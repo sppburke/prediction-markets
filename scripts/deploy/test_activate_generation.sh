@@ -230,7 +230,7 @@ case "$action" in
       if [[ -f "$state/service.exec-start" ]]; then
         cat "$state/service.exec-start"
       else
-        echo "{ path=$root/prediction-markets/target/release/pe-service ; argv[]=$root/prediction-markets/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }"
+        echo "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source $root/prediction-markets/.env; set +a; exec $root/prediction-markets/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }"
       fi
     elif [[ "$*" == *EnvironmentFiles* ]]; then
       if [[ -f "$state/service.environment-files" ]]; then
@@ -491,62 +491,64 @@ rm "$hold"
 wait "$holder"
 assert_verified "$root"
 
-# Unit ownership accepts exactly the direct argv `<binary> <config>` (production shape).
+# Unit ownership: the documented wrapper (default fixture) is accepted; the direct shape with EnvironmentFiles is accepted.
 root=$(make_case unit-config-direct-argv)
 service="$root/prediction-markets"
 printf "{ path=%s/target/release/pe-service ; argv[]=%s/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }\n" \
   "$service" "$service" > "$root/test-state/service.exec-start"
+printf "path=%s/.env ; ignore_errors=no\n" "$service" > "$root/test-state/service.environment-files"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
-# A shell wrapper is refused outright even when it names the real binary and config.
-root=$(make_case unit-config-shell-wrapper)
+refuse_unit_shape() {
+  local name=$1 exec_start=$2
+  local root service
+  root=$(make_case "$name")
+  service="$root/prediction-markets"
+  printf '%s\n' "${exec_start//@SVC@/$service}" > "$root/test-state/service.exec-start"
+  set +e
+  activate "$root" activation-557 >"$root/unit-shape.out" 2>"$root/unit-shape.err"
+  local rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "$name: ExecStart shape was accepted"
+  grep -q 'does not select the installed binary and service config' "$root/unit-shape.err" ||
+    fail "$name: refusal was not explicit"
+  [[ ! -e "$root/pe-activation.json" ]] || fail "$name: shape was adopted into a manifest"
+  assert_deploy_lock_unchanged "$root"
+}
+# Every deviation from the two exact templates is refused: extra tokens, comments, attached hashes,
+# a backup env in the wrapper, a different binary, a subshell, a shell wrapper of any other content.
+refuse_unit_shape unit-wrapper-comment-backup "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml # @SVC@/smoke-test/service.toml.backup ; ignore_errors=no }"
+refuse_unit_shape unit-wrapper-backup-config "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml.backup ; ignore_errors=no }"
+refuse_unit_shape unit-wrapper-attached-hash "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml#backup ; ignore_errors=no }"
+refuse_unit_shape unit-wrapper-backup-env "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env.backup; set +a; exec @SVC@/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }"
+refuse_unit_shape unit-wrapper-command-in-comment "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec /tmp/not-pe-service # exec @SVC@/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }"
+refuse_unit_shape unit-wrapper-quoted-hash "{ path=/bin/bash ; argv[]=/bin/bash -c false && exec @SVC@/target/release/pe-service smoke-test/service.toml; printf '%s' '#'; exec @SVC@/target/release/pe-service smoke-test/service.toml.backup ; ignore_errors=no }"
+refuse_unit_shape unit-wrapper-subshell "{ path=/bin/bash ; argv[]=/bin/bash -c (exec @SVC@/target/release/pe-service smoke-test/service.toml) ; ignore_errors=no }"
+refuse_unit_shape unit-direct-three-tokens "{ path=@SVC@/target/release/pe-service ; argv[]=@SVC@/target/release/pe-service smoke-test/service.toml extra ; ignore_errors=no }"
+refuse_unit_shape unit-direct-other-binary "{ path=/tmp/other ; argv[]=/tmp/other smoke-test/service.toml ; ignore_errors=no }"
+
+# The direct shape needs EnvironmentFiles to own the environment; an empty EnvironmentFiles is refused.
+root=$(make_case unit-direct-no-environment-files)
 service="$root/prediction-markets"
-printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml' ; ignore_errors=no }\n" \
-  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+printf "{ path=%s/target/release/pe-service ; argv[]=%s/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }\n" \
+  "$service" "$service" > "$root/test-state/service.exec-start"
+: > "$root/test-state/service.environment-files"
 set +e
-activate "$root" activation-557 >"$root/unit-wrap.out" 2>"$root/unit-wrap.err"
+activate "$root" activation-557 >"$root/unit-env.out" 2>"$root/unit-env.err"
 rc=$?
 set -e
-[[ "$rc" == 1 ]] || fail "shell-wrapped ExecStart was accepted"
-grep -q 'does not select the installed binary and service config' "$root/unit-wrap.err" ||
-  fail "shell-wrapper refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "shell-wrapped ExecStart was adopted into a manifest"
+[[ "$rc" == 1 ]] || fail "direct shape without EnvironmentFiles was accepted"
+grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit-env.err" ||
+  fail "EnvironmentFiles role refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "direct shape without environment was adopted into a manifest"
 assert_deploy_lock_unchanged "$root"
 
-# A real config mentioned only in a comment cannot legitimize the backup argument.
-root=$(make_case unit-config-real-comment)
-service="$root/prediction-markets"
-printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml.backup # %s/smoke-test/service.toml' ; ignore_errors=no ; }\n" \
-  "$service" "$service" "$service" "$service" > "$root/test-state/service.exec-start"
-set +e
-activate "$root" activation-557 >"$root/unit.out" 2>"$root/unit.err"
-rc=$?
-set -e
-[[ "$rc" == 1 ]] || fail "suffixed service config path was accepted"
-grep -q 'does not select the installed binary and service config' "$root/unit.err" ||
-  fail "suffixed service config refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "suffixed service config was adopted into a manifest"
-assert_deploy_lock_unchanged "$root"
-
-# An attached "#" is literal in systemd argv: service.toml#backup is not service.toml.
-root=$(make_case unit-config-attached-hash)
-service="$root/prediction-markets"
-printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml#backup' ; ignore_errors=no }\n" \
-  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
-set +e
-activate "$root" activation-557 >"$root/unit-hash.out" 2>"$root/unit-hash.err"
-rc=$?
-set -e
-[[ "$rc" == 1 ]] || fail "attached-hash service config path was accepted"
-grep -q 'does not select the installed binary and service config' "$root/unit-hash.err" ||
-  fail "attached-hash service config refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "attached-hash service config was adopted into a manifest"
-assert_deploy_lock_unchanged "$root"
-
-# An attached "#" is literal in EnvironmentFiles too: .env#backup is not .env.
+# An attached "#" is literal in EnvironmentFiles too: .env#backup is not .env (direct shape).
 root=$(make_case unit-environment-attached-hash)
 service="$root/prediction-markets"
+printf "{ path=%s/target/release/pe-service ; argv[]=%s/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }\n" \
+  "$service" "$service" > "$root/test-state/service.exec-start"
 printf "path=%s/.env#backup ; ignore_errors=no\n" "$service" > "$root/test-state/service.environment-files"
 set +e
 activate "$root" activation-557 >"$root/unit-env-hash.out" 2>"$root/unit-env-hash.err"
@@ -556,34 +558,6 @@ set -e
 grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit-env-hash.err" ||
   fail "attached-hash environment refusal was not explicit"
 [[ ! -e "$root/pe-activation.json" ]] || fail "attached-hash environment was adopted into a manifest"
-assert_deploy_lock_unchanged "$root"
-
-# A command that appears only inside a Bash comment does not select the installed service.
-root=$(make_case unit-config-command-in-comment)
-service="$root/prediction-markets"
-printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec /tmp/not-pe-service # exec %s/target/release/pe-service %s/smoke-test/service.toml' ; ignore_errors=no }\n" \
-  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
-set +e
-activate "$root" activation-557 >"$root/unit-comment-cmd.out" 2>"$root/unit-comment-cmd.err"
-rc=$?
-set -e
-[[ "$rc" == 1 ]] || fail "command inside a comment was accepted as the installed service"
-grep -q 'does not select the installed binary and service config' "$root/unit-comment-cmd.err" ||
-  fail "comment-only command refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "comment-only command was adopted into a manifest"
-assert_deploy_lock_unchanged "$root"
-
-# ExecStart mentioning the env is insufficient; EnvironmentFiles owns that role.
-root=$(make_case unit-environment-role)
-: > "$root/test-state/service.environment-files"
-set +e
-activate "$root" activation-557 >"$root/unit-env.out" 2>"$root/unit-env.err"
-rc=$?
-set -e
-[[ "$rc" == 1 ]] || fail "environment mentioned only in ExecStart was accepted"
-grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit-env.err" ||
-  fail "EnvironmentFiles role refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "wrong-role environment was adopted into a manifest"
 assert_deploy_lock_unchanged "$root"
 
 # A different id is rejected while durable state is non-terminal.

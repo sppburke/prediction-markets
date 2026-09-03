@@ -173,11 +173,14 @@ raise SystemExit(1)' "$expected" "$environment_files"
 }
 
 unit_exec_selects_service() {
-  # The production unit runs the binary DIRECTLY: argv[] is exactly `<binary> <config>` (docs/35). Any
-  # shell wrapper, extra argument, or different binary is refused outright; nothing is interpreted.
-  local expected_binary=$1 expected_config=$2 working=$3 exec_start=$4
-  python3 -c 'import os,re,shlex,sys
-expected_binary,expected_config,working,value=sys.argv[1:]
+  # Exactly two documented unit shapes are accepted, by exact template on systemd's rendered argv[]
+  # (systemd renders the elements space-joined, unquoted) — nothing is interpreted:
+  #   direct : argv[]=<binary> <config>
+  #   wrapper: argv[]=/bin/bash -c set -a; source <env>; set +a; exec <binary> <config>      (docs/35)
+  # Prints "direct" or "wrapper" on success. Any other rendering is refused.
+  local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 exec_start=$5
+  python3 -c 'import os,re,sys
+expected_binary,expected_config,expected_env,working,value=sys.argv[1:]
 marker="argv[]="
 if marker not in value:
     raise SystemExit(1)
@@ -185,17 +188,22 @@ argv=value.split(marker,1)[1]
 metadata=re.search(r"\s;\s(?:ignore_errors|start_time|stop_time|pid|code|status)=", argv)
 if metadata:
     argv=argv[:metadata.start()]
-try:
-    tokens=shlex.split(argv, posix=True, comments=False)
-except ValueError:
+argv=argv.strip()
+def norm(path):
+    return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
+direct=re.fullmatch(r"(\S+) (\S+)", argv)
+if direct:
+    binary,config=direct.groups()
+    if binary == expected_binary and norm(config) == os.path.normpath(expected_config):
+        print("direct"); raise SystemExit(0)
     raise SystemExit(1)
-if len(tokens) != 2 or tokens[0] != expected_binary:
-    raise SystemExit(1)
-config=tokens[1]
-if not os.path.isabs(config):
-    config=os.path.join(working, config)
-raise SystemExit(0 if os.path.normpath(config) == os.path.normpath(expected_config) else 1)' \
-    "$expected_binary" "$expected_config" "$working" "$exec_start"
+wrapper=re.fullmatch(r"/bin/bash -c set -a; source (\S+); set \+a; exec (\S+) (\S+)", argv)
+if wrapper:
+    env,binary,config=wrapper.groups()
+    if norm(env) == os.path.normpath(expected_env) and binary == expected_binary and norm(config) == os.path.normpath(expected_config):
+        print("wrapper"); raise SystemExit(0)
+raise SystemExit(1)' \
+    "$expected_binary" "$expected_config" "$expected_env" "$working" "$exec_start"
 }
 
 verify_installed_unit_owner() {
@@ -208,10 +216,13 @@ verify_installed_unit_owner() {
     die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
   exec_start=$(systemctl show pe-service -p ExecStart --value)
   environment_files=$(systemctl show pe-service -p EnvironmentFiles --value)
-  unit_environment_has_exact_path "$SERVICE_ENV" "$environment_files" ||
-    die "pe-service EnvironmentFiles does not select the installed environment"
-  unit_exec_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$working" "$exec_start" ||
+  local shape
+  shape=$(unit_exec_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$exec_start") ||
     die "pe-service ExecStart does not select the installed binary and service config"
+  if [[ "$shape" == direct ]]; then
+    unit_environment_has_exact_path "$SERVICE_ENV" "$environment_files" ||
+      die "pe-service EnvironmentFiles does not select the installed environment"
+  fi
   if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
     pid=$(systemctl show pe-service -p MainPID --value)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
