@@ -610,7 +610,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     control_tx
         .send(OrchestratorControl::CommitActivityBucket {
             aggregates: vec![pending_aggregate(FROZEN_MARKET, SOURCE_EPOCH)],
-            context: Box::new(BucketDecisionContext {
+            context: Arc::new(BucketDecisionContext {
                 applied_configuration: config_a.clone(),
                 decision_inputs_json: serde_json::json!({
                     "fixed_end": SOURCE_EPOCH + 10,

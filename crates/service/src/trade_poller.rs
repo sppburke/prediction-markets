@@ -686,7 +686,7 @@ impl TradePoller {
         self.control_tx
             .send(OrchestratorControl::CommitActivityBucket {
                 aggregates,
-                context: Box::new(context),
+                context: Arc::new(context),
                 committed,
             })
             .await

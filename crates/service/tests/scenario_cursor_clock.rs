@@ -199,7 +199,7 @@ async fn run_once(
                     engine
                         .commit(
                             aggregates,
-                            &context,
+                            context.as_ref(),
                             pe_service::bucket_commit::FrozenDecisionBasis {
                                 win_rate_p: pe_core_types::Probability::ZERO,
                                 bankroll: rust_decimal::Decimal::ZERO,

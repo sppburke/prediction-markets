@@ -511,7 +511,7 @@ fn spawn_control_actor(
                 } => {
                     let _ = committed.send(
                         engine
-                            .commit(aggregates, &context, zero_basis())
+                            .commit(aggregates, context.as_ref(), zero_basis())
                             .map_err(|error| error.to_string()),
                     );
                 }
@@ -2100,7 +2100,7 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                         engine
                             .commit(
                                 aggregates,
-                                &context,
+                                context.as_ref(),
                                 pe_service::bucket_commit::FrozenDecisionBasis {
                                     win_rate_p: pe_core_types::Probability::ZERO,
                                     bankroll: rust_decimal::Decimal::ZERO,

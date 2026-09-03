@@ -300,7 +300,7 @@ fn poller_harness(
                         engine
                             .commit(
                                 aggregates,
-                                &context,
+                                context.as_ref(),
                                 FrozenDecisionBasis {
                                     win_rate_p: pe_core_types::Probability::ZERO,
                                     bankroll: rust_decimal::Decimal::ZERO,
@@ -418,7 +418,7 @@ async fn refresh_outcome_for_install_rejection(
                         engine
                             .commit(
                                 aggregates,
-                                &context,
+                                context.as_ref(),
                                 FrozenDecisionBasis {
                                     win_rate_p: pe_core_types::Probability::ZERO,
                                     bankroll: rust_decimal::Decimal::ZERO,

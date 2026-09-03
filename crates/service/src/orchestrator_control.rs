@@ -6,6 +6,8 @@
 //! those mutable ledgers while an acknowledgement gives the shared admission preparer
 //! ([`crate::watchlist_admission`]) a strict seed-before-membership ordering.
 
+use std::sync::Arc;
+
 use pe_core_types::WalletAddress;
 use pe_source_polymarket_public::ActivityAggregate;
 use tokio::sync::oneshot;
@@ -46,7 +48,7 @@ pub enum OrchestratorControl {
     /// source routing closes obligations before sending this command.
     CommitActivityBucket {
         aggregates: Vec<ActivityAggregate>,
-        context: Box<BucketDecisionContext>,
+        context: Arc<BucketDecisionContext>,
         committed: oneshot::Sender<Result<BucketCommitResult, String>>,
     },
 }

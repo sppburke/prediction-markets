@@ -418,9 +418,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     // concurrent refresh, and later watchlist/bankroll moves
                     // cannot change what a resumed continuation decides.
                     let frozen_basis = self.freeze_decision_basis(&aggregates);
-                    let result = self
-                        .bucket_engine
-                        .commit(aggregates, &context, frozen_basis);
+                    let result =
+                        self.bucket_engine
+                            .commit(aggregates, context.as_ref(), frozen_basis);
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {
@@ -436,9 +436,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     // those harnesses have no competing membership writer to
                     // linearize the basis capture against.
                     let frozen_basis = self.freeze_decision_basis(&aggregates);
-                    let result = self
-                        .bucket_engine
-                        .commit(aggregates, &context, frozen_basis);
+                    let result =
+                        self.bucket_engine
+                            .commit(aggregates, context.as_ref(), frozen_basis);
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {

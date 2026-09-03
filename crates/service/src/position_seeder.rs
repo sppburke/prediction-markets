@@ -704,13 +704,17 @@ impl CausalPositionValidator {
         let buckets = activity
             .buckets()
             .map_err(|source| CausalPositionError::Activity { wallet, source })?;
-        let context = bracket_context(activity, &self.source_log_generation, prepared)?;
+        let context = Arc::new(bracket_context(
+            activity,
+            &self.source_log_generation,
+            prepared,
+        )?);
         for bucket in buckets {
             let (committed, acknowledgement) = oneshot::channel();
             control_tx
                 .send(OrchestratorControl::CommitActivityBucket {
                     aggregates: bucket,
-                    context: Box::new(context.clone()),
+                    context: Arc::clone(&context),
                     committed,
                 })
                 .await
@@ -1125,6 +1129,112 @@ mod tests {
             SourceError::Fatal { message }
                 if message.contains("source-log append failed: I/O error: injected append failure")
         ));
+    }
+
+    #[tokio::test]
+    async fn control_commit_shares_one_context_across_read_buckets() {
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let observed_at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+        let row = |epoch: i64, asset: &str, market: &str, tx: &str| {
+            json!({
+                "proxyWallet": wallet,
+                "timestamp": epoch,
+                "conditionId": market,
+                "type": "TRADE",
+                "size": "1",
+                "usdcSize": "0.5",
+                "transactionHash": tx,
+                "price": "0.5",
+                "asset": asset,
+                "side": "BUY",
+                "outcomeIndex": 0,
+                "outcome": "Yes",
+                "isCombo": false
+            })
+        };
+        let parsed = parse_activity_response(
+            &serde_json::to_vec(&vec![
+                row(1, "asset-first", "market-first", "0xfirst"),
+                row(2, "asset-second", "market-second", "0xsecond"),
+            ])
+            .unwrap(),
+            wallet,
+            &ActivityParseContext {
+                source_id: SourceId("fixture".to_owned()),
+                observed_at: SourceTimestamp(observed_at),
+                received_at: ReceivedAt(observed_at),
+                transport: ActivityTransport::Rest,
+            },
+        )
+        .unwrap();
+        let activity = CompleteActivityRead {
+            requested_wallet: wallet,
+            fixed_end: 100,
+            rows: parsed.rows,
+            pages: Vec::new(),
+        };
+        let prepared = PreparedActivity {
+            mapping: activity.asset_mapping().unwrap(),
+            identity_overrides: HashMap::new(),
+            identity_unresolved: HashSet::new(),
+            no_copy_dispositions: HashMap::new(),
+            unresolved_assets: BTreeMap::new(),
+            metadata_reads: BTreeMap::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(EmptyFetcher);
+        let source_log = Arc::new(tokio::sync::Mutex::new(
+            SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+        ));
+        let resolver = Arc::new(AssetIdentityResolver::new(
+            Arc::clone(&fetcher),
+            "https://gamma.example.com".to_owned(),
+            10,
+            source_log,
+        ));
+        let validator = CausalPositionValidator::new(
+            fetcher,
+            "https://data.example.com",
+            "fixture-generation",
+            resolver,
+        );
+        let (control_tx, mut control_rx) = mpsc::channel(2);
+        let actor = tokio::spawn(async move {
+            let mut first_context = None;
+            for source_epoch in [1, 2] {
+                let Some(OrchestratorControl::CommitActivityBucket {
+                    context, committed, ..
+                }) = control_rx.recv().await
+                else {
+                    return false;
+                };
+                if let Some(first_context) = &first_context
+                    && !Arc::ptr_eq(first_context, &context)
+                {
+                    return false;
+                }
+                first_context.get_or_insert_with(|| Arc::clone(&context));
+                committed
+                    .send(Ok(crate::bucket_commit::BucketCommitResult {
+                        wallet,
+                        source_epoch,
+                        dispositions: BTreeMap::new(),
+                        pending: Vec::new(),
+                        newly_fenced: None,
+                        already_committed: false,
+                    }))
+                    .unwrap();
+            }
+            true
+        });
+
+        assert!(
+            validator
+                .commit_control(wallet, &activity, &prepared, &control_tx, true)
+                .await
+                .unwrap()
+        );
+        assert!(actor.await.unwrap());
     }
 
     #[test]
