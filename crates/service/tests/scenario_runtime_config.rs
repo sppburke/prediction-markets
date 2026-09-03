@@ -620,6 +620,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                 signal_config: SignalConfig::default(),
                 copy_eligible: true,
+                bracket_commit: false,
                 recorded_at_unix: SOURCE_EPOCH + 2,
                 observation_provenance: HashMap::new(),
                 no_copy_dispositions: HashMap::new(),

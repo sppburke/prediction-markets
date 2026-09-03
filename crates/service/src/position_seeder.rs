@@ -3,7 +3,7 @@
 //! Venue positions own absolute balances at each proved anchor; ordered
 //! activity owns exact causal effects after that anchor.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use pe_core_types::{
     ShareAmount, SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{NoCopyDisposition, PaperStateDb};
 use pe_position_ledger::PositionLedger;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
@@ -187,6 +187,9 @@ struct ActivityEvidence {
 struct PreparedActivity {
     mapping: ActivityAssetMapping,
     identity_overrides: HashMap<SourceTradeId, IdentityOverride>,
+    identity_unresolved: HashSet<SourceTradeId>,
+    no_copy_dispositions: HashMap<SourceTradeId, NoCopyDisposition>,
+    unresolved_assets: BTreeMap<String, String>,
     metadata_reads: BTreeMap<PolymarketTokenId, IdentityProvenance>,
 }
 
@@ -404,17 +407,13 @@ impl CausalPositionValidator {
         control_tx: &mpsc::Sender<OrchestratorControl>,
     ) -> Result<AnchorInstall, CausalPositionError> {
         let mut metadata_reads = BTreeMap::new();
+        let mut unresolved_assets = BTreeMap::new();
         let first_activity = self.activity(wallet).await?;
         let first_prepared = self.prepare_activity(wallet, &first_activity).await?;
         metadata_reads.extend(first_prepared.metadata_reads.clone());
-        self.commit_control(
-            wallet,
-            &first_activity,
-            &first_prepared.identity_overrides,
-            control_tx,
-            false,
-        )
-        .await?;
+        unresolved_assets.extend(first_prepared.unresolved_assets.clone());
+        self.commit_control(wallet, &first_activity, &first_prepared, control_tx, false)
+            .await?;
         let first_ledger = capture_control(wallet, control_tx).await?;
         let first_positions = self.positions(wallet, &first_prepared.mapping).await?;
         let first_activity = ActivityEvidence::from(first_activity);
@@ -422,14 +421,9 @@ impl CausalPositionValidator {
         let second_activity = self.activity(wallet).await?;
         let second_prepared = self.prepare_activity(wallet, &second_activity).await?;
         metadata_reads.extend(second_prepared.metadata_reads.clone());
+        unresolved_assets.extend(second_prepared.unresolved_assets.clone());
         if self
-            .commit_control(
-                wallet,
-                &second_activity,
-                &second_prepared.identity_overrides,
-                control_tx,
-                true,
-            )
+            .commit_control(wallet, &second_activity, &second_prepared, control_tx, true)
             .await?
         {
             return Err(CausalPositionError::InterveningActivity { wallet });
@@ -440,29 +434,26 @@ impl CausalPositionValidator {
 
         let final_activity = self.activity(wallet).await?;
         let final_prepared = self.prepare_activity(wallet, &final_activity).await?;
-        metadata_reads.extend(final_prepared.metadata_reads);
+        unresolved_assets.extend(final_prepared.unresolved_assets.clone());
+        metadata_reads.extend(final_prepared.metadata_reads.clone());
         if self
-            .commit_control(
-                wallet,
-                &final_activity,
-                &final_prepared.identity_overrides,
-                control_tx,
-                true,
-            )
+            .commit_control(wallet, &final_activity, &final_prepared, control_tx, true)
             .await?
         {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
         let final_ledger = capture_control(wallet, control_tx).await?;
         let final_activity = ActivityEvidence::from(final_activity);
-        self.finish(
+        let install = self.finish(
             wallet,
             [&first_activity, &second_activity, &final_activity],
             [&first_ledger, &second_ledger, &final_ledger],
             &first_positions,
             &second_positions,
             metadata_reads.into_values().collect(),
-        )
+        )?;
+        log_unresolved_activity_assets(wallet, &unresolved_assets);
+        Ok(install)
     }
 
     async fn validate_one_direct(
@@ -472,15 +463,17 @@ impl CausalPositionValidator {
         paper_state: &PaperStateDb,
     ) -> Result<AnchorInstall, CausalPositionError> {
         let mut metadata_reads = BTreeMap::new();
+        let mut unresolved_assets = BTreeMap::new();
         let first_activity = self.activity(wallet).await?;
         let first_prepared = self.prepare_activity(wallet, &first_activity).await?;
         metadata_reads.extend(first_prepared.metadata_reads.clone());
+        unresolved_assets.extend(first_prepared.unresolved_assets.clone());
         let first_ledger = {
             let mut engine = engine.lock().await;
             commit_direct(
                 wallet,
                 &first_activity,
-                &first_prepared.identity_overrides,
+                &first_prepared,
                 &mut engine,
                 false,
                 &self.source_log_generation,
@@ -501,12 +494,13 @@ impl CausalPositionValidator {
         let second_activity = self.activity(wallet).await?;
         let second_prepared = self.prepare_activity(wallet, &second_activity).await?;
         metadata_reads.extend(second_prepared.metadata_reads.clone());
+        unresolved_assets.extend(second_prepared.unresolved_assets.clone());
         let second_ledger = {
             let mut engine = engine.lock().await;
             if commit_direct(
                 wallet,
                 &second_activity,
-                &second_prepared.identity_overrides,
+                &second_prepared,
                 &mut engine,
                 true,
                 &self.source_log_generation,
@@ -528,13 +522,14 @@ impl CausalPositionValidator {
 
         let final_activity = self.activity(wallet).await?;
         let final_prepared = self.prepare_activity(wallet, &final_activity).await?;
-        metadata_reads.extend(final_prepared.metadata_reads);
+        unresolved_assets.extend(final_prepared.unresolved_assets.clone());
+        metadata_reads.extend(final_prepared.metadata_reads.clone());
         let final_ledger = {
             let mut engine = engine.lock().await;
             if commit_direct(
                 wallet,
                 &final_activity,
-                &final_prepared.identity_overrides,
+                &final_prepared,
                 &mut engine,
                 true,
                 &self.source_log_generation,
@@ -552,6 +547,7 @@ impl CausalPositionValidator {
             &second_positions,
             metadata_reads.into_values().collect(),
         )?;
+        log_unresolved_activity_assets(wallet, &unresolved_assets);
         #[cfg(feature = "scenario")]
         {
             let mut engine = engine.lock().await;
@@ -608,16 +604,7 @@ impl CausalPositionValidator {
                 };
                 return Err(CausalPositionError::Positions { wallet, source });
             }
-            if !resolved.verified.contains_key(asset) {
-                let source = PositionReadError::MetadataUnresolved {
-                    asset: asset.0.clone(),
-                    reason: resolved.unverified.get(asset).cloned().unwrap_or_else(|| {
-                        "token absent from open and closed Gamma metadata".to_owned()
-                    }),
-                };
-                return Err(CausalPositionError::Positions { wallet, source });
-            }
-            if !resolved.provenance.contains_key(asset) {
+            if resolved.verified.contains_key(asset) && !resolved.provenance.contains_key(asset) {
                 return Err(CausalPositionError::Identity {
                     wallet,
                     source: SourceError::Fatal {
@@ -631,6 +618,20 @@ impl CausalPositionValidator {
         }
 
         let mut identity_overrides = HashMap::new();
+        let unresolved_assets = tokens
+            .iter()
+            .filter(|asset| !resolved.verified.contains_key(*asset))
+            .map(|asset| {
+                (
+                    asset.0.clone(),
+                    resolved.unverified.get(asset).cloned().unwrap_or_else(|| {
+                        "token absent from open and closed Gamma metadata".to_owned()
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut identity_unresolved = HashSet::new();
+        let mut no_copy_dispositions = HashMap::new();
         for bucket in activity
             .buckets()
             .map_err(|source| CausalPositionError::Activity { wallet, source })?
@@ -641,6 +642,19 @@ impl CausalPositionValidator {
                     continue;
                 };
                 let Some(identity) = resolved.verified.get(asset) else {
+                    let source_trade_id = aggregate.group_id.key().clone();
+                    identity_unresolved.insert(source_trade_id.clone());
+                    no_copy_dispositions.insert(
+                        source_trade_id,
+                        NoCopyDisposition {
+                            provenance: "rest_poll".to_owned(),
+                            age_secs: activity
+                                .fixed_end
+                                .saturating_sub(aggregate.source_time.0.unix_timestamp()),
+                            reason: "identity_unresolved".to_owned(),
+                            recorded_at_unix: activity.fixed_end,
+                        },
+                    );
                     continue;
                 };
                 if components.condition_id.as_ref() != Some(&identity.condition_id)
@@ -662,6 +676,9 @@ impl CausalPositionValidator {
         Ok(PreparedActivity {
             mapping,
             identity_overrides,
+            identity_unresolved,
+            no_copy_dispositions,
+            unresolved_assets,
             metadata_reads: resolved.provenance,
         })
     }
@@ -680,7 +697,7 @@ impl CausalPositionValidator {
         &self,
         wallet: WalletAddress,
         activity: &CompleteActivityRead,
-        identity_overrides: &HashMap<SourceTradeId, IdentityOverride>,
+        prepared: &PreparedActivity,
         control_tx: &mpsc::Sender<OrchestratorControl>,
         count_change: bool,
     ) -> Result<bool, CausalPositionError> {
@@ -696,7 +713,7 @@ impl CausalPositionValidator {
                     context: Box::new(bracket_context(
                         activity,
                         &self.source_log_generation,
-                        identity_overrides.clone(),
+                        prepared,
                     )?),
                     committed,
                 })
@@ -806,6 +823,19 @@ fn is_bounded_retry_error(error: &CausalPositionError) -> bool {
     )
 }
 
+fn log_unresolved_activity_assets(
+    wallet: WalletAddress,
+    unresolved_assets: &BTreeMap<String, String>,
+) {
+    if !unresolved_assets.is_empty() {
+        tracing::warn!(
+            wallet = %wallet,
+            raw_only_assets = ?unresolved_assets,
+            "position bracket: activity assets recorded raw-only"
+        );
+    }
+}
+
 struct DurableRecordingFetcher {
     inner: Arc<dyn ReconciliationFetcher>,
     sink: BootSourceLog,
@@ -843,7 +873,7 @@ impl ReconciliationFetcher for DurableRecordingFetcher {
 fn bracket_context(
     activity: &CompleteActivityRead,
     source_log_generation: &str,
-    identity_overrides: HashMap<SourceTradeId, IdentityOverride>,
+    prepared: &PreparedActivity,
 ) -> Result<BucketDecisionContext, CausalPositionError> {
     let reconstruction_quality =
         ReconstructionQuality::new(100).map_err(|_| CausalPositionError::ReconstructionQuality)?;
@@ -859,11 +889,12 @@ fn bracket_context(
         reconstruction_quality,
         signal_config: SignalConfig::default(),
         copy_eligible: false,
+        bracket_commit: true,
         recorded_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
         observation_provenance: HashMap::new(),
-        no_copy_dispositions: HashMap::new(),
-        identity_overrides,
-        identity_unresolved: Default::default(),
+        no_copy_dispositions: prepared.no_copy_dispositions.clone(),
+        identity_overrides: prepared.identity_overrides.clone(),
+        identity_unresolved: prepared.identity_unresolved.clone(),
         history_status: None,
     })
 }
@@ -871,38 +902,53 @@ fn bracket_context(
 fn commit_direct(
     wallet: WalletAddress,
     activity: &CompleteActivityRead,
-    identity_overrides: &HashMap<SourceTradeId, IdentityOverride>,
+    prepared: &PreparedActivity,
     engine: &mut BucketCommitEngine,
     count_change: bool,
     source_log_generation: &str,
 ) -> Result<bool, CausalPositionError> {
-    let mut changed = false;
-    for bucket in activity
-        .buckets()
-        .map_err(|source| CausalPositionError::Activity { wallet, source })?
-    {
-        let result = engine
-            // Bracket catch-up is never copy-eligible (`copy_eligible: false`
-            // above), so no pending decision is created and the frozen basis is
-            // inert; a zero basis keeps that invariant explicit (#544).
-            .commit(
-                bucket,
-                &bracket_context(activity, source_log_generation, identity_overrides.clone())?,
-                crate::bucket_commit::FrozenDecisionBasis {
-                    win_rate_p: pe_core_types::Probability::ZERO,
-                    bankroll: rust_decimal::Decimal::ZERO,
-                },
-            )
-            .map_err(|error| CausalPositionError::BucketCommit {
-                wallet,
-                message: error.to_string(),
-            })?;
-        if result.newly_fenced.is_some() {
-            return Err(CausalPositionError::Fenced { wallet });
-        }
-        changed |= count_change && !result.already_committed;
+    enum BatchOutcome {
+        Complete { changed: bool },
+        NewlyFenced,
     }
-    Ok(changed)
+
+    let buckets = activity
+        .buckets()
+        .map_err(|source| CausalPositionError::Activity { wallet, source })?;
+    let context = bracket_context(activity, source_log_generation, prepared)?;
+    let outcome = engine
+        .commit_batch(|engine| {
+            let mut changed = false;
+            for bucket in buckets {
+                let result = engine.commit(
+                    // Bracket catch-up is never copy-eligible (`copy_eligible: false`
+                    // above), so no pending decision is created and the frozen basis is
+                    // inert; a zero basis keeps that invariant explicit (#544).
+                    bucket,
+                    &context,
+                    crate::bucket_commit::FrozenDecisionBasis {
+                        win_rate_p: pe_core_types::Probability::ZERO,
+                        bankroll: rust_decimal::Decimal::ZERO,
+                    },
+                )?;
+                if result.newly_fenced.is_some() {
+                    return Ok(BatchOutcome::NewlyFenced);
+                }
+                changed |= count_change && !result.already_committed;
+            }
+            Ok(BatchOutcome::Complete { changed })
+        })
+        .map_err(|error| CausalPositionError::BucketCommit {
+            wallet,
+            message: error.to_string(),
+        })?;
+    match outcome {
+        BatchOutcome::Complete { changed } => Ok(changed),
+        BatchOutcome::NewlyFenced => {
+            // The fence bucket and every preceding bucket are durable now.
+            Err(CausalPositionError::Fenced { wallet })
+        }
+    }
 }
 
 /// Canonical exact ledger proof for one wallet.
@@ -1049,6 +1095,9 @@ pub fn parse_positions_strict(
 mod tests {
     use super::*;
     use crate::source_event_sink::SourceEventSink;
+    use pe_source_polymarket_public::{
+        ActivityParseContext, ActivityTransport, aggregate_activity_rows, parse_activity_response,
+    };
 
     struct EmptyFetcher;
 
@@ -1080,5 +1129,118 @@ mod tests {
             SourceError::Fatal { message }
                 if message.contains("source-log append failed: I/O error: injected append failure")
         ));
+    }
+
+    #[test]
+    fn direct_batch_surfaces_fence_after_committing_its_prefix() {
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let observed_at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+        let row = |epoch: i64, activity_type: &str, asset: &str, market: &str, tx: &str| {
+            json!({
+                "proxyWallet": wallet,
+                "timestamp": epoch,
+                "conditionId": market,
+                "type": activity_type,
+                "size": "1",
+                "usdcSize": "0.5",
+                "transactionHash": tx,
+                "price": "0.5",
+                "asset": asset,
+                "side": "BUY",
+                "outcomeIndex": 0,
+                "outcome": "Yes",
+                "isCombo": false
+            })
+        };
+        let parsed = parse_activity_response(
+            &serde_json::to_vec(&vec![
+                row(1, "TRADE", "asset-first", "market-first", "0xfirst"),
+                row(2, "REDEEM", "asset-fence", "market-fence", "0xfence"),
+                row(3, "TRADE", "asset-later", "market-later", "0xlater"),
+            ])
+            .unwrap(),
+            wallet,
+            &ActivityParseContext {
+                source_id: SourceId("fixture".to_owned()),
+                observed_at: SourceTimestamp(observed_at),
+                received_at: ReceivedAt(observed_at),
+                transport: ActivityTransport::Rest,
+            },
+        )
+        .unwrap();
+        let aggregates = aggregate_activity_rows(&parsed.rows).unwrap();
+        let first_id = aggregates[0].group_id.key().clone();
+        let fence_id = aggregates[1].group_id.key().clone();
+        let later_id = aggregates[2].group_id.key().clone();
+        let activity = CompleteActivityRead {
+            requested_wallet: wallet,
+            fixed_end: 100,
+            rows: parsed.rows,
+            pages: Vec::new(),
+        };
+        let prepared = PreparedActivity {
+            mapping: activity.asset_mapping().unwrap(),
+            identity_overrides: HashMap::new(),
+            identity_unresolved: HashSet::new(),
+            no_copy_dispositions: HashMap::new(),
+            unresolved_assets: BTreeMap::new(),
+            metadata_reads: BTreeMap::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let mut engine =
+            BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
+        paper.set_cursor(&wallet, 0).unwrap();
+        let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+        engine
+            .install_anchors(&[AnchorInstall {
+                wallet,
+                balances: Vec::new(),
+                cutoff: 0,
+                proof: AnchorProof {
+                    positions_proof_hash: "fixture".to_owned(),
+                    activity_bounds_json: "[]".to_owned(),
+                    source_log_generation: "fixture-generation".to_owned(),
+                    document: "{}".to_owned(),
+                    recorded_at_unix: 0,
+                },
+                expected: AnchorExpectation {
+                    ledger_hash: captured.hash,
+                    cursor: captured.cursor,
+                    anchor_seq: captured.anchor_seq,
+                    coverage_generation: captured.coverage_generation,
+                },
+            }])
+            .unwrap();
+
+        let error = commit_direct(
+            wallet,
+            &activity,
+            &prepared,
+            &mut engine,
+            false,
+            "fixture-generation",
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CausalPositionError::Fenced { .. }));
+        assert!(paper.activity_group_state(&first_id).unwrap().is_some());
+        assert!(paper.activity_group_state(&fence_id).unwrap().is_some());
+        assert!(paper.activity_group_state(&later_id).unwrap().is_none());
+        assert!(paper.is_wallet_fenced(&wallet).unwrap());
+        assert!(engine.is_fenced(&wallet));
+        assert_eq!(
+            engine
+                .ledger()
+                .position(&wallet)
+                .and_then(|snapshot| {
+                    snapshot.positions.get(&MarketOutcomeId::new(
+                        MarketId(VenueMarketId("market-first".to_owned())),
+                        OutcomeId(0),
+                    ))
+                })
+                .map(|position| position.long_contracts.atomic()),
+            Some(1_000_000)
+        );
     }
 }

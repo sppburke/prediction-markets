@@ -454,6 +454,7 @@ fn context(epoch: i64) -> BucketDecisionContext {
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),
         copy_eligible: false,
+        bracket_commit: false,
         recorded_at_unix: epoch,
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
@@ -1930,7 +1931,7 @@ async fn mixed_activity_combo_classification_defers_with_named_asset() {
 }
 
 #[tokio::test]
-async fn metadata_unresolved_activity_asset_defers_with_typed_reason() {
+async fn metadata_unresolved_activity_only_asset_is_raw_only_and_wallet_anchors() {
     let wallet = wallet(0x74);
     let (_dir, paper, engine) = fresh(&[wallet]);
     let activity = serde_json::to_vec(&vec![activity(
@@ -1941,10 +1942,20 @@ async fn metadata_unresolved_activity_asset_defers_with_typed_reason() {
         10,
     )])
     .unwrap();
-    let responses = HashMap::from([(
-        activity_url(wallet),
-        vec![activity.clone(), activity.clone(), activity],
-    )]);
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![activity.clone(), activity.clone(), activity],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+    ]);
     let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(b"[]".to_vec())));
     let (control_tx, control_rx) = mpsc::channel(2);
     let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
@@ -1954,31 +1965,49 @@ async fn metadata_unresolved_activity_asset_defers_with_typed_reason() {
         validator_from_fetcher(fetcher),
     );
 
-    let error = preparer.prepare(&[wallet]).await.unwrap_err();
-    assert!(matches!(
-        error,
-        AdmissionError::PositionValidation(CausalPositionError::Positions {
-            source: PositionReadError::MetadataUnresolved { asset, reason },
-            ..
-        }) if asset == crate::asset(1)
-            && reason == "token absent from open and closed Gamma metadata"
-    ));
+    preparer.prepare(&[wallet]).await.unwrap();
+    let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].disposition, "raw_only");
+    assert_eq!(
+        paper
+            .no_copy_disposition(&groups[0].source_trade_id)
+            .unwrap()
+            .unwrap()
+            .2,
+        "identity_unresolved"
+    );
+    let coverage = paper.wallet_coverage(&wallet).unwrap();
+    assert_eq!(coverage.coverage_generation, 0);
+    assert!(!coverage.reanchor_required);
+    assert_eq!(coverage.anchor_seq, Some(0));
+    assert!(paper.position_validation_current(&wallet).unwrap());
     drop(preparer);
     actor.await.unwrap();
 }
 
 #[tokio::test]
-async fn conflicting_stamped_identities_without_metadata_defer_as_metadata_unresolved() {
+async fn conflicting_stamped_identities_without_metadata_are_raw_only_and_anchor() {
     let wallet = wallet(0x75);
     let (_dir, paper, engine) = fresh(&[wallet]);
     let first = activity(wallet, 1, "1.000000", "0xstamped-zero", 10);
     let mut second = activity(wallet, 1, "1.000000", "0xstamped-one", 11);
     second["outcomeIndex"] = json!(1);
     let activity = serde_json::to_vec(&vec![first, second]).unwrap();
-    let responses = HashMap::from([(
-        activity_url(wallet),
-        vec![activity.clone(), activity.clone(), activity],
-    )]);
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![activity.clone(), activity.clone(), activity],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+    ]);
     let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(b"[]".to_vec())));
     let (control_tx, control_rx) = mpsc::channel(2);
     let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
@@ -1988,19 +2017,20 @@ async fn conflicting_stamped_identities_without_metadata_defer_as_metadata_unres
         validator_from_fetcher(fetcher),
     );
 
-    let error = preparer.prepare(&[wallet]).await.unwrap_err();
-    assert!(error.to_string().contains(&format!(
-        "activity asset {} is unresolved by venue metadata: token absent from open and closed Gamma metadata",
-        crate::asset(1)
-    )));
-    assert!(matches!(
-        error,
-        AdmissionError::PositionValidation(CausalPositionError::Positions {
-            source: PositionReadError::MetadataUnresolved { asset, reason },
-            ..
-        }) if asset == crate::asset(1)
-            && reason == "token absent from open and closed Gamma metadata"
-    ));
+    preparer.prepare(&[wallet]).await.unwrap();
+    let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups.iter().all(|group| group.disposition == "raw_only"));
+    assert!(groups.iter().all(|group| {
+        paper
+            .no_copy_disposition(&group.source_trade_id)
+            .unwrap()
+            .is_some_and(|(_, _, reason)| reason == "identity_unresolved")
+    }));
+    let coverage = paper.wallet_coverage(&wallet).unwrap();
+    assert_eq!(coverage.coverage_generation, 0);
+    assert!(!coverage.reanchor_required);
+    assert_eq!(coverage.anchor_seq, Some(0));
     drop(preparer);
     actor.await.unwrap();
 }

@@ -368,6 +368,8 @@ Campaign financial limits and eligibility are canonical in
 
 Copies only a leader's first-ever BUY entry into a market that resolves within the configured horizon. Version-two `wallet_market_history_v2`, `entry_gate_results`, and `wallet_history_status_v2` rows in paper-state are the sole runtime history owner; `CopyEntryGate` is rebuilt from them before producers. Missing or incomplete reconciled history blocks membership publication. The captured legacy history file is a one-time migration input selected by boot-owned `legacy_wallet_history_path`: its source hash and import result are durable; it must stay present and unchanged until the migration reaches phase `installed`, after which file edits are inert. It is not a runtime sidecar. SELLs remain non-consuming.
 
+“History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
+
 Activity groups in one wallet/epoch bucket commit atomically against immutable pre-bucket gate
 state. A single first BUY consumes history even if a later copy gate rejects it; multiple
 same-market candidates in one second are all recorded as ambiguous. `decision_pending` bridges

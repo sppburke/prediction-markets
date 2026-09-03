@@ -392,6 +392,8 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 
 **Fail posture (gate B history unknown).** Missing or incomplete reconciled history fails closed: the wallet cannot be published into membership, and any attempted entry receives the typed `wallet_history_incomplete` disposition. Version-two paper-state records are the authority. The captured legacy history file is a one-time migration input only: a valid import is a conservative seed and remains incomplete until a reconciled-history proof is durably recorded (#544).
 
+“History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
+
 A rejected copy-scope gate logs the typed reason and commits a no-fill (the leader ledger is still mirrored, matching the existing no-edge path). SELL-only and non-entry buckets do not consume history. Defaults for the remaining gate config keys (`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
 
 **Current fill-basis sizing (#339/#544).** Unlike backtest (`simulation.rs`, which sizes at the historical fill price), the copy path computes Kelly cost `c` and the flat-path contract count from the resolved copy-time basis, not the Gamma mid. Paper `clob_best_ask` uses the mandatory plan's exact ladder VWAP; `leader_haircut` uses its boot-owned haircut only after usable book evidence. The signal retains the leader execution as audit evidence, but it cannot substitute for the mandatory current-book decision.

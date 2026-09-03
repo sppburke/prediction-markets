@@ -22,7 +22,7 @@ use pe_service::decision_replay::{
     AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
     DecisionPostBoundaryEvidenceBody, TerminalDispositionEvidence, replay_decision_pending,
 };
-use pe_service::paper_recovery::build_leader_ledger;
+use pe_service::paper_recovery::{build_leader_ledger, replay_wallet_ledger};
 use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
 use pe_source_polymarket_public::{
     ActivityAggregate, ActivityParseContext, ActivityTransport, parse_activity_response,
@@ -146,6 +146,7 @@ fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),
         copy_eligible: true,
+        bracket_commit: false,
         recorded_at_unix: epoch + 20,
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
@@ -391,6 +392,7 @@ fn verified_identity_override_commits_v2_and_replays_with_v1() {
 #[test]
 fn unverified_identity_is_raw_only_reanchors_and_replays() {
     let (dir, paper, mut engine) = fresh_anchored();
+    let coverage_before = paper.wallet_coverage(&wallet()).unwrap();
     let unverified = position_row(
         "TRADE",
         "0xidentity-unverified",
@@ -426,7 +428,12 @@ fn unverified_identity_is_raw_only_reanchors_and_replays() {
         paper.no_copy_disposition(&source_trade_id).unwrap(),
         Some(("rest_poll".to_owned(), 0, "identity_unresolved".to_owned()))
     );
-    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let coverage_after = paper.wallet_coverage(&wallet()).unwrap();
+    assert!(coverage_after.reanchor_required);
+    assert_eq!(
+        coverage_after.coverage_generation,
+        coverage_before.coverage_generation + 1
+    );
     assert!(paper.open_decision_pending().unwrap().is_empty());
     assert!(
         paper
@@ -448,6 +455,83 @@ fn unverified_identity_is_raw_only_reanchors_and_replays() {
     let replayed = build_leader_ledger(&restarted).unwrap();
     let restarted_engine = BucketCommitEngine::load(restarted, replayed).unwrap();
     assert_eq!(state(&restarted_engine, MARKET_A, 0), ShareAmount::ZERO);
+}
+
+#[test]
+fn bracket_unverified_covered_group_is_raw_only_without_reanchor_then_anchors() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let before = paper.wallet_coverage(&wallet()).unwrap();
+    let unverified = position_row(
+        "TRADE",
+        "0xbracket-identity-unverified",
+        MARKET_A,
+        0,
+        "BUY",
+        "7",
+        "0.5",
+        92,
+    );
+    let source_trade_id = unverified.group_id.key().clone();
+    let mut bracket_context = context(92, true);
+    bracket_context.bracket_commit = true;
+    bracket_context
+        .identity_unresolved
+        .insert(source_trade_id.clone());
+    bracket_context.no_copy_dispositions.insert(
+        source_trade_id.clone(),
+        NoCopyDisposition {
+            provenance: "rest_poll".to_owned(),
+            age_secs: 0,
+            reason: "identity_unresolved".to_owned(),
+            recorded_at_unix: 112,
+        },
+    );
+
+    let result = engine
+        .commit(vec![unverified], &bracket_context, zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&source_trade_id.0], "raw_only");
+    assert!(result.pending.is_empty());
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(paper.wallet_coverage(&wallet()).unwrap(), before);
+    assert_eq!(
+        paper.no_copy_disposition(&source_trade_id).unwrap(),
+        Some(("rest_poll".to_owned(), 0, "identity_unresolved".to_owned()))
+    );
+    assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert!(
+        paper
+            .gate_history()
+            .unwrap()
+            .get(&wallet())
+            .is_none_or(std::collections::HashSet::is_empty)
+    );
+
+    let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
+    engine
+        .install_anchors(&[AnchorInstall {
+            wallet: wallet(),
+            balances: Vec::new(),
+            cutoff: 92,
+            proof: AnchorProof {
+                positions_proof_hash: "bracket-unverified".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: 112,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        }])
+        .unwrap();
+    let anchored = paper.wallet_coverage(&wallet()).unwrap();
+    assert_eq!(anchored.anchor_seq, Some(1));
+    assert_eq!(anchored.coverage_generation, before.coverage_generation);
+    assert!(!anchored.reanchor_required);
 }
 
 #[test]
@@ -548,6 +632,7 @@ fn covered_identity_resolution_uses_verified_history_and_keeps_unverified_raw_on
     resolved_context
         .identity_unresolved
         .insert(unverified_id.clone());
+    resolved_context.bracket_commit = true;
     resolved_context.no_copy_dispositions.insert(
         unverified_id.clone(),
         NoCopyDisposition {
@@ -681,6 +766,130 @@ fn mixed_corrected_unverified_bucket_rolls_back_every_surface_then_retries() {
             .is_some()
     );
     assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+}
+
+#[test]
+fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let first = position_row("TRADE", "0xbatch-first", MARKET_A, 0, "BUY", "3", "0.5", 93);
+    let second = position_row(
+        "TRADE",
+        "0xbatch-second",
+        MARKET_B,
+        0,
+        "BUY",
+        "4",
+        "0.5",
+        94,
+    );
+    let first_id = first.group_id.key().clone();
+    let second_id = second.group_id.key().clone();
+    let mut first_context = context(93, true);
+    first_context.copy_eligible = false;
+    let mut second_context = context(94, true);
+    second_context.copy_eligible = false;
+    let database_path = dir.path().join("paper.db");
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_second_batch_bucket BEFORE INSERT ON activity_groups
+             WHEN NEW.source_epoch = 94
+             BEGIN SELECT RAISE(FAIL, 'injected ordinary batch failure'); END;",
+        )
+        .unwrap();
+
+    let result = engine.commit_batch(|engine| {
+        engine.commit(vec![first.clone()], &first_context, zero_basis())?;
+        engine.commit(vec![second.clone()], &second_context, zero_basis())?;
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert!(paper.activity_group_state(&first_id).unwrap().is_none());
+    assert!(paper.activity_group_state(&second_id).unwrap().is_none());
+    assert!(paper.leader_positions().unwrap().is_empty());
+    assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert!(paper.gate_history().unwrap().is_empty());
+    assert!(!engine.history_complete(&wallet()));
+    assert!(!engine.is_fenced(&wallet()));
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
+    assert_eq!(paper.cursor(&wallet()).unwrap(), Some(0));
+    assert!(paper.position_validation_current(&wallet()).unwrap());
+    let revisions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM activity_group_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(revisions, 0);
+
+    connection
+        .execute_batch("DROP TRIGGER fail_second_batch_bucket;")
+        .unwrap();
+    drop(connection);
+    let committed = engine
+        .commit_batch(|engine| {
+            let first = engine.commit(vec![first], &first_context, zero_basis())?;
+            let second = engine.commit(vec![second], &second_context, zero_basis())?;
+            Ok([first, second])
+        })
+        .unwrap();
+    assert_eq!(committed[0].dispositions[&first_id.0], "not_copy_eligible");
+    assert_eq!(committed[1].dispositions[&second_id.0], "not_copy_eligible");
+    assert!(engine.history_complete(&wallet()));
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 3_000_000);
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 4_000_000);
+    assert!(paper.activity_group_state(&first_id).unwrap().is_some());
+    assert!(paper.activity_group_state(&second_id).unwrap().is_some());
+}
+
+#[test]
+fn replay_is_identical_for_batched_and_single_bucket_commits() {
+    let (_batch_dir, batch_paper, mut batch_engine) = fresh_anchored();
+    let (_single_dir, single_paper, mut single_engine) = fresh_anchored();
+    let first = position_row(
+        "TRADE",
+        "0xreplay-batch-first",
+        MARKET_A,
+        0,
+        "BUY",
+        "3",
+        "0.5",
+        93,
+    );
+    let second = position_row(
+        "TRADE",
+        "0xreplay-batch-second",
+        MARKET_B,
+        1,
+        "BUY",
+        "4",
+        "0.5",
+        94,
+    );
+    let mut first_context = context(93, true);
+    first_context.copy_eligible = false;
+    let mut second_context = context(94, true);
+    second_context.copy_eligible = false;
+
+    batch_engine
+        .commit_batch(|engine| {
+            engine.commit(vec![first.clone()], &first_context, zero_basis())?;
+            engine.commit(vec![second.clone()], &second_context, zero_basis())?;
+            Ok(())
+        })
+        .unwrap();
+    single_engine
+        .commit(vec![first], &first_context, zero_basis())
+        .unwrap();
+    single_engine
+        .commit(vec![second], &second_context, zero_basis())
+        .unwrap();
+
+    let batch_replay = replay_wallet_ledger(&batch_paper, wallet()).unwrap();
+    let single_replay = replay_wallet_ledger(&single_paper, wallet()).unwrap();
+    let batch_capture = ledger_capture(&batch_replay, &batch_paper, wallet()).unwrap();
+    let single_capture = ledger_capture(&single_replay, &single_paper, wallet()).unwrap();
+    assert_eq!(batch_capture.hash, single_capture.hash);
 }
 
 #[test]

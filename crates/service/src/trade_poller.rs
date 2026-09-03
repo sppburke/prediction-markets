@@ -625,6 +625,7 @@ impl TradePoller {
             reconstruction_quality,
             signal_config: self.signal_config.clone(),
             copy_eligible,
+            bracket_commit: false,
             recorded_at_unix: now.unix_timestamp(),
             observation_provenance,
             no_copy_dispositions,

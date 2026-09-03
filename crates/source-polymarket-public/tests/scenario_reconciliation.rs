@@ -59,6 +59,32 @@ fn mapping(rows: Vec<Value>) -> ActivityAssetMapping {
     ActivityAssetMapping::from_rows(&parsed.rows)
 }
 
+fn verified_mapping(rows: Vec<Value>) -> ActivityAssetMapping {
+    let mut mapping = mapping(rows);
+    let identities = mapping
+        .tokens()
+        .filter_map(|asset| {
+            mapping
+                .identity(asset)
+                .cloned()
+                .map(|identity| (asset.clone(), identity))
+        })
+        .collect::<Vec<_>>();
+    for (asset, identity) in identities {
+        mapping
+            .apply_verified(
+                &asset,
+                &VerifiedTokenIdentity {
+                    condition_id: identity.condition_id,
+                    outcome: identity.outcome,
+                    evidence_hash: "fixture-metadata-page".to_owned(),
+                },
+            )
+            .unwrap();
+    }
+    mapping
+}
+
 fn position_url(partition: PositionPartition, offset: u32) -> String {
     PolymarketEndpoint::CurrentPositionsReconciliationPage {
         user: WALLET.to_owned(),
@@ -128,7 +154,7 @@ async fn one_position_read(
     activity_rows: Vec<Value>,
     position_rows: Vec<Value>,
 ) -> pe_source_polymarket_public::CompletePositionsRead {
-    let activity = mapping(activity_rows);
+    let activity = verified_mapping(activity_rows);
     let fetcher = FixtureFetcher::new(HashMap::from([
         (
             position_url(PositionPartition::NotRedeemable, 0),
@@ -147,7 +173,7 @@ async fn one_position_read(
 #[tokio::test]
 async fn captured_partition_row_uses_exact_size_and_activity_combo_identity() {
     let captured = include_bytes!("fixtures/positions_partition_true_w0_trimmed.json").to_vec();
-    let activity = mapping(vec![json!({
+    let activity = verified_mapping(vec![json!({
         "proxyWallet": WALLET,
         "timestamp": 100,
         "conditionId": CONDITION,
@@ -188,7 +214,7 @@ async fn captured_partition_row_uses_exact_size_and_activity_combo_identity() {
 
 #[tokio::test]
 async fn partition_layout_and_presentation_do_not_change_semantic_proof() {
-    let activity = mapping(vec![activity_row(
+    let activity = verified_mapping(vec![activity_row(
         100,
         "0xactivity".to_owned(),
         "asset-1".to_owned(),
@@ -317,7 +343,7 @@ async fn every_position_semantic_field_changes_the_proof() {
 
 #[tokio::test]
 async fn duplicate_asset_across_explicit_partitions_rejects() {
-    let activity = mapping(vec![activity_row(
+    let activity = verified_mapping(vec![activity_row(
         100,
         "0xactivity".to_owned(),
         "asset-1".to_owned(),
@@ -345,7 +371,7 @@ async fn duplicate_asset_across_explicit_partitions_rejects() {
 }
 
 #[tokio::test]
-async fn missing_and_unverified_conflicting_activity_mapping_rejects() {
+async fn missing_and_unverified_activity_mapping_rejects() {
     let activity = mapping(Vec::new());
     let body = serde_json::to_vec(&vec![json!({
         "proxyWallet": WALLET,
@@ -362,6 +388,30 @@ async fn missing_and_unverified_conflicting_activity_mapping_rejects() {
     assert!(matches!(
         fetch_complete_positions(&fetcher, BASE, wallet(), &activity).await,
         Err(PositionReadError::MissingActivityMapping { .. })
+    ));
+
+    let unverified = mapping(vec![activity_row(
+        100,
+        "0xmatching".to_owned(),
+        "asset-1".to_owned(),
+        0,
+    )]);
+    let position = serde_json::to_vec(&vec![json!({
+        "proxyWallet": WALLET,
+        "asset": "asset-1",
+        "conditionId": "0xcondition0",
+        "size": "1",
+        "outcomeIndex": 0
+    })])
+    .unwrap();
+    let fetcher = FixtureFetcher::new(HashMap::from([(
+        position_url(PositionPartition::NotRedeemable, 0),
+        position,
+    )]));
+    assert!(matches!(
+        fetch_complete_positions(&fetcher, BASE, wallet(), &unverified).await,
+        Err(PositionReadError::MetadataUnresolved { asset, reason })
+            if asset == "asset-1" && reason == "position asset unverified by venue metadata"
     ));
 
     let conflicting = vec![
@@ -389,7 +439,8 @@ async fn missing_and_unverified_conflicting_activity_mapping_rejects() {
     )]));
     assert!(matches!(
         fetch_complete_positions(&fetcher, BASE, wallet(), &conflicting).await,
-        Err(PositionReadError::MissingActivityMapping { .. })
+        Err(PositionReadError::MetadataUnresolved { asset, reason })
+            if asset == "asset-1" && reason == "position asset unverified by venue metadata"
     ));
 }
 
@@ -546,7 +597,8 @@ async fn metadata_identity_overrides_disagreeing_position_stamp() {
     ]));
     assert!(matches!(
         fetch_complete_positions(&fetcher, BASE, wallet(), &mapping).await,
-        Err(PositionReadError::PositionMappingConflict { .. })
+        Err(PositionReadError::MetadataUnresolved { asset, reason })
+            if asset == "asset-1" && reason == "position asset unverified by venue metadata"
     ));
 
     mapping
@@ -572,7 +624,7 @@ async fn metadata_identity_overrides_disagreeing_position_stamp() {
 
 #[tokio::test]
 async fn exact_position_precision_and_wallet_identity_fail_closed() {
-    let activity = mapping(vec![activity_row(
+    let activity = verified_mapping(vec![activity_row(
         100,
         "0xactivity".to_owned(),
         "asset-1".to_owned(),
@@ -618,7 +670,7 @@ async fn saturated_positions_terminal_offset_is_typed_incomplete() {
             row
         })
         .collect::<Vec<_>>();
-    let activity = mapping(activity_rows);
+    let activity = verified_mapping(activity_rows);
     let mut responses = HashMap::new();
     for offset in (0..=10_000_u32).step_by(500) {
         let rows = (offset..offset + RECONCILIATION_PAGE_LIMIT)

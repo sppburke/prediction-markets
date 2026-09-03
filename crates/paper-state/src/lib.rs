@@ -565,6 +565,24 @@ impl PaperStateDb {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Begin one caller-owned batch spanning multiple activity-bucket savepoints.
+    pub fn begin_batch(&self) -> Result<(), PaperStateError> {
+        self.lock().execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    /// Commit the caller-owned activity-bucket batch.
+    pub fn commit_batch(&self) -> Result<(), PaperStateError> {
+        self.lock().execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Roll back the caller-owned activity-bucket batch.
+    pub fn rollback_batch(&self) -> Result<(), PaperStateError> {
+        self.lock().execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
     // ── Input dedup ────────────────────────────────────────────────────────────
 
     /// Whether this `source_trade_id` has already been processed. Checked as the
@@ -762,7 +780,7 @@ impl PaperStateDb {
     ) -> Result<(), PaperStateError> {
         validate_activity_bucket(bucket)?;
         let mut conn = self.lock();
-        let tx = conn.transaction()?;
+        let tx = conn.savepoint()?;
         let is_revision_fence = bucket
             .fence
             .as_ref()
@@ -3273,7 +3291,7 @@ fn tx_flip_dispatch_ready(
 }
 
 fn tx_record_no_copy_disposition(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     source_trade_id: &SourceTradeId,
     d: &NoCopyDisposition,
 ) -> Result<(), PaperStateError> {
@@ -3339,7 +3357,7 @@ fn tx_terminalize_pending(
 }
 
 fn tx_mark_seen(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     source_trade_id: &SourceTradeId,
     transaction_hash: Option<&str>,
 ) -> Result<(), PaperStateError> {
@@ -3355,10 +3373,7 @@ fn tx_mark_seen(
     Ok(())
 }
 
-fn tx_upsert_leader(
-    tx: &Transaction<'_>,
-    leader: &LeaderPositionRow,
-) -> Result<(), PaperStateError> {
+fn tx_upsert_leader(tx: &Connection, leader: &LeaderPositionRow) -> Result<(), PaperStateError> {
     tx.execute(
         "INSERT INTO leader_positions \
             (wallet_hex, market_id, outcome_id, long_amount_str, short_amount_str) \
@@ -3768,6 +3783,47 @@ mod tests {
             advance_cursor: false,
         })
         .unwrap();
+    }
+
+    fn activity_disposition(
+        wallet: WalletAddress,
+        source_epoch: i64,
+        suffix: char,
+    ) -> ActivityDispositionRecord {
+        ActivityDispositionRecord {
+            source_trade_id: group_id(suffix),
+            transaction_hash: format!("transaction-{suffix}"),
+            wallet,
+            source_epoch,
+            semantic_revision: format!("revision-{suffix}"),
+            activity_type: "TRADE".to_owned(),
+            disposition: "applied".to_owned(),
+            proof_json: "{\"version\":1,\"effect\":\"RawOnly\"}".to_owned(),
+            no_copy: None,
+        }
+    }
+
+    fn activity_bucket(
+        wallet: WalletAddress,
+        source_epoch: i64,
+        suffixes: &[char],
+    ) -> ActivityBucketCommit {
+        ActivityBucketCommit {
+            wallet,
+            source_epoch,
+            dispositions: suffixes
+                .iter()
+                .map(|suffix| activity_disposition(wallet, source_epoch, *suffix))
+                .collect(),
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: None,
+            pending: Vec::new(),
+            fence: None,
+            reanchor: None,
+            advance_cursor: false,
+        }
     }
 
     fn leader(long: u64, short: u64) -> LeaderPositionRow {
@@ -4227,6 +4283,59 @@ mod tests {
         assert!(!coverage.reanchor_required);
         assert_eq!(coverage.anchor_seq, Some(1));
         assert!(db.position_validation(&wallet).unwrap().is_some());
+    }
+
+    #[test]
+    fn activity_bucket_savepoint_outside_batch_rolls_back_on_error() {
+        let (dir, db) = db();
+        let trigger = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        trigger
+            .execute_batch(
+                "CREATE TRIGGER fail_second_activity_group
+                 BEFORE INSERT ON activity_groups
+                 WHEN NEW.transaction_hash = 'transaction-b'
+                 BEGIN SELECT RAISE(FAIL, 'injected second group failure'); END;",
+            )
+            .unwrap();
+
+        let bucket = activity_bucket(wallet(), 100, &['a', 'b']);
+        assert!(matches!(
+            db.commit_activity_bucket(&bucket),
+            Err(PaperStateError::Sqlite(_))
+        ));
+        for source_trade_id in [group_id('a'), group_id('b')] {
+            assert!(db.activity_group_state(&source_trade_id).unwrap().is_none());
+            assert!(!db.is_seen(&source_trade_id).unwrap());
+        }
+        let revisions: i64 = trigger
+            .query_row("SELECT COUNT(*) FROM activity_group_revisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(revisions, 0);
+    }
+
+    #[test]
+    fn activity_bucket_savepoints_are_invisible_until_outer_batch_commits() {
+        let (dir, db) = db();
+        let observer = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        let durable_groups = || {
+            observer
+                .query_row("SELECT COUNT(*) FROM activity_groups", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+
+        db.begin_batch().unwrap();
+        db.commit_activity_bucket(&activity_bucket(wallet(), 100, &['a']))
+            .unwrap();
+        assert_eq!(durable_groups(), 0);
+        db.commit_activity_bucket(&activity_bucket(wallet(), 101, &['b']))
+            .unwrap();
+        assert_eq!(durable_groups(), 0);
+        db.commit_batch().unwrap();
+        assert_eq!(durable_groups(), 2);
     }
 
     #[test]

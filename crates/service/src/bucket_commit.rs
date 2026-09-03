@@ -41,6 +41,8 @@ pub struct BucketDecisionContext {
     pub reconstruction_quality: ReconstructionQuality,
     pub signal_config: SignalConfig,
     pub copy_eligible: bool,
+    /// Bracket catch-up installs an anchor immediately after this read.
+    pub bracket_commit: bool,
     pub recorded_at_unix: i64,
     /// Transport retained from the first durable observation of each group.
     pub observation_provenance: HashMap<SourceTradeId, TradeProvenance>,
@@ -270,6 +272,36 @@ impl BucketCommitEngine {
     #[must_use]
     pub fn history_complete(&self, wallet: &WalletAddress) -> bool {
         self.complete_history.contains(wallet)
+    }
+
+    /// Commit several activity buckets as one durable paper-state batch.
+    pub fn commit_batch<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, BucketCommitError>,
+    ) -> Result<T, BucketCommitError> {
+        let ledger = self.ledger.clone();
+        let entry_gate = self.entry_gate.clone();
+        let complete_history = self.complete_history.clone();
+        let fences = self.fences.clone();
+        self.paper_state.begin_batch()?;
+        let result = f(self).and_then(|value| {
+            self.paper_state.commit_batch()?;
+            Ok(value)
+        });
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let rollback = self.paper_state.rollback_batch();
+                self.ledger = ledger;
+                self.entry_gate = entry_gate;
+                self.complete_history = complete_history;
+                self.fences = fences;
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error.into()),
+                }
+            }
+        }
     }
 
     /// Compare-and-swap one complete anchor batch, then publish the prebuilt
@@ -583,9 +615,10 @@ impl BucketCommitEngine {
             return self.commit_fence(&aggregates, wallet, source_epoch, cause, trigger, context);
         }
         let reanchor_trigger = mutations.iter().find_map(|mutation| {
-            if context
-                .identity_unresolved
-                .contains(&mutation.source_trade_id)
+            if !context.bracket_commit
+                && context
+                    .identity_unresolved
+                    .contains(&mutation.source_trade_id)
             {
                 Some((
                     mutation.source_trade_id.clone(),
@@ -888,16 +921,26 @@ impl BucketCommitEngine {
             mutations.push(mutation.clone());
         }
         let history_effects = self.covered_history_effects(wallet, source_epoch, &mutations);
-        let unresolved_trigger = mutations.iter().find_map(|mutation| {
-            context
-                .identity_unresolved
-                .contains(&mutation.source_trade_id)
-                .then(|| mutation.source_trade_id.clone())
-        });
-        let trigger = mutations
-            .first()
-            .map(|mutation| mutation.source_trade_id.clone())
-            .ok_or(BucketCommitError::PartialDurableBucket)?;
+        let unresolved_trigger = (!context.bracket_commit)
+            .then(|| {
+                mutations.iter().find_map(|mutation| {
+                    context
+                        .identity_unresolved
+                        .contains(&mutation.source_trade_id)
+                        .then(|| mutation.source_trade_id.clone())
+                })
+            })
+            .flatten();
+        let late_trigger = late
+            .then(|| {
+                mutations.iter().find_map(|mutation| {
+                    (!context
+                        .identity_unresolved
+                        .contains(&mutation.source_trade_id))
+                    .then(|| mutation.source_trade_id.clone())
+                })
+            })
+            .flatten();
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
                 wallet,
@@ -915,8 +958,8 @@ impl BucketCommitEngine {
                         reason: "identity_unresolved".to_owned(),
                     })
                     .or_else(|| {
-                        late.then(|| ReanchorRecord {
-                            source_trade_id: trigger,
+                        late_trigger.map(|source_trade_id| ReanchorRecord {
+                            source_trade_id,
                             reason: disposition.to_owned(),
                         })
                     }),
@@ -1098,7 +1141,9 @@ impl BucketCommitEngine {
                 .identity_unresolved
                 .contains(aggregate.group_id.key());
             let disposition = if unresolved {
-                unresolved_trigger.get_or_insert_with(|| aggregate.group_id.key().clone());
+                if !context.bracket_commit {
+                    unresolved_trigger.get_or_insert_with(|| aggregate.group_id.key().clone());
+                }
                 "raw_only".to_owned()
             } else if aggregate.group_id.key() == &trigger {
                 cause.as_str().to_owned()
@@ -1181,7 +1226,9 @@ impl BucketCommitEngine {
                 .contains(aggregate.group_id.key());
             let disposition = if differs {
                 if unresolved {
-                    unresolved_trigger.get_or_insert_with(|| aggregate.group_id.key().clone());
+                    if !context.bracket_commit {
+                        unresolved_trigger.get_or_insert_with(|| aggregate.group_id.key().clone());
+                    }
                     "raw_only".to_owned()
                 } else if aggregate.group_id.key() == &trigger && !already_fenced {
                     cause.as_str().to_owned()
@@ -1267,12 +1314,16 @@ impl BucketCommitEngine {
         let applied = order_independent_validity(&self.ledger, wallet, &known)
             && candidate.apply_all_or_none(&known).is_ok();
         let mut dispositions = BTreeMap::new();
-        let unresolved_trigger = mutations.iter().find_map(|mutation| {
-            context
-                .identity_unresolved
-                .contains(&mutation.source_trade_id)
-                .then(|| mutation.source_trade_id.clone())
-        });
+        let unresolved_trigger = (!context.bracket_commit)
+            .then(|| {
+                mutations.iter().find_map(|mutation| {
+                    context
+                        .identity_unresolved
+                        .contains(&mutation.source_trade_id)
+                        .then(|| mutation.source_trade_id.clone())
+                })
+            })
+            .flatten();
         let records = aggregates
             .iter()
             .zip(mutations)

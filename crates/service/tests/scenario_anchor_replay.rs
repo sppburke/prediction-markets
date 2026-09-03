@@ -121,6 +121,7 @@ fn context(epoch: i64) -> BucketDecisionContext {
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),
         copy_eligible: false,
+        bracket_commit: false,
         recorded_at_unix: epoch,
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),

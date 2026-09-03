@@ -51,6 +51,7 @@ pub struct CopyEntryGateConfig;
 ///
 /// Built once at startup from a per-wallet history map; mutated in-session via
 /// [`Self::record_entry`] so same-session re-entries are also blocked.
+#[derive(Clone)]
 pub struct CopyEntryGate {
     /// For each leader wallet, the conservative set of markets with prior trade
     /// activity. A missing wallet is unavailable and therefore fails closed.

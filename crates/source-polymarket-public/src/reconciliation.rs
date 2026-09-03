@@ -631,7 +631,7 @@ pub enum PositionReadError {
     ConflictingActivityMapping { asset: String },
     #[error("activity asset {asset} has mixed ordinary/combo classifications")]
     MixedActivityClassification { asset: String },
-    #[error("activity asset {asset} is unresolved by venue metadata: {reason}")]
+    #[error("position asset {asset} is unresolved by venue metadata: {reason}")]
     MetadataUnresolved { asset: String, reason: String },
     #[error("activity condition {condition_id} outcome {outcome} maps to multiple assets")]
     ConflictingOutcomeMapping { condition_id: String, outcome: u16 },
@@ -745,31 +745,36 @@ pub async fn fetch_complete_positions(
                 }
                 let asset =
                     PolymarketTokenId(required_raw_string(decoded.asset, row_index, "asset")?);
-                let condition_id = PolymarketConditionId(
+                let _position_condition_id = PolymarketConditionId(
                     required_raw_string(decoded.condition_id, row_index, "conditionId")?
                         .to_ascii_lowercase(),
                 );
-                let outcome = OutcomeId(decoded.outcome_index.ok_or(
+                let _position_outcome = OutcomeId(decoded.outcome_index.ok_or(
                     PositionReadError::MissingField {
                         row_index,
                         field: "outcomeIndex",
                     },
                 )?);
-                let identity = mapping.identity(&asset).ok_or_else(|| {
-                    PositionReadError::MissingActivityMapping {
-                        asset: asset.0.clone(),
+                let identity = match mapping.identity(&asset) {
+                    Some(identity) => identity,
+                    None if mapping.unresolved().contains_key(&asset) => {
+                        return Err(PositionReadError::MetadataUnresolved {
+                            asset: asset.0,
+                            reason: "position asset unverified by venue metadata".to_owned(),
+                        });
                     }
-                })?;
-                if !identity.verified
-                    && (identity.condition_id != condition_id || identity.outcome != outcome)
-                {
-                    return Err(PositionReadError::PositionMappingConflict { asset: asset.0 });
-                }
-                let (condition_id, outcome) = if identity.verified {
-                    (identity.condition_id.clone(), identity.outcome)
-                } else {
-                    (condition_id, outcome)
+                    None => {
+                        return Err(PositionReadError::MissingActivityMapping { asset: asset.0 });
+                    }
                 };
+                if !identity.verified {
+                    return Err(PositionReadError::MetadataUnresolved {
+                        asset: asset.0,
+                        reason: "position asset unverified by venue metadata".to_owned(),
+                    });
+                }
+                let condition_id = identity.condition_id.clone();
+                let outcome = identity.outcome;
                 let size = ShareAmount::from_decimal_exact(decoded.size.0).map_err(|error| {
                     PositionReadError::InvalidAmount {
                         row_index,
