@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Shared crash-safe primitives for the generation activation and rollback drivers.
+
+set -euo pipefail
+
+DEPLOY_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$DEPLOY_SCRIPT_DIR/../.." && pwd)
+
+if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]]; then
+  : "${PE_ACTIVATION_TEST_ROOT:?PE_ACTIVATION_TEST_ROOT is required in test mode}"
+  DEPLOY_HOME=$(realpath -m "$PE_ACTIVATION_TEST_ROOT")
+  SERVICE_ROOT="$DEPLOY_HOME/prediction-markets"
+  SERVICE_MUTATE=(systemctl)
+else
+  DEPLOY_HOME=/home/sean
+  SERVICE_ROOT=/home/sean/prediction-markets
+  SERVICE_MUTATE=(sudo -n systemctl)
+fi
+
+MANIFEST="$DEPLOY_HOME/pe-activation.json"
+DEPLOY_LOCK="$DEPLOY_HOME/.pe-deploy.lock"
+SERVICE_BINARY="$SERVICE_ROOT/target/release/pe-service"
+SERVICE_CONFIG="$SERVICE_ROOT/smoke-test/service.toml"
+SERVICE_ENV="$SERVICE_ROOT/.env"
+FORGE_ROOT="$SERVICE_ROOT"
+FORGE_FLAG="$FORGE_ROOT/data/eval-results/rank_and_push.loop"
+FORGE_LOCKS=(
+  "$FORGE_ROOT/data/eval-results/.rank_and_push_loop.lock"
+  "$FORGE_ROOT/data/eval-results/.rank_and_push.lock"
+  "$FORGE_ROOT/data/wallet_cache.db.lock"
+)
+
+SIMULATE_CRASH_AFTER=${SIMULATE_CRASH_AFTER:-}
+
+die() {
+  echo "FATAL: $*" >&2
+  exit 1
+}
+
+maybe_crash() {
+  local boundary=$1
+  if [[ -n "$SIMULATE_CRASH_AFTER" && "$SIMULATE_CRASH_AFTER" == "$boundary" ]]; then
+    echo "SIMULATED CRASH after $boundary" >&2
+    exit 86
+  fi
+}
+
+acquire_deploy_lock() {
+  mkdir -p "$DEPLOY_HOME"
+  touch "$DEPLOY_LOCK"
+  exec 9<"$DEPLOY_LOCK"
+  flock -n 9 || die "another generation driver holds $DEPLOY_LOCK"
+  if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 && -n "${PE_ACTIVATION_TEST_HOLD_LOCK_FILE:-}" ]]; then
+    : > "$PE_ACTIVATION_TEST_HOLD_LOCK_FILE.ready"
+    while [[ -e "$PE_ACTIVATION_TEST_HOLD_LOCK_FILE" ]]; do sleep 0.05; done
+  fi
+}
+
+sha256_file() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+manifest_get() {
+  python3 -c 'import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+for part in sys.argv[2].split("."):
+    value=value[part]
+if isinstance(value, bool): print(str(value).lower())
+elif value is None: print("")
+elif isinstance(value, (dict,list)): print(json.dumps(value, sort_keys=True, separators=(",",":")))
+else: print(value)' "$MANIFEST" "$1"
+}
+
+atomic_manifest_json() {
+  local json=$1 boundary=$2
+  maybe_crash "before-manifest-$boundary"
+  python3 -c 'import json,os,sys
+path,payload=sys.argv[1:]
+value=json.loads(payload)
+parent=os.path.dirname(path) or "."
+tmp=os.path.join(parent, ".pe-activation.tmp.%d" % os.getpid())
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, sort_keys=True, separators=(",",":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+directory=os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try: os.fsync(directory)
+finally: os.close(directory)' "$MANIFEST" "$json"
+  maybe_crash "$boundary"
+  maybe_crash "after-manifest-$boundary"
+}
+
+manifest_advance() {
+  local state=$1 patch=${2:-'{}'}
+  local json
+  json=$(python3 -c 'import json,sys
+path,state,patch=sys.argv[1:]
+value=json.load(open(path, encoding="utf-8"))
+delta=json.loads(patch)
+value.update(delta)
+value["state"]=state
+print(json.dumps(value, sort_keys=True, separators=(",",":")))' \
+    "$MANIFEST" "$state" "$patch")
+  atomic_manifest_json "$json" "$state"
+}
+
+manifest_patch_boundary() {
+  local boundary=$1 patch=$2 json
+  json=$(python3 -c 'import json,sys
+path,patch=sys.argv[1:]
+value=json.load(open(path, encoding="utf-8"))
+value.update(json.loads(patch))
+print(json.dumps(value, sort_keys=True, separators=(",",":")))' "$MANIFEST" "$patch")
+  atomic_manifest_json "$json" "$boundary"
+}
+
+atomic_adopt() {
+  local source=$1 destination=$2 mode=$3 boundary=$4 expected actual
+  expected=$(sha256_file "$source")
+  if [[ -f "$destination" ]]; then
+    actual=$(sha256_file "$destination")
+    if [[ "$actual" == "$expected" && "$(stat -c '%a' "$destination")" == "${mode#0}" ]]; then
+      return 0
+    fi
+  fi
+  mkdir -p "$(dirname "$destination")"
+  python3 -c 'import os,shutil,sys
+source,destination,mode=sys.argv[1:]
+parent=os.path.dirname(destination) or "."
+tmp=os.path.join(parent, ".pe-adopt.tmp.%d" % os.getpid())
+shutil.copyfile(source, tmp)
+os.chmod(tmp, int(mode, 8))
+with open(tmp, "rb") as handle: os.fsync(handle.fileno())
+os.replace(tmp, destination)
+directory=os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try: os.fsync(directory)
+finally: os.close(directory)' "$source" "$destination" "$mode"
+  actual=$(sha256_file "$destination")
+  [[ "$actual" == "$expected" ]] || die "adopted hash mismatch for $destination"
+  maybe_crash "$boundary"
+}
+
+systemctl_enabled() {
+  if systemctl is-enabled "$1" >/dev/null 2>&1; then echo true; else echo false; fi
+}
+
+systemctl_active() {
+  if systemctl is-active "$1" >/dev/null 2>&1; then echo true; else echo false; fi
+}
+
+forge_enabled() {
+  if systemctl --user is-enabled pe-rank-loop >/dev/null 2>&1; then echo true; else echo false; fi
+}
+
+forge_active() {
+  if systemctl --user is-active pe-rank-loop >/dev/null 2>&1; then echo true; else echo false; fi
+}
+
+atomic_flag_write() {
+  local value=$1 tmp
+  mkdir -p "$(dirname "$FORGE_FLAG")"
+  if [[ "$value" == missing ]]; then
+    rm -f "$FORGE_FLAG"
+    python3 -c 'import os,sys
+directory=os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try: os.fsync(directory)
+finally: os.close(directory)' "$(dirname "$FORGE_FLAG")"
+    return
+  fi
+  tmp="$(dirname "$FORGE_FLAG")/.rank_and_push.loop.$$"
+  printf '%s\n' "$value" > "$tmp"
+  python3 -c 'import os,sys
+path=sys.argv[1]
+with open(path, "rb") as handle: os.fsync(handle.fileno())' "$tmp"
+  mv "$tmp" "$FORGE_FLAG"
+  python3 -c 'import os,sys
+directory=os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try: os.fsync(directory)
+finally: os.close(directory)' "$(dirname "$FORGE_FLAG")"
+}
+
+pause_forge() {
+  atomic_flag_write stop
+  systemctl --user stop pe-rank-loop
+  [[ "$(forge_active)" == false ]] || die "pe-rank-loop did not become inactive"
+  if pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|pe-bootstrap|latency_shift_rerank[.]py|rank_72hr_buyandhold[.]py' >/dev/null; then
+    die "a Forge cycle descendant is still running"
+  fi
+  local lock
+  for lock in "${FORGE_LOCKS[@]}"; do
+    mkdir -p "$(dirname "$lock")"
+    touch "$lock"
+    flock -n "$lock" true || die "Forge lock is still held: $lock"
+  done
+}
+
+restore_forge() {
+  local prior_flag=$1 prior_enabled=$2 prior_active=$3
+  atomic_flag_write "$prior_flag"
+  if [[ "$prior_enabled" == true ]]; then
+    systemctl --user enable pe-rank-loop
+    [[ "$(forge_enabled)" == true ]] || die "failed to restore Forge enablement"
+  else
+    systemctl --user disable pe-rank-loop
+    [[ "$(forge_enabled)" == false ]] || die "failed to restore Forge disablement"
+  fi
+  if [[ "$prior_active" == true ]]; then
+    systemctl --user start pe-rank-loop
+    [[ "$(forge_active)" == true ]] || die "failed to restore Forge activity"
+  else
+    systemctl --user stop pe-rank-loop
+    [[ "$(forge_active)" == false ]] || die "failed to restore Forge inactivity"
+  fi
+}

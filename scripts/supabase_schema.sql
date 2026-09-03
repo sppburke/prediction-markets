@@ -390,7 +390,8 @@ begin
       message = 'service_watchlist_replace_v1_conflict';
   end if;
 
-  delete from service_watchlist;
+  -- Supabase preloads safeupdate for the API role, so retain an explicit predicate.
+  delete from service_watchlist where true;
   insert into service_watchlist (wallet_hex, rank, leader_score_bps, updated_at)
   select value->>'wallet_hex',
          (value->>'rank')::integer,

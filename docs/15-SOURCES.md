@@ -81,13 +81,18 @@
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
-> **Data-API reconciliation contract re-verified live (2026-09-02, issues #544/#555).**
+> **Data-API reconciliation contract re-verified live (2026-09-03, issues #544/#555/#557).**
 > `/activity` accepts one comma-separated `type` parameter: the production request
 > `TRADE,SPLIT,MERGE,REDEEM,CONVERSION` returned mixed position-changing activity in one response.
 > Its documented maximum offset is 5,000. `/positions` accepts `limit=500`, maximum offset
 > 10,000, and the deterministic `sizeThreshold=0&sortBy=TOKENS&sortDirection=ASC` request used by
 > the reconciliation reader. Explicit `redeemable=false` and `redeemable=true` walks are disjoint
 > partitions and must both complete; no omitted-filter inference substitutes for either partition.
+> A live #557 incident-wallet check observed `/positions` `size` at four decimal places
+> (`34.0795`), while the same wallet's incident `/activity?type=REDEEM` `size` carried five decimal places.
+> Across the seven incident anchors, position balances carried at most four decimal places. This is
+> an observed source precision, not a parser rounding rule: the reader retains the exact lexical
+> decimal, and the canonical REDEEM residual bound and rationale live in `docs/_GLOSSARY.md`.
 > Captured URLs, fetch times, byte lengths, and SHA-256 hashes are recorded in the issue-#544
 > fixture `MANIFEST.json`. **`/activity` `start` is INCLUSIVE (2026-09-01, #544 activation
 > rehearsal):** a request with `start=S` returns rows whose `timestamp` equals `S`, proven live
@@ -155,7 +160,7 @@
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-02 | 2026-11-01 |
+| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-03 | 2026-11-01 |
 | https://docs.polymarket.com/concepts/resolution | 2026-09-01 | 2026-10-31 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |
@@ -233,6 +238,12 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-09-03: Re-verified `/positions` size precision for issue #557 against an incident wallet.
+  The current-position size was `34.0795`; the same wallet's incident REDEEM activity size was
+  `33.32222`, and all seven incident anchor balances used no more than four decimal places. This
+  supports the glossary's one-reported-quantum residual rationale but does not change exact-decimal
+  parsing or assert a documented venue guarantee.
 
 - 2026-09-01: Re-verified issue #544's user-activity, current-position, price-history, and CLOB
   resolution contracts. Live captures confirmed the comma-separated multi-type activity request,

@@ -8,6 +8,135 @@
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
 deploying it to the VPS with one restart and no stop-before-swap window.
 
+## Issue #557 generation activation
+
+The procedure in this section replaces the ordinary binary swap when a deployment creates a new
+paper-state generation. The AC10 rehearsal is a **mandatory pre-deploy gate**. Do not enter the
+activation driver's `guarded` state without its recorded PASS evidence.
+
+### Mandatory isolated rehearsal
+
+Run the rehearsal from the final reviewed head with the exact staged binary and a VPS copy of
+production state. Rehearsal isolation means all local durable paths and the bind address resolve to a
+dedicated directory/port, the complete staged environment contains no service-role credential, and
+the Polymarket venue remains real. It is not a special application mode and it is not permission to
+write production Supabase.
+
+1. Copy the stopped/checkpointed production SQLite main without opening it read-write:
+
+   ```bash
+   mkdir -p /home/sean/pe-rehearsal-557
+   sqlite3 -readonly /home/sean/prediction-markets/paper_state.db \
+     ".backup '/home/sean/pe-rehearsal-557/paper_state.db'"
+   ```
+
+   Copy the three logs and legacy-history input into that directory without changing the production
+   files. Record source/destination SHA-256 values.
+2. Create a **complete** rehearsal environment. Set all of these explicitly; no inherited production
+   path or bind is permitted:
+
+   ```text
+   PE_BIND=<dedicated-loopback-bind>
+   PE_EVENT_LOG_PATH=/home/sean/pe-rehearsal-557/paper.log
+   PE_SOURCE_EVENT_LOG_PATH=/home/sean/pe-rehearsal-557/source_events.log
+   PE_JSONL_LOG_PATH=/home/sean/pe-rehearsal-557/paper.jsonl
+   PE_STATUS_PATH=/home/sean/pe-rehearsal-557/status.json
+   PE_PAPER_STATE_DB_PATH=/home/sean/pe-rehearsal-557/paper_state.db
+   PE_LEGACY_WALLET_HISTORY_PATH=/home/sean/pe-rehearsal-557/wallet_market_history.json
+   ```
+
+   Preserve every other required production environment entry, except put the Supabase publishable
+   (`anon`) key in `PE_SUPABASE_SECRET_KEY`. The service-role key must not be present in the rehearsal
+   environment or process.
+3. Run `scripts/deploy/rehearsal_preflight.sh <rehearsal-env>`. Its database matrix must prove:
+
+   - `anon` cannot execute any of the six service write RPCs while `service_role` can;
+   - `anon` has no DML grants on the three live tables; and
+   - each other reachable sink has RLS enabled, is not anon-owned, anon cannot bypass RLS, and no
+     anon/PUBLIC/authenticated write policy exists.
+
+   Its representative HTTP canaries must all return 401/403, including
+   `service_watchlist_replace_v1` with the exact argument shape, and the marker-row query must remain
+   zero.
+4. Print and independently compare env-over-TOML effective bind/state/log/history paths before start.
+   Run the staged binary against the rehearsal config and real venue. Let producers run for at least
+   `ANCHOR_REFRESH_SECS`; use the canonical value and rationale in `docs/_GLOSSARY.md` rather than
+   copying it here.
+5. AC10 passes only when its acceptance bounds are met for reader continuity and drops, fence
+   inspection, a full poll/refresh round, refused projection attempts, ERROR count, VmHWM, and the full
+   D11 convergence record (duration, wallets/minute, errors/deferred, oldest final anchor age, and final
+   due-wallet count) at the concurrency being shipped. Use `FIXFWD_SPEC.md` AC10 as the checklist and
+   record every value; do not restate its numeric thresholds in this runbook. A failed or incomplete item
+   is a deployment stop, not a waiver.
+
+Archive the exact config, complete environment with secrets redacted, staged binary hashes, privilege
+matrix/canary output, status snapshots, logs, and measurements with the issue evidence.
+
+### Warm prepare and cutover
+
+The driver holds `/home/sean/.pe-deploy.lock` for its whole run and writes only the fixed
+`/home/sean/pe-activation.json` manifest as activation authority. Its state order is
+`seed → prepared → prechecked → guarded → archived → reset → switched → started → verified`. Use a
+unique `activation_id`; a different id is refused while the manifest is non-terminal.
+
+Stage the exact release binary, the complete service and rehearsal environment files, and the full
+`smoke-test/service.toml` from the reviewed merge commit. The driver changes only the bind and
+generation path owners in that full TOML. Preview first:
+
+```bash
+SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/activate_generation.sh --dry-run \
+  --activation-id <id> \
+  --generation-dir /home/sean/prediction-markets/gen/<generation> \
+  --source-v1-main <production-v1-main-copy> \
+  --legacy-history <captured-legacy-history> \
+  --staged-binary <reviewed-pe-service> \
+  --config-template <merge-commit-service.toml> \
+  --rehearsal-env <complete-rehearsal-env> \
+  --service-env <complete-production-env> \
+  --merge-commit <reviewed-40-hex> \
+  --bind <production-bind> --rehearsal-bind <dedicated-loopback-bind> \
+  --bankroll <fresh-bankroll>
+```
+
+Run the same command without `--dry-run`. While the old service still trades, `seed` creates the
+empty schema-v1 generation and `prepared` migrates it with `--exit-after-anchors`. At `prechecked`, the
+driver records Forge's flag plus enabled/active bits, writes its existing `stop` flag, stops the user
+unit, proves no cycle process or lock remains, freezes the latest ranking batch, and evaluates the
+canonical due-wallet rule from `docs/_GLOSSARY.md`. A nonzero result stops. Only an explicit owner
+decision may be supplied as the exact `--approve-due-subset <count>`; it is durable in the manifest.
+
+`guarded` starts T0 by disabling and stopping `pe-service`. `archived` copies every pre-T0 artifact
+without deleting it. `reset` applies the activation-stamped single Supabase transaction. `switched`
+hash-verifies and atomically adopts config, complete environment, and binary, then prints and validates
+their effective paths. `started` adopts an already-running exact generation or uses
+`systemctl enable --now` once. `verified` proves the running binary/config/env hashes, bind and permanent
+paths, zero replay/walk beyond any approved subset, producer/critical-task health, fresh Supabase book,
+successful watchlist projection, signed-in fresh site, and refreshed materialized view. Only then does
+it restore Forge's prior flag and independently restore its enablement and activity bits.
+
+Re-run the identical command after interruption or reboot. Each external boundary is rechecked, and
+the first incomplete durable state resumes. Never edit the manifest or substitute a repository
+checkout for its staged artifact paths. Before live use, run the network-free recovery proof:
+
+```bash
+bash scripts/deploy/test_activate_generation.sh
+```
+
+### Generation rollback
+
+Rollback is also locked and resumable:
+
+```bash
+SUPABASE_DB_URL=<session-pooler-url> \
+  scripts/deploy/rollback_generation.sh --activation-id <id>
+```
+
+It records `rolling_back` first, disables and stops any non-adoptable service before database access,
+restores exactly that id's five archived row sets in one transaction, refreshes the materialized view,
+restores old config/environment/binary from manifest-hashed copies, starts or adopts the exact old
+generation, and records `rolled_back`. A forward rerun of that id is thereafter refused. Retain the
+manifest, generation, and pre-T0 archive for audit.
+
 ## Facts
 
 | item | value |

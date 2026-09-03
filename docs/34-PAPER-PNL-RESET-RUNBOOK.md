@@ -1,116 +1,112 @@
-# 34 — Paper-P&L archive-then-reset runbook
+# 34 — Paper-P&L generation reset runbook
 
-**Purpose.** Start the paper copy-trader's P&L from a clean T0 for the 2026-07-03
-single-system cutover (`docs/32` §1 operator decision) — archiving, never destroying,
-the prior track record. Tooling: `scripts/paper_reset/reset_paper_state.sh` (dry-run by
-default) + `scripts/paper_reset/archive_paper_state.sql` (fail-closed, single
-transaction, the #474 archive-before-DELETE discipline).
+**Purpose.** Start a new paper-P&L era without destroying the prior one. Issue #557 makes this a
+generation activation: build an explicitly empty schema-v1 seed, migrate that seed in place, archive
+the five Supabase paper tables under one `activation_id`, and switch the service to permanent
+generation-qualified paths. The activation and rollback commands are in
+[`35-PE-SERVICE-DEPLOY-RUNBOOK.md`](35-PE-SERVICE-DEPLOY-RUNBOOK.md).
 
-## What is being reset, and where it lives
+## Authority and invariants
 
-Paper state is dual-store (`docs/_GLOSSARY.md`, issue #397): **Supabase is
-authoritative** (`paper_bankroll` singleton, `paper_positions`, `paper_fills`,
-`settled_markets`; mutated only via the `commit_fill` / `apply_resolution` RPCs), local
-SQLite (`paper_state.db`) is the write-through cache, and the BLAKE3 **event log**
-(`paper.log`, plus the `live_journal.log` stream) is the true fill source that boot
-replays. `fill_market_snapshots` (analytics) is archived alongside. Local-only tables
-(`seen_trades`, `poll_cursors`, `leader_positions`, `meta`) go with the SQLite file.
+Paper state spans Supabase, the local SQLite main, `paper.log`, `live_journal.log`, and
+`source_events.log`. A generation also binds the captured legacy history input. The migration records
+canonical paths and verified log tails, so none of those bound files may be moved after preparation.
+The new generation therefore lives permanently below
+`/home/sean/prediction-markets/gen/<generation>/`.
 
-The account-tagged journal is named exactly `live_journal.log`; there is no
-`paper.live.log` artifact. Schema v2 adds reconciled activity/group revisions, durable
-entry-gate history/results/completeness, `decision_pending`, wallet fences, position
-validations, and the machine-owned v1→v2 migration/activation record. Those rows are part of
-the authority boundary, not disposable analytics state.
+The historical instruction to stop when the production main is schema v2 is superseded. **Reset the
+seed, then migrate:** copy the production schema-v1 main with SQLite's online backup command, empty the
+exact twelve-table schema-v1 allowlist, and let the reviewed binary migrate that empty copy. Never
+manufacture a fresh schema-v2 database and never delete migration records from an installed main.
 
-> **Schema-v2 stop condition (#544).** Before executing this runbook, inspect
-> `PRAGMA user_version` on the stopped service's fixed `paper_state.db`. The archive/reset
-> tooling below is the historical schema-v1 reset workflow. Do not execute it when the value is
-> `2`: rotating away the installed v2 main would also erase the machine-owned migration record,
-> and ordinary boot requires an existing fixed main with matching recorded log boundaries. A v2
-> P&L reset needs a separately reviewed generation-reset surface; none shipped in #544.
+The seed owner is [`seed_v1_empty.sh`](../scripts/paper_reset/seed_v1_empty.sh). It is dry-run by
+default. With `--execute` it requires:
 
-## The one landmine
+- exactly the schema-v1 `a5f3a8f` user tables and no others;
+- zero rows in every copied table after reset;
+- `PRAGMA user_version = 1` and `PRAGMA integrity_check = ok`;
+- a WAL checkpoint and initially empty paper, live-journal, and source logs; and
+- the captured legacy-history file with both BLAKE3 and SHA-256 recorded.
 
-**The event log MUST be rotated together with the SQLite file.** A fresh
-`paper_state.db` resets both replay watermarks (`last_applied_event_seq`,
-`last_supabase_applied_event_seq`); if `paper.log` is still present at the next boot,
-`reconcile_paper_state` replays every historical fill into SQLite and
-`catch_up_supabase` re-inserts them into the just-emptied Supabase `paper_fills` —
-re-debiting the fresh bankroll and silently undoing the reset
-(`crates/service/src/paper_recovery.rs`, `supabase_state.rs`).
+The activation driver's `prepared` state then runs the staged binary with
+`--exit-after-anchors`. Its postconditions are schema v2, zero fills and settlements, no authoritative
+watermark, no sealed v1 cursor rows, delivery cursors equal to bracket cursors, empty paper/live logs,
+and a non-empty migrated source log.
 
-Bounded, accepted side effect: wiping `seen_trades` + `poll_cursors` re-opens a
-boundary-second window (cursors re-seed to each wallet's `last_trade_unix`; the poller
-fetches from cursor−1 exclusive), so a handful of already-copied boundary trades may
-re-arrive as fresh events. Idempotency keys regenerate identically, but against an
-emptied `paper_fills` the RPC treats them as new — the exposure is a few
-boundary-second trades at most, and the first-entry gate blocks most.
-The captured legacy history file is deliberately **kept** for a schema-v1 migration rehearsal.
-It is a one-time, hash-bound migration input selected by `PE_LEGACY_WALLET_HISTORY_PATH`, not a
-runtime sidecar; once the migration reaches phase `installed`, edits are inert.
+## Supabase archive and reset
 
-## Sequence
+[`archive_paper_state.sql`](../scripts/paper_reset/archive_paper_state.sql) owns the #474
+archive-before-delete transaction. It receives `activation_id` and the fresh bankroll through psql
+variables, takes the existing exclusive locks, adds `activation_id text` to all five archive tables if
+needed, copies every live row with that id, verifies copied counts, clears the live tables, verifies
+zero live counts, and inserts `paper_bankroll (id, bankroll_str)`. The pre-reset bankroll singleton is
+the durable stamp that lets a resumed activation prove that a database commit occurred before its
+manifest rename.
 
-| # | where | action |
-|---|---|---|
-| 1 | operator (sudo) | `ssh -t -i ~/.ssh/id_personal sean@82.22.32.225 'sudo systemctl stop pe-service'` |
-| 2 | local checkout | `bash scripts/paper_reset/reset_paper_state.sh --execute` — archives all 5 tables into `*_archive` (stamped `archived_at`), verifies counts, deletes live rows, keeps `supabase_sink_hwm`, reloads the PostgREST cache. Any failure = full rollback. |
-| 3 | VPS (service **stopped**) | rotate local state into an archive dir: `paper_state.db`, `paper_state.db-wal`, `paper_state.db-shm`, `paper.log`, `live_journal.log` (the live journal is derived beside the configured event log in `main.rs`). Resolve the exact working directory via `systemctl cat pe-service` first (paths are CWD-relative, `config.rs`). |
-| 4 | VPS (service stopped) | confirm the fresh starting bankroll: `bankroll_usd` boot config (default `10000`) — `init_bankroll` credits it because the fresh SQLite has no row. Then run the binary once with `--backfill-supabase` to re-seed the Supabase `paper_bankroll` singleton (authoritative boot fail-closes without it, by design). Also set the `service_config.bankroll_usd` row to the same value (bookkeeping mirror only — no runtime behavior consumes the parsed value, #516; the BOOT value is the /paper/pnl denominator). |
-| 5 | operator (sudo) | `ssh -t ... 'sudo systemctl start pe-service'` |
-| 6 | local | `psql "$SUPABASE_DB_URL" -c 'refresh materialized view concurrently wallet_live_stats_mv;'` (optional — pg_cron refreshes ≤2 min) |
+A rerun with the same `activation_id` validates the already-fresh live book and does not archive or
+delete again. Per-table counts for that id are printed and recorded in the fixed activation manifest.
+Do not run the SQL independently during a generation cutover; the locked driver coordinates both
+stores.
 
-## Verification (step 6+)
+For a read-only preview of the SQL owner:
 
-- `select count(*) from paper_fills;` → 0, then grows only with organic post-T0 fills.
-- `select bankroll_str from paper_bankroll where id = 0;` → the fresh starting value.
-- Boot log shows a clean authoritative boot (no `Uninitialised`), watchlist seeded from
-  `latest_ranking`, `service_config poll loop started`, 0 poll failures.
-- Dashboard shows zeroed P&L after the matview refresh.
-- The #473 demotion gate is expected to be **inert** immediately post-reset (it feeds on
-  settled local fills; nothing fires below `demotion_min_trades` per wallet) — this is
-  correct, not a bug.
+```bash
+bash scripts/paper_reset/reset_paper_state.sh \
+  --activation-id <activation-id> --bankroll <fresh-bankroll>
+```
+
+## Activation sequence
+
+The exact operational command, rehearsal gate, durable states, and crash recovery are documented in
+docs/35. At a high level:
+
+1. Build the empty v1 seed at permanent generation paths and migrate it during warm prepare while the
+   old service continues trading.
+2. Complete the mandatory isolated rehearsal and record AC10 evidence.
+3. Freeze the final ranking batch and prove the canonical due-wallet rule.
+4. Disable and stop `pe-service`, preserving every pre-T0 file and installed artifact by hash.
+5. Archive/reset Supabase with the manifest's `activation_id`.
+6. Adopt the generation config, complete environment, and binary; start once; verify the fresh book,
+   bindings, producer/task health, projection, site, and materialized view.
+
+The fixed `/home/sean/pe-activation.json` is the sole activation authority. Do not infer state from
+terminal output or manually advance it.
+
+## Verification
+
+- The manifest is `verified` and names the intended generation, reviewed revision, and artifact
+  hashes.
+- `paper_fills`, `paper_positions`, `settled_markets`, and `fill_market_snapshots` are empty;
+  `paper_bankroll` contains the fresh singleton.
+- Local fills and settlements are zero, the generation bindings match every effective env-over-TOML
+  path, and boot replayed no historical paper event.
+- The boot used the recorded ranking batch and performed no walk, or exactly the owner-approved
+  due-wallet subset recorded in the manifest.
+- The watchlist projection has succeeded, `wallet_live_stats_mv` was refreshed, and the signed-in site
+  displays the fresh era.
+- Forge's prior loop flag, unit enablement, and unit activity were restored independently.
 
 ## Rollback
 
-The archive is the rollback: restore Supabase rows with
-`insert into paper_fills select <original columns> from paper_fills_archive` (drop the
-`archived_at` column from the select list; same for the other four tables), and move
-the archived `paper_state.db*`, `paper.log`, and `live_journal.log` files back before starting the
-service.
-Archive tables are append-only across resets (`archived_at` distinguishes epochs) —
-never dropped by tooling.
+Use `scripts/deploy/rollback_generation.sh --activation-id <id>`; do not hand-copy rows. The driver
+records `rolling_back`, disables and stops any non-adoptable running service before touching the
+database, and restores exactly the five archive-table row sets stamped with that id using explicit
+column lists in one transaction. It verifies the restored counts, refreshes the materialized view,
+restores the hash-bound old config/environment/binary, starts the old generation, and records
+`rolled_back`.
 
-## #511: rebuild-state and RPC v1 notes
+Rollback is resumable. A running exact old generation is adopted only when the archived artifacts and
+restored database independently match. A forward rerun of the rolled-back activation id is refused.
+Archive tables and pre-T0 copies remain retained; never drop them as cleanup.
 
-- `--rebuild-state` is **refused in authoritative mode** (`PE_SUPABASE_AUTHORITATIVE=true`):
-  frame-only reconstruction cannot know authority dispositions (a refused or ambiguously
-  failed frame would resurrect locally and diverge from Supabase). Restore local state by
-  restarting the service — the boot frame-walk converges SQLite on the system of record.
-  In legacy mode, rebuild restores `settled_markets` from its own backup before replaying,
-  so replay refuses fills into already-settled markets.
-- The v1 RPCs (`commit_fill`, `apply_resolution`) are retained through the #511 rollback
-  window. Revoke their `service_role` execute grants in a later cycle once the #511 binary
-  has soaked (rollback to the pre-#511 binary requires them).
+## Rebuild and migration recovery notes
 
-## #544 schema-v1 to schema-v2 roll-forward notes
+`--rebuild-state` remains refused in authoritative mode: frame-only reconstruction cannot know which
+authority writes were refused or ambiguous. Restart the compatible service so boot converges from the
+system of record.
 
-This is migration, not a P&L reset. One ordinary v2 `pe-service` boot performs it with
-`PE_SUPABASE_AUTHORITATIVE=true` and `PE_LEGACY_WALLET_HISTORY_PATH` pointing at the captured
-legacy input. The machine-owned phases are `boundary_recorded`,
-`version_two_inputs_appending`, `side_state_built`, `activation_tails_recorded`, and
-`installed`; restart resumes the exact recorded side main and phase. The source, paper, and
-`live_journal.log` path/tail/sequence/hash bindings must still match.
-
-Only before any v2 append or active-state commit, rollback can preserve the failed side and
-restore the immutable v1 main:
-
-```bash
-PE_PAPER_V1_BACKUP_PATH="$PAPER_V1_BACKUP" \
-PE_PAPER_FAILED_SIDE_PATH="$FAILED_PAPER_SIDE" \
-pe-service --rollback-paper-v1
-```
-
-Once any first v2 append or active-state commit exists, that command refuses. Restart the
-v2-compatible binary to resume roll-forward; do not rotate logs, replace the fixed main, or
-manually edit the migration record.
+The v1-to-v2 migration phases remain machine-owned: `boundary_recorded`,
+`version_two_inputs_appending`, `side_state_built`, `activation_tails_recorded`, and `installed`. Before
+any v2 append or active-state commit, the migration's dedicated `--rollback-paper-v1` path can preserve
+the failed side and restore its immutable v1 input. After either boundary it refuses; resume with the
+same v2-compatible binary. Do not move bound logs or edit the migration record.
