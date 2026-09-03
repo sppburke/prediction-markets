@@ -836,22 +836,16 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
     assert!(engine.is_fenced(&fenced_wallet));
     assert!(!engine.is_fenced(&wallet()));
     let first = position_row("TRADE", "0xbatch-first", MARKET_A, 0, "BUY", "3", "0.5", 93);
-    let second = position_row(
-        "TRADE",
-        "0xbatch-second",
-        MARKET_B,
-        0,
-        "BUY",
-        "4",
-        "0.5",
-        94,
-    );
+    let fence_in_batch = pair_effect("CONVERSION", "0xbatch-fence", MARKET_C, "1", 94);
+    let third = position_row("TRADE", "0xbatch-third", MARKET_B, 0, "BUY", "4", "0.5", 95);
     let first_id = first.group_id.key().clone();
-    let second_id = second.group_id.key().clone();
+    let fence_id = fence_in_batch.group_id.key().clone();
+    let third_id = third.group_id.key().clone();
     let mut first_context = context(93, true);
     first_context.copy_eligible = false;
-    let mut second_context = context(94, true);
-    second_context.copy_eligible = false;
+    let fence_context = context(94, true);
+    let mut third_context = context(95, true);
+    third_context.copy_eligible = false;
     let database_path = dir.path().join("paper.db");
     let connection = rusqlite::Connection::open(&database_path).unwrap();
     let pre_batch_revisions: i64 = connection
@@ -861,25 +855,28 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
         .unwrap();
     connection
         .execute_batch(
-            "CREATE TRIGGER fail_second_batch_bucket BEFORE INSERT ON activity_groups
-             WHEN NEW.source_epoch = 94
+            "CREATE TRIGGER fail_third_batch_bucket BEFORE INSERT ON activity_groups
+             WHEN NEW.source_epoch = 95
              BEGIN SELECT RAISE(FAIL, 'injected ordinary batch failure'); END;",
         )
         .unwrap();
 
     let result = engine.commit_batch(|engine| {
         engine.commit(vec![first.clone()], &first_context, zero_basis())?;
-        engine.commit(vec![second.clone()], &second_context, zero_basis())?;
+        engine.commit(vec![fence_in_batch.clone()], &fence_context, zero_basis())?;
+        engine.commit(vec![third.clone()], &third_context, zero_basis())?;
         Ok(())
     });
     assert!(result.is_err());
     assert!(paper.activity_group_state(&first_id).unwrap().is_none());
-    assert!(paper.activity_group_state(&second_id).unwrap().is_none());
+    assert!(paper.activity_group_state(&fence_id).unwrap().is_none());
+    assert!(paper.activity_group_state(&third_id).unwrap().is_none());
     assert!(paper.leader_positions().unwrap().is_empty());
     assert!(paper.open_decision_pending().unwrap().is_empty());
     assert!(paper.gate_history().unwrap().is_empty());
     assert!(!engine.history_complete(&wallet()));
     assert_eq!(paper.wallet_fences().unwrap(), pre_batch_fences);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
     assert!(engine.is_fenced(&fenced_wallet));
     assert!(!engine.is_fenced(&wallet()));
     assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
@@ -894,23 +891,38 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
     assert_eq!(revisions, pre_batch_revisions);
 
     connection
-        .execute_batch("DROP TRIGGER fail_second_batch_bucket;")
+        .execute_batch("DROP TRIGGER fail_third_batch_bucket;")
         .unwrap();
     drop(connection);
     let committed = engine
         .commit_batch(|engine| {
             let first = engine.commit(vec![first], &first_context, zero_basis())?;
-            let second = engine.commit(vec![second], &second_context, zero_basis())?;
-            Ok([first, second])
+            let fence = engine.commit(vec![fence_in_batch], &fence_context, zero_basis())?;
+            let third = engine.commit(vec![third], &third_context, zero_basis())?;
+            Ok([first, fence, third])
         })
         .unwrap();
     assert_eq!(committed[0].dispositions[&first_id.0], "not_copy_eligible");
-    assert_eq!(committed[1].dispositions[&second_id.0], "not_copy_eligible");
+    assert_eq!(
+        committed[1].newly_fenced,
+        Some(WalletFenceCause::Conversion)
+    );
+    assert_eq!(
+        committed[1].dispositions[&fence_id.0],
+        "conversion_unknown_conditions"
+    );
+    assert_eq!(
+        committed[2].dispositions[&third_id.0],
+        "wallet_fenced_applied"
+    );
     assert!(engine.history_complete(&wallet()));
+    assert!(paper.is_wallet_fenced(&wallet()).unwrap());
+    assert!(engine.is_fenced(&wallet()));
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 3_000_000);
     assert_eq!(state(&engine, MARKET_B, 0).atomic(), 4_000_000);
     assert!(paper.activity_group_state(&first_id).unwrap().is_some());
-    assert!(paper.activity_group_state(&second_id).unwrap().is_some());
+    assert!(paper.activity_group_state(&fence_id).unwrap().is_some());
+    assert!(paper.activity_group_state(&third_id).unwrap().is_some());
 }
 
 #[test]
@@ -937,15 +949,28 @@ fn replay_is_identical_for_batched_and_single_bucket_commits() {
         "0.5",
         94,
     );
+    let third = position_row(
+        "TRADE",
+        "0xreplay-batch-third",
+        MARKET_C,
+        0,
+        "SELL",
+        "2",
+        "0.5",
+        95,
+    );
     let mut first_context = context(93, true);
     first_context.copy_eligible = false;
     let mut second_context = context(94, true);
     second_context.copy_eligible = false;
+    let mut third_context = context(95, true);
+    third_context.copy_eligible = false;
 
     batch_engine
         .commit_batch(|engine| {
             engine.commit(vec![first.clone()], &first_context, zero_basis())?;
             engine.commit(vec![second.clone()], &second_context, zero_basis())?;
+            engine.commit(vec![third.clone()], &third_context, zero_basis())?;
             Ok(())
         })
         .unwrap();
@@ -955,24 +980,43 @@ fn replay_is_identical_for_batched_and_single_bucket_commits() {
     single_engine
         .commit(vec![second], &second_context, zero_basis())
         .unwrap();
+    single_engine
+        .commit(vec![third], &third_context, zero_basis())
+        .unwrap();
 
     let batch_replay = replay_wallet_ledger(&batch_paper, wallet()).unwrap();
     let single_replay = replay_wallet_ledger(&single_paper, wallet()).unwrap();
     for replay in [&batch_replay, &single_replay] {
         let balances = &replay.position(&wallet()).unwrap().positions;
-        assert_eq!(balances.len(), 2);
+        assert_eq!(balances.len(), 3);
         assert_eq!(
             balances[&market_outcome(MARKET_A, 0)].long_contracts,
             ShareAmount::from_atomic(3_000_000)
         );
         assert_eq!(
+            balances[&market_outcome(MARKET_A, 0)].short_contracts,
+            ShareAmount::ZERO
+        );
+        assert_eq!(
             balances[&market_outcome(MARKET_B, 1)].long_contracts,
             ShareAmount::from_atomic(4_000_000)
+        );
+        assert_eq!(
+            balances[&market_outcome(MARKET_B, 1)].short_contracts,
+            ShareAmount::ZERO
+        );
+        assert_eq!(
+            balances[&market_outcome(MARKET_C, 0)].long_contracts,
+            ShareAmount::ZERO
+        );
+        assert_eq!(
+            balances[&market_outcome(MARKET_C, 0)].short_contracts,
+            ShareAmount::from_atomic(2_000_000)
         );
     }
     let batch_capture = ledger_capture(&batch_replay, &batch_paper, wallet()).unwrap();
     let single_capture = ledger_capture(&single_replay, &single_paper, wallet()).unwrap();
-    assert_eq!(batch_capture.hash, single_capture.hash);
+    assert_eq!(batch_capture, single_capture);
 }
 
 #[test]
