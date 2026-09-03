@@ -514,6 +514,35 @@ grep -q 'does not select the installed binary and service config' "$root/unit.er
 [[ ! -e "$root/pe-activation.json" ]] || fail "suffixed service config was adopted into a manifest"
 assert_deploy_lock_unchanged "$root"
 
+# An attached "#" is literal in systemd argv: service.toml#backup is not service.toml.
+root=$(make_case unit-config-attached-hash)
+service="$root/prediction-markets"
+printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml#backup' ; ignore_errors=no }\n" \
+  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+set +e
+activate "$root" activation-557 >"$root/unit-hash.out" 2>"$root/unit-hash.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "attached-hash service config path was accepted"
+grep -q 'does not select the installed binary and service config' "$root/unit-hash.err" ||
+  fail "attached-hash service config refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "attached-hash service config was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
+
+# An attached "#" is literal in EnvironmentFiles too: .env#backup is not .env.
+root=$(make_case unit-environment-attached-hash)
+service="$root/prediction-markets"
+printf "path=%s/.env#backup ; ignore_errors=no\n" "$service" > "$root/test-state/service.environment-files"
+set +e
+activate "$root" activation-557 >"$root/unit-env-hash.out" 2>"$root/unit-env-hash.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "attached-hash environment path was accepted"
+grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit-env-hash.err" ||
+  fail "attached-hash environment refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "attached-hash environment was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
+
 # ExecStart mentioning the env is insufficient; EnvironmentFiles owns that role.
 root=$(make_case unit-environment-role)
 : > "$root/test-state/service.environment-files"

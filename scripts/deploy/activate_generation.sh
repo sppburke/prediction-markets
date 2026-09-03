@@ -160,7 +160,7 @@ unit_environment_has_exact_path() {
 expected,value=sys.argv[1:]
 lexer=shlex.shlex(value, posix=True, punctuation_chars=";&|(){}")
 lexer.whitespace_split=True
-lexer.commenters="#"
+lexer.commenters=""  # systemd values are structured: an attached "#" is literal, never a comment
 for token in lexer:
     if token.startswith("path="):
         token=token.removeprefix("path=")
@@ -187,7 +187,7 @@ if metadata:
 def tokens(text):
     lexer=shlex.shlex(text, posix=True, punctuation_chars=";&|(){}")
     lexer.whitespace_split=True
-    lexer.commenters="#"
+    lexer.commenters=""  # systemd values are structured: an attached "#" is literal, never a comment
     result=[]
     for token in lexer:
         if token != text and (any(char.isspace() for char in token) or any(char in ";&|(){}" for char in token)):
