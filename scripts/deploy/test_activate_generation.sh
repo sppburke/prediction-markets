@@ -230,7 +230,7 @@ case "$action" in
       if [[ -f "$state/service.exec-start" ]]; then
         cat "$state/service.exec-start"
       else
-        echo "{ path=/bin/bash ; argv[]=/bin/bash -c 'source $root/prediction-markets/.env; exec $root/prediction-markets/target/release/pe-service $root/prediction-markets/smoke-test/service.toml' ; ignore_errors=no ; }"
+        echo "{ path=$root/prediction-markets/target/release/pe-service ; argv[]=$root/prediction-markets/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }"
       fi
     elif [[ "$*" == *EnvironmentFiles* ]]; then
       if [[ -f "$state/service.environment-files" ]]; then
@@ -491,13 +491,28 @@ rm "$hold"
 wait "$holder"
 assert_verified "$root"
 
-# Unit ownership takes the config argument from ExecStart argv and ignores a backup in a comment.
-root=$(make_case unit-config-comment-backup)
+# Unit ownership accepts exactly the direct argv `<binary> <config>` (production shape).
+root=$(make_case unit-config-direct-argv)
 service="$root/prediction-markets"
-printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml # %s/smoke-test/service.toml.backup' ; ignore_errors=no ; }\n" \
-  "$service" "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+printf "{ path=%s/target/release/pe-service ; argv[]=%s/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }\n" \
+  "$service" "$service" > "$root/test-state/service.exec-start"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
+
+# A shell wrapper is refused outright even when it names the real binary and config.
+root=$(make_case unit-config-shell-wrapper)
+service="$root/prediction-markets"
+printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml' ; ignore_errors=no }\n" \
+  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+set +e
+activate "$root" activation-557 >"$root/unit-wrap.out" 2>"$root/unit-wrap.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "shell-wrapped ExecStart was accepted"
+grep -q 'does not select the installed binary and service config' "$root/unit-wrap.err" ||
+  fail "shell-wrapper refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "shell-wrapped ExecStart was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
 
 # A real config mentioned only in a comment cannot legitimize the backup argument.
 root=$(make_case unit-config-real-comment)

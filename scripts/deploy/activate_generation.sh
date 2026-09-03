@@ -173,6 +173,8 @@ raise SystemExit(1)' "$expected" "$environment_files"
 }
 
 unit_exec_selects_service() {
+  # The production unit runs the binary DIRECTLY: argv[] is exactly `<binary> <config>` (docs/35). Any
+  # shell wrapper, extra argument, or different binary is refused outright; nothing is interpreted.
   local expected_binary=$1 expected_config=$2 working=$3 exec_start=$4
   python3 -c 'import os,re,shlex,sys
 expected_binary,expected_config,working,value=sys.argv[1:]
@@ -183,37 +185,16 @@ argv=value.split(marker,1)[1]
 metadata=re.search(r"\s;\s(?:ignore_errors|start_time|stop_time|pid|code|status)=", argv)
 if metadata:
     argv=argv[:metadata.start()]
-
-def tokens(text):
-    # Shell comment rule: a WORD that begins with "#" starts a comment to the end of that line;
-    # an attached "#" inside a word (service.toml#backup) is literal. Lines are split first so a
-    # comment never swallows the next line of a multi-line "bash -c" script.
-    result=[]
-    for line in text.split("\n"):
-        lexer=shlex.shlex(line, posix=True, punctuation_chars=";&|(){}")
-        lexer.whitespace_split=True
-        lexer.commenters=""
-        for token in lexer:
-            if token.startswith("#"):
-                break
-            if token != line and (any(char.isspace() for char in token) or any(char in ";&|(){}" for char in token)):
-                result.extend(tokens(token))
-            else:
-                result.append(token)
-    return result
-
-argv_tokens=tokens(argv)
-configs=[]
-for index,token in enumerate(argv_tokens[:-1]):
-    if token != expected_binary:
-        continue
-    if index != 0 and argv_tokens[index-1] != "exec":
-        continue
-    config=argv_tokens[index+1]
-    if not os.path.isabs(config):
-        config=os.path.join(working, config)
-    configs.append(os.path.normpath(config))
-raise SystemExit(0 if configs and all(config == os.path.normpath(expected_config) for config in configs) else 1)' \
+try:
+    tokens=shlex.split(argv, posix=True, comments=False)
+except ValueError:
+    raise SystemExit(1)
+if len(tokens) != 2 or tokens[0] != expected_binary:
+    raise SystemExit(1)
+config=tokens[1]
+if not os.path.isabs(config):
+    config=os.path.join(working, config)
+raise SystemExit(0 if os.path.normpath(config) == os.path.normpath(expected_config) else 1)' \
     "$expected_binary" "$expected_config" "$working" "$exec_start"
 }
 
