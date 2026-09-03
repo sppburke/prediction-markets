@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, PositionState};
 use pe_core_types::{
@@ -683,15 +687,30 @@ impl LedgerError {
 /// `position()` returns the state after all trades ingested so far. Calling it
 /// before any trade has been ingested returns `None` for every wallet — this is
 /// the correct sentinel, not an error.
-#[derive(Clone)]
+#[cfg_attr(not(test), derive(Clone))]
 pub struct PositionLedger {
     snapshots: HashMap<WalletAddress, PositionSnapshot>,
+    #[cfg(test)]
+    full_clone_count: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Clone for PositionLedger {
+    fn clone(&self) -> Self {
+        self.full_clone_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            snapshots: self.snapshots.clone(),
+            full_clone_count: Arc::clone(&self.full_clone_count),
+        }
+    }
 }
 
 impl PositionLedger {
     pub fn new() -> Self {
         Self {
             snapshots: HashMap::new(),
+            #[cfg(test)]
+            full_clone_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -701,7 +720,11 @@ impl PositionLedger {
     /// post-restart trade as a fresh Entry. Reuses the existing `PositionSnapshot`
     /// type; no trades are replayed.
     pub fn from_snapshots(snapshots: HashMap<WalletAddress, PositionSnapshot>) -> Self {
-        Self { snapshots }
+        Self {
+            snapshots,
+            #[cfg(test)]
+            full_clone_count: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Apply one trade to the ledger, updating net exposure for the wallet.
@@ -878,29 +901,34 @@ impl PositionLedger {
                 source_trade_id: mutation.source_trade_id.clone(),
             });
         }
-        let mut candidate = self.clone();
-        candidate.checked_remove_strict(mutation, market_id, OutcomeId(0), amount)?;
-        candidate.checked_remove_strict(mutation, market_id, OutcomeId(1), amount)?;
-        *self = candidate;
+        let outcome_zero =
+            self.checked_remaining_long(mutation, market_id, OutcomeId(0), amount)?;
+        let outcome_one = self.checked_remaining_long(mutation, market_id, OutcomeId(1), amount)?;
+        self.state_mut(mutation.wallet, market_id, OutcomeId(0))
+            .long_contracts = outcome_zero;
+        self.state_mut(mutation.wallet, market_id, OutcomeId(1))
+            .long_contracts = outcome_one;
         Ok(())
     }
 
-    fn checked_remove_strict(
-        &mut self,
+    fn checked_remaining_long(
+        &self,
         mutation: &LedgerMutation,
         market_id: &MarketId,
         outcome_id: OutcomeId,
         amount: ShareAmount,
-    ) -> Result<(), LedgerError> {
-        let state = self.state_mut(mutation.wallet, market_id, outcome_id);
-        state.long_contracts =
-            state
-                .long_contracts
-                .checked_sub(amount)
-                .map_err(|_| LedgerError::Underflow {
-                    source_trade_id: mutation.source_trade_id.clone(),
-                })?;
-        Ok(())
+    ) -> Result<ShareAmount, LedgerError> {
+        let key = MarketOutcomeId::new(market_id.clone(), outcome_id);
+        let balance = self
+            .snapshots
+            .get(&mutation.wallet)
+            .and_then(|snapshot| snapshot.positions.get(&key))
+            .map_or(ShareAmount::ZERO, |state| state.long_contracts);
+        balance
+            .checked_sub(amount)
+            .map_err(|_| LedgerError::Underflow {
+                source_trade_id: mutation.source_trade_id.clone(),
+            })
     }
 
     fn checked_remove_redeem(
@@ -1335,6 +1363,19 @@ mod tests {
         }
     }
 
+    fn merge_mutation(w: WalletAddress, id: &str, amount: u64) -> LedgerMutation {
+        LedgerMutation {
+            source_trade_id: SourceTradeId(id.to_owned()),
+            transaction_hash: format!("0x{id}"),
+            wallet: w,
+            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            effect: LedgerEffect::Merge {
+                market_id: market(),
+                amount: ShareAmount::from_atomic(amount),
+            },
+        }
+    }
+
     #[test]
     fn incident_redeem_residuals_clamp_and_emit_version_three_documents() {
         let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -1384,21 +1425,84 @@ mod tests {
 
         let mut ledger = ledger_with_longs(w, 1_000, 1_000);
         let before = ledger.clone();
-        let merge = LedgerMutation {
-            source_trade_id: SourceTradeId("g2:strict-merge".to_owned()),
-            transaction_hash: "0xstrict-merge".to_owned(),
-            wallet: w,
-            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
-            effect: LedgerEffect::Merge {
-                market_id: market(),
-                amount: ShareAmount::from_atomic(1_001),
-            },
-        };
+        let merge = merge_mutation(w, "g2:strict-merge", 1_001);
         assert!(matches!(
             ledger.apply_all_or_none(&[merge]),
             Err(LedgerError::Underflow { .. })
         ));
         assert_eq!(ledger.snapshots(), before.snapshots());
+    }
+
+    #[test]
+    fn merge_with_one_insufficient_pair_balance_is_atomic() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut ledger = ledger_with_longs(w, 1_001, 1_000);
+        let before = ledger.snapshots().clone();
+        let merge = merge_mutation(w, "g2:insufficient-pair", 1_001);
+
+        assert_eq!(
+            ledger.apply_all_or_none(&[merge]),
+            Err(LedgerError::Underflow {
+                source_trade_id: SourceTradeId("g2:insufficient-pair".to_owned()),
+            })
+        );
+        assert_eq!(ledger.snapshots(), &before);
+    }
+
+    #[test]
+    fn four_merge_permutations_clone_the_ledger_once_per_sequence() {
+        const PERMUTATIONS: [[usize; 4]; 24] = [
+            [0, 1, 2, 3],
+            [0, 1, 3, 2],
+            [0, 2, 1, 3],
+            [0, 2, 3, 1],
+            [0, 3, 1, 2],
+            [0, 3, 2, 1],
+            [1, 0, 2, 3],
+            [1, 0, 3, 2],
+            [1, 2, 0, 3],
+            [1, 2, 3, 0],
+            [1, 3, 0, 2],
+            [1, 3, 2, 0],
+            [2, 0, 1, 3],
+            [2, 0, 3, 1],
+            [2, 1, 0, 3],
+            [2, 1, 3, 0],
+            [2, 3, 0, 1],
+            [2, 3, 1, 0],
+            [3, 0, 1, 2],
+            [3, 0, 2, 1],
+            [3, 1, 0, 2],
+            [3, 1, 2, 0],
+            [3, 2, 0, 1],
+            [3, 2, 1, 0],
+        ];
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let ledger = ledger_with_longs(w, 100, 100);
+        let merges = [
+            merge_mutation(w, "g2:merge-0", 1),
+            merge_mutation(w, "g2:merge-1", 1),
+            merge_mutation(w, "g2:merge-2", 1),
+            merge_mutation(w, "g2:merge-3", 1),
+        ];
+
+        for permutation in PERMUTATIONS {
+            let sequence = permutation.map(|index| merges[index].clone());
+            let (candidate, applied) = ledger.simulate_all_or_none(&sequence).unwrap();
+            assert_eq!(applied.len(), sequence.len());
+            let snapshot = candidate.position(&w).unwrap();
+            for outcome in [OutcomeId(0), OutcomeId(1)] {
+                assert_eq!(
+                    snapshot.positions[&MarketOutcomeId::new(market(), outcome)].long_contracts,
+                    ShareAmount::from_atomic(96)
+                );
+            }
+        }
+
+        assert_eq!(
+            ledger.full_clone_count.load(Ordering::Relaxed),
+            PERMUTATIONS.len()
+        );
     }
 
     #[test]
