@@ -185,15 +185,21 @@ if metadata:
     argv=argv[:metadata.start()]
 
 def tokens(text):
-    lexer=shlex.shlex(text, posix=True, punctuation_chars=";&|(){}")
-    lexer.whitespace_split=True
-    lexer.commenters=""  # systemd values are structured: an attached "#" is literal, never a comment
+    # Shell comment rule: a WORD that begins with "#" starts a comment to the end of that line;
+    # an attached "#" inside a word (service.toml#backup) is literal. Lines are split first so a
+    # comment never swallows the next line of a multi-line "bash -c" script.
     result=[]
-    for token in lexer:
-        if token != text and (any(char.isspace() for char in token) or any(char in ";&|(){}" for char in token)):
-            result.extend(tokens(token))
-        else:
-            result.append(token)
+    for line in text.split("\n"):
+        lexer=shlex.shlex(line, posix=True, punctuation_chars=";&|(){}")
+        lexer.whitespace_split=True
+        lexer.commenters=""
+        for token in lexer:
+            if token.startswith("#"):
+                break
+            if token != line and (any(char.isspace() for char in token) or any(char in ";&|(){}" for char in token)):
+                result.extend(tokens(token))
+            else:
+                result.append(token)
     return result
 
 argv_tokens=tokens(argv)

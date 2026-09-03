@@ -543,6 +543,21 @@ grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit
 [[ ! -e "$root/pe-activation.json" ]] || fail "attached-hash environment was adopted into a manifest"
 assert_deploy_lock_unchanged "$root"
 
+# A command that appears only inside a Bash comment does not select the installed service.
+root=$(make_case unit-config-command-in-comment)
+service="$root/prediction-markets"
+printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec /tmp/not-pe-service # exec %s/target/release/pe-service %s/smoke-test/service.toml' ; ignore_errors=no }\n" \
+  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+set +e
+activate "$root" activation-557 >"$root/unit-comment-cmd.out" 2>"$root/unit-comment-cmd.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "command inside a comment was accepted as the installed service"
+grep -q 'does not select the installed binary and service config' "$root/unit-comment-cmd.err" ||
+  fail "comment-only command refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "comment-only command was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
+
 # ExecStart mentioning the env is insufficient; EnvironmentFiles owns that role.
 root=$(make_case unit-environment-role)
 : > "$root/test-state/service.environment-files"
