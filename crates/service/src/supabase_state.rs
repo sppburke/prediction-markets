@@ -17,7 +17,6 @@
 //! [`crate::supabase_sink`] `SinkWriter` seam.
 
 use std::future::Future;
-use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -287,10 +286,7 @@ impl SupabaseStateClient {
         );
         let rows: Vec<BankrollRow> = self.get_json(&url).await?;
         rows.first()
-            .map(|r| {
-                Decimal::from_str(r.bankroll_str.trim())
-                    .map_err(|_| SupabaseStateError::Corrupt(r.bankroll_str.clone()))
-            })
+            .map(|r| bankroll_money(r.bankroll_str.trim(), "paper_bankroll bankroll_str"))
             .transpose()
     }
 
@@ -425,12 +421,8 @@ struct ResolutionV2Resp {
 }
 
 /// Parse a decimal-string money field: fail closed on malformed or negative (#511).
-/// Postgres renders `numeric` arithmetic at its full accumulated scale, so a stored
-/// bankroll such as `3729.7323088775297327030000000060` carries more significant
-/// digits than `Decimal` holds; like the boot pull path, precision beyond the 28th
-/// significant digit is rounded (1e-24 USD), while malformed text still fails.
 fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
-    let d = Decimal::from_str(raw)
+    let d = Decimal::from_str_exact(raw)
         .map_err(|e| SupabaseStateError::Corrupt(format!("{what}: {raw:?}: {e}")))?;
     if d < Decimal::ZERO {
         return Err(SupabaseStateError::Corrupt(format!(
@@ -438,6 +430,30 @@ fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
         )));
     }
     Ok(d)
+}
+
+/// The stored bankroll is Postgres `numeric` text whose scale grows with every fill
+/// (`3729.7323088775297327030000000060` on 2026-09-02); `Decimal` holds 28 significant
+/// digits. Accept only plain unsigned decimal text (no sign, exponent, or other bytes),
+/// drop fractional digits beyond the 28th significant digit (below 1e-24 USD), then
+/// parse exactly. Everything else fails closed like `money`.
+fn bankroll_money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
+    let corrupt = || SupabaseStateError::Corrupt(format!("{what}: {raw:?}"));
+    let (integer, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    if integer.is_empty()
+        || !integer.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(corrupt());
+    }
+    let integer_digits = integer.trim_start_matches('0').len();
+    let keep = 28usize.saturating_sub(integer_digits).min(fraction.len());
+    let normalized = if keep < fraction.len() {
+        format!("{integer}.{}", &fraction[..keep])
+    } else {
+        raw.to_owned()
+    };
+    Decimal::from_str_exact(&normalized).map_err(|_| corrupt())
 }
 
 fn canonical_fill(row: FillV2RowJson) -> Result<CanonicalFill, SupabaseStateError> {
@@ -492,7 +508,7 @@ impl SupabaseStateTrait for SupabaseStateClient {
         let value = self.post_rpc_json("commit_fill_v2", &body).await?;
         let resp: FillV2Resp = serde_json::from_value(value)
             .map_err(|e| SupabaseStateError::Corrupt(format!("commit_fill_v2 shape: {e}")))?;
-        let bankroll = money(&resp.bankroll, "commit_fill_v2 bankroll")?;
+        let bankroll = bankroll_money(&resp.bankroll, "commit_fill_v2 bankroll")?;
         match (resp.outcome.as_str(), resp.row) {
             ("applied", Some(row)) => Ok(FillV2Outcome::Applied {
                 bankroll,
@@ -545,7 +561,7 @@ impl SupabaseStateTrait for SupabaseStateClient {
             credit: money(&resp.credit, "apply_resolution_v2 credit")?,
             outcome_prices: parsed_prices,
             settled_at_unix: resp.settled_at_unix,
-            bankroll: money(&resp.bankroll, "apply_resolution_v2 bankroll")?,
+            bankroll: bankroll_money(&resp.bankroll, "apply_resolution_v2 bankroll")?,
         })
     }
 }
@@ -1100,13 +1116,26 @@ mod tests {
     }
 
     #[test]
-    fn money_rounds_postgres_scale_noise_and_still_fails_closed() {
+    fn bankroll_text_truncates_postgres_scale_noise_and_fails_closed_otherwise() {
         // Live `paper_bankroll.bankroll_str` on 2026-09-02 (32 significant digits).
         let live = "3729.7323088775297327030000000060";
-        let parsed = super::money(live, "bankroll").expect("over-precise numeric text parses");
-        assert_eq!(parsed.to_string(), "3729.7323088775297327030000000");
-        assert!(super::money("3729.73x", "bankroll").is_err());
-        assert!(super::money("-1", "bankroll").is_err());
+        let parsed = super::bankroll_money(live, "bankroll").unwrap();
+        assert_eq!(parsed.to_string(), "3729.732308877529732703000000");
+        assert_eq!(
+            super::bankroll_money("4422.242308877529732703", "bankroll")
+                .unwrap()
+                .to_string(),
+            "4422.242308877529732703"
+        );
+        assert!(super::bankroll_money("3729.7323088775297327030000000060x", "bankroll").is_err());
+        assert!(super::bankroll_money("-0.00000000000000000000000000001", "bankroll").is_err());
+        assert!(super::bankroll_money("-1", "bankroll").is_err());
+        assert!(super::bankroll_money("1e5", "bankroll").is_err());
+        assert!(super::bankroll_money("", "bankroll").is_err());
+        assert!(super::bankroll_money(".5", "bankroll").is_err());
+        // Exact money parsing is unchanged for every other field.
+        assert!(super::money(live, "credit").is_err());
+        assert!(super::money("-1", "credit").is_err());
     }
 
     #[tokio::test]

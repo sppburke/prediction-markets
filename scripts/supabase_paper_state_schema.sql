@@ -312,7 +312,7 @@ begin
   values (p_market_id, p_outcome_prices, v_credit, p_settled_at_unix);
 
   update paper_bankroll
-     set bankroll_str = (bankroll_str::numeric + v_credit)::text,
+     set bankroll_str = round(bankroll_str::numeric + v_credit, 18)::text,
          updated_at   = now()
    where id = 0;
   select bankroll_str into v_bankroll from paper_bankroll where id = 0;
