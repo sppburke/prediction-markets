@@ -414,10 +414,9 @@ impl Reader {
                 () = tokio::time::sleep_until(deadline) => None,
                 frame = stream.next_frame() => Some(frame),
             };
-            // One deadline check per iteration, BEFORE any normalization could
-            // refresh it: covers expiry while parked, a frame that became ready
-            // at the same instant, and a fan-in block inside the previous frame
-            // that outlived the deadline (the drop then precedes the next read).
+            // One deadline check per iteration, BEFORE processing the next frame.
+            // An accepted watched row that blocks on fan-in credits liveness from
+            // a fresh post-delivery instant before this loop can check again.
             let now = Instant::now();
             if now >= deadline {
                 warn!(

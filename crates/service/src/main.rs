@@ -114,20 +114,6 @@ fn select_boot_anchor_wallets(
     Ok(selection)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostAnchorBootAction {
-    Continue,
-    Exit,
-}
-
-fn post_anchor_boot_action(exit_after_anchors: bool) -> PostAnchorBootAction {
-    if exit_after_anchors {
-        PostAnchorBootAction::Exit
-    } else {
-        PostAnchorBootAction::Continue
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -480,6 +466,12 @@ async fn main() -> Result<()> {
         OffsetDateTime::now_utc().unix_timestamp(),
     )
     .context("select reusable boot anchors")?;
+    info!(
+        reused = boot_anchor_selection.reused.len(),
+        walked = boot_anchor_selection.walked.len(),
+        first_migration_boot = migration_boot.session.is_some(),
+        "boot anchor selection census"
+    );
     let anchored = boot_position_validator
         .validate_direct(
             &boot_anchor_selection.walked,
@@ -568,7 +560,7 @@ async fn main() -> Result<()> {
         .activation_tails
         .as_ref()
         .context("installed migration metadata omitted activation tails")?;
-    if post_anchor_boot_action(exit_after_anchors) == PostAnchorBootAction::Exit {
+    if exit_after_anchors {
         info!("boot anchors prepared; exiting before runtime writers and listeners");
         return Ok(());
     }
@@ -1827,14 +1819,5 @@ mod tests {
             select_boot_anchor_wallets(&paper_state, &[with_validation], true, NOW).unwrap();
         assert!(migration.reused.is_empty());
         assert_eq!(migration.walked, vec![with_validation]);
-    }
-
-    #[test]
-    fn exit_after_anchors_returns_exit_signal_before_runtime_setup() {
-        assert_eq!(post_anchor_boot_action(true), PostAnchorBootAction::Exit);
-        assert_eq!(
-            post_anchor_boot_action(false),
-            PostAnchorBootAction::Continue
-        );
     }
 }

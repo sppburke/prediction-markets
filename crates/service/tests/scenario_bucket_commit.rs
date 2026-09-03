@@ -364,9 +364,14 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     let result = engine
         .commit(vec![copy], &context(101, true), zero_basis())
         .unwrap();
-    assert_eq!(result.dispositions[&copy_id.0], "not_copy_eligible");
+    assert_eq!(
+        result.dispositions[&copy_id.0],
+        "reanchor_required_late_group"
+    );
     assert!(result.pending.is_empty());
     assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert_eq!(state(&engine, MARKET_C, 0), ShareAmount::ZERO);
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
 }
 
 #[test]
@@ -1444,30 +1449,56 @@ fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
     assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
 
-    let zero = aggregate(json!({
-        "timestamp": 561,
-        "conditionId": MARKET_A,
-        "type": "REDEEM",
-        "size": "0",
-        "usdcSize": "0",
-        "transactionHash": "0x73",
-        "price": "0",
-        "asset": "asset-0",
-        "side": "",
-        "outcomeIndex": 0,
-        "outcome": "Yes",
-    }));
-    let zero_id = zero.group_id.key().clone();
+    let pending_before = paper.open_decision_pending().unwrap().len();
+    let buy = position_row("TRADE", "0x73", MARKET_A, 0, "BUY", "2", "0.5", 561);
+    let buy_id = buy.group_id.key().clone();
     let result = engine
-        .commit(vec![zero], &context(561, true), zero_basis())
+        .commit(vec![buy], &context(561, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     assert_eq!(
-        result.dispositions[&zero_id.0],
-        "reanchor_required_redemption"
+        result.dispositions[&buy_id.0],
+        "reanchor_required_late_group"
     );
+    assert!(result.pending.is_empty());
+    assert_eq!(paper.open_decision_pending().unwrap().len(), pending_before);
+    let group = paper
+        .activity_groups_after(&wallet(), 560)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.source_trade_id == buy_id)
+        .unwrap();
+    assert!(matches!(
+        LedgerEffect::from_document(&group.proof_json),
+        Ok(LedgerEffect::RawOnly)
+    ));
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+
+    install_anchor(
+        &mut engine,
+        &paper,
+        561,
+        vec![(
+            MarketId(VenueMarketId(MARKET_A.to_owned())),
+            OutcomeId(0),
+            ShareAmount::from_atomic(4_000_000),
+        )],
+        562,
+    );
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let mut after_anchor = context(562, true);
+    after_anchor.copy_eligible = false;
+    engine
+        .commit(
+            vec![position_row(
+                "TRADE", "0x74", MARKET_A, 0, "BUY", "2", "0.5", 562,
+            )],
+            &after_anchor,
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 6_000_000);
 }
 
 #[test]
@@ -2044,6 +2075,30 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
         Ok(LedgerEffect::RawOnly)
     ));
 
+    let decrement = position_row("TRADE", "0x83", MARKET_B, 0, "SELL", "1", "0.5", 701);
+    let decrement_id = decrement.group_id.key().clone();
+    let result = engine
+        .commit(vec![decrement], &context(701, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.newly_fenced, None);
+    assert_eq!(
+        result.dispositions[&decrement_id.0],
+        "reanchor_required_late_group"
+    );
+    assert!(result.pending.is_empty());
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 5_000_000);
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let decrement_group = paper
+        .activity_groups_after(&wallet(), 700)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.source_trade_id == decrement_id)
+        .unwrap();
+    assert!(matches!(
+        LedgerEffect::from_document(&decrement_group.proof_json),
+        Ok(LedgerEffect::RawOnly)
+    ));
+
     let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
     assert_eq!(
         replayed.position(&wallet()).unwrap().positions[&market_outcome(MARKET_A, 0)]
@@ -2057,6 +2112,29 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
             .atomic(),
         5_000_000
     );
+
+    install_anchor(&mut engine, &paper, 701, Vec::new(), 702);
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let mut after_anchor = context(702, true);
+    after_anchor.copy_eligible = false;
+    let applied = engine
+        .commit(
+            vec![position_row(
+                "TRADE",
+                "0xafter-late-anchor",
+                MARKET_B,
+                0,
+                "BUY",
+                "2",
+                "0.5",
+                702,
+            )],
+            &after_anchor,
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(applied.newly_fenced, None);
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 2_000_000);
 }
 
 #[test]

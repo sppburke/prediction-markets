@@ -814,13 +814,32 @@ impl PositionLedger {
         &mut self,
         mutations: &[LedgerMutation],
     ) -> Result<Vec<AppliedEffect>, LedgerError> {
+        let (candidate, applied) = self.simulate_all_or_none(mutations)?;
+        *self = candidate;
+        Ok(applied)
+    }
+
+    /// Apply a batch to one disposable ledger clone and return its resulting state.
+    /// The equal-second proof uses this to pay for exactly one full clone per
+    /// permutation while sharing the production batch semantics.
+    pub fn simulate_all_or_none(
+        &self,
+        mutations: &[LedgerMutation],
+    ) -> Result<(Self, Vec<AppliedEffect>), LedgerError> {
         let mut candidate = self.clone();
+        let applied = candidate.apply_all_in_place(mutations)?;
+        Ok((candidate, applied))
+    }
+
+    fn apply_all_in_place(
+        &mut self,
+        mutations: &[LedgerMutation],
+    ) -> Result<Vec<AppliedEffect>, LedgerError> {
         let mut closed_by_residual = HashSet::new();
         let mut applied = Vec::with_capacity(mutations.len());
         for mutation in mutations {
-            applied.push(candidate.apply_in_place(mutation, &mut closed_by_residual)?);
+            applied.push(self.apply_in_place(mutation, &mut closed_by_residual)?);
         }
-        *self = candidate;
         Ok(applied)
     }
 
