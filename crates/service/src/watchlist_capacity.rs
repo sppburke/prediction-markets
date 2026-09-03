@@ -172,25 +172,35 @@ impl WatchlistCapacityApplier for SupabaseWatchlistCapacity {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    fn fake_accept_validations(paper_state: &PaperStateDb, wallets: &[WalletAddress]) {
+    fn fake_install_anchors(paper_state: &PaperStateDb, wallets: &[WalletAddress], cursor: i64) {
         // Mirror the real orchestrator's successful acceptance so the publication
         // recheck sees a current causal position validation; the bracket itself is
         // proven in scenario_position_bracket.rs.
-        let validations: Vec<pe_paper_state::PositionValidationRecord> = wallets
+        paper_state
+            .seed_cursors_if_absent(
+                &wallets
+                    .iter()
+                    .copied()
+                    .map(|wallet| (wallet, cursor))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let installs: Vec<pe_paper_state::AnchorInstallRecord> = wallets
             .iter()
-            .map(|wallet| pe_paper_state::PositionValidationRecord {
+            .map(|wallet| pe_paper_state::AnchorInstallRecord {
                 wallet: *wallet,
-                ledger_hash: "test-ledger".to_owned(),
+                balances: Vec::new(),
+                activity_cutoff_unix: cursor,
+                anchored_at_unix: cursor,
+                ledger_hash_after: "test-ledger".to_owned(),
                 positions_proof_hash: "test-proof".to_owned(),
                 activity_bounds_json: "{}".to_owned(),
                 source_log_generation: "test-gen".to_owned(),
                 proof_json: "{}".to_owned(),
-                recorded_at_unix: 0,
+                recorded_at_unix: cursor,
             })
             .collect();
-        paper_state
-            .record_position_validations(&validations)
-            .unwrap();
+        paper_state.install_anchors(&installs).unwrap();
     }
 
     use std::time::Duration;
@@ -320,7 +330,7 @@ mod tests {
                     };
                     let mut wallets = wallets;
                     wallets.sort_unstable_by_key(|w| w.0);
-                    fake_accept_validations(&fake_paper_state, &wallets);
+                    fake_install_anchors(&fake_paper_state, &wallets, 1_700_000_100);
                     prepared_sets
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -457,7 +467,7 @@ mod tests {
                 } => {
                     assert_eq!(live_at_control.snapshot().entries.len(), 1);
                     assert_eq!(wallets, vec![newcomer]);
-                    fake_accept_validations(&fake_paper_state, &wallets);
+                    fake_install_anchors(&fake_paper_state, &wallets, newcomer_last_trade);
                     prepared_task.notify_one();
                     release_task.notified().await;
                     acknowledged.send(()).unwrap();
@@ -465,7 +475,7 @@ mod tests {
                 OrchestratorControl::CommitActivityBucket { .. } => {
                     panic!("capacity transition sent an activity bucket")
                 }
-                OrchestratorControl::PrepareValidatedAdmissions { .. }
+                OrchestratorControl::InstallAnchors { .. }
                 | OrchestratorControl::CaptureAdmissionLedger { .. } => {
                     panic!("legacy admission test sent a causal-bracket command")
                 }
@@ -494,7 +504,10 @@ mod tests {
         prepared.notified().await;
         assert_eq!(live.snapshot().entries.len(), 1);
         assert_eq!(applied.load().target, 1);
-        assert_eq!(paper_state.cursor(&newcomer).unwrap(), None);
+        assert_eq!(
+            paper_state.cursor(&newcomer).unwrap(),
+            Some(newcomer_last_trade)
+        );
 
         release_ack.notify_one();
         assert_eq!(apply.await.unwrap().unwrap(), 2);

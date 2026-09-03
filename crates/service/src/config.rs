@@ -686,6 +686,20 @@ mode = "shadow"
     }
 
     #[test]
+    fn checked_in_service_config_names_the_legacy_history_file() {
+        // The version-two migration imports the captured legacy history once
+        // from this boot-owned path; the production service keeps the file
+        // under `smoke-test/`, not at the working-directory default (#555).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../smoke-test/service.toml");
+        // The checked-in file alone, without the environment overlay `load` applies.
+        let cfg: ServiceConfig = Figment::new().merge(Toml::file(&path)).extract().unwrap();
+        assert_eq!(
+            cfg.legacy_wallet_history_path,
+            PathBuf::from("smoke-test/wallet_market_history.json")
+        );
+    }
+
+    #[test]
     fn supabase_authoritative_flag_loads_from_toml() {
         use std::io::Write as _;
         let mut f = tempfile::NamedTempFile::new().unwrap();

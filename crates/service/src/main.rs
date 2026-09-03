@@ -13,6 +13,7 @@ use pe_core_types::SourceId;
 use pe_event_log::{Scanner, Writer};
 use pe_execution_core::{ExecutionDispatcher, LiveJournal};
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
+use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_migration::{
@@ -22,7 +23,7 @@ use pe_service::paper_migration::{
 };
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_service::position_seeder::CausalPositionValidator;
-use pe_source_polymarket_public::{ReconciliationFetcher, ReqwestFetcher};
+use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, ReconciliationFetcher, ReqwestFetcher};
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
@@ -65,6 +66,10 @@ use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
+
+/// Longest HTTP 429 `Retry-After` the reconciliation fetcher waits out in-line (issue #555;
+/// `docs/_GLOSSARY.md`): the venue answers a boot-bracket page burst with `Retry-After: 1`.
+const RECONCILIATION_RATE_LIMIT_RETRY_SECS: u32 = 1;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -370,21 +375,34 @@ async fn main() -> Result<()> {
     .context("encode source-log generation for position validation")?;
     // One fetcher owns the documented public-API rate gate for boot brackets
     // and runtime reconciliation (#544).
-    let position_fetcher: Arc<dyn ReconciliationFetcher> =
-        Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
+    let position_fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(
+        ReqwestFetcher::new(reqwest::Client::new())
+            .with_rate_limit_retry_max_secs(RECONCILIATION_RATE_LIMIT_RETRY_SECS),
+    );
+    let boot_source_log = Arc::new(tokio::sync::Mutex::new(
+        pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+            .context("open boot source-log recorder")?,
+    ));
+    let asset_identity = Arc::new(AssetIdentityResolver::new(
+        position_fetcher.clone(),
+        cfg.gamma_base_url.clone(),
+        GAMMA_BATCH_SIZE,
+        Arc::clone(&boot_source_log),
+    ));
     let boot_position_validator = if migration_boot.session.is_some() {
         CausalPositionValidator::new_recording(
             position_fetcher.clone(),
             cfg.polymarket_base_url.clone(),
             source_log_generation,
-            &cfg.source_event_log_path,
+            Arc::clone(&boot_source_log),
+            Arc::clone(&asset_identity),
         )
-        .context("open migration source-log recorder")?
     } else {
         CausalPositionValidator::new(
             position_fetcher.clone(),
             cfg.polymarket_base_url.clone(),
             source_log_generation,
+            Arc::clone(&asset_identity),
         )
     };
     let mut boot_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
@@ -395,12 +413,16 @@ async fn main() -> Result<()> {
         .iter()
         .map(|entry| entry.wallet)
         .collect::<Vec<_>>();
-    boot_position_validator
+    let anchored = boot_position_validator
         .validate_direct(&boot_wallets, &mut boot_engine, &paper_state)
         .await
         .context("causal current-position validation for boot universe")?;
     let leader_ledger = boot_engine.into_ledger();
     drop(boot_position_validator);
+    let (source_log, source_rx) =
+        pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
+    asset_identity.activate_runtime(source_log.clone()).await;
+    drop(boot_source_log);
 
     let complete_history = paper_state
         .complete_history_wallets()
@@ -413,9 +435,20 @@ async fn main() -> Result<()> {
         .map(|entry| entry.wallet)
         .collect();
     live_watchlist.remove_fenced(&history_incomplete);
+    // Live at boot means accepted by this boot's bracket. Deferred wallets
+    // re-enter only through the runtime admission preparer; fenced wallets stay
+    // excluded. On a resumed side main an earlier bracket's promoted history
+    // would otherwise keep a now-deferred wallet live.
+    let anchored_wallets: Vec<_> = anchored.iter().map(|install| install.wallet).collect();
+    let not_accepted: std::collections::HashSet<_> = boot_wallets
+        .iter()
+        .filter(|wallet| !anchored_wallets.contains(wallet))
+        .copied()
+        .collect();
+    live_watchlist.remove_fenced(&not_accepted);
     anyhow::ensure!(
         !live_watchlist.snapshot().entries.is_empty(),
-        "no wallets eligible after durable fence/history filtering"
+        "no wallets eligible after durable fence/history/acceptance filtering"
     );
 
     if migration_boot.session.is_some() {
@@ -424,7 +457,7 @@ async fn main() -> Result<()> {
                 .context("capture migration reconciliation obligations")?;
         record_activation_facts(
             &paper_state,
-            &boot_wallets,
+            &anchored_wallets,
             &activation_obligations,
             build_identity(),
         )?;
@@ -472,6 +505,7 @@ async fn main() -> Result<()> {
         position_fetcher.clone(),
         cfg.polymarket_base_url.clone(),
         runtime_source_generation,
+        Arc::clone(&asset_identity),
     );
 
     projection_dirty.mark();
@@ -553,8 +587,6 @@ async fn main() -> Result<()> {
                 cfg.source_event_log_path.display()
             )
         })?;
-    let (source_log, source_rx) =
-        pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
     let (trigger_tx, trigger_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
     let mut start = producer_start_rx.clone();
     let activity_watchlist = live_watchlist.clone();
@@ -598,6 +630,8 @@ async fn main() -> Result<()> {
     let poller_copy_latency_budget_secs = cfg.copy_latency_budget_secs;
     let poller_control_tx = control_tx.clone();
     let poller_runtime_config = live_runtime_config.clone();
+    let poller_admission_preparer = admission_preparer.clone();
+    let poller_asset_identity = Arc::clone(&asset_identity);
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -612,6 +646,7 @@ async fn main() -> Result<()> {
             },
             poller_watchlist,
             position_fetcher,
+            poller_asset_identity,
             source_log,
             trigger_rx,
             poller_control_tx,
@@ -620,6 +655,7 @@ async fn main() -> Result<()> {
             Default::default(),
             poller_runtime_config,
             obligations,
+            Some(poller_admission_preparer),
         )
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
         .await

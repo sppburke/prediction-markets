@@ -681,8 +681,15 @@ fn duplicate_envelope(envelope: &EnvelopeIn) -> EnvelopeIn {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::asset_identity::AssetIdentityResolver;
     use crate::health::new_shared_health_with_ws;
+    use pe_core_types::PolymarketTokenId;
     use pe_event_log::Reader as LogReader;
+    use pe_source_core::SourceError;
+    use pe_source_polymarket_public::{
+        GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
+        ReconciliationFetcher,
+    };
 
     const WALLET: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -710,6 +717,87 @@ mod tests {
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }
+    }
+
+    struct RuntimeGammaFetcher;
+
+    impl ReconciliationFetcher for RuntimeGammaFetcher {
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                Ok(
+                    br#"[{"conditionId":"condition-runtime","clobTokenIds":["token-runtime"]}]"#
+                        .to_vec(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_identity_waits_for_recovered_durable_metadata_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let mut sink = SourceEventSink::open(&path).unwrap();
+        sink.fail_next_append();
+        let (fan_in_tx, fan_in_rx) = mpsc::channel(1);
+        let (trigger_tx, trigger_rx) = mpsc::channel(1);
+        let (source_log, source_rx) = SourceLogHandle::channel(1);
+        let health = new_shared_health_with_ws(false, true, 90);
+        let coordinator = tokio::spawn(
+            Coordinator {
+                sink,
+                trigger_tx,
+                health: health.clone(),
+                fan_in: fan_in_rx,
+                source_rx: source_rx.rx,
+            }
+            .run(),
+        );
+        let resolver = Arc::new(AssetIdentityResolver::new_runtime(
+            Arc::new(RuntimeGammaFetcher),
+            "https://gamma.example.test".to_owned(),
+            50,
+            source_log,
+        ));
+        let resolving = tokio::spawn({
+            let resolver = Arc::clone(&resolver);
+            async move {
+                resolver
+                    .resolve([PolymarketTokenId("token-runtime".to_owned())])
+                    .await
+            }
+        });
+
+        settle().await;
+        assert!(health.lock().unwrap().ws_sink_poisoned);
+        assert!(
+            !resolving.is_finished(),
+            "identity cannot be returned before the held append is durable"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        let resolved = resolving.await.unwrap().unwrap();
+        let token = PolymarketTokenId("token-runtime".to_owned());
+        assert_eq!(resolved.provenance[&token].source_log_sequence, 0);
+        assert!(!health.lock().unwrap().ws_sink_poisoned);
+
+        drop(trigger_rx);
+        drop(fan_in_tx);
+        coordinator.await.unwrap();
+        drop(resolver);
+        let entries = LogReader::replay(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.source_id.0, GAMMA_MARKETS_SOURCE_ID);
+        assert_eq!(entries[0].1.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
+        assert_eq!(entries[0].1.parser_version, GAMMA_MARKETS_PARSER_VERSION);
     }
 
     /// Sink uncertainty holds the current item, blocks delivery from every

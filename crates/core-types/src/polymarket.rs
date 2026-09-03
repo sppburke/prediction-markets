@@ -16,7 +16,7 @@ impl fmt::Display for PolymarketConditionId {
 }
 
 /// Polymarket ERC-1155 token ID — identifies a specific outcome's collateral token.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PolymarketTokenId(pub String);
 

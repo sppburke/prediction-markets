@@ -38,7 +38,8 @@ const UNOBSERVED_CONTEXT: HttpRequestContext = HttpRequestContext {
 pub trait PageFetcher {
     /// Fetch a page from `url`. Returns raw response bytes.
     ///
-    /// - Returns [`SourceError::RateLimited`] on HTTP 429 with the `Retry-After` value.
+    /// - Returns [`SourceError::RateLimited`] on HTTP 429 with the `Retry-After` value (an
+    ///   opted-in instance first retries short waits within its budget).
     /// - Returns [`SourceError::Transient`] on 5xx or network errors (retried internally).
     /// - Returns [`SourceError::Fatal`] on 4xx (non-429) errors.
     fn fetch_page(
@@ -59,13 +60,17 @@ pub trait PageFetcher {
 ///   shared via `Mutex<Option<Instant>>` so concurrent callers all observe the
 ///   serial gate (see `last_request_at` and the gate logic in `fetch_page`).
 ///   Override via [`Self::with_min_interval_ms`] for APIs with different rate limits.
-/// - HTTP 429 → [`SourceError::RateLimited`] (returned to caller, not retried).
+/// - HTTP 429 → [`SourceError::RateLimited`] (returned to caller, not retried) unless the
+///   instance opted in via [`Self::with_rate_limit_retry_max_secs`], in which case a
+///   `Retry-After` at or below that bound is waited out inside the same retry budget.
 /// - HTTP 4xx (non-429) → [`SourceError::Fatal`].
 pub struct ReqwestFetcher {
     client: reqwest::Client,
     timeout: Duration,
     max_retries: u32,
     initial_backoff_ms: u64,
+    /// Longest `Retry-After` honored in-line on HTTP 429; `None` returns 429 to the caller.
+    rate_limit_retry_max_secs: Option<u32>,
     min_interval_ms: u64,
     /// Shared rate-limit clock: serializes the gate across concurrent callers
     /// so the global throughput stays under `min_interval_ms` even when a single
@@ -81,6 +86,7 @@ impl ReqwestFetcher {
             timeout: Duration::from_secs(REQUEST_TIMEOUT_SECS),
             max_retries: MAX_RETRIES,
             initial_backoff_ms: 200,
+            rate_limit_retry_max_secs: None,
             min_interval_ms: MIN_INTERVAL_MS,
             last_request_at: Mutex::new(None),
         }
@@ -101,6 +107,15 @@ impl ReqwestFetcher {
     /// Override the initial retry backoff; useful in tests to keep them fast.
     pub fn with_initial_backoff_ms(mut self, ms: u64) -> Self {
         self.initial_backoff_ms = ms;
+        self
+    }
+
+    /// Opt in to waiting out a short HTTP 429 `Retry-After` (at most `max_secs`) inside the
+    /// retry budget. Only the Data-API reconciliation fetcher opts in (issue #555): the venue
+    /// answers a page burst with `Retry-After: 1`, and returning it uncontested deferred whole
+    /// wallets from the boot bracket. Hot-path and outer-budgeted clients keep the default.
+    pub fn with_rate_limit_retry_max_secs(mut self, max_secs: u32) -> Self {
+        self.rate_limit_retry_max_secs = Some(max_secs);
         self
     }
 
@@ -145,12 +160,6 @@ impl ReqwestFetcher {
         deadline: Option<Instant>,
         observe: &mut impl FnMut(RawHttpAttempt) -> Result<(), SourceError>,
     ) -> Result<Vec<u8>, SourceError> {
-        if !self.wait_for_rate_slot(deadline).await {
-            return Err(SourceError::Transient {
-                message: "request deadline elapsed before send".to_owned(),
-            });
-        }
-
         let mut attempt = 0u32;
         let parsed_url = reqwest::Url::parse(url).map_err(|error| SourceError::Fatal {
             message: error.to_string(),
@@ -161,6 +170,12 @@ impl ReqwestFetcher {
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect::<Vec<_>>();
         loop {
+            // Every attempt, including retries, takes a slot from the shared rate gate.
+            if !self.wait_for_rate_slot(deadline).await {
+                return Err(SourceError::Transient {
+                    message: "request deadline elapsed before send".to_owned(),
+                });
+            }
             let ordinal = attempt + 1;
             let request_timeout = match deadline {
                 Some(deadline) => deadline
@@ -258,6 +273,24 @@ impl ReqwestFetcher {
                             .as_deref()
                             .and_then(|value| value.parse::<u32>().ok())
                             .unwrap_or(30);
+                        if self
+                            .rate_limit_retry_max_secs
+                            .is_some_and(|max_secs| retry_after_secs <= max_secs)
+                            && attempt < self.max_retries
+                        {
+                            attempt += 1;
+                            tracing::warn!(
+                                path = %path,
+                                retry_after_secs,
+                                attempt,
+                                "rate limited by the venue; retrying after the requested wait"
+                            );
+                            tokio::time::sleep(Duration::from_secs(u64::from(
+                                retry_after_secs.max(1),
+                            )))
+                            .await;
+                            continue;
+                        }
                         return Err(SourceError::RateLimited { retry_after_secs });
                     }
                     if is_retryable_status(status) {
@@ -390,6 +423,164 @@ impl PageFetcher for FixtureFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn short_retry_after_is_honored_inside_the_retry_budget() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/burst",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "1")],
+                            "{}".to_owned(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [("retry-after", "0")],
+                            "[1]".to_owned(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(1)
+            .with_rate_limit_retry_max_secs(1);
+        let body = fetcher
+            .fetch_page(&format!("http://{address}/burst"))
+            .await
+            .unwrap();
+        assert_eq!(body, b"[1]");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn long_retry_after_is_returned_to_the_caller_without_a_retry() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "60")],
+                        "{}",
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(3)
+            .with_rate_limit_retry_max_secs(1);
+        let result = fetcher.fetch_page(&format!("http://{address}/slow")).await;
+        assert!(matches!(
+            result,
+            Err(SourceError::RateLimited {
+                retry_after_secs: 60
+            })
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_short_429_exhausts_the_budget_and_records_every_attempt() {
+        let app = axum::Router::new().route(
+            "/persistent",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "0")],
+                    "{}",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(1)
+            .with_min_interval_ms(0)
+            .with_rate_limit_retry_max_secs(1);
+        let mut ordinals = Vec::new();
+        let result = fetcher
+            .fetch_page_observed(
+                &format!("http://{address}/persistent"),
+                HttpRequestContext {
+                    source_id: "test-server",
+                    endpoint_kind: "persistent",
+                },
+                |attempt| {
+                    if let RawHttpAttempt::Response(response) = &attempt {
+                        ordinals.push((response.attempt_ordinal, response.status));
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SourceError::RateLimited {
+                retry_after_secs: 0
+            })
+        ));
+        assert_eq!(ordinals, vec![(1, 429), (2, 429)]);
+    }
+
+    #[tokio::test]
+    async fn a_retry_attempt_waits_for_the_shared_rate_slot() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        // A 5xx retry with zero backoff isolates the gate: the only wait between
+        // the two attempts is the 300 ms rate slot.
+        let app = axum::Router::new().route(
+            "/paced",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (axum::http::StatusCode::BAD_GATEWAY, "{}".to_owned())
+                    } else {
+                        (axum::http::StatusCode::OK, "[]".to_owned())
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(1)
+            .with_initial_backoff_ms(0)
+            .with_min_interval_ms(300);
+        let started = std::time::Instant::now();
+        fetcher
+            .fetch_page(&format!("http://{address}/paced"))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn observed_response_retains_retry_headers() {

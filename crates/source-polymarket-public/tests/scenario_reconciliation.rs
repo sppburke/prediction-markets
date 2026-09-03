@@ -2,12 +2,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use pe_core_types::{ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress};
+use pe_core_types::{
+    OutcomeId, PolymarketConditionId, PolymarketTokenId, ReceivedAt, ShareAmount, SourceId,
+    SourceTimestamp, WalletAddress,
+};
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ActivityAssetMapping, ActivityParseContext, ActivityReadError,
     ActivityTransport, FixtureFetcher, PolymarketEndpoint, PositionClassification,
-    PositionPartition, PositionReadError, RECONCILIATION_PAGE_LIMIT, fetch_complete_activity,
-    fetch_complete_positions, parse_activity_response,
+    PositionPartition, PositionReadError, RECONCILIATION_PAGE_LIMIT, VerifiedTokenIdentity,
+    fetch_complete_activity, fetch_complete_positions, parse_activity_response,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -53,7 +56,33 @@ fn context() -> ActivityParseContext {
 fn mapping(rows: Vec<Value>) -> ActivityAssetMapping {
     let raw = serde_json::to_vec(&rows).unwrap();
     let parsed = parse_activity_response(&raw, wallet(), &context()).unwrap();
-    ActivityAssetMapping::from_rows(&parsed.rows).unwrap()
+    ActivityAssetMapping::from_rows(&parsed.rows)
+}
+
+fn verified_mapping(rows: Vec<Value>) -> ActivityAssetMapping {
+    let mut mapping = mapping(rows);
+    let identities = mapping
+        .tokens()
+        .filter_map(|asset| {
+            mapping
+                .identity(asset)
+                .cloned()
+                .map(|identity| (asset.clone(), identity))
+        })
+        .collect::<Vec<_>>();
+    for (asset, identity) in identities {
+        mapping
+            .apply_verified(
+                &asset,
+                &VerifiedTokenIdentity {
+                    condition_id: identity.condition_id,
+                    outcome: identity.outcome,
+                    evidence_hash: "fixture-metadata-page".to_owned(),
+                },
+            )
+            .unwrap();
+    }
+    mapping
 }
 
 fn position_url(partition: PositionPartition, offset: u32) -> String {
@@ -125,7 +154,7 @@ async fn one_position_read(
     activity_rows: Vec<Value>,
     position_rows: Vec<Value>,
 ) -> pe_source_polymarket_public::CompletePositionsRead {
-    let activity = mapping(activity_rows);
+    let activity = verified_mapping(activity_rows);
     let fetcher = FixtureFetcher::new(HashMap::from([
         (
             position_url(PositionPartition::NotRedeemable, 0),
@@ -144,7 +173,7 @@ async fn one_position_read(
 #[tokio::test]
 async fn captured_partition_row_uses_exact_size_and_activity_combo_identity() {
     let captured = include_bytes!("fixtures/positions_partition_true_w0_trimmed.json").to_vec();
-    let activity = mapping(vec![json!({
+    let activity = verified_mapping(vec![json!({
         "proxyWallet": WALLET,
         "timestamp": 100,
         "conditionId": CONDITION,
@@ -185,7 +214,7 @@ async fn captured_partition_row_uses_exact_size_and_activity_combo_identity() {
 
 #[tokio::test]
 async fn partition_layout_and_presentation_do_not_change_semantic_proof() {
-    let activity = mapping(vec![activity_row(
+    let activity = verified_mapping(vec![activity_row(
         100,
         "0xactivity".to_owned(),
         "asset-1".to_owned(),
@@ -314,7 +343,7 @@ async fn every_position_semantic_field_changes_the_proof() {
 
 #[tokio::test]
 async fn duplicate_asset_across_explicit_partitions_rejects() {
-    let activity = mapping(vec![activity_row(
+    let activity = verified_mapping(vec![activity_row(
         100,
         "0xactivity".to_owned(),
         "asset-1".to_owned(),
@@ -342,7 +371,7 @@ async fn duplicate_asset_across_explicit_partitions_rejects() {
 }
 
 #[tokio::test]
-async fn missing_or_conflicting_activity_mapping_rejects() {
+async fn missing_and_unverified_activity_mapping_rejects() {
     let activity = mapping(Vec::new());
     let body = serde_json::to_vec(&vec![json!({
         "proxyWallet": WALLET,
@@ -361,16 +390,162 @@ async fn missing_or_conflicting_activity_mapping_rejects() {
         Err(PositionReadError::MissingActivityMapping { .. })
     ));
 
+    let unverified = mapping(vec![activity_row(
+        100,
+        "0xmatching".to_owned(),
+        "asset-1".to_owned(),
+        0,
+    )]);
+    let position = serde_json::to_vec(&vec![json!({
+        "proxyWallet": WALLET,
+        "asset": "asset-1",
+        "conditionId": "0xcondition0",
+        "size": "1",
+        "outcomeIndex": 0
+    })])
+    .unwrap();
+    let fetcher = FixtureFetcher::new(HashMap::from([(
+        position_url(PositionPartition::NotRedeemable, 0),
+        position,
+    )]));
+    assert!(matches!(
+        fetch_complete_positions(&fetcher, BASE, wallet(), &unverified).await,
+        Err(PositionReadError::MetadataUnresolved { asset, reason })
+            if asset == "asset-1" && reason == "position asset unverified by venue metadata"
+    ));
+
     let conflicting = vec![
         activity_row(100, "0xone".to_owned(), "asset-1".to_owned(), 0),
         activity_row(101, "0xtwo".to_owned(), "asset-1".to_owned(), 1),
     ];
     let raw = serde_json::to_vec(&conflicting).unwrap();
     let parsed = parse_activity_response(&raw, wallet(), &context()).unwrap();
+    let conflicting = ActivityAssetMapping::from_rows(&parsed.rows);
+    let token = PolymarketTokenId("asset-1".to_owned());
+    assert_eq!(conflicting.unresolved()[&token].len(), 2);
+    assert!(conflicting.identity(&token).is_none());
+
+    let position = serde_json::to_vec(&vec![json!({
+        "proxyWallet": WALLET,
+        "asset": "asset-1",
+        "conditionId": "0xcondition0",
+        "size": "1",
+        "outcomeIndex": 0
+    })])
+    .unwrap();
+    let fetcher = FixtureFetcher::new(HashMap::from([(
+        position_url(PositionPartition::NotRedeemable, 0),
+        position,
+    )]));
     assert!(matches!(
-        ActivityAssetMapping::from_rows(&parsed.rows),
-        Err(PositionReadError::ConflictingActivityMapping { .. })
+        fetch_complete_positions(&fetcher, BASE, wallet(), &conflicting).await,
+        Err(PositionReadError::MetadataUnresolved { asset, reason })
+            if asset == "asset-1" && reason == "position asset unverified by venue metadata"
     ));
+}
+
+#[test]
+fn e4_conflict_collects_all_candidates_then_metadata_installs_identity() {
+    let mut rows = (0..6)
+        .map(|index| activity_row(100 + index, format!("0x{index}"), ASSET.to_owned(), 0))
+        .collect::<Vec<_>>();
+    rows.push(activity_row(
+        106,
+        "0xmistamped".to_owned(),
+        ASSET.to_owned(),
+        1,
+    ));
+    for row in &mut rows {
+        row["conditionId"] = json!(CONDITION);
+    }
+
+    let mut mapping = mapping(rows);
+    let asset = PolymarketTokenId(ASSET.to_owned());
+    let candidates = &mapping.unresolved()[&asset];
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].outcome, OutcomeId(0));
+    assert_eq!(candidates[1].outcome, OutcomeId(1));
+    assert_eq!(
+        mapping.classification(&asset),
+        Some(PositionClassification::Ordinary)
+    );
+    assert_eq!(mapping.tokens().filter(|token| *token == &asset).count(), 1);
+
+    mapping
+        .apply_verified(
+            &asset,
+            &VerifiedTokenIdentity {
+                condition_id: PolymarketConditionId(CONDITION.to_owned()),
+                outcome: OutcomeId(0),
+                evidence_hash: "canonical-page-hash".to_owned(),
+            },
+        )
+        .unwrap();
+    assert!(!mapping.unresolved().contains_key(&asset));
+    assert_eq!(
+        mapping.identity(&asset),
+        Some(&pe_source_polymarket_public::ActivityAssetIdentity {
+            condition_id: PolymarketConditionId(CONDITION.to_owned()),
+            outcome: OutcomeId(0),
+            classification: PositionClassification::Ordinary,
+            verified: true,
+        })
+    );
+}
+
+#[test]
+fn mixed_activity_classification_stays_unresolved_and_cannot_apply_metadata() {
+    let mut combo = activity_row(101, "0xcombo".to_owned(), "asset-1".to_owned(), 0);
+    combo["isCombo"] = json!(true);
+    let mut mapping = mapping(vec![
+        activity_row(100, "0xordinary".to_owned(), "asset-1".to_owned(), 0),
+        combo,
+    ]);
+    let asset = PolymarketTokenId("asset-1".to_owned());
+    assert_eq!(mapping.classification(&asset), None);
+    assert_eq!(mapping.unresolved()[&asset].len(), 2);
+    assert!(matches!(
+        mapping.apply_verified(
+            &asset,
+            &VerifiedTokenIdentity {
+                condition_id: PolymarketConditionId("0xcondition0".to_owned()),
+                outcome: OutcomeId(0),
+                evidence_hash: "hash".to_owned(),
+            }
+        ),
+        Err(PositionReadError::MixedActivityClassification { .. })
+    ));
+
+    let mut position_only = ActivityAssetMapping::from_rows(&[]);
+    assert!(matches!(
+        position_only.apply_verified(
+            &PolymarketTokenId("position-only".to_owned()),
+            &VerifiedTokenIdentity {
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                outcome: OutcomeId(0),
+                evidence_hash: "hash".to_owned(),
+            }
+        ),
+        Err(PositionReadError::MissingActivityMapping { .. })
+    ));
+}
+
+#[test]
+fn duplicate_activity_outcome_marks_every_asset_unresolved() {
+    let mapping = mapping(vec![
+        activity_row(100, "0xone".to_owned(), "asset-1".to_owned(), 0),
+        activity_row(101, "0xtwo".to_owned(), "asset-2".to_owned(), 0),
+    ]);
+    assert!(
+        mapping
+            .unresolved()
+            .contains_key(&PolymarketTokenId("asset-1".to_owned()))
+    );
+    assert!(
+        mapping
+            .unresolved()
+            .contains_key(&PolymarketTokenId("asset-2".to_owned()))
+    );
 }
 
 #[test]
@@ -389,17 +564,67 @@ fn incomplete_split_identity_does_not_override_a_complete_activity_mapping() {
     })])
     .unwrap();
     let parsed = parse_activity_response(&raw, wallet(), &context()).unwrap();
-    let incomplete = ActivityAssetMapping::from_rows(&parsed.rows).unwrap();
-    assert!(
-        incomplete
-            .identity(&pe_core_types::PolymarketTokenId(ASSET.to_owned()))
-            .is_none()
+    let incomplete = ActivityAssetMapping::from_rows(&parsed.rows);
+    let asset = PolymarketTokenId(ASSET.to_owned());
+    assert!(incomplete.identity(&asset).is_none());
+    assert_eq!(incomplete.unresolved()[&asset], Vec::new());
+    assert_eq!(
+        incomplete.classification(&asset),
+        Some(PositionClassification::Ordinary)
     );
 }
 
 #[tokio::test]
+async fn metadata_identity_overrides_disagreeing_position_stamp() {
+    let mut activity = activity_row(100, "0xactivity".to_owned(), "asset-1".to_owned(), 1);
+    activity["conditionId"] = json!("0xactivity-condition");
+    let mut mapping = mapping(vec![activity]);
+    let asset = PolymarketTokenId("asset-1".to_owned());
+    let position = serde_json::to_vec(&vec![json!({
+        "proxyWallet": WALLET,
+        "asset": "asset-1",
+        "conditionId": "0xposition-misstamp",
+        "size": "1",
+        "outcomeIndex": 1
+    })])
+    .unwrap();
+    let fetcher = FixtureFetcher::new(HashMap::from([
+        (position_url(PositionPartition::NotRedeemable, 0), position),
+        (
+            position_url(PositionPartition::Redeemable, 0),
+            b"[]".to_vec(),
+        ),
+    ]));
+    assert!(matches!(
+        fetch_complete_positions(&fetcher, BASE, wallet(), &mapping).await,
+        Err(PositionReadError::MetadataUnresolved { asset, reason })
+            if asset == "asset-1" && reason == "position asset unverified by venue metadata"
+    ));
+
+    mapping
+        .apply_verified(
+            &asset,
+            &VerifiedTokenIdentity {
+                condition_id: PolymarketConditionId("0xverified-condition".to_owned()),
+                outcome: OutcomeId(0),
+                evidence_hash: "canonical-page-hash".to_owned(),
+            },
+        )
+        .unwrap();
+
+    let read = fetch_complete_positions(&fetcher, BASE, wallet(), &mapping)
+        .await
+        .unwrap();
+    assert_eq!(
+        read.positions[0].condition_id,
+        PolymarketConditionId("0xverified-condition".to_owned())
+    );
+    assert_eq!(read.positions[0].outcome, OutcomeId(0));
+}
+
+#[tokio::test]
 async fn exact_position_precision_and_wallet_identity_fail_closed() {
-    let activity = mapping(vec![activity_row(
+    let activity = verified_mapping(vec![activity_row(
         100,
         "0xactivity".to_owned(),
         "asset-1".to_owned(),
@@ -445,7 +670,7 @@ async fn saturated_positions_terminal_offset_is_typed_incomplete() {
             row
         })
         .collect::<Vec<_>>();
-    let activity = mapping(activity_rows);
+    let activity = verified_mapping(activity_rows);
     let mut responses = HashMap::new();
     for offset in (0..=10_000_u32).step_by(500) {
         let rows = (offset..offset + RECONCILIATION_PAGE_LIMIT)
@@ -518,7 +743,7 @@ async fn oversized_activity_and_position_pages_are_typed_incomplete() {
             &positions_fetcher,
             BASE,
             wallet(),
-            &ActivityAssetMapping::from_rows(&[]).unwrap(),
+            &ActivityAssetMapping::from_rows(&[]),
         )
         .await,
         Err(PositionReadError::PageTooLarge {

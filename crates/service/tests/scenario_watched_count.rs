@@ -138,6 +138,7 @@ fn fence(paper: &PaperStateDb, wallet: WalletAddress) {
                 proof_json: "{}".to_owned(),
                 fenced_at_unix: 1,
             }),
+            reanchor: None,
             advance_cursor: true,
         })
         .unwrap();

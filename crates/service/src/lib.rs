@@ -6,6 +6,7 @@
 pub mod build_identity;
 
 pub mod activity_ingest;
+pub mod asset_identity;
 pub mod bucket_commit;
 pub mod build_info;
 pub mod clob_book;

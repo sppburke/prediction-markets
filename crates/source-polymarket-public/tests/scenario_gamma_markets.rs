@@ -13,7 +13,11 @@
 
 use std::collections::HashMap;
 
-use pe_source_polymarket_public::{FixtureFetcher, GammaMarketsClient, MarketFilter};
+use pe_core_types::SourceId;
+use pe_source_polymarket_public::{
+    FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaMarketsError, MarketFilter,
+};
 
 const BASE: &str = "https://g";
 
@@ -32,6 +36,22 @@ fn batch_url(ids: &[&str], closed: bool) -> String {
     }
     u.push_str("&limit=500");
     u
+}
+
+fn token_batch_url(ids: &[&str], closed: bool) -> String {
+    let mut url = format!("{BASE}/markets?");
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            url.push('&');
+        }
+        url.push_str("clob_token_ids=");
+        url.push_str(id);
+    }
+    url.push_str("&limit=500");
+    if closed {
+        url.push_str("&closed=true");
+    }
+    url
 }
 
 fn market(id: &str, end_date: Option<&str>, liquidity: Option<&str>) -> String {
@@ -189,4 +209,90 @@ async fn closed_filter_uses_closed_true_url() {
 
     assert_eq!(out.markets.len(), 1, "&closed=true URL must be used");
     assert_eq!(out.markets["A"].end_date_unix, Some(1_705_276_800));
+}
+
+#[tokio::test]
+async fn token_lookup_deduplicates_one_request_and_returns_raw_evidence() {
+    let first_raw = br#"[
+      {"conditionId":"condition-a","clobTokenIds":["A","B"]}
+    ]"#
+    .to_vec();
+    let mut responses = HashMap::new();
+    responses.insert(token_batch_url(&["A", "B"], true), first_raw.clone());
+
+    let out = client(responses, 2)
+        .fetch_markets_by_token_ids(&ids(&["A", "A", "B"]), MarketFilter::ClosedOnly)
+        .await
+        .unwrap();
+
+    assert_eq!(out.markets.markets.len(), 1);
+    let (page, raw) = out.page.unwrap();
+    assert_eq!(page.request_url, token_batch_url(&["A", "B"], true));
+    assert_eq!(raw, first_raw);
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let canonical = serde_json::to_vec(&value).unwrap();
+    assert_eq!(page.raw_page_hash, blake3::hash(&raw).to_hex().to_string());
+    assert_eq!(
+        page.canonical_page_hash,
+        blake3::hash(&canonical).to_hex().to_string()
+    );
+    assert_eq!(page.source_id, SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()));
+    assert_eq!(page.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
+    assert_eq!(page.parser_version, GAMMA_MARKETS_PARSER_VERSION);
+}
+
+#[tokio::test]
+async fn token_lookup_rejects_more_than_one_request_batch() {
+    let result = client(HashMap::new(), 2)
+        .fetch_markets_by_token_ids(&ids(&["A", "B", "C"]), MarketFilter::OpenOnly)
+        .await;
+    assert!(matches!(
+        result,
+        Err(error) if matches!(
+            error.source,
+            GammaMarketsError::TooManyTokenIds {
+                tokens: 3,
+                limit: 2
+            }
+        ) && error.page.is_none()
+    ));
+}
+
+#[tokio::test]
+async fn token_lookup_rejects_comma_joined_input() {
+    let result = client(HashMap::new(), 50)
+        .fetch_markets_by_token_ids(&ids(&["A,B"]), MarketFilter::OpenOnly)
+        .await;
+    assert!(matches!(
+        result,
+        Err(error) if matches!(
+            &error.source,
+            GammaMarketsError::InvalidTokenId { token } if token == "A,B"
+        ) && error.page.is_none()
+    ));
+}
+
+#[tokio::test]
+async fn malformed_token_lookup_returns_parse_error_with_raw_page_evidence() {
+    for raw in [b"not-json".to_vec(), br#"{"not":"an array"}"#.to_vec()] {
+        let mut responses = HashMap::new();
+        responses.insert(token_batch_url(&["A"], false), raw.clone());
+
+        let error = client(responses, 50)
+            .fetch_markets_by_token_ids(&ids(&["A"]), MarketFilter::OpenOnly)
+            .await
+            .err()
+            .expect("malformed response must fail");
+
+        assert!(matches!(error.source, GammaMarketsError::Parse(_)));
+        let (evidence, recorded) = error.page.expect("successful transport retains its page");
+        assert_eq!(recorded, raw);
+        assert_eq!(
+            evidence.raw_page_hash,
+            blake3::hash(&recorded).to_hex().to_string()
+        );
+        assert_eq!(evidence.source_id.0, GAMMA_MARKETS_SOURCE_ID);
+        assert_eq!(evidence.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
+        assert_eq!(evidence.parser_version, GAMMA_MARKETS_PARSER_VERSION);
+    }
 }

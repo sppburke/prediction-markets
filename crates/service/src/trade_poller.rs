@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use pe_copy_signal_engine::{SignalConfig, TradeProvenance};
 use pe_core_types::{
-    ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, SourceTradeId, WalletAddress,
+    MarketId, MarketOutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality, SourceId,
+    SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Reader};
 use pe_paper_state::{NoCopyDisposition, PaperStateDb};
@@ -34,14 +35,18 @@ use tracing::warn;
 use crate::activity_ingest::{
     ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger, SourceLogHandle, SourceLogHandleError,
 };
-use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
+use crate::asset_identity::AssetIdentityResolver;
+use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext, IdentityOverride};
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::LiveRuntimeConfig;
+use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome};
 
 /// Source id stamped on every fixed-end activity page before it is parsed.
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
+/// Best-effort cadence for refreshing venue-authoritative position anchors.
+pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
 
 /// Configuration for the existing per-wallet polling cadence.
 #[derive(Debug, Clone)]
@@ -56,6 +61,12 @@ pub struct TradePollerConfig {
 struct Obligation {
     group_id: SourceTradeId,
     received_at_unix: i64,
+}
+
+#[derive(Default)]
+struct BucketIdentities {
+    overrides: HashMap<SourceTradeId, IdentityOverride>,
+    unresolved: HashSet<SourceTradeId>,
 }
 
 /// Coalesced durable websocket work rebuilt from source evidence on restart.
@@ -217,6 +228,8 @@ pub fn rebuild_reconciliation_obligations(
 enum ReconciliationError {
     #[error("activity reconciliation: {0}")]
     Activity(#[from] ActivityReadError),
+    #[error("asset identity resolution: {0}")]
+    Identity(SourceError),
     #[error("source-log coordinator closed")]
     SourceLogClosed,
     #[error("paper-state: {0}")]
@@ -234,6 +247,10 @@ enum ReconciliationError {
 impl ReconciliationError {
     fn retryable(&self) -> bool {
         matches!(self, Self::Activity(_))
+            || matches!(
+                self,
+                Self::Identity(SourceError::Transient { .. } | SourceError::RateLimited { .. })
+            )
     }
 }
 
@@ -242,6 +259,7 @@ pub struct TradePoller {
     config: TradePollerConfig,
     live_watchlist: LiveWatchlist,
     fetcher: Arc<dyn ReconciliationFetcher>,
+    asset_identity: Arc<AssetIdentityResolver>,
     source_log: SourceLogHandle,
     trigger_rx: mpsc::Receiver<ReconciliationTrigger>,
     control_tx: mpsc::Sender<OrchestratorControl>,
@@ -250,6 +268,8 @@ pub struct TradePoller {
     signal_config: SignalConfig,
     runtime_config: LiveRuntimeConfig,
     obligations: ReconciliationObligations,
+    admission_preparer: Option<AdmissionPreparer>,
+    refresh_cursor: usize,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
 
@@ -261,6 +281,8 @@ pub enum TradePollerOwnerError {
     TriggerChannelClosed,
     #[error("trade poll interval is zero")]
     ZeroPollInterval,
+    #[error("position anchor refresh failed: {0}")]
+    AnchorRefresh(String),
 }
 
 impl TradePoller {
@@ -269,6 +291,7 @@ impl TradePoller {
         config: TradePollerConfig,
         live_watchlist: LiveWatchlist,
         fetcher: Arc<dyn ReconciliationFetcher>,
+        asset_identity: Arc<AssetIdentityResolver>,
         source_log: SourceLogHandle,
         trigger_rx: mpsc::Receiver<ReconciliationTrigger>,
         control_tx: mpsc::Sender<OrchestratorControl>,
@@ -277,11 +300,13 @@ impl TradePoller {
         signal_config: SignalConfig,
         runtime_config: LiveRuntimeConfig,
         obligations: ReconciliationObligations,
+        admission_preparer: Option<AdmissionPreparer>,
     ) -> Self {
         Self {
             config,
             live_watchlist,
             fetcher,
+            asset_identity,
             source_log,
             trigger_rx,
             control_tx,
@@ -290,6 +315,8 @@ impl TradePoller {
             signal_config,
             runtime_config,
             obligations,
+            admission_preparer,
+            refresh_cursor: 0,
             now: Arc::new(OffsetDateTime::now_utc),
         }
     }
@@ -351,8 +378,11 @@ impl TradePoller {
 
     async fn poll_round(&mut self) -> Result<(), TradePollerOwnerError> {
         let snapshot = self.live_watchlist.snapshot();
-        let mut wallets: Vec<WalletAddress> =
+        let mut live_wallets: Vec<WalletAddress> =
             snapshot.entries.iter().map(|entry| entry.wallet).collect();
+        live_wallets.sort_by_key(ToString::to_string);
+        live_wallets.dedup();
+        let mut wallets = live_wallets.clone();
         wallets.extend(self.obligations.wallets());
         wallets.sort_by_key(ToString::to_string);
         wallets.dedup();
@@ -387,6 +417,49 @@ impl TradePoller {
             } else {
                 health.poll_error_streak = health.poll_error_streak.saturating_add(1);
             }
+        }
+        self.refresh_one_wallet(&live_wallets).await?;
+        Ok(())
+    }
+
+    async fn refresh_one_wallet(
+        &mut self,
+        wallets: &[WalletAddress],
+    ) -> Result<(), TradePollerOwnerError> {
+        let Some(preparer) = self.admission_preparer.as_ref() else {
+            return Ok(());
+        };
+        if wallets.is_empty() {
+            self.refresh_cursor = 0;
+            return Ok(());
+        }
+        let now_unix = (self.now)().unix_timestamp();
+        let refresh_secs = i64::try_from(ANCHOR_REFRESH_SECS).unwrap_or(i64::MAX);
+        for offset in 0..wallets.len() {
+            let index = self.refresh_cursor.saturating_add(offset) % wallets.len();
+            let wallet = wallets[index];
+            let coverage = self
+                .paper_state
+                .wallet_coverage(&wallet)
+                .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?;
+            let due = coverage.reanchor_required
+                || coverage
+                    .anchored_at_unix
+                    .is_none_or(|anchored| now_unix.saturating_sub(anchored) > refresh_secs);
+            if !due {
+                continue;
+            }
+            self.refresh_cursor = index.saturating_add(1) % wallets.len();
+            match preparer
+                .prepare_if_due(wallet, now_unix, ANCHOR_REFRESH_SECS)
+                .await
+                .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?
+            {
+                AnchorRefreshOutcome::Anchored
+                | AnchorRefreshOutcome::Skipped
+                | AnchorRefreshOutcome::Deferred => {}
+            }
+            break;
         }
         Ok(())
     }
@@ -467,6 +540,7 @@ impl TradePoller {
             {
                 break;
             }
+            let identities = self.resolve_bucket(&bucket).await?;
             let context = self.context(
                 wallet,
                 source_epoch,
@@ -475,6 +549,7 @@ impl TradePoller {
                 copy_eligible,
                 &activity.pages,
                 &bucket,
+                identities,
             )?;
             let result = self.commit_bucket(bucket, context).await?;
             for group in bucket_ids {
@@ -501,6 +576,7 @@ impl TradePoller {
         copy_eligible: bool,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
         bucket: &[ActivityAggregate],
+        identities: BucketIdentities,
     ) -> Result<BucketDecisionContext, ReconciliationError> {
         let now = (self.now)();
         let mut observation_provenance = HashMap::new();
@@ -525,6 +601,21 @@ impl TradePoller {
                 no_copy_dispositions.insert(group, disposition);
             }
         }
+        for group in &identities.unresolved {
+            let provenance = observation_provenance
+                .get(group)
+                .copied()
+                .unwrap_or(TradeProvenance::RestPoll);
+            let source_time = bucket
+                .iter()
+                .find(|aggregate| aggregate.group_id.key() == group)
+                .map(|aggregate| aggregate.source_time.0)
+                .unwrap_or(now);
+            no_copy_dispositions.insert(
+                group.clone(),
+                identity_unresolved_disposition(provenance, source_time, now),
+            );
+        }
         Ok(BucketDecisionContext {
             applied_configuration: self.runtime_config.snapshot().as_ref().clone(),
             decision_inputs_json: serde_json::to_string(&serde_json::json!({
@@ -534,11 +625,56 @@ impl TradePoller {
             reconstruction_quality,
             signal_config: self.signal_config.clone(),
             copy_eligible,
+            bracket_commit: false,
             recorded_at_unix: now.unix_timestamp(),
             observation_provenance,
             no_copy_dispositions,
+            identity_overrides: identities.overrides,
+            identity_unresolved: identities.unresolved,
             history_status: None,
         })
+    }
+
+    async fn resolve_bucket(
+        &self,
+        bucket: &[ActivityAggregate],
+    ) -> Result<BucketIdentities, ReconciliationError> {
+        let tokens = bucket
+            .iter()
+            .filter_map(|aggregate| aggregate.group_id.components().asset.clone())
+            .collect::<HashSet<PolymarketTokenId>>();
+        let resolved = self
+            .asset_identity
+            .resolve(tokens)
+            .await
+            .map_err(ReconciliationError::Identity)?;
+        let mut identities = BucketIdentities::default();
+        for aggregate in bucket {
+            let components = aggregate.group_id.components();
+            let Some(asset) = &components.asset else {
+                continue;
+            };
+            let group = aggregate.group_id.key().clone();
+            let Some(verified) = resolved.verified.get(asset) else {
+                identities.unresolved.insert(group);
+                continue;
+            };
+            let differs = components.condition_id.as_ref() != Some(&verified.condition_id)
+                || components.outcome != Some(verified.outcome);
+            if differs {
+                identities.overrides.insert(
+                    group,
+                    IdentityOverride {
+                        verified: MarketOutcomeId::new(
+                            MarketId(VenueMarketId(verified.condition_id.0.clone())),
+                            verified.outcome,
+                        ),
+                        evidence_hash: verified.evidence_hash.clone(),
+                    },
+                );
+            }
+        }
+        Ok(identities)
     }
 
     async fn commit_bucket(
@@ -550,7 +686,7 @@ impl TradePoller {
         self.control_tx
             .send(OrchestratorControl::CommitActivityBucket {
                 aggregates,
-                context: Box::new(context),
+                context: Arc::new(context),
                 committed,
             })
             .await
@@ -595,6 +731,23 @@ fn stale_disposition(
         reason: reason.to_owned(),
         recorded_at_unix: now.unix_timestamp(),
     })
+}
+
+fn identity_unresolved_disposition(
+    provenance: TradeProvenance,
+    source_time: OffsetDateTime,
+    now: OffsetDateTime,
+) -> NoCopyDisposition {
+    NoCopyDisposition {
+        provenance: match provenance {
+            TradeProvenance::RestPoll => "rest_poll",
+            TradeProvenance::ActivityWs => "activity_ws",
+        }
+        .to_owned(),
+        age_secs: (now - source_time).whole_seconds(),
+        reason: "identity_unresolved".to_owned(),
+        recorded_at_unix: now.unix_timestamp(),
+    }
 }
 
 struct RecordingFetcher {

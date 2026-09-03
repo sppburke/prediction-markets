@@ -1812,6 +1812,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
                 updated_at_unix: 2,
             }],
             fence: None,
+            reanchor: None,
             advance_cursor: true,
         })
         .unwrap();

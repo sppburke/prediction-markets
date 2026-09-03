@@ -19,7 +19,7 @@ use std::str::FromStr as _;
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
+use pe_paper_state::{AnchorInstallRecord, FillRecord, LeaderPositionRow, PaperStateDb};
 use pe_service::status_writer::{build_snapshot, write_snapshot};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -64,7 +64,18 @@ fn seeded_db() -> (TempDir, PaperStateDb) {
 #[test]
 fn ac_snapshot_reflects_state() {
     let (_dir, db) = seeded_db();
-    let snap = build_snapshot(&db, "paper", true, 123, 1_700_000_500, 25, 100, 42, None);
+    let snap = build_snapshot(
+        &db,
+        "paper",
+        true,
+        123,
+        1_700_000_500,
+        25,
+        &[],
+        100,
+        42,
+        None,
+    );
 
     // PASS: every field mirrors the seeded state (bankroll compared scale-insensitively).
     assert_eq!(
@@ -96,7 +107,7 @@ fn ac_snapshot_reflects_state() {
 fn ac_write_is_atomic_and_valid_json() {
     let (dir, db) = seeded_db();
     let path = dir.path().join("status.json");
-    let snap = build_snapshot(&db, "paper", true, 1, 1_700_000_000, 25, 100, 0, None);
+    let snap = build_snapshot(&db, "paper", true, 1, 1_700_000_000, 25, &[], 100, 0, None);
     write_snapshot(&path, &snap).unwrap();
 
     // PASS: the file exists, no temp left behind, and parses to the expected shape.
@@ -147,6 +158,7 @@ fn ac_live_block_reports_freshness() {
         1,
         1_700_000_500,
         25,
+        &[],
         100,
         0,
         Some(&snapshot),
@@ -168,6 +180,7 @@ fn ac_live_block_reports_freshness() {
         1,
         1_700_000_500,
         25,
+        &[],
         100,
         0,
         Some(&snapshot),
@@ -184,6 +197,7 @@ fn ac_live_block_reports_freshness() {
         1,
         1_700_000_500,
         25,
+        &[],
         100,
         0,
         Some(&snapshot),
@@ -198,7 +212,7 @@ fn ac_live_block_reports_freshness() {
 fn ac_uninitialised_bankroll_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let db = PaperStateDb::open(&dir.path().join("p.db")).unwrap(); // no init_bankroll
-    let snap = build_snapshot(&db, "shadow", false, 0, 1_700_000_000, 0, 100, 0, None);
+    let snap = build_snapshot(&db, "shadow", false, 0, 1_700_000_000, 0, &[], 100, 0, None);
 
     // PASS: an uninitialised bankroll is `None` (serializes as JSON null), counts are 0.
     assert!(snap.bankroll.is_none(), "uninitialised bankroll → None");
@@ -206,4 +220,86 @@ fn ac_uninitialised_bankroll_is_none() {
     assert_eq!(snap.open_positions, 0);
     assert_eq!(snap.settled_total, 0);
     println!("PASS: uninitialised bankroll → null; zero counts");
+}
+
+#[test]
+fn anchor_age_is_none_before_install_and_tracks_the_oldest_latest_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    let now = 1_700_000_000;
+    let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let before = build_snapshot(&db, "paper", true, 0, now, 1, &[wallet], 100, 0, None);
+    assert_eq!(before.oldest_anchor_age_secs, None);
+
+    db.set_cursor(&wallet, 10).unwrap();
+    db.install_anchors(&[AnchorInstallRecord {
+        wallet,
+        balances: Vec::new(),
+        activity_cutoff_unix: 10,
+        anchored_at_unix: now - 75,
+        ledger_hash_after: "empty".to_owned(),
+        positions_proof_hash: "positions".to_owned(),
+        activity_bounds_json: "[]".to_owned(),
+        source_log_generation: "scenario".to_owned(),
+        proof_json: "{}".to_owned(),
+        recorded_at_unix: now - 75,
+    }])
+    .unwrap();
+    let after = build_snapshot(&db, "paper", true, 0, now, 1, &[wallet], 100, 0, None);
+    assert_eq!(after.oldest_anchor_age_secs, Some(75));
+}
+
+#[test]
+fn anchor_age_excludes_wallets_removed_from_the_live_watchlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    let now = 1_700_000_000;
+    let removed = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let active = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    for wallet in [removed, active] {
+        db.set_cursor(&wallet, 10).unwrap();
+    }
+    db.install_anchors(&[
+        AnchorInstallRecord {
+            wallet: removed,
+            balances: Vec::new(),
+            activity_cutoff_unix: 10,
+            anchored_at_unix: now - 100,
+            ledger_hash_after: "removed".to_owned(),
+            positions_proof_hash: "positions-removed".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: now - 100,
+        },
+        AnchorInstallRecord {
+            wallet: active,
+            balances: Vec::new(),
+            activity_cutoff_unix: 10,
+            anchored_at_unix: now - 5,
+            ledger_hash_after: "active".to_owned(),
+            positions_proof_hash: "positions-active".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: now - 5,
+        },
+    ])
+    .unwrap();
+
+    let live_only = build_snapshot(&db, "paper", true, 0, now, 1, &[active], 100, 0, None);
+    assert_eq!(live_only.oldest_anchor_age_secs, Some(5));
+    let historical = build_snapshot(
+        &db,
+        "paper",
+        true,
+        0,
+        now,
+        2,
+        &[removed, active],
+        100,
+        0,
+        None,
+    );
+    assert_eq!(historical.oldest_anchor_age_secs, Some(100));
 }

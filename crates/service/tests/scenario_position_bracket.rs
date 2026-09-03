@@ -1,21 +1,33 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pe_core_types::{ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, WalletAddress};
+use pe_copy_signal_engine::PositionState;
+use pe_core_types::{
+    MarketId, MarketOutcomeId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId,
+    SourceTimestamp, VenueMarketId, WalletAddress,
+};
+use pe_event_log::Reader;
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
+use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use pe_service::orchestrator_control::OrchestratorControl;
-use pe_service::paper_recovery::build_leader_ledger;
-use pe_service::position_seeder::{CausalPositionError, CausalPositionValidator, ledger_capture};
-use pe_service::watchlist_admission::AdmissionPreparer;
+use pe_service::paper_recovery::{build_leader_ledger, replay_wallet_ledger};
+use pe_service::position_seeder::{
+    AnchorExpectation, AnchorInstall, AnchorProof, CausalPositionError, CausalPositionValidator,
+    is_deferred_causal_position_error, ledger_capture,
+};
+use pe_service::source_event_sink::SourceEventSink;
+use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityTransport, PageFetcher, PolymarketEndpoint, PositionPartition,
-    aggregate_activity_rows, parse_activity_response,
+    ActivityParseContext, ActivityReadError, ActivityTransport, GAMMA_BATCH_SIZE,
+    GAMMA_MARKETS_SOURCE_ID, PageFetcher, PolymarketEndpoint, PositionPartition, PositionReadError,
+    ReconciliationFetcher, aggregate_activity_rows, parse_activity_response,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -27,10 +39,19 @@ const END: i64 = 100;
 
 struct QueueFetcher {
     responses: Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
+    urls: Mutex<Vec<String>>,
+    gamma_response: Option<Vec<u8>>,
 }
 
 impl QueueFetcher {
     fn new(responses: HashMap<String, Vec<Vec<u8>>>) -> Self {
+        Self::with_gamma(responses, None)
+    }
+
+    fn with_gamma(
+        responses: HashMap<String, Vec<Vec<u8>>>,
+        gamma_response: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             responses: Mutex::new(
                 responses
@@ -38,12 +59,50 @@ impl QueueFetcher {
                     .map(|(url, responses)| (url, responses.into()))
                     .collect(),
             ),
+            urls: Mutex::new(Vec::new()),
+            gamma_response,
         }
+    }
+
+    fn urls(&self) -> Vec<String> {
+        self.urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
 impl PageFetcher for QueueFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        self.urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(url.to_owned());
+        if url.contains("/markets?clob_token_ids=") {
+            if let Some(response) = &self.gamma_response {
+                return Ok(response.clone());
+            }
+            let markets = url
+                .split('?')
+                .nth(1)
+                .into_iter()
+                .flat_map(|query| query.split('&'))
+                .filter_map(|part| part.strip_prefix("clob_token_ids="))
+                .filter_map(|token| {
+                    let byte = token.strip_prefix("asset-")?;
+                    u8::from_str_radix(byte, 16).ok().map(|byte| {
+                        json!({
+                            "conditionId": condition(byte),
+                            "clobTokenIds": [token],
+                            "closed": url.contains("closed=true")
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            return serde_json::to_vec(&markets).map_err(|error| SourceError::Fatal {
+                message: error.to_string(),
+            });
+        }
         self.responses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -52,6 +111,126 @@ impl PageFetcher for QueueFetcher {
             .ok_or_else(|| SourceError::Fatal {
                 message: format!("no queued fixture for {url}"),
             })
+    }
+}
+
+struct GatedFetcher {
+    inner: QueueFetcher,
+    wallets: Vec<WalletAddress>,
+    first_activity: Mutex<HashSet<WalletAddress>>,
+    barrier: tokio::sync::Barrier,
+    yields: HashMap<WalletAddress, usize>,
+}
+
+impl GatedFetcher {
+    fn new(
+        responses: HashMap<String, Vec<Vec<u8>>>,
+        wallets: Vec<WalletAddress>,
+        yields: HashMap<WalletAddress, usize>,
+        gamma_response: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            inner: QueueFetcher::with_gamma(responses, gamma_response),
+            barrier: tokio::sync::Barrier::new(wallets.len()),
+            wallets,
+            first_activity: Mutex::new(HashSet::new()),
+            yields,
+        }
+    }
+}
+
+impl PageFetcher for GatedFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        let wallet = self
+            .wallets
+            .iter()
+            .copied()
+            .find(|wallet| url.contains(&wallet.to_string()));
+        let gate = wallet.is_some_and(|wallet| {
+            url.contains("/activity?")
+                && self
+                    .first_activity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(wallet)
+        });
+        if gate {
+            self.barrier.wait().await;
+            if let Some(wallet) = wallet {
+                for _ in 0..self.yields.get(&wallet).copied().unwrap_or_default() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        self.inner.fetch_page(url).await
+    }
+}
+
+struct OrderedBracketFetcher {
+    inner: QueueFetcher,
+    wallets: [WalletAddress; 2],
+    preferred: WalletAddress,
+    activity_calls: Mutex<HashMap<WalletAddress, usize>>,
+    first_activity: tokio::sync::Barrier,
+    preferred_first_commit: Arc<tokio::sync::Semaphore>,
+    other_first_commit: Arc<tokio::sync::Semaphore>,
+    preferred_completion: Arc<tokio::sync::Semaphore>,
+}
+
+impl PageFetcher for OrderedBracketFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        let wallet = self
+            .wallets
+            .iter()
+            .copied()
+            .find(|wallet| url.contains(&wallet.to_string()));
+        if url.contains("/activity?")
+            && let Some(wallet) = wallet
+        {
+            let call = {
+                let mut calls = self
+                    .activity_calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let call = calls.entry(wallet).or_default();
+                *call += 1;
+                *call
+            };
+            match (wallet == self.preferred, call) {
+                (preferred, 1) => {
+                    self.first_activity.wait().await;
+                    if !preferred {
+                        self.preferred_first_commit
+                            .acquire()
+                            .await
+                            .map_err(|error| SourceError::Fatal {
+                                message: error.to_string(),
+                            })?
+                            .forget();
+                    }
+                }
+                (true, 2) => {
+                    self.other_first_commit
+                        .acquire()
+                        .await
+                        .map_err(|error| SourceError::Fatal {
+                            message: error.to_string(),
+                        })?
+                        .forget();
+                }
+                (false, 3) => {
+                    self.preferred_completion
+                        .acquire()
+                        .await
+                        .map_err(|error| SourceError::Fatal {
+                            message: error.to_string(),
+                        })?
+                        .forget();
+                }
+                _ => {}
+            }
+        }
+        self.inner.fetch_page(url).await
     }
 }
 
@@ -98,9 +277,13 @@ fn position(wallet: WalletAddress, byte: u8, amount: &str) -> Value {
 }
 
 fn activity_url(wallet: WalletAddress) -> String {
+    activity_url_at(wallet, END)
+}
+
+fn activity_url_at(wallet: WalletAddress, end: i64) -> String {
     PolymarketEndpoint::UserPositionActivityPage {
         user: wallet.to_string(),
-        end: END,
+        end,
         start: None,
         offset: 0,
     }
@@ -144,13 +327,69 @@ fn stable_responses(specs: &[(WalletAddress, u8, &str)]) -> HashMap<String, Vec<
     responses
 }
 
+fn stable_responses_for_attempts(
+    specs: &[(WalletAddress, u8, &str)],
+    attempts: usize,
+) -> HashMap<String, Vec<Vec<u8>>> {
+    let mut responses = stable_responses(specs);
+    for pages in responses.values_mut() {
+        let original = pages.clone();
+        for _ in 1..attempts {
+            pages.extend(original.clone());
+        }
+    }
+    responses
+}
+
 fn validator(responses: HashMap<String, Vec<Vec<u8>>>) -> CausalPositionValidator {
-    CausalPositionValidator::new(
-        Arc::new(QueueFetcher::new(responses)),
+    validator_from_fetcher(Arc::new(QueueFetcher::new(responses)))
+}
+
+fn validator_from_fetcher(fetcher: Arc<QueueFetcher>) -> CausalPositionValidator {
+    let fetcher: Arc<dyn ReconciliationFetcher> = fetcher;
+    validator_from_reconciliation(fetcher)
+}
+
+fn validator_from_reconciliation(
+    fetcher: Arc<dyn ReconciliationFetcher>,
+) -> CausalPositionValidator {
+    let dir = tempfile::tempdir().unwrap();
+    let source_log = Arc::new(tokio::sync::Mutex::new(
+        SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+    ));
+    let asset_identity = Arc::new(AssetIdentityResolver::new(
+        Arc::clone(&fetcher),
+        BASE.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source_log,
+    ));
+    CausalPositionValidator::new(fetcher, BASE, "source-generation-test", asset_identity)
+        .with_clock(Arc::new(|| END))
+}
+
+fn recording_validator(
+    fetcher: Arc<dyn ReconciliationFetcher>,
+) -> (TempDir, std::path::PathBuf, CausalPositionValidator) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.log");
+    let sink = Arc::new(tokio::sync::Mutex::new(
+        SourceEventSink::open(&path).unwrap(),
+    ));
+    let asset_identity = Arc::new(AssetIdentityResolver::new(
+        Arc::clone(&fetcher),
+        BASE.to_owned(),
+        GAMMA_BATCH_SIZE,
+        Arc::clone(&sink),
+    ));
+    let validator = CausalPositionValidator::new_recording(
+        fetcher,
         BASE,
         "source-generation-test",
+        sink,
+        asset_identity,
     )
-    .with_clock(Arc::new(|| END))
+    .with_clock(Arc::new(|| END));
+    (dir, path, validator)
 }
 
 fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommitEngine) {
@@ -170,6 +409,36 @@ fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommit
     (dir, paper, engine)
 }
 
+fn install_empty_anchor(
+    engine: &mut BucketCommitEngine,
+    paper: &PaperStateDb,
+    wallet: WalletAddress,
+    cutoff: i64,
+) {
+    paper.set_cursor(&wallet, cutoff).unwrap();
+    let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
+    engine
+        .install_anchors(&[AnchorInstall {
+            wallet,
+            balances: Vec::new(),
+            cutoff,
+            proof: AnchorProof {
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: cutoff,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        }])
+        .unwrap();
+}
+
 fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
     pe_service::bucket_commit::FrozenDecisionBasis {
         win_rate_p: pe_core_types::Probability::ZERO,
@@ -185,9 +454,12 @@ fn context(epoch: i64) -> BucketDecisionContext {
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),
         copy_eligible: false,
+        bracket_commit: false,
         recorded_at_unix: epoch,
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
+        identity_overrides: HashMap::new(),
+        identity_unresolved: Default::default(),
         history_status: None,
     }
 }
@@ -208,6 +480,82 @@ fn aggregate(row: Value, wallet: WalletAddress) -> pe_source_polymarket_public::
     aggregate_activity_rows(&parsed.rows).unwrap().remove(0)
 }
 
+fn spawn_control_actor(
+    mut control_rx: mpsc::Receiver<OrchestratorControl>,
+    mut engine: BucketCommitEngine,
+    paper: Arc<PaperStateDb>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(message) = control_rx.recv().await {
+            match message {
+                OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
+                    let _ = acknowledged.send(());
+                }
+                OrchestratorControl::InstallAnchors {
+                    installs,
+                    acknowledged,
+                } => {
+                    let result = engine.install_anchors(&installs);
+                    let _ = acknowledged.send(result);
+                }
+                OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let _ = captured.send(
+                        ledger_capture(engine.ledger(), &paper, wallet)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                OrchestratorControl::CommitActivityBucket {
+                    aggregates,
+                    context,
+                    committed,
+                } => {
+                    let _ = committed.send(
+                        engine
+                            .commit(aggregates, context.as_ref(), zero_basis())
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn canonical_capture_hash_matches_sorted_anchored_balances() {
+    let wallet = wallet(0x10);
+    let (_dir, paper, _engine) = fresh(&[wallet]);
+    paper.set_cursor(&wallet, 42).unwrap();
+    let mut ledger = PositionLedger::new();
+    ledger.replace_wallet_snapshot(
+        wallet,
+        HashMap::from([
+            (
+                MarketOutcomeId::new(MarketId(VenueMarketId(condition(2))), OutcomeId(1)),
+                PositionState {
+                    long_contracts: ShareAmount::ZERO,
+                    short_contracts: ShareAmount::from_atomic(2_500_000),
+                },
+            ),
+            (
+                MarketOutcomeId::new(MarketId(VenueMarketId(condition(1))), OutcomeId(0)),
+                PositionState {
+                    long_contracts: ShareAmount::from_atomic(1_000_000),
+                    short_contracts: ShareAmount::ZERO,
+                },
+            ),
+        ]),
+    );
+
+    let capture = ledger_capture(&ledger, &paper, wallet).unwrap();
+    assert_eq!(
+        capture.hash,
+        "c08a170362315f92f6ee39615f7db11e308c4a7db8f2b1b044813fe8a67113c4"
+    );
+    assert_eq!(capture.cursor, Some(42));
+    assert_eq!(capture.anchor_seq, None);
+    assert_eq!(capture.coverage_generation, 0);
+}
+
 #[tokio::test]
 async fn stable_complete_bracket_installs_and_restart_is_identical() {
     let wallet = wallet(0x11);
@@ -217,7 +565,10 @@ async fn stable_complete_bracket_installs_and_restart_is_identical() {
         .await
         .unwrap();
     let durable = paper.position_validation(&wallet).unwrap().unwrap();
-    assert_eq!(durable.ledger_hash, first[0].validation.ledger_hash);
+    assert_eq!(
+        durable.positions_proof_hash,
+        first[0].proof.positions_proof_hash
+    );
     assert_eq!(durable.source_log_generation, "source-generation-test");
 
     let restarted_ledger = build_leader_ledger(&paper).unwrap();
@@ -226,21 +577,787 @@ async fn stable_complete_bracket_installs_and_restart_is_identical() {
         .validate_direct(&[wallet], &mut restarted, &paper)
         .await
         .unwrap();
+    assert_eq!(first[0].balances, second[0].balances);
     assert_eq!(
-        first[0].validation.ledger_hash,
-        second[0].validation.ledger_hash
-    );
-    assert_eq!(
-        first[0].validation.positions_proof_hash,
-        second[0].validation.positions_proof_hash
+        first[0].proof.positions_proof_hash,
+        second[0].proof.positions_proof_hash
     );
 }
 
 #[tokio::test]
+async fn corrected_bracket_records_metadata_reuses_provenance_and_keeps_full_reads() {
+    let wallet = wallet(0x12);
+    let (_paper_dir, paper, mut engine) = fresh(&[wallet]);
+    let gamma = serde_json::to_vec(&vec![json!({
+        "conditionId": condition(9),
+        "clobTokenIds": ["other-outcome", asset(1)]
+    })])
+    .unwrap();
+    let fetcher = Arc::new(QueueFetcher::with_gamma(
+        stable_responses_for_attempts(&[(wallet, 1, "1.000000")], 2),
+        Some(gamma),
+    ));
+    let fetcher_trait: Arc<dyn ReconciliationFetcher> = fetcher.clone();
+    let (_source_dir, source_path, validator) = recording_validator(fetcher_trait);
+
+    let first = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    let second = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        first[0].balances,
+        vec![(
+            MarketId(VenueMarketId(condition(9))),
+            OutcomeId(1),
+            ShareAmount::from_atomic(1_000_000),
+        )]
+    );
+    let first_proof: Value = serde_json::from_str(&first[0].proof.document).unwrap();
+    let second_proof: Value = serde_json::from_str(&second[0].proof.document).unwrap();
+    assert_eq!(
+        first_proof["metadata_reads"],
+        second_proof["metadata_reads"]
+    );
+    let metadata_reads = first_proof["metadata_reads"].as_array().unwrap();
+    assert_eq!(metadata_reads.len(), 1);
+    let sequence = metadata_reads[0]["source_log_sequence"].as_u64().unwrap();
+    let canonical_hash = metadata_reads[0]["canonical_page_hash"].as_str().unwrap();
+
+    let urls = fetcher.urls();
+    let activity_urls = urls
+        .iter()
+        .filter(|url| url.contains("/activity?"))
+        .collect::<Vec<_>>();
+    assert_eq!(activity_urls.len(), 6);
+    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    assert_eq!(
+        urls.iter()
+            .filter(|url| url.contains("/markets?clob_token_ids="))
+            .count(),
+        1,
+        "the anchored bracket reuses the process cache"
+    );
+    assert_eq!(first[0].cutoff, END);
+    assert_eq!(second[0].cutoff, END);
+
+    let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+    assert_eq!(groups.len(), 1);
+    let effect = pe_position_ledger::LedgerEffect::from_document(&groups[0].proof_json).unwrap();
+    assert!(effect.correction().is_some());
+    assert_eq!(
+        serde_json::from_str::<Value>(&groups[0].proof_json).unwrap()["version"],
+        2
+    );
+
+    drop(validator);
+    let metadata_entries = Reader::replay(&source_path)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|(_, envelope)| envelope.source_id.0 == GAMMA_MARKETS_SOURCE_ID)
+        .collect::<Vec<_>>();
+    assert_eq!(metadata_entries.len(), 1);
+    assert_eq!(metadata_entries[0].0.0, sequence);
+    let canonical_payload = serde_json::to_vec(
+        &serde_json::from_slice::<Value>(&metadata_entries[0].1.payload).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        blake3::hash(&canonical_payload).to_hex().as_str(),
+        canonical_hash
+    );
+}
+
+#[tokio::test]
+async fn direct_bracket_uses_three_unbounded_ends_and_step_three_cutoff() {
+    let wallet = wallet(0x76);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    let activity = serde_json::to_vec(&vec![activity(
+        wallet,
+        1,
+        "1.000000",
+        "0xvarying-direct",
+        90,
+    )])
+    .unwrap();
+    let positions = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
+    let responses = HashMap::from([
+        (activity_url_at(wallet, 100), vec![activity.clone()]),
+        (activity_url_at(wallet, 101), vec![activity.clone()]),
+        (activity_url_at(wallet, 102), vec![activity]),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![positions.clone(), positions],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let ends = Arc::new(Mutex::new(VecDeque::from([100, 101, 102, 102])));
+    let clock_ends = Arc::clone(&ends);
+    let validator = validator_from_fetcher(Arc::clone(&fetcher)).with_clock(Arc::new(move || {
+        clock_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(102)
+    }));
+
+    let accepted = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+
+    assert_eq!(accepted[0].cutoff, 101);
+    let activity_urls = fetcher
+        .urls()
+        .into_iter()
+        .filter(|url| url.contains("/activity?"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        activity_urls,
+        vec![
+            activity_url_at(wallet, 100),
+            activity_url_at(wallet, 101),
+            activity_url_at(wallet, 102),
+        ]
+    );
+    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+}
+
+#[tokio::test]
+async fn row_older_than_the_previous_end_is_fetched_and_triggers_the_bounded_retry() {
+    let wallet = wallet(0x77);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    let baseline = activity(wallet, 1, "1.000000", "0xbaseline", 90);
+    let intervening = activity(wallet, 2, "1.000000", "0xolder-intervening", 80);
+    let baseline_page = serde_json::to_vec(&vec![baseline.clone()]).unwrap();
+    let both_page = serde_json::to_vec(&vec![baseline, intervening.clone()]).unwrap();
+    let first_positions = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
+    let both_positions = serde_json::to_vec(&vec![
+        position(wallet, 1, "1.000000"),
+        position(wallet, 2, "1.000000"),
+    ])
+    .unwrap();
+    let responses = HashMap::from([
+        (
+            activity_url_at(wallet, 100),
+            vec![baseline_page, both_page.clone()],
+        ),
+        (
+            activity_url_at(wallet, 101),
+            vec![both_page.clone(), both_page.clone()],
+        ),
+        (activity_url_at(wallet, 102), vec![both_page]),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![first_positions, both_positions.clone(), both_positions],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec(), b"[]".to_vec()],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let ends = Arc::new(Mutex::new(VecDeque::from([100, 101, 100, 101, 102, 102])));
+    let clock_ends = Arc::clone(&ends);
+    let validator = validator_from_fetcher(Arc::clone(&fetcher)).with_clock(Arc::new(move || {
+        clock_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(102)
+    }));
+    let intervening_id = aggregate(intervening, wallet).group_id.key().clone();
+
+    let accepted = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+
+    assert_eq!(accepted[0].cutoff, 101);
+    let activity_urls = fetcher
+        .urls()
+        .into_iter()
+        .filter(|url| url.contains("/activity?"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        activity_urls,
+        vec![
+            activity_url_at(wallet, 100),
+            activity_url_at(wallet, 101),
+            activity_url_at(wallet, 100),
+            activity_url_at(wallet, 101),
+            activity_url_at(wallet, 102),
+        ],
+        "the second read detected the inserted old row and forced one full retry"
+    );
+    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    assert!(
+        paper
+            .activity_group_state(&intervening_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+}
+
+#[tokio::test]
+async fn runtime_control_bracket_uses_three_unbounded_reads() {
+    let wallet = wallet(0x78);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let activity = serde_json::to_vec(&vec![activity(
+        wallet,
+        1,
+        "1.000000",
+        "0xvarying-control",
+        90,
+    )])
+    .unwrap();
+    let positions = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
+    let responses = HashMap::from([
+        (activity_url_at(wallet, 100), vec![activity.clone()]),
+        (activity_url_at(wallet, 101), vec![activity.clone()]),
+        (activity_url_at(wallet, 102), vec![activity]),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![positions.clone(), positions],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let ends = Arc::new(Mutex::new(VecDeque::from([100, 101, 102, 102])));
+    let clock_ends = Arc::clone(&ends);
+    let validator = validator_from_fetcher(Arc::clone(&fetcher)).with_clock(Arc::new(move || {
+        clock_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(102)
+    }));
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+
+    let accepted = validator
+        .validate_via_control(&[wallet], &control_tx, &paper)
+        .await
+        .unwrap();
+
+    assert_eq!(accepted[0].cutoff, 101);
+    let activity_urls = fetcher
+        .urls()
+        .into_iter()
+        .filter(|url| url.contains("/activity?"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        activity_urls,
+        vec![
+            activity_url_at(wallet, 100),
+            activity_url_at(wallet, 101),
+            activity_url_at(wallet, 102),
+        ]
+    );
+    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    drop(control_tx);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn verified_anchor_replaces_a_preexisting_wrong_identity_ledger_row() {
+    let wallet = wallet(0x18);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let raw = activity(wallet, 1, "1.000000", "0xbase1", 10);
+    engine
+        .commit(vec![aggregate(raw, wallet)], &context(10), zero_basis())
+        .unwrap();
+    assert_eq!(
+        engine
+            .ledger()
+            .position(&wallet)
+            .and_then(|snapshot| {
+                snapshot.positions.get(&MarketOutcomeId::new(
+                    MarketId(VenueMarketId(condition(1))),
+                    OutcomeId(0),
+                ))
+            })
+            .map(|position| position.long_contracts.atomic()),
+        Some(1_000_000)
+    );
+
+    let gamma = serde_json::to_vec(&vec![json!({
+        "conditionId": condition(9),
+        "clobTokenIds": ["other-outcome", asset(1)]
+    })])
+    .unwrap();
+    let fetcher = Arc::new(QueueFetcher::with_gamma(
+        stable_responses(&[(wallet, 1, "1.000000")]),
+        Some(gamma),
+    ));
+    let validator = validator_from_fetcher(fetcher);
+    let accepted = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+
+    assert_eq!(accepted.len(), 1);
+    let snapshot = engine.ledger().position(&wallet).unwrap();
+    assert!(!snapshot.positions.contains_key(&MarketOutcomeId::new(
+        MarketId(VenueMarketId(condition(1))),
+        OutcomeId(0),
+    )));
+    assert_eq!(
+        snapshot.positions
+            [&MarketOutcomeId::new(MarketId(VenueMarketId(condition(9))), OutcomeId(1),)]
+            .long_contracts
+            .atomic(),
+        1_000_000
+    );
+
+    let replayed = build_leader_ledger(&paper).unwrap();
+    let replayed = replayed.position(&wallet).unwrap();
+    assert!(!replayed.positions.contains_key(&MarketOutcomeId::new(
+        MarketId(VenueMarketId(condition(1))),
+        OutcomeId(0),
+    )));
+    assert_eq!(
+        replayed.positions
+            [&MarketOutcomeId::new(MarketId(VenueMarketId(condition(9))), OutcomeId(1),)]
+            .long_contracts
+            .atomic(),
+        1_000_000
+    );
+}
+
+#[tokio::test]
+async fn assets_first_seen_in_second_or_final_activity_read_are_resolved_before_commit() {
+    for (suffix, appearance) in [(0x19, 2_usize), (0x1a, 3_usize)] {
+        let wallet = wallet(suffix);
+        let (_dir, paper, mut engine) = fresh(&[wallet]);
+        let first_row = activity(wallet, 1, "1.000000", "0xfirst-asset", 10);
+        let second_row = activity(wallet, 2, "2.000000", "0xlater-asset", 20);
+        let second_group = aggregate(second_row.clone(), wallet).group_id.key().clone();
+        let first_activity = serde_json::to_vec(&vec![first_row.clone()]).unwrap();
+        let both_activity = serde_json::to_vec(&vec![second_row, first_row]).unwrap();
+        let activity_pages = if appearance == 2 {
+            vec![
+                first_activity,
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity,
+            ]
+        } else {
+            vec![
+                first_activity.clone(),
+                first_activity,
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity,
+            ]
+        };
+        let first_positions = serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap();
+        let both_positions =
+            serde_json::to_vec(&vec![position(wallet, 1, "1"), position(wallet, 2, "2")]).unwrap();
+        let position_reads = if appearance == 2 { 3 } else { 4 };
+        let mut not_redeemable = vec![first_positions; appearance - 1];
+        not_redeemable.extend((0..2).map(|_| both_positions.clone()));
+        assert_eq!(not_redeemable.len(), position_reads);
+        let responses = HashMap::from([
+            (activity_url(wallet), activity_pages),
+            (
+                position_url(wallet, PositionPartition::NotRedeemable),
+                not_redeemable,
+            ),
+            (
+                position_url(wallet, PositionPartition::Redeemable),
+                (0..position_reads).map(|_| b"[]".to_vec()).collect(),
+            ),
+        ]);
+        let gamma = serde_json::to_vec(&vec![
+            json!({"conditionId":condition(1),"clobTokenIds":[asset(1)]}),
+            json!({
+                "conditionId":condition(9),
+                "clobTokenIds":["other-outcome",asset(2)]
+            }),
+        ])
+        .unwrap();
+        let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(gamma)));
+
+        let accepted = validator_from_fetcher(fetcher)
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert!(accepted[0].balances.contains(&(
+            MarketId(VenueMarketId(condition(9))),
+            OutcomeId(1),
+            ShareAmount::from_atomic(2_000_000),
+        )));
+        let corrected = paper
+            .activity_groups_after(&wallet, -1)
+            .unwrap()
+            .into_iter()
+            .find(|group| group.source_trade_id == second_group)
+            .expect("later asset is committed during the read where it first appears");
+        assert_eq!(
+            serde_json::from_str::<Value>(&corrected.proof_json).unwrap()["version"],
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_brackets_record_both_orders_install_once_and_attribute_distinct_pages() {
+    let first = wallet(0x13);
+    let second = wallet(0x14);
+    let mut outcomes = Vec::new();
+    let mut commit_orders = Vec::new();
+    let mut completion_orders = Vec::new();
+    for preferred in [first, second] {
+        let (_paper_dir, paper, mut engine) = fresh(&[first, second]);
+        let preferred_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
+        let other_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
+        let preferred_completion = Arc::new(tokio::sync::Semaphore::new(0));
+        let fetcher = Arc::new(OrderedBracketFetcher {
+            inner: QueueFetcher::new(stable_responses(&[
+                (first, 1, "1.000000"),
+                (second, 2, "2.000000"),
+            ])),
+            wallets: [first, second],
+            preferred,
+            activity_calls: Mutex::new(HashMap::new()),
+            first_activity: tokio::sync::Barrier::new(2),
+            preferred_first_commit: Arc::clone(&preferred_first_commit),
+            other_first_commit: Arc::clone(&other_first_commit),
+            preferred_completion: Arc::clone(&preferred_completion),
+        });
+        let fetcher_trait: Arc<dyn ReconciliationFetcher> = fetcher.clone();
+        let (_source_dir, source_path, validator) = recording_validator(fetcher_trait);
+        let commit_order = Arc::new(Mutex::new(Vec::new()));
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let install_calls = Arc::new(AtomicUsize::new(0));
+        let observed_commit_order = Arc::clone(&commit_order);
+        let observed_completion_order = Arc::clone(&completion_order);
+        let step_hook = Arc::new(
+            move |wallet: WalletAddress, step: usize, _engine: &mut BucketCommitEngine| {
+                if step == 1 {
+                    observed_commit_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(wallet);
+                    if wallet == preferred {
+                        preferred_first_commit.add_permits(1);
+                    } else {
+                        other_first_commit.add_permits(1);
+                    }
+                }
+                if step == 5 {
+                    observed_completion_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(wallet);
+                    if wallet == preferred {
+                        preferred_completion.add_permits(1);
+                    }
+                }
+            },
+        );
+        let observed_install_calls = Arc::clone(&install_calls);
+        let install_hook = Arc::new(move |_installs: &[AnchorInstall]| {
+            observed_install_calls.fetch_add(1, Ordering::SeqCst);
+        });
+        let validator = validator
+            .with_step_hook(step_hook)
+            .with_install_hook(install_hook);
+
+        let accepted = validator
+            .validate_direct(&[first, second], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(install_calls.load(Ordering::SeqCst), 1);
+        commit_orders.push(
+            commit_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+        completion_orders.push(
+            completion_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+        let metadata = accepted
+            .iter()
+            .map(|install| {
+                serde_json::from_str::<Value>(&install.proof.document).unwrap()["metadata_reads"]
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(metadata[0], metadata[1]);
+        assert_eq!(metadata[0][0]["asset"], asset(1));
+        assert_eq!(metadata[1][0]["asset"], asset(2));
+
+        drop(validator);
+        let metadata_entries = Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|(_, envelope)| envelope.source_id.0 == GAMMA_MARKETS_SOURCE_ID)
+            .collect::<HashMap<_, _>>();
+        assert_eq!(metadata_entries.len(), 2);
+        for proof in &metadata {
+            let provenance = &proof[0];
+            let sequence = provenance["source_log_sequence"].as_u64().unwrap();
+            let canonical_hash = provenance["canonical_page_hash"].as_str().unwrap();
+            let envelope = &metadata_entries[&pe_core_types::EventSeq(sequence)];
+            let canonical_payload =
+                serde_json::to_vec(&serde_json::from_slice::<Value>(&envelope.payload).unwrap())
+                    .unwrap();
+            assert_eq!(
+                blake3::hash(&canonical_payload).to_hex().as_str(),
+                canonical_hash
+            );
+        }
+
+        let replayed = build_leader_ledger(&paper).unwrap();
+        let replayed_engine = BucketCommitEngine::load(Arc::clone(&paper), replayed).unwrap();
+        outcomes.push(
+            [first, second]
+                .into_iter()
+                .map(|wallet| {
+                    replayed_engine
+                        .ledger()
+                        .position(&wallet)
+                        .and_then(|snapshot| {
+                            snapshot.positions.get(&MarketOutcomeId::new(
+                                MarketId(VenueMarketId(condition(if wallet == first {
+                                    1
+                                } else {
+                                    2
+                                }))),
+                                OutcomeId(0),
+                            ))
+                        })
+                        .map(|position| position.long_contracts.atomic())
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        commit_orders,
+        vec![vec![first, second], vec![second, first]]
+    );
+    assert_eq!(completion_orders, commit_orders);
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[0], vec![Some(1_000_000), Some(2_000_000)]);
+}
+
+#[tokio::test]
+async fn concurrent_shared_corrected_asset_replays_identically_in_both_completion_orders() {
+    let first = wallet(0x79);
+    let second = wallet(0x7a);
+    let gamma = serde_json::to_vec(&vec![json!({
+        "conditionId": condition(9),
+        "clobTokenIds": ["other-outcome", asset(1)]
+    })])
+    .unwrap();
+    let mut completion_orders = Vec::new();
+    let mut replayed_balances = Vec::new();
+    for preferred in [first, second] {
+        let preferred_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
+        let other_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
+        let preferred_completion = Arc::new(tokio::sync::Semaphore::new(0));
+        let fetcher = Arc::new(OrderedBracketFetcher {
+            inner: QueueFetcher::with_gamma(
+                stable_responses(&[(first, 1, "1.000000"), (second, 1, "2.000000")]),
+                Some(gamma.clone()),
+            ),
+            wallets: [first, second],
+            preferred,
+            activity_calls: Mutex::new(HashMap::new()),
+            first_activity: tokio::sync::Barrier::new(2),
+            preferred_first_commit: Arc::clone(&preferred_first_commit),
+            other_first_commit: Arc::clone(&other_first_commit),
+            preferred_completion: Arc::clone(&preferred_completion),
+        });
+        let fetcher_trait: Arc<dyn ReconciliationFetcher> = fetcher.clone();
+        let (_source_dir, source_path, validator) = recording_validator(fetcher_trait);
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let observed_completion_order = Arc::clone(&completion_order);
+        let step_hook = Arc::new(
+            move |wallet: WalletAddress, step: usize, _engine: &mut BucketCommitEngine| {
+                if step == 1 {
+                    if wallet == preferred {
+                        preferred_first_commit.add_permits(1);
+                    } else {
+                        other_first_commit.add_permits(1);
+                    }
+                }
+                if step == 5 {
+                    observed_completion_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(wallet);
+                    if wallet == preferred {
+                        preferred_completion.add_permits(1);
+                    }
+                }
+            },
+        );
+        let validator = validator.with_step_hook(step_hook);
+        let (_paper_dir, paper, mut engine) = fresh(&[first, second]);
+
+        let accepted = validator
+            .validate_direct(&[first, second], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 2);
+        completion_orders.push(
+            completion_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+
+        let metadata = accepted
+            .iter()
+            .map(|install| {
+                serde_json::from_str::<Value>(&install.proof.document).unwrap()["metadata_reads"]
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metadata[0], metadata[1]);
+        assert_eq!(metadata[0][0]["asset"], asset(1));
+        assert_eq!(
+            fetcher
+                .inner
+                .urls()
+                .iter()
+                .filter(|url| url.contains("/markets?clob_token_ids="))
+                .count(),
+            1
+        );
+
+        let verified_key =
+            MarketOutcomeId::new(MarketId(VenueMarketId(condition(9))), OutcomeId(1));
+        let stamped_key = MarketOutcomeId::new(MarketId(VenueMarketId(condition(1))), OutcomeId(0));
+        let mut balances = Vec::new();
+        for (wallet, amount) in [(first, 1_000_000), (second, 2_000_000)] {
+            let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+            assert_eq!(groups.len(), 1);
+            let document = serde_json::from_str::<Value>(&groups[0].proof_json).unwrap();
+            assert_eq!(document["version"], 2);
+            assert_eq!(document["correction"]["stamped"]["market"], condition(1));
+            assert_eq!(document["correction"]["stamped"]["outcome"], 0);
+            assert_eq!(document["correction"]["verified"]["market"], condition(9));
+            assert_eq!(document["correction"]["verified"]["outcome"], 1);
+            assert_eq!(document["effect"]["market"], condition(9));
+            assert_eq!(document["effect"]["outcome"], 1);
+
+            let replayed = replay_wallet_ledger(&paper, wallet).unwrap();
+            let snapshot = replayed.position(&wallet).unwrap();
+            assert!(!snapshot.positions.contains_key(&stamped_key));
+            let position = snapshot.positions.get(&verified_key).unwrap();
+            assert_eq!(position.long_contracts.atomic(), amount);
+            assert_eq!(position.short_contracts, ShareAmount::ZERO);
+            balances.push(position.long_contracts.atomic());
+        }
+        replayed_balances.push(balances);
+
+        drop(validator);
+        let provenance = &metadata[0][0];
+        let sequence = provenance["source_log_sequence"].as_u64().unwrap();
+        let canonical_hash = provenance["canonical_page_hash"].as_str().unwrap();
+        let metadata_entry = Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|(event_sequence, envelope)| {
+                event_sequence.0 == sequence && envelope.source_id.0 == GAMMA_MARKETS_SOURCE_ID
+            })
+            .expect("both proofs reference the one appended Gamma page");
+        let canonical_payload = serde_json::to_vec(
+            &serde_json::from_slice::<Value>(&metadata_entry.1.payload).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            blake3::hash(&canonical_payload).to_hex().as_str(),
+            canonical_hash
+        );
+    }
+    assert_eq!(
+        completion_orders,
+        vec![vec![first, second], vec![second, first]]
+    );
+    assert_eq!(replayed_balances[0], replayed_balances[1]);
+    assert_eq!(replayed_balances[0], vec![1_000_000, 2_000_000]);
+}
+
+#[tokio::test]
+async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
+    let fenced = wallet(0x15);
+    let deferred = wallet(0x16);
+    let healthy = wallet(0x17);
+    let (_dir, paper, mut engine) = fresh(&[fenced, deferred, healthy]);
+    install_empty_anchor(&mut engine, &paper, fenced, 0);
+    let mut responses = stable_responses(&[(healthy, 3, "4.000000")]);
+    let mut underflow = activity(fenced, 1, "2.000000", "0xconcurrent-underflow", 10);
+    underflow["type"] = json!("REDEEM");
+    responses.insert(
+        activity_url(fenced),
+        vec![serde_json::to_vec(&vec![underflow]).unwrap()],
+    );
+    responses.insert(
+        activity_url(deferred),
+        vec![b"[]".to_vec(), b"[]".to_vec(), b"[]".to_vec()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::NotRedeemable),
+        vec![serde_json::to_vec(&vec![position(deferred, 2, "1")]).unwrap()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::Redeemable),
+        vec![b"[]".to_vec()],
+    );
+    let fetcher = Arc::new(GatedFetcher::new(
+        responses,
+        vec![fenced, deferred, healthy],
+        HashMap::from([(fenced, 4), (deferred, 2), (healthy, 0)]),
+        None,
+    ));
+    let fetcher: Arc<dyn ReconciliationFetcher> = fetcher;
+    let validator = validator_from_reconciliation(fetcher);
+
+    let accepted = validator
+        .validate_direct(&[fenced, deferred, healthy], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].wallet, healthy);
+    assert!(paper.is_wallet_fenced(&fenced).unwrap());
+    assert!(paper.position_validation(&fenced).unwrap().is_none());
+    assert!(paper.position_validation(&deferred).unwrap().is_none());
+    assert!(paper.position_validation(&healthy).unwrap().is_some());
+}
+
+#[tokio::test]
 async fn mutation_between_each_bracket_step_installs_nothing() {
-    for target_step in 1..=4 {
+    for target_step in 1..=5 {
         let wallet = wallet(u8::try_from(0x20 + target_step).unwrap());
         let (_dir, paper, mut engine) = fresh(&[wallet]);
+        install_empty_anchor(&mut engine, &paper, wallet, 0);
         let mutation = aggregate(
             activity(
                 wallet,
@@ -251,27 +1368,75 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
             ),
             wallet,
         );
-        let hook = Arc::new(move |step: usize, engine: &mut BucketCommitEngine| {
-            if step == target_step {
+        let hook = Arc::new(
+            move |_wallet, step: usize, engine: &mut BucketCommitEngine| {
+                if step == target_step {
+                    engine
+                        .commit(vec![mutation.clone()], &context(20), zero_basis())
+                        .unwrap();
+                }
+            },
+        );
+        let error = validator(stable_responses(&[(wallet, 1, "1.000000")]))
+            .with_step_hook(hook)
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CausalPositionError::LedgerRevision { .. } | CausalPositionError::AnchorInstall(_)
+        ));
+        assert_eq!(
+            engine
+                .ledger()
+                .position(&wallet)
+                .and_then(|snapshot| {
+                    snapshot.positions.get(&MarketOutcomeId::new(
+                        MarketId(VenueMarketId(condition(9))),
+                        OutcomeId(0),
+                    ))
+                })
+                .map(|state| state.long_contracts),
+            Some(ShareAmount::from_atomic(1_000_000)),
+            "the intervening poller BUY must survive the rejected anchor"
+        );
+        assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
+        assert!(paper.position_validation(&wallet).unwrap().is_none());
+        assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn intervening_once_retries_then_accepts_and_clears_reanchor() {
+    let wallet = wallet(0x2f);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let mut redeem = activity(wallet, 9, "0", "0xreanchor-between-captures", 20);
+    redeem["type"] = json!("REDEEM");
+    redeem["usdcSize"] = json!("0");
+    redeem["price"] = json!("0");
+    redeem["side"] = json!("");
+    let mutation = aggregate(redeem, wallet);
+    let hook = Arc::new(
+        move |_wallet, step: usize, engine: &mut BucketCommitEngine| {
+            if step == 4 {
                 engine
                     .commit(vec![mutation.clone()], &context(20), zero_basis())
                     .unwrap();
             }
-        });
-        match validator(stable_responses(&[(wallet, 1, "1.000000")]))
-            .with_step_hook(hook)
-            .validate_direct(&[wallet], &mut engine, &paper)
-            .await
-        {
-            // A mismatch surfaced inside the bracket defers the wallet at
-            // boot (retryable, nothing installed); a ledger revision caught
-            // by the post-loop recheck still rejects the attempted generation.
-            Ok(accepted) => assert!(accepted.is_empty(), "a deferred wallet installs nothing"),
-            Err(error) => assert!(matches!(error, CausalPositionError::LedgerRevision { .. })),
-        }
-        assert!(paper.position_validation(&wallet).unwrap().is_none());
-        assert!(!paper.is_wallet_fenced(&wallet).unwrap());
-    }
+        },
+    );
+
+    let accepted = validator(stable_responses_for_attempts(&[(wallet, 1, "1.000000")], 2))
+        .with_step_hook(hook)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 2);
+    assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -304,24 +1469,25 @@ async fn changed_activity_revision_fences_and_installs_nothing() {
 }
 
 #[tokio::test]
-async fn stable_unexplained_mismatch_retries_without_fencing() {
+async fn stable_positions_replace_the_activity_balance_without_fencing() {
     let wallet = wallet(0x41);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     let accepted = validator(stable_responses(&[(wallet, 1, "2.000000")]))
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("a stable unexplained mismatch defers the wallet at boot, never fatally");
-    assert!(accepted.is_empty());
+        .expect("stable positions are the authoritative anchor");
+    assert_eq!(accepted.len(), 1);
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+    assert_eq!(accepted[0].balances[0].2.atomic(), 2_000_000);
 
     let second = validator(stable_responses(&[(wallet, 1, "2.000000")]))
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("a never-converging mismatch stays deferred on retry");
-    assert!(second.is_empty());
+        .expect("the authoritative balance re-installs idempotently");
+    assert_eq!(second.len(), 1);
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -332,6 +1498,139 @@ async fn changed_position_revision_retries_without_fencing() {
         serde_json::to_vec(&vec![activity(wallet, 1, "1.000000", "0xbase", 10)]).unwrap();
     let first = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
     let second = serde_json::to_vec(&vec![position(wallet, 1, "2.000000")]).unwrap();
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity,
+            ],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![first, second.clone(), second.clone(), second],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+            ],
+        ),
+    ]);
+    let accepted = validator(responses)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .expect("the one bounded retry accepts stable position semantics");
+    assert_eq!(accepted.len(), 1);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn position_revision_twice_defers_after_one_retry() {
+    let wallet = wallet(0x45);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    let activity =
+        serde_json::to_vec(&vec![activity(wallet, 1, "1.000000", "0xbase", 10)]).unwrap();
+    let positions = ["1", "2", "3", "4"]
+        .into_iter()
+        .map(|amount| serde_json::to_vec(&vec![position(wallet, 1, amount)]).unwrap())
+        .collect::<Vec<_>>();
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity,
+            ],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            positions,
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+            ],
+        ),
+    ]);
+
+    let accepted = validator(responses)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert!(accepted.is_empty());
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+}
+
+#[tokio::test]
+async fn intervening_twice_defers_after_one_retry() {
+    let wallet = wallet(0x46);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let mutations = [("0xintervening-first", 20), ("0xintervening-second", 21)]
+        .into_iter()
+        .map(|(transaction_hash, epoch)| {
+            let mut redeem = activity(wallet, 9, "0", transaction_hash, epoch);
+            redeem["type"] = json!("REDEEM");
+            redeem["usdcSize"] = json!("0");
+            redeem["price"] = json!("0");
+            redeem["side"] = json!("");
+            aggregate(redeem, wallet)
+        })
+        .collect::<VecDeque<_>>();
+    let mutations = Arc::new(Mutex::new(mutations));
+    let hook = Arc::new(
+        move |_wallet, step: usize, engine: &mut BucketCommitEngine| {
+            if step == 4
+                && let Some(mutation) = mutations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front()
+            {
+                let epoch = mutation.source_time.0.unix_timestamp();
+                engine
+                    .commit(vec![mutation], &context(epoch), zero_basis())
+                    .unwrap();
+            }
+        },
+    );
+
+    let accepted = validator(stable_responses_for_attempts(&[(wallet, 1, "1.000000")], 2))
+        .with_step_hook(hook)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert!(accepted.is_empty());
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+}
+
+#[tokio::test]
+async fn durable_fence_between_attempts_stops_the_retry() {
+    let wallet = wallet(0x47);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let activity =
+        serde_json::to_vec(&vec![activity(wallet, 1, "1.000000", "0xbase", 10)]).unwrap();
+    let first = serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap();
+    let second = serde_json::to_vec(&vec![position(wallet, 1, "2")]).unwrap();
     let responses = HashMap::from([
         (
             activity_url(wallet),
@@ -346,12 +1645,35 @@ async fn changed_position_revision_retries_without_fencing() {
             vec![b"[]".to_vec(), b"[]".to_vec()],
         ),
     ]);
+    let database_path = dir.path().join("paper.db");
+    let inserted = Arc::new(Mutex::new(false));
+    let hook = Arc::new(
+        move |_wallet, step: usize, _engine: &mut BucketCommitEngine| {
+            let mut inserted = inserted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if step == 4 && !*inserted {
+                rusqlite::Connection::open(&database_path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO wallet_fences
+                     (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix)
+                     VALUES (?1, 'g2:test-fence', 'test_fence', '{}', 100)",
+                        [wallet.to_string()],
+                    )
+                    .unwrap();
+                *inserted = true;
+            }
+        },
+    );
+
     let accepted = validator(responses)
+        .with_step_hook(hook)
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("changed position semantics defer the wallet for a later retry");
+        .unwrap();
     assert!(accepted.is_empty());
-    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
 }
 
@@ -403,12 +1725,7 @@ async fn backwards_activity_fixed_end_retries_without_installing() {
         ),
     ]);
     let clock = Arc::new(Mutex::new(VecDeque::from([100_i64, 99, 101])));
-    let validator = CausalPositionValidator::new(
-        Arc::new(QueueFetcher::new(responses)),
-        BASE,
-        "source-generation-test",
-    )
-    .with_clock(Arc::new(move || {
+    let validator = validator(responses).with_clock(Arc::new(move || {
         clock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -447,11 +1764,7 @@ async fn later_activity_atomically_invalidates_an_accepted_proof() {
 }
 
 #[tokio::test]
-async fn boot_bracket_defers_the_mismatched_wallet_and_accepts_the_rest() {
-    // Live shape from the #544 activation rehearsals: one wallet's positions
-    // stably disagree with its reconstructed ledger. The one-shot boot has no
-    // retry loop, so that wallet is deferred to runtime admission (no fence,
-    // nothing installed) while the healthy wallet is accepted.
+async fn boot_bracket_installs_each_stable_authoritative_balance() {
     let first = wallet(0x51);
     let second = wallet(0x52);
     let (_dir, paper, mut engine) = fresh(&[first, second]);
@@ -461,11 +1774,11 @@ async fn boot_bracket_defers_the_mismatched_wallet_and_accepts_the_rest() {
     ]))
     .validate_direct(&[first, second], &mut engine, &paper)
     .await
-    .expect("a retryable wallet outcome must not abort the boot bracket");
-    assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].validation.wallet, first);
+    .expect("stable authoritative positions install for the whole boot batch");
+    assert_eq!(accepted.len(), 2);
+    assert_eq!(accepted[0].wallet, first);
     assert!(paper.position_validation(&first).unwrap().is_some());
-    assert!(paper.position_validation(&second).unwrap().is_none());
+    assert!(paper.position_validation(&second).unwrap().is_some());
     assert!(!paper.is_wallet_fenced(&second).unwrap());
 }
 
@@ -488,12 +1801,13 @@ async fn positions_before_activity_retry_then_converge_without_fence() {
             vec![b"[]".to_vec()],
         ),
     ]);
-    assert!(matches!(
+    assert!(
         validator(unavailable)
             .validate_direct(&[wallet], &mut engine, &paper)
-            .await,
-        Err(CausalPositionError::Positions { .. })
-    ));
+            .await
+            .expect("missing activity mapping is a deferred boot outcome")
+            .is_empty()
+    );
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
 
     validator(stable_responses(&[(wallet, 1, "1.000000")]))
@@ -587,6 +1901,141 @@ async fn combo_identity_comes_from_activity_and_is_excluded_from_ordinary_compar
 }
 
 #[tokio::test]
+async fn mixed_activity_combo_classification_defers_with_named_asset() {
+    let wallet = wallet(0x60);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let ordinary = activity(wallet, 1, "1.000000", "0xmixed-ordinary", 10);
+    let mut combo = activity(wallet, 1, "1.000000", "0xmixed-combo", 11);
+    combo["isCombo"] = json!(true);
+    let activity = serde_json::to_vec(&vec![ordinary, combo]).unwrap();
+    let responses = HashMap::from([(
+        activity_url(wallet),
+        vec![activity.clone(), activity.clone(), activity],
+    )]);
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer =
+        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
+
+    let error = preparer.prepare(&[wallet]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        AdmissionError::PositionValidation(CausalPositionError::Positions {
+            source: PositionReadError::MixedActivityClassification { asset },
+            ..
+        }) if asset == crate::asset(1)
+    ));
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn metadata_unresolved_activity_only_asset_is_raw_only_and_wallet_anchors() {
+    let wallet = wallet(0x74);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let activity = serde_json::to_vec(&vec![activity(
+        wallet,
+        1,
+        "1.000000",
+        "0xmetadata-unresolved",
+        10,
+    )])
+    .unwrap();
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![activity.clone(), activity.clone(), activity],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(b"[]".to_vec())));
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer = AdmissionPreparer::with_validator(
+        control_tx,
+        Arc::clone(&paper),
+        validator_from_fetcher(fetcher),
+    );
+
+    preparer.prepare(&[wallet]).await.unwrap();
+    let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].disposition, "raw_only");
+    assert_eq!(
+        paper
+            .no_copy_disposition(&groups[0].source_trade_id)
+            .unwrap()
+            .unwrap()
+            .2,
+        "identity_unresolved"
+    );
+    let coverage = paper.wallet_coverage(&wallet).unwrap();
+    assert_eq!(coverage.coverage_generation, 0);
+    assert!(!coverage.reanchor_required);
+    assert_eq!(coverage.anchor_seq, Some(0));
+    assert!(paper.position_validation_current(&wallet).unwrap());
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn conflicting_stamped_identities_without_metadata_are_raw_only_and_anchor() {
+    let wallet = wallet(0x75);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let first = activity(wallet, 1, "1.000000", "0xstamped-zero", 10);
+    let mut second = activity(wallet, 1, "1.000000", "0xstamped-one", 11);
+    second["outcomeIndex"] = json!(1);
+    let activity = serde_json::to_vec(&vec![first, second]).unwrap();
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![activity.clone(), activity.clone(), activity],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(), b"[]".to_vec()],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(b"[]".to_vec())));
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer = AdmissionPreparer::with_validator(
+        control_tx,
+        Arc::clone(&paper),
+        validator_from_fetcher(fetcher),
+    );
+
+    preparer.prepare(&[wallet]).await.unwrap();
+    let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups.iter().all(|group| group.disposition == "raw_only"));
+    assert!(groups.iter().all(|group| {
+        paper
+            .no_copy_disposition(&group.source_trade_id)
+            .unwrap()
+            .is_some_and(|(_, _, reason)| reason == "identity_unresolved")
+    }));
+    let coverage = paper.wallet_coverage(&wallet).unwrap();
+    assert_eq!(coverage.coverage_generation, 0);
+    assert!(!coverage.reanchor_required);
+    assert_eq!(coverage.anchor_seq, Some(0));
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
 async fn exact_zero_ordinary_balance_is_omitted_without_resolution_filtering() {
     let wallet = wallet(0x64);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
@@ -629,31 +2078,17 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
                 }
-                OrchestratorControl::PrepareValidatedAdmissions {
-                    validations,
+                OrchestratorControl::InstallAnchors {
+                    installs,
                     acknowledged,
                 } => {
-                    let result = validations
-                        .iter()
-                        .try_for_each(|validation| {
-                            let capture = ledger_capture(engine.ledger(), validation.wallet)
-                                .map_err(|error| error.to_string())?;
-                            if capture.hash == validation.ledger_hash {
-                                Ok(())
-                            } else {
-                                Err("ledger changed".to_owned())
-                            }
-                        })
-                        .and_then(|()| {
-                            actor_paper
-                                .record_position_validations(&validations)
-                                .map_err(|error| error.to_string())
-                        });
+                    let result = engine.install_anchors(&installs);
                     let _ = acknowledged.send(result);
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(
-                        ledger_capture(engine.ledger(), wallet).map_err(|error| error.to_string()),
+                        ledger_capture(engine.ledger(), &actor_paper, wallet)
+                            .map_err(|error| error.to_string()),
                     );
                 }
                 OrchestratorControl::CommitActivityBucket {
@@ -665,7 +2100,7 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                         engine
                             .commit(
                                 aggregates,
-                                &context,
+                                context.as_ref(),
                                 pe_service::bucket_commit::FrozenDecisionBasis {
                                     win_rate_p: pe_core_types::Probability::ZERO,
                                     bankroll: rust_decimal::Decimal::ZERO,
@@ -689,6 +2124,445 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
     actor.await.unwrap();
 }
 
+#[test]
+fn anchor_transaction_failure_preserves_engine_before_retry_and_rejects_regressed_cutoff() {
+    let wallet = wallet(0x66);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    paper.set_cursor(&wallet, 10).unwrap();
+    let before = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let balance = (
+        MarketId(VenueMarketId(condition(1))),
+        OutcomeId(0),
+        ShareAmount::from_atomic(3_000_000),
+    );
+    let install = AnchorInstall {
+        wallet,
+        balances: vec![balance.clone()],
+        cutoff: 10,
+        proof: AnchorProof {
+            positions_proof_hash: "positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 100,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: before.hash.clone(),
+            cursor: before.cursor,
+            anchor_seq: before.anchor_seq,
+            coverage_generation: before.coverage_generation,
+        },
+    };
+
+    let trigger = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    trigger
+        .execute_batch(
+            "CREATE TRIGGER fail_anchor_validation
+             BEFORE INSERT ON position_validations
+             BEGIN SELECT RAISE(FAIL, 'injected anchor transaction failure'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.install_anchors(std::slice::from_ref(&install)),
+        Err(pe_service::bucket_commit::AnchorInstallError::Durability(_))
+    ));
+    assert_eq!(
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash,
+        before.hash
+    );
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    assert!(paper.leader_positions().unwrap().is_empty());
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+
+    trigger
+        .execute_batch("DROP TRIGGER fail_anchor_validation;")
+        .unwrap();
+    engine.install_anchors(&[install]).unwrap();
+    let installed = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    assert_eq!(
+        engine
+            .ledger()
+            .position(&wallet)
+            .and_then(|snapshot| {
+                snapshot.positions.get(&MarketOutcomeId::new(
+                    MarketId(VenueMarketId(condition(1))),
+                    OutcomeId(0),
+                ))
+            })
+            .map(|state| state.long_contracts),
+        Some(balance.2)
+    );
+    let durable_before_regression = (
+        paper.position_anchors(&wallet).unwrap(),
+        paper.leader_positions().unwrap(),
+        paper.position_validation(&wallet).unwrap(),
+        paper.wallet_coverage(&wallet).unwrap(),
+    );
+    let regressed = AnchorInstall {
+        wallet,
+        balances: Vec::new(),
+        cutoff: 9,
+        proof: AnchorProof {
+            positions_proof_hash: "regressed".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 101,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: installed.hash.clone(),
+            cursor: installed.cursor,
+            anchor_seq: installed.anchor_seq,
+            coverage_generation: installed.coverage_generation,
+        },
+    };
+    assert!(matches!(
+        engine.install_anchors(&[regressed]),
+        Err(pe_service::bucket_commit::AnchorInstallError::CutoffRegression { .. })
+    ));
+    assert_eq!(
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash,
+        installed.hash
+    );
+    assert_eq!(
+        (
+            paper.position_anchors(&wallet).unwrap(),
+            paper.leader_positions().unwrap(),
+            paper.position_validation(&wallet).unwrap(),
+            paper.wallet_coverage(&wallet).unwrap(),
+        ),
+        durable_before_regression
+    );
+}
+
+#[test]
+fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
+    let cursor_wallet = wallet(0x6d);
+    let (_dir, paper, mut engine) = fresh(&[cursor_wallet]);
+    paper.set_cursor(&cursor_wallet, 10).unwrap();
+    let captured = ledger_capture(engine.ledger(), &paper, cursor_wallet).unwrap();
+    let candidate = AnchorInstall {
+        wallet: cursor_wallet,
+        balances: Vec::new(),
+        cutoff: 20,
+        proof: AnchorProof {
+            positions_proof_hash: "cursor".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 20,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: captured.hash,
+            cursor: captured.cursor,
+            anchor_seq: captured.anchor_seq,
+            coverage_generation: captured.coverage_generation,
+        },
+    };
+    paper.set_cursor(&cursor_wallet, 11).unwrap();
+    assert!(matches!(
+        engine.install_anchors(&[candidate]),
+        Err(pe_service::bucket_commit::AnchorInstallError::CursorChanged { .. })
+    ));
+
+    let wallet = wallet(0x6e);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 10);
+    let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let candidate = AnchorInstall {
+        wallet,
+        balances: Vec::new(),
+        cutoff: 10,
+        proof: AnchorProof {
+            positions_proof_hash: "anchor-sequence".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 11,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: captured.hash,
+            cursor: captured.cursor,
+            anchor_seq: captured.anchor_seq,
+            coverage_generation: captured.coverage_generation,
+        },
+    };
+    install_empty_anchor(&mut engine, &paper, wallet, 10);
+    assert!(matches!(
+        engine.install_anchors(&[candidate]),
+        Err(pe_service::bucket_commit::AnchorInstallError::AnchorSeqChanged { .. })
+    ));
+}
+
+#[test]
+fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
+    let wallet = wallet(0x67);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 100);
+    let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let candidate = AnchorInstall {
+        wallet,
+        balances: Vec::new(),
+        cutoff: 100,
+        proof: AnchorProof {
+            positions_proof_hash: "candidate".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 101,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: captured.hash.clone(),
+            cursor: captured.cursor,
+            anchor_seq: captured.anchor_seq,
+            coverage_generation: captured.coverage_generation,
+        },
+    };
+    engine
+        .commit(
+            vec![aggregate(
+                activity(wallet, 2, "1.000000", "0xcovered-late", 90),
+                wallet,
+            )],
+            &context(101),
+            zero_basis(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        engine.install_anchors(&[candidate]),
+        Err(pe_service::bucket_commit::AnchorInstallError::CoverageGenerationChanged { .. })
+    ));
+    let after = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    assert_eq!(after.hash, captured.hash);
+    assert_eq!(after.cursor, captured.cursor);
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+}
+
+#[test]
+fn deferred_position_predicate_is_exact() {
+    let wallet = wallet(0x68);
+    let retryable = vec![
+        CausalPositionError::PositionRevision { wallet },
+        CausalPositionError::InterveningActivity { wallet },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::SaturatedTerminalSecond {
+                end: 100,
+                offset: 3_000,
+            },
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Fetch {
+                url: "activity".to_owned(),
+                source: SourceError::Transient {
+                    message: "retry".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Fetch {
+                url: "activity".to_owned(),
+                source: SourceError::RateLimited {
+                    retry_after_secs: 1,
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::Fetch {
+                url: "positions".to_owned(),
+                source: SourceError::Transient {
+                    message: "retry".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::Fetch {
+                url: "positions".to_owned(),
+                source: SourceError::RateLimited {
+                    retry_after_secs: 1,
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::MissingActivityMapping {
+                asset: "missing".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::ConflictingActivityMapping {
+                asset: "activity-conflict".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::MixedActivityClassification {
+                asset: "mixed-classification".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::MetadataUnresolved {
+                asset: "metadata-unresolved".to_owned(),
+                reason: "absent".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::ConflictingOutcomeMapping {
+                condition_id: "condition".to_owned(),
+                outcome: 0,
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::DuplicateAsset {
+                asset: "duplicate".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::SaturatedTerminalPage {
+                partition: PositionPartition::NotRedeemable,
+                offset: 3_000,
+            },
+        },
+    ];
+    assert!(retryable.iter().all(is_deferred_causal_position_error));
+
+    let fatal = [
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Fetch {
+                url: "activity".to_owned(),
+                source: SourceError::Fatal {
+                    message: "fatal".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::Fetch {
+                url: "positions".to_owned(),
+                source: SourceError::Fatal {
+                    message: "fatal".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::LedgerRevision { wallet },
+    ];
+    assert!(
+        fatal
+            .iter()
+            .all(|error| !is_deferred_causal_position_error(error))
+    );
+}
+
+#[tokio::test]
+async fn parse_and_fatal_fetch_errors_remain_boot_fatal() {
+    for (suffix, payload) in [(0x69, Some(b"{".to_vec())), (0x6a, None)] {
+        let wallet = wallet(suffix);
+        let (_dir, paper, mut engine) = fresh(&[wallet]);
+        let responses = payload.map_or_else(HashMap::new, |payload| {
+            HashMap::from([(activity_url(wallet), vec![payload])])
+        });
+        let error = validator(responses)
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CausalPositionError::Activity {
+                source: ActivityReadError::Parse(_)
+                    | ActivityReadError::Fetch {
+                        source: SourceError::Fatal { .. },
+                        ..
+                    },
+                ..
+            }
+        ));
+        assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn paper_state_transaction_error_remains_boot_fatal_without_swapping() {
+    let wallet = wallet(0x73);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let before = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let trigger = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    trigger
+        .execute_batch(
+            "CREATE TRIGGER fail_activity_group
+             BEFORE INSERT ON activity_groups
+             BEGIN SELECT RAISE(FAIL, 'injected activity transaction failure'); END;",
+        )
+        .unwrap();
+
+    let error = validator(stable_responses(&[(wallet, 1, "1.000000")]))
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CausalPositionError::BucketCommit { .. }));
+    assert_eq!(
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash,
+        before.hash
+    );
+    assert_eq!(paper.cursor(&wallet).unwrap(), None);
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn multi_wallet_prepare_preserves_typed_deferral_and_installs_none() {
+    let healthy = wallet(0x6b);
+    let deferred = wallet(0x6c);
+    let (_dir, paper, engine) = fresh(&[healthy, deferred]);
+    let mut responses = stable_responses(&[(healthy, 1, "1.000000")]);
+    responses.insert(
+        activity_url(deferred),
+        vec![b"[]".to_vec(), b"[]".to_vec(), b"[]".to_vec()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::NotRedeemable),
+        vec![serde_json::to_vec(&vec![position(deferred, 2, "1")]).unwrap()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::Redeemable),
+        vec![b"[]".to_vec()],
+    );
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer =
+        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
+    let error = preparer.prepare(&[healthy, deferred]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        AdmissionError::PositionValidation(CausalPositionError::Positions {
+            source: PositionReadError::MissingActivityMapping { .. },
+            ..
+        })
+    ));
+    assert!(paper.position_anchors(&healthy).unwrap().is_empty());
+    assert!(paper.position_anchors(&deferred).unwrap().is_empty());
+    drop(preparer);
+    actor.await.unwrap();
+}
+
 #[tokio::test]
 async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
     // Live shape from the #544 activation rehearsal: one wallet's visible
@@ -698,6 +2572,8 @@ async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
     let fenced_wallet = wallet(0x71);
     let healthy = wallet(0x72);
     let (_dir, paper, mut engine) = fresh(&[fenced_wallet, healthy]);
+    install_empty_anchor(&mut engine, &paper, fenced_wallet, 0);
+    install_empty_anchor(&mut engine, &paper, healthy, 0);
     let mut responses = stable_responses(&[(healthy, 2, "1.000000")]);
     let mut underflow_redeem = activity(fenced_wallet, 1, "2.000000", "0xunderflow", 10);
     underflow_redeem["type"] = json!("REDEEM");
@@ -712,7 +2588,7 @@ async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
         .expect("a per-wallet fence must not abort the boot bracket");
 
     assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].validation.wallet, healthy);
+    assert_eq!(accepted[0].wallet, healthy);
     assert!(paper.is_wallet_fenced(&fenced_wallet).unwrap());
     assert!(paper.position_validation(&fenced_wallet).unwrap().is_none());
     assert!(paper.position_validation(&healthy).unwrap().is_some());

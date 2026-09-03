@@ -17,7 +17,6 @@
 //! [`crate::supabase_sink`] `SinkWriter` seam.
 
 use std::future::Future;
-use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -287,10 +286,7 @@ impl SupabaseStateClient {
         );
         let rows: Vec<BankrollRow> = self.get_json(&url).await?;
         rows.first()
-            .map(|r| {
-                Decimal::from_str(r.bankroll_str.trim())
-                    .map_err(|_| SupabaseStateError::Corrupt(r.bankroll_str.clone()))
-            })
+            .map(|r| bankroll_money(&r.bankroll_str, "paper_bankroll bankroll_str"))
             .transpose()
     }
 
@@ -436,6 +432,57 @@ fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
     Ok(d)
 }
 
+/// The stored bankroll is Postgres `numeric` text whose scale grows with every fill
+/// (`3729.7323088775297327030000000060` on 2026-09-02), while `Decimal` holds at most
+/// 28 fractional digits. Grammar is canonical and unsigned: `digits` or `digits.digits`
+/// with nothing else. A value the exact parser accepts is returned unchanged; only an
+/// exact-parse failure caused by excess fractional precision (`Underflow`) falls back
+/// to dropping fractional digits beyond the 28th significant digit, and only when every
+/// dropped digit within the first 24 fractional positions is zero (so the loss is below
+/// 1e-24 USD at any magnitude); a nonzero value that would truncate to zero fails closed
+/// like every other input.
+fn bankroll_money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
+    let corrupt = |detail: &str| SupabaseStateError::Corrupt(format!("{what}: {raw:?}: {detail}"));
+    let (integer, fraction) = match raw.split_once('.') {
+        Some((integer, fraction)) if !fraction.is_empty() => (integer, fraction),
+        Some(_) => return Err(corrupt("trailing decimal point")),
+        None => (raw, ""),
+    };
+    if integer.is_empty()
+        || !integer.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(corrupt("not plain unsigned decimal text"));
+    }
+    match Decimal::from_str_exact(raw) {
+        Ok(exact) => Ok(exact),
+        Err(rust_decimal::Error::Underflow) => {
+            let integer_digits = integer.trim_start_matches('0').len();
+            let keep = 28usize.saturating_sub(integer_digits).min(fraction.len());
+            if keep == 0 {
+                return Err(corrupt("integer part leaves no representable fraction"));
+            }
+            // Only digits beyond the 24th fractional position may be dropped (the
+            // documented bound of 1e-24 USD); a larger integer part shrinks `keep`,
+            // so any nonzero digit between `keep` and position 24 fails closed.
+            let guard_end = fraction.len().min(24);
+            if keep < guard_end && fraction[keep..guard_end].bytes().any(|b| b != b'0') {
+                return Err(corrupt(
+                    "nonzero digit dropped within the first 24 fractional positions",
+                ));
+            }
+            let normalized = format!("{integer}.{}", &fraction[..keep]);
+            let truncated = Decimal::from_str_exact(&normalized)
+                .map_err(|e| corrupt(&format!("excess precision fallback: {e}")))?;
+            if truncated.is_zero() && fraction.bytes().any(|b| b != b'0') {
+                return Err(corrupt("nonzero value below representable precision"));
+            }
+            Ok(truncated)
+        }
+        Err(e) => Err(corrupt(&e.to_string())),
+    }
+}
+
 fn canonical_fill(row: FillV2RowJson) -> Result<CanonicalFill, SupabaseStateError> {
     let side = match row.side.as_str() {
         "buy" => Side::Buy,
@@ -488,7 +535,7 @@ impl SupabaseStateTrait for SupabaseStateClient {
         let value = self.post_rpc_json("commit_fill_v2", &body).await?;
         let resp: FillV2Resp = serde_json::from_value(value)
             .map_err(|e| SupabaseStateError::Corrupt(format!("commit_fill_v2 shape: {e}")))?;
-        let bankroll = money(&resp.bankroll, "commit_fill_v2 bankroll")?;
+        let bankroll = bankroll_money(&resp.bankroll, "commit_fill_v2 bankroll")?;
         match (resp.outcome.as_str(), resp.row) {
             ("applied", Some(row)) => Ok(FillV2Outcome::Applied {
                 bankroll,
@@ -541,7 +588,7 @@ impl SupabaseStateTrait for SupabaseStateClient {
             credit: money(&resp.credit, "apply_resolution_v2 credit")?,
             outcome_prices: parsed_prices,
             settled_at_unix: resp.settled_at_unix,
-            bankroll: money(&resp.bankroll, "apply_resolution_v2 bankroll")?,
+            bankroll: bankroll_money(&resp.bankroll, "apply_resolution_v2 bankroll")?,
         })
     }
 }
@@ -1093,6 +1140,75 @@ mod tests {
 
     fn client(base: &str) -> SupabaseStateClient {
         SupabaseStateClient::new(reqwest::Client::new(), base, "anon", "")
+    }
+
+    #[test]
+    fn bankroll_text_is_exact_when_representable_and_truncates_only_excess_precision() {
+        // Live `paper_bankroll.bankroll_str` on 2026-09-02 (32 significant digits).
+        let live = "3729.7323088775297327030000000060";
+        assert_eq!(
+            super::bankroll_money(live, "bankroll").unwrap().to_string(),
+            "3729.732308877529732703000000"
+        );
+        // Exactly representable inputs are returned unchanged, including the maximum.
+        for exact in [
+            "4422.242308877529732703",
+            "3729.73",
+            "0",
+            "7.9228162514264337593543950335",
+            "79228162514264337593543950335",
+        ] {
+            assert_eq!(
+                super::bankroll_money(exact, "bankroll")
+                    .unwrap()
+                    .to_string(),
+                exact
+            );
+        }
+        // Fail closed: garbage, signs, exponent, grammar, whitespace, underflow, overflow.
+        for bad in [
+            "3729.7323088775297327030000000060x",
+            "-0.00000000000000000000000000001",
+            "-1",
+            "+1",
+            "1e5",
+            "",
+            ".5",
+            "1.",
+            " 1 ",
+            "1_000",
+            "0.0000000000000000000000000001", // 1e-28 fits; 1e-29 below must fail
+        ]
+        .into_iter()
+        .filter(|s| *s != "0.0000000000000000000000000001")
+        {
+            assert!(super::bankroll_money(bad, "bankroll").is_err(), "{bad:?}");
+        }
+        assert!(super::bankroll_money("0.00000000000000000000000000001", "bankroll").is_err());
+        assert!(super::bankroll_money("79228162514264337593543950335.9", "bankroll").is_err());
+        // The loss bound holds at any magnitude: a five-digit integer part keeps 23
+        // fractional digits, so a nonzero 24th digit fails closed, while over-precision
+        // beyond the 24th position is still dropped.
+        assert_eq!(
+            super::bankroll_money("3.12345678901234567890123456789", "bankroll")
+                .unwrap()
+                .to_string(),
+            "3.123456789012345678901234567"
+        );
+        assert!(super::bankroll_money("12345.1234567890123456789012345", "bankroll").is_err());
+        assert_eq!(
+            super::bankroll_money("123456.12345678901234567890120000001", "bankroll")
+                .unwrap()
+                .to_string(),
+            "123456.1234567890123456789012"
+        );
+        assert!(
+            super::bankroll_money("123456789012345678901234567.10000000000001", "bankroll")
+                .is_err()
+        );
+        // Exact money parsing is unchanged for every other field.
+        assert!(super::money(live, "credit").is_err());
+        assert!(super::money("-1", "credit").is_err());
     }
 
     #[tokio::test]
