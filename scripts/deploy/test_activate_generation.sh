@@ -230,10 +230,14 @@ case "$action" in
       if [[ -f "$state/service.exec-start" ]]; then
         cat "$state/service.exec-start"
       else
-        echo "/bin/bash -c source $root/prediction-markets/.env; exec $root/prediction-markets/target/release/pe-service $root/prediction-markets/smoke-test/service.toml"
+        echo "{ path=/bin/bash ; argv[]=/bin/bash -c 'source $root/prediction-markets/.env; exec $root/prediction-markets/target/release/pe-service $root/prediction-markets/smoke-test/service.toml' ; ignore_errors=no ; }"
       fi
     elif [[ "$*" == *EnvironmentFiles* ]]; then
-      [[ ! -f "$state/service.environment-files" ]] || cat "$state/service.environment-files"
+      if [[ -f "$state/service.environment-files" ]]; then
+        cat "$state/service.environment-files"
+      else
+        echo "$root/prediction-markets/.env (ignore_errors=no)"
+      fi
     else
       echo 1234
     fi
@@ -487,19 +491,40 @@ rm "$hold"
 wait "$holder"
 assert_verified "$root"
 
-# Unit ownership requires complete path tokens; a suffixed config backup is not the installed config.
-root=$(make_case unit-config-backup)
+# Unit ownership takes the config argument from ExecStart argv and ignores a backup in a comment.
+root=$(make_case unit-config-comment-backup)
 service="$root/prediction-markets"
-printf '/bin/bash -c source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml.backup\n' \
-  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml # %s/smoke-test/service.toml.backup' ; ignore_errors=no ; }\n" \
+  "$service" "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
+
+# A real config mentioned only in a comment cannot legitimize the backup argument.
+root=$(make_case unit-config-real-comment)
+service="$root/prediction-markets"
+printf "{ path=/bin/bash ; argv[]=/bin/bash -c 'source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml.backup # %s/smoke-test/service.toml' ; ignore_errors=no ; }\n" \
+  "$service" "$service" "$service" "$service" > "$root/test-state/service.exec-start"
 set +e
 activate "$root" activation-557 >"$root/unit.out" 2>"$root/unit.err"
 rc=$?
 set -e
 [[ "$rc" == 1 ]] || fail "suffixed service config path was accepted"
-grep -q 'does not select the installed service config' "$root/unit.err" ||
+grep -q 'does not select the installed binary and service config' "$root/unit.err" ||
   fail "suffixed service config refusal was not explicit"
 [[ ! -e "$root/pe-activation.json" ]] || fail "suffixed service config was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
+
+# ExecStart mentioning the env is insufficient; EnvironmentFiles owns that role.
+root=$(make_case unit-environment-role)
+: > "$root/test-state/service.environment-files"
+set +e
+activate "$root" activation-557 >"$root/unit-env.out" 2>"$root/unit-env.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "environment mentioned only in ExecStart was accepted"
+grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit-env.err" ||
+  fail "EnvironmentFiles role refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "wrong-role environment was adopted into a manifest"
 assert_deploy_lock_unchanged "$root"
 
 # A different id is rejected while durable state is non-terminal.
@@ -578,6 +603,31 @@ grep -q 'staged rehearsal binary hash drift' "$root/rehearsal-resume.err" ||
   fail "substituted rehearsal binary executed before hash verification"
 cp "$root/input/new-pe-service" "$root/prediction-markets/gen/557/staged/pe-service"
 chmod 0755 "$root/prediction-markets/gen/557/staged/pe-service"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
+
+# A resume verifies the rehearsal environment before any shell source or executable can consume it.
+root=$(make_case rehearsal-environment-drift)
+set +e
+activate "$root" activation-557 --simulate-crash-after before-manifest-prepared \
+  >"$root/rehearsal-env-first.out" 2>"$root/rehearsal-env-first.err"
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "rehearsal environment drift case did not reach prepared boundary"
+staged_rehearsal_env="$root/prediction-markets/gen/557/staged/rehearsal.env"
+cp "$staged_rehearsal_env" "$root/rehearsal.env.saved"
+printf ': > "%s/test-state/substituted-rehearsal-environment-sourced"\n' "$root" >> "$staged_rehearsal_env"
+set +e
+activate "$root" activation-557 >"$root/rehearsal-env-resume.out" 2>"$root/rehearsal-env-resume.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "substituted rehearsal environment was accepted on resume"
+grep -q 'staged rehearsal environment hash drift' "$root/rehearsal-env-resume.err" ||
+  fail "substituted rehearsal environment refusal was not explicit"
+[[ ! -e "$root/test-state/substituted-rehearsal-environment-sourced" ]] ||
+  fail "substituted rehearsal environment was sourced before hash verification"
+cp "$root/rehearsal.env.saved" "$staged_rehearsal_env"
+chmod 0600 "$staged_rehearsal_env"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 

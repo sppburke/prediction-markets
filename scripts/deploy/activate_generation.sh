@@ -109,6 +109,18 @@ state_rank() {
   esac
 }
 
+verify_staged_artifacts() {
+  local path expected label
+  while (($#)); do
+    path=$(manifest_get "artifacts.$1.path")
+    expected=$(manifest_get "artifacts.$1.sha256")
+    label=$2
+    [[ -f "$path" ]] || die "staged $label is absent: $path"
+    [[ "$(sha256_file "$path")" == "$expected" ]] || die "staged $label hash drift"
+    shift 2
+  done
+}
+
 env_value() {
   local file=$1 name=$2
   (
@@ -142,24 +154,61 @@ effective_path() {
   absolute_from_root "$value"
 }
 
-unit_has_exact_token() {
-  local expected=$1
-  shift
+unit_environment_has_exact_path() {
+  local expected=$1 environment_files=$2
   python3 -c 'import shlex,sys
-expected=sys.argv[1]
-pending=list(sys.argv[2:])
-tokens=set()
-while pending:
-    value=pending.pop()
-    lexer=shlex.shlex(value, posix=True, punctuation_chars=";&|(){}")
+expected,value=sys.argv[1:]
+lexer=shlex.shlex(value, posix=True, punctuation_chars=";&|(){}")
+lexer.whitespace_split=True
+lexer.commenters="#"
+for token in lexer:
+    if token.startswith("path="):
+        token=token.removeprefix("path=")
+    token=token.removesuffix(";")
+    if token.startswith("-/"):
+        token=token[1:]
+    if token == expected:
+        raise SystemExit(0)
+raise SystemExit(1)' "$expected" "$environment_files"
+}
+
+unit_exec_selects_service() {
+  local expected_binary=$1 expected_config=$2 working=$3 exec_start=$4
+  python3 -c 'import os,re,shlex,sys
+expected_binary,expected_config,working,value=sys.argv[1:]
+marker="argv[]="
+if marker not in value:
+    raise SystemExit(1)
+argv=value.split(marker,1)[1]
+metadata=re.search(r"\s;\s(?:ignore_errors|start_time|stop_time|pid|code|status)=", argv)
+if metadata:
+    argv=argv[:metadata.start()]
+
+def tokens(text):
+    lexer=shlex.shlex(text, posix=True, punctuation_chars=";&|(){}")
     lexer.whitespace_split=True
-    lexer.commenters=""
+    lexer.commenters="#"
+    result=[]
     for token in lexer:
-        if token != value and (any(char.isspace() for char in token) or any(char in ";&|(){}" for char in token)):
-            pending.append(token)
+        if token != text and (any(char.isspace() for char in token) or any(char in ";&|(){}" for char in token)):
+            result.extend(tokens(token))
         else:
-            tokens.add(token)
-raise SystemExit(0 if expected in tokens else 1)' "$expected" "$@"
+            result.append(token)
+    return result
+
+argv_tokens=tokens(argv)
+configs=[]
+for index,token in enumerate(argv_tokens[:-1]):
+    if token != expected_binary:
+        continue
+    if index != 0 and argv_tokens[index-1] != "exec":
+        continue
+    config=argv_tokens[index+1]
+    if not os.path.isabs(config):
+        config=os.path.join(working, config)
+    configs.append(os.path.normpath(config))
+raise SystemExit(0 if configs and all(config == os.path.normpath(expected_config) for config in configs) else 1)' \
+    "$expected_binary" "$expected_config" "$working" "$exec_start"
 }
 
 verify_installed_unit_owner() {
@@ -172,12 +221,10 @@ verify_installed_unit_owner() {
     die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
   exec_start=$(systemctl show pe-service -p ExecStart --value)
   environment_files=$(systemctl show pe-service -p EnvironmentFiles --value)
-  unit_has_exact_token "$SERVICE_ENV" "$exec_start" "$environment_files" &&
-    unit_has_exact_token "$SERVICE_BINARY" "$exec_start" ||
-    die "pe-service ExecStart does not source the installed environment and binary"
-  unit_has_exact_token "$SERVICE_CONFIG" "$exec_start" ||
-    unit_has_exact_token "smoke-test/service.toml" "$exec_start" ||
-    die "pe-service ExecStart does not select the installed service config"
+  unit_environment_has_exact_path "$SERVICE_ENV" "$environment_files" ||
+    die "pe-service EnvironmentFiles does not select the installed environment"
+  unit_exec_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$working" "$exec_start" ||
+    die "pe-service ExecStart does not select the installed binary and service config"
   if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
     pid=$(systemctl show pe-service -p MainPID --value)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
@@ -359,6 +406,9 @@ fi
 [[ "$(manifest_get generation_dir)" == "$generation_dir" ]] || die "manifest generation mismatch"
 [[ "$(manifest_get merge_commit)" == "$merge_commit" ]] || die "manifest merge commit mismatch"
 [[ "$(manifest_get bankroll)" == "$bankroll" ]] || die "manifest bankroll mismatch"
+verify_staged_artifacts environment "production environment" \
+  rehearsal_environment "rehearsal environment" rehearsal_config "rehearsal config" \
+  binary "rehearsal binary"
 [[ "$(env_value "$(manifest_get artifacts.environment.path)" PE_BIND)" == "$production_bind" ]] ||
   die "manifest production bind mismatch"
 [[ "$(env_value "$(manifest_get artifacts.rehearsal_environment.path)" PE_BIND)" == "$rehearsal_bind" ]] ||
@@ -439,18 +489,6 @@ verify_seed_or_prepared() {
   fi
 }
 
-verify_rehearsal_artifacts() {
-  local path expected label
-  while (($#)); do
-    path=$(manifest_get "artifacts.$1.path")
-    expected=$(manifest_get "artifacts.$1.sha256")
-    label=$2
-    [[ -f "$path" ]] || die "staged rehearsal $label is absent: $path"
-    [[ "$(sha256_file "$path")" == "$expected" ]] || die "staged rehearsal $label hash drift"
-    shift 2
-  done
-}
-
 if (( $(state_rank "$state") < $(state_rank prepared) )); then
   seed_version=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" 'pragma user_version;')
   if [[ "$seed_version" == 1 ]]; then
@@ -461,9 +499,11 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   rehearsal_env=$(manifest_get artifacts.rehearsal_environment.path)
   rehearsal_config=$(manifest_get artifacts.rehearsal_config.path)
   staged_binary=$(manifest_get artifacts.binary.path)
-  verify_rehearsal_artifacts rehearsal_environment environment rehearsal_config config binary binary
+  verify_staged_artifacts rehearsal_environment "rehearsal environment" \
+    rehearsal_config "rehearsal config" binary "rehearsal binary"
   "$DEPLOY_SCRIPT_DIR/rehearsal_preflight.sh" "$rehearsal_env"
-  verify_rehearsal_artifacts rehearsal_environment environment rehearsal_config config binary binary
+  verify_staged_artifacts rehearsal_environment "rehearsal environment" \
+    rehearsal_config "rehearsal config" binary "rehearsal binary"
   (
     set -a
     # shellcheck disable=SC1090
