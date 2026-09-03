@@ -21,10 +21,9 @@
 //!         the first copy: three raw envelopes, one seen row, one leader delta,
 //!         one fill, one dispatch seed, the frozen armed targets; then the
 //!         source log replays into a fresh orchestrator to the same result.
-//!   R7  — full fan-in: the reader retains its frame, item, and socket, reads
-//!         no second frame, derives non-live at 30 s, drains in order once
-//!         capacity returns (stale rows become `activity_ws` no-copies), then
-//!         drops and re-dials.
+//!   R7  — full fan-in behind a delayed append: the reader retains its frame,
+//!         item, and socket beyond 30 s, then credits liveness from the fresh
+//!         post-delivery instant and continues on the same connection.
 //!   R8  — the early gate applies the strict `age > budget` rule to BOTH
 //!         provenances with a fixed clock; exact-boundary rows stay eligible.
 //!   R9  — fresh at the early gate, stale immediately before staging: no-copy
@@ -88,7 +87,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -522,6 +521,14 @@ async fn start_pool_with(
     net: Arc<PipeNet>,
     capacity: usize,
 ) -> (Pool, mpsc::Receiver<IncomingTrade>) {
+    start_pool_with_gate(net, capacity, None).await
+}
+
+async fn start_pool_with_gate(
+    net: Arc<PipeNet>,
+    capacity: usize,
+    reader_append_gate: Option<Arc<Semaphore>>,
+) -> (Pool, mpsc::Receiver<IncomingTrade>) {
     let dir = tempfile::tempdir().unwrap();
     let source_log = dir.path().join("source.log");
     let sink = SourceEventSink::open(&source_log).unwrap();
@@ -529,7 +536,7 @@ async fn start_pool_with(
     let (trigger_tx, mut trigger_rx) = mpsc::channel(capacity);
     let (trade_tx, trade_rx) = mpsc::channel(capacity);
     let health = healthy_ws_health();
-    let ingest = ActivityIngest::with_dialer(
+    let mut ingest = ActivityIngest::with_dialer(
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         sink,
         source_rx,
@@ -537,6 +544,9 @@ async fn start_pool_with(
         health.clone(),
         net.dialer(),
     );
+    if let Some(gate) = reader_append_gate {
+        ingest = ingest.with_reader_append_gate(gate);
+    }
     let replay_path = source_log.clone();
     // Compatibility projection for the retained #546 reader-pool scenarios:
     // production emits only reconciliation triggers, while these tests still
@@ -769,6 +779,31 @@ async fn r2_mixed_frame_delivers_watched_row_once_and_unwatched_rows_only_refres
     assert_eq!(pool.source_log_ids().len(), 1);
     advance(Duration::from_secs(1)).await;
     assert!(!pool.reader(0).connected, "30s after the last accepted row");
+    pool.task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn unwatched_accepted_rows_alone_keep_reader_live_beyond_thirty_seconds() {
+    let (pool, mut trade_rx) = start_pool(8).await;
+    let mut server = pool.net.take_server(0);
+    for tx in ["0xstranger-a", "0xstranger-b", "0xstranger-c"] {
+        advance(Duration::from_secs(20)).await;
+        server
+            .send_text(&activity_frame(&[payload(
+                tx,
+                STRANGER,
+                &market_b(),
+                now_unix(),
+            )]))
+            .await
+            .unwrap();
+        settle().await;
+        assert!(pool.reader(0).connected);
+    }
+    assert_eq!(pool.net.dial_count(0), 1);
+    assert_eq!(pool.reader(0).normalized_activity_rows_total, 3);
+    assert!(trade_rx.try_recv().is_err());
+    assert!(pool.source_log_ids().is_empty());
     pool.task.abort();
 }
 
@@ -1128,109 +1163,60 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
     assert!(hooks2.age_clock.lock().unwrap().is_empty());
 }
 
-// ── R7: saturation retains the frame, item, and socket; drains in order ──────
+// ── R7: delayed append saturation refreshes from post-delivery time ─────────
 
 #[tokio::test(start_paused = true)]
-async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops() {
-    // Trade channel capacity 1 ⇒ fan-in capacity 1.
-    let (pool, trade_rx) = start_pool(1).await;
+async fn r7_full_fan_in_drains_after_thirty_seconds_without_dropping_socket() {
+    let append_gate = Arc::new(Semaphore::new(0));
+    let (pool, _trade_rx) = start_pool_with_gate(
+        Arc::new(PipeNet::default()),
+        1,
+        Some(Arc::clone(&append_gate)),
+    )
+    .await;
     let mut server = pool.net.take_server(0);
-    let stale_unix = now_unix() - 60;
-    let rows: Vec<String> = ["0xa", "0xb", "0xc", "0xd", "0xf", "0xg"]
+    let rows: Vec<String> = ["0xa", "0xb", "0xc"]
         .iter()
-        .map(|tx| payload(tx, LEADER, &market(), stale_unix))
+        .map(|tx| payload(tx, LEADER, &market(), now_unix()))
         .collect();
     server.send_text(&activity_frame(&rows)).await.unwrap();
     assert!(
         settle_until(|| pool.reader(0).fan_in_blocked).await,
-        "the sixth row blocks after the test-only trigger projection adds two retained slots"
+        "the frame blocks behind the delayed first append"
     );
-    let before = pool.reader(0);
-    assert!(before.connected && before.is_live(Instant::now()));
-    assert_eq!(
-        pool.source_log_ids(),
-        vec![
-            "0xa".to_string(),
-            "0xb".to_string(),
-            "0xc".to_string(),
-            "0xd".to_string(),
-        ]
-    );
-
-    // No second wire frame is read while blocked.
-    server
-        .send_text(&activity_frame(&[payload(
-            "0xe",
-            STRANGER,
-            &market_b(),
-            now_unix(),
-        )]))
-        .await
-        .unwrap();
-    settle().await;
+    let blocked_at = Instant::now();
+    assert!(pool.reader(0).connected);
     assert_eq!(pool.reader(0).normalized_activity_rows_total, 0);
-    assert!(pool.reader(0).fan_in_blocked);
+    assert!(pool.source_log_ids().is_empty());
 
-    // 30 s later: non-live by the derived rule, still connected, item and socket retained.
-    advance(Duration::from_secs(30)).await;
+    advance(Duration::from_secs(31)).await;
     let r = pool.reader(0);
     assert!(r.connected && r.fan_in_blocked);
-    assert_eq!(
-        r.last_normalized_activity_at,
-        before.last_normalized_activity_at
-    );
-    assert!(
-        !r.is_live(Instant::now()),
-        "derived non-live after 30 s on the reader's own clock"
-    );
+    assert!(!r.is_live(Instant::now()));
+    assert!(r.last_normalized_activity_at.unwrap() < blocked_at + Duration::from_secs(31));
     assert_eq!(pool.net.dial_count(0), 1, "no reconnect while blocked");
 
-    // Release capacity: an orchestrator drains every retained row IN ORDER; each
-    // stale websocket row is seen with an `activity_ws` no-copy disposition.
-    let dir = tempfile::tempdir().unwrap();
-    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
-    let orch = build_orchestrator(
-        dir.path(),
-        paper_state.clone(),
-        trade_rx,
-        pool.health.clone(),
-        OrchOpts::ws(vec![market()]),
+    append_gate.add_permits(rows.len());
+    assert!(
+        settle_until(|| pool.reader(0).normalized_activity_rows_total == 3).await,
+        "the retained frame drains after append resumes"
     );
-    let (orch_task, shutdown) = spawn_orchestrator(orch);
-    let all = ["0xa", "0xb", "0xc", "0xd", "0xf", "0xg"];
-    assert!(settle_until(|| all.iter().all(|t| paper_state.is_seen(&id(t)).unwrap())).await);
+    let drained = pool.reader(0);
+    assert!(drained.connected);
+    assert!(!drained.fan_in_blocked);
+    assert!(drained.is_live(Instant::now()));
+    assert!(
+        drained.last_normalized_activity_at.unwrap() >= blocked_at + Duration::from_secs(31),
+        "watched liveness uses a fresh instant after every fan-in delivery succeeds"
+    );
     assert_eq!(
         pool.source_log_ids(),
-        all.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        vec!["0xa".to_owned(), "0xb".to_owned(), "0xc".to_owned()],
         "retained rows landed in order without eviction"
     );
-    for t in all {
-        let (provenance, age, reason) = paper_state.no_copy_disposition(&id(t)).unwrap().unwrap();
-        assert_eq!(provenance, "activity_ws");
-        assert!(age >= 60, "{t}: age {age}");
-        assert_eq!(reason, "stale_activity_ws_past_copy_budget");
-    }
-    assert_eq!(paper_fill_count(dir.path()), 0, "no fill");
-    assert!(
-        paper_state.pending_dispatch_seeds().unwrap().is_empty(),
-        "no seed"
-    );
-    assert_eq!(
-        leader_long(&paper_state, &market()),
-        Some(whole_shares(600)),
-        "leader bookkeeping kept"
-    );
-
-    // After the drain the deadline check drops the socket BEFORE the next read, so
-    // the second frame is never consumed; the slot re-dials after its backoff.
-    assert!(settle_until(|| !pool.reader(0).connected).await);
-    assert!(!pool.reader(0).fan_in_blocked);
-    assert!(server.recv_text().await.is_none());
-    assert_eq!(pool.reader(0).normalized_activity_rows_total, 6);
-    advance(Duration::from_secs(1)).await;
-    assert_eq!(pool.net.dial_count(0), 2);
-    shutdown.send(()).unwrap();
-    orch_task.await.unwrap();
+    advance(Duration::from_secs(29)).await;
+    assert!(pool.reader(0).connected);
+    assert_eq!(pool.net.dial_count(0), 1);
     pool.task.abort();
 }
 

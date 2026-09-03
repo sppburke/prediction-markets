@@ -16,7 +16,9 @@ use pe_core_types::{
 };
 use pe_event_log::Reader;
 use pe_paper_state::{FillRecord, FillRow, PaperStateDb};
-use pe_position_ledger::{LedgerEffect, LedgerEffectDocumentError, LedgerMutation, PositionLedger};
+use pe_position_ledger::{
+    AppliedEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation, PositionLedger,
+};
 use pe_strategy_winner_follow::PaperFill;
 
 use crate::bucket_commit::DecisionContinuationV2;
@@ -194,6 +196,15 @@ pub enum WalletLedgerReplayError {
         source_trade_id: SourceTradeId,
         message: String,
     },
+    #[error(
+        "activity bucket for {wallet} at {source_epoch} recomputed clamped residuals {actual:?}, expected {expected:?}"
+    )]
+    ClampedResidualMismatch {
+        wallet: WalletAddress,
+        source_epoch: i64,
+        expected: Vec<Option<u64>>,
+        actual: Vec<Option<u64>>,
+    },
     #[error("wallet ledger capture failed: {0}")]
     LedgerCapture(String),
 }
@@ -222,18 +233,22 @@ pub fn replay_wallet_ledger(
     let groups = paper_state.activity_groups_after(&wallet, first_anchor.activity_cutoff_unix)?;
     let mut next_group = 0usize;
     for anchor in anchors.iter().skip(1) {
+        let bucket_start = next_group;
         while let Some(group) = groups.get(next_group) {
             if group.source_epoch > anchor.activity_cutoff_unix {
                 break;
             }
-            apply_replayed_group(&mut ledger, paper_state, wallet, group)?;
             next_group = next_group.saturating_add(1);
         }
+        apply_replayed_groups(
+            &mut ledger,
+            paper_state,
+            wallet,
+            &groups[bucket_start..next_group],
+        )?;
         install_replayed_anchor(&mut ledger, paper_state, anchor)?;
     }
-    for group in groups.iter().skip(next_group) {
-        apply_replayed_group(&mut ledger, paper_state, wallet, group)?;
-    }
+    apply_replayed_groups(&mut ledger, paper_state, wallet, &groups[next_group..])?;
     Ok(ledger)
 }
 
@@ -281,42 +296,101 @@ fn install_replayed_anchor(
     Ok(())
 }
 
-fn apply_replayed_group(
+fn apply_replayed_groups(
     ledger: &mut PositionLedger,
     paper_state: &PaperStateDb,
     wallet: WalletAddress,
-    group: &pe_paper_state::ActivityGroupRow,
+    groups: &[pe_paper_state::ActivityGroupRow],
 ) -> Result<(), WalletLedgerReplayError> {
-    let durable = paper_state.activity_group_state(&group.source_trade_id)?;
-    verify_replayed_group_revision(durable.as_ref(), group)?;
-    let effect = LedgerEffect::from_document(&group.proof_json).map_err(|source| {
-        WalletLedgerReplayError::EffectDocument {
-            source_trade_id: group.source_trade_id.clone(),
-            source,
+    let mut bucket_start = 0usize;
+    while let Some(first) = groups.get(bucket_start) {
+        let mut bucket_end = bucket_start.saturating_add(1);
+        while groups
+            .get(bucket_end)
+            .is_some_and(|group| group.source_epoch == first.source_epoch)
+        {
+            bucket_end = bucket_end.saturating_add(1);
         }
-    })?;
-    if !applied_disposition(&group.source_trade_id, &group.disposition)? {
-        return Ok(());
+        apply_replayed_bucket(
+            ledger,
+            paper_state,
+            wallet,
+            &groups[bucket_start..bucket_end],
+        )?;
+        bucket_start = bucket_end;
     }
+    Ok(())
+}
+
+fn apply_replayed_bucket(
+    ledger: &mut PositionLedger,
+    paper_state: &PaperStateDb,
+    wallet: WalletAddress,
+    groups: &[pe_paper_state::ActivityGroupRow],
+) -> Result<(), WalletLedgerReplayError> {
+    let Some(first) = groups.first() else {
+        return Ok(());
+    };
     let source_time =
-        time::OffsetDateTime::from_unix_timestamp(group.source_epoch).map_err(|_| {
+        time::OffsetDateTime::from_unix_timestamp(first.source_epoch).map_err(|_| {
             WalletLedgerReplayError::InvalidSourceEpoch {
-                source_trade_id: group.source_trade_id.clone(),
-                source_epoch: group.source_epoch,
+                source_trade_id: first.source_trade_id.clone(),
+                source_epoch: first.source_epoch,
             }
         })?;
-    ledger
-        .apply(&LedgerMutation {
+    let mut mutations = Vec::new();
+    let mut expected = Vec::new();
+    for group in groups {
+        let durable = paper_state.activity_group_state(&group.source_trade_id)?;
+        verify_replayed_group_revision(durable.as_ref(), group)?;
+        let applied_effect = AppliedEffect::from_document(&group.proof_json).map_err(|source| {
+            WalletLedgerReplayError::EffectDocument {
+                source_trade_id: group.source_trade_id.clone(),
+                source,
+            }
+        })?;
+        if !applied_disposition(&group.source_trade_id, &group.disposition)? {
+            continue;
+        }
+        expected.push(applied_effect.clamped_residual);
+        mutations.push(LedgerMutation {
             source_trade_id: group.source_trade_id.clone(),
             transaction_hash: group.source_trade_id.0.clone(),
             wallet,
             source_time: SourceTimestamp(source_time),
-            effect,
-        })
-        .map_err(|error| WalletLedgerReplayError::Ledger {
-            source_trade_id: group.source_trade_id.clone(),
-            message: error.to_string(),
-        })
+            effect: applied_effect.effect,
+        });
+    }
+    let applied =
+        ledger
+            .apply_all_or_none(&mutations)
+            .map_err(|error| WalletLedgerReplayError::Ledger {
+                source_trade_id: ledger_error_source_id(&error),
+                message: error.to_string(),
+            })?;
+    let actual = applied
+        .into_iter()
+        .map(|effect| effect.clamped_residual)
+        .collect::<Vec<_>>();
+    if actual != expected {
+        return Err(WalletLedgerReplayError::ClampedResidualMismatch {
+            wallet,
+            source_epoch: first.source_epoch,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn ledger_error_source_id(error: &LedgerError) -> SourceTradeId {
+    match error {
+        LedgerError::InvalidMapping { source_trade_id }
+        | LedgerError::Underflow { source_trade_id }
+        | LedgerError::Overflow { source_trade_id }
+        | LedgerError::Conversion { source_trade_id }
+        | LedgerError::UnknownEffect { source_trade_id } => source_trade_id.clone(),
+    }
 }
 
 fn verify_replayed_group_revision(
@@ -358,6 +432,7 @@ fn applied_disposition(
         disposition,
         "raw_only"
             | "reanchor_required_redemption"
+            | "reanchor_required_late_group"
             | "anchor_covered"
             | "anchor_covered_late"
             | "wallet_fenced"

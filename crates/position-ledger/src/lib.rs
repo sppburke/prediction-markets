@@ -4,7 +4,7 @@
 //! deterministic output given the same ordered input stream.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, PositionState};
 use pe_core_types::{
@@ -78,6 +78,19 @@ pub enum LedgerEffectDocumentError {
 
 const LEDGER_EFFECT_DOCUMENT_VERSION_V1: u64 = 1;
 const LEDGER_EFFECT_DOCUMENT_VERSION_V2: u64 = 2;
+const LEDGER_EFFECT_DOCUMENT_VERSION_V3: u64 = 3;
+
+/// One four-decimal `/positions` quantum. Per EVIDENCE_FIXFWD.md F1,
+/// redeem residuals `1..=99` clamp while a residual of 100 fences.
+pub const REDEEM_RESIDUAL_LIMIT_ATOMIC: u64 = 100;
+
+/// The result of applying one ledger effect, including any bounded redeem
+/// residual needed to prove production/replay parity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedEffect {
+    pub effect: LedgerEffect,
+    pub clamped_residual: Option<u64>,
+}
 
 /// Versioned persisted form of a [`LedgerEffect`] (issue #555): the exact
 /// normalized mutation stored beside each activity-group disposition so a
@@ -87,6 +100,8 @@ const LEDGER_EFFECT_DOCUMENT_VERSION_V2: u64 = 2;
 struct LedgerEffectDocument {
     version: u64,
     effect: LedgerEffectDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clamped_residual_atomic: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     correction: Option<IdentityCorrection>,
 }
@@ -294,72 +309,154 @@ impl LedgerEffect {
     /// Field order is the declaration order above, so the encoding is
     /// deterministic for equal effects.
     pub fn to_document(&self) -> Result<String, LedgerEffectDocumentError> {
+        AppliedEffect {
+            effect: self.clone(),
+            clamped_residual: None,
+        }
+        .to_document()
+    }
+
+    /// Decode a versioned effect document; unknown versions and any missing,
+    /// extra, or malformed field are typed failures.
+    pub fn from_document(document: &str) -> Result<Self, LedgerEffectDocumentError> {
+        Ok(AppliedEffect::from_document(document)?.effect)
+    }
+}
+
+impl AppliedEffect {
+    /// Canonical JSON document for an applied outcome. Version three is used
+    /// only for a redeem whose bounded residual was clamped.
+    pub fn to_document(&self) -> Result<String, LedgerEffectDocumentError> {
+        validate_clamped_residual(&self.effect, self.clamped_residual)?;
         // Encoding through `Value` sorts object keys, so equal effects always
         // produce byte-identical documents.
-        let correction = self.correction().cloned();
+        let correction = self.effect.correction().cloned();
+        let version = if self.clamped_residual.is_some() {
+            LEDGER_EFFECT_DOCUMENT_VERSION_V3
+        } else if correction.is_some() {
+            LEDGER_EFFECT_DOCUMENT_VERSION_V2
+        } else {
+            LEDGER_EFFECT_DOCUMENT_VERSION_V1
+        };
         let value = serde_json::to_value(LedgerEffectDocument {
-            version: if correction.is_some() {
-                LEDGER_EFFECT_DOCUMENT_VERSION_V2
-            } else {
-                LEDGER_EFFECT_DOCUMENT_VERSION_V1
-            },
-            effect: self.effective().into(),
+            version,
+            effect: self.effect.effective().into(),
+            clamped_residual_atomic: self.clamped_residual,
             correction,
         })
         .map_err(malformed)?;
         serde_json::to_string(&value).map_err(malformed)
     }
 
-    /// Decode a versioned effect document; unknown versions and any missing,
-    /// extra, or malformed field are typed failures.
+    /// Decode a versioned effect document together with its expected redeem
+    /// residual. Version-one and version-two documents yield no residual.
     pub fn from_document(document: &str) -> Result<Self, LedgerEffectDocumentError> {
         let value: serde_json::Value = serde_json::from_str(document).map_err(malformed)?;
         let decoded: LedgerEffectDocument =
             serde_json::from_value(value.clone()).map_err(malformed)?;
-        let effect = match (decoded.version, decoded.correction) {
-            (LEDGER_EFFECT_DOCUMENT_VERSION_V1, None) => decoded.effect.into(),
-            (LEDGER_EFFECT_DOCUMENT_VERSION_V1, Some(_)) => {
+        let (effect, clamped_residual) = match (
+            decoded.version,
+            decoded.correction,
+            decoded.clamped_residual_atomic,
+        ) {
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V1, None, None) => (decoded.effect.into(), None),
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V1, Some(_), _) => {
                 return Err(LedgerEffectDocumentError::Malformed {
                     message: "version 1 ledger effect document contains a correction".to_owned(),
                 });
             }
-            (LEDGER_EFFECT_DOCUMENT_VERSION_V2, Some(correction)) => {
-                let effect: Self = decoded.effect.into();
-                if correction.stamped == correction.verified {
-                    return Err(LedgerEffectDocumentError::Malformed {
-                        message: "ledger identity correction does not change identity".to_owned(),
-                    });
-                }
-                if effect.identity().as_ref() != Some(&correction.verified) {
-                    return Err(LedgerEffectDocumentError::Malformed {
-                        message: "corrected effect identity does not match verified identity"
-                            .to_owned(),
-                    });
-                }
-                Self::Corrected {
-                    effect: Box::new(effect),
-                    correction,
-                }
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V1, None, Some(_)) => {
+                return Err(LedgerEffectDocumentError::Malformed {
+                    message: "version 1 ledger effect document contains a clamped residual"
+                        .to_owned(),
+                });
             }
-            (LEDGER_EFFECT_DOCUMENT_VERSION_V2, None) => {
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V2, Some(correction), None) => {
+                (corrected_effect(decoded.effect.into(), correction)?, None)
+            }
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V2, None, _) => {
                 return Err(LedgerEffectDocumentError::Malformed {
                     message: "version 2 ledger effect document is missing its correction"
                         .to_owned(),
                 });
             }
-            (version, _) => {
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V2, Some(_), Some(_)) => {
+                return Err(LedgerEffectDocumentError::Malformed {
+                    message: "version 2 ledger effect document contains a clamped residual"
+                        .to_owned(),
+                });
+            }
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V3, correction, Some(residual)) => {
+                let effect = match correction {
+                    Some(correction) => corrected_effect(decoded.effect.into(), correction)?,
+                    None => decoded.effect.into(),
+                };
+                validate_clamped_residual(&effect, Some(residual))?;
+                (effect, Some(residual))
+            }
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V3, _, None) => {
+                return Err(LedgerEffectDocumentError::Malformed {
+                    message: "version 3 ledger effect document is missing its clamped residual"
+                        .to_owned(),
+                });
+            }
+            (version, _, _) => {
                 return Err(LedgerEffectDocumentError::UnknownVersion { version });
             }
         };
+        let applied = Self {
+            effect,
+            clamped_residual,
+        };
         // Exact decoding: the input must be the canonical encoding of what it
         // decoded to, which rejects extra fields on any variant.
-        if serde_json::to_string(&value).map_err(malformed)? != effect.to_document()? {
+        if serde_json::to_string(&value).map_err(malformed)? != applied.to_document()? {
             return Err(LedgerEffectDocumentError::Malformed {
                 message: "document is not the canonical encoding of its effect".to_owned(),
             });
         }
-        Ok(effect)
+        Ok(applied)
     }
+}
+
+fn corrected_effect(
+    effect: LedgerEffect,
+    correction: IdentityCorrection,
+) -> Result<LedgerEffect, LedgerEffectDocumentError> {
+    if correction.stamped == correction.verified {
+        return Err(LedgerEffectDocumentError::Malformed {
+            message: "ledger identity correction does not change identity".to_owned(),
+        });
+    }
+    if effect.identity().as_ref() != Some(&correction.verified) {
+        return Err(LedgerEffectDocumentError::Malformed {
+            message: "corrected effect identity does not match verified identity".to_owned(),
+        });
+    }
+    Ok(LedgerEffect::Corrected {
+        effect: Box::new(effect),
+        correction,
+    })
+}
+
+fn validate_clamped_residual(
+    effect: &LedgerEffect,
+    clamped_residual: Option<u64>,
+) -> Result<(), LedgerEffectDocumentError> {
+    let Some(residual) = clamped_residual else {
+        return Ok(());
+    };
+    if residual == 0 || residual >= REDEEM_RESIDUAL_LIMIT_ATOMIC {
+        return Err(LedgerEffectDocumentError::Malformed {
+            message: "clamped redeem residual is outside 1..=99 atomic".to_owned(),
+        });
+    }
+    if !matches!(effect.effective(), LedgerEffect::Redeem { .. }) {
+        return Err(LedgerEffectDocumentError::Malformed {
+            message: "clamped residual belongs only to a redeem effect".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn malformed(error: impl std::fmt::Display) -> LedgerEffectDocumentError {
@@ -634,13 +731,18 @@ impl PositionLedger {
     /// Apply a complete reconciled group with checked exact arithmetic.
     pub fn apply(&mut self, mutation: &LedgerMutation) -> Result<(), LedgerError> {
         let mut candidate = self.clone();
-        candidate.apply_in_place(mutation)?;
+        let mut closed_by_residual = HashSet::new();
+        candidate.apply_in_place(mutation, &mut closed_by_residual)?;
         *self = candidate;
         Ok(())
     }
 
-    fn apply_in_place(&mut self, mutation: &LedgerMutation) -> Result<(), LedgerError> {
-        match mutation.effect.effective() {
+    fn apply_in_place(
+        &mut self,
+        mutation: &LedgerMutation,
+        closed_by_residual: &mut HashSet<(MarketId, OutcomeId)>,
+    ) -> Result<AppliedEffect, LedgerError> {
+        let clamped_residual = match mutation.effect.effective() {
             LedgerEffect::Trade {
                 market_id,
                 outcome_id,
@@ -648,8 +750,17 @@ impl PositionLedger {
                 amount,
                 ..
             } => {
+                if *side == Side::Sell
+                    && *amount != ShareAmount::ZERO
+                    && closed_by_residual.contains(&(market_id.clone(), *outcome_id))
+                {
+                    return Err(LedgerError::Underflow {
+                        source_trade_id: mutation.source_trade_id.clone(),
+                    });
+                }
                 let state = self.state_mut(mutation.wallet, market_id, *outcome_id);
-                apply_trade(state, *side, *amount, &mutation.source_trade_id)
+                apply_trade(state, *side, *amount, &mutation.source_trade_id)?;
+                None
             }
             LedgerEffect::Split { market_id, amount } => {
                 for outcome in [OutcomeId(0), OutcomeId(1)] {
@@ -661,36 +772,56 @@ impl PositionLedger {
                             }
                         })?;
                 }
-                Ok(())
+                None
             }
             LedgerEffect::Merge { market_id, amount } => {
-                self.checked_remove_pair(mutation, market_id, *amount)
+                self.checked_remove_pair(mutation, market_id, *amount, closed_by_residual)?;
+                None
             }
             LedgerEffect::Redeem {
                 market_id,
                 outcome_id,
                 amount,
-            } => self.checked_remove(mutation, market_id, *outcome_id, *amount),
-            LedgerEffect::Conversion => Err(LedgerError::Conversion {
-                source_trade_id: mutation.source_trade_id.clone(),
-            }),
-            LedgerEffect::RequiresAnchor | LedgerEffect::RawOnly => Ok(()),
-            LedgerEffect::UnknownEffect => Err(LedgerError::UnknownEffect {
-                source_trade_id: mutation.source_trade_id.clone(),
-            }),
-            LedgerEffect::Corrected { .. } => Ok(()),
-        }
+            } => self.checked_remove_redeem(
+                mutation,
+                market_id,
+                *outcome_id,
+                *amount,
+                closed_by_residual,
+            )?,
+            LedgerEffect::Conversion => {
+                return Err(LedgerError::Conversion {
+                    source_trade_id: mutation.source_trade_id.clone(),
+                });
+            }
+            LedgerEffect::RequiresAnchor | LedgerEffect::RawOnly => None,
+            LedgerEffect::UnknownEffect => {
+                return Err(LedgerError::UnknownEffect {
+                    source_trade_id: mutation.source_trade_id.clone(),
+                });
+            }
+            LedgerEffect::Corrected { .. } => None,
+        };
+        Ok(AppliedEffect {
+            effect: mutation.effect.clone(),
+            clamped_residual,
+        })
     }
 
     /// Apply every group atomically. Any invalid mapping/effect/arithmetic leaves
     /// the original ledger byte-equivalent (#544).
-    pub fn apply_all_or_none(&mut self, mutations: &[LedgerMutation]) -> Result<(), LedgerError> {
+    pub fn apply_all_or_none(
+        &mut self,
+        mutations: &[LedgerMutation],
+    ) -> Result<Vec<AppliedEffect>, LedgerError> {
         let mut candidate = self.clone();
+        let mut closed_by_residual = HashSet::new();
+        let mut applied = Vec::with_capacity(mutations.len());
         for mutation in mutations {
-            candidate.apply_in_place(mutation)?;
+            applied.push(candidate.apply_in_place(mutation, &mut closed_by_residual)?);
         }
         *self = candidate;
-        Ok(())
+        Ok(applied)
     }
 
     fn state_mut(
@@ -717,15 +848,25 @@ impl PositionLedger {
         mutation: &LedgerMutation,
         market_id: &MarketId,
         amount: ShareAmount,
+        closed_by_residual: &HashSet<(MarketId, OutcomeId)>,
     ) -> Result<(), LedgerError> {
+        if amount != ShareAmount::ZERO
+            && [OutcomeId(0), OutcomeId(1)]
+                .into_iter()
+                .any(|outcome| closed_by_residual.contains(&(market_id.clone(), outcome)))
+        {
+            return Err(LedgerError::Underflow {
+                source_trade_id: mutation.source_trade_id.clone(),
+            });
+        }
         let mut candidate = self.clone();
-        candidate.checked_remove(mutation, market_id, OutcomeId(0), amount)?;
-        candidate.checked_remove(mutation, market_id, OutcomeId(1), amount)?;
+        candidate.checked_remove_strict(mutation, market_id, OutcomeId(0), amount)?;
+        candidate.checked_remove_strict(mutation, market_id, OutcomeId(1), amount)?;
         *self = candidate;
         Ok(())
     }
 
-    fn checked_remove(
+    fn checked_remove_strict(
         &mut self,
         mutation: &LedgerMutation,
         market_id: &MarketId,
@@ -741,6 +882,47 @@ impl PositionLedger {
                     source_trade_id: mutation.source_trade_id.clone(),
                 })?;
         Ok(())
+    }
+
+    fn checked_remove_redeem(
+        &mut self,
+        mutation: &LedgerMutation,
+        market_id: &MarketId,
+        outcome_id: OutcomeId,
+        amount: ShareAmount,
+        closed_by_residual: &mut HashSet<(MarketId, OutcomeId)>,
+    ) -> Result<Option<u64>, LedgerError> {
+        let key = (market_id.clone(), outcome_id);
+        if amount != ShareAmount::ZERO && closed_by_residual.contains(&key) {
+            return Err(LedgerError::Underflow {
+                source_trade_id: mutation.source_trade_id.clone(),
+            });
+        }
+        let state = self.state_mut(mutation.wallet, market_id, outcome_id);
+        if amount <= state.long_contracts {
+            state.long_contracts =
+                state
+                    .long_contracts
+                    .checked_sub(amount)
+                    .map_err(|_| LedgerError::Underflow {
+                        source_trade_id: mutation.source_trade_id.clone(),
+                    })?;
+            return Ok(None);
+        }
+        let residual = amount
+            .checked_sub(state.long_contracts)
+            .map_err(|_| LedgerError::Underflow {
+                source_trade_id: mutation.source_trade_id.clone(),
+            })?
+            .atomic();
+        if residual >= REDEEM_RESIDUAL_LIMIT_ATOMIC {
+            return Err(LedgerError::Underflow {
+                source_trade_id: mutation.source_trade_id.clone(),
+            });
+        }
+        state.long_contracts = ShareAmount::ZERO;
+        closed_by_residual.insert(key);
+        Ok(Some(residual))
     }
 
     /// Restore the exact pre-trade state for one `(wallet, market-outcome)` — the
@@ -1080,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn stamped_non_zero_redeem_keeps_exact_arithmetic_and_underflow() {
+    fn stamped_non_zero_redeem_keeps_exact_arithmetic_and_clamps_small_residual() {
         let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let mutation = LedgerMutation::from_activity(&activity_aggregate(
             "REDEEM",
@@ -1111,16 +1293,108 @@ mod tests {
         );
 
         let mut underfunded = ledger_with_longs(w, 50, 20);
-        assert!(matches!(
-            underfunded.apply(&mutation),
-            Err(LedgerError::Underflow { .. })
-        ));
+        underfunded.apply(&mutation).unwrap();
         assert_eq!(
             underfunded.position(&w).unwrap().positions
                 [&MarketOutcomeId::new(market(), OutcomeId(0))]
                 .long_contracts,
-            ShareAmount::from_atomic(50)
+            ShareAmount::ZERO
         );
+    }
+
+    fn redeem_mutation(w: WalletAddress, id: &str, amount: u64) -> LedgerMutation {
+        LedgerMutation {
+            source_trade_id: SourceTradeId(id.to_owned()),
+            transaction_hash: format!("0x{id}"),
+            wallet: w,
+            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            effect: LedgerEffect::Redeem {
+                market_id: market(),
+                outcome_id: OutcomeId(0),
+                amount: ShareAmount::from_atomic(amount),
+            },
+        }
+    }
+
+    #[test]
+    fn incident_redeem_residuals_clamp_and_emit_version_three_documents() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let fixtures = [
+            (1_369_800, 1_369_862, 62),
+            (442_157_700, 442_157_776, 76),
+            (20_338_900, 20_338_982, 82),
+            (6_410_200, 6_410_254, 54),
+            (33_322_200, 33_322_220, 20),
+            (704_934_500, 704_934_540, 40),
+            (65_086_600, 65_086_665, 65),
+        ];
+
+        for (ordinal, (balance, amount, residual)) in fixtures.into_iter().enumerate() {
+            let mut ledger = ledger_with_longs(w, balance, 0);
+            let mutation = redeem_mutation(w, &format!("g2:residual-{ordinal}"), amount);
+            let applied = ledger.apply_all_or_none(&[mutation]).unwrap();
+            assert_eq!(applied.len(), 1);
+            assert_eq!(applied[0].clamped_residual, Some(residual));
+            assert_eq!(
+                ledger.position(&w).unwrap().positions
+                    [&MarketOutcomeId::new(market(), OutcomeId(0))]
+                    .long_contracts,
+                ShareAmount::ZERO
+            );
+            let document = applied[0].to_document().unwrap();
+            let value: Value = serde_json::from_str(&document).unwrap();
+            assert_eq!(value["version"], 3);
+            assert_eq!(value["clamped_residual_atomic"], residual);
+            assert_eq!(AppliedEffect::from_document(&document).unwrap(), applied[0]);
+        }
+    }
+
+    #[test]
+    fn redeem_residual_limit_and_merge_remain_strict() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for residual in [REDEEM_RESIDUAL_LIMIT_ATOMIC, 200] {
+            let mut ledger = ledger_with_longs(w, 1_000, 1_000);
+            let before = ledger.clone();
+            let mutation = redeem_mutation(w, "g2:strict-redeem", 1_000 + residual);
+            assert!(matches!(
+                ledger.apply_all_or_none(&[mutation]),
+                Err(LedgerError::Underflow { .. })
+            ));
+            assert_eq!(ledger.snapshots(), before.snapshots());
+        }
+
+        let mut ledger = ledger_with_longs(w, 1_000, 1_000);
+        let before = ledger.clone();
+        let merge = LedgerMutation {
+            source_trade_id: SourceTradeId("g2:strict-merge".to_owned()),
+            transaction_hash: "0xstrict-merge".to_owned(),
+            wallet: w,
+            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            effect: LedgerEffect::Merge {
+                market_id: market(),
+                amount: ShareAmount::from_atomic(1_001),
+            },
+        };
+        assert!(matches!(
+            ledger.apply_all_or_none(&[merge]),
+            Err(LedgerError::Underflow { .. })
+        ));
+        assert_eq!(ledger.snapshots(), before.snapshots());
+    }
+
+    #[test]
+    fn redeem_residual_tolerance_cannot_stack_within_a_batch() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for amounts in [[190, 20], [20, 190]] {
+            let mut ledger = ledger_with_longs(w, 100, 0);
+            let before = ledger.clone();
+            let mutations = amounts.map(|amount| redeem_mutation(w, "g2:stack", amount));
+            assert!(matches!(
+                ledger.apply_all_or_none(&mutations),
+                Err(LedgerError::Underflow { .. })
+            ));
+            assert_eq!(ledger.snapshots(), before.snapshots());
+        }
     }
 
     #[test]
@@ -1402,6 +1676,30 @@ mod tests {
         assert_eq!(replayed_effect, corrected.effect);
         assert_eq!(replayed_effect.correction(), Some(&expected_correction));
 
+        let corrected_redeem = AppliedEffect {
+            effect: LedgerEffect::Corrected {
+                effect: Box::new(LedgerEffect::Redeem {
+                    market_id: verified.market().clone(),
+                    outcome_id: verified.outcome(),
+                    amount: ShareAmount::from_atomic(1_000),
+                }),
+                correction: expected_correction.clone(),
+            },
+            clamped_residual: Some(42),
+        };
+        let document = corrected_redeem.to_document().unwrap();
+        let value: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["version"], 3);
+        assert_eq!(value["clamped_residual_atomic"], 42);
+        assert_eq!(
+            value["correction"]["verified"]["market"],
+            "0xverified-market"
+        );
+        assert_eq!(
+            AppliedEffect::from_document(&document).unwrap(),
+            corrected_redeem
+        );
+
         let mut replayed = corrected.clone();
         replayed.effect = replayed_effect;
         let mut ledger = PositionLedger::new();
@@ -1431,11 +1729,11 @@ mod tests {
 
     #[test]
     fn effect_document_unknown_version_is_typed() {
-        let document = json!({"effect": {"kind": "raw_only"}, "version": 3});
+        let document = json!({"effect": {"kind": "raw_only"}, "version": 4});
         let error = LedgerEffect::from_document(&document.to_string()).unwrap_err();
         assert_eq!(
             error,
-            LedgerEffectDocumentError::UnknownVersion { version: 3 }
+            LedgerEffectDocumentError::UnknownVersion { version: 4 }
         );
     }
 
@@ -1446,6 +1744,10 @@ mod tests {
             r#"{"effect":{"kind":"trade"},"version":1}"#,
             r#"{"effect":{"kind":"raw_only","market":"extra"},"version":1}"#,
             r#"{"effect":{"kind":"raw_only"},"version":"1"}"#,
+            r#"{"effect":{"amount":1,"kind":"redeem","market":"0xmarket1","outcome":0},"version":3}"#,
+            r#"{"clamped_residual_atomic":0,"effect":{"amount":1,"kind":"redeem","market":"0xmarket1","outcome":0},"version":3}"#,
+            r#"{"clamped_residual_atomic":100,"effect":{"amount":1,"kind":"redeem","market":"0xmarket1","outcome":0},"version":3}"#,
+            r#"{"clamped_residual_atomic":1,"effect":{"kind":"raw_only"},"version":3}"#,
         ] {
             assert!(matches!(
                 LedgerEffect::from_document(document),

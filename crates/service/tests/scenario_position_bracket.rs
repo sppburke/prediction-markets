@@ -22,7 +22,7 @@ use pe_service::position_seeder::{
     is_deferred_causal_position_error, ledger_capture,
 };
 use pe_service::source_event_sink::SourceEventSink;
-use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
+use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer, AnchorRefreshOutcome};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityReadError, ActivityTransport, GAMMA_BATCH_SIZE,
@@ -2120,6 +2120,57 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
 
     preparer.prepare(&[wallet]).await.unwrap();
     assert!(paper.position_validation_current(&wallet).unwrap());
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn periodic_refresh_skips_an_existing_fence_but_genuine_admission_stays_fatal() {
+    let wallet = wallet(0x76);
+    let (dir, paper, _engine) = fresh(&[wallet]);
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO wallet_fences \
+             (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) \
+             VALUES (?1, 'group', 'test', '{}', 1)",
+            [wallet.to_string()],
+        )
+        .unwrap();
+    let (control_tx, _control_rx) = mpsc::channel(1);
+    let preparer = AdmissionPreparer::new(control_tx, Arc::clone(&paper));
+
+    assert_eq!(
+        preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+        AnchorRefreshOutcome::Skipped
+    );
+    assert!(matches!(
+        preparer.prepare(&[wallet]).await.unwrap_err(),
+        AdmissionError::Fenced { fenced: 1 }
+    ));
+}
+
+#[tokio::test]
+async fn periodic_refresh_skips_a_wallet_newly_fenced_inside_the_bracket() {
+    let wallet = wallet(0x77);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let mut underflow_redeem = activity(wallet, 1, "2.000000", "0xrefresh-underflow", 10);
+    underflow_redeem["type"] = json!("REDEEM");
+    let responses = HashMap::from([(
+        activity_url(wallet),
+        vec![serde_json::to_vec(&vec![underflow_redeem]).unwrap()],
+    )]);
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer =
+        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
+
+    assert_eq!(
+        preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+        AnchorRefreshOutcome::Skipped
+    );
+    assert!(paper.is_wallet_fenced(&wallet).unwrap());
     drop(preparer);
     actor.await.unwrap();
 }

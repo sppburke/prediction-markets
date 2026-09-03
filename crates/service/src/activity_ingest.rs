@@ -5,35 +5,35 @@
 //! It parses every frame's activity payloads, normalizes EACH payload exactly
 //! once through the same parser as the REST path
 //! (`parse_activity_trade_observation`), and only then filters on the normalized
-//! wallet against one watchlist snapshot per frame. A parser-accepted row —
-//! watched or not — is the ONLY evidence a reader is alive: the 2026-08-31
+//! wallet against one watchlist snapshot per frame. A parser-accepted unwatched
+//! row, or a watched row delivered to fan-in, is the ONLY evidence a reader is
+//! alive: the 2026-08-31
 //! experiments (#546) showed a connection can stay open and acknowledged while
 //! delivering nothing, so 30 s without one drops the socket and the reader
 //! re-dials after its own backoff while the other readers keep delivering.
 //!
 //! Watched rows travel `(slot, exact raw bytes, normalized trigger)` over ONE
 //! bounded fan-in channel (capacity = the trigger channel's) to the coordinator,
-//! which keeps the pre-#546 order: durable source-log append+sync, then the
-//! bounded reconciliation-trigger channel. Public polling pages enter that
+//! which keeps the pre-#546 order: durable source-log append+sync, then a
+//! best-effort reconciliation-trigger enqueue. Public polling pages enter that
 //! same coordinator through a second bounded input and wait for the same durable
 //! acknowledgement. Reader copies are never coalesced before recording; the
 //! reconciliation owner coalesces their durable obligations per wallet.
 //!
 //! Failure semantics:
-//! - full fan-in or trigger channel → the sender blocks holding its one item
-//!   (`fan_in_blocked` in health) and reads no further wire frame, so
-//!   backpressure reaches the socket; health derives the slot non-live once its
-//!   last row ages past the timeout, the socket is kept, and after the frame
-//!   drains the deadline check drops it before any further read. Nothing is
-//!   deliberately dropped while both downstream receivers are open; a closed
-//!   receiver is orderly shutdown. Owner abort or process failure may discard
-//!   in-memory pre-log work (the declared whole-process boundary; polling and
-//!   #544 own recovery).
+//! - full fan-in → the sender blocks holding its one item (`fan_in_blocked` in
+//!   health) and reads no further wire frame, so backpressure reaches the
+//!   socket. Once delivery succeeds, the fresh post-delivery instant credits
+//!   liveness. A full reconciliation-trigger queue drops only that durable
+//!   obligation and increments the source-health counter; polling and restart
+//!   replay recover it from the source log. A closed receiver is orderly
+//!   shutdown. Owner abort or process failure may discard in-memory pre-log
+//!   work (the declared whole-process boundary; polling and #544 own recovery).
 //! - source-log append/sync failure → the sink poisons and the coordinator
 //!   enters a bounded-backoff reopen/revalidate loop holding the current item,
 //!   blocking delivery from EVERY reader until it durably appends (#530 review
 //!   F4/F1: the observation is retained, never assumed onto REST).
-//! - payload rejected by the normalizer → counted and warned once per frame;
+//! - payload rejected by the normalizer → counted and debug-logged once per frame;
 //!   the REST path parses the same shape with the same converter, so the
 //!   poller either delivers it or freezes the wallet cursor on it (#511).
 //! - reader silence → drop + backoff + re-dial, per slot. `ActivityIngest::run`
@@ -41,6 +41,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -55,11 +56,13 @@ use pe_source_polymarket_public::{
     backoff_secs, parse_activity_frame, parse_activity_trade_observation,
 };
 use time::OffsetDateTime;
+#[cfg(feature = "scenario")]
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::health::{HealthState, ReaderHealth, SharedHealth};
 use crate::live_watchlist::LiveWatchlist;
@@ -146,6 +149,9 @@ pub struct ActivityIngest {
     source_rx: SourceLogReceiver,
     trigger_tx: mpsc::Sender<ReconciliationTrigger>,
     health: SharedHealth,
+    reconciliation_triggers_dropped: Arc<AtomicU64>,
+    #[cfg(feature = "scenario")]
+    reader_append_gate: Option<Arc<Semaphore>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -186,6 +192,9 @@ impl ActivityIngest {
             source_rx,
             trigger_tx,
             health,
+            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "scenario")]
+            reader_append_gate: None,
         }
     }
 
@@ -202,6 +211,9 @@ impl ActivityIngest {
             source_rx,
             trigger_tx,
             health,
+            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "scenario")]
+            reader_append_gate: None,
         }
     }
 
@@ -225,7 +237,23 @@ impl ActivityIngest {
             source_rx,
             trigger_tx,
             health,
+            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            reader_append_gate: None,
         }
+    }
+
+    /// Counter projected into `source_health` by the status writer.
+    #[must_use]
+    pub fn reconciliation_triggers_dropped_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.reconciliation_triggers_dropped)
+    }
+
+    /// Deterministic scenario seam for a delayed reader append/fsync.
+    #[cfg(feature = "scenario")]
+    #[must_use]
+    pub fn with_reader_append_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.reader_append_gate = Some(gate);
+        self
     }
 
     /// Run until the trigger channel closes (service shutdown).
@@ -283,6 +311,9 @@ impl ActivityIngest {
                 health: self.health,
                 fan_in: fan_in_rx,
                 source_rx: self.source_rx.rx,
+                reconciliation_triggers_dropped: self.reconciliation_triggers_dropped,
+                #[cfg(feature = "scenario")]
+                reader_append_gate: self.reader_append_gate,
             }
             .run()
             .await;
@@ -418,8 +449,8 @@ impl Reader {
     }
 
     /// Parse one text frame received at `now`, normalize every payload once,
-    /// refresh liveness on the first accepted payload, and deliver the watched
-    /// rows in order.
+    /// credit unwatched liveness immediately, and deliver watched rows in order
+    /// before crediting them from one fresh post-processing instant.
     async fn on_frame(
         &mut self,
         text: &str,
@@ -463,18 +494,8 @@ impl Reader {
                 }
             };
             normalized += 1;
-            if normalized == 1 {
-                // Parser acceptance — watched or not — is the liveness and
-                // backoff-progress signal; acknowledgements and rejected payloads
-                // never are (#546).
-                *deadline = now + activity_timeout();
-                backoff.on_normalized_row();
-                self.set_health(|r| {
-                    r.last_normalized_activity_at = Some(now);
-                    r.consecutive_reconnects = 0;
-                });
-            }
             if !watched.contains(&activity.wallet) {
+                self.credit_liveness(deadline, backoff);
                 continue;
             }
             self.deliver(Observation {
@@ -489,13 +510,14 @@ impl Reader {
                 },
             })
             .await?;
+            self.credit_liveness(deadline, backoff);
         }
         self.set_health(|r| {
             r.normalized_activity_rows_total =
                 r.normalized_activity_rows_total.saturating_add(normalized);
         });
         if rejected > 0 {
-            warn!(
+            debug!(
                 slot = self.slot,
                 rejected,
                 normalized,
@@ -504,6 +526,16 @@ impl Reader {
             );
         }
         Ok(())
+    }
+
+    fn credit_liveness(&self, deadline: &mut Instant, backoff: &mut ReconnectBackoff) {
+        let now = Instant::now();
+        *deadline = now + activity_timeout();
+        backoff.on_normalized_row();
+        self.set_health(|r| {
+            r.last_normalized_activity_at = Some(now);
+            r.consecutive_reconnects = 0;
+        });
     }
 
     /// Hand one watched observation to the coordinator. A full channel blocks
@@ -541,6 +573,9 @@ struct Coordinator {
     health: SharedHealth,
     fan_in: mpsc::Receiver<Observation>,
     source_rx: mpsc::Receiver<SourceLogRequest>,
+    reconciliation_triggers_dropped: Arc<AtomicU64>,
+    #[cfg(feature = "scenario")]
+    reader_append_gate: Option<Arc<Semaphore>>,
 }
 
 impl Coordinator {
@@ -567,6 +602,13 @@ impl Coordinator {
             };
             match input {
                 Input::Reader(observation) => {
+                    #[cfg(feature = "scenario")]
+                    if let Some(gate) = &self.reader_append_gate {
+                        let Ok(permit) = gate.acquire().await else {
+                            return;
+                        };
+                        permit.forget();
+                    }
                     let envelope = EnvelopeIn {
                         source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_string()),
                         schema_version: ACTIVITY_SCHEMA_VERSION,
@@ -585,10 +627,15 @@ impl Coordinator {
                     {
                         return;
                     }
-                    // Bounded channel: a full queue blocks here → the fan-in fills →
-                    // readers block on their sockets. Trigger delivery always follows sync.
-                    if self.trigger_tx.send(observation.trigger).await.is_err() {
-                        return;
+                    // Trigger delivery follows sync. A full queue drops only this
+                    // durable obligation; polling and restart replay recover it.
+                    match self.trigger_tx.try_send(observation.trigger) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            self.reconciliation_triggers_dropped
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(TrySendError::Closed(_)) => return,
                     }
                 }
                 Input::Source(request) => {
@@ -754,6 +801,9 @@ mod tests {
                 health: health.clone(),
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
+                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                #[cfg(feature = "scenario")]
+                reader_append_gate: None,
             }
             .run(),
         );
@@ -821,6 +871,9 @@ mod tests {
                 health: health.clone(),
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
+                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                #[cfg(feature = "scenario")]
+                reader_append_gate: None,
             }
             .run(),
         );
@@ -868,6 +921,70 @@ mod tests {
         assert_eq!(ids, vec!["0xa".to_string(), "0xb".to_string()]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn full_trigger_queue_drops_obligation_and_releases_poll_page_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = SourceEventSink::open(dir.path().join("source.log")).unwrap();
+        sink.fail_next_append();
+        let (fan_in_tx, fan_in_rx) = mpsc::channel(1);
+        let (trigger_tx, mut trigger_rx) = mpsc::channel(1);
+        let (source_log, source_rx) = SourceLogHandle::channel(1);
+        let health = new_shared_health_with_ws(false, true, 90);
+        let dropped = Arc::new(AtomicU64::new(0));
+        trigger_tx
+            .try_send(observation("0xqueued").trigger)
+            .unwrap();
+        let task = tokio::spawn(
+            Coordinator {
+                sink,
+                trigger_tx,
+                health: health.clone(),
+                fan_in: fan_in_rx,
+                source_rx: source_rx.rx,
+                reconciliation_triggers_dropped: Arc::clone(&dropped),
+                #[cfg(feature = "scenario")]
+                reader_append_gate: None,
+            }
+            .run(),
+        );
+        fan_in_tx.send(observation("0xreader")).await.unwrap();
+        settle().await;
+        assert!(health.lock().unwrap().ws_sink_poisoned);
+
+        let poll_page = observation("0xpoll");
+        let appending = tokio::spawn({
+            let source_log = source_log.clone();
+            async move {
+                source_log
+                    .append(EnvelopeIn {
+                        source_id: SourceId("poll-test".to_owned()),
+                        schema_version: 1,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(poll_page.trigger.source_time),
+                        received_at: ReceivedAt(poll_page.trigger.received_at),
+                        content_type: ContentType::Json,
+                        payload: poll_page.payload,
+                    })
+                    .await
+            }
+        });
+        settle().await;
+        assert!(!appending.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(appending.await.unwrap().unwrap(), EventSeq(1));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            trigger_rx.try_recv().unwrap().source_trade_id,
+            observation("0xqueued").trigger.source_trade_id
+        );
+
+        drop(source_log);
+        drop(fan_in_tx);
+        task.await.unwrap();
+    }
+
     /// A receiver closed before the coordinator runs wins over buffered fan-in
     /// work: nothing is appended for a destination that no longer exists.
     #[tokio::test(start_paused = true)]
@@ -886,6 +1003,9 @@ mod tests {
             health: new_shared_health_with_ws(false, true, 90),
             fan_in: fan_in_rx,
             source_rx: source_rx.rx,
+            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "scenario")]
+            reader_append_gate: None,
         }
         .run()
         .await;
@@ -909,6 +1029,9 @@ mod tests {
                 health,
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
+                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                #[cfg(feature = "scenario")]
+                reader_append_gate: None,
             }
             .run(),
         );
