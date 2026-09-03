@@ -286,7 +286,7 @@ impl SupabaseStateClient {
         );
         let rows: Vec<BankrollRow> = self.get_json(&url).await?;
         rows.first()
-            .map(|r| bankroll_money(r.bankroll_str.trim(), "paper_bankroll bankroll_str"))
+            .map(|r| bankroll_money(&r.bankroll_str, "paper_bankroll bankroll_str"))
             .transpose()
     }
 
@@ -433,27 +433,43 @@ fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
 }
 
 /// The stored bankroll is Postgres `numeric` text whose scale grows with every fill
-/// (`3729.7323088775297327030000000060` on 2026-09-02); `Decimal` holds 28 significant
-/// digits. Accept only plain unsigned decimal text (no sign, exponent, or other bytes),
-/// drop fractional digits beyond the 28th significant digit (below 1e-24 USD), then
-/// parse exactly. Everything else fails closed like `money`.
+/// (`3729.7323088775297327030000000060` on 2026-09-02), while `Decimal` holds at most
+/// 28 fractional digits. Grammar is canonical and unsigned: `digits` or `digits.digits`
+/// with nothing else. A value the exact parser accepts is returned unchanged; only an
+/// exact-parse failure caused by excess fractional precision (`Underflow`) falls back
+/// to dropping fractional digits beyond the 28th significant digit (below 1e-24 USD),
+/// and a nonzero value that would truncate to zero fails closed like every other input.
 fn bankroll_money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
-    let corrupt = || SupabaseStateError::Corrupt(format!("{what}: {raw:?}"));
-    let (integer, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    let corrupt = |detail: &str| SupabaseStateError::Corrupt(format!("{what}: {raw:?}: {detail}"));
+    let (integer, fraction) = match raw.split_once('.') {
+        Some((integer, fraction)) if !fraction.is_empty() => (integer, fraction),
+        Some(_) => return Err(corrupt("trailing decimal point")),
+        None => (raw, ""),
+    };
     if integer.is_empty()
         || !integer.bytes().all(|b| b.is_ascii_digit())
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
-        return Err(corrupt());
+        return Err(corrupt("not plain unsigned decimal text"));
     }
-    let integer_digits = integer.trim_start_matches('0').len();
-    let keep = 28usize.saturating_sub(integer_digits).min(fraction.len());
-    let normalized = if keep < fraction.len() {
-        format!("{integer}.{}", &fraction[..keep])
-    } else {
-        raw.to_owned()
-    };
-    Decimal::from_str_exact(&normalized).map_err(|_| corrupt())
+    match Decimal::from_str_exact(raw) {
+        Ok(exact) => Ok(exact),
+        Err(rust_decimal::Error::Underflow) => {
+            let integer_digits = integer.trim_start_matches('0').len();
+            let keep = 28usize.saturating_sub(integer_digits).min(fraction.len());
+            if keep == 0 {
+                return Err(corrupt("integer part leaves no representable fraction"));
+            }
+            let normalized = format!("{integer}.{}", &fraction[..keep]);
+            let truncated = Decimal::from_str_exact(&normalized)
+                .map_err(|e| corrupt(&format!("excess precision fallback: {e}")))?;
+            if truncated.is_zero() && fraction.bytes().any(|b| b != b'0') {
+                return Err(corrupt("nonzero value below representable precision"));
+            }
+            Ok(truncated)
+        }
+        Err(e) => Err(corrupt(&e.to_string())),
+    }
 }
 
 fn canonical_fill(row: FillV2RowJson) -> Result<CanonicalFill, SupabaseStateError> {
@@ -1116,23 +1132,49 @@ mod tests {
     }
 
     #[test]
-    fn bankroll_text_truncates_postgres_scale_noise_and_fails_closed_otherwise() {
+    fn bankroll_text_is_exact_when_representable_and_truncates_only_excess_precision() {
         // Live `paper_bankroll.bankroll_str` on 2026-09-02 (32 significant digits).
         let live = "3729.7323088775297327030000000060";
-        let parsed = super::bankroll_money(live, "bankroll").unwrap();
-        assert_eq!(parsed.to_string(), "3729.732308877529732703000000");
         assert_eq!(
-            super::bankroll_money("4422.242308877529732703", "bankroll")
-                .unwrap()
-                .to_string(),
-            "4422.242308877529732703"
+            super::bankroll_money(live, "bankroll").unwrap().to_string(),
+            "3729.732308877529732703000000"
         );
-        assert!(super::bankroll_money("3729.7323088775297327030000000060x", "bankroll").is_err());
-        assert!(super::bankroll_money("-0.00000000000000000000000000001", "bankroll").is_err());
-        assert!(super::bankroll_money("-1", "bankroll").is_err());
-        assert!(super::bankroll_money("1e5", "bankroll").is_err());
-        assert!(super::bankroll_money("", "bankroll").is_err());
-        assert!(super::bankroll_money(".5", "bankroll").is_err());
+        // Exactly representable inputs are returned unchanged, including the maximum.
+        for exact in [
+            "4422.242308877529732703",
+            "3729.73",
+            "0",
+            "7.9228162514264337593543950335",
+            "79228162514264337593543950335",
+        ] {
+            assert_eq!(
+                super::bankroll_money(exact, "bankroll")
+                    .unwrap()
+                    .to_string(),
+                exact
+            );
+        }
+        // Fail closed: garbage, signs, exponent, grammar, whitespace, underflow, overflow.
+        for bad in [
+            "3729.7323088775297327030000000060x",
+            "-0.00000000000000000000000000001",
+            "-1",
+            "+1",
+            "1e5",
+            "",
+            ".5",
+            "1.",
+            " 1 ",
+            "1_000",
+            "0.0000000000000000000000000001", // 1e-28 fits; 1e-29 below must fail
+        ]
+        .into_iter()
+        .filter(|s| *s != "0.0000000000000000000000000001")
+        {
+            assert!(super::bankroll_money(bad, "bankroll").is_err(), "{bad:?}");
+        }
+        assert!(super::bankroll_money("0.00000000000000000000000000001", "bankroll").is_err());
+        assert!(super::bankroll_money("79228162514264337593543950335.9", "bankroll").is_err());
         // Exact money parsing is unchanged for every other field.
         assert!(super::money(live, "credit").is_err());
         assert!(super::money("-1", "credit").is_err());
