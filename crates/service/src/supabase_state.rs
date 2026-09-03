@@ -437,8 +437,10 @@ fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
 /// 28 fractional digits. Grammar is canonical and unsigned: `digits` or `digits.digits`
 /// with nothing else. A value the exact parser accepts is returned unchanged; only an
 /// exact-parse failure caused by excess fractional precision (`Underflow`) falls back
-/// to dropping fractional digits beyond the 28th significant digit (below 1e-24 USD),
-/// and a nonzero value that would truncate to zero fails closed like every other input.
+/// to dropping fractional digits beyond the 28th significant digit, and only when every
+/// dropped digit within the first 24 fractional positions is zero (so the loss is below
+/// 1e-24 USD at any magnitude); a nonzero value that would truncate to zero fails closed
+/// like every other input.
 fn bankroll_money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
     let corrupt = |detail: &str| SupabaseStateError::Corrupt(format!("{what}: {raw:?}: {detail}"));
     let (integer, fraction) = match raw.split_once('.') {
@@ -459,6 +461,15 @@ fn bankroll_money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStat
             let keep = 28usize.saturating_sub(integer_digits).min(fraction.len());
             if keep == 0 {
                 return Err(corrupt("integer part leaves no representable fraction"));
+            }
+            // Only digits beyond the 24th fractional position may be dropped (the
+            // documented bound of 1e-24 USD); a larger integer part shrinks `keep`,
+            // so any nonzero digit between `keep` and position 24 fails closed.
+            let guard_end = fraction.len().min(24);
+            if keep < guard_end && fraction[keep..guard_end].bytes().any(|b| b != b'0') {
+                return Err(corrupt(
+                    "nonzero digit dropped within the first 24 fractional positions",
+                ));
             }
             let normalized = format!("{integer}.{}", &fraction[..keep]);
             let truncated = Decimal::from_str_exact(&normalized)
@@ -1175,6 +1186,26 @@ mod tests {
         }
         assert!(super::bankroll_money("0.00000000000000000000000000001", "bankroll").is_err());
         assert!(super::bankroll_money("79228162514264337593543950335.9", "bankroll").is_err());
+        // The loss bound holds at any magnitude: a five-digit integer part keeps 23
+        // fractional digits, so a nonzero 24th digit fails closed, while over-precision
+        // beyond the 24th position is still dropped.
+        assert_eq!(
+            super::bankroll_money("3.12345678901234567890123456789", "bankroll")
+                .unwrap()
+                .to_string(),
+            "3.123456789012345678901234567"
+        );
+        assert!(super::bankroll_money("12345.1234567890123456789012345", "bankroll").is_err());
+        assert_eq!(
+            super::bankroll_money("123456.12345678901234567890120000001", "bankroll")
+                .unwrap()
+                .to_string(),
+            "123456.1234567890123456789012"
+        );
+        assert!(
+            super::bankroll_money("123456789012345678901234567.10000000000001", "bankroll")
+                .is_err()
+        );
         // Exact money parsing is unchanged for every other field.
         assert!(super::money(live, "credit").is_err());
         assert!(super::money("-1", "credit").is_err());
