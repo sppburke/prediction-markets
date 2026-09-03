@@ -219,6 +219,14 @@ case "$action" in
       if [[ "$prefix" == service ]]; then start_service; else write_bit forge.active true; fi
     fi
     ;;
+  cat)
+    if [[ -f "$state/service.unit-file" ]]; then
+      cat "$state/service.unit-file"
+    else
+      printf '%s\n' "[Service]" "User=sean" "WorkingDirectory=$root/prediction-markets" \
+        "ExecStart=/bin/bash -c 'set -a; source $root/prediction-markets/.env; set +a; exec $root/prediction-markets/target/release/pe-service smoke-test/service.toml'"
+    fi
+    ;;
   show)
     if [[ "$*" == *InvocationID* ]]; then
       if [[ -e "$state/invocation-changed" ]]; then echo invocation-test-2; else echo invocation-test-1; fi
@@ -226,18 +234,6 @@ case "$action" in
       echo 2033-05-18T03:33:19Z
     elif [[ "$*" == *WorkingDirectory* ]]; then
       echo "$root/prediction-markets"
-    elif [[ "$*" == *ExecStart* ]]; then
-      if [[ -f "$state/service.exec-start" ]]; then
-        cat "$state/service.exec-start"
-      else
-        echo "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source $root/prediction-markets/.env; set +a; exec $root/prediction-markets/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }"
-      fi
-    elif [[ "$*" == *EnvironmentFiles* ]]; then
-      if [[ -f "$state/service.environment-files" ]]; then
-        cat "$state/service.environment-files"
-      else
-        echo "$root/prediction-markets/.env (ignore_errors=no)"
-      fi
     else
       echo 1234
     fi
@@ -491,74 +487,45 @@ rm "$hold"
 wait "$holder"
 assert_verified "$root"
 
-# Unit ownership: the documented wrapper (default fixture) is accepted; the direct shape with EnvironmentFiles is accepted.
-root=$(make_case unit-config-direct-argv)
+# Unit ownership is proved from the unit file text: the documented wrapper (default) and the direct shape with EnvironmentFile=.
+root=$(make_case unit-direct-with-environment-file)
 service="$root/prediction-markets"
-printf "{ path=%s/target/release/pe-service ; argv[]=%s/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }\n" \
-  "$service" "$service" > "$root/test-state/service.exec-start"
-printf "path=%s/.env ; ignore_errors=no\n" "$service" > "$root/test-state/service.environment-files"
+printf '%s\n' "[Service]" "WorkingDirectory=$service" "EnvironmentFile=$service/.env" \
+  "ExecStart=$service/target/release/pe-service smoke-test/service.toml" > "$root/test-state/service.unit-file"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
-refuse_unit_shape() {
-  local name=$1 exec_start=$2
+refuse_unit_file() {
+  local name=$1 exec_line=$2 extra=${3-}
   local root service
   root=$(make_case "$name")
   service="$root/prediction-markets"
-  printf '%s\n' "${exec_start//@SVC@/$service}" > "$root/test-state/service.exec-start"
+  { printf '%s\n' "[Service]" "WorkingDirectory=$service"; [[ -n "$extra" ]] && printf '%s\n' "${extra//@SVC@/$service}"; printf '%s\n' "${exec_line//@SVC@/$service}"; } > "$root/test-state/service.unit-file"
   set +e
   activate "$root" activation-557 >"$root/unit-shape.out" 2>"$root/unit-shape.err"
   local rc=$?
   set -e
-  [[ "$rc" == 1 ]] || fail "$name: ExecStart shape was accepted"
+  [[ "$rc" == 1 ]] || fail "$name: unit ExecStart shape was accepted"
   grep -q 'does not select the installed binary and service config' "$root/unit-shape.err" ||
     fail "$name: refusal was not explicit"
   [[ ! -e "$root/pe-activation.json" ]] || fail "$name: shape was adopted into a manifest"
   assert_deploy_lock_unchanged "$root"
 }
-# Every deviation from the two exact templates is refused: extra tokens, comments, attached hashes,
-# a backup env in the wrapper, a different binary, a subshell, a shell wrapper of any other content.
-refuse_unit_shape unit-wrapper-comment-backup "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml # @SVC@/smoke-test/service.toml.backup ; ignore_errors=no }"
-refuse_unit_shape unit-wrapper-backup-config "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml.backup ; ignore_errors=no }"
-refuse_unit_shape unit-wrapper-attached-hash "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml#backup ; ignore_errors=no }"
-refuse_unit_shape unit-wrapper-backup-env "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env.backup; set +a; exec @SVC@/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }"
-refuse_unit_shape unit-wrapper-command-in-comment "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source @SVC@/.env; set +a; exec /tmp/not-pe-service # exec @SVC@/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }"
-refuse_unit_shape unit-wrapper-quoted-hash "{ path=/bin/bash ; argv[]=/bin/bash -c false && exec @SVC@/target/release/pe-service smoke-test/service.toml; printf '%s' '#'; exec @SVC@/target/release/pe-service smoke-test/service.toml.backup ; ignore_errors=no }"
-refuse_unit_shape unit-wrapper-subshell "{ path=/bin/bash ; argv[]=/bin/bash -c (exec @SVC@/target/release/pe-service smoke-test/service.toml) ; ignore_errors=no }"
-refuse_unit_shape unit-direct-three-tokens "{ path=@SVC@/target/release/pe-service ; argv[]=@SVC@/target/release/pe-service smoke-test/service.toml extra ; ignore_errors=no }"
-refuse_unit_shape unit-direct-other-binary "{ path=/tmp/other ; argv[]=/tmp/other smoke-test/service.toml ; ignore_errors=no }"
-
-# The direct shape needs EnvironmentFiles to own the environment; an empty EnvironmentFiles is refused.
-root=$(make_case unit-direct-no-environment-files)
-service="$root/prediction-markets"
-printf "{ path=%s/target/release/pe-service ; argv[]=%s/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }\n" \
-  "$service" "$service" > "$root/test-state/service.exec-start"
-: > "$root/test-state/service.environment-files"
-set +e
-activate "$root" activation-557 >"$root/unit-env.out" 2>"$root/unit-env.err"
-rc=$?
-set -e
-[[ "$rc" == 1 ]] || fail "direct shape without EnvironmentFiles was accepted"
-grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit-env.err" ||
-  fail "EnvironmentFiles role refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "direct shape without environment was adopted into a manifest"
-assert_deploy_lock_unchanged "$root"
-
-# An attached "#" is literal in EnvironmentFiles too: .env#backup is not .env (direct shape).
-root=$(make_case unit-environment-attached-hash)
-service="$root/prediction-markets"
-printf "{ path=%s/target/release/pe-service ; argv[]=%s/target/release/pe-service smoke-test/service.toml ; ignore_errors=no }\n" \
-  "$service" "$service" > "$root/test-state/service.exec-start"
-printf "path=%s/.env#backup ; ignore_errors=no\n" "$service" > "$root/test-state/service.environment-files"
-set +e
-activate "$root" activation-557 >"$root/unit-env-hash.out" 2>"$root/unit-env-hash.err"
-rc=$?
-set -e
-[[ "$rc" == 1 ]] || fail "attached-hash environment path was accepted"
-grep -q 'EnvironmentFiles does not select the installed environment' "$root/unit-env-hash.err" ||
-  fail "attached-hash environment refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "attached-hash environment was adopted into a manifest"
-assert_deploy_lock_unchanged "$root"
+# Every deviation from the two exact templates is refused.
+refuse_unit_file unit-wrapper-comment-backup "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml # @SVC@/smoke-test/service.toml.backup'"
+refuse_unit_file unit-wrapper-backup-config "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml.backup'"
+refuse_unit_file unit-wrapper-attached-hash "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml#backup'"
+refuse_unit_file unit-wrapper-backup-env "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env.backup; set +a; exec @SVC@/target/release/pe-service smoke-test/service.toml'"
+refuse_unit_file unit-wrapper-command-in-comment "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec /tmp/not-pe-service # exec @SVC@/target/release/pe-service smoke-test/service.toml'"
+refuse_unit_file unit-wrapper-quoted-hash "ExecStart=/bin/bash -c 'false && exec @SVC@/target/release/pe-service smoke-test/service.toml; printf \"%s\" \"#\"; exec @SVC@/target/release/pe-service smoke-test/service.toml.backup'"
+refuse_unit_file unit-wrapper-subshell "ExecStart=/bin/bash -c '(exec @SVC@/target/release/pe-service smoke-test/service.toml)'"
+refuse_unit_file unit-wrapper-unquoted "ExecStart=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service smoke-test/service.toml"
+refuse_unit_file unit-wrapper-split-config "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service' smoke-test/service.toml"
+refuse_unit_file unit-direct-three-tokens "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml extra" "EnvironmentFile=@SVC@/.env"
+refuse_unit_file unit-direct-other-binary "ExecStart=/tmp/other smoke-test/service.toml" "EnvironmentFile=@SVC@/.env"
+refuse_unit_file unit-direct-no-environment-file "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml"
+refuse_unit_file unit-direct-environment-attached-hash "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "EnvironmentFile=@SVC@/.env#backup"
+refuse_unit_file unit-two-exec-start-lines "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart=')"
 
 # A different id is rejected while durable state is non-terminal.
 root=$(make_case different-id)

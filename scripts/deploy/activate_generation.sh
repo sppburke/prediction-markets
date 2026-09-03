@@ -154,81 +154,73 @@ effective_path() {
   absolute_from_root "$value"
 }
 
-unit_environment_has_exact_path() {
-  local expected=$1 environment_files=$2
-  python3 -c 'import shlex,sys
-expected,value=sys.argv[1:]
-lexer=shlex.shlex(value, posix=True, punctuation_chars=";&|(){}")
-lexer.whitespace_split=True
-lexer.commenters=""  # systemd values are structured: an attached "#" is literal, never a comment
-for token in lexer:
-    if token.startswith("path="):
-        token=token.removeprefix("path=")
-    token=token.removesuffix(";")
-    if token.startswith("-/"):
-        token=token[1:]
-    if token == expected:
-        raise SystemExit(0)
-raise SystemExit(1)' "$expected" "$environment_files"
-}
-
-unit_exec_selects_service() {
-  # Exactly two documented unit shapes are accepted, by exact template on systemd's rendered argv[]
-  # (systemd renders the elements space-joined, unquoted) — nothing is interpreted:
-  #   direct : argv[]=<binary> <config>
-  #   wrapper: argv[]=/bin/bash -c set -a; source <env>; set +a; exec <binary> <config>      (docs/35)
-  # Prints "direct" or "wrapper" on success. Any other rendering is refused.
-  local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 exec_start=$5
+unit_file_selects_service() {
+  # Ownership of what the unit WILL run at restart, proved from the unit file text (`systemctl cat`),
+  # where the wrapper script is quoted and therefore lossless. Exactly two documented shapes, by exact
+  # template — nothing is interpreted:
+  #   wrapper: ExecStart=/bin/bash -c 'set -a; source <env>; set +a; exec <binary> <config>'   (docs/35)
+  #   direct : ExecStart=<binary> <config>   plus   EnvironmentFile=<env>
+  # Prints "direct" or "wrapper" on success; any other ExecStart line is refused.
+  local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 unit_text=$5
   python3 -c 'import os,re,sys
-expected_binary,expected_config,expected_env,working,value=sys.argv[1:]
-marker="argv[]="
-if marker not in value:
-    raise SystemExit(1)
-argv=value.split(marker,1)[1]
-metadata=re.search(r"\s;\s(?:ignore_errors|start_time|stop_time|pid|code|status)=", argv)
-if metadata:
-    argv=argv[:metadata.start()]
-argv=argv.strip()
+expected_binary,expected_config,expected_env,working,text=sys.argv[1:]
 def norm(path):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
-direct=re.fullmatch(r"(\S+) (\S+)", argv)
-if direct:
-    binary,config=direct.groups()
-    if binary == expected_binary and norm(config) == os.path.normpath(expected_config):
-        print("direct"); raise SystemExit(0)
+exec_lines=[line.strip() for line in text.splitlines() if line.strip().startswith("ExecStart=")]
+if len(exec_lines) != 1:
     raise SystemExit(1)
-wrapper=re.fullmatch(r"/bin/bash -c set -a; source (\S+); set \+a; exec (\S+) (\S+)", argv)
+line=exec_lines[0]
+wrapper=re.fullmatch(r"ExecStart=/bin/bash -c \x27set -a; source (\S+); set \+a; exec (\S+) (\S+)\x27", line)
 if wrapper:
     env,binary,config=wrapper.groups()
     if norm(env) == os.path.normpath(expected_env) and binary == expected_binary and norm(config) == os.path.normpath(expected_config):
         print("wrapper"); raise SystemExit(0)
+    raise SystemExit(1)
+direct=re.fullmatch(r"ExecStart=(\S+) (\S+)", line)
+if direct:
+    binary,config=direct.groups()
+    env_lines=[l.strip() for l in text.splitlines() if l.strip().startswith("EnvironmentFile=")]
+    envs=[norm(l.split("=",1)[1].lstrip("-")) for l in env_lines]
+    if binary == expected_binary and norm(config) == os.path.normpath(expected_config) and envs == [os.path.normpath(expected_env)]:
+        print("direct"); raise SystemExit(0)
 raise SystemExit(1)' \
-    "$expected_binary" "$expected_config" "$expected_env" "$working" "$exec_start"
+    "$expected_binary" "$expected_config" "$expected_env" "$working" "$unit_text"
+}
+
+process_runs_service() {
+  # Ownership of what runs NOW, from the process itself: argv exactly `<binary> <config>` (NUL-split,
+  # lossless) and the executable hash equal to the installed binary.
+  local expected_binary=$1 expected_config=$2 working=$3 pid=$4
+  python3 -c 'import os,sys
+expected_binary,expected_config,working,pid=sys.argv[1:]
+with open("/proc/%s/cmdline" % pid, "rb") as handle:
+    argv=[part.decode() for part in handle.read().split(b"\0") if part]
+def norm(path):
+    return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
+raise SystemExit(0 if len(argv) == 2 and argv[0] == expected_binary and norm(argv[1]) == os.path.normpath(expected_config) else 1)' \
+    "$expected_binary" "$expected_config" "$working" "$pid"
 }
 
 verify_installed_unit_owner() {
-  local working exec_start environment_files pid running
+  local working pid running
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
     die "one or more installed service artifacts are absent"
   [[ "$(systemctl_active pe-service)" == true ]] || die "installed pe-service is not active"
   working=$(systemctl show pe-service -p WorkingDirectory --value)
   [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
     die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
-  exec_start=$(systemctl show pe-service -p ExecStart --value)
-  environment_files=$(systemctl show pe-service -p EnvironmentFiles --value)
-  local shape
-  shape=$(unit_exec_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$exec_start") ||
+  local unit_text
+  unit_text=$(systemctl cat pe-service)
+  unit_file_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$unit_text" > /dev/null ||
     die "pe-service ExecStart does not select the installed binary and service config"
-  if [[ "$shape" == direct ]]; then
-    unit_environment_has_exact_path "$SERVICE_ENV" "$environment_files" ||
-      die "pe-service EnvironmentFiles does not select the installed environment"
-  fi
   if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
     pid=$(systemctl show pe-service -p MainPID --value)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
     running=$(sha256_file "/proc/$pid/exe")
     [[ "$running" == "$(sha256_file "$SERVICE_BINARY")" ]] ||
       die "running pe-service is not the installed binary"
+    process_runs_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$working" "$pid" ||
+      die "running pe-service argv is not the installed binary and service config"
   fi
 }
 
