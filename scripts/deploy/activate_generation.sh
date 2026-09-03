@@ -5,6 +5,7 @@ set -euo pipefail
 
 # shellcheck source=generation_common.sh
 source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+umask 077
 
 usage() {
   cat >&2 <<'EOF'
@@ -13,7 +14,7 @@ usage: activate_generation.sh [--dry-run] [--simulate-crash-after BOUNDARY]
   --legacy-history PATH --staged-binary PATH --config-template PATH
   --rehearsal-env PATH --service-env PATH --merge-commit SHA
   --bind ADDR --rehearsal-bind ADDR --bankroll DECIMAL
-  [--approve-due-subset COUNT]
+  [--approve-due-subset COUNT] [--site-confirmed]
 EOF
   exit 2
 }
@@ -32,6 +33,7 @@ production_bind=
 rehearsal_bind=
 bankroll=
 approved_due_subset=
+site_confirmed=false
 while (($#)); do
   case "$1" in
     --dry-run) dry_run=true; shift ;;
@@ -49,6 +51,7 @@ while (($#)); do
     --rehearsal-bind) [[ $# -ge 2 ]] || usage; rehearsal_bind=$2; shift 2 ;;
     --bankroll) [[ $# -ge 2 ]] || usage; bankroll=$2; shift 2 ;;
     --approve-due-subset) [[ $# -ge 2 ]] || usage; approved_due_subset=$2; shift 2 ;;
+    --site-confirmed) site_confirmed=true; shift ;;
     *) usage ;;
   esac
 done
@@ -71,7 +74,7 @@ config_template=$(realpath "$config_template")
 rehearsal_env_template=$(realpath "$rehearsal_env_template")
 service_env_template=$(realpath "$service_env_template")
 
-[[ "$generation_dir" == "$DEPLOY_HOME"/gen/* ]] || die "generation must be beneath $DEPLOY_HOME/gen"
+[[ "$generation_dir" == "$SERVICE_ROOT"/gen/* ]] || die "generation must be beneath $SERVICE_ROOT/gen"
 
 if [[ "$dry_run" == true ]]; then
   cat <<EOF
@@ -132,11 +135,33 @@ absolute_from_root() {
 }
 
 effective_path() {
-  local env_name=$1 toml_name=$2 fallback=$3 value
-  value=$(env_value "$service_env_template" "$env_name")
-  [[ -n "$value" ]] || value=$(toml_value "$config_template" "$toml_name")
+  local env_file=$1 config_file=$2 env_name=$3 toml_name=$4 fallback=$5 value
+  value=$(env_value "$env_file" "$env_name")
+  [[ -n "$value" ]] || value=$(toml_value "$config_file" "$toml_name")
   [[ -n "$value" ]] || value=$fallback
   absolute_from_root "$value"
+}
+
+verify_installed_unit_owner() {
+  local working exec_start pid running
+  [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
+    die "one or more installed service artifacts are absent"
+  [[ "$(systemctl_active pe-service)" == true ]] || die "installed pe-service is not active"
+  working=$(systemctl show pe-service -p WorkingDirectory --value)
+  [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
+    die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
+  exec_start=$(systemctl show pe-service -p ExecStart --value)
+  [[ "$exec_start" == *"$SERVICE_ENV"* && "$exec_start" == *"$SERVICE_BINARY"* ]] ||
+    die "pe-service ExecStart does not source the installed environment and binary"
+  [[ "$exec_start" == *"$SERVICE_CONFIG"* || "$exec_start" == *"smoke-test/service.toml"* ]] ||
+    die "pe-service ExecStart does not select the installed service config"
+  if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
+    pid=$(systemctl show pe-service -p MainPID --value)
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
+    running=$(sha256_file "/proc/$pid/exe")
+    [[ "$running" == "$(sha256_file "$SERVICE_BINARY")" ]] ||
+      die "running pe-service is not the installed binary"
+  fi
 }
 
 render_config() {
@@ -167,6 +192,10 @@ with open(tmp,"w",encoding="utf-8") as handle:
     handle.write(text)
     handle.flush(); os.fsync(handle.fileno())
 os.replace(tmp,destination)' "$source" "$destination" "$bind" "$generation_dir"
+  python3 -c 'import os,sys
+directory=os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try: os.fsync(directory)
+finally: os.close(directory)' "$(dirname "$destination")"
 }
 
 render_env() {
@@ -191,11 +220,16 @@ lines=open(source, encoding="utf-8").read().splitlines()
 keys=set(values)
 kept=[line for line in lines if not any(re.match(r"^\s*(?:export\s+)?"+re.escape(key)+r"=",line) for key in keys)]
 kept.extend(key+"="+shlex.quote(value) for key,value in values.items())
-parent=os.path.dirname(destination) or "."; os.makedirs(parent,exist_ok=True)
+parent=os.path.dirname(destination) or "."; os.makedirs(parent,mode=0o700,exist_ok=True)
 tmp=os.path.join(parent,".env.tmp.%d" % os.getpid())
-with open(tmp,"w",encoding="utf-8") as handle:
-    handle.write("\n".join(kept)+"\n"); handle.flush(); os.fsync(handle.fileno())
-os.chmod(tmp,0o600); os.replace(tmp,destination)' \
+fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+with os.fdopen(fd,"w",encoding="utf-8") as handle:
+    handle.write("\n".join(kept)+"\n")
+    handle.flush(); os.fchmod(handle.fileno(),0o600); os.fsync(handle.fileno())
+os.replace(tmp,destination)
+directory=os.open(parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+try: os.fsync(directory)
+finally: os.close(directory)' \
     "$source" "$destination" "$bind" "$generation_dir" "$rehearsal" "$anon"
 }
 
@@ -228,9 +262,13 @@ stage_inputs() {
   mkdir -p "$stage"
   atomic_adopt "$input_binary" "$stage/pe-service" 0755 stage-binary
   render_config "$config_template" "$stage/service.toml" "$production_bind"
+  maybe_crash rendered-config
   render_config "$config_template" "$stage/rehearsal.service.toml" "$rehearsal_bind"
+  maybe_crash rendered-rehearsal-config
   render_env "$service_env_template" "$stage/service.env" "$production_bind" false
+  maybe_crash rendered-env
   render_env "$rehearsal_env_template" "$stage/rehearsal.env" "$rehearsal_bind" true
+  maybe_crash rendered-rehearsal-env
   validate_environment "$stage/service.env" "$production_bind" false
   validate_environment "$stage/rehearsal.env" "$rehearsal_bind" true
   "$stage/pe-service" --verify-staged-revision "$merge_commit"
@@ -252,16 +290,18 @@ if [[ -f "$MANIFEST" ]]; then
 fi
 
 if [[ ! -f "$MANIFEST" || "$(manifest_get activation_id 2>/dev/null || true)" != "$activation_id" ]]; then
-  "$REPO_ROOT/scripts/paper_reset/seed_v1_empty.sh" --execute \
+  SIMULATE_CRASH_AFTER="$SIMULATE_CRASH_AFTER" \
+    "$REPO_ROOT/scripts/paper_reset/seed_v1_empty.sh" --execute \
     --source-main "$source_v1_main" --generation-dir "$generation_dir" \
     --legacy-history "$legacy_history"
   stage_inputs
 
-  old_event=$(effective_path PE_EVENT_LOG_PATH event_log_path ./paper.log)
-  old_source=$(effective_path PE_SOURCE_EVENT_LOG_PATH source_event_log_path source_events.log)
-  old_status=$(effective_path PE_STATUS_PATH status_path ./status.json)
-  old_db=$(effective_path PE_PAPER_STATE_DB_PATH paper_state_db_path ./paper_state.db)
-  old_history=$(effective_path PE_LEGACY_WALLET_HISTORY_PATH legacy_wallet_history_path ./wallet_market_history.json)
+  verify_installed_unit_owner
+  old_event=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_EVENT_LOG_PATH event_log_path ./paper.log)
+  old_source=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_SOURCE_EVENT_LOG_PATH source_event_log_path source_events.log)
+  old_status=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_STATUS_PATH status_path ./status.json)
+  old_db=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_PAPER_STATE_DB_PATH paper_state_db_path ./paper_state.db)
+  old_history=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_LEGACY_WALLET_HISTORY_PATH legacy_wallet_history_path ./wallet_market_history.json)
   old_live="$(dirname "$old_event")/live_journal.log"
   initial=$(python3 -c 'import json,sys
 (activation,generation,commit,bankroll,source_main,legacy,stage,old_event,old_source,
@@ -280,6 +320,8 @@ value={
    "environment":artifact(stage+"/service.env"),
    "rehearsal_config":artifact(stage+"/rehearsal.service.toml"),
    "rehearsal_environment":artifact(stage+"/rehearsal.env")},
+ "old_installed_artifacts":{"service_toml":artifact(config),"service_env":artifact(env),
+   "pe_service":artifact(binary)},
  "destinations":{"binary":binary,"config":config,"environment":env},
  "old_paths":{"paper_log":old_event,"source_log":old_source,"live_journal":old_live,
    "status":old_status,"paper_state":old_db,"legacy_history":old_history}}
@@ -299,6 +341,46 @@ fi
 [[ "$(env_value "$(manifest_get artifacts.rehearsal_environment.path)" PE_BIND)" == "$rehearsal_bind" ]] ||
   die "manifest rehearsal bind mismatch"
 state=$(manifest_get state)
+
+verify_pre_t0_artifacts() {
+  local event source status db history live
+  [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get old_installed_artifacts.service_toml.sha256)" ]] ||
+    die "installed pre-T0 service config hash drift"
+  [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get old_installed_artifacts.service_env.sha256)" ]] ||
+    die "installed pre-T0 service environment hash drift"
+  [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get old_installed_artifacts.pe_service.sha256)" ]] ||
+    die "installed pre-T0 service binary hash drift"
+  event=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_EVENT_LOG_PATH event_log_path ./paper.log)
+  source=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_SOURCE_EVENT_LOG_PATH source_event_log_path source_events.log)
+  status=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_STATUS_PATH status_path ./status.json)
+  db=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_PAPER_STATE_DB_PATH paper_state_db_path ./paper_state.db)
+  history=$(effective_path "$SERVICE_ENV" "$SERVICE_CONFIG" PE_LEGACY_WALLET_HISTORY_PATH legacy_wallet_history_path ./wallet_market_history.json)
+  live="$(dirname "$event")/live_journal.log"
+  [[ "$event" == "$(manifest_get old_paths.paper_log)" &&
+     "$source" == "$(manifest_get old_paths.source_log)" &&
+     "$status" == "$(manifest_get old_paths.status)" &&
+     "$db" == "$(manifest_get old_paths.paper_state)" &&
+     "$history" == "$(manifest_get old_paths.legacy_history)" &&
+     "$live" == "$(manifest_get old_paths.live_journal)" ]] ||
+    die "installed pre-T0 effective paths drifted from the manifest"
+}
+
+verify_pre_t0_owner() {
+  verify_installed_unit_owner
+  verify_pre_t0_artifacts
+}
+
+if (( $(state_rank "$state") < $(state_rank guarded) )); then
+  if [[ "$state" == prechecked && "$(systemctl_active pe-service)" == false &&
+        "$(systemctl_enabled pe-service)" == false ]]; then
+    # A crash can land after disable+stop but before the guarded manifest rename.
+    verify_pre_t0_artifacts
+    manifest_advance guarded
+    state=guarded
+  else
+    verify_pre_t0_owner
+  fi
+fi
 
 verify_seed_or_prepared() {
   local expected_version=$1 version total integrity expected_hash
@@ -334,17 +416,13 @@ verify_seed_or_prepared() {
   fi
 }
 
-# The migration commit can be durable before the prepared manifest rename. Its
-# complete postconditions are sufficient to adopt that external boundary.
-if [[ "$state" == seed ]] &&
-   [[ "$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" 'pragma user_version;')" == 2 ]]; then
-  verify_seed_or_prepared 2
-  manifest_advance prepared
-  state=prepared
-fi
-
 if (( $(state_rank "$state") < $(state_rank prepared) )); then
-  verify_seed_or_prepared 1
+  seed_version=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" 'pragma user_version;')
+  if [[ "$seed_version" == 1 ]]; then
+    verify_seed_or_prepared 1
+  elif [[ "$seed_version" != 2 ]]; then
+    die "generation user_version=$seed_version, expected 1 or resumable 2"
+  fi
   rehearsal_env=$(manifest_get artifacts.rehearsal_environment.path)
   rehearsal_config=$(manifest_get artifacts.rehearsal_config.path)
   staged_binary=$(manifest_get artifacts.binary.path)
@@ -357,6 +435,8 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
     cd "$SERVICE_ROOT"
     "$staged_binary" "$rehearsal_config" --exit-after-anchors
   )
+  # A version-two main is never adopted from table counts alone. Re-entering the
+  # binary completes or verifies the machine-owned migration through installed.
   verify_seed_or_prepared 2
   manifest_advance prepared
   state=prepared
@@ -369,6 +449,18 @@ archive_counts() {
             (select count(*) from paper_positions_archive where activation_id='$activation_id') || ' ' ||
             (select count(*) from paper_bankroll_archive where activation_id='$activation_id') || ' ' ||
             (select count(*) from fill_market_snapshots_archive where activation_id='$activation_id');"
+}
+
+archive_counts_match_pre_reset() {
+  local counts=$1 recorded
+  recorded=$(manifest_get pre_reset_live_counts)
+  python3 -c 'import json,sys
+counts=[int(value) for value in sys.argv[1].split()]
+if len(counts) != 5: raise SystemExit(1)
+recorded=json.loads(sys.argv[2])
+keys=["paper_fills","settled_markets","paper_positions","paper_bankroll","fill_market_snapshots"]
+raise SystemExit(0 if counts == [int(recorded[key]) for key in keys] else 1)' \
+    "$counts" "$recorded"
 }
 
 verify_fresh_supabase() {
@@ -385,8 +477,11 @@ verify_fresh_supabase() {
 
 if [[ "$state" == archived ]]; then
   if counts=$(archive_counts 2>/dev/null); then
-    read -r _ _ _ bankroll_archived _ <<<"$counts"
-    if [[ "${bankroll_archived:-0}" -gt 0 ]]; then
+    read -r fills_archived settled_archived positions_archived bankroll_archived snapshots_archived <<<"$counts"
+    if ((fills_archived + settled_archived + positions_archived + bankroll_archived + snapshots_archived > 0)); then
+      archive_counts_match_pre_reset "$counts" ||
+        die "activation archive counts do not match the recorded pre-reset live counts"
+      [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
       verify_fresh_supabase
       patch=$(python3 -c 'import json,sys; print(json.dumps({"archive_counts":sys.argv[1]}))' "$counts")
       manifest_advance reset "$patch"
@@ -445,6 +540,7 @@ print(json.dumps({"ranking_batch_id":int(sys.argv[1]),"due_wallets":int(sys.argv
 fi
 
 if (( $(state_rank "$state") < $(state_rank guarded) )); then
+  verify_pre_t0_owner
   "${SERVICE_MUTATE[@]}" disable pe-service
   "${SERVICE_MUTATE[@]}" stop pe-service
   [[ "$(systemctl_active pe-service)" == false ]] || die "pe-service is still active"
@@ -507,6 +603,8 @@ if (( $(state_rank "$state") < $(state_rank reset) )); then
   counts=$(archive_counts)
   read -r _ _ _ bankroll_archived _ <<<"$counts"
   [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
+  archive_counts_match_pre_reset "$counts" ||
+    die "activation archive counts do not match the recorded pre-reset live counts"
   patch=$(python3 -c 'import json,sys; print(json.dumps({"archive_counts":sys.argv[1]}))' "$counts")
   manifest_advance reset "$patch"
   state=reset
@@ -581,17 +679,30 @@ if (( $(state_rank "$state") < $(state_rank started) )); then
   fi
   [[ "$(systemctl_enabled pe-service)" == true ]] || die "pe-service did not become enabled"
   invocation=$(systemctl show pe-service -p InvocationID --value)
-  patch=$(python3 -c 'import json,sys; print(json.dumps({"invocation_id":sys.argv[1]}))' "$invocation")
+  [[ -n "$invocation" ]] || die "pe-service has no InvocationID"
+  active_enter=$(systemctl show pe-service -p ActiveEnterTimestamp --value)
+  [[ -n "$active_enter" ]] || die "pe-service has no ActiveEnterTimestamp"
+  [[ "$(systemctl show pe-service -p InvocationID --value)" == "$invocation" ]] ||
+    die "pe-service invocation changed while its activation timestamp was recorded"
+  active_enter_unix=$(date --date="$active_enter" +%s)
+  [[ "$active_enter_unix" =~ ^[0-9]+$ ]] || die "invalid pe-service ActiveEnterTimestamp: $active_enter"
+  patch=$(python3 -c 'import json,sys; print(json.dumps({"invocation_id":sys.argv[1],"active_enter_timestamp":sys.argv[2],"active_enter_unix":int(sys.argv[3])}))' \
+    "$invocation" "$active_enter" "$active_enter_unix")
   manifest_advance started "$patch"
   state=started
 fi
 
 verify_status() {
   python3 -c 'import json,sys
-path,revision,bankroll=sys.argv[1:]
+from datetime import datetime
+path,revision,bankroll,active_enter_unix=sys.argv[1:]
 value=json.load(open(path, encoding="utf-8"))
 assert value.get("revision")==revision, "status revision mismatch"
 assert str(value.get("bankroll"))==bankroll, "status bankroll mismatch"
+updated=value.get("updated_at")
+assert isinstance(updated,str), "status updated_at is absent"
+updated_unix=datetime.fromisoformat(updated.replace("Z","+00:00")).timestamp()
+assert updated_unix > int(active_enter_unix), "status predates the recorded invocation"
 assert value.get("fills_total")==0 and value.get("settled_total")==0, "fresh local book is not empty"
 tasks=value.get("tasks",[])
 required={"activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server"}
@@ -600,13 +711,54 @@ assert required <= running, "producer/critical task set is not running"
 assert all(row.get("state")=="running" for row in tasks if row.get("class")=="critical"), "critical owner is not running"
 projection=value.get("watchlist_projection") or {}
 assert projection.get("applied") is not None and projection.get("last_error") is None, "watchlist projection has not succeeded"' \
-    "$generation_dir/status.json" "$merge_commit" "$bankroll"
+    "$generation_dir/status.json" "$merge_commit" "$bankroll" "$1"
+}
+
+wait_for_invocation_status() {
+  local active_enter_unix=$1
+  for _ in {1..120}; do
+    if [[ -f "$generation_dir/status.json" ]] && verify_status "$active_enter_unix" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  verify_status "$active_enter_unix" || true
+  die "status.json did not become healthy and newer than the recorded invocation within 120 seconds"
+}
+
+record_site_confirmation() {
+  local confirmed_by confirmed_at patch
+  if python3 -c 'import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if value.get("site_confirmed_by") and value.get("site_confirmed_at") else 1)' "$MANIFEST"; then
+    return
+  fi
+  if [[ -t 0 ]]; then
+    read -r -p "After signing in, verify the fresh era and enter your operator name to confirm: " confirmed_by
+    [[ -n "$confirmed_by" ]] || die "signed-in site confirmation requires an operator name"
+  else
+    [[ "$site_confirmed" == true ]] ||
+      die "non-interactive verification requires --site-confirmed after the signed-in site check"
+    confirmed_by=${SUDO_USER:-}
+    [[ -n "$confirmed_by" ]] || confirmed_by=$(id -un)
+  fi
+  confirmed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  patch=$(python3 -c 'import json,sys; print(json.dumps({"site_confirmed_by":sys.argv[1],"site_confirmed_at":sys.argv[2]}))' \
+    "$confirmed_by" "$confirmed_at")
+  manifest_patch_boundary site-confirmed "$patch"
 }
 
 if (( $(state_rank "$state") < $(state_rank verified) )); then
   verify_running_generation
   verify_listening_bind
-  verify_status
+  [[ "$(systemctl show pe-service -p InvocationID --value)" == "$(manifest_get invocation_id)" ]] ||
+    die "running pe-service InvocationID differs from the started manifest"
+  [[ "$(systemctl show pe-service -p ActiveEnterTimestamp --value)" == "$(manifest_get active_enter_timestamp)" ]] ||
+    die "running pe-service ActiveEnterTimestamp differs from the started manifest"
+  wait_for_invocation_status "$(manifest_get active_enter_unix)"
+  latest_batch=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;')
+  [[ "$latest_batch" == "$(manifest_get ranking_batch_id)" ]] ||
+    die "latest ranking batch $latest_batch differs from the frozen activation batch $(manifest_get ranking_batch_id)"
   before=$(manifest_get prepared_anchor_count)
   approved=$(manifest_get owner_approved_due_subset)
   [[ -n "$approved" ]] || approved=0
@@ -622,6 +774,7 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
       (select watchlist_size from service_runtime where id=1)=(select count(*) from service_watchlist)
       then 'ok' else 'mismatch' end;")
   [[ "$projection" == ok ]] || die "Supabase projection verification failed: $projection"
+  record_site_confirmation
   restore_forge "$(manifest_get forge.prior_flag)" \
     "$(manifest_get forge.prior_enabled)" "$(manifest_get forge.prior_active)"
   manifest_advance verified '{"forge_restored":true}'

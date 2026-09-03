@@ -44,7 +44,9 @@ the durable stamp that lets a resumed activation prove that a database commit oc
 manifest rename.
 
 A rerun with the same `activation_id` validates the already-fresh live book and does not archive or
-delete again. Per-table counts for that id are printed and recorded in the fixed activation manifest.
+delete again. All five stamped counts must exactly equal the manifest's recorded pre-reset live census
+before either the initial transition or crash reconciliation can adopt `reset`. Per-table counts for
+that id are printed and recorded in the fixed activation manifest.
 Do not run the SQL independently during a generation cutover; the locked driver coordinates both
 stores.
 
@@ -74,23 +76,25 @@ terminal output or manually advance it.
 
 ## Verification
 
-- The manifest is `verified` and names the intended generation, reviewed revision, and artifact
-  hashes.
+- The manifest is `verified` and names the intended generation, reviewed revision, artifact hashes,
+  frozen ranking batch, recorded systemd invocation, and signed-in-site operator confirmation.
 - `paper_fills`, `paper_positions`, `settled_markets`, and `fill_market_snapshots` are empty;
   `paper_bankroll` contains the fresh singleton.
 - Local fills and settlements are zero, the generation bindings match every effective env-over-TOML
   path, and boot replayed no historical paper event.
 - The boot used the recorded ranking batch and performed no walk, or exactly the owner-approved
   due-wallet subset recorded in the manifest.
-- The watchlist projection has succeeded, `wallet_live_stats_mv` was refreshed, and the signed-in site
+- The watchlist projection has succeeded, invocation-fresh status was observed,
+  `wallet_live_stats_mv` was refreshed, and the recorded operator confirmation says the signed-in site
   displays the fresh era.
 - Forge's prior loop flag, unit enablement, and unit activity were restored independently.
 
 ## Rollback
 
 Use `scripts/deploy/rollback_generation.sh --activation-id <id>`; do not hand-copy rows. The driver
-records `rolling_back`, disables and stops any non-adoptable running service before touching the
-database, and restores exactly the five archive-table row sets stamped with that id using explicit
+records `rolling_back`, validates every archived config/environment/binary source against its manifest
+hash before changing the database or installed files, disables and stops any non-adoptable running
+service before touching the database, and restores exactly the five archive-table row sets stamped with that id using explicit
 column lists in one transaction. It verifies the restored counts, refreshes the materialized view,
 restores the hash-bound old config/environment/binary, starts the old generation, and records
 `rolled_back`.

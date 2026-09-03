@@ -342,6 +342,12 @@ process. The database privilege matrix and representative refused HTTP canaries 
 reachable service write site remains unavailable. Isolation is an operational credential/path
 boundary, not an application mode or write-suppression code path.
 
+**Generation verification.** A #557 generation reaches `verified` only on the ranking batch frozen in
+`prechecked`, with `status.json.updated_at` newer than the recorded systemd invocation's
+`ActiveEnterTimestamp`. The signed-in site check is a recorded operator confirmation because Google
+single sign-on prevents automation: the activation manifest stores `site_confirmed_by` and
+`site_confirmed_at`, and non-interactive driver runs require `--site-confirmed` before Forge is restored.
+
 ### Isolated Polymarket V2 canary (`pe-service-live-canary`)
 
 The canary is a boot-frozen campaign role, not an `ExecutionMode` or promotion state. It is

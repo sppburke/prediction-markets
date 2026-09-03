@@ -90,6 +90,7 @@ jobs:
 
       - name: Python drift-guard tests
         run: |
+          bash -n scripts/deploy/*.sh scripts/paper_reset/*.sh
           python3 scripts/check_sql_unfiltered_dml.py
           python3 scripts/test_push_ranking_filter.py
           python3 scripts/test_ranker_decay.py

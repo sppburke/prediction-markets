@@ -46,8 +46,7 @@ maybe_crash() {
 }
 
 acquire_deploy_lock() {
-  mkdir -p "$DEPLOY_HOME"
-  touch "$DEPLOY_LOCK"
+  [[ -f "$DEPLOY_LOCK" ]] || die "provisioned deploy lock is absent: $DEPLOY_LOCK"
   exec 9<"$DEPLOY_LOCK"
   flock -n 9 || die "another generation driver holds $DEPLOY_LOCK"
   if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 && -n "${PE_ACTIVATION_TEST_HOLD_LOCK_FILE:-}" ]]; then

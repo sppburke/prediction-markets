@@ -2,6 +2,14 @@
 # Build the only supported fresh schema-v2 input: an emptied production schema-v1 copy.
 
 set -euo pipefail
+umask 077
+
+maybe_crash() {
+  if [[ -n "${SIMULATE_CRASH_AFTER:-}" && "$SIMULATE_CRASH_AFTER" == "$1" ]]; then
+    echo "SIMULATED CRASH after $1" >&2
+    exit 86
+  fi
+}
 
 usage() {
   echo "usage: $0 [--execute] --source-main PATH --generation-dir DIR --legacy-history PATH" >&2
@@ -104,6 +112,7 @@ SQL
 directory=os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 try: os.fsync(directory)
 finally: os.close(directory)' "$generation_dir"
+  maybe_crash seed-main
 fi
 
 actual_tables=$(sqlite3 -readonly "file:$destination?immutable=1" \
@@ -118,11 +127,18 @@ done
 [[ "$actual_version" == 1 ]] || { echo "FATAL: seeded user_version=$actual_version" >&2; exit 1; }
 [[ "$integrity" == ok ]] || { echo "FATAL: seeded integrity_check=$integrity" >&2; exit 1; }
 
-python3 -c 'import os,sys
-root=sys.argv[1]
-for name in ("paper.log", "live_journal.log", "source_events.log"):
-    with open(os.path.join(root, name), "wb") as handle:
-        handle.flush(); os.fsync(handle.fileno())' "$generation_dir"
+for log_name in paper.log live_journal.log source_events.log; do
+  python3 -c 'import os,sys
+path=os.path.join(sys.argv[1],sys.argv[2])
+fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+with os.fdopen(fd,"wb") as handle: handle.flush(); os.fsync(handle.fileno())' \
+    "$generation_dir" "$log_name"
+  case "$log_name" in
+    paper.log) maybe_crash seed-paper-log ;;
+    live_journal.log) maybe_crash seed-live-journal ;;
+    source_events.log) maybe_crash seed-source-log ;;
+  esac
+done
 if [[ -e "$history_destination" ]]; then
   [[ "$(sha256sum "$history_destination" | awk '{print $1}')" == "$legacy_sha256" ]] || {
     echo "FATAL: existing generation legacy history differs from the requested input" >&2
@@ -136,6 +152,7 @@ path=sys.argv[1]
 with open(path, "rb") as handle: os.fsync(handle.fileno())' "$history_tmp"
   mv "$history_tmp" "$history_destination"
 fi
+maybe_crash seed-history
 hash_tmp="$generation_dir/.legacy-history.hashes.$$"
 printf 'blake3 %s  %s\nsha256 %s  %s\n' \
   "$legacy_blake3" "$legacy_history" "$legacy_sha256" "$legacy_history" > "$hash_tmp"
@@ -147,6 +164,7 @@ python3 -c 'import os,sys
 directory=os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 try: os.fsync(directory)
 finally: os.close(directory)' "$generation_dir"
+maybe_crash seed-history-hashes
 
 printf '%s\n' \
   "seed.main=$destination" \

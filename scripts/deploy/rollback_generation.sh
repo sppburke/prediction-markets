@@ -52,12 +52,27 @@ archive_sha() {
   manifest_get "archive_artifacts.$1.sha256"
 }
 
+verify_archive_sources() {
+  local name path expected actual
+  for name in service_toml service_env pe_service; do
+    path=$(archive_path "$name")
+    expected=$(archive_sha "$name")
+    [[ -f "$path" ]] || die "archived $name source is absent: $path"
+    actual=$(sha256_file "$path")
+    [[ "$actual" == "$expected" ]] ||
+      die "archived $name source hash mismatch: expected $expected, found $actual"
+  done
+}
+
 installed_old_artifacts() {
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] || return 1
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(archive_sha service_toml)" ]] || return 1
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(archive_sha service_env)" ]] || return 1
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$(archive_sha pe_service)" ]] || return 1
 }
+
+# Validate every rollback source before any database or installed artifact is changed.
+verify_archive_sources
 
 restored_counts_match() {
   local answer

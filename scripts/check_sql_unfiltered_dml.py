@@ -15,22 +15,34 @@ SCHEMA_OWNERS = (
     ROOT / "scripts/supabase_paper_state_schema.sql",
 )
 # Reviewed reset SQL runs under an exclusive lock and is deliberately unconditional.
-ALLOWLISTED_PREFIX = ROOT / "scripts/paper_reset"
+ALLOWLISTED_PATHS = frozenset(
+    {
+        (ROOT / "scripts/paper_reset/archive_paper_state.sql").resolve(),
+        (ROOT / "scripts/paper_reset/restore_paper_state.sql").resolve(),
+    }
+)
+CHECKED_PATHS = SCHEMA_OWNERS + tuple(sorted(ALLOWLISTED_PATHS))
 DIRECT_DML = re.compile(
     r"(?i)\b(?:"
     r"delete[ \t\r\n]+from[ \t\r\n]+(?:only[ \t\r\n]+)?"
     r"(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*"
     r"|update[ \t\r\n]+(?:only[ \t\r\n]+)?"
-    r"(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*[ \t\r\n]+set"
+    r"(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*"
+    r"(?:[ \t\r\n]+(?:as[ \t\r\n]+)?[a-z_][a-z0-9_]*)?"
+    r"[ \t\r\n]+set"
     r")\b"
 )
-WHERE = re.compile(r"(?i)\bwhere\b")
 SELF_TEST_FIXTURE = """\
 create or replace function broken() returns void language plpgsql as $$
 begin
   delete from service_watchlist;
 end;
 $$;
+"""
+ALIASED_UPDATE_FIXTURE = "update target_table as target set value = 1;"
+NESTED_WHERE_FIXTURE = """\
+update target_table
+set value = (select source_value from source_table where source_id = 1);
 """
 
 
@@ -100,18 +112,29 @@ def violations(sql: str) -> list[tuple[int, str]]:
         if statement_end < 0:
             statement_end = len(masked)
         statement = masked[match.start() : statement_end]
-        if not WHERE.search(statement):
+        if not has_target_predicate(statement):
             line = masked.count("\n", 0, match.start()) + 1
             found.append((line, " ".join(match.group(0).split())))
     return found
 
 
+def has_target_predicate(statement: str) -> bool:
+    """Return whether the DML target has a top-level WHERE predicate."""
+
+    depth = 0
+    for token in re.finditer(r"[()]|[a-z_][a-z0-9_]*", statement, re.IGNORECASE):
+        value = token.group(0).lower()
+        if value == "(":
+            depth += 1
+        elif value == ")":
+            depth = max(0, depth - 1)
+        elif value == "where" and depth == 0:
+            return True
+    return False
+
+
 def is_allowlisted(path: Path) -> bool:
-    try:
-        path.resolve().relative_to(ALLOWLISTED_PREFIX.resolve())
-    except ValueError:
-        return False
-    return path.suffix == ".sql"
+    return path.resolve() in ALLOWLISTED_PATHS
 
 
 def check_paths(paths: list[Path]) -> int:
@@ -139,6 +162,14 @@ def self_test() -> None:
     found = violations(SELF_TEST_FIXTURE)
     if found != [(3, "delete from service_watchlist")]:
         raise RuntimeError(f"pre-fix fixture was not rejected exactly: {found!r}")
+    aliased = violations(ALIASED_UPDATE_FIXTURE)
+    if aliased != [(1, "update target_table as target set")]:
+        raise RuntimeError(f"aliased unfiltered UPDATE was not rejected exactly: {aliased!r}")
+    nested = violations(NESTED_WHERE_FIXTURE)
+    if nested != [(1, "update target_table set")]:
+        raise RuntimeError(f"nested WHERE incorrectly filtered the target: {nested!r}")
+    if is_allowlisted(ROOT / "scripts/paper_reset/not_reviewed.sql"):
+        raise RuntimeError("paper-reset directory was allowlisted beyond the reviewed exact paths")
 
 
 def main() -> int:
@@ -146,7 +177,7 @@ def main() -> int:
     parser.add_argument("paths", nargs="*", type=Path)
     args = parser.parse_args()
     self_test()
-    paths = [path.resolve() for path in args.paths] if args.paths else list(SCHEMA_OWNERS)
+    paths = [path.resolve() for path in args.paths] if args.paths else list(CHECKED_PATHS)
     return check_paths(paths)
 
 

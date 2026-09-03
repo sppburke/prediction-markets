@@ -78,6 +78,8 @@ The driver holds `/home/sean/.pe-deploy.lock` for its whole run and writes only 
 `/home/sean/pe-activation.json` manifest as activation authority. Its state order is
 `seed → prepared → prechecked → guarded → archived → reset → switched → started → verified`. Use a
 unique `activation_id`; a different id is refused while the manifest is non-terminal.
+The lock is a provisioned root-owned mode-`0644` file. The driver only opens it read-only and refuses
+when it is absent; it never creates or touches the production lock.
 
 Stage the exact release binary, the complete service and rehearsal environment files, and the full
 `smoke-test/service.toml` from the reviewed merge commit. The driver changes only the bind and
@@ -99,20 +101,37 @@ SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/activate_generation.sh --dry
 ```
 
 Run the same command without `--dry-run`. While the old service still trades, `seed` creates the
-empty schema-v1 generation and `prepared` migrates it with `--exit-after-anchors`. At `prechecked`, the
+empty schema-v1 generation and `prepared` migrates it with `--exit-after-anchors`. If a crash leaves a
+version-two main before the `prepared` manifest rename, the driver re-enters that command so the binary
+completes or verifies the machine-owned `installed` phase and activation-tail bindings; table counts
+alone never adopt it. At `prechecked`, the
 driver records Forge's flag plus enabled/active bits, writes its existing `stop` flag, stops the user
 unit, proves no cycle process or lock remains, freezes the latest ranking batch, and evaluates the
 canonical due-wallet rule from `docs/_GLOSSARY.md`. A nonzero result stops. Only an explicit owner
 decision may be supplied as the exact `--approve-due-subset <count>`; it is durable in the manifest.
 
-`guarded` starts T0 by disabling and stopping `pe-service`. `archived` copies every pre-T0 artifact
-without deleting it. `reset` applies the activation-stamped single Supabase transaction. `switched`
+Before T0, old state paths are resolved exclusively from the installed `.env` and service TOML, whose
+hashes and systemd `ExecStart`/`WorkingDirectory` ownership are bound in the manifest; staged templates
+are not an old-state authority. Staging runs under a restrictive umask, and secret-bearing environment
+files are mode `0600` from their first open. `guarded` starts T0 by disabling and stopping `pe-service`.
+`archived` copies every pre-T0 artifact without deleting it. `reset` applies the activation-stamped
+single Supabase transaction and requires its five stamped counts to equal the recorded pre-reset census.
+`switched`
 hash-verifies and atomically adopts config, complete environment, and binary, then prints and validates
 their effective paths. `started` adopts an already-running exact generation or uses
-`systemctl enable --now` once. `verified` proves the running binary/config/env hashes, bind and permanent
-paths, zero replay/walk beyond any approved subset, producer/critical-task health, fresh Supabase book,
-successful watchlist projection, signed-in fresh site, and refreshed materialized view. Only then does
-it restore Forge's prior flag and independently restore its enablement and activity bits.
+`systemctl enable --now` once and records its `InvocationID` plus `ActiveEnterTimestamp`. `verified`
+waits a bounded 120 seconds for `status.json.updated_at` to be newer than that recorded invocation,
+requires the latest ranking batch to equal the frozen manifest batch, and proves the running
+binary/config/env hashes, bind and permanent paths, zero replay/walk beyond any approved subset,
+producer/critical-task health, fresh Supabase book, successful watchlist projection, and refreshed
+materialized view.
+
+The final signed-in site check cannot be automated because the site uses Google single sign-on. The
+driver therefore prompts the operator to inspect the fresh era and records `site_confirmed_by` and
+`site_confirmed_at` in the manifest before restoring Forge or advancing to `verified`. A non-interactive
+invocation must include `--site-confirmed`; that flag is the operator's attestation that the signed-in
+check was performed, not an automated site probe. Only after the durable confirmation does the driver
+restore Forge's prior flag and independently restore its enablement and activity bits.
 
 Re-run the identical command after interruption or reboot. Each external boundary is rechecked, and
 the first incomplete durable state resumes. Never edit the manifest or substitute a repository
@@ -131,7 +150,9 @@ SUPABASE_DB_URL=<session-pooler-url> \
   scripts/deploy/rollback_generation.sh --activation-id <id>
 ```
 
-It records `rolling_back` first, disables and stops any non-adoptable service before database access,
+It records `rolling_back` first, verifies all three archived config/environment/binary sources against
+their manifest hashes before any database or installed artifact changes, disables and stops any
+non-adoptable service before database access,
 restores exactly that id's five archived row sets in one transaction, refreshes the materialized view,
 restores old config/environment/binary from manifest-hashed copies, starts or adopts the exact old
 generation, and records `rolled_back`. A forward rerun of that id is thereafter refused. Retain the
