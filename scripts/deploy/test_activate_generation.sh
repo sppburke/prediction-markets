@@ -45,6 +45,21 @@ echo "network access is forbidden in this test" >&2
 exit 90
 SH
 
+  for command in touch chmod chown; do
+    cat > "$bin/$command" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+lock=${PE_ACTIVATION_TEST_ROOT:?}/.pe-deploy.lock
+for argument in "$@"; do
+  if [[ "$argument" == "$lock" ]]; then
+    echo "deploy driver invoked ${0##*/} on provisioned lock $lock" >&2
+    exit 95
+  fi
+done
+exec "/usr/bin/${0##*/}" "$@"
+SH
+  done
+
   cat > "$bin/curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -206,13 +221,19 @@ case "$action" in
     ;;
   show)
     if [[ "$*" == *InvocationID* ]]; then
-      echo invocation-test-1
+      if [[ -e "$state/invocation-changed" ]]; then echo invocation-test-2; else echo invocation-test-1; fi
     elif [[ "$*" == *ActiveEnterTimestamp* ]]; then
       echo 2033-05-18T03:33:19Z
     elif [[ "$*" == *WorkingDirectory* ]]; then
       echo "$root/prediction-markets"
     elif [[ "$*" == *ExecStart* ]]; then
-      echo "/bin/bash -c source $root/prediction-markets/.env; exec $root/prediction-markets/target/release/pe-service $root/prediction-markets/smoke-test/service.toml"
+      if [[ -f "$state/service.exec-start" ]]; then
+        cat "$state/service.exec-start"
+      else
+        echo "/bin/bash -c source $root/prediction-markets/.env; exec $root/prediction-markets/target/release/pe-service $root/prediction-markets/smoke-test/service.toml"
+      fi
+    elif [[ "$*" == *EnvironmentFiles* ]]; then
+      [[ ! -f "$state/service.environment-files" ]] || cat "$state/service.environment-files"
     else
       echo 1234
     fi
@@ -231,8 +252,9 @@ make_case() {
   mkdir -p "$service/target/release" "$service/smoke-test" \
     "$service/data/eval-results" "$service/data" "$root/input" "$service/gen/557" \
     "$root/test-state"
-  printf '%s\n' root-owned-deploy-lock > "$root/.pe-deploy.lock"
+  printf '%s\n' provisioned-deploy-lock > "$root/.pe-deploy.lock"
   chmod 0444 "$root/.pe-deploy.lock"
+  stat -c '%i|%y|%a' "$root/.pe-deploy.lock" > "$root/test-state/deploy-lock.before"
   write_shims "$root/bin"
   printf '%s\n' old-binary > "$service/target/release/pe-service"
   chmod +x "$service/target/release/pe-service"
@@ -336,6 +358,13 @@ reboot_host() {
   done
 }
 
+assert_deploy_lock_unchanged() {
+  local root=$1 before after
+  before=$(<"$root/test-state/deploy-lock.before")
+  after=$(stat -c '%i|%y|%a' "$root/.pe-deploy.lock")
+  [[ "$after" == "$before" ]] || fail "deploy lock inode/mtime/mode changed: $before -> $after"
+}
+
 assert_verified() {
   local root=$1 state starts stamps
   state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
@@ -350,7 +379,8 @@ assert_verified() {
   [[ "$(<"$root/prediction-markets/data/eval-results/rank_and_push.loop")" == run ]] ||
     fail "Forge flag changed"
   [[ "$(stat -c '%a' "$root/.pe-deploy.lock")" == 444 ]] || fail "deploy lock mode changed"
-  [[ "$(<"$root/.pe-deploy.lock")" == root-owned-deploy-lock ]] || fail "deploy lock content changed"
+  [[ "$(<"$root/.pe-deploy.lock")" == provisioned-deploy-lock ]] || fail "deploy lock content changed"
+  assert_deploy_lock_unchanged "$root"
   python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["ranking_batch_id"] == 7
@@ -418,6 +448,17 @@ artifact_boundaries=(
 )
 for boundary in "${artifact_boundaries[@]}"; do run_crash_case "$boundary"; done
 
+# The production lock is provisioned out of band; an absent lock fails before any state is created.
+root=$(make_case lock-absent)
+rm "$root/.pe-deploy.lock"
+set +e
+activate "$root" activation-557 >"$root/absent.out" 2>"$root/absent.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "absent deploy lock returned $rc"
+grep -q 'provisioned deploy lock is absent' "$root/absent.err" || fail "absent-lock refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "absent lock allowed activation state to be created"
+
 # A lock contender cannot enter while the first process holds the whole-run lock.
 root=$(make_case lock)
 hold="$root/hold"
@@ -445,6 +486,21 @@ grep -q 'another generation driver holds' "$root/contender.err" || fail "lock re
 rm "$hold"
 wait "$holder"
 assert_verified "$root"
+
+# Unit ownership requires complete path tokens; a suffixed config backup is not the installed config.
+root=$(make_case unit-config-backup)
+service="$root/prediction-markets"
+printf '/bin/bash -c source %s/.env; exec %s/target/release/pe-service %s/smoke-test/service.toml.backup\n' \
+  "$service" "$service" "$service" > "$root/test-state/service.exec-start"
+set +e
+activate "$root" activation-557 >"$root/unit.out" 2>"$root/unit.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "suffixed service config path was accepted"
+grep -q 'does not select the installed service config' "$root/unit.err" ||
+  fail "suffixed service config refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "suffixed service config was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
 
 # A different id is rejected while durable state is non-terminal.
 root=$(make_case different-id)
@@ -495,6 +551,33 @@ grep -q 'simulated privilege-matrix failure' "$root/preflight.err" || fail "matr
 [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-activation.json")" == seed ]] ||
   fail "negative privilege matrix advanced the manifest"
 rm "$root/test-state/preflight-fail"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
+
+# A resume re-verifies the exact rehearsal executable before it can run again.
+root=$(make_case rehearsal-binary-drift)
+set +e
+activate "$root" activation-557 --simulate-crash-after before-manifest-prepared \
+  >"$root/rehearsal-first.out" 2>"$root/rehearsal-first.err"
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "rehearsal binary drift case did not reach prepared boundary"
+cat > "$root/prediction-markets/gen/557/staged/pe-service" <<'SH'
+#!/usr/bin/env bash
+: > "${PE_ACTIVATION_TEST_ROOT:?}/test-state/substituted-rehearsal-executed"
+SH
+chmod 0755 "$root/prediction-markets/gen/557/staged/pe-service"
+set +e
+activate "$root" activation-557 >"$root/rehearsal-resume.out" 2>"$root/rehearsal-resume.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "substituted rehearsal binary was accepted on resume"
+grep -q 'staged rehearsal binary hash drift' "$root/rehearsal-resume.err" ||
+  fail "substituted rehearsal binary refusal was not explicit"
+[[ ! -e "$root/test-state/substituted-rehearsal-executed" ]] ||
+  fail "substituted rehearsal binary executed before hash verification"
+cp "$root/input/new-pe-service" "$root/prediction-markets/gen/557/staged/pe-service"
+chmod 0755 "$root/prediction-markets/gen/557/staged/pe-service"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
@@ -556,6 +639,39 @@ set -e
 grep -q 'did not become healthy and newer' "$root/stale.err" || fail "stale-status refusal was not explicit"
 sed -i 's/2033-05-18T03:33:19Z/2033-05-18T03:33:20Z/' \
   "$root/prediction-markets/gen/557/status.json"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
+
+# Invocation identity is re-read after readiness; a service change during the wait cannot verify.
+root=$(make_case invocation-change-during-wait)
+set +e
+activate "$root" activation-557 --simulate-crash-after started >/dev/null 2>"$root/invocation-started.err"
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "changing-invocation case did not reach started"
+sed -i 's/2033-05-18T03:33:20Z/2033-05-18T03:33:19Z/' \
+  "$root/prediction-markets/gen/557/status.json"
+: > "$root/test-state/change-invocation-on-sleep"
+cat > "$root/bin/sleep" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
+if [[ -e "$state/change-invocation-on-sleep" ]]; then
+  : > "$state/invocation-changed"
+  /usr/bin/sed -i 's/2033-05-18T03:33:19Z/2033-05-18T03:33:20Z/' \
+    "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/557/status.json"
+fi
+exit 0
+SH
+chmod +x "$root/bin/sleep"
+set +e
+activate "$root" activation-557 >"$root/invocation.out" 2>"$root/invocation.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "changed InvocationID was accepted after the readiness wait"
+grep -q 'InvocationID differs from the started manifest' "$root/invocation.err" ||
+  fail "changed InvocationID refusal was not explicit"
+rm "$root/test-state/change-invocation-on-sleep" "$root/test-state/invocation-changed"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 

@@ -142,8 +142,28 @@ effective_path() {
   absolute_from_root "$value"
 }
 
+unit_has_exact_token() {
+  local expected=$1
+  shift
+  python3 -c 'import shlex,sys
+expected=sys.argv[1]
+pending=list(sys.argv[2:])
+tokens=set()
+while pending:
+    value=pending.pop()
+    lexer=shlex.shlex(value, posix=True, punctuation_chars=";&|(){}")
+    lexer.whitespace_split=True
+    lexer.commenters=""
+    for token in lexer:
+        if token != value and (any(char.isspace() for char in token) or any(char in ";&|(){}" for char in token)):
+            pending.append(token)
+        else:
+            tokens.add(token)
+raise SystemExit(0 if expected in tokens else 1)' "$expected" "$@"
+}
+
 verify_installed_unit_owner() {
-  local working exec_start pid running
+  local working exec_start environment_files pid running
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
     die "one or more installed service artifacts are absent"
   [[ "$(systemctl_active pe-service)" == true ]] || die "installed pe-service is not active"
@@ -151,9 +171,12 @@ verify_installed_unit_owner() {
   [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
     die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
   exec_start=$(systemctl show pe-service -p ExecStart --value)
-  [[ "$exec_start" == *"$SERVICE_ENV"* && "$exec_start" == *"$SERVICE_BINARY"* ]] ||
+  environment_files=$(systemctl show pe-service -p EnvironmentFiles --value)
+  unit_has_exact_token "$SERVICE_ENV" "$exec_start" "$environment_files" &&
+    unit_has_exact_token "$SERVICE_BINARY" "$exec_start" ||
     die "pe-service ExecStart does not source the installed environment and binary"
-  [[ "$exec_start" == *"$SERVICE_CONFIG"* || "$exec_start" == *"smoke-test/service.toml"* ]] ||
+  unit_has_exact_token "$SERVICE_CONFIG" "$exec_start" ||
+    unit_has_exact_token "smoke-test/service.toml" "$exec_start" ||
     die "pe-service ExecStart does not select the installed service config"
   if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
     pid=$(systemctl show pe-service -p MainPID --value)
@@ -416,6 +439,18 @@ verify_seed_or_prepared() {
   fi
 }
 
+verify_rehearsal_artifacts() {
+  local path expected label
+  while (($#)); do
+    path=$(manifest_get "artifacts.$1.path")
+    expected=$(manifest_get "artifacts.$1.sha256")
+    label=$2
+    [[ -f "$path" ]] || die "staged rehearsal $label is absent: $path"
+    [[ "$(sha256_file "$path")" == "$expected" ]] || die "staged rehearsal $label hash drift"
+    shift 2
+  done
+}
+
 if (( $(state_rank "$state") < $(state_rank prepared) )); then
   seed_version=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" 'pragma user_version;')
   if [[ "$seed_version" == 1 ]]; then
@@ -426,7 +461,9 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   rehearsal_env=$(manifest_get artifacts.rehearsal_environment.path)
   rehearsal_config=$(manifest_get artifacts.rehearsal_config.path)
   staged_binary=$(manifest_get artifacts.binary.path)
+  verify_rehearsal_artifacts rehearsal_environment environment rehearsal_config config binary binary
   "$DEPLOY_SCRIPT_DIR/rehearsal_preflight.sh" "$rehearsal_env"
+  verify_rehearsal_artifacts rehearsal_environment environment rehearsal_config config binary binary
   (
     set -a
     # shellcheck disable=SC1090
@@ -726,6 +763,13 @@ wait_for_invocation_status() {
   die "status.json did not become healthy and newer than the recorded invocation within 120 seconds"
 }
 
+verify_started_invocation() {
+  [[ "$(systemctl show pe-service -p InvocationID --value)" == "$(manifest_get invocation_id)" ]] ||
+    die "running pe-service InvocationID differs from the started manifest"
+  [[ "$(systemctl show pe-service -p ActiveEnterTimestamp --value)" == "$(manifest_get active_enter_timestamp)" ]] ||
+    die "running pe-service ActiveEnterTimestamp differs from the started manifest"
+}
+
 record_site_confirmation() {
   local confirmed_by confirmed_at patch
   if python3 -c 'import json,sys
@@ -751,11 +795,9 @@ raise SystemExit(0 if value.get("site_confirmed_by") and value.get("site_confirm
 if (( $(state_rank "$state") < $(state_rank verified) )); then
   verify_running_generation
   verify_listening_bind
-  [[ "$(systemctl show pe-service -p InvocationID --value)" == "$(manifest_get invocation_id)" ]] ||
-    die "running pe-service InvocationID differs from the started manifest"
-  [[ "$(systemctl show pe-service -p ActiveEnterTimestamp --value)" == "$(manifest_get active_enter_timestamp)" ]] ||
-    die "running pe-service ActiveEnterTimestamp differs from the started manifest"
+  verify_started_invocation
   wait_for_invocation_status "$(manifest_get active_enter_unix)"
+  verify_started_invocation
   latest_batch=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;')
   [[ "$latest_batch" == "$(manifest_get ranking_batch_id)" ]] ||
     die "latest ranking batch $latest_batch differs from the frozen activation batch $(manifest_get ranking_batch_id)"
