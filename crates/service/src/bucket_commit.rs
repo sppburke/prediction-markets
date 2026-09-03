@@ -275,6 +275,13 @@ impl BucketCommitEngine {
     }
 
     /// Commit several activity buckets as one durable paper-state batch.
+    ///
+    /// Connection ownership makes this safe: the only production caller is the boot bracket's
+    /// `commit_direct`, under the engine lock before producers start; `begin_batch` therefore has
+    /// that single production caller and batches never nest. The sole boot-path paper-state write
+    /// outside that lock, `mark_seeded_history_validated`, runs after every bracket completes. A
+    /// failed `ROLLBACK` surfaces as the bracket error, and the next `BEGIN IMMEDIATE` then fails,
+    /// so boot fails closed instead of committing partial state.
     pub fn commit_batch<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, BucketCommitError>,

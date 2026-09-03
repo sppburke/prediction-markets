@@ -153,7 +153,6 @@ pub fn is_deferred_causal_position_error(error: &CausalPositionError) -> bool {
                 | PositionReadError::MixedActivityClassification { .. }
                 | PositionReadError::MetadataUnresolved { .. }
                 | PositionReadError::ConflictingOutcomeMapping { .. }
-                | PositionReadError::PositionMappingConflict { .. }
                 | PositionReadError::DuplicateAsset { .. }
                 | PositionReadError::SaturatedTerminalPage { .. }
         ),
@@ -702,19 +701,16 @@ impl CausalPositionValidator {
         count_change: bool,
     ) -> Result<bool, CausalPositionError> {
         let mut changed = false;
-        for bucket in activity
+        let buckets = activity
             .buckets()
-            .map_err(|source| CausalPositionError::Activity { wallet, source })?
-        {
+            .map_err(|source| CausalPositionError::Activity { wallet, source })?;
+        let context = bracket_context(activity, &self.source_log_generation, prepared)?;
+        for bucket in buckets {
             let (committed, acknowledgement) = oneshot::channel();
             control_tx
                 .send(OrchestratorControl::CommitActivityBucket {
                     aggregates: bucket,
-                    context: Box::new(bracket_context(
-                        activity,
-                        &self.source_log_generation,
-                        prepared,
-                    )?),
+                    context: Box::new(context.clone()),
                     committed,
                 })
                 .await

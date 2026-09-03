@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 const WALLET_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const FENCED_WALLET_HEX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MARKET_A: &str = "0xcondition-a";
 const MARKET_B: &str = "0xcondition-b";
 const MARKET_C: &str = "0xcondition-c";
@@ -43,10 +44,10 @@ fn timestamp(epoch: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(epoch).unwrap()
 }
 
-fn aggregate_rows(mut rows: Vec<Value>) -> ActivityAggregate {
+fn aggregate_rows_for_wallet(wallet_hex: &str, mut rows: Vec<Value>) -> ActivityAggregate {
     let epoch = rows[0]["timestamp"].as_i64().expect("fixture epoch");
     for row in &mut rows {
-        row["proxyWallet"] = json!(WALLET_HEX);
+        row["proxyWallet"] = json!(wallet_hex);
     }
     let context = ActivityParseContext {
         source_id: SourceId("polymarket-data-api".to_owned()),
@@ -54,11 +55,19 @@ fn aggregate_rows(mut rows: Vec<Value>) -> ActivityAggregate {
         received_at: ReceivedAt(timestamp(epoch + 11)),
         transport: ActivityTransport::Rest,
     };
-    let window =
-        parse_activity_response(&serde_json::to_vec(&rows).unwrap(), wallet(), &context).unwrap();
+    let window = parse_activity_response(
+        &serde_json::to_vec(&rows).unwrap(),
+        WalletAddress::from_hex(wallet_hex).unwrap(),
+        &context,
+    )
+    .unwrap();
     let mut aggregates = window.aggregates().unwrap();
     assert_eq!(aggregates.len(), 1);
     aggregates.remove(0)
+}
+
+fn aggregate_rows(rows: Vec<Value>) -> ActivityAggregate {
+    aggregate_rows_for_wallet(WALLET_HEX, rows)
 }
 
 fn aggregate(row: Value) -> ActivityAggregate {
@@ -98,20 +107,41 @@ fn pair_effect(
     size: &str,
     epoch: i64,
 ) -> ActivityAggregate {
-    aggregate(json!({
-        "timestamp": epoch,
-        "conditionId": market,
-        "type": activity_type,
-        "size": size,
-        "usdcSize": "0.000000",
-        "transactionHash": transaction_hash,
-        "price": "1",
-        "asset": "",
-        "side": "",
-        "outcomeIndex": 999,
-        "outcome": "",
-        "isCombo": false,
-    }))
+    pair_effect_for_wallet(
+        WALLET_HEX,
+        activity_type,
+        transaction_hash,
+        market,
+        size,
+        epoch,
+    )
+}
+
+fn pair_effect_for_wallet(
+    wallet_hex: &str,
+    activity_type: &str,
+    transaction_hash: &str,
+    market: &str,
+    size: &str,
+    epoch: i64,
+) -> ActivityAggregate {
+    aggregate_rows_for_wallet(
+        wallet_hex,
+        vec![json!({
+            "timestamp": epoch,
+            "conditionId": market,
+            "type": activity_type,
+            "size": size,
+            "usdcSize": "0.000000",
+            "transactionHash": transaction_hash,
+            "price": "1",
+            "asset": "",
+            "side": "",
+            "outcomeIndex": 999,
+            "outcome": "",
+            "isCombo": false,
+        })],
+    )
 }
 
 fn combo_effect(activity_type: &str, transaction_hash: &str, epoch: i64) -> ActivityAggregate {
@@ -202,10 +232,21 @@ fn install_anchor(
     balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
     recorded_at_unix: i64,
 ) {
-    let captured = ledger_capture(engine.ledger(), paper, wallet()).unwrap();
+    install_anchor_for_wallet(engine, paper, wallet(), cutoff, balances, recorded_at_unix);
+}
+
+fn install_anchor_for_wallet(
+    engine: &mut BucketCommitEngine,
+    paper: &PaperStateDb,
+    wallet: WalletAddress,
+    cutoff: i64,
+    balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
+    recorded_at_unix: i64,
+) {
+    let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
-            wallet: wallet(),
+            wallet,
             balances,
             cutoff,
             proof: AnchorProof {
@@ -771,6 +812,29 @@ fn mixed_corrected_unverified_bucket_rolls_back_every_surface_then_retries() {
 #[test]
 fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() {
     let (dir, paper, mut engine) = fresh_anchored();
+    let fenced_wallet = WalletAddress::from_hex(FENCED_WALLET_HEX).unwrap();
+    paper.set_cursor(&fenced_wallet, 0).unwrap();
+    install_anchor_for_wallet(&mut engine, &paper, fenced_wallet, 0, Vec::new(), 91);
+    let fence = engine
+        .commit(
+            vec![pair_effect_for_wallet(
+                FENCED_WALLET_HEX,
+                "CONVERSION",
+                "0xpreexisting-fence",
+                MARKET_C,
+                "1",
+                92,
+            )],
+            &context(92, false),
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(fence.newly_fenced, Some(WalletFenceCause::Conversion));
+    let pre_batch_fences = paper.wallet_fences().unwrap();
+    assert_eq!(pre_batch_fences.len(), 1);
+    assert_eq!(pre_batch_fences[0].wallet, fenced_wallet);
+    assert!(engine.is_fenced(&fenced_wallet));
+    assert!(!engine.is_fenced(&wallet()));
     let first = position_row("TRADE", "0xbatch-first", MARKET_A, 0, "BUY", "3", "0.5", 93);
     let second = position_row(
         "TRADE",
@@ -790,6 +854,11 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
     second_context.copy_eligible = false;
     let database_path = dir.path().join("paper.db");
     let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let pre_batch_revisions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM activity_group_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
     connection
         .execute_batch(
             "CREATE TRIGGER fail_second_batch_bucket BEFORE INSERT ON activity_groups
@@ -810,6 +879,8 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
     assert!(paper.open_decision_pending().unwrap().is_empty());
     assert!(paper.gate_history().unwrap().is_empty());
     assert!(!engine.history_complete(&wallet()));
+    assert_eq!(paper.wallet_fences().unwrap(), pre_batch_fences);
+    assert!(engine.is_fenced(&fenced_wallet));
     assert!(!engine.is_fenced(&wallet()));
     assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
     assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
@@ -820,7 +891,7 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
             row.get(0)
         })
         .unwrap();
-    assert_eq!(revisions, 0);
+    assert_eq!(revisions, pre_batch_revisions);
 
     connection
         .execute_batch("DROP TRIGGER fail_second_batch_bucket;")
@@ -887,6 +958,18 @@ fn replay_is_identical_for_batched_and_single_bucket_commits() {
 
     let batch_replay = replay_wallet_ledger(&batch_paper, wallet()).unwrap();
     let single_replay = replay_wallet_ledger(&single_paper, wallet()).unwrap();
+    for replay in [&batch_replay, &single_replay] {
+        let balances = &replay.position(&wallet()).unwrap().positions;
+        assert_eq!(balances.len(), 2);
+        assert_eq!(
+            balances[&market_outcome(MARKET_A, 0)].long_contracts,
+            ShareAmount::from_atomic(3_000_000)
+        );
+        assert_eq!(
+            balances[&market_outcome(MARKET_B, 1)].long_contracts,
+            ShareAmount::from_atomic(4_000_000)
+        );
+    }
     let batch_capture = ledger_capture(&batch_replay, &batch_paper, wallet()).unwrap();
     let single_capture = ledger_capture(&single_replay, &single_paper, wallet()).unwrap();
     assert_eq!(batch_capture.hash, single_capture.hash);

@@ -635,8 +635,6 @@ pub enum PositionReadError {
     MetadataUnresolved { asset: String, reason: String },
     #[error("activity condition {condition_id} outcome {outcome} maps to multiple assets")]
     ConflictingOutcomeMapping { condition_id: String, outcome: u16 },
-    #[error("position asset {asset} conflicts with its activity condition/outcome mapping")]
-    PositionMappingConflict { asset: String },
     #[error("duplicate or overlapping position asset {asset}")]
     DuplicateAsset { asset: String },
     #[error("positions partition {partition:?} is still full at terminal offset {offset}")]

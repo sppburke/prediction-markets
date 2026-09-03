@@ -2428,12 +2428,6 @@ fn deferred_position_predicate_is_exact() {
         },
         CausalPositionError::Positions {
             wallet,
-            source: PositionReadError::PositionMappingConflict {
-                asset: "position-conflict".to_owned(),
-            },
-        },
-        CausalPositionError::Positions {
-            wallet,
             source: PositionReadError::DuplicateAsset {
                 asset: "duplicate".to_owned(),
             },

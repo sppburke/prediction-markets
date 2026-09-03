@@ -3686,6 +3686,12 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    static TRACED_STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn record_traced_statement(statement: &str) {
+        TRACED_STATEMENTS.lock().unwrap().push(statement.to_owned());
+    }
+
     fn db() -> (tempfile::TempDir, PaperStateDb) {
         let dir = tempfile::tempdir().unwrap();
         let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
@@ -4336,6 +4342,58 @@ mod tests {
         assert_eq!(durable_groups(), 0);
         db.commit_batch().unwrap();
         assert_eq!(durable_groups(), 2);
+    }
+
+    #[test]
+    fn activity_bucket_batch_uses_one_outer_transaction_and_one_savepoint_per_bucket() {
+        let (_dir, db) = db();
+        TRACED_STATEMENTS.lock().unwrap().clear();
+        db.lock().trace(Some(record_traced_statement));
+
+        db.begin_batch().unwrap();
+        for (source_epoch, suffix) in [(100, 'a'), (101, 'b'), (102, 'c')] {
+            db.commit_activity_bucket(&activity_bucket(wallet(), source_epoch, &[suffix]))
+                .unwrap();
+        }
+        db.commit_batch().unwrap();
+        db.lock().trace(None);
+
+        let statements = std::mem::take(&mut *TRACED_STATEMENTS.lock().unwrap());
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.as_str() == "BEGIN IMMEDIATE")
+                .count(),
+            1
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.as_str() == "COMMIT")
+                .count(),
+            1
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.starts_with("SAVEPOINT"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.starts_with("RELEASE"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.starts_with("ROLLBACK"))
+                .count(),
+            0
+        );
     }
 
     #[test]
