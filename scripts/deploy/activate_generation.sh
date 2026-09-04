@@ -927,16 +927,49 @@ assert projection.get("applied") is not None and projection.get("last_error") is
     "$generation_dir/status.json" "$merge_commit" "$bankroll" "$1"
 }
 
-wait_for_invocation_status() {
-  local active_enter_unix=$1
-  for _ in {1..120}; do
-    if [[ -f "$generation_dir/status.json" ]] && verify_status "$active_enter_unix" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
+# The binary binds its listener and starts the status writer only AFTER the boot walk of the approved
+# due subset (rehearsal: census 01:04:24Z, listening 01:41:21Z; production: 82 wallets took 92 min at
+# concurrency 4). Readiness deadlines are therefore sized by the approved walk: 120 s per wallet, at
+# least 300 s. While waiting, the process proved at `started` must remain the running invocation.
+boot_readiness_deadline() {
+  local approved deadline
+  approved=$(manifest_get owner_approved_due_subset 2>/dev/null) || approved=0
+  [[ "$approved" =~ ^[0-9]+$ ]] || approved=0
+  deadline=$((approved * 120))
+  ((deadline >= 300)) || deadline=300
+  echo "$deadline"
+}
+
+readiness_poll_secs() {
+  if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]]; then echo 0; else echo 30; fi
+}
+
+wait_for_listening_bind() {
+  local deadline=$1 waited=0 poll
+  poll=$(readiness_poll_secs)
+  while ! (verify_listening_bind >/dev/null 2>&1); do
+    ((waited < deadline)) || {
+      verify_listening_bind || true
+      die "pe-service is not listening on the configured production bind after $deadline seconds (boot walk of $(manifest_get owner_approved_due_subset 2>/dev/null || echo '?') wallets)"
+    }
+    verify_started_invocation || die "pe-service invocation changed while waiting for the production bind"
+    sleep "$poll"
+    waited=$((waited + (poll > 0 ? poll : 30)))
   done
-  verify_status "$active_enter_unix" || true
-  die "status.json did not become healthy and newer than the recorded invocation within 120 seconds"
+}
+
+wait_for_invocation_status() {
+  local active_enter_unix=$1 deadline=$2 waited=0 poll
+  poll=$(readiness_poll_secs)
+  while ! { [[ -f "$generation_dir/status.json" ]] && verify_status "$active_enter_unix" >/dev/null 2>&1; }; do
+    ((waited < deadline)) || {
+      verify_status "$active_enter_unix" || true
+      die "status.json did not become healthy and newer than the recorded invocation within $deadline seconds"
+    }
+    verify_started_invocation || die "pe-service invocation changed while waiting for status.json"
+    sleep "$poll"
+    waited=$((waited + (poll > 0 ? poll : 30)))
+  done
 }
 
 verify_started_invocation() {
@@ -989,7 +1022,8 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
   if ! (verify_running_generation >/dev/null); then
     post_start_refusal "new pe-service process proof failed while entering verified"
   fi
-  if ! (verify_listening_bind); then
+  boot_deadline=$(boot_readiness_deadline)
+  if ! (wait_for_listening_bind "$boot_deadline"); then
     post_start_refusal "pe-service is not listening on the configured production bind"
   fi
   if ! (verify_started_invocation); then
@@ -998,8 +1032,8 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
   if ! active_enter_unix=$(manifest_get active_enter_unix); then
     post_start_refusal "recorded pe-service invocation timestamp is unavailable"
   fi
-  if ! (wait_for_invocation_status "$active_enter_unix"); then
-    post_start_refusal "status.json did not become healthy and newer than the recorded invocation within 120 seconds"
+  if ! (wait_for_invocation_status "$active_enter_unix" "$boot_deadline"); then
+    post_start_refusal "status.json did not become healthy and newer than the recorded invocation within $boot_deadline seconds"
   fi
   if ! (verify_started_invocation); then
     post_start_refusal "recorded pe-service invocation changed while entering verified"

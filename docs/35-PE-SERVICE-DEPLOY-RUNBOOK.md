@@ -180,7 +180,10 @@ adopts an already-running exact generation or runs `systemctl enable pe-service`
 running-process proof against the adopted artifacts, and records its `InvocationID` plus
 `ActiveEnterTimestamp`. Both the `started` and `verified` proofs require the unit to be active and
 enabled. `verified` repeats that proof before the manifest advances,
-waits a bounded 120 seconds for `status.json.updated_at` to be newer than that recorded invocation, then
+then waits for the production bind and for `status.json.updated_at` to be newer than that recorded
+invocation: the binary binds its listener and starts the status writer only after the boot walk of the
+approved due subset, so the deadline is 120 seconds per approved wallet (at least 300 seconds), and the
+proved invocation must remain the running one throughout the wait. It then
 rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest ranking
 batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
 any approved subset, producer/critical-task health, fresh Supabase book, successful watchlist projection,
