@@ -194,7 +194,7 @@ write_service_environment() {
   (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") |
     python3 -c 'import sys
 parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
-shell_own=(b"_=",b"PWD=",b"SHLVL=",b"OLDPWD=")
+shell_own=(b"_=",b"OLDPWD=")  # the real wrapper exec keeps PWD and SHLVL (EVIDENCE F6)
 sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$proc/environ"
   printf '%s\0' \
     "CREDENTIALS_DIRECTORY=$credential" \
@@ -369,7 +369,7 @@ EOF
   (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") |
     python3 -c 'import sys
 parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
-shell_own=(b"_=",b"PWD=",b"SHLVL=",b"OLDPWD=")
+shell_own=(b"_=",b"OLDPWD=")  # the real wrapper exec keeps PWD and SHLVL (EVIDENCE F6)
 sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$root/proc/1234/environ"
   printf '%s\0' \
     'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \
@@ -727,7 +727,7 @@ restore_fake_process() {
   (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") |
     python3 -c 'import sys
 parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
-shell_own=(b"_=",b"PWD=",b"SHLVL=",b"OLDPWD=")
+shell_own=(b"_=",b"OLDPWD=")  # the real wrapper exec keeps PWD and SHLVL (EVIDENCE F6)
 sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$proc/environ"
   printf '%s\0' \
     'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \

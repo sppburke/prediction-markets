@@ -159,7 +159,8 @@ process_runs_service() {
   #   argv  == exactly `<binary> <config>` (NUL-split; empty elements kept)
   #   environ: every variable the installed environment file defines (evaluated with the unit's own
   #   `set -a; source` semantics) is present with an equal value, and every extra name is one of the
-  #   exact systemd-injected names observed for the production unit
+  #   exact systemd-injected names observed for the production unit or one of the unit's `bash -c`
+  #   wrapper's own variables (PWD, SHLVL, OLDPWD, _; production shows PWD and SHLVL — EVIDENCE F6)
   local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 pid=$5
   python3 -c 'import os,subprocess,sys
 expected_binary,expected_config,expected_env,working,pid,proc_root=sys.argv[1:]
@@ -198,6 +199,7 @@ missing=[name for name,value in expected.items() if running.get(name) != value]
 injected={
     b"CREDENTIALS_DIRECTORY",b"HOME",b"INVOCATION_ID",b"JOURNAL_STREAM",b"LANG",b"LOGNAME",
     b"MEMORY_PRESSURE_WATCH",b"MEMORY_PRESSURE_WRITE",b"PATH",b"SHELL",b"SYSTEMD_EXEC_PID",b"USER",
+    b"PWD",b"SHLVL",b"OLDPWD",b"_",
 }
 unknown=[name for name in running if name not in expected and name not in injected]
 credential_ok=running.get(b"CREDENTIALS_DIRECTORY") == b"/run/credentials/pe-service.service"
