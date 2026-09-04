@@ -219,25 +219,11 @@ case "$action" in
       if [[ "$prefix" == service ]]; then start_service; else write_bit forge.active true; fi
     fi
     ;;
-  cat)
-    if [[ -f "$state/service.unit-file" ]]; then
-      cat "$state/service.unit-file"
-    else
-      printf '%s\n' "[Service]" "User=sean" "WorkingDirectory=$root/prediction-markets" \
-        "ExecStart=/bin/bash -c 'set -a; source $root/prediction-markets/.env; set +a; exec $root/prediction-markets/target/release/pe-service smoke-test/service.toml'"
-    fi
-    ;;
   show)
     if [[ "$*" == *InvocationID* ]]; then
       if [[ -e "$state/invocation-changed" ]]; then echo invocation-test-2; else echo invocation-test-1; fi
     elif [[ "$*" == *ActiveEnterTimestamp* ]]; then
       echo 2033-05-18T03:33:19Z
-    elif [[ "$*" == *ExecStart* ]]; then
-      if [[ -f "$state/service.exec-start-rendered" ]]; then
-        cat "$state/service.exec-start-rendered"
-      else
-        echo "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source $root/prediction-markets/.env; set +a; exec $root/prediction-markets/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }"
-      fi
     elif [[ "$*" == *NeedDaemonReload* ]]; then
       if [[ -e "$state/daemon-reload-pending" ]]; then echo yes; else echo no; fi
     elif [[ "$*" == *WorkingDirectory* ]]; then
@@ -264,6 +250,8 @@ make_case() {
   chmod 0444 "$root/.pe-deploy.lock"
   stat -c '%i|%y|%a' "$root/.pe-deploy.lock" > "$root/test-state/deploy-lock.before"
   write_shims "$root/bin"
+  mkdir -p "$root/proc/1234"
+  printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml" > "$root/proc/1234/cmdline"
   printf '%s\n' old-binary > "$service/target/release/pe-service"
   chmod +x "$service/target/release/pe-service"
   cat > "$service/smoke-test/service.toml" <<'TOML'
@@ -288,6 +276,17 @@ PE_STATUS_PATH=$service/old/status.json
 PE_PAPER_STATE_DB_PATH=$service/old/paper_state.db
 PE_LEGACY_WALLET_HISTORY_PATH=$service/old/wallet_market_history.json
 EOF
+  # fake /proc: the running process's PE_* environment is exactly the installed .env; its exe is the installed binary
+  python3 - "$service/.env" "$root/proc/1234/environ" <<'PY'
+import sys
+env,out=sys.argv[1:]
+parts=[]
+for line in open(env):
+    line=line.strip()
+    if line.startswith("PE_") and "=" in line: parts.append(line)
+open(out,"wb").write(("\0".join(parts)+"\0").encode())
+PY
+  cp "$service/target/release/pe-service" "$root/proc/1234/exe"
   mkdir -p "$service/old"
   printf '%s\n' old-paper > "$service/old/paper.log"
   printf '%s\n' old-source > "$service/old/source_events.log"
@@ -326,7 +325,7 @@ activate() {
   local root=$1 id=${2:-activation-557}; shift 2 || true
   local site_args=(--site-confirmed)
   [[ "${TEST_OMIT_SITE_CONFIRMATION:-0}" != 1 ]] || site_args=()
-  env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" \
+  env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" \
     SUPABASE_DB_URL=postgres://test PATH="$root/bin:$PATH" \
     "$SCRIPT_DIR/activate_generation.sh" \
       --activation-id "$id" --generation-dir "$root/prediction-markets/gen/557" \
@@ -343,7 +342,7 @@ activate() {
 
 rollback() {
   local root=$1; shift
-  env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" \
+  env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" \
     SUPABASE_DB_URL=postgres://test PATH="$root/bin:$PATH" \
     "$SCRIPT_DIR/rollback_generation.sh" --activation-id activation-557 "$@"
 }
@@ -356,10 +355,10 @@ reboot_host() {
     if [[ "$unit" == pe-service ]]; then prefix=service; else prefix=forge; fi
     if [[ "$(<"$root/test-state/$prefix.enabled")" == true ]]; then
       if [[ "$unit" == pe-service ]]; then
-        env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PATH="$root/bin:$PATH" \
+        env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" PATH="$root/bin:$PATH" \
           "$root/bin/systemctl" start pe-service
       else
-        env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PATH="$root/bin:$PATH" \
+        env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" PATH="$root/bin:$PATH" \
           "$root/bin/systemctl" --user start pe-rank-loop
       fi
     fi
@@ -471,7 +470,7 @@ grep -q 'provisioned deploy lock is absent' "$root/absent.err" || fail "absent-l
 root=$(make_case lock)
 hold="$root/hold"
 : > "$hold"
-env PE_ACTIVATION_TEST_HOLD_LOCK_FILE="$hold" \
+env PE_ACTIVATION_TEST_HOLD_LOCK_FILE="$hold" PROC_ROOT="$root/proc" \
   PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" \
   SUPABASE_DB_URL=postgres://test PATH="$root/bin:$PATH" \
   "$SCRIPT_DIR/activate_generation.sh" --activation-id activation-557 \
@@ -495,62 +494,31 @@ rm "$hold"
 wait "$holder"
 assert_verified "$root"
 
-# Unit ownership is proved from the unit file text: the documented wrapper (default) and the direct shape with EnvironmentFile=.
-root=$(make_case unit-direct-with-environment-file)
-service="$root/prediction-markets"
-printf '%s\n' "[Service]" "WorkingDirectory=$service" "EnvironmentFile=$service/.env" \
-  "ExecStart=$service/target/release/pe-service smoke-test/service.toml" > "$root/test-state/service.unit-file"
-echo "{ path=$service/target/release/pe-service ; argv[]=$service/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }" > "$root/test-state/service.exec-start-rendered"
-activate "$root" activation-557 >/dev/null
-assert_verified "$root"
-
-# The loaded (rendered) command must match the unit file: a stale loaded command with NeedDaemonReload=no is refused.
-root=$(make_case unit-loaded-differs-from-file)
-service="$root/prediction-markets"
-echo "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source $service/.env; set +a; exec /tmp/other smoke-test/service.toml ; ignore_errors=no ; }" > "$root/test-state/service.exec-start-rendered"
-set +e
-activate "$root" activation-557 >"$root/unit-loaded.out" 2>"$root/unit-loaded.err"
-rc=$?
-set -e
-[[ "$rc" == 1 ]] || fail "loaded ExecStart differing from the unit file was accepted"
-grep -q 'loaded ExecStart differs from the unit file' "$root/unit-loaded.err" || fail "loaded-differs refusal was not explicit"
-[[ ! -e "$root/pe-activation.json" ]] || fail "loaded-differs unit was adopted into a manifest"
-assert_deploy_lock_unchanged "$root"
-
-refuse_unit_file() {
-  local name=$1 exec_line=$2 extra=${3-}
-  local root service
+# Ownership is proved from the running process: a fake /proc per case carries cmdline, environ and exe.
+refuse_process() {
+  local name=$1 kind=$2 message=$3
+  local root service proc
   root=$(make_case "$name")
-  service="$root/prediction-markets"
-  { printf '%s\n' "[Service]" "WorkingDirectory=$service"; [[ -n "$extra" ]] && printf '%s\n' "${extra//@SVC@/$service}"; printf '%s\n' "${exec_line//@SVC@/$service}"; } > "$root/test-state/service.unit-file"
+  service="$root/prediction-markets"; proc="$root/proc/1234"
+  case "$kind" in
+    argv) printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml.backup" > "$proc/cmdline" ;;
+    argv-empty) printf '%s\0%s\0%s\0' "$service/target/release/pe-service" "" "smoke-test/service.toml" > "$proc/cmdline" ;;
+    environ) printf 'PE_SUPABASE_URL=https://other.example\0PE_SUPABASE_SECRET_KEY=x\0' > "$proc/environ" ;;
+    exe) printf 'other-binary-bytes\n' > "$proc/exe" ;;
+  esac
   set +e
-  activate "$root" activation-557 >"$root/unit-shape.out" 2>"$root/unit-shape.err"
+  activate "$root" activation-557 >"$root/proc.out" 2>"$root/proc.err"
   local rc=$?
   set -e
-  [[ "$rc" == 1 ]] || fail "$name: unit ExecStart shape was accepted"
-  grep -q 'does not select the installed binary and service config' "$root/unit-shape.err" ||
-    fail "$name: refusal was not explicit"
-  [[ ! -e "$root/pe-activation.json" ]] || fail "$name: shape was adopted into a manifest"
+  [[ "$rc" == 1 ]] || fail "$name: mismatching process was accepted"
+  grep -q "$message" "$root/proc.err" || fail "$name: refusal was not explicit"
+  [[ ! -e "$root/pe-activation.json" ]] || fail "$name: mismatching process was adopted into a manifest"
   assert_deploy_lock_unchanged "$root"
 }
-# Every deviation from the two exact templates is refused.
-refuse_unit_file unit-wrapper-comment-backup "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml # @SVC@/smoke-test/service.toml.backup'"
-refuse_unit_file unit-wrapper-backup-config "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml.backup'"
-refuse_unit_file unit-wrapper-attached-hash "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service @SVC@/smoke-test/service.toml#backup'"
-refuse_unit_file unit-wrapper-backup-env "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env.backup; set +a; exec @SVC@/target/release/pe-service smoke-test/service.toml'"
-refuse_unit_file unit-wrapper-command-in-comment "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec /tmp/not-pe-service # exec @SVC@/target/release/pe-service smoke-test/service.toml'"
-refuse_unit_file unit-wrapper-quoted-hash "ExecStart=/bin/bash -c 'false && exec @SVC@/target/release/pe-service smoke-test/service.toml; printf \"%s\" \"#\"; exec @SVC@/target/release/pe-service smoke-test/service.toml.backup'"
-refuse_unit_file unit-wrapper-subshell "ExecStart=/bin/bash -c '(exec @SVC@/target/release/pe-service smoke-test/service.toml)'"
-refuse_unit_file unit-wrapper-unquoted "ExecStart=/bin/bash -c set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service smoke-test/service.toml"
-refuse_unit_file unit-wrapper-split-config "ExecStart=/bin/bash -c 'set -a; source @SVC@/.env; set +a; exec @SVC@/target/release/pe-service' smoke-test/service.toml"
-refuse_unit_file unit-direct-three-tokens "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml extra" "EnvironmentFile=@SVC@/.env"
-refuse_unit_file unit-direct-other-binary "ExecStart=/tmp/other smoke-test/service.toml" "EnvironmentFile=@SVC@/.env"
-refuse_unit_file unit-direct-no-environment-file "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml"
-refuse_unit_file unit-direct-environment-attached-hash "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "EnvironmentFile=@SVC@/.env#backup"
-refuse_unit_file unit-spaced-reset-override "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart =\nExecStart =/tmp/other smoke-test/service.toml')"
-refuse_unit_file unit-spaced-extra-environment "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nEnvironmentFile =@SVC@/.env.backup')"
-refuse_unit_file unit-continuation-reset-override "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart \\\n=\nExecStart \\\n=/tmp/other smoke-test/service.toml')"
-refuse_unit_file unit-two-exec-start-lines "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart=')"
+refuse_process proc-argv-backup-config argv "does not run the installed binary, service config and environment"
+refuse_process proc-argv-empty-element argv-empty "does not run the installed binary, service config and environment"
+refuse_process proc-environ-differs environ "does not run the installed binary, service config and environment"
+refuse_process proc-exe-differs exe "running pe-service is not the installed binary"
 
 # A pending daemon-reload means the loaded unit may differ from the files on disk: refuse.
 root=$(make_case unit-daemon-reload-pending)
