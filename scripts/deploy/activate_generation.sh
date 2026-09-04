@@ -90,7 +90,7 @@ EOF
   exit 0
 fi
 
-for command in python3 realpath sha256sum sqlite3 psql flock systemctl; do
+for command in python3 realpath readlink sha256sum sqlite3 psql flock systemctl; do
   command -v "$command" >/dev/null || die "$command not installed"
 done
 if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
@@ -158,8 +158,8 @@ process_runs_service() {
   # Ownership of what runs NOW, from the process itself (lossless, no unit-file interpretation):
   #   argv  == exactly `<binary> <config>` (NUL-split; empty elements kept)
   #   environ: every variable the installed environment file defines (evaluated with the unit's own
-  #   `set -a; source` semantics) is present with an equal value, PE_* names match both ways, and the
-  #   dynamic-loader overrides are absent; variables systemd itself injects are not the file's and are ignored
+  #   `set -a; source` semantics) is present with an equal value, and every extra name is one of the
+  #   exact systemd-injected names observed for the production unit
   local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 pid=$5
   python3 -c 'import os,subprocess,sys
 expected_binary,expected_config,expected_env,working,pid,proc_root=sys.argv[1:]
@@ -186,8 +186,6 @@ def parse_environment(raw):
     return entries
 with open("%s/%s/environ" % (proc_root, pid), "rb") as handle:
     running=parse_environment(handle.read())
-if b"LD_PRELOAD" in running or b"LD_LIBRARY_PATH" in running:
-    raise SystemExit(1)
 evaluated=subprocess.run(
     ["env","-i","/bin/bash","-c","set -a; source \"$1\"; set +a; env -0","bash",expected_env],
     check=False,cwd=working,stdout=subprocess.PIPE,
@@ -197,32 +195,65 @@ if evaluated.returncode != 0:
 shell_own={b"_",b"PWD",b"SHLVL",b"OLDPWD"}
 expected={name:value for name,value in parse_environment(evaluated.stdout).items() if name not in shell_own}
 missing=[name for name,value in expected.items() if running.get(name) != value]
-extra_pe=[name for name in running if name.startswith(b"PE_") and name not in expected]
-raise SystemExit(0 if not missing and not extra_pe else 1)' \
+injected={
+    b"CREDENTIALS_DIRECTORY",b"HOME",b"INVOCATION_ID",b"JOURNAL_STREAM",b"LANG",b"LOGNAME",
+    b"MEMORY_PRESSURE_WATCH",b"MEMORY_PRESSURE_WRITE",b"PATH",b"SHELL",b"SYSTEMD_EXEC_PID",b"USER",
+}
+unknown=[name for name in running if name not in expected and name not in injected]
+credential_ok=running.get(b"CREDENTIALS_DIRECTORY") == b"/run/credentials/pe-service.service"
+raise SystemExit(0 if not missing and not unknown and credential_ok else 1)' \
     "$expected_binary" "$expected_config" "$expected_env" "$working" "$pid" "$PROC_ROOT"
 }
 
+read_service_process_snapshot() {
+  local output key value
+  local active= pid= invocation= active_enter=
+  output=$(systemctl show -p ActiveState -p MainPID -p InvocationID -p ActiveEnterTimestamp pe-service) ||
+    return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      ActiveState) active=$value ;;
+      MainPID) pid=$value ;;
+      InvocationID) invocation=$value ;;
+      ActiveEnterTimestamp) active_enter=$value ;;
+    esac
+  done <<< "$output"
+  [[ -n "$active" && -n "$pid" && -n "$invocation" && -n "$active_enter" ]] || return 1
+  SERVICE_SNAPSHOT_ACTIVE=$active
+  SERVICE_SNAPSHOT_PID=$pid
+  SERVICE_SNAPSHOT_INVOCATION=$invocation
+  SERVICE_SNAPSHOT_ACTIVE_ENTER=$active_enter
+}
+
 verify_installed_unit_owner() {
-  # Ownership is proved from the running process, never from unit-file syntax: the manager's working
-  # directory, no pending daemon-reload, the running executable's hash, its exact argv, and its environment
-  # carrying the shell-evaluated installed environment file. The same checks run on the NEW process in
-  # `verified`, so what the unit starts after the switch is proved, not parsed.
-  local working pid running
+  # Ownership is proved from one stable manager snapshot plus the running process, never from unit-file
+  # syntax. The same checks run on the NEW process in `verified`, so what the unit starts after the switch
+  # is proved, not parsed.
+  local active pid invocation active_enter working running
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
     die "one or more installed service artifacts are absent"
-  [[ "$(systemctl_active pe-service)" == true ]] || die "installed pe-service is not active"
-  working=$(systemctl show pe-service -p WorkingDirectory --value)
-  [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
-    die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
+  read_service_process_snapshot || die "could not read the pe-service process snapshot"
+  active=$SERVICE_SNAPSHOT_ACTIVE
+  pid=$SERVICE_SNAPSHOT_PID
+  invocation=$SERVICE_SNAPSHOT_INVOCATION
+  active_enter=$SERVICE_SNAPSHOT_ACTIVE_ENTER
+  [[ "$active" == active ]] || die "installed pe-service is not active"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
   [[ "$(systemctl show pe-service -p NeedDaemonReload --value)" == no ]] ||
     die "pe-service unit files differ from the loaded configuration (daemon-reload pending)"
-  pid=$(systemctl show pe-service -p MainPID --value)
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
+  working=$(readlink "$PROC_ROOT/$pid/cwd") || die "could not read pe-service process cwd"
+  [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
+    die "pe-service process cwd is $working, expected $SERVICE_ROOT"
   running=$(sha256_file "$PROC_ROOT/$pid/exe")
   [[ "$running" == "$(sha256_file "$SERVICE_BINARY")" ]] ||
     die "running pe-service is not the installed binary"
   process_runs_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$pid" ||
     die "running pe-service does not run the installed binary, service config and environment"
+  read_service_process_snapshot || die "could not re-read the pe-service process snapshot"
+  [[ "$SERVICE_SNAPSHOT_ACTIVE" == "$active" && "$SERVICE_SNAPSHOT_PID" == "$pid" &&
+     "$SERVICE_SNAPSHOT_INVOCATION" == "$invocation" &&
+     "$SERVICE_SNAPSHOT_ACTIVE_ENTER" == "$active_enter" ]] ||
+    die "pe-service process snapshot changed during ownership proof"
 }
 
 render_config() {
@@ -708,24 +739,52 @@ if (( $(state_rank "$state") < $(state_rank switched) )); then
 fi
 
 verify_running_generation() {
-  local expected working pid running
+  local expected active pid invocation active_enter working running
   expected=$(manifest_get artifacts.binary.sha256)
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$expected" ]] || die "installed binary is not the generation binary"
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get artifacts.config.sha256)" ]] || die "installed config hash drift"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get artifacts.environment.sha256)" ]] || die "installed env hash drift"
   validate_environment "$SERVICE_ENV" "$production_bind" false
-  [[ "$(systemctl_active pe-service)" == true ]] || die "generation pe-service is not active"
-  working=$(systemctl show pe-service -p WorkingDirectory --value)
-  [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
-    die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
+  read_service_process_snapshot || die "could not read the pe-service process snapshot"
+  active=$SERVICE_SNAPSHOT_ACTIVE
+  pid=$SERVICE_SNAPSHOT_PID
+  invocation=$SERVICE_SNAPSHOT_INVOCATION
+  active_enter=$SERVICE_SNAPSHOT_ACTIVE_ENTER
+  [[ "$active" == active ]] || die "generation pe-service is not active"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
   [[ "$(systemctl show pe-service -p NeedDaemonReload --value)" == no ]] ||
     die "pe-service unit files differ from the loaded configuration (daemon-reload pending)"
-  pid=$(systemctl show pe-service -p MainPID --value)
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
+  working=$(readlink "$PROC_ROOT/$pid/cwd") || die "could not read pe-service process cwd"
+  [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
+    die "pe-service process cwd is $working, expected $SERVICE_ROOT"
   running=$(sha256_file "$PROC_ROOT/$pid/exe")
   [[ "$running" == "$expected" ]] || die "running pe-service hash is not the generation hash"
   process_runs_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$pid" ||
     die "running pe-service does not run the generation binary, service config and environment"
+  read_service_process_snapshot || die "could not re-read the pe-service process snapshot"
+  [[ "$SERVICE_SNAPSHOT_ACTIVE" == "$active" && "$SERVICE_SNAPSHOT_PID" == "$pid" &&
+     "$SERVICE_SNAPSHOT_INVOCATION" == "$invocation" &&
+     "$SERVICE_SNAPSHOT_ACTIVE_ENTER" == "$active_enter" ]] ||
+    die "pe-service process snapshot changed during generation proof"
+  printf '%s\n%s\n' "$invocation" "$active_enter"
+}
+
+post_start_refusal() {
+  local reason=$1 at json
+  "${SERVICE_MUTATE[@]}" disable --now pe-service
+  [[ "$(systemctl_active pe-service)" == false ]] || die "post-start refusal left pe-service active"
+  [[ "$(systemctl_enabled pe-service)" == false ]] || die "post-start refusal left pe-service enabled"
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  json=$(python3 -c 'import json,sys
+path,at,reason=sys.argv[1:]
+value=json.load(open(path, encoding="utf-8"))
+for key in ("invocation_id","active_enter_timestamp","active_enter_unix"):
+    value.pop(key,None)
+value.setdefault("post_start_refusals",[]).append({"at":at,"reason":reason})
+value["state"]="switched"
+print(json.dumps(value,sort_keys=True,separators=(",",":")))' "$MANIFEST" "$at" "$reason")
+  atomic_manifest_json "$json" post-start-refusal
+  die "$reason; pe-service disabled and stopped, activation rewound to switched"
 }
 
 verify_listening_bind() {
@@ -744,21 +803,25 @@ print(port)' "$production_bind")
 }
 
 if (( $(state_rank "$state") < $(state_rank started) )); then
+  proof=
   if [[ "$(systemctl_active pe-service)" == true ]]; then
-    verify_running_generation
+    if ! proof=$(verify_running_generation); then
+      post_start_refusal "new pe-service process proof failed while entering started"
+    fi
   else
     "${SERVICE_MUTATE[@]}" enable --now pe-service
     maybe_crash service-started
-    [[ "$(systemctl_active pe-service)" == true ]] || die "pe-service did not become active"
-    verify_running_generation
+    if ! proof=$(verify_running_generation); then
+      post_start_refusal "new pe-service process proof failed while entering started"
+    fi
   fi
   [[ "$(systemctl_enabled pe-service)" == true ]] || die "pe-service did not become enabled"
-  invocation=$(systemctl show pe-service -p InvocationID --value)
+  mapfile -t proved_snapshot <<< "$proof"
+  [[ "${#proved_snapshot[@]}" == 2 ]] || die "generation proof returned an invalid snapshot"
+  invocation=${proved_snapshot[0]}
   [[ -n "$invocation" ]] || die "pe-service has no InvocationID"
-  active_enter=$(systemctl show pe-service -p ActiveEnterTimestamp --value)
+  active_enter=${proved_snapshot[1]}
   [[ -n "$active_enter" ]] || die "pe-service has no ActiveEnterTimestamp"
-  [[ "$(systemctl show pe-service -p InvocationID --value)" == "$invocation" ]] ||
-    die "pe-service invocation changed while its activation timestamp was recorded"
   active_enter_unix=$(date --date="$active_enter" +%s)
   [[ "$active_enter_unix" =~ ^[0-9]+$ ]] || die "invalid pe-service ActiveEnterTimestamp: $active_enter"
   patch=$(python3 -c 'import json,sys; print(json.dumps({"invocation_id":sys.argv[1],"active_enter_timestamp":sys.argv[2],"active_enter_unix":int(sys.argv[3])}))' \
@@ -802,9 +865,10 @@ wait_for_invocation_status() {
 }
 
 verify_started_invocation() {
-  [[ "$(systemctl show pe-service -p InvocationID --value)" == "$(manifest_get invocation_id)" ]] ||
+  read_service_process_snapshot || die "could not read the pe-service process snapshot"
+  [[ "$SERVICE_SNAPSHOT_INVOCATION" == "$(manifest_get invocation_id)" ]] ||
     die "running pe-service InvocationID differs from the started manifest"
-  [[ "$(systemctl show pe-service -p ActiveEnterTimestamp --value)" == "$(manifest_get active_enter_timestamp)" ]] ||
+  [[ "$SERVICE_SNAPSHOT_ACTIVE_ENTER" == "$(manifest_get active_enter_timestamp)" ]] ||
     die "running pe-service ActiveEnterTimestamp differs from the started manifest"
 }
 
@@ -831,7 +895,9 @@ raise SystemExit(0 if value.get("site_confirmed_by") and value.get("site_confirm
 }
 
 if (( $(state_rank "$state") < $(state_rank verified) )); then
-  verify_running_generation
+  if ! (verify_running_generation >/dev/null); then
+    post_start_refusal "new pe-service process proof failed while entering verified"
+  fi
   verify_listening_bind
   verify_started_invocation
   wait_for_invocation_status "$(manifest_get active_enter_unix)"

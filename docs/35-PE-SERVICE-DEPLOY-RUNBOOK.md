@@ -113,12 +113,16 @@ decision may be supplied as the exact `--approve-due-subset <count>`; it is dura
 Before T0, old state paths are resolved exclusively from the installed `.env` and service TOML, whose
 hashes are bound in the manifest. The driver never parses `ExecStart`, `EnvironmentFile`, or other unit
 text. Instead it proves ownership from the running `MainPID`: `/proc/<pid>/exe` matches the installed
-binary, argv is exactly `<installed-binary> <installed-config>`, every variable the installed environment
-file defines (evaluated with the unit's own `set -a; source` semantics) is present in the process with an
-equal value, and `PE_*` names match both ways. Variables systemd itself injects (its credentials and
-memory-pressure paths, invocation ids, `PATH`, `HOME`) are not the file's and are ignored; `LD_PRELOAD` and
-`LD_LIBRARY_PATH` are always refused. The loaded manager state must also report the expected `WorkingDirectory` and
-`NeedDaemonReload=no`. Staged templates are not an old-state authority. Immediately before each
+binary; `/proc/<pid>/cwd` equals the service root and owns normalization of the relative config argv; argv
+is exactly `<installed-binary> <installed-config>`; and every variable the installed environment file
+defines (evaluated with the unit's own `set -a; source` semantics) is present with an equal value. Any
+process variable not defined by that file must be one of exactly `CREDENTIALS_DIRECTORY`, `HOME`,
+`INVOCATION_ID`, `JOURNAL_STREAM`, `LANG`, `LOGNAME`, `MEMORY_PRESSURE_WATCH`,
+`MEMORY_PRESSURE_WRITE`, `PATH`, `SHELL`, `SYSTEMD_EXEC_PID`, or `USER`, and
+`CREDENTIALS_DIRECTORY` must equal `/run/credentials/pe-service.service`; every other extra is refused.
+One systemd snapshot supplies `ActiveState`, `MainPID`, `InvocationID`, and `ActiveEnterTimestamp` before
+the `/proc` proof, and an identical second snapshot must follow it. The loaded manager state must also
+report `NeedDaemonReload=no`. Staged templates are not an old-state authority. Immediately before each
 rehearsal preflight and execution, the driver rechecks the staged rehearsal environment, config, and
 binary against their manifest hashes. Staging runs under a restrictive umask, and secret-bearing
 environment files are mode `0600` from their first open. `guarded` starts T0 by disabling and stopping
@@ -138,7 +142,11 @@ waits a bounded 120 seconds for `status.json.updated_at` to be newer than that r
 rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest ranking
 batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
 any approved subset, producer/critical-task health, fresh Supabase book, successful watchlist projection,
-and refreshed materialized view.
+and refreshed materialized view. If the new-process proof fails either while entering `started` or at the
+top of `verified`, the driver stops and disables `pe-service`, verifies both conditions, appends the
+timestamped refusal reason to `post_start_refusals`, removes the recorded invocation fields, and rewinds
+the manifest to `switched`. Forge remains paused; repair the mismatch and re-run the same activation so it
+starts and proves the generation again.
 
 The final signed-in site check cannot be automated because the site uses Google single sign-on. The
 driver therefore prompts the operator to inspect the fresh era and records `site_confirmed_by` and

@@ -188,17 +188,65 @@ unit=${*: -1}
 if [[ "$unit" == pe-rank-loop ]]; then prefix=forge; else prefix=service; fi
 read_bit() { [[ -e "$state/$1" ]] && cat "$state/$1" || echo false; }
 write_bit() { printf '%s\n' "$2" > "$state/$1"; }
+write_service_environment() {
+  local proc=$1 service=$2 credential=/run/credentials/pe-service.service
+  [[ ! -e "$state/post-start-credential-wrong" ]] || credential=/wrong
+  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") |
+    python3 -c 'import sys
+parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
+shell_own=(b"_=",b"PWD=",b"SHLVL=",b"OLDPWD=")
+sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$proc/environ"
+  printf '%s\0' \
+    "CREDENTIALS_DIRECTORY=$credential" \
+    "HOME=$root/home" \
+    'INVOCATION_ID=invocation-test-1' \
+    'JOURNAL_STREAM=8:557' \
+    'LANG=C.UTF-8' \
+    'LOGNAME=sean' \
+    'MEMORY_PRESSURE_WATCH=/sys/fs/cgroup/system.slice/pe-service.service/memory.pressure' \
+    'MEMORY_PRESSURE_WRITE=c29tZQ==' \
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin' \
+    'SHELL=/bin/bash' \
+    'SYSTEMD_EXEC_PID=1234' \
+    'USER=sean' >> "$proc/environ"
+  if [[ -e "$state/post-start-environ-wrong" ]]; then
+    printf 'PE_POST_START_MISMATCH=1\0' >> "$proc/environ"
+  elif [[ -e "$state/post-start-ld-preload-wrong" ]]; then
+    printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ"
+  elif [[ -e "$state/post-start-non-pe-value-wrong" ]]; then
+    python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[(b"NON_PE_QUOTED_VALUE=changed" if part.startswith(b"NON_PE_QUOTED_VALUE=") else part)
+       for part in open(path,"rb").read().split(b"\0") if part]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+  elif [[ -e "$state/post-start-non-pe-missing-wrong" ]]; then
+    python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[part for part in open(path,"rb").read().split(b"\0")
+       if part and not part.startswith(b"NON_PE_QUOTED_VALUE=")]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+  fi
+}
 refresh_service_process() {
   local proc="$root/proc/1234"
   local service="$root/prediction-markets"
   mkdir -p "$proc"
   printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml" > "$proc/cmdline"
-  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") > "$proc/environ"
+  write_service_environment "$proc" "$service"
   cp "$service/target/release/pe-service" "$proc/exe"
+  rm -f "$proc/cwd"
+  if [[ -e "$state/post-start-cwd-wrong" ]]; then
+    mkdir -p "$root/elsewhere"
+    ln -s "$root/elsewhere" "$proc/cwd"
+  else
+    ln -s "$service" "$proc/cwd"
+  fi
   if [[ -e "$state/post-start-argv-wrong" ]]; then
     printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml.wrong" > "$proc/cmdline"
-  elif [[ -e "$state/post-start-environ-wrong" ]]; then
-    printf 'PE_POST_START_MISMATCH=1\0' >> "$proc/environ"
   elif [[ -e "$state/post-start-exe-wrong" ]]; then
     printf '%s\n' wrong-new-process-executable > "$proc/exe"
   fi
@@ -209,6 +257,7 @@ start_service() {
     echo $((count + 1)) > "$state/service-start-count"
   fi
   write_bit service.active true
+  : > "$state/fresh-service-started"
   refresh_service_process
   env_file="$root/prediction-markets/.env"
   if [[ -f "$env_file" ]]; then
@@ -228,7 +277,10 @@ case "$action" in
   start)
     if [[ "$prefix" == service ]]; then start_service; else write_bit forge.active true; fi
     ;;
-  disable) write_bit "$prefix.enabled" false ;;
+  disable)
+    write_bit "$prefix.enabled" false
+    if [[ " $* " == *" --now "* ]]; then write_bit "$prefix.active" false; fi
+    ;;
   enable)
     write_bit "$prefix.enabled" true
     if [[ "${1-}" == --now || "${2-}" == --now ]]; then
@@ -236,14 +288,30 @@ case "$action" in
     fi
     ;;
   show)
-    if [[ "$*" == *InvocationID* ]]; then
+    if [[ "$*" == *ActiveState* && "$*" == *MainPID* && "$*" == *InvocationID* &&
+          "$*" == *ActiveEnterTimestamp* ]]; then
+      snapshot_pid=1234
+      snapshot_invocation=invocation-test-1
+      if [[ -e "$state/invocation-changed" ]]; then snapshot_invocation=invocation-test-2; fi
+      if [[ -e "$state/fresh-service-started" && -e "$state/snapshot-change-after-first-show" ]]; then
+        count=0
+        [[ ! -e "$state/snapshot-change-show-count" ]] || count=$(<"$state/snapshot-change-show-count")
+        count=$((count + 1))
+        echo "$count" > "$state/snapshot-change-show-count"
+        if ((count > 1)); then
+          snapshot_pid=4321
+          snapshot_invocation=invocation-test-2
+        fi
+      fi
+      printf 'ActiveState=%s\nMainPID=%s\nInvocationID=%s\nActiveEnterTimestamp=%s\n' \
+        "$(read_bit service.active | sed 's/true/active/;s/false/inactive/')" \
+        "$snapshot_pid" "$snapshot_invocation" '2033-05-18T03:33:19Z'
+    elif [[ "$*" == *InvocationID* ]]; then
       if [[ -e "$state/invocation-changed" ]]; then echo invocation-test-2; else echo invocation-test-1; fi
     elif [[ "$*" == *ActiveEnterTimestamp* ]]; then
       echo 2033-05-18T03:33:19Z
     elif [[ "$*" == *NeedDaemonReload* ]]; then
       if [[ -e "$state/daemon-reload-pending" ]]; then echo yes; else echo no; fi
-    elif [[ "$*" == *WorkingDirectory* ]]; then
-      echo "$root/prediction-markets"
     else
       echo 1234
     fi
@@ -268,6 +336,7 @@ make_case() {
   write_shims "$root/bin"
   mkdir -p "$root/proc/1234"
   printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml" > "$root/proc/1234/cmdline"
+  ln -s "$service" "$root/proc/1234/cwd"
   printf '%s\n' old-binary > "$service/target/release/pe-service"
   chmod +x "$service/target/release/pe-service"
   cat > "$service/smoke-test/service.toml" <<'TOML'
@@ -297,7 +366,24 @@ PE_QUOTED_VALUE="quoted \${NON_PE_BASE} with spaces"
 NON_PE_QUOTED_VALUE="non-PE quoted value"
 EOF
   # fake /proc: the running process has the shell-evaluated installed environment and executable.
-  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") > "$root/proc/1234/environ"
+  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") |
+    python3 -c 'import sys
+parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
+shell_own=(b"_=",b"PWD=",b"SHLVL=",b"OLDPWD=")
+sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$root/proc/1234/environ"
+  printf '%s\0' \
+    'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \
+    "HOME=$root/home" \
+    'INVOCATION_ID=invocation-test-1' \
+    'JOURNAL_STREAM=8:557' \
+    'LANG=C.UTF-8' \
+    'LOGNAME=sean' \
+    'MEMORY_PRESSURE_WATCH=/sys/fs/cgroup/system.slice/pe-service.service/memory.pressure' \
+    'MEMORY_PRESSURE_WRITE=c29tZQ==' \
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin' \
+    'SHELL=/bin/bash' \
+    'SYSTEMD_EXEC_PID=1234' \
+    'USER=sean' >> "$root/proc/1234/environ"
   cp "$service/target/release/pe-service" "$root/proc/1234/exe"
   mkdir -p "$service/old"
   printf '%s\n' old-paper > "$service/old/paper.log"
@@ -385,12 +471,13 @@ assert_deploy_lock_unchanged() {
 }
 
 assert_verified() {
-  local root=$1 state starts stamps
+  local root=$1 expected_starts=${2:-1} state starts stamps
   state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
     "$root/pe-activation.json")
   [[ "$state" == verified ]] || fail "$root ended in state $state"
   starts=$(<"$root/test-state/service-start-count")
-  [[ "$starts" == 1 ]] || fail "$root started the fresh service $starts times"
+  [[ "$starts" == "$expected_starts" ]] ||
+    fail "$root started the fresh service $starts times, expected $expected_starts"
   stamps=$(<"$root/test-state/archive-count")
   [[ "$stamps" == 1 ]] || fail "$root created $stamps archive stamps"
   [[ "$(<"$root/test-state/forge.enabled")" == false ]] || fail "Forge enablement changed"
@@ -531,8 +618,33 @@ parts=[(b"PE_STATUS_PATH=/elsewhere/status.json" if part.startswith(b"PE_STATUS_
 open(path,"wb").write(b"\0".join(parts)+b"\0")
 PY
       ;;
+    non-pe-missing) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[part for part in open(path,"rb").read().split(b"\0")
+       if part and not part.startswith(b"NON_PE_QUOTED_VALUE=")]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
+    non-pe-value) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[(b"NON_PE_QUOTED_VALUE=changed" if part.startswith(b"NON_PE_QUOTED_VALUE=") else part)
+       for part in open(path,"rb").read().split(b"\0") if part]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
+    credential-wrong) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[(b"CREDENTIALS_DIRECTORY=/wrong" if part.startswith(b"CREDENTIALS_DIRECTORY=") else part)
+       for part in open(path,"rb").read().split(b"\0") if part]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
     environ-extra-pe) printf 'PE_UNEXPECTED=1\0' >> "$proc/environ" ;;
     ld-preload) printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ" ;;
+    cwd) rm "$proc/cwd"; mkdir -p "$root/elsewhere"; ln -s "$root/elsewhere" "$proc/cwd" ;;
     exe) printf 'other-binary-bytes\n' > "$proc/exe" ;;
   esac
   set +e
@@ -549,12 +661,15 @@ refuse_process proc-argv-empty-element argv-empty "does not run the installed bi
 refuse_process proc-environ-differs environ "does not run the installed binary, service config and environment"
 refuse_process proc-environ-missing environ-missing "does not run the installed binary, service config and environment"
 refuse_process proc-environ-value-differs environ-value "does not run the installed binary, service config and environment"
+refuse_process proc-environ-non-pe-missing non-pe-missing "does not run the installed binary, service config and environment"
+refuse_process proc-environ-non-pe-value-differs non-pe-value "does not run the installed binary, service config and environment"
 refuse_process proc-environ-extra-pe environ-extra-pe "does not run the installed binary, service config and environment"
 refuse_process proc-environ-ld-preload ld-preload "does not run the installed binary, service config and environment"
+refuse_process proc-environ-credential-wrong credential-wrong "does not run the installed binary, service config and environment"
+refuse_process proc-cwd-differs cwd "process cwd is"
 
-# Variables systemd injects into the process (production shows CREDENTIALS_DIRECTORY, MEMORY_PRESSURE_*) are not the file's: accepted.
+# The complete production-observed injected set, including the bound credential path, is accepted.
 root=$(make_case proc-environ-systemd-extra)
-printf 'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service\0MEMORY_PRESSURE_WATCH=/sys/fs/cgroup/memory.pressure\0' >> "$root/proc/1234/environ"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 refuse_process proc-exe-differs exe "running pe-service is not the installed binary"
@@ -575,15 +690,75 @@ corrupt_new_process() {
   case "$kind" in
     argv) printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml.wrong" > "$proc/cmdline" ;;
     environ) printf 'PE_POST_START_MISMATCH=1\0' >> "$proc/environ" ;;
+    ld-preload) printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ" ;;
+    credential) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[(b"CREDENTIALS_DIRECTORY=/wrong" if part.startswith(b"CREDENTIALS_DIRECTORY=") else part)
+       for part in open(path,"rb").read().split(b"\0") if part]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
+    non-pe-value) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[(b"NON_PE_QUOTED_VALUE=changed" if part.startswith(b"NON_PE_QUOTED_VALUE=") else part)
+       for part in open(path,"rb").read().split(b"\0") if part]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
+    non-pe-missing) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[part for part in open(path,"rb").read().split(b"\0")
+       if part and not part.startswith(b"NON_PE_QUOTED_VALUE=")]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
+    cwd) rm "$proc/cwd"; mkdir -p "$root/elsewhere"; ln -s "$root/elsewhere" "$proc/cwd" ;;
+    snapshot) : > "$root/test-state/snapshot-change-after-first-show" ;;
     exe) printf '%s\n' wrong-new-process-executable > "$proc/exe" ;;
   esac
 }
 
+restore_fake_process() {
+  local root=$1 service="$1/prediction-markets" proc="$1/proc/1234"
+  printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml" > "$proc/cmdline"
+  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") |
+    python3 -c 'import sys
+parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
+shell_own=(b"_=",b"PWD=",b"SHLVL=",b"OLDPWD=")
+sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$proc/environ"
+  printf '%s\0' \
+    'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \
+    "HOME=$root/home" \
+    'INVOCATION_ID=invocation-test-1' \
+    'JOURNAL_STREAM=8:557' \
+    'LANG=C.UTF-8' \
+    'LOGNAME=sean' \
+    'MEMORY_PRESSURE_WATCH=/sys/fs/cgroup/system.slice/pe-service.service/memory.pressure' \
+    'MEMORY_PRESSURE_WRITE=c29tZQ==' \
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin' \
+    'SHELL=/bin/bash' \
+    'SYSTEMD_EXEC_PID=1234' \
+    'USER=sean' >> "$proc/environ"
+  cp "$service/target/release/pe-service" "$proc/exe"
+  rm -f "$proc/cwd"
+  ln -s "$service" "$proc/cwd"
+  rm -f "$root/test-state"/post-start-*-wrong \
+    "$root/test-state/snapshot-change-after-first-show" \
+    "$root/test-state/snapshot-change-show-count"
+}
+
 refuse_post_start_process() {
-  local phase=$1 kind=$2 message=$3 root rc state expected_state marker
+  local phase=$1 kind=$2 message=$3 root rc state marker
   root=$(make_case "post-start-$phase-$kind")
   if [[ "$phase" == started ]]; then
-    marker="$root/test-state/post-start-$kind-wrong"
+    if [[ "$kind" == snapshot ]]; then
+      marker="$root/test-state/snapshot-change-after-first-show"
+    else
+      marker="$root/test-state/post-start-$kind-wrong"
+    fi
     : > "$marker"
   else
     set +e
@@ -602,15 +777,34 @@ refuse_post_start_process() {
   grep -q "$message" "$root/$phase.err" || fail "$kind $phase refusal was not explicit"
   state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
     "$root/pe-activation.json")
-  if [[ "$phase" == started ]]; then expected_state=switched; else expected_state=started; fi
-  [[ "$state" == "$expected_state" ]] ||
+  [[ "$state" == switched ]] ||
     fail "$kind mismatch advanced manifest to $state while proving $phase"
+  [[ "$(<"$root/test-state/service.active")" == false ]] ||
+    fail "$kind mismatch left the refused service active"
+  [[ "$(<"$root/test-state/service.enabled")" == false ]] ||
+    fail "$kind mismatch left the refused service enabled"
   [[ "$(<"$root/test-state/forge.active")" == false ]] ||
     fail "$kind mismatch restored Forge before $phase proof"
   [[ "$(<"$root/prediction-markets/data/eval-results/rank_and_push.loop")" == stop ]] ||
     fail "$kind mismatch restored the Forge flag before $phase proof"
   [[ "$(<"$root/test-state/service-start-count")" == 1 ]] ||
     fail "$kind mismatch caused an unexpected fresh-service start count"
+  python3 - "$root/pe-activation.json" "$phase" <<'PY' || fail "$kind $phase refusal audit is incomplete"
+import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["state"] == "switched"
+assert all(key not in value for key in ("invocation_id","active_enter_timestamp","active_enter_unix"))
+refusals=value.get("post_start_refusals")
+assert isinstance(refusals,list) and len(refusals) == 1
+assert refusals[0].get("at") == "2033-05-18T03:33:20Z"
+assert sys.argv[2] in refusals[0].get("reason","")
+PY
+  restore_fake_process "$root"
+  if ! activate "$root" activation-557 >"$root/$phase-repaired.out" 2>"$root/$phase-repaired.err"; then
+    sed -n '1,120p' "$root/$phase-repaired.err" >&2
+    fail "$kind $phase refusal did not resume after repair"
+  fi
+  assert_verified "$root" 2
 }
 
 for phase in started verified; do
@@ -618,6 +812,16 @@ for phase in started verified; do
     "does not run the generation binary, service config and environment"
   refuse_post_start_process "$phase" environ \
     "does not run the generation binary, service config and environment"
+  refuse_post_start_process "$phase" ld-preload \
+    "does not run the generation binary, service config and environment"
+  refuse_post_start_process "$phase" credential \
+    "does not run the generation binary, service config and environment"
+  refuse_post_start_process "$phase" non-pe-value \
+    "does not run the generation binary, service config and environment"
+  refuse_post_start_process "$phase" non-pe-missing \
+    "does not run the generation binary, service config and environment"
+  refuse_post_start_process "$phase" cwd "process cwd is"
+  refuse_post_start_process "$phase" snapshot "process snapshot changed during generation proof"
   refuse_post_start_process "$phase" exe "running pe-service hash is not the generation hash"
 done
 
@@ -904,3 +1108,5 @@ echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
 echo "rollback restore/adoption and forward-refusal matrix: PASS"
 echo "lock, preflight, invocation, batch, site, reboot, and Forge restoration: PASS"
+echo "post-start refusal stop, disable, rewind, audit, and repaired rerun: PASS"
+echo "process cwd, stable snapshot, and exact environment ownership: PASS"
