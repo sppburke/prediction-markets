@@ -6,6 +6,7 @@ set -euo pipefail
 REPO_ROOT="$HOME/prediction-markets"
 RUN_FLAG="$REPO_ROOT/data/eval-results/rank_and_push.loop"
 PAUSE_RECORD="$REPO_ROOT/data/eval-results/.forge_pause.json"
+PAUSE_LOCK="$REPO_ROOT/data/eval-results/.forge_pause.lock"
 RANK_LOCKS=(
   "$REPO_ROOT/data/eval-results/.rank_and_push_loop.lock"
   "$REPO_ROOT/data/eval-results/.rank_and_push.lock"
@@ -24,11 +25,23 @@ usage() {
 }
 
 unit_enabled() {
-  if systemctl --user is-enabled pe-rank-loop >/dev/null 2>&1; then echo true; else echo false; fi
+  local output rc
+  if output=$(systemctl --user is-enabled pe-rank-loop 2>/dev/null); then rc=0; else rc=$?; fi
+  case "$output:$rc" in
+    enabled:0) echo true ;;
+    disabled:1) echo false ;;
+    *) die "could not prove pe-rank-loop enablement (rc=$rc, output=$output)" ;;
+  esac
 }
 
 unit_active() {
-  if systemctl --user is-active pe-rank-loop >/dev/null 2>&1; then echo true; else echo false; fi
+  local output rc
+  if output=$(systemctl --user is-active pe-rank-loop 2>/dev/null); then rc=0; else rc=$?; fi
+  case "$output:$rc" in
+    active:0) echo true ;;
+    inactive:3|failed:3) echo false ;;
+    *) die "could not prove pe-rank-loop activity (rc=$rc, output=$output)" ;;
+  esac
 }
 
 current_flag() {
@@ -135,6 +148,18 @@ delete_pause_record() {
   fsync_directory "$parent"
 }
 
+cycle_descendant_running() {
+  pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|[p]e-bootstrap|[l]atency_shift_rerank[.]py|[r]ank_72hr_buyandhold[.]py' >/dev/null
+}
+
+rank_locks_unheld() {
+  local lock
+  for lock in "${RANK_LOCKS[@]}"; do
+    [[ -e "$lock" ]] || continue
+    flock -n "$lock" true || return 1
+  done
+}
+
 pause() {
   local deadline lock
   if [[ ! -f "$PAUSE_RECORD" ]]; then
@@ -149,7 +174,7 @@ pause() {
     ((SECONDS < deadline)) || die "pe-rank-loop did not become inactive within $STOP_WAIT_SECS seconds"
     sleep 1
   done
-  if pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|[p]e-bootstrap|[l]atency_shift_rerank[.]py|[r]ank_72hr_buyandhold[.]py' >/dev/null; then
+  if cycle_descendant_running; then
     die "a Forge cycle descendant is still running"
   fi
   for lock in "${RANK_LOCKS[@]}"; do
@@ -188,17 +213,39 @@ restore() {
 }
 
 status() {
-  local flag enabled active
+  local flag enabled active descendants_running=false locks_unheld=true record_present=false
+  local paused_complete=false
   flag=$(current_flag)
   enabled=$(unit_enabled)
   active=$(unit_active)
+  if cycle_descendant_running; then descendants_running=true; fi
+  if ! rank_locks_unheld; then locks_unheld=false; fi
+  if [[ -f "$PAUSE_RECORD" ]]; then
+    load_pause_record
+    record_present=true
+  fi
+  if [[ "$record_present" == true && "$flag" == stop && "$active" == false &&
+        "$descendants_running" == false && "$locks_unheld" == true ]]; then
+    paused_complete=true
+  fi
   python3 -c 'import json,os,sys
-path,flag,enabled,active=sys.argv[1:]
+path,flag,enabled,active,descendants_running,locks_unheld,paused_complete=sys.argv[1:]
 record=None
 if os.path.exists(path):
     with open(path, encoding="utf-8") as handle: record=json.load(handle)
-print(json.dumps({"record":record,"live":{"flag":flag,"enabled":enabled=="true","active":active=="true"}},sort_keys=True,indent=2))' \
-    "$PAUSE_RECORD" "$flag" "$enabled" "$active"
+print(json.dumps({
+    "live":{
+        "active":active=="true",
+        "cycle_descendant_running":descendants_running=="true",
+        "enabled":enabled=="true",
+        "flag":flag,
+        "locks_unheld":locks_unheld=="true",
+    },
+    "paused_complete":paused_complete=="true",
+    "record":record,
+},sort_keys=True,indent=2))' \
+    "$PAUSE_RECORD" "$flag" "$enabled" "$active" "$descendants_running" \
+    "$locks_unheld" "$paused_complete"
 }
 
 [[ $# == 1 ]] || usage
@@ -207,6 +254,9 @@ cd "$REPO_ROOT"
 for command in python3 systemctl flock pgrep; do
   command -v "$command" >/dev/null || die "$command not installed"
 done
+[[ -d "$(dirname "$PAUSE_LOCK")" ]] || die "Forge pause lock directory is absent: $(dirname "$PAUSE_LOCK")"
+exec 9>>"$PAUSE_LOCK"
+flock -n 9 || die "another Forge pause/restore/status invocation holds $PAUSE_LOCK"
 
 case "$1" in
   pause) pause ;;

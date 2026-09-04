@@ -187,13 +187,22 @@ def parse_environment(raw):
 with open("%s/%s/environ" % (proc_root, pid), "rb") as handle:
     running=parse_environment(handle.read())
 evaluated=subprocess.run(
-    ["env","-i","/bin/bash","-c","set -a; source \"$1\"; set +a; env -0","bash",expected_env],
+    ["env","-i","/bin/bash","-c","""set -a
+source "$1"
+set +a
+while IFS= read -r name; do
+    printf "%s=%s\\0" "$name" "${!name}"
+done < <(compgen -e)""","bash",expected_env],
     check=False,cwd=working,stdout=subprocess.PIPE,
 )
 if evaluated.returncode != 0:
     raise SystemExit(1)
 shell_own={b"_",b"PWD",b"SHLVL",b"OLDPWD"}
-expected={name:value for name,value in parse_environment(evaluated.stdout).items() if name not in shell_own}
+evaluated_environment=parse_environment(evaluated.stdout)
+loader_overrides={b"LD_PRELOAD",b"LD_LIBRARY_PATH"}
+if loader_overrides & (running.keys() | evaluated_environment.keys()):
+    raise SystemExit(1)
+expected={name:value for name,value in evaluated_environment.items() if name not in shell_own}
 missing=[name for name,value in expected.items() if running.get(name) != value]
 injected={
     b"CREDENTIALS_DIRECTORY",b"HOME",b"INVOCATION_ID",b"JOURNAL_STREAM",b"LANG",b"LOGNAME",
@@ -542,27 +551,6 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   state=prepared
 fi
 
-archive_counts() {
-  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
-    "select (select count(*) from paper_fills_archive where activation_id='$activation_id') || ' ' ||
-            (select count(*) from settled_markets_archive where activation_id='$activation_id') || ' ' ||
-            (select count(*) from paper_positions_archive where activation_id='$activation_id') || ' ' ||
-            (select count(*) from paper_bankroll_archive where activation_id='$activation_id') || ' ' ||
-            (select count(*) from fill_market_snapshots_archive where activation_id='$activation_id');"
-}
-
-archive_counts_match_pre_reset() {
-  local counts=$1 recorded
-  recorded=$(manifest_get pre_reset_live_counts)
-  python3 -c 'import json,sys
-counts=[int(value) for value in sys.argv[1].split()]
-if len(counts) != 5: raise SystemExit(1)
-recorded=json.loads(sys.argv[2])
-keys=["paper_fills","settled_markets","paper_positions","paper_bankroll","fill_market_snapshots"]
-raise SystemExit(0 if counts == [int(recorded[key]) for key in keys] else 1)' \
-    "$counts" "$recorded"
-}
-
 verify_fresh_supabase() {
   local result
   result=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
@@ -576,10 +564,10 @@ verify_fresh_supabase() {
 }
 
 if [[ "$state" == archived ]]; then
-  if counts=$(archive_counts 2>/dev/null); then
-    read -r fills_archived settled_archived positions_archived bankroll_archived snapshots_archived <<<"$counts"
-    if ((fills_archived + settled_archived + positions_archived + bankroll_archived + snapshots_archived > 0)); then
-      archive_counts_match_pre_reset "$counts" ||
+  if counts=$(activation_archive_counts "$activation_id" 2>/dev/null); then
+    read -r _ _ _ bankroll_archived _ <<<"$counts"
+    if activation_archive_stamp_exists "$counts"; then
+      activation_archive_counts_match_pre_reset "$counts" ||
         die "activation archive counts do not match the recorded pre-reset live counts"
       [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
       verify_fresh_supabase
@@ -691,10 +679,10 @@ if (( $(state_rank "$state") < $(state_rank reset) )); then
     -v bankroll="$bankroll" -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
   maybe_crash db-commit
   verify_fresh_supabase
-  counts=$(archive_counts)
+  counts=$(activation_archive_counts "$activation_id")
   read -r _ _ _ bankroll_archived _ <<<"$counts"
   [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
-  archive_counts_match_pre_reset "$counts" ||
+  activation_archive_counts_match_pre_reset "$counts" ||
     die "activation archive counts do not match the recorded pre-reset live counts"
   patch=$(python3 -c 'import json,sys; print(json.dumps({"archive_counts":sys.argv[1]}))' "$counts")
   manifest_advance reset "$patch"
@@ -893,9 +881,13 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
     post_start_refusal "new pe-service process proof failed while entering verified"
   fi
   verify_listening_bind
-  verify_started_invocation
+  if ! (verify_started_invocation); then
+    post_start_refusal "recorded pe-service invocation changed while entering verified"
+  fi
   wait_for_invocation_status "$(manifest_get active_enter_unix)"
-  verify_started_invocation
+  if ! (verify_started_invocation); then
+    post_start_refusal "recorded pe-service invocation changed while entering verified"
+  fi
   latest_batch=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;')
   [[ "$latest_batch" == "$(manifest_get ranking_batch_id)" ]] ||
     die "latest ranking batch $latest_batch differs from the frozen activation batch $(manifest_get ranking_batch_id)"

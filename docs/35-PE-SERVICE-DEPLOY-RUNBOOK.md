@@ -130,8 +130,10 @@ is exactly `<installed-binary> <installed-config>`; and every variable the insta
 defines (evaluated with the unit's own `set -a; source` semantics) is present with an equal value. Any
 process variable not defined by that file must be one of exactly `CREDENTIALS_DIRECTORY`, `HOME`,
 `INVOCATION_ID`, `JOURNAL_STREAM`, `LANG`, `LOGNAME`, `MEMORY_PRESSURE_WATCH`,
-`MEMORY_PRESSURE_WRITE`, `PATH`, `SHELL`, `SYSTEMD_EXEC_PID`, or `USER`, and
-`CREDENTIALS_DIRECTORY` must equal `/run/credentials/pe-service.service`; every other extra is refused.
+`MEMORY_PRESSURE_WRITE`, `PATH`, `SHELL`, `SYSTEMD_EXEC_PID`, `USER`, or the wrapper-owned
+`PWD`, `SHLVL`, `OLDPWD`, or `_`. `CREDENTIALS_DIRECTORY` must equal
+`/run/credentials/pe-service.service`; every other extra is refused. `LD_PRELOAD` and
+`LD_LIBRARY_PATH` are refused even when the installed environment file defines the same value.
 One systemd snapshot supplies `ActiveState`, `MainPID`, `InvocationID`, and `ActiveEnterTimestamp` before
 the `/proc` proof, and an identical second snapshot must follow it. The loaded manager state must also
 report `NeedDaemonReload=no`. Staged templates are not an old-state authority. Immediately before each
@@ -194,12 +196,14 @@ SUPABASE_DB_URL=<session-pooler-url> \
   scripts/deploy/rollback_generation.sh --activation-id <id>
 ```
 
-It records `rolling_back` first, verifies all three archived config/environment/binary sources against
-their manifest hashes before any database or installed artifact changes, disables and stops any
-non-adoptable service before database access,
-restores exactly that id's five archived row sets in one transaction, refreshes the materialized view,
-restores old config/environment/binary from manifest-hashed copies, starts or adopts the exact old
-generation, and records `rolled_back`. A forward rerun of that id is thereafter refused. Retain the
+It accepts every state from `guarded` onward and records `rolling_back` first. It validates archived
+config/environment/binary sources when `archive_artifacts` is durable; before that manifest fact exists,
+the installed artifacts must still match the pre-T0 hashes recorded by the driver. It always disables
+and stops the service before reading the durable archive stamp. The database restore and materialized-view
+refresh run only when stamped archive rows for this activation exist, and restored counts are compared
+only after that restore. It then restores artifacts when an archive was recorded, enables and starts the
+old generation, and proves the unit active and enabled with the running executable hash equal to the old
+binary before recording `rolled_back`. A forward rerun of that id is thereafter refused. Retain the
 manifest, generation, and pre-T0 archive for audit.
 
 ## Facts

@@ -32,7 +32,7 @@ acquire_deploy_lock
 
 state=$(manifest_get state)
 case "$state" in
-  verified)
+  guarded|archived|reset|switched|started|verified)
     manifest_advance rolling_back
     state=rolling_back
     ;;
@@ -41,8 +41,16 @@ case "$state" in
     echo "activation_id=$activation_id state=rolled_back"
     exit 0
     ;;
-  *) die "rollback requires verified or rolling_back state, found $state" ;;
+  *) die "rollback requires a post-guarded or rolling_back state, found $state" ;;
 esac
+
+manifest_has() {
+  python3 -c 'import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+for part in sys.argv[2].split("."):
+    if not isinstance(value,dict) or part not in value: raise SystemExit(1)
+    value=value[part]' "$MANIFEST" "$1"
+}
 
 archive_path() {
   manifest_get "archive_artifacts.$1.path"
@@ -50,6 +58,10 @@ archive_path() {
 
 archive_sha() {
   manifest_get "archive_artifacts.$1.sha256"
+}
+
+old_sha() {
+  manifest_get "old_installed_artifacts.$1.sha256"
 }
 
 verify_archive_sources() {
@@ -66,13 +78,20 @@ verify_archive_sources() {
 
 installed_old_artifacts() {
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] || return 1
-  [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(archive_sha service_toml)" ]] || return 1
-  [[ "$(sha256_file "$SERVICE_ENV")" == "$(archive_sha service_env)" ]] || return 1
-  [[ "$(sha256_file "$SERVICE_BINARY")" == "$(archive_sha pe_service)" ]] || return 1
+  [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(old_sha service_toml)" ]] || return 1
+  [[ "$(sha256_file "$SERVICE_ENV")" == "$(old_sha service_env)" ]] || return 1
+  [[ "$(sha256_file "$SERVICE_BINARY")" == "$(old_sha pe_service)" ]] || return 1
 }
 
-# Validate every rollback source before any database or installed artifact is changed.
-verify_archive_sources
+restore_artifacts=false
+if manifest_has archive_artifacts; then
+  # Validate every rollback source before any database or installed artifact is changed.
+  verify_archive_sources
+  restore_artifacts=true
+else
+  installed_old_artifacts ||
+    die "pre-T0 artifacts changed before the activation archive was recorded"
+fi
 
 restored_counts_match() {
   local answer
@@ -101,52 +120,44 @@ verify_old_running() {
   installed_old_artifacts || die "installed artifacts are not the archived generation"
   [[ "$(systemctl_active pe-service)" == true ]] || die "old generation is not active"
   [[ "$(systemctl_enabled pe-service)" == true ]] || die "old generation is not enabled"
-  if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
-    local pid running
-    pid=$(systemctl show pe-service -p MainPID --value)
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
-    running=$(sha256_file "/proc/$pid/exe")
-    [[ "$running" == "$(archive_sha pe_service)" ]] || die "running binary is not the archived generation"
-  fi
+  local pid running
+  pid=$(systemctl show pe-service -p MainPID --value)
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
+  running=$(sha256_file "$PROC_ROOT/$pid/exe")
+  [[ "$running" == "$(old_sha pe_service)" ]] || die "running binary is not the archived generation"
 }
 
-# A crash after the old service started is adopted only after both durable sides
-# independently prove rollback completion. This prevents a second service start.
-if [[ "$(systemctl_active pe-service)" == true ]] && installed_old_artifacts && restored_counts_match; then
-  verify_old_running
-  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c \
-    'refresh materialized view concurrently wallet_live_stats_mv;'
-  manifest_advance rolled_back
-  echo "activation_id=$activation_id state=rolled_back (adopted running old generation)"
-  exit 0
-fi
-
-# Any non-adoptable service is disabled and stopped before the database is touched.
+# Every rollback attempt first makes the service inert before consulting durable database facts.
 "${SERVICE_MUTATE[@]}" disable pe-service
 "${SERVICE_MUTATE[@]}" stop pe-service
 [[ "$(systemctl_active pe-service)" == false ]] || die "pe-service is still active"
 [[ "$(systemctl_enabled pe-service)" == false ]] || die "pe-service is still enabled"
 
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
-  -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
-maybe_crash rollback-db-restored
-restored_counts_match || die "restored live counts do not match the activation archive"
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c \
-  'refresh materialized view concurrently wallet_live_stats_mv;'
-
-atomic_adopt "$(archive_path service_toml)" "$SERVICE_CONFIG" 0644 rollback-config
-atomic_adopt "$(archive_path service_env)" "$SERVICE_ENV" 0600 rollback-env
-atomic_adopt "$(archive_path pe_service)" "$SERVICE_BINARY" 0755 rollback-binary
-installed_old_artifacts || die "archived artifact restoration failed"
-
-if [[ "$(systemctl_active pe-service)" == true ]]; then
-  verify_old_running
-else
-  "${SERVICE_MUTATE[@]}" enable pe-service
-  "${SERVICE_MUTATE[@]}" start pe-service
-  maybe_crash rollback-started
-  verify_old_running
+archive_counts=$(activation_archive_counts "$activation_id")
+if activation_archive_stamp_exists "$archive_counts"; then
+  activation_archive_counts_match_pre_reset "$archive_counts" ||
+    die "activation archive counts do not match the recorded pre-reset live counts"
+  read -r _ _ _ bankroll_archived _ <<< "$archive_counts"
+  [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
+  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
+    -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
+  maybe_crash rollback-db-restored
+  restored_counts_match || die "restored live counts do not match the activation archive"
+  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c \
+    'refresh materialized view concurrently wallet_live_stats_mv;'
 fi
+
+if [[ "$restore_artifacts" == true ]]; then
+  atomic_adopt "$(archive_path service_toml)" "$SERVICE_CONFIG" 0644 rollback-config
+  atomic_adopt "$(archive_path service_env)" "$SERVICE_ENV" 0600 rollback-env
+  atomic_adopt "$(archive_path pe_service)" "$SERVICE_BINARY" 0755 rollback-binary
+fi
+installed_old_artifacts || die "pre-T0 artifact restoration or verification failed"
+
+"${SERVICE_MUTATE[@]}" enable pe-service
+"${SERVICE_MUTATE[@]}" start pe-service
+maybe_crash rollback-started
+verify_old_running
 
 manifest_advance rolled_back
 echo "activation_id=$activation_id state=rolled_back"

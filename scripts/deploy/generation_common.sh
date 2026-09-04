@@ -143,6 +143,37 @@ finally: os.close(directory)' "$source" "$destination" "$mode"
   maybe_crash "$boundary"
 }
 
+activation_archive_counts() {
+  local activation_id=$1
+  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
+    "select (select count(*) from paper_fills_archive where activation_id='$activation_id') || ' ' ||
+            (select count(*) from settled_markets_archive where activation_id='$activation_id') || ' ' ||
+            (select count(*) from paper_positions_archive where activation_id='$activation_id') || ' ' ||
+            (select count(*) from paper_bankroll_archive where activation_id='$activation_id') || ' ' ||
+            (select count(*) from fill_market_snapshots_archive where activation_id='$activation_id');"
+}
+
+activation_archive_stamp_exists() {
+  local counts=$1 fills settled positions bankroll snapshots
+  read -r fills settled positions bankroll snapshots <<< "$counts"
+  [[ "$fills" =~ ^[0-9]+$ && "$settled" =~ ^[0-9]+$ && "$positions" =~ ^[0-9]+$ &&
+     "$bankroll" =~ ^[0-9]+$ && "$snapshots" =~ ^[0-9]+$ ]] ||
+    die "invalid activation archive counts: $counts"
+  ((fills + settled + positions + bankroll + snapshots > 0))
+}
+
+activation_archive_counts_match_pre_reset() {
+  local counts=$1 recorded
+  recorded=$(manifest_get pre_reset_live_counts)
+  python3 -c 'import json,sys
+counts=[int(value) for value in sys.argv[1].split()]
+if len(counts) != 5: raise SystemExit(1)
+recorded=json.loads(sys.argv[2])
+keys=["paper_fills","settled_markets","paper_positions","paper_bankroll","fill_market_snapshots"]
+raise SystemExit(0 if counts == [int(recorded[key]) for key in keys] else 1)' \
+    "$counts" "$recorded"
+}
+
 systemctl_enabled() {
   if systemctl is-enabled "$1" >/dev/null 2>&1; then echo true; else echo false; fi
 }
