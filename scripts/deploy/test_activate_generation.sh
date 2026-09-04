@@ -1139,6 +1139,43 @@ rm "$root/test-state/archive-count-mismatch"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
+# The inert prechecked recovery (a crash after disable+stop, before the guarded rename) still rechecks the
+# frozen batch: a changed batch leaves a rollback-only guarded manifest, never continues forward.
+root=$(make_case ranking-batch-drift-inert-prechecked)
+set +e
+activate "$root" activation-557 --simulate-crash-after prechecked >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "inert-prechecked fixture did not reach prechecked ($rc)"
+printf '%s\n' false > "$root/test-state/service.active"
+printf '%s\n' false > "$root/test-state/service.enabled"
+: > "$root/test-state/ranking-batch-drift"
+set +e
+activate "$root" activation-557 >"$root/inert-drift.out" 2>"$root/inert-drift.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "inert-prechecked batch drift was accepted ($rc)"
+grep -q 'changed after prechecked while pe-service was already stopped' "$root/inert-drift.err" ||
+  fail "inert-prechecked batch refusal was not explicit"
+python3 - "$root/pe-activation.json" <<'PY' || fail "inert-prechecked drift did not leave a rollback-only guarded manifest"
+import json,sys
+value=json.load(open(sys.argv[1]))
+raise SystemExit(0 if value["state"] == "guarded" and value.get("forward_blocked", {}).get("reason") else 1)
+PY
+[[ "$(<"$root/test-state/service.active")" == false ]] || fail "inert-prechecked drift started the service"
+[[ ! -e "$root/test-state/archive-stamp" ]] || fail "inert-prechecked drift archived the database"
+set +e
+activate "$root" activation-557 >/dev/null 2>"$root/inert-forward.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "forward run after inert-prechecked drift was accepted ($rc)"
+grep -q 'forward blocked' "$root/inert-forward.err" || fail "forward run after inert drift was not refused as blocked"
+rollback "$root" >/dev/null
+[[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-activation.json")" == rolled_back ]] ||
+  fail "rollback after inert-prechecked drift did not converge"
+[[ "$(<"$root/test-state/service.active")" == true && "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "rollback after inert-prechecked drift did not restart the old service"
+
 # A new batch between prechecked and guarded refuses immediately before T0 with the service untouched.
 root=$(make_case ranking-batch-drift-before-guard)
 : > "$root/test-state/ranking-batch-drift-before-guard"

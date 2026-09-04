@@ -557,8 +557,18 @@ if (( $(state_rank "$state") < $(state_rank guarded) )); then
     service_active=$(systemctl_active_state pe-service)
     service_enabled=$(systemctl_enabled_state pe-service)
     if [[ "$service_active" == false && "$service_enabled" == false ]]; then
-      # A crash can land after disable+stop but before the guarded manifest rename.
+      # A crash can land after disable+stop but before the guarded manifest rename. The frozen-batch
+      # recheck that precedes T0 must still happen here; the old service is already stopped, so a
+      # changed batch leaves a rollback-only `guarded` manifest instead of continuing forward.
       verify_pre_t0_artifacts
+      latest_batch=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;')
+      if [[ "$latest_batch" != "$(manifest_get ranking_batch_id)" ]]; then
+        blocked_patch=$(python3 -c 'import json,sys; print(json.dumps({"forward_blocked":{"at":sys.argv[1],"reason":sys.argv[2]}}))' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          "latest ranking batch $latest_batch changed after prechecked while pe-service was already stopped")
+        manifest_advance guarded "$blocked_patch"
+        die "latest ranking batch $latest_batch changed after prechecked while pe-service was already stopped; forward blocked, run rollback_generation.sh"
+      fi
       manifest_advance guarded
       state=guarded
     else
