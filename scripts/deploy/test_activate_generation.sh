@@ -74,6 +74,12 @@ SH
 set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
 [[ ! -e "$state/bind-not-listening" ]] || exit 0
+# The real binary listens only after its boot walk: `listen-after-polls` holds how many probes still
+# see no listener before the socket appears.
+if [[ -f "$state/listen-after-polls" ]]; then
+  remaining=$(<"$state/listen-after-polls")
+  if ((remaining > 0)); then echo $((remaining - 1)) > "$state/listen-after-polls"; exit 0; fi
+fi
 printf '%s\n' 'LISTEN 0 128 127.0.0.1:9100 0.0.0.0:* users:(("pe-service",pid=1234,fd=7))'
 SH
 
@@ -1251,6 +1257,14 @@ for phase in started verified; do
   activate "$root" activation-557 >/dev/null
   assert_verified "$root" 2
 done
+
+# The listener appears only after the boot walk: `verified` waits (deadline sized by the approved walk)
+# and succeeds; if the proved invocation disappears while waiting, it refuses.
+root=$(make_case listen-after-boot-walk)
+echo 3 > "$root/test-state/listen-after-polls"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
+[[ "$(<"$root/test-state/listen-after-polls")" == 0 ]] || fail "listener wait did not poll through the boot walk"
 
 # Every material verification refusal stops, disables, audits, and rewinds the activation.
 for fixture in \
