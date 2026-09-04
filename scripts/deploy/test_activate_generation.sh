@@ -565,7 +565,7 @@ assert value["state"] == "switched"
 assert all(key not in value for key in ("invocation_id","active_enter_timestamp","active_enter_unix"))
 assert "refusal" not in value
 refusals=value.get("post_start_refusals")
-assert isinstance(refusals,list) and refusals
+assert isinstance(refusals,list) and len(refusals) == 1
 assert sys.argv[2] in refusals[-1].get("reason","")
 if sys.argv[3] == "true":
     assert value.get("forward_blocked") == {
@@ -986,6 +986,37 @@ grep -q 'activation id already used: rows stamped .*; choose a new id' "$root/re
    "$(<"$root/test-state/service.enabled")" == true ]] ||
   fail "reused activation id touched the service"
 
+# A new id cannot treat missing archive columns as a clean database when the prior terminal manifest
+# carries durable reset metadata. It must fail before creating the new seed and leave that manifest intact.
+root=$(make_case terminal-manifest-zero-archive-columns)
+activate "$root" activation-557 >/dev/null
+python3 - "$root/pe-activation.json" <<'PY' || fail "terminal fixture lacks durable archive counts"
+import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["state"] == "verified"
+assert value.get("archive_counts")
+PY
+: > "$root/test-state/archive-column-zero-query"
+manifest_before=$(sha256sum "$root/pe-activation.json" | awk '{print $1}')
+prepare_before=$(<"$root/test-state/prepare-count")
+set +e
+TEST_GENERATION_NAME=558 activate "$root" activation-558 \
+  >"$root/new-id-zero-columns.out" 2>"$root/new-id-zero-columns.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "new id accepted zero archive columns after a durable reset"
+grep -q 'archive stamp column missing after a durable reset' "$root/new-id-zero-columns.err" ||
+  fail "new-id durable-column refusal was not explicit"
+[[ ! -e "$root/prediction-markets/gen/558" ]] ||
+  fail "new-id durable-column refusal created the new generation seed"
+[[ "$(sha256sum "$root/pe-activation.json" | awk '{print $1}')" == "$manifest_before" ]] ||
+  fail "new-id durable-column refusal changed the terminal manifest"
+[[ "$(<"$root/test-state/prepare-count")" == "$prepare_before" ]] ||
+  fail "new-id durable-column refusal touched generation preparation"
+[[ "$(<"$root/test-state/service.active")" == true &&
+   "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "new-id durable-column refusal touched the service"
+
 # A rolled-back id remains stamped and refused while a new id can use a new permanent generation.
 root=$(make_case new-id-after-rollback)
 activate "$root" activation-557 >/dev/null
@@ -1265,6 +1296,38 @@ for entry in \
   assert_verified "$root" 2
 done
 
+# A crash at each internal refusal boundary resumes to one inert, forward-blocked audit entry. The
+# post-rewind case starts in `switched`; its durable block prevents a second start/refusal/audit cycle.
+for boundary in refusal-stopped refusal-inert-proved \
+  before-manifest-post-start-refusal post-start-refusal; do
+  safe=${boundary//[^A-Za-z0-9]/_}
+  root=$(make_case "refusal-internal-crash-$safe")
+  set +e
+  activate "$root" activation-557 --simulate-crash-after started \
+    >"$root/started.out" 2>"$root/started.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "$boundary fixture did not reach started"
+  : > "$root/test-state/ranking-batch-drift"
+  set +e
+  activate "$root" activation-557 --simulate-crash-after "$boundary" \
+    >"$root/refusal-crash.out" 2>"$root/refusal-crash.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "$boundary refusal crash returned $rc"
+  [[ "$(<"$root/test-state/service.active")" == false &&
+     "$(<"$root/test-state/service.enabled")" == false ]] ||
+    fail "$boundary refusal crash did not leave the service inert"
+  set +e
+  activate "$root" activation-557 >"$root/refusal-resume.out" 2>"$root/refusal-resume.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "$boundary refusal resume returned $rc"
+  assert_verified_refusal "$root" 'differs from the frozen activation batch' true
+  [[ "$(<"$root/test-state/service-start-count")" == 1 ]] ||
+    fail "$boundary refusal resume restarted the service"
+done
+
 root=$(make_case refusal-disable-failure)
 set +e
 activate "$root" activation-557 --simulate-crash-after started >/dev/null 2>"$root/started.err"
@@ -1493,6 +1556,38 @@ for entry in "${rollback_entry_cases[@]}"; do
   rollback "$root" >/dev/null
   assert_rolled_back "$root" "$expect_stamp" "$expected_starts"
 done
+
+# Rollback accepts a durable refusal intent before quiescence, preserves its forward-blocking audit,
+# and converges through the ordinary inert/restore/start proof path.
+root=$(make_case rollback-entry-refusing)
+set +e
+activate "$root" activation-557 --simulate-crash-after started \
+  >"$root/refusing-started.out" 2>"$root/refusing-started.err"
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "refusing rollback fixture did not reach started"
+: > "$root/test-state/ranking-batch-drift"
+set +e
+activate "$root" activation-557 --simulate-crash-after refusal-intent-recorded \
+  >"$root/refusing-entry.out" 2>"$root/refusing-entry.err"
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "refusing rollback fixture did not retain the refusal intent"
+[[ "$(<"$root/test-state/service.active")" == true &&
+   "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "refusing rollback fixture mutated the service before rollback"
+rollback "$root" >/dev/null
+assert_rolled_back "$root" true 2
+python3 - "$root/pe-activation.json" <<'PY' || fail "refusing rollback lost its audit"
+import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["state"] == "rolled_back"
+refusal=value.get("refusal")
+assert isinstance(refusal,dict)
+assert refusal.get("at") == "2033-05-18T03:33:20Z"
+assert "differs from the frozen activation batch" in refusal.get("reason","")
+assert refusal.get("forward_blocked") is True
+PY
 
 # Mid-rollback repeats the restore transaction safely and restarts from an inert service baseline.
 for boundary in rollback-db-restored rollback-started before-manifest-rolling_back \

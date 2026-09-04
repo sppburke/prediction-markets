@@ -81,7 +81,9 @@ The driver holds `/home/sean/.pe-deploy.lock` for its whole run and writes only 
 different id is refused while the manifest is non-terminal.
 When creating a new `seed` manifest, the driver first queries all five archive tables and refuses an
 id that already stamps any row, including an id from an earlier terminal activation. Existing-manifest
-resumes do not repeat that new-id check.
+resumes do not repeat that new-id check. When a prior terminal manifest records reset metadata, its
+durable fact also makes zero or partial archive-column presence a corruption during this new-id check;
+the driver refuses before seed creation and leaves the terminal manifest unchanged.
 The lock is a provisioned root-owned mode-`0644` file. The driver only opens it read-only and refuses
 when it is absent; it never creates or touches the production lock.
 
@@ -220,8 +222,9 @@ SUPABASE_DB_URL=<session-pooler-url> \
   scripts/deploy/rollback_generation.sh --activation-id <id>
 ```
 
-It accepts every state from `guarded` onward and records `rolling_back` first, then immediately disables
-and stops the service and proves it inactive and disabled. Only then does it validate archived
+It accepts every state from `guarded` onward, including a durable `refusing` intent, and records
+`rolling_back` first without discarding any refusal or forward-blocking audit fields. It then immediately
+disables and stops the service and proves it inactive and disabled. Only then does it validate archived
 config/environment/binary sources when `archive_artifacts` is durable; before that manifest fact exists,
 the installed artifacts must still match the pre-T0 hashes recorded by the driver. It reads the durable
 archive stamp only after those checks. The database restore and materialized-view

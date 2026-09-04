@@ -32,7 +32,7 @@ acquire_deploy_lock
 
 state=$(manifest_get state)
 case "$state" in
-  guarded|archived|reset|switched|started|verified)
+  guarded|archived|reset|switched|started|verified|refusing)
     manifest_advance rolling_back
     state=rolling_back
     ;;

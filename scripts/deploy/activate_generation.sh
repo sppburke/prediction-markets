@@ -111,6 +111,7 @@ complete_post_start_refusal() {
   "${SERVICE_MUTATE[@]}" disable pe-service || disable_rc=$?
   maybe_crash refusal-disabled
   "${SERVICE_MUTATE[@]}" stop pe-service || stop_rc=$?
+  maybe_crash refusal-stopped
   active=$(systemctl_active_state pe-service) || active_rc=$?
   enabled=$(systemctl_enabled_state pe-service) || enabled_rc=$?
   ((disable_rc == 0)) || failures+=("disable failed ($disable_rc)")
@@ -120,6 +121,7 @@ complete_post_start_refusal() {
   [[ "$active" == false ]] || failures+=("pe-service remained active")
   [[ "$enabled" == false ]] || failures+=("pe-service remained enabled")
   ((${#failures[@]} == 0)) || die "post-start refusal did not make pe-service inert: ${failures[*]}"
+  maybe_crash refusal-inert-proved
 
   local json reason
   reason=$(manifest_get refusal.reason)
@@ -458,7 +460,11 @@ print(blocked.get("reason", "") if isinstance(blocked,dict) else "")' "$MANIFEST
 fi
 
 if [[ ! -f "$MANIFEST" || "$(manifest_get activation_id 2>/dev/null || true)" != "$activation_id" ]]; then
-  archive_counts=$(activation_archive_counts "$activation_id" false)
+  archive_columns_required=false
+  if [[ -f "$MANIFEST" ]] && manifest_requires_archive_columns; then
+    archive_columns_required=true
+  fi
+  archive_counts=$(activation_archive_counts "$activation_id" "$archive_columns_required")
   if activation_archive_stamp_exists "$archive_counts"; then
     die "activation id already used: rows stamped $archive_counts; choose a new id"
   fi
