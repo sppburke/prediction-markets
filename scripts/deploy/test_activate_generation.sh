@@ -232,6 +232,8 @@ case "$action" in
       if [[ -e "$state/invocation-changed" ]]; then echo invocation-test-2; else echo invocation-test-1; fi
     elif [[ "$*" == *ActiveEnterTimestamp* ]]; then
       echo 2033-05-18T03:33:19Z
+    elif [[ "$*" == *NeedDaemonReload* ]]; then
+      if [[ -e "$state/daemon-reload-pending" ]]; then echo yes; else echo no; fi
     elif [[ "$*" == *WorkingDirectory* ]]; then
       echo "$root/prediction-markets"
     else
@@ -525,7 +527,29 @@ refuse_unit_file unit-direct-three-tokens "ExecStart=@SVC@/target/release/pe-ser
 refuse_unit_file unit-direct-other-binary "ExecStart=/tmp/other smoke-test/service.toml" "EnvironmentFile=@SVC@/.env"
 refuse_unit_file unit-direct-no-environment-file "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml"
 refuse_unit_file unit-direct-environment-attached-hash "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "EnvironmentFile=@SVC@/.env#backup"
+refuse_unit_file unit-spaced-reset-override "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart =\nExecStart =/tmp/other smoke-test/service.toml')"
+refuse_unit_file unit-spaced-extra-environment "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nEnvironmentFile =@SVC@/.env.backup')"
 refuse_unit_file unit-two-exec-start-lines "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart=')"
+
+# A pending daemon-reload means the loaded unit may differ from the files on disk: refuse.
+root=$(make_case unit-daemon-reload-pending)
+: > "$root/test-state/daemon-reload-pending"
+set +e
+activate "$root" activation-557 >"$root/unit-reload.out" 2>"$root/unit-reload.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "pending daemon-reload was accepted"
+grep -q 'daemon-reload pending' "$root/unit-reload.err" || fail "daemon-reload refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "pending daemon-reload was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
+
+# Whitespace around "=" is legal systemd syntax and must still match the exact template.
+root=$(make_case unit-spaced-valid)
+service="$root/prediction-markets"
+printf '%s\n' "[Service]" "WorkingDirectory = $service" \
+  "ExecStart = /bin/bash -c 'set -a; source $service/.env; set +a; exec $service/target/release/pe-service smoke-test/service.toml'" > "$root/test-state/service.unit-file"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
 
 # A different id is rejected while durable state is non-terminal.
 root=$(make_case different-id)

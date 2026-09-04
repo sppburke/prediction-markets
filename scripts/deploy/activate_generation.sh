@@ -166,10 +166,16 @@ unit_file_selects_service() {
 expected_binary,expected_config,expected_env,working,text=sys.argv[1:]
 def norm(path):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
-exec_lines=[line.strip() for line in text.splitlines() if line.strip().startswith("ExecStart=")]
-if len(exec_lines) != 1:
+# systemd ignores whitespace around "=": normalise every directive line to KEY=VALUE before matching,
+# so a drop-in "ExecStart =" reset or "ExecStart =/other" override cannot hide behind spacing.
+directives=[]
+for raw in text.splitlines():
+    m=re.fullmatch(r"\s*([A-Za-z]+)\s*=\s*(.*?)\s*", raw)
+    if m: directives.append((m.group(1), m.group(2)))
+exec_lines=[value for key,value in directives if key == "ExecStart"]
+if len(exec_lines) != 1 or exec_lines[0] == "":
     raise SystemExit(1)
-line=exec_lines[0]
+line="ExecStart="+exec_lines[0]
 wrapper=re.fullmatch(r"ExecStart=/bin/bash -c \x27set -a; source (\S+); set \+a; exec (\S+) (\S+)\x27", line)
 if wrapper:
     env,binary,config=wrapper.groups()
@@ -179,8 +185,8 @@ if wrapper:
 direct=re.fullmatch(r"ExecStart=(\S+) (\S+)", line)
 if direct:
     binary,config=direct.groups()
-    env_lines=[l.strip() for l in text.splitlines() if l.strip().startswith("EnvironmentFile=")]
-    envs=[norm(l.split("=",1)[1].lstrip("-")) for l in env_lines]
+    env_lines=[value for key,value in directives if key == "EnvironmentFile"]
+    envs=[norm(value.lstrip("-")) for value in env_lines]
     if binary == expected_binary and norm(config) == os.path.normpath(expected_config) and envs == [os.path.normpath(expected_env)]:
         print("direct"); raise SystemExit(0)
 raise SystemExit(1)' \
@@ -194,7 +200,10 @@ process_runs_service() {
   python3 -c 'import os,sys
 expected_binary,expected_config,working,pid=sys.argv[1:]
 with open("/proc/%s/cmdline" % pid, "rb") as handle:
-    argv=[part.decode() for part in handle.read().split(b"\0") if part]
+    raw=handle.read()
+    if raw.endswith(b"\0"):
+        raw=raw[:-1]
+    argv=[part.decode() for part in raw.split(b"\0")]  # empty elements are kept: they change what the binary sees
 def norm(path):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
 raise SystemExit(0 if len(argv) == 2 and argv[0] == expected_binary and norm(argv[1]) == os.path.normpath(expected_config) else 1)' \
@@ -209,6 +218,8 @@ verify_installed_unit_owner() {
   working=$(systemctl show pe-service -p WorkingDirectory --value)
   [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
     die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
+  [[ "$(systemctl show pe-service -p NeedDaemonReload --value)" == no ]] ||
+    die "pe-service unit files differ from the loaded configuration (daemon-reload pending)"
   local unit_text
   unit_text=$(systemctl cat pe-service)
   unit_file_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$unit_text" > /dev/null ||
