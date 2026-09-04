@@ -1048,25 +1048,20 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
     post_start_refusal \
       "latest ranking batch $latest_batch differs from the frozen activation batch $frozen_batch" true
   fi
-  if ! before=$(manifest_get prepared_anchor_count); then
-    post_start_refusal "prepared anchor count is unavailable"
+  # Boot census, recorded for the audit rather than compared with the precheck's due count: anchors age
+  # out of the reuse window while the driver waits (the first real T0 prechecked 69 due wallets at
+  # 18:28Z and the boot at 19:24Z walked all 82), and every wallet walked inside the approved boot adds
+  # no downtime. The service is writing this database now: a plain read-only connection sees the WAL,
+  # whereas an immutable open sees only the checkpointed file (measured: 1 row vs 51).
+  if ! boot_census=$(sqlite3 -separator ' ' -readonly "$generation_dir/paper_state.db" \
+    "select (select count(*) from (select wallet_hex, max(anchored_at_unix) newest from position_anchors group by wallet_hex) where newest >= $active_enter_unix), (select count(*) from (select wallet_hex, max(anchored_at_unix) newest from position_anchors group by wallet_hex) where newest < $active_enter_unix);"); then
+    post_start_refusal "could not read the generation boot census"
   fi
-  if ! approved=$(manifest_get owner_approved_due_subset); then
-    post_start_refusal "owner-approved due subset is unavailable"
+  read -r boot_walked boot_reused <<< "$boot_census"
+  if [[ ! "$boot_walked" =~ ^[0-9]+$ || ! "$boot_reused" =~ ^[0-9]+$ ]]; then
+    post_start_refusal "generation boot census is invalid: $boot_census"
   fi
-  [[ -n "$approved" ]] || approved=0
-  # The service is writing this database now: a plain read-only connection sees the WAL, whereas an
-  # immutable open sees only the checkpointed file (measured: 1 row vs 51 on a live WAL database).
-  if ! after=$(sqlite3 -readonly "$generation_dir/paper_state.db" 'select count(*) from position_anchors;'); then
-    post_start_refusal "could not read the generation anchor count"
-  fi
-  if [[ ! "$before" =~ ^[0-9]+$ || ! "$approved" =~ ^[0-9]+$ || ! "$after" =~ ^[0-9]+$ ]]; then
-    post_start_refusal "generation anchor counts are invalid"
-  fi
-  if [[ "$after" -ne $((before + approved)) ]]; then
-    post_start_refusal \
-      "boot anchor count changed by $((after - before)); expected approved walk of $approved"
-  fi
+  manifest_patch_boundary boot-census "$(python3 -c 'import json,sys; print(json.dumps({"boot_walked":int(sys.argv[1]),"boot_reused":int(sys.argv[2])}))' "$boot_walked" "$boot_reused")"
   if ! psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c \
     'refresh materialized view concurrently wallet_live_stats_mv;'; then
     post_start_refusal "wallet_live_stats_mv refresh failed after service start"

@@ -111,6 +111,8 @@ elif [[ "$sql" == *"pragma integrity_check"* ]]; then
   echo ok
 elif [[ "$sql" == *"last_ts_unix > c.activity_cutoff_unix"* && "$sql" == *"activity_cutoff_unix is null"* ]]; then
   echo '0 0 0 0 0 0 3 0'
+elif [[ "$sql" == *"max(anchored_at_unix) newest from position_anchors"* ]]; then
+  echo '2 0'
 elif [[ "$sql" == *"select count(*) from position_anchors"* ]]; then
   if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/anchor-count-drift-after-start" &&
         -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/fresh-service-started" ]]; then
@@ -1269,7 +1271,6 @@ assert_verified "$root"
 # Every material verification refusal stops, disables, audits, and rewinds the activation.
 for fixture in \
   'bind-not-listening|not listening on configured port|not listening on the configured production bind' \
-  'anchor-count-drift-after-start|boot anchor count changed|boot anchor count changed' \
   'fresh-book-fail|Supabase fresh-book verification failed|Supabase fresh-book verification failed' \
   'materialized-view-fail|wallet_live_stats_mv refresh failed|wallet_live_stats_mv refresh failed' \
   'projection-fail|Supabase projection verification failed|Supabase projection verification failed'; do
