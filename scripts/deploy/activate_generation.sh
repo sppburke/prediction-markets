@@ -89,7 +89,7 @@ EOF
   exit 0
 fi
 
-for command in python3 realpath readlink sha256sum sqlite3 psql flock systemctl ss; do
+for command in python3 realpath readlink sha256sum b3sum sqlite3 psql flock systemctl ss stat od; do
   command -v "$command" >/dev/null || die "$command not installed"
 done
 : "${SUPABASE_DB_URL:?SUPABASE_DB_URL must be exported for activation}"
@@ -592,12 +592,12 @@ verify_seed_or_prepared() {
     total=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" \
       "select (select count(*) from fills)+(select count(*) from positions)+(select count(*) from bankroll)+(select count(*) from settled_markets)+(select count(*) from fill_market_snapshots)+(select count(*) from seen_trades)+(select count(*) from leader_positions)+(select count(*) from poll_cursors)+(select count(*) from meta)+(select count(*) from no_copy_dispositions)+(select count(*) from dispatch_seeds)+(select count(*) from dispatch_targets);")
     [[ "$total" == 0 ]] || die "version-one seed contains $total row(s)"
-    [[ -f "$generation_dir/paper.log" && ! -s "$generation_dir/paper.log" ]] ||
-      die "version-one seed paper.log is absent or non-empty"
-    [[ -f "$generation_dir/live_journal.log" && ! -s "$generation_dir/live_journal.log" ]] ||
-      die "version-one seed live_journal.log is absent or non-empty"
-    [[ -f "$generation_dir/source_events.log" && ! -s "$generation_dir/source_events.log" ]] ||
-      die "version-one seed source_events.log is absent or non-empty"
+    log_is_header_only "$generation_dir/paper.log" ||
+      die "version-one seed paper.log is not the header-only empty log"
+    log_is_header_only "$generation_dir/live_journal.log" ||
+      die "version-one seed live_journal.log is not the header-only empty log"
+    log_is_header_only "$generation_dir/source_events.log" ||
+      die "version-one seed source_events.log is not the header-only empty log"
     expected_hash=$(manifest_get legacy_history.sha256)
     [[ "$(sha256_file "$generation_dir/wallet_market_history.json")" == "$expected_hash" ]] ||
       die "version-one seed legacy history hash drift"
@@ -607,9 +607,10 @@ verify_seed_or_prepared() {
       "select (select count(*) from fills), (select count(*) from settled_markets), (select count(*) from meta where key='last_supabase_applied_event_seq'), (select count(*) from poll_cursors_v1_sealed), (select count(*) from poll_cursors where last_ts_unix <> activity_cutoff_unix or activity_cutoff_unix is null);")
     [[ "$fills $settled $watermark $sealed $mismatch" == "0 0 0 0 0" ]] ||
       die "prepared generation postconditions failed: fills=$fills settled=$settled watermark=$watermark sealed=$sealed cursor_mismatch=$mismatch"
-    [[ ! -s "$generation_dir/paper.log" && ! -s "$generation_dir/live_journal.log" ]] ||
-      die "prepared paper/live logs must remain empty"
-    [[ -s "$generation_dir/source_events.log" ]] || die "prepared source log must be non-empty"
+    log_is_header_only "$generation_dir/paper.log" && log_is_header_only "$generation_dir/live_journal.log" ||
+      die "prepared paper/live logs must remain header-only"
+    [[ -f "$generation_dir/source_events.log" && "$(stat -c %s "$generation_dir/source_events.log")" -gt 5 ]] ||
+      die "prepared source log must hold frames beyond the header"
   fi
 }
 

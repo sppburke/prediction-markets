@@ -25,7 +25,8 @@ default. With `--execute` it requires:
 - exactly the schema-v1 `a5f3a8f` user tables and no others;
 - zero rows in every copied table after reset;
 - `PRAGMA user_version = 1` and `PRAGMA integrity_check = ok`;
-- a WAL checkpoint and initially empty paper, live-journal, and source logs; and
+- a WAL checkpoint and initially empty paper, live-journal, and source logs (an empty event log is the
+  5-byte header `EDGE\x01`, never a zero-byte file: the migration verifies the header before any writer runs); and
 - the captured legacy-history file with both BLAKE3 and SHA-256 recorded.
 
 The activation driver's `prepared` state then runs the staged binary with

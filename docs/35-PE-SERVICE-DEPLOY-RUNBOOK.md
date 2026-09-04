@@ -74,6 +74,15 @@ matrix/canary output, status snapshots, logs, and measurements with the issue ev
 
 ### Warm prepare and cutover
 
+Prerequisites on the VPS, checked by the driver before it touches anything: `python3 realpath readlink
+sha256sum b3sum sqlite3 psql flock systemctl ss stat od` on `PATH` (`b3sum` is a user-local
+`cargo install b3sum`; run the driver with `$HOME/.cargo/bin` on `PATH`), `SUPABASE_DB_URL` exported
+in the driver's environment (delivered over stdin to the launcher, never on a command line or in a file
+on the host), and the rehearsal environment template carrying the publishable key in BOTH
+`PE_SUPABASE_ANON_KEY` and `PE_SUPABASE_SECRET_KEY`. The version-one seed's three fresh logs are the
+5-byte event-log header `EDGE\x01`, never zero-byte files: the migration verifies each header with a
+reader before any writer opens the file.
+
 The driver holds `/home/sean/.pe-deploy.lock` for its whole run and writes only the fixed
 `/home/sean/pe-activation.json` manifest as activation authority. Its state order is
 `seed → prepared → prechecked → guarded → archived → reset → switched → started → verified`, with
