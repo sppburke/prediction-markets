@@ -100,15 +100,27 @@ SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/activate_generation.sh --dry
   --bankroll <fresh-bankroll>
 ```
 
-Run the same command without `--dry-run`. While the old service still trades, `seed` creates the
-empty schema-v1 generation and `prepared` migrates it with `--exit-after-anchors`. If a crash leaves a
-version-two main before the `prepared` manifest rename, the driver re-enters that command so the binary
-completes or verifies the machine-owned `installed` phase and activation-tail bindings; table counts
-alone never adopt it. At `prechecked`, the
-driver records Forge's flag plus enabled/active bits, writes its existing `stop` flag, stops the user
-unit, proves no cycle process or lock remains, freezes the latest ranking batch, and evaluates the
-canonical due-wallet rule from `docs/_GLOSSARY.md`. A nonzero result stops. Only an explicit owner
-decision may be supplied as the exact `--approve-due-subset <count>`; it is durable in the manifest.
+Before starting the driver, pause the ranking loop from an operator host that can reach Forge and
+verify the recorded and live state:
+
+```bash
+scp scripts/deploy/forge_pause.sh forge:/tmp/forge_pause.sh
+ssh forge 'bash /tmp/forge_pause.sh pause'
+ssh forge 'bash /tmp/forge_pause.sh status'
+```
+
+The activation driver runs on the VPS, which cannot resolve or reach Forge. The Forge pause is
+therefore an operator invariant; the driver verifies its consequence by requiring the ranking batch
+to remain frozen. Run the same driver command without `--dry-run`. While the old service still trades,
+`seed` creates the empty schema-v1 generation and `prepared` migrates it with
+`--exit-after-anchors`. If a crash leaves a version-two main before the `prepared` manifest rename, the
+driver re-enters that command so the binary completes or verifies the machine-owned `installed` phase
+and activation-tail bindings; table counts alone never adopt it. At `prechecked`, the driver records the
+latest ranking batch and evaluates the canonical due-wallet rule from `docs/_GLOSSARY.md`. A nonzero
+result stops. Only an explicit owner decision may be supplied as the exact
+`--approve-due-subset <count>`; it is durable in the manifest.
+Immediately before `guarded` disables or stops the service at T0, the driver re-reads the latest batch
+and refuses with the service untouched if it differs from the `prechecked` batch.
 
 Before T0, old state paths are resolved exclusively from the installed `.env` and service TOML, whose
 hashes are bound in the manifest. The driver never parses `ExecStart`, `EnvironmentFile`, or other unit
@@ -135,25 +147,35 @@ their effective paths. The persistence invariant is exact: artifacts are replace
 the running process proves it uses, so any unit that started the current process starts the next one
 identically. Unit-file edits are outside the driver's control; it neither parses nor reloads them, and
 drift is caught by the next activation's pre-T0 proof or by the immediate post-start proof. `started`
-adopts an already-running exact generation or uses `systemctl enable --now` once, repeats the complete
+adopts an already-running exact generation or runs `systemctl enable pe-service` followed by
+`systemctl start pe-service`, repeats the complete
 running-process proof against the adopted artifacts, and records its `InvocationID` plus
-`ActiveEnterTimestamp`. `verified` repeats that proof before any Forge restoration or manifest advance,
+`ActiveEnterTimestamp`. `verified` repeats that proof before the manifest advances,
 waits a bounded 120 seconds for `status.json.updated_at` to be newer than that recorded invocation, then
 rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest ranking
 batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
 any approved subset, producer/critical-task health, fresh Supabase book, successful watchlist projection,
 and refreshed materialized view. If the new-process proof fails either while entering `started` or at the
-top of `verified`, the driver stops and disables `pe-service`, verifies both conditions, appends the
+top of `verified`, the driver disables and stops `pe-service`, verifies both conditions, appends the
 timestamped refusal reason to `post_start_refusals`, removes the recorded invocation fields, and rewinds
-the manifest to `switched`. Forge remains paused; repair the mismatch and re-run the same activation so it
-starts and proves the generation again.
+the manifest to `switched`. The operator-held pause on Forge remains in place; repair the mismatch and
+re-run the same activation so it starts and proves the generation again.
 
 The final signed-in site check cannot be automated because the site uses Google single sign-on. The
 driver therefore prompts the operator to inspect the fresh era and records `site_confirmed_by` and
-`site_confirmed_at` in the manifest before restoring Forge or advancing to `verified`. A non-interactive
+`site_confirmed_at` in the manifest before advancing to `verified`. A non-interactive
 invocation must include `--site-confirmed`; that flag is the operator's attestation that the signed-in
-check was performed, not an automated site probe. Only after the durable confirmation does the driver
-restore Forge's prior flag and independently restore its enablement and activity bits.
+check was performed, not an automated site probe.
+
+After the driver reaches `verified`, update the Forge checkout to the exact merge commit and restore its
+recorded flag, enablement, and activity independently on Forge itself:
+
+```bash
+ssh forge 'cd ~/prediction-markets && scripts/deploy/forge_pause.sh restore'
+ssh forge 'cd ~/prediction-markets && scripts/deploy/forge_pause.sh status'
+```
+
+Do not restore Forge before `verified`: the driver checks the frozen batch again during verification.
 
 Re-run the identical command after interruption or reboot. Each external boundary is rechecked, and
 the first incomplete durable state resumes. Never edit the manifest or substitute a repository

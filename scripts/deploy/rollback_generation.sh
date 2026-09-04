@@ -142,7 +142,8 @@ installed_old_artifacts || die "archived artifact restoration failed"
 if [[ "$(systemctl_active pe-service)" == true ]]; then
   verify_old_running
 else
-  "${SERVICE_MUTATE[@]}" enable --now pe-service
+  "${SERVICE_MUTATE[@]}" enable pe-service
+  "${SERVICE_MUTATE[@]}" start pe-service
   maybe_crash rollback-started
   verify_old_running
 fi

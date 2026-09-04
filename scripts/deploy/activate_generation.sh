@@ -84,7 +84,6 @@ manifest=$MANIFEST
 generation_dir=$generation_dir
 state_plan=seed -> prepared -> prechecked -> guarded -> archived -> reset -> switched -> started -> verified
 rollback_plan=rolling_back -> rolled_back
-forge_flag=$FORGE_FLAG (prior flag, enabled bit, and active bit restored independently)
 service_artifacts=$SERVICE_CONFIG $SERVICE_ENV $SERVICE_BINARY
 EOF
   exit 0
@@ -592,18 +591,6 @@ if [[ "$state" == archived ]]; then
 fi
 
 if (( $(state_rank "$state") < $(state_rank prechecked) )); then
-  if ! python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(0 if "forge" in value else 1)' "$MANIFEST"; then
-    prior_flag=missing
-    [[ -f "$FORGE_FLAG" ]] && prior_flag=$(<"$FORGE_FLAG")
-    [[ "$prior_flag" == run || "$prior_flag" == stop || "$prior_flag" == missing ]] ||
-      die "invalid prior Forge flag: $prior_flag"
-    prior_enabled=$(forge_enabled)
-    prior_active=$(forge_active)
-    forge_patch=$(python3 -c 'import json,sys; print(json.dumps({"forge":{"prior_flag":sys.argv[1],"prior_enabled":sys.argv[2]=="true","prior_active":sys.argv[3]=="true"}}))' \
-      "$prior_flag" "$prior_enabled" "$prior_active")
-    manifest_patch_boundary prechecked-recorded "$forge_patch"
-  fi
-  pause_forge
   "$DEPLOY_SCRIPT_DIR/rehearsal_preflight.sh" "$(manifest_get artifacts.rehearsal_environment.path)"
   batch_id=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;')
   [[ "$batch_id" =~ ^[0-9]+$ ]] || die "latest ranking batch is absent"
@@ -642,6 +629,9 @@ fi
 
 if (( $(state_rank "$state") < $(state_rank guarded) )); then
   verify_pre_t0_owner
+  latest_batch=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;')
+  [[ "$latest_batch" == "$(manifest_get ranking_batch_id)" ]] ||
+    die "latest ranking batch $latest_batch changed between prechecked and guarded; pe-service was not touched"
   "${SERVICE_MUTATE[@]}" disable pe-service
   "${SERVICE_MUTATE[@]}" stop pe-service
   [[ "$(systemctl_active pe-service)" == false ]] || die "pe-service is still active"
@@ -773,7 +763,8 @@ verify_running_generation() {
 
 post_start_refusal() {
   local reason=$1 at json
-  "${SERVICE_MUTATE[@]}" disable --now pe-service
+  "${SERVICE_MUTATE[@]}" disable pe-service
+  "${SERVICE_MUTATE[@]}" stop pe-service
   [[ "$(systemctl_active pe-service)" == false ]] || die "post-start refusal left pe-service active"
   [[ "$(systemctl_enabled pe-service)" == false ]] || die "post-start refusal left pe-service enabled"
   at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -811,7 +802,8 @@ if (( $(state_rank "$state") < $(state_rank started) )); then
       post_start_refusal "new pe-service process proof failed while entering started"
     fi
   else
-    "${SERVICE_MUTATE[@]}" enable --now pe-service
+    "${SERVICE_MUTATE[@]}" enable pe-service
+    "${SERVICE_MUTATE[@]}" start pe-service
     maybe_crash service-started
     if ! proof=$(verify_running_generation); then
       post_start_refusal "new pe-service process proof failed while entering started"
@@ -923,9 +915,7 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
       then 'ok' else 'mismatch' end;")
   [[ "$projection" == ok ]] || die "Supabase projection verification failed: $projection"
   record_site_confirmation
-  restore_forge "$(manifest_get forge.prior_flag)" \
-    "$(manifest_get forge.prior_enabled)" "$(manifest_get forge.prior_active)"
-  manifest_advance verified '{"forge_restored":true}'
+  manifest_advance verified
   state=verified
 fi
 

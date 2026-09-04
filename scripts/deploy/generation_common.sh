@@ -22,13 +22,6 @@ DEPLOY_LOCK="$DEPLOY_HOME/.pe-deploy.lock"
 SERVICE_BINARY="$SERVICE_ROOT/target/release/pe-service"
 SERVICE_CONFIG="$SERVICE_ROOT/smoke-test/service.toml"
 SERVICE_ENV="$SERVICE_ROOT/.env"
-FORGE_ROOT="$SERVICE_ROOT"
-FORGE_FLAG="$FORGE_ROOT/data/eval-results/rank_and_push.loop"
-FORGE_LOCKS=(
-  "$FORGE_ROOT/data/eval-results/.rank_and_push_loop.lock"
-  "$FORGE_ROOT/data/eval-results/.rank_and_push.lock"
-  "$FORGE_ROOT/data/wallet_cache.db.lock"
-)
 
 SIMULATE_CRASH_AFTER=${SIMULATE_CRASH_AFTER:-}
 
@@ -156,69 +149,4 @@ systemctl_enabled() {
 
 systemctl_active() {
   if systemctl is-active "$1" >/dev/null 2>&1; then echo true; else echo false; fi
-}
-
-forge_enabled() {
-  if systemctl --user is-enabled pe-rank-loop >/dev/null 2>&1; then echo true; else echo false; fi
-}
-
-forge_active() {
-  if systemctl --user is-active pe-rank-loop >/dev/null 2>&1; then echo true; else echo false; fi
-}
-
-atomic_flag_write() {
-  local value=$1 tmp
-  mkdir -p "$(dirname "$FORGE_FLAG")"
-  if [[ "$value" == missing ]]; then
-    rm -f "$FORGE_FLAG"
-    python3 -c 'import os,sys
-directory=os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-try: os.fsync(directory)
-finally: os.close(directory)' "$(dirname "$FORGE_FLAG")"
-    return
-  fi
-  tmp="$(dirname "$FORGE_FLAG")/.rank_and_push.loop.$$"
-  printf '%s\n' "$value" > "$tmp"
-  python3 -c 'import os,sys
-path=sys.argv[1]
-with open(path, "rb") as handle: os.fsync(handle.fileno())' "$tmp"
-  mv "$tmp" "$FORGE_FLAG"
-  python3 -c 'import os,sys
-directory=os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-try: os.fsync(directory)
-finally: os.close(directory)' "$(dirname "$FORGE_FLAG")"
-}
-
-pause_forge() {
-  atomic_flag_write stop
-  systemctl --user stop pe-rank-loop
-  [[ "$(forge_active)" == false ]] || die "pe-rank-loop did not become inactive"
-  if pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|pe-bootstrap|latency_shift_rerank[.]py|rank_72hr_buyandhold[.]py' >/dev/null; then
-    die "a Forge cycle descendant is still running"
-  fi
-  local lock
-  for lock in "${FORGE_LOCKS[@]}"; do
-    mkdir -p "$(dirname "$lock")"
-    touch "$lock"
-    flock -n "$lock" true || die "Forge lock is still held: $lock"
-  done
-}
-
-restore_forge() {
-  local prior_flag=$1 prior_enabled=$2 prior_active=$3
-  atomic_flag_write "$prior_flag"
-  if [[ "$prior_enabled" == true ]]; then
-    systemctl --user enable pe-rank-loop
-    [[ "$(forge_enabled)" == true ]] || die "failed to restore Forge enablement"
-  else
-    systemctl --user disable pe-rank-loop
-    [[ "$(forge_enabled)" == false ]] || die "failed to restore Forge disablement"
-  fi
-  if [[ "$prior_active" == true ]]; then
-    systemctl --user start pe-rank-loop
-    [[ "$(forge_active)" == true ]] || die "failed to restore Forge activity"
-  else
-    systemctl --user stop pe-rank-loop
-    [[ "$(forge_active)" == false ]] || die "failed to restore Forge inactivity"
-  fi
 }

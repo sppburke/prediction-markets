@@ -34,11 +34,6 @@ else
 fi
 SH
 
-  cat > "$bin/pgrep" <<'SH'
-#!/usr/bin/env bash
-exit 1
-SH
-
   cat > "$bin/ssh" <<'SH'
 #!/usr/bin/env bash
 echo "network access is forbidden in this test" >&2
@@ -130,7 +125,6 @@ if [[ -z "$sql" && -z "$file" && ! -t 0 ]]; then sql=$(cat); fi
 if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ "$(cat "$state/service.active")" == false ]] || { echo 'archive called while service active' >&2; exit 91; }
   [[ "$(cat "$state/service.enabled")" == false ]] || { echo 'archive called while service enabled' >&2; exit 91; }
-  [[ "$(cat "$state/forge.active")" == false ]] || { echo 'archive called while Forge active' >&2; exit 91; }
   if [[ ! -e "$state/archive-stamp" ]]; then
     echo 1 > "$state/archive-count"
     : > "$state/archive-stamp"
@@ -151,7 +145,16 @@ elif [[ "$sql" == *"anon must exist and must not bypass RLS"* ]]; then
   [[ ! -e "$state/preflight-fail" ]] || { echo 'simulated privilege-matrix failure' >&2; exit 94; }
   : > "$state/preflight-matrix-checked"
 elif [[ "$sql" == *"select max(batch_id)"* ]]; then
-  if [[ -e "$state/ranking-batch-drift" ]]; then echo 8; else echo 7; fi
+  count=0
+  [[ ! -e "$state/ranking-batch-query-count" ]] || count=$(<"$state/ranking-batch-query-count")
+  count=$((count + 1))
+  echo "$count" > "$state/ranking-batch-query-count"
+  if [[ -e "$state/ranking-batch-drift" ||
+        ( -e "$state/ranking-batch-drift-before-guard" && "$count" -ge 2 ) ]]; then
+    echo 8
+  else
+    echo 7
+  fi
 elif [[ "$sql" == *"select lower(wallet_hex)"* ]]; then
   echo 0x0000000000000000000000000000000000000557
 elif [[ "$sql" == *"json_build_object('paper_fills'"* ]]; then
@@ -181,11 +184,13 @@ set -euo pipefail
 root=${PE_ACTIVATION_TEST_ROOT:?}
 state="$root/test-state"
 mkdir -p "$state"
-user=false
-if [[ "${1-}" == --user ]]; then user=true; shift; fi
+for argument in "$@"; do
+  if [[ "$argument" == --now ]]; then
+    echo "fake systemctl rejects sudoers-incompatible --now" >&2
+    exit 1
+  fi
+done
 action=${1:?}; shift
-unit=${*: -1}
-if [[ "$unit" == pe-rank-loop ]]; then prefix=forge; else prefix=service; fi
 read_bit() { [[ -e "$state/$1" ]] && cat "$state/$1" || echo false; }
 write_bit() { printf '%s\n' "$2" > "$state/$1"; }
 write_service_environment() {
@@ -269,24 +274,14 @@ JSON
   fi
 }
 case "$action" in
-  is-active) [[ "$(read_bit "$prefix.active")" == true ]]
+  is-active) [[ "$(read_bit service.active)" == true ]]
     ;;
-  is-enabled) [[ "$(read_bit "$prefix.enabled")" == true ]]
+  is-enabled) [[ "$(read_bit service.enabled)" == true ]]
     ;;
-  stop) write_bit "$prefix.active" false ;;
-  start)
-    if [[ "$prefix" == service ]]; then start_service; else write_bit forge.active true; fi
-    ;;
-  disable)
-    write_bit "$prefix.enabled" false
-    if [[ " $* " == *" --now "* ]]; then write_bit "$prefix.active" false; fi
-    ;;
-  enable)
-    write_bit "$prefix.enabled" true
-    if [[ "${1-}" == --now || "${2-}" == --now ]]; then
-      if [[ "$prefix" == service ]]; then start_service; else write_bit forge.active true; fi
-    fi
-    ;;
+  stop) write_bit service.active false ;;
+  start) start_service ;;
+  disable) write_bit service.enabled false ;;
+  enable) write_bit service.enabled true ;;
   show)
     if [[ "$*" == *ActiveState* && "$*" == *MainPID* && "$*" == *InvocationID* &&
           "$*" == *ActiveEnterTimestamp* ]]; then
@@ -328,7 +323,7 @@ make_case() {
   root="$TEST_TMP/$name"
   service="$root/prediction-markets"
   mkdir -p "$service/target/release" "$service/smoke-test" \
-    "$service/data/eval-results" "$service/data" "$root/input" "$service/gen/557" \
+    "$root/input" "$service/gen/557" \
     "$root/test-state"
   printf '%s\n' provisioned-deploy-lock > "$root/.pe-deploy.lock"
   chmod 0444 "$root/.pe-deploy.lock"
@@ -411,11 +406,8 @@ SH
   cp "$service/.env" "$root/input/service.env"
   sed -i "s#$service/old/#$service/template-only/#g" "$root/input/service.env"
   cp "$root/input/service.env" "$root/input/rehearsal.env"
-  printf '%s\n' run > "$service/data/eval-results/rank_and_push.loop"
   printf '%s\n' true > "$root/test-state/service.active"
   printf '%s\n' true > "$root/test-state/service.enabled"
-  printf '%s\n' true > "$root/test-state/forge.active"
-  printf '%s\n' false > "$root/test-state/forge.enabled"
   echo "$root"
 }
 
@@ -446,21 +438,12 @@ rollback() {
 }
 
 reboot_host() {
-  local root=$1 unit prefix
+  local root=$1
   printf '%s\n' false > "$root/test-state/service.active"
-  printf '%s\n' false > "$root/test-state/forge.active"
-  for unit in pe-service pe-rank-loop; do
-    if [[ "$unit" == pe-service ]]; then prefix=service; else prefix=forge; fi
-    if [[ "$(<"$root/test-state/$prefix.enabled")" == true ]]; then
-      if [[ "$unit" == pe-service ]]; then
-        env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" PATH="$root/bin:$PATH" \
-          "$root/bin/systemctl" start pe-service
-      else
-        env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" PATH="$root/bin:$PATH" \
-          "$root/bin/systemctl" --user start pe-rank-loop
-      fi
-    fi
-  done
+  if [[ "$(<"$root/test-state/service.enabled")" == true ]]; then
+    env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" PATH="$root/bin:$PATH" \
+      "$root/bin/systemctl" start pe-service
+  fi
 }
 
 assert_deploy_lock_unchanged() {
@@ -480,10 +463,6 @@ assert_verified() {
     fail "$root started the fresh service $starts times, expected $expected_starts"
   stamps=$(<"$root/test-state/archive-count")
   [[ "$stamps" == 1 ]] || fail "$root created $stamps archive stamps"
-  [[ "$(<"$root/test-state/forge.enabled")" == false ]] || fail "Forge enablement changed"
-  [[ "$(<"$root/test-state/forge.active")" == true ]] || fail "Forge activity changed"
-  [[ "$(<"$root/prediction-markets/data/eval-results/rank_and_push.loop")" == run ]] ||
-    fail "Forge flag changed"
   [[ "$(stat -c '%a' "$root/.pe-deploy.lock")" == 444 ]] || fail "deploy lock mode changed"
   [[ "$(<"$root/.pe-deploy.lock")" == provisioned-deploy-lock ]] || fail "deploy lock content changed"
   assert_deploy_lock_unchanged "$root"
@@ -537,7 +516,7 @@ run_crash_case() {
 }
 
 manifest_boundaries=(
-  seed prepared prechecked-recorded prechecked guarded archived reset switched started site-confirmed verified
+  seed prepared prechecked guarded archived reset switched started site-confirmed verified
 )
 for state in "${manifest_boundaries[@]}"; do
   run_crash_case "before-manifest-$state"
@@ -783,10 +762,6 @@ refuse_post_start_process() {
     fail "$kind mismatch left the refused service active"
   [[ "$(<"$root/test-state/service.enabled")" == false ]] ||
     fail "$kind mismatch left the refused service enabled"
-  [[ "$(<"$root/test-state/forge.active")" == false ]] ||
-    fail "$kind mismatch restored Forge before $phase proof"
-  [[ "$(<"$root/prediction-markets/data/eval-results/rank_and_push.loop")" == stop ]] ||
-    fail "$kind mismatch restored the Forge flag before $phase proof"
   [[ "$(<"$root/test-state/service-start-count")" == 1 ]] ||
     fail "$kind mismatch caused an unexpected fresh-service start count"
   python3 - "$root/pe-activation.json" "$phase" <<'PY' || fail "$kind $phase refusal audit is incomplete"
@@ -872,7 +847,6 @@ done
 root=$(make_case reboot-enabled-model)
 reboot_host "$root"
 [[ "$(<"$root/test-state/service.active")" == true ]] || fail "enabled service did not auto-start on reboot"
-[[ "$(<"$root/test-state/forge.active")" == false ]] || fail "disabled Forge unit auto-started on reboot"
 
 # The privilege matrix is evaluated and a changed matrix stops before warm prepare.
 root=$(make_case preflight-negative)
@@ -956,6 +930,32 @@ set -e
 [[ "$rc" == 1 ]] || fail "mismatched archive counts were accepted"
 grep -q 'archive counts do not match' "$root/count.err" || fail "archive-count refusal was not explicit"
 rm "$root/test-state/archive-count-mismatch"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
+
+# A new batch between prechecked and guarded refuses immediately before T0 with the service untouched.
+root=$(make_case ranking-batch-drift-before-guard)
+: > "$root/test-state/ranking-batch-drift-before-guard"
+set +e
+activate "$root" activation-557 >"$root/pre-guard-batch.out" 2>"$root/pre-guard-batch.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "pre-guard ranking batch drift was accepted"
+grep -q 'changed between prechecked and guarded; pe-service was not touched' \
+  "$root/pre-guard-batch.err" || fail "pre-guard batch refusal was not explicit"
+state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+  "$root/pe-activation.json")
+[[ "$state" == prechecked ]] || fail "pre-guard batch drift advanced manifest to $state"
+[[ "$(<"$root/test-state/service.active")" == true ]] ||
+  fail "pre-guard batch drift stopped the service"
+[[ "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "pre-guard batch drift disabled the service"
+[[ ! -e "$root/test-state/service-start-count" ]] ||
+  fail "pre-guard batch drift restarted the service"
+[[ ! -e "$root/test-state/db-reset" ]] || fail "pre-guard batch drift reached the database reset"
+[[ "$(<"$root/prediction-markets/target/release/pe-service")" == old-binary ]] ||
+  fail "pre-guard batch drift replaced the installed binary"
+rm "$root/test-state/ranking-batch-drift-before-guard"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
@@ -1107,6 +1107,6 @@ grep -q 'archived service_toml source hash mismatch' "$root/corrupt.err" ||
 echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
 echo "rollback restore/adoption and forward-refusal matrix: PASS"
-echo "lock, preflight, invocation, batch, site, reboot, and Forge restoration: PASS"
+echo "lock, preflight, invocation, batch, site, and reboot: PASS"
 echo "post-start refusal stop, disable, rewind, audit, and repaired rerun: PASS"
 echo "process cwd, stable snapshot, and exact environment ownership: PASS"
