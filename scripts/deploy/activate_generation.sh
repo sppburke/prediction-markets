@@ -602,11 +602,16 @@ verify_seed_or_prepared() {
     [[ "$(sha256_file "$generation_dir/wallet_market_history.json")" == "$expected_hash" ]] ||
       die "version-one seed legacy history hash drift"
   else
-    read -r fills settled watermark sealed mismatch < <(sqlite3 -separator ' ' -readonly \
+    # After a prepare-only run (no producers) the binary leaves each anchored wallet's delivery cursor at
+    # its last activity time (never beyond its bracket cutoff) with a non-null cutoff, and each deferred
+    # wallet (left unvalidated for runtime admission) with a null cutoff and no anchor. Measured on the
+    # first real prepare (act-557-62ed205-1): beyond_cutoff=0, orphan=0, deferred=10 of 78.
+    read -r fills settled watermark sealed beyond orphan deferred < <(sqlite3 -separator ' ' -readonly \
       "file:$generation_dir/paper_state.db?immutable=1" \
-      "select (select count(*) from fills), (select count(*) from settled_markets), (select count(*) from meta where key='last_supabase_applied_event_seq'), (select count(*) from poll_cursors_v1_sealed), (select count(*) from poll_cursors where last_ts_unix <> activity_cutoff_unix or activity_cutoff_unix is null);")
-    [[ "$fills $settled $watermark $sealed $mismatch" == "0 0 0 0 0" ]] ||
-      die "prepared generation postconditions failed: fills=$fills settled=$settled watermark=$watermark sealed=$sealed cursor_mismatch=$mismatch"
+      "select (select count(*) from fills), (select count(*) from settled_markets), (select count(*) from meta where key='last_supabase_applied_event_seq'), (select count(*) from poll_cursors_v1_sealed), (select count(*) from poll_cursors where activity_cutoff_unix is not null and last_ts_unix > activity_cutoff_unix), (select count(*) from poll_cursors c where c.activity_cutoff_unix is not null and not exists (select 1 from position_anchors a where a.wallet_hex = c.wallet_hex)) + (select count(*) from position_anchors a where not exists (select 1 from poll_cursors c where c.wallet_hex = a.wallet_hex and c.activity_cutoff_unix is not null)), (select count(*) from poll_cursors where activity_cutoff_unix is null);")
+    [[ "$fills $settled $watermark $sealed $beyond $orphan" == "0 0 0 0 0 0" && "$deferred" =~ ^[0-9]+$ ]] ||
+      die "prepared generation postconditions failed: fills=$fills settled=$settled watermark=$watermark sealed=$sealed cursor_beyond_cutoff=$beyond anchor_cursor_orphans=$orphan deferred=$deferred"
+    PREPARED_DEFERRED_WALLETS=$deferred
     log_is_header_only "$generation_dir/paper.log" && log_is_header_only "$generation_dir/live_journal.log" ||
       die "prepared paper/live logs must remain header-only"
     [[ -f "$generation_dir/source_events.log" && "$(stat -c %s "$generation_dir/source_events.log")" -gt 5 ]] ||
@@ -640,7 +645,7 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   # A version-two main is never adopted from table counts alone. Re-entering the
   # binary completes or verifies the machine-owned migration through installed.
   verify_seed_or_prepared 2
-  manifest_advance prepared
+  manifest_advance prepared "$(python3 -c 'import json,sys; print(json.dumps({"deferred_wallets":int(sys.argv[1])}))' "${PREPARED_DEFERRED_WALLETS:-0}")"
   state=prepared
 fi
 

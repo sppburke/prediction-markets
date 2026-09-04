@@ -31,8 +31,10 @@ default. With `--execute` it requires:
 
 The activation driver's `prepared` state then runs the staged binary with
 `--exit-after-anchors`. Its postconditions are schema v2, zero fills and settlements, no authoritative
-watermark, no sealed v1 cursor rows, delivery cursors equal to bracket cursors, empty paper/live logs,
-and a non-empty migrated source log.
+watermark, no sealed v1 cursor rows, no delivery cursor beyond its bracket cutoff, every anchored wallet
+carrying a cutoff and every cutoff carrying an anchor (deferred wallets — left unvalidated for runtime
+admission — have a null cutoff and are counted, not refused), header-only paper/live logs, and a source
+log holding frames beyond the header.
 
 ## Supabase archive and reset
 
