@@ -47,8 +47,10 @@ esac
 # Every rollback attempt first makes the service inert before consulting archive or database facts.
 "${SERVICE_MUTATE[@]}" disable pe-service
 "${SERVICE_MUTATE[@]}" stop pe-service
-[[ "$(systemctl_active pe-service)" == false ]] || die "pe-service is still active"
-[[ "$(systemctl_enabled pe-service)" == false ]] || die "pe-service is still enabled"
+service_active=$(systemctl_active_state pe-service)
+service_enabled=$(systemctl_enabled_state pe-service)
+[[ "$service_active" == false ]] || die "pe-service is still active"
+[[ "$service_enabled" == false ]] || die "pe-service is still enabled"
 
 manifest_has() {
   python3 -c 'import json,sys
@@ -123,9 +125,12 @@ restored_counts_match() {
 }
 
 verify_old_running() {
+  local service_active service_enabled
   installed_old_artifacts || die "installed artifacts are not the archived generation"
-  [[ "$(systemctl_active pe-service)" == true ]] || die "old generation is not active"
-  [[ "$(systemctl_enabled pe-service)" == true ]] || die "old generation is not enabled"
+  service_active=$(systemctl_active_state pe-service)
+  service_enabled=$(systemctl_enabled_state pe-service)
+  [[ "$service_active" == true ]] || die "old generation is not active"
+  [[ "$service_enabled" == true ]] || die "old generation is not enabled"
   local pid running
   pid=$(systemctl show pe-service -p MainPID --value)
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
@@ -133,7 +138,9 @@ verify_old_running() {
   [[ "$running" == "$(old_sha pe_service)" ]] || die "running binary is not the archived generation"
 }
 
-archive_counts=$(activation_archive_counts "$activation_id")
+archive_columns_required=false
+manifest_requires_archive_columns && archive_columns_required=true
+archive_counts=$(activation_archive_counts "$activation_id" "$archive_columns_required")
 if activation_archive_stamp_exists "$archive_counts"; then
   activation_archive_counts_match_pre_reset "$archive_counts" ||
     die "activation archive counts do not match the recorded pre-reset live counts"

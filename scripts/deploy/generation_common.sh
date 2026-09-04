@@ -50,6 +50,9 @@ acquire_deploy_lock() {
   [[ -f "$DEPLOY_LOCK" ]] || die "provisioned deploy lock is absent: $DEPLOY_LOCK"
   exec 9<"$DEPLOY_LOCK"
   flock -n 9 || die "another generation driver holds $DEPLOY_LOCK"
+}
+
+hold_deploy_lock_at_test_boundary() {
   if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 && -n "${PE_ACTIVATION_TEST_HOLD_LOCK_FILE:-}" ]]; then
     : > "$PE_ACTIVATION_TEST_HOLD_LOCK_FILE.ready"
     while [[ -e "$PE_ACTIVATION_TEST_HOLD_LOCK_FILE" ]]; do sleep 0.05; done
@@ -69,6 +72,14 @@ if isinstance(value, bool): print(str(value).lower())
 elif value is None: print("")
 elif isinstance(value, (dict,list)): print(json.dumps(value, sort_keys=True, separators=(",",":")))
 else: print(value)' "$MANIFEST" "$1"
+}
+
+manifest_requires_archive_columns() {
+  python3 -c 'import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+durable=("archive_counts" in value or
+         value.get("state") in {"reset","switched","started","verified"})
+raise SystemExit(0 if durable else 1)' "$MANIFEST"
 }
 
 atomic_manifest_json() {
@@ -147,15 +158,25 @@ activation_archive_counts() {
   # The archive tables gain `activation_id` only when archive_paper_state.sql first runs (`add column if
   # not exists`); the deployed database had no such column before the first activation (EVIDENCE F7
   # addendum). A missing column means no stamped rows, by definition — never a query error.
-  local activation_id=$1 present
+  local activation_id=$1 durable_reset=$2 present
   present=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
     "select count(*) from information_schema.columns where table_schema='public' and column_name='activation_id'
        and table_name in ('paper_fills_archive','settled_markets_archive','paper_positions_archive','paper_bankroll_archive','fill_market_snapshots_archive');") ||
     return 1
   case "$present" in
-    0) echo '0 0 0 0 0'; return 0 ;;
+    0)
+      [[ "$durable_reset" == false ]] ||
+        die "archive stamp column missing after a durable reset"
+      echo '0 0 0 0 0'
+      return 0
+      ;;
     5) ;;
-    *) die "activation_id is present on $present of the five archive tables" ;;
+    *)
+      if [[ "$durable_reset" == true ]]; then
+        die "archive stamp column missing after a durable reset"
+      fi
+      die "activation_id is present on $present of the five archive tables"
+      ;;
   esac
   psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
     "select (select count(*) from paper_fills_archive where activation_id='$activation_id') || ' ' ||
@@ -186,10 +207,22 @@ raise SystemExit(0 if counts == [int(recorded[key]) for key in keys] else 1)' \
     "$counts" "$recorded"
 }
 
-systemctl_enabled() {
-  if systemctl is-enabled "$1" >/dev/null 2>&1; then echo true; else echo false; fi
+systemctl_enabled_state() {
+  local output status=0
+  output=$(systemctl is-enabled "$1" 2>/dev/null) || status=$?
+  case "$output" in
+    enabled) [[ "$status" == 0 ]] || die "systemctl is-enabled failed for $1"; echo true ;;
+    disabled) [[ "$status" == 1 ]] || die "systemctl is-enabled failed for $1"; echo false ;;
+    *) die "could not prove $1 enablement from systemctl is-enabled: ${output:-<no output>}" ;;
+  esac
 }
 
-systemctl_active() {
-  if systemctl is-active "$1" >/dev/null 2>&1; then echo true; else echo false; fi
+systemctl_active_state() {
+  local output status=0
+  output=$(systemctl is-active "$1" 2>/dev/null) || status=$?
+  case "$output" in
+    active) [[ "$status" == 0 ]] || die "systemctl is-active failed for $1"; echo true ;;
+    inactive|failed) [[ "$status" == 3 ]] || die "systemctl is-active failed for $1"; echo false ;;
+    *) die "could not prove $1 activity from systemctl is-active: ${output:-<no output>}" ;;
+  esac
 }

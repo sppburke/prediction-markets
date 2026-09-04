@@ -105,6 +105,59 @@ state_rank() {
   esac
 }
 
+complete_post_start_refusal() {
+  local disable_rc=0 stop_rc=0 active_rc=0 enabled_rc=0 active='' enabled=''
+  local -a failures=()
+  "${SERVICE_MUTATE[@]}" disable pe-service || disable_rc=$?
+  maybe_crash refusal-disabled
+  "${SERVICE_MUTATE[@]}" stop pe-service || stop_rc=$?
+  active=$(systemctl_active_state pe-service) || active_rc=$?
+  enabled=$(systemctl_enabled_state pe-service) || enabled_rc=$?
+  ((disable_rc == 0)) || failures+=("disable failed ($disable_rc)")
+  ((stop_rc == 0)) || failures+=("stop failed ($stop_rc)")
+  ((active_rc == 0)) || failures+=("activity probe failed")
+  ((enabled_rc == 0)) || failures+=("enablement probe failed")
+  [[ "$active" == false ]] || failures+=("pe-service remained active")
+  [[ "$enabled" == false ]] || failures+=("pe-service remained enabled")
+  ((${#failures[@]} == 0)) || die "post-start refusal did not make pe-service inert: ${failures[*]}"
+
+  local json reason
+  reason=$(manifest_get refusal.reason)
+  json=$(python3 -c 'import json,sys
+path=sys.argv[1]
+value=json.load(open(path, encoding="utf-8"))
+refusal=value.get("refusal")
+if not isinstance(refusal,dict) or not refusal.get("at") or not refusal.get("reason"):
+    raise SystemExit("invalid durable refusal intent")
+for key in ("invocation_id","active_enter_timestamp","active_enter_unix"):
+    value.pop(key,None)
+value.setdefault("post_start_refusals",[]).append(refusal)
+if refusal.get("forward_blocked") is True:
+    value["forward_blocked"]={"at":refusal["at"],"reason":refusal["reason"]}
+value.pop("refusal",None)
+value["state"]="switched"
+print(json.dumps(value,sort_keys=True,separators=(",",":")))' "$MANIFEST")
+  atomic_manifest_json "$json" post-start-refusal
+  die "$reason; pe-service disabled and stopped, activation rewound to switched"
+}
+
+post_start_refusal() {
+  local reason=$1 forward_blocked=${2:-false} at json
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  json=$(python3 -c 'import json,sys
+path,at,reason,forward_blocked=sys.argv[1:]
+value=json.load(open(path, encoding="utf-8"))
+refusal={"at":at,"reason":reason}
+if forward_blocked == "true": refusal["forward_blocked"]=True
+value["refusal"]=refusal
+value["state"]="refusing"
+print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
+    "$MANIFEST" "$at" "$reason" "$forward_blocked")
+  atomic_manifest_json "$json" refusing
+  maybe_crash refusal-intent-recorded
+  complete_post_start_refusal
+}
+
 verify_staged_artifacts() {
   local path expected label
   while (($#)); do
@@ -240,9 +293,13 @@ verify_installed_unit_owner() {
   # Ownership is proved from one stable manager snapshot plus the running process, never from unit-file
   # syntax. The same checks run on the NEW process in `verified`, so what the unit starts after the switch
   # is proved, not parsed.
-  local active pid invocation active_enter working running
+  local active enabled pid invocation active_enter working running
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
     die "one or more installed service artifacts are absent"
+  active=$(systemctl_active_state pe-service)
+  enabled=$(systemctl_enabled_state pe-service)
+  [[ "$active" == true ]] || die "installed pe-service is not active"
+  [[ "$enabled" == true ]] || die "installed pe-service is not enabled"
   read_service_process_snapshot || die "could not read the pe-service process snapshot"
   active=$SERVICE_SNAPSHOT_ACTIVE
   pid=$SERVICE_SNAPSHOT_PID
@@ -384,6 +441,8 @@ if [[ -f "$MANIFEST" ]]; then
     if [[ "$manifest_state" != verified && "$manifest_state" != rolled_back ]]; then
       die "activation $manifest_id is non-terminal at $manifest_state"
     fi
+  elif [[ "$manifest_state" == refusing ]]; then
+    complete_post_start_refusal
   elif forward_blocked_reason=$(python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
 blocked=value.get("forward_blocked")
@@ -399,7 +458,7 @@ print(blocked.get("reason", "") if isinstance(blocked,dict) else "")' "$MANIFEST
 fi
 
 if [[ ! -f "$MANIFEST" || "$(manifest_get activation_id 2>/dev/null || true)" != "$activation_id" ]]; then
-  archive_counts=$(activation_archive_counts "$activation_id")
+  archive_counts=$(activation_archive_counts "$activation_id" false)
   if activation_archive_stamp_exists "$archive_counts"; then
     die "activation id already used: rows stamped $archive_counts; choose a new id"
   fi
@@ -443,6 +502,7 @@ print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
     "$legacy_history" "$generation_dir/staged" "$old_event" "$old_source" "$old_status" \
     "$old_db" "$old_history" "$old_live" "$SERVICE_CONFIG" "$SERVICE_ENV" "$SERVICE_BINARY")
   atomic_manifest_json "$initial" seed
+  hold_deploy_lock_at_test_boundary
 fi
 
 [[ "$(manifest_get activation_id)" == "$activation_id" ]] || die "manifest activation mismatch"
@@ -487,12 +547,17 @@ verify_pre_t0_owner() {
 }
 
 if (( $(state_rank "$state") < $(state_rank guarded) )); then
-  if [[ "$state" == prechecked && "$(systemctl_active pe-service)" == false &&
-        "$(systemctl_enabled pe-service)" == false ]]; then
-    # A crash can land after disable+stop but before the guarded manifest rename.
-    verify_pre_t0_artifacts
-    manifest_advance guarded
-    state=guarded
+  if [[ "$state" == prechecked ]]; then
+    service_active=$(systemctl_active_state pe-service)
+    service_enabled=$(systemctl_enabled_state pe-service)
+    if [[ "$service_active" == false && "$service_enabled" == false ]]; then
+      # A crash can land after disable+stop but before the guarded manifest rename.
+      verify_pre_t0_artifacts
+      manifest_advance guarded
+      state=guarded
+    else
+      verify_pre_t0_owner
+    fi
   else
     verify_pre_t0_owner
   fi
@@ -575,17 +640,18 @@ verify_fresh_supabase() {
 }
 
 if [[ "$state" == archived ]]; then
-  if counts=$(activation_archive_counts "$activation_id" 2>/dev/null); then
-    read -r _ _ _ bankroll_archived _ <<<"$counts"
-    if activation_archive_stamp_exists "$counts"; then
-      activation_archive_counts_match_pre_reset "$counts" ||
-        die "activation archive counts do not match the recorded pre-reset live counts"
-      [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
-      verify_fresh_supabase
-      patch=$(python3 -c 'import json,sys; print(json.dumps({"archive_counts":sys.argv[1]}))' "$counts")
-      manifest_advance reset "$patch"
-      state=reset
-    fi
+  archive_columns_required=false
+  manifest_requires_archive_columns && archive_columns_required=true
+  counts=$(activation_archive_counts "$activation_id" "$archive_columns_required")
+  read -r _ _ _ bankroll_archived _ <<<"$counts"
+  if activation_archive_stamp_exists "$counts"; then
+    activation_archive_counts_match_pre_reset "$counts" ||
+      die "activation archive counts do not match the recorded pre-reset live counts"
+    [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
+    verify_fresh_supabase
+    patch=$(python3 -c 'import json,sys; print(json.dumps({"archive_counts":sys.argv[1]}))' "$counts")
+    manifest_advance reset "$patch"
+    state=reset
   fi
 fi
 
@@ -633,8 +699,10 @@ if (( $(state_rank "$state") < $(state_rank guarded) )); then
     die "latest ranking batch $latest_batch changed between prechecked and guarded; pe-service was not touched"
   "${SERVICE_MUTATE[@]}" disable pe-service
   "${SERVICE_MUTATE[@]}" stop pe-service
-  [[ "$(systemctl_active pe-service)" == false ]] || die "pe-service is still active"
-  [[ "$(systemctl_enabled pe-service)" == false ]] || die "pe-service is still enabled"
+  service_active=$(systemctl_active_state pe-service)
+  service_enabled=$(systemctl_enabled_state pe-service)
+  [[ "$service_active" == false ]] || die "pe-service is still active"
+  [[ "$service_enabled" == false ]] || die "pe-service is still enabled"
   manifest_advance guarded
   state=guarded
 fi
@@ -673,7 +741,9 @@ print(json.dumps({"archive_artifacts":result},sort_keys=True))' "$archive"
 }
 
 if (( $(state_rank "$state") < $(state_rank archived) )); then
-  [[ "$(systemctl_active pe-service)" == false && "$(systemctl_enabled pe-service)" == false ]] ||
+  service_active=$(systemctl_active_state pe-service)
+  service_enabled=$(systemctl_enabled_state pe-service)
+  [[ "$service_active" == false && "$service_enabled" == false ]] ||
     die "guarded service state was lost"
   artifacts_patch=$(copy_pre_t0_files)
   live_counts=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
@@ -690,7 +760,7 @@ if (( $(state_rank "$state") < $(state_rank reset) )); then
     -v bankroll="$bankroll" -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
   maybe_crash db-commit
   verify_fresh_supabase
-  counts=$(activation_archive_counts "$activation_id")
+  counts=$(activation_archive_counts "$activation_id" true)
   read -r _ _ _ bankroll_archived _ <<<"$counts"
   [[ "$bankroll_archived" -gt 0 ]] || die "activation archive lacks its guaranteed bankroll stamp"
   activation_archive_counts_match_pre_reset "$counts" ||
@@ -760,28 +830,6 @@ verify_running_generation() {
   printf '%s\n%s\n' "$invocation" "$active_enter"
 }
 
-post_start_refusal() {
-  local reason=$1 forward_blocked=${2:-false} at json
-  "${SERVICE_MUTATE[@]}" disable pe-service
-  "${SERVICE_MUTATE[@]}" stop pe-service
-  [[ "$(systemctl_active pe-service)" == false ]] || die "post-start refusal left pe-service active"
-  [[ "$(systemctl_enabled pe-service)" == false ]] || die "post-start refusal left pe-service enabled"
-  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  json=$(python3 -c 'import json,sys
-path,at,reason,forward_blocked=sys.argv[1:]
-value=json.load(open(path, encoding="utf-8"))
-for key in ("invocation_id","active_enter_timestamp","active_enter_unix"):
-    value.pop(key,None)
-value.setdefault("post_start_refusals",[]).append({"at":at,"reason":reason})
-if forward_blocked == "true":
-    value["forward_blocked"]={"at":at,"reason":reason}
-value["state"]="switched"
-print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
-    "$MANIFEST" "$at" "$reason" "$forward_blocked")
-  atomic_manifest_json "$json" post-start-refusal
-  die "$reason; pe-service disabled and stopped, activation rewound to switched"
-}
-
 verify_listening_bind() {
   local pid port sockets
   pid=$(systemctl show pe-service -p MainPID --value)
@@ -798,19 +846,23 @@ print(port)' "$production_bind")
 
 if (( $(state_rank "$state") < $(state_rank started) )); then
   proof=
-  if [[ "$(systemctl_active pe-service)" == true ]]; then
-    if ! proof=$(verify_running_generation); then
-      post_start_refusal "new pe-service process proof failed while entering started"
-    fi
-  else
+  service_active=$(systemctl_active_state pe-service)
+  if [[ "$service_active" == false ]]; then
     "${SERVICE_MUTATE[@]}" enable pe-service
     "${SERVICE_MUTATE[@]}" start pe-service
     maybe_crash service-started
-    if ! proof=$(verify_running_generation); then
-      post_start_refusal "new pe-service process proof failed while entering started"
-    fi
   fi
-  [[ "$(systemctl_enabled pe-service)" == true ]] || die "pe-service did not become enabled"
+  service_active=$(systemctl_active_state pe-service)
+  service_enabled=$(systemctl_enabled_state pe-service)
+  [[ "$service_active" == true ]] || post_start_refusal "pe-service did not become active while entering started"
+  [[ "$service_enabled" == true ]] || post_start_refusal "pe-service was disabled while entering started"
+  if ! proof=$(verify_running_generation); then
+    post_start_refusal "new pe-service process proof failed while entering started"
+  fi
+  service_active=$(systemctl_active_state pe-service)
+  service_enabled=$(systemctl_enabled_state pe-service)
+  [[ "$service_active" == true ]] || post_start_refusal "pe-service became inactive while entering started"
+  [[ "$service_enabled" == true ]] || post_start_refusal "pe-service became disabled while entering started"
   mapfile -t proved_snapshot <<< "$proof"
   [[ "${#proved_snapshot[@]}" == 2 ]] || die "generation proof returned an invalid snapshot"
   invocation=${proved_snapshot[0]}
@@ -902,6 +954,10 @@ raise SystemExit(0 if value.get("site_confirmed_by")==sys.argv[2] and value.get(
 }
 
 if (( $(state_rank "$state") < $(state_rank verified) )); then
+  service_active=$(systemctl_active_state pe-service)
+  service_enabled=$(systemctl_enabled_state pe-service)
+  [[ "$service_active" == true ]] || post_start_refusal "pe-service is inactive while entering verified"
+  [[ "$service_enabled" == true ]] || post_start_refusal "pe-service is disabled while entering verified"
   if ! (verify_running_generation >/dev/null); then
     post_start_refusal "new pe-service process proof failed while entering verified"
   fi
@@ -975,6 +1031,10 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
     98) exit 1 ;;
     *) post_start_refusal "signed-in site confirmation recording failed" ;;
   esac
+  service_active=$(systemctl_active_state pe-service)
+  service_enabled=$(systemctl_enabled_state pe-service)
+  [[ "$service_active" == true ]] || post_start_refusal "pe-service became inactive while entering verified"
+  [[ "$service_enabled" == true ]] || post_start_refusal "pe-service became disabled while entering verified"
   manifest_advance verified
   state=verified
 fi

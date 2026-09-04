@@ -76,8 +76,9 @@ matrix/canary output, status snapshots, logs, and measurements with the issue ev
 
 The driver holds `/home/sean/.pe-deploy.lock` for its whole run and writes only the fixed
 `/home/sean/pe-activation.json` manifest as activation authority. Its state order is
-`seed → prepared → prechecked → guarded → archived → reset → switched → started → verified`. Use a
-unique `activation_id`; a different id is refused while the manifest is non-terminal.
+`seed → prepared → prechecked → guarded → archived → reset → switched → started → verified`, with
+`refusing` as the durable transient state for a post-start refusal. Use a unique `activation_id`; a
+different id is refused while the manifest is non-terminal.
 When creating a new `seed` manifest, the driver first queries all five archive tables and refuses an
 id that already stamps any row, including an id from an earlier terminal activation. Existing-manifest
 resumes do not repeat that new-id check.
@@ -151,16 +152,23 @@ environment files are mode `0600` from their first open. `guarded` starts T0 by 
 `pe-service`.
 `archived` copies every pre-T0 artifact without deleting it. `reset` applies the activation-stamped
 single Supabase transaction and requires its five stamped counts to equal the recorded pre-reset census.
+The five archive tables may lack their `activation_id` columns only before the manifest carries reset
+metadata. Once `state >= reset` or `archive_counts` is durable, a zero- or partial-column result is
+corruption and rollback stops after making the service inactive and disabled.
 `switched`
 hash-verifies and atomically adopts config, complete environment, and binary, then prints and validates
 their effective paths. The persistence invariant is exact: artifacts are replaced in place at the paths
 the running process proves it uses, so any unit that started the current process starts the next one
 identically. Unit-file edits are outside the driver's control; it neither parses nor reloads them, and
-drift is caught by the next activation's pre-T0 proof or by the immediate post-start proof. `started`
+drift is caught by the next activation's pre-T0 proof or by the immediate post-start proof. Every unit
+bit is read from the exact output of `systemctl is-active` and `systemctl is-enabled`: only
+`active`/`inactive`/`failed` and `enabled`/`disabled`, respectively, are accepted; transitional,
+runtime-only, static, or manager-error results stop the driver. `started`
 adopts an already-running exact generation or runs `systemctl enable pe-service` followed by
 `systemctl start pe-service`, repeats the complete
 running-process proof against the adopted artifacts, and records its `InvocationID` plus
-`ActiveEnterTimestamp`. `verified` repeats that proof before the manifest advances,
+`ActiveEnterTimestamp`. Both the `started` and `verified` proofs require the unit to be active and
+enabled. `verified` repeats that proof before the manifest advances,
 waits a bounded 120 seconds for `status.json.updated_at` to be newer than that recorded invocation, then
 rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest ranking
 batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
@@ -168,9 +176,11 @@ any approved subset, producer/critical-task health, fresh Supabase book, success
 and refreshed materialized view. If the new-process proof fails either while entering `started` or at the
 top of `verified`, or if any later material verification fails (bind, readiness/status, invocation,
 frozen batch, approved walk, prepared generation, materialized view, fresh Supabase book, or
-projection), the driver disables and stops `pe-service`, verifies both conditions, appends the
-timestamped refusal reason to `post_start_refusals`, removes the recorded invocation fields, and rewinds
-the manifest to `switched`. Frozen-batch drift after T0 also records `forward_blocked`; that activation
+projection), the driver first atomically records `state=refusing` and the timestamped refusal intent.
+It then attempts both disable and stop even if either command fails, proves the exact inactive and
+disabled states, appends that intent to `post_start_refusals`, removes the recorded invocation fields,
+and atomically rewinds the manifest to `switched`. A run resumed in `refusing` repeats this quiesce and
+rewind sequence before any forward work. Frozen-batch drift after T0 also records `forward_blocked`; that activation
 cannot run forward again and must use `rollback_generation.sh`. After any repairable refusal, the
 operator chooses either to re-run the same activation (which starts and verifies the generation again)
 or to roll it back. The operator-held pause on Forge remains in place through either decision.

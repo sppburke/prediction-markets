@@ -104,7 +104,12 @@ elif [[ "$sql" == *"pragma user_version"* ]]; then
 elif [[ "$sql" == *"pragma integrity_check"* ]]; then
   echo ok
 elif [[ "$sql" == *"last_ts_unix <> activity_cutoff_unix"* ]]; then
-  echo '0 0 0 0 0'
+  if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/prepared-generation-fail" &&
+        -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/fresh-service-started" ]]; then
+    echo '0 0 0 0 1'
+  else
+    echo '0 0 0 0 0'
+  fi
 elif [[ "$sql" == *"select count(*) from position_anchors"* ]]; then
   if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/anchor-count-drift-after-start" &&
         -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/fresh-service-started" ]]; then
@@ -126,11 +131,15 @@ state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
 mkdir -p "$state"
 sql=
 file=
+activation_id=
 while (($#)); do
   case "$1" in
     -c|-Atc) sql=$2; shift 2 ;;
     -f) file=$2; shift 2 ;;
-    -v) shift 2 ;;
+    -v)
+      [[ "$2" != activation_id=* ]] || activation_id=${2#activation_id=}
+      shift 2
+      ;;
     *) shift ;;
   esac
 done
@@ -139,10 +148,13 @@ if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ "$(cat "$state/service.active")" == false ]] || { echo 'archive called while service active' >&2; exit 91; }
   [[ "$(cat "$state/service.enabled")" == false ]] || { echo 'archive called while service enabled' >&2; exit 91; }
   rm -f "$state/archive-column-absent"
-  if [[ ! -e "$state/archive-stamp" ]]; then
-    echo 1 > "$state/archive-count"
-    : > "$state/archive-stamp"
+  [[ -n "$activation_id" ]] || { echo 'archive activation id is absent' >&2; exit 91; }
+  if [[ ! -e "$state/archive-ids" ]] || ! grep -Fxq "$activation_id" "$state/archive-ids"; then
+    printf '%s\n' "$activation_id" >> "$state/archive-ids"
+    count=0; [[ ! -e "$state/archive-count" ]] || count=$(<"$state/archive-count")
+    echo $((count + 1)) > "$state/archive-count"
   fi
+  : > "$state/archive-stamp"
   : > "$state/db-reset"
   rm -f "$state/db-restored"
 elif [[ "$file" == *restore_paper_state.sql ]]; then
@@ -174,10 +186,11 @@ elif [[ "$sql" == *"select lower(wallet_hex)"* ]]; then
 elif [[ "$sql" == *"json_build_object('paper_fills'"* ]]; then
   echo '{"paper_fills":3,"settled_markets":2,"paper_positions":2,"paper_bankroll":1,"fill_market_snapshots":1}'
 elif [[ "$sql" == *"information_schema.columns"* && "$sql" == *"column_name='activation_id'"* ]]; then
-  if [[ -e "$state/archive-column-absent" ]]; then echo 0; else echo 5; fi
+  if [[ -e "$state/archive-column-absent" || -e "$state/archive-column-zero-query" ]]; then echo 0; else echo 5; fi
 elif [[ "$sql" == *"paper_fills_archive where activation_id"* && "$sql" == *" || ' ' ||"* ]]; then
   [[ ! -e "$state/archive-column-absent" ]] || { echo 'ERROR:  column "activation_id" does not exist' >&2; exit 1; }
-  if [[ -e "$state/archive-stamp" ]]; then
+  requested=$(sed -n "s/.*where activation_id='\([^']*\)'.*/\1/p" <<< "$sql" | head -n 1)
+  if [[ -n "$requested" && -e "$state/archive-ids" ]] && grep -Fxq "$requested" "$state/archive-ids"; then
     if [[ -e "$state/archive-count-mismatch" ]]; then echo '4 2 2 1 1'; else echo '3 2 2 1 1'; fi
   else
     echo '0 0 0 0 0'
@@ -215,6 +228,11 @@ done
 action=${1:?}; shift
 read_bit() { [[ -e "$state/$1" ]] && cat "$state/$1" || echo false; }
 write_bit() { printf '%s\n' "$2" > "$state/$1"; }
+increment_count() {
+  local file=$1 count=0
+  [[ ! -e "$state/$file" ]] || count=$(<"$state/$file")
+  echo $((count + 1)) > "$state/$file"
+}
 write_service_environment() {
   local proc=$1 service=$2 credential=/run/credentials/pe-service.service
   [[ ! -e "$state/post-start-credential-wrong" ]] || credential=/wrong
@@ -297,13 +315,44 @@ JSON
   fi
 }
 case "$action" in
-  is-active) [[ "$(read_bit service.active)" == true ]]
+  is-active)
+    [[ ! -e "$state/service.active.error" ]] || exit 1
+    if [[ -e "$state/service.active.output" ]]; then
+      value=$(<"$state/service.active.output")
+    elif [[ "$(read_bit service.active)" == true ]]; then
+      value=active
+    else
+      value=inactive
+    fi
+    printf '%s\n' "$value"
+    [[ "$value" == active ]] && exit 0
+    [[ "$value" == inactive || "$value" == failed ]] && exit 3
+    exit 0
     ;;
-  is-enabled) [[ "$(read_bit service.enabled)" == true ]]
+  is-enabled)
+    [[ ! -e "$state/service.enabled.error" ]] || exit 1
+    if [[ -e "$state/service.enabled.output" ]]; then
+      value=$(<"$state/service.enabled.output")
+    elif [[ "$(read_bit service.enabled)" == true ]]; then
+      value=enabled
+    else
+      value=disabled
+    fi
+    printf '%s\n' "$value"
+    [[ "$value" == enabled ]] && exit 0
+    [[ "$value" == disabled ]] && exit 1
+    exit 0
     ;;
-  stop) write_bit service.active false ;;
+  stop) increment_count service-stop-count; write_bit service.active false ;;
   start) start_service ;;
-  disable) write_bit service.enabled false ;;
+  disable)
+    increment_count service-disable-count
+    if [[ -e "$state/disable-fail-once" ]]; then
+      rm "$state/disable-fail-once"
+      exit 97
+    fi
+    write_bit service.enabled false
+    ;;
   enable) write_bit service.enabled true ;;
   show)
     if [[ "$*" == *ActiveState* && "$*" == *MainPID* && "$*" == *InvocationID* &&
@@ -437,12 +486,13 @@ SH
 
 activate() {
   local root=$1 id=${2:-activation-557}; shift 2 || true
+  local generation_name=${TEST_GENERATION_NAME:-557}
   local site_args=(--site-confirmed)
   [[ "${TEST_OMIT_SITE_CONFIRMATION:-0}" != 1 ]] || site_args=()
   env PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" \
     SUPABASE_DB_URL=postgres://test PATH="$root/bin:$PATH" \
     "$SCRIPT_DIR/activate_generation.sh" \
-      --activation-id "$id" --generation-dir "$root/prediction-markets/gen/557" \
+      --activation-id "$id" --generation-dir "$root/prediction-markets/gen/$generation_name" \
       --source-v1-main "$root/input/source-v1.db" \
       --legacy-history "$root/input/history.json" \
       --staged-binary "$root/input/new-pe-service" \
@@ -478,7 +528,7 @@ assert_deploy_lock_unchanged() {
 }
 
 assert_verified() {
-  local root=$1 expected_starts=${2:-1} state starts stamps
+  local root=$1 expected_starts=${2:-1} expected_stamps=${3:-1} state starts stamps
   state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
     "$root/pe-activation.json")
   [[ "$state" == verified ]] || fail "$root ended in state $state"
@@ -486,7 +536,8 @@ assert_verified() {
   [[ "$starts" == "$expected_starts" ]] ||
     fail "$root started the fresh service $starts times, expected $expected_starts"
   stamps=$(<"$root/test-state/archive-count")
-  [[ "$stamps" == 1 ]] || fail "$root created $stamps archive stamps"
+  [[ "$stamps" == "$expected_stamps" ]] ||
+    fail "$root created $stamps archive stamps, expected $expected_stamps"
   [[ "$(stat -c '%a' "$root/.pe-deploy.lock")" == 444 ]] || fail "deploy lock mode changed"
   [[ "$(<"$root/.pe-deploy.lock")" == provisioned-deploy-lock ]] || fail "deploy lock content changed"
   assert_deploy_lock_unchanged "$root"
@@ -512,6 +563,7 @@ import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["state"] == "switched"
 assert all(key not in value for key in ("invocation_id","active_enter_timestamp","active_enter_unix"))
+assert "refusal" not in value
 refusals=value.get("post_start_refusals")
 assert isinstance(refusals,list) and refusals
 assert sys.argv[2] in refusals[-1].get("reason","")
@@ -916,6 +968,7 @@ assert_verified "$root"
 # A terminal manifest does not make its activation id reusable when archive rows already carry it.
 root=$(make_case reused-activation-id)
 activate "$root" activation-557 >/dev/null
+printf '%s\n' reused-id >> "$root/test-state/archive-ids"
 manifest_before=$(sha256sum "$root/pe-activation.json" | awk '{print $1}')
 prepare_before=$(<"$root/test-state/prepare-count")
 set +e
@@ -932,6 +985,23 @@ grep -q 'activation id already used: rows stamped .*; choose a new id' "$root/re
 [[ "$(<"$root/test-state/service.active")" == true &&
    "$(<"$root/test-state/service.enabled")" == true ]] ||
   fail "reused activation id touched the service"
+
+# A rolled-back id remains stamped and refused while a new id can use a new permanent generation.
+root=$(make_case new-id-after-rollback)
+activate "$root" activation-557 >/dev/null
+rollback "$root" >/dev/null
+TEST_GENERATION_NAME=558 activate "$root" activation-558 >/dev/null
+assert_verified "$root" 3 2
+new_manifest_before=$(sha256sum "$root/pe-activation.json" | awk '{print $1}')
+set +e
+activate "$root" activation-557 >"$root/old-id.out" 2>"$root/old-id.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "rolled-back activation id was reusable after a new activation"
+grep -q 'activation id already used: rows stamped .*; choose a new id' "$root/old-id.err" ||
+  fail "rolled-back activation id refusal was not explicit"
+[[ "$(sha256sum "$root/pe-activation.json" | awk '{print $1}')" == "$new_manifest_before" ]] ||
+  fail "old-id refusal changed the new verified manifest"
 
 # Explicit host-reboot resumes from the durable guarded/reset/switched states.
 for state in guarded reset switched; do
@@ -1064,10 +1134,68 @@ rm "$root/test-state/ranking-batch-drift-before-guard"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
+# Unknown systemd probe output is neither true nor false and cannot mutate a pre-T0 manifest or unit.
+for entry in \
+  'service.active.output activating activity' \
+  'service.enabled.output static enablement'; do
+  read -r marker output label <<< "$entry"
+  root=$(make_case "unit-tristate-$output")
+  set +e
+  activate "$root" activation-557 --simulate-crash-after prechecked >/dev/null 2>"$root/prechecked.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "$output tri-state fixture did not reach prechecked"
+  manifest_before=$(sha256sum "$root/pe-activation.json" | awk '{print $1}')
+  printf '%s\n' "$output" > "$root/test-state/$marker"
+  set +e
+  activate "$root" activation-557 >"$root/tristate.out" 2>"$root/tristate.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "$output unit state returned $rc"
+  grep -q "could not prove pe-service $label" "$root/tristate.err" ||
+    fail "$output unit-state refusal was not explicit"
+  [[ "$(sha256sum "$root/pe-activation.json" | awk '{print $1}')" == "$manifest_before" ]] ||
+    fail "$output unit-state probe mutated the manifest"
+  [[ "$(<"$root/test-state/service.active")" == true &&
+     "$(<"$root/test-state/service.enabled")" == true ]] ||
+    fail "$output unit-state probe mutated service bits"
+  [[ ! -e "$root/test-state/db-reset" ]] || fail "$output unit-state probe reached T0"
+  rm "$root/test-state/$marker"
+  activate "$root" activation-557 >/dev/null
+  assert_verified "$root"
+done
+
+# A disabled but active generation is refused at both the started and verified proofs.
+for phase in started verified; do
+  root=$(make_case "disabled-active-$phase")
+  boundary=started
+  if [[ "$phase" == started ]]; then boundary=service-started; fi
+  set +e
+  activate "$root" activation-557 --simulate-crash-after "$boundary" \
+    >/dev/null 2>"$root/$phase-boundary.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "disabled-active $phase fixture did not reach its proof"
+  printf '%s\n' false > "$root/test-state/service.enabled"
+  set +e
+  activate "$root" activation-557 >"$root/$phase.out" 2>"$root/$phase.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "disabled-active unit advanced through $phase"
+  grep -q "disabled while entering $phase" "$root/$phase.err" ||
+    fail "disabled-active $phase refusal was not explicit"
+  assert_verified_refusal "$root" "disabled while entering $phase"
+  activate "$root" activation-557 >/dev/null
+  assert_verified "$root" 2
+done
+
 # Every material verification refusal stops, disables, audits, and rewinds the activation.
 for fixture in \
   'bind-not-listening|not listening on configured port|not listening on the configured production bind' \
   'anchor-count-drift-after-start|boot anchor count changed|boot anchor count changed' \
+  'fresh-book-fail|Supabase fresh-book verification failed|Supabase fresh-book verification failed' \
+  'materialized-view-fail|wallet_live_stats_mv refresh failed|wallet_live_stats_mv refresh failed' \
+  'prepared-generation-fail|prepared generation verification failed|prepared generation verification failed' \
   'projection-fail|Supabase projection verification failed|Supabase projection verification failed'; do
   IFS='|' read -r marker error_text reason_text <<< "$fixture"
   root=$(make_case "verified-refusal-$marker")
@@ -1088,6 +1216,86 @@ for fixture in \
   activate "$root" activation-557 >/dev/null
   assert_verified "$root" 2
 done
+
+# A refusal intent is durable before service mutation. Crashes and command failure resume by completing
+# the same refusal before any forward verification can run.
+assert_refusing_intent() {
+  local root=$1 reason=$2
+  python3 - "$root/pe-activation.json" "$reason" <<'PY' || fail "$root refusal intent is incomplete"
+import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["state"] == "refusing"
+assert value["refusal"]["at"] == "2033-05-18T03:33:20Z"
+assert sys.argv[2] in value["refusal"]["reason"]
+assert value["invocation_id"] == "invocation-test-1"
+assert "post_start_refusals" not in value
+PY
+}
+
+for entry in \
+  'refusal-intent-recorded true true' \
+  'refusal-disabled true false'; do
+  read -r boundary expected_active expected_enabled <<< "$entry"
+  root=$(make_case "refusal-crash-$boundary")
+  set +e
+  activate "$root" activation-557 --simulate-crash-after started >/dev/null 2>"$root/started.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "$boundary fixture did not reach started"
+  : > "$root/test-state/projection-fail"
+  set +e
+  activate "$root" activation-557 --simulate-crash-after "$boundary" \
+    >"$root/refusal-crash.out" 2>"$root/refusal-crash.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "$boundary refusal crash returned $rc"
+  assert_refusing_intent "$root" 'Supabase projection verification failed'
+  [[ "$(<"$root/test-state/service.active")" == "$expected_active" ]] ||
+    fail "$boundary crash left unexpected service activity"
+  [[ "$(<"$root/test-state/service.enabled")" == "$expected_enabled" ]] ||
+    fail "$boundary crash left unexpected service enablement"
+  set +e
+  activate "$root" activation-557 >"$root/refusal-resume.out" 2>"$root/refusal-resume.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "$boundary refusal resume returned $rc"
+  assert_verified_refusal "$root" 'Supabase projection verification failed'
+  rm "$root/test-state/projection-fail"
+  activate "$root" activation-557 >/dev/null
+  assert_verified "$root" 2
+done
+
+root=$(make_case refusal-disable-failure)
+set +e
+activate "$root" activation-557 --simulate-crash-after started >/dev/null 2>"$root/started.err"
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "disable-failure fixture did not reach started"
+: > "$root/test-state/projection-fail"
+: > "$root/test-state/disable-fail-once"
+set +e
+activate "$root" activation-557 >"$root/disable-failure.out" 2>"$root/disable-failure.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "failed refusal disable returned $rc"
+grep -q 'disable failed (97)' "$root/disable-failure.err" ||
+  fail "failed refusal disable was not reported"
+assert_refusing_intent "$root" 'Supabase projection verification failed'
+[[ "$(<"$root/test-state/service.active")" == false ]] ||
+  fail "refusal did not run stop after disable failed"
+[[ "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "failed disable unexpectedly changed enablement"
+[[ "$(<"$root/test-state/service-stop-count")" == 2 ]] ||
+  fail "refusal stop was not attempted after disable failed"
+set +e
+activate "$root" activation-557 >"$root/disable-resume.out" 2>"$root/disable-resume.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "disable-failure refusal resume returned $rc"
+assert_verified_refusal "$root" 'Supabase projection verification failed'
+rm "$root/test-state/projection-fail"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root" 2
 
 # Verification remains bound to the frozen ranking batch. This drift is non-repairable in place.
 root=$(make_case ranking-batch-drift)
@@ -1549,18 +1757,51 @@ root=$(make_case archive-column-absent-fresh)
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 [[ ! -e "$root/test-state/archive-column-absent" ]] || fail "archive SQL did not add the activation_id column"
-root=$(make_case archive-column-absent-rollback-from-guarded)
-: > "$root/test-state/archive-column-absent"
-set +e
-activate "$root" activation-557 --simulate-crash-after guarded >/dev/null 2>&1
-rc=$?
-set -e
-[[ "$rc" == 86 ]] || fail "column-absent guarded crash returned $rc"
-rollback "$root" >/dev/null
-[[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-activation.json")" == rolled_back ]] ||
-  fail "column-absent rollback from guarded did not converge"
-[[ ! -e "$root/test-state/db-restored" ]] || fail "column-absent rollback restored a database that was never reset"
-[[ "$(<"$root/test-state/service.active")" == true ]] || fail "column-absent rollback left the old service inactive"
+for state in guarded archived; do
+  root=$(make_case "archive-column-absent-rollback-from-$state")
+  : > "$root/test-state/archive-column-absent"
+  set +e
+  activate "$root" activation-557 --simulate-crash-after "$state" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "column-absent $state crash returned $rc"
+  rollback "$root" >/dev/null
+  [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-activation.json")" == rolled_back ]] ||
+    fail "column-absent rollback from $state did not converge"
+  [[ ! -e "$root/test-state/db-restored" ]] ||
+    fail "column-absent rollback from $state restored a database that was never reset"
+  [[ "$(<"$root/test-state/service.active")" == true ]] ||
+    fail "column-absent rollback from $state left the old service inactive"
+done
+
+# Once reset metadata is durable, a zero-column metadata result is corruption. Rollback has already
+# made the unit inactive and disabled when it refuses.
+for state in reset switched started verified; do
+  root=$(make_case "archive-column-zero-after-$state")
+  set +e
+  activate "$root" activation-557 --simulate-crash-after "$state" >/dev/null 2>"$root/$state.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "zero-column rollback fixture did not reach $state"
+  : > "$root/test-state/archive-column-zero-query"
+  set +e
+  rollback "$root" >"$root/zero-column.out" 2>"$root/zero-column.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "rollback from $state accepted zero archive columns"
+  grep -q 'archive stamp column missing after a durable reset' "$root/zero-column.err" ||
+    fail "rollback from $state did not report missing durable archive columns"
+  [[ "$(<"$root/test-state/service.active")" == false &&
+     "$(<"$root/test-state/service.enabled")" == false ]] ||
+    fail "rollback from $state checked archive columns before making the service inert"
+  [[ ! -e "$root/test-state/db-restored" ]] ||
+    fail "rollback from $state restored without durable archive columns"
+  rm "$root/test-state/archive-column-zero-query"
+  rollback "$root" >/dev/null
+  expected_starts=1
+  [[ "$state" != started && "$state" != verified ]] || expected_starts=2
+  assert_rolled_back "$root" true "$expected_starts"
+done
 
 echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
