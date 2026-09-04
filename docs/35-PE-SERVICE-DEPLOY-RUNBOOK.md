@@ -185,8 +185,7 @@ invocation: the binary binds its listener and starts the status writer only afte
 approved due subset, so the deadline is 120 seconds per approved wallet (at least 300 seconds), and the
 proved invocation must remain the running one throughout the wait. It then
 rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest ranking
-batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
-any approved subset, producer/critical-task health, fresh Supabase book, successful watchlist projection,
+batch to equal the frozen manifest batch, and proves the bind and permanent paths, the boot census recorded in the manifest (wallets anchored by this boot vs. carried over; the count is not compared with the precheck's due count, which ages while the driver waits), producer/critical-task health, fresh Supabase book, successful watchlist projection,
 and refreshed materialized view. If the new-process proof fails either while entering `started` or at the
 top of `verified`, or if any later material verification fails (bind, readiness/status, invocation,
 frozen batch, approved walk, prepared generation, materialized view, fresh Supabase book, or
