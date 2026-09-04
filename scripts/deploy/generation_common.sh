@@ -144,7 +144,19 @@ finally: os.close(directory)' "$source" "$destination" "$mode"
 }
 
 activation_archive_counts() {
-  local activation_id=$1
+  # The archive tables gain `activation_id` only when archive_paper_state.sql first runs (`add column if
+  # not exists`); the deployed database had no such column before the first activation (EVIDENCE F7
+  # addendum). A missing column means no stamped rows, by definition — never a query error.
+  local activation_id=$1 present
+  present=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
+    "select count(*) from information_schema.columns where table_schema='public' and column_name='activation_id'
+       and table_name in ('paper_fills_archive','settled_markets_archive','paper_positions_archive','paper_bankroll_archive','fill_market_snapshots_archive');") ||
+    return 1
+  case "$present" in
+    0) echo '0 0 0 0 0'; return 0 ;;
+    5) ;;
+    *) die "activation_id is present on $present of the five archive tables" ;;
+  esac
   psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
     "select (select count(*) from paper_fills_archive where activation_id='$activation_id') || ' ' ||
             (select count(*) from settled_markets_archive where activation_id='$activation_id') || ' ' ||

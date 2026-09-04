@@ -138,6 +138,7 @@ if [[ -z "$sql" && -z "$file" && ! -t 0 ]]; then sql=$(cat); fi
 if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ "$(cat "$state/service.active")" == false ]] || { echo 'archive called while service active' >&2; exit 91; }
   [[ "$(cat "$state/service.enabled")" == false ]] || { echo 'archive called while service enabled' >&2; exit 91; }
+  rm -f "$state/archive-column-absent"
   if [[ ! -e "$state/archive-stamp" ]]; then
     echo 1 > "$state/archive-count"
     : > "$state/archive-stamp"
@@ -172,7 +173,10 @@ elif [[ "$sql" == *"select lower(wallet_hex)"* ]]; then
   echo 0x0000000000000000000000000000000000000557
 elif [[ "$sql" == *"json_build_object('paper_fills'"* ]]; then
   echo '{"paper_fills":3,"settled_markets":2,"paper_positions":2,"paper_bankroll":1,"fill_market_snapshots":1}'
+elif [[ "$sql" == *"information_schema.columns"* && "$sql" == *"column_name='activation_id'"* ]]; then
+  if [[ -e "$state/archive-column-absent" ]]; then echo 0; else echo 5; fi
 elif [[ "$sql" == *"paper_fills_archive where activation_id"* && "$sql" == *" || ' ' ||"* ]]; then
+  [[ ! -e "$state/archive-column-absent" ]] || { echo 'ERROR:  column "activation_id" does not exist' >&2; exit 1; }
   if [[ -e "$state/archive-stamp" ]]; then
     if [[ -e "$state/archive-count-mismatch" ]]; then echo '4 2 2 1 1'; else echo '3 2 2 1 1'; fi
   else
@@ -1536,6 +1540,27 @@ forge_run restore > "$forge_state/restore-after-activating.out"
   fail "Forge activating refusal did not restore its recorded unit bits"
 [[ "$(<"$forge_repo/data/eval-results/rank_and_push.loop")" == run ]] ||
   fail "Forge activating refusal did not restore its recorded run flag"
+
+# A database that has never run the archive SQL has no activation_id column on the archive tables (the
+# deployed database before the first activation): the stamp predicate must read "no stamped rows", never
+# fail, and the archive SQL adds the column; rollback from guarded in that state must also converge.
+root=$(make_case archive-column-absent-fresh)
+: > "$root/test-state/archive-column-absent"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
+[[ ! -e "$root/test-state/archive-column-absent" ]] || fail "archive SQL did not add the activation_id column"
+root=$(make_case archive-column-absent-rollback-from-guarded)
+: > "$root/test-state/archive-column-absent"
+set +e
+activate "$root" activation-557 --simulate-crash-after guarded >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" == 86 ]] || fail "column-absent guarded crash returned $rc"
+rollback "$root" >/dev/null
+[[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-activation.json")" == rolled_back ]] ||
+  fail "column-absent rollback from guarded did not converge"
+[[ ! -e "$root/test-state/db-restored" ]] || fail "column-absent rollback restored a database that was never reset"
+[[ "$(<"$root/test-state/service.active")" == true ]] || fail "column-absent rollback left the old service inactive"
 
 echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
