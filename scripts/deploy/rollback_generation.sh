@@ -44,6 +44,12 @@ case "$state" in
   *) die "rollback requires a post-guarded or rolling_back state, found $state" ;;
 esac
 
+# Every rollback attempt first makes the service inert before consulting archive or database facts.
+"${SERVICE_MUTATE[@]}" disable pe-service
+"${SERVICE_MUTATE[@]}" stop pe-service
+[[ "$(systemctl_active pe-service)" == false ]] || die "pe-service is still active"
+[[ "$(systemctl_enabled pe-service)" == false ]] || die "pe-service is still enabled"
+
 manifest_has() {
   python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
@@ -126,12 +132,6 @@ verify_old_running() {
   running=$(sha256_file "$PROC_ROOT/$pid/exe")
   [[ "$running" == "$(old_sha pe_service)" ]] || die "running binary is not the archived generation"
 }
-
-# Every rollback attempt first makes the service inert before consulting durable database facts.
-"${SERVICE_MUTATE[@]}" disable pe-service
-"${SERVICE_MUTATE[@]}" stop pe-service
-[[ "$(systemctl_active pe-service)" == false ]] || die "pe-service is still active"
-[[ "$(systemctl_enabled pe-service)" == false ]] || die "pe-service is still enabled"
 
 archive_counts=$(activation_archive_counts "$activation_id")
 if activation_archive_stamp_exists "$archive_counts"; then

@@ -161,18 +161,23 @@ rank_locks_unheld() {
 }
 
 pause() {
-  local deadline lock
+  local deadline lock prior_flag prior_enabled prior_active active
   if [[ ! -f "$PAUSE_RECORD" ]]; then
-    record_pause_if_absent "$(current_flag)" "$(unit_enabled)" "$(unit_active)" \
+    prior_flag=$(current_flag) || exit $?
+    prior_enabled=$(unit_enabled) || exit $?
+    prior_active=$(unit_active) || exit $?
+    record_pause_if_absent "$prior_flag" "$prior_enabled" "$prior_active" \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
   load_pause_record
   write_flag_atomically stop
   deadline=$((SECONDS + STOP_WAIT_SECS))
   systemctl --user stop pe-rank-loop
-  while [[ "$(unit_active)" == true ]]; do
+  active=$(unit_active) || exit $?
+  while [[ "$active" == true ]]; do
     ((SECONDS < deadline)) || die "pe-rank-loop did not become inactive within $STOP_WAIT_SECS seconds"
     sleep 1
+    active=$(unit_active) || exit $?
   done
   if cycle_descendant_running; then
     die "a Forge cycle descendant is still running"
@@ -193,20 +198,25 @@ restore() {
   local prior_flag=${PAUSE_RECORD_FIELDS[0]}
   local prior_enabled=${PAUSE_RECORD_FIELDS[1]}
   local prior_active=${PAUSE_RECORD_FIELDS[2]}
+  local enabled active
   write_flag_atomically "$prior_flag"
   if [[ "$prior_enabled" == true ]]; then
     systemctl --user enable pe-rank-loop
-    [[ "$(unit_enabled)" == true ]] || die "failed to restore Forge enablement"
+    enabled=$(unit_enabled) || exit $?
+    [[ "$enabled" == true ]] || die "failed to restore Forge enablement"
   else
     systemctl --user disable pe-rank-loop
-    [[ "$(unit_enabled)" == false ]] || die "failed to restore Forge disablement"
+    enabled=$(unit_enabled) || exit $?
+    [[ "$enabled" == false ]] || die "failed to restore Forge disablement"
   fi
   if [[ "$prior_active" == true ]]; then
     systemctl --user start pe-rank-loop
-    [[ "$(unit_active)" == true ]] || die "failed to restore Forge activity"
+    active=$(unit_active) || exit $?
+    [[ "$active" == true ]] || die "failed to restore Forge activity"
   else
     systemctl --user stop pe-rank-loop
-    [[ "$(unit_active)" == false ]] || die "failed to restore Forge inactivity"
+    active=$(unit_active) || exit $?
+    [[ "$active" == false ]] || die "failed to restore Forge inactivity"
   fi
   delete_pause_record
   echo "Forge ranking loop restored"
@@ -215,9 +225,9 @@ restore() {
 status() {
   local flag enabled active descendants_running=false locks_unheld=true record_present=false
   local paused_complete=false
-  flag=$(current_flag)
-  enabled=$(unit_enabled)
-  active=$(unit_active)
+  flag=$(current_flag) || exit $?
+  enabled=$(unit_enabled) || exit $?
+  active=$(unit_active) || exit $?
   if cycle_descendant_running; then descendants_running=true; fi
   if ! rank_locks_unheld; then locks_unheld=false; fi
   if [[ -f "$PAUSE_RECORD" ]]; then

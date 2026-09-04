@@ -78,6 +78,9 @@ The driver holds `/home/sean/.pe-deploy.lock` for its whole run and writes only 
 `/home/sean/pe-activation.json` manifest as activation authority. Its state order is
 `seed → prepared → prechecked → guarded → archived → reset → switched → started → verified`. Use a
 unique `activation_id`; a different id is refused while the manifest is non-terminal.
+When creating a new `seed` manifest, the driver first queries all five archive tables and refuses an
+id that already stamps any row, including an id from an earlier terminal activation. Existing-manifest
+resumes do not repeat that new-id check.
 The lock is a provisioned root-owned mode-`0644` file. The driver only opens it read-only and refuses
 when it is absent; it never creates or touches the production lock.
 
@@ -134,6 +137,11 @@ process variable not defined by that file must be one of exactly `CREDENTIALS_DI
 `PWD`, `SHLVL`, `OLDPWD`, or `_`. `CREDENTIALS_DIRECTORY` must equal
 `/run/credentials/pe-service.service`; every other extra is refused. `LD_PRELOAD` and
 `LD_LIBRARY_PATH` are refused even when the installed environment file defines the same value.
+The clean-shell comparison uses `set -a; source "$1"; set +a`, rejects either loader variable by
+set/unset presence, then `exec env -0`. This matches real exec behavior: exported scalars and
+`BASH_FUNC_*` functions cross the boundary, while arrays do not. The wrapper-owned `PWD`, `SHLVL`,
+`OLDPWD`, and `_` names are stripped from the expected set because they do not affect the binary;
+`/proc/<pid>/cwd` proves the working directory separately.
 One systemd snapshot supplies `ActiveState`, `MainPID`, `InvocationID`, and `ActiveEnterTimestamp` before
 the `/proc` proof, and an identical second snapshot must follow it. The loaded manager state must also
 report `NeedDaemonReload=no`. Staged templates are not an old-state authority. Immediately before each
@@ -158,16 +166,22 @@ rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It re
 batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
 any approved subset, producer/critical-task health, fresh Supabase book, successful watchlist projection,
 and refreshed materialized view. If the new-process proof fails either while entering `started` or at the
-top of `verified`, the driver disables and stops `pe-service`, verifies both conditions, appends the
+top of `verified`, or if any later material verification fails (bind, readiness/status, invocation,
+frozen batch, approved walk, prepared generation, materialized view, fresh Supabase book, or
+projection), the driver disables and stops `pe-service`, verifies both conditions, appends the
 timestamped refusal reason to `post_start_refusals`, removes the recorded invocation fields, and rewinds
-the manifest to `switched`. The operator-held pause on Forge remains in place; repair the mismatch and
-re-run the same activation so it starts and proves the generation again.
+the manifest to `switched`. Frozen-batch drift after T0 also records `forward_blocked`; that activation
+cannot run forward again and must use `rollback_generation.sh`. After any repairable refusal, the
+operator chooses either to re-run the same activation (which starts and verifies the generation again)
+or to roll it back. The operator-held pause on Forge remains in place through either decision.
 
 The final signed-in site check cannot be automated because the site uses Google single sign-on. The
 driver therefore prompts the operator to inspect the fresh era and records `site_confirmed_by` and
 `site_confirmed_at` in the manifest before advancing to `verified`. A non-interactive
 invocation must include `--site-confirmed`; that flag is the operator's attestation that the signed-in
-check was performed, not an automated site probe.
+check was performed, not an automated site probe. This interactive attestation is the sole verification
+exception that leaves the service running at `started`; supply the attestation on the next identical run
+or choose rollback.
 
 After the driver reaches `verified`, update the Forge checkout to the exact merge commit and restore its
 recorded flag, enablement, and activity independently on Forge itself:
@@ -196,10 +210,11 @@ SUPABASE_DB_URL=<session-pooler-url> \
   scripts/deploy/rollback_generation.sh --activation-id <id>
 ```
 
-It accepts every state from `guarded` onward and records `rolling_back` first. It validates archived
+It accepts every state from `guarded` onward and records `rolling_back` first, then immediately disables
+and stops the service and proves it inactive and disabled. Only then does it validate archived
 config/environment/binary sources when `archive_artifacts` is durable; before that manifest fact exists,
-the installed artifacts must still match the pre-T0 hashes recorded by the driver. It always disables
-and stops the service before reading the durable archive stamp. The database restore and materialized-view
+the installed artifacts must still match the pre-T0 hashes recorded by the driver. It reads the durable
+archive stamp only after those checks. The database restore and materialized-view
 refresh run only when stamped archive rows for this activation exist, and restored counts are compared
 only after that restore. It then restores artifacts when an archive was recorded, enables and starts the
 old generation, and proves the unit active and enabled with the running executable hash equal to the old

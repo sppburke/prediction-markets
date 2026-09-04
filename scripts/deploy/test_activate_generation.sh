@@ -69,6 +69,14 @@ done
 printf '401'
 SH
 
+  cat > "$bin/ss" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
+[[ ! -e "$state/bind-not-listening" ]] || exit 0
+printf '%s\n' 'LISTEN 0 128 127.0.0.1:9100 0.0.0.0:* users:(("pe-service",pid=1234,fd=7))'
+SH
+
   cat > "$bin/sqlite3" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -98,7 +106,12 @@ elif [[ "$sql" == *"pragma integrity_check"* ]]; then
 elif [[ "$sql" == *"last_ts_unix <> activity_cutoff_unix"* ]]; then
   echo '0 0 0 0 0'
 elif [[ "$sql" == *"select count(*) from position_anchors"* ]]; then
-  echo 2
+  if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/anchor-count-drift-after-start" &&
+        -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/fresh-service-started" ]]; then
+    echo 3
+  else
+    echo 2
+  fi
 elif [[ "$sql" == *"select case when exists(select 1 from wallet_fences"* ]]; then
   echo 0
 elif [[ "$sql" == *"select count(*) from"* || "$sql" == *"select (select count(*)"* ]]; then
@@ -168,13 +181,18 @@ elif [[ "$sql" == *"paper_fills_archive where activation_id"* && "$sql" == *" ||
 elif [[ "$sql" == *"Supabase fresh"* ]]; then
   echo ok
 elif [[ "$sql" == *"paper_bankroll where id=0"* ]]; then
-  [[ -e "$state/db-reset" ]] && echo ok || echo mismatch
+  if [[ -e "$state/fresh-book-fail" ]]; then echo mismatch
+  elif [[ -e "$state/db-reset" ]]; then echo ok
+  else echo mismatch
+  fi
+elif [[ "$sql" == *"refresh materialized view concurrently wallet_live_stats_mv"* ]]; then
+  [[ ! -e "$state/materialized-view-fail" ]] || exit 96
 elif [[ "$sql" == *"then 'ok' else 'mismatch'"* && "$sql" == *"paper_fills_archive"* ]]; then
   [[ -e "$state/db-restored" ]] && echo ok || echo mismatch
 elif [[ "$sql" == *"pe-rehearsal-canary-557"* ]]; then
   echo 0
 elif [[ "$sql" == *"select count(*) from service_watchlist"* ]]; then
-  echo ok
+  if [[ -e "$state/projection-fail" ]]; then echo mismatch; else echo ok; fi
 fi
 SH
 
@@ -196,13 +214,8 @@ write_bit() { printf '%s\n' "$2" > "$state/$1"; }
 write_service_environment() {
   local proc=$1 service=$2 credential=/run/credentials/pe-service.service
   [[ ! -e "$state/post-start-credential-wrong" ]] || credential=/wrong
-  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a
-while IFS= read -r name; do printf "%s=%s\0" "$name" "${!name}"; done < <(compgen -e)' \
-    bash "$service/.env") |
-    python3 -c 'import sys
-parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
-shell_own=(b"_=",b"OLDPWD=")  # the real wrapper exec keeps PWD and SHLVL (EVIDENCE F6)
-sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$proc/environ"
+  (cd "$service" && env -i /bin/bash -c \
+    'set -a; source "$1"; set +a; exec env -0' bash "$service/.env") > "$proc/environ"
   printf '%s\0' \
     "CREDENTIALS_DIRECTORY=$credential" \
     "HOME=$root/home" \
@@ -365,15 +378,14 @@ NON_PE_BASE='source value'
 export PE_X=
 PE_QUOTED_VALUE="quoted \${NON_PE_BASE} with spaces"
 NON_PE_QUOTED_VALUE="non-PE quoted value"
+EXPORTED_ARRAY=(one two)
+export EXPORTED_ARRAY
+exported_fixture_function() { :; }
+export -f exported_fixture_function
 EOF
   # fake /proc: the running process has the shell-evaluated installed environment and executable.
-  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a
-while IFS= read -r name; do printf "%s=%s\0" "$name" "${!name}"; done < <(compgen -e)' \
-    bash "$service/.env") |
-    python3 -c 'import sys
-parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
-shell_own=(b"_=",b"OLDPWD=")  # the real wrapper exec keeps PWD and SHLVL (EVIDENCE F6)
-sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$root/proc/1234/environ"
+  (cd "$service" && env -i /bin/bash -c \
+    'set -a; source "$1"; set +a; exec env -0' bash "$service/.env") > "$root/proc/1234/environ"
   printf '%s\0' \
     'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \
     "HOME=$root/home" \
@@ -483,6 +495,33 @@ assert value["site_confirmed_by"]
 assert value["site_confirmed_at"] == "2033-05-18T03:33:20Z"' \
     "$root/pe-activation.json" || fail "verification proofs are absent from the manifest"
   [[ -e "$root/test-state/preflight-matrix-checked" ]] || fail "privilege matrix was not evaluated"
+}
+
+assert_verified_refusal() {
+  local root=$1 reason=$2 forward_blocked=${3:-false}
+  [[ "$(<"$root/test-state/service.active")" == false ]] ||
+    fail "$root verified refusal left the service active"
+  [[ "$(<"$root/test-state/service.enabled")" == false ]] ||
+    fail "$root verified refusal left the service enabled"
+  if ! python3 - "$root/pe-activation.json" "$reason" "$forward_blocked" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["state"] == "switched"
+assert all(key not in value for key in ("invocation_id","active_enter_timestamp","active_enter_unix"))
+refusals=value.get("post_start_refusals")
+assert isinstance(refusals,list) and refusals
+assert sys.argv[2] in refusals[-1].get("reason","")
+if sys.argv[3] == "true":
+    assert value.get("forward_blocked") == {
+        "at":"2033-05-18T03:33:20Z",
+        "reason":refusals[-1]["reason"],
+    }
+else:
+    assert "forward_blocked" not in value
+PY
+  then
+    fail "$root verified refusal audit is incomplete"
+  fi
 }
 
 run_crash_case() {
@@ -690,20 +729,7 @@ corrupt_new_process() {
     ld-library-path) printf 'LD_LIBRARY_PATH=/tmp/not-allowed\0' >> "$proc/environ" ;;
     unlisted-non-pe) printf 'UNLISTED_NON_PE=1\0' >> "$proc/environ" ;;
     file-ld-preload)
-      printf '%s\n' 'LD_PRELOAD=/tmp/not-allowed.so' >> "$service/.env"
-      printf '%s\n' 'LD_PRELOAD=/tmp/not-allowed.so' >> \
-        "$service/gen/557/staged/service.env"
-      printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ"
-      python3 - "$root/pe-activation.json" <<'PY'
-import hashlib,json,sys
-path=sys.argv[1]
-value=json.load(open(path, encoding="utf-8"))
-with open(value["artifacts"]["environment"]["path"], "rb") as handle:
-    value["artifacts"]["environment"]["sha256"]=hashlib.sha256(handle.read()).hexdigest()
-with open(path,"w",encoding="utf-8") as handle:
-    json.dump(value,handle,sort_keys=True,separators=(",",":"))
-    handle.write("\n")
-PY
+      : > "$root/test-state/file-loader-enabled"
       ;;
     credential) python3 - "$proc/environ" <<'PY'
 import sys
@@ -735,32 +761,11 @@ PY
   esac
 }
 
-repair_recorded_generation_environment() {
-  local root=$1 service="$1/prediction-markets"
-  sed -i '/^LD_PRELOAD=/d;/^LD_LIBRARY_PATH=/d' "$service/.env" \
-    "$service/gen/557/staged/service.env"
-  python3 - "$root/pe-activation.json" <<'PY'
-import hashlib,json,sys
-path=sys.argv[1]
-value=json.load(open(path, encoding="utf-8"))
-with open(value["artifacts"]["environment"]["path"], "rb") as handle:
-    value["artifacts"]["environment"]["sha256"]=hashlib.sha256(handle.read()).hexdigest()
-with open(path,"w",encoding="utf-8") as handle:
-    json.dump(value,handle,sort_keys=True,separators=(",",":"))
-    handle.write("\n")
-PY
-}
-
 restore_fake_process() {
   local root=$1 service="$1/prediction-markets" proc="$1/proc/1234"
   printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml" > "$proc/cmdline"
-  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a
-while IFS= read -r name; do printf "%s=%s\0" "$name" "${!name}"; done < <(compgen -e)' \
-    bash "$service/.env") |
-    python3 -c 'import sys
-parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
-shell_own=(b"_=",b"OLDPWD=")  # the real wrapper exec keeps PWD and SHLVL (EVIDENCE F6)
-sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith(shell_own))+b"\0")' > "$proc/environ"
+  (cd "$service" && env -i /bin/bash -c \
+    'set -a; source "$1"; set +a; exec env -0' bash "$service/.env") > "$proc/environ"
   printf '%s\0' \
     'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \
     "HOME=$root/home" \
@@ -785,9 +790,13 @@ sys.stdout.buffer.write(b"\0".join(part for part in parts if not part.startswith
 refuse_post_start_process() {
   local phase=$1 kind=$2 message=$3 root rc state marker
   root=$(make_case "post-start-$phase-$kind")
+  if [[ "$kind" == file-ld-preload ]]; then
+    printf 'if [[ -e %q ]]; then export LD_PRELOAD=/tmp/not-allowed.so; fi\n' \
+      "$root/test-state/file-loader-enabled" >> "$root/input/service.env"
+  fi
   if [[ "$phase" == started ]]; then
     if [[ "$kind" == file-ld-preload ]]; then
-      printf '%s\n' 'LD_PRELOAD=/tmp/not-allowed.so' >> "$root/input/service.env"
+      : > "$root/test-state/file-loader-enabled"
     elif [[ "$kind" == snapshot ]]; then
       marker="$root/test-state/snapshot-change-after-first-show"
       : > "$marker"
@@ -831,7 +840,14 @@ assert refusals[0].get("at") == "2033-05-18T03:33:20Z"
 assert sys.argv[2] in refusals[0].get("reason","")
 PY
   if [[ "$kind" == file-ld-preload ]]; then
-    repair_recorded_generation_environment "$root"
+    rollback "$root" >/dev/null
+    state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+      "$root/pe-activation.json")
+    [[ "$state" == rolled_back ]] || fail "$kind $phase refusal did not recover by rollback"
+    [[ "$(<"$root/test-state/service.active")" == true &&
+       "$(<"$root/test-state/service.enabled")" == true ]] ||
+      fail "$kind $phase rollback did not restore the old service"
+    return
   fi
   restore_fake_process "$root"
   if ! activate "$root" activation-557 >"$root/$phase-repaired.out" 2>"$root/$phase-repaired.err"; then
@@ -892,6 +908,26 @@ set -e
 grep -q 'non-terminal' "$root/other.err" || fail "different-id refusal was not explicit"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
+
+# A terminal manifest does not make its activation id reusable when archive rows already carry it.
+root=$(make_case reused-activation-id)
+activate "$root" activation-557 >/dev/null
+manifest_before=$(sha256sum "$root/pe-activation.json" | awk '{print $1}')
+prepare_before=$(<"$root/test-state/prepare-count")
+set +e
+activate "$root" reused-id >"$root/reused.out" 2>"$root/reused.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "reused activation id returned $rc"
+grep -q 'activation id already used: rows stamped .*; choose a new id' "$root/reused.err" ||
+  fail "reused activation id refusal was not explicit"
+[[ "$(sha256sum "$root/pe-activation.json" | awk '{print $1}')" == "$manifest_before" ]] ||
+  fail "reused activation id changed the terminal manifest"
+[[ "$(<"$root/test-state/prepare-count")" == "$prepare_before" ]] ||
+  fail "reused activation id touched generation preparation"
+[[ "$(<"$root/test-state/service.active")" == true &&
+   "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "reused activation id touched the service"
 
 # Explicit host-reboot resumes from the durable guarded/reset/switched states.
 for state in guarded reset switched; do
@@ -1024,7 +1060,32 @@ rm "$root/test-state/ranking-batch-drift-before-guard"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
-# Verification remains bound to the frozen ranking batch.
+# Every material verification refusal stops, disables, audits, and rewinds the activation.
+for fixture in \
+  'bind-not-listening|not listening on configured port|not listening on the configured production bind' \
+  'anchor-count-drift-after-start|boot anchor count changed|boot anchor count changed' \
+  'projection-fail|Supabase projection verification failed|Supabase projection verification failed'; do
+  IFS='|' read -r marker error_text reason_text <<< "$fixture"
+  root=$(make_case "verified-refusal-$marker")
+  set +e
+  activate "$root" activation-557 --simulate-crash-after started >/dev/null 2>"$root/started.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 86 ]] || fail "$marker fixture did not reach started"
+  : > "$root/test-state/$marker"
+  set +e
+  activate "$root" activation-557 >"$root/refusal.out" 2>"$root/refusal.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "$marker verified failure returned $rc"
+  grep -q "$error_text" "$root/refusal.err" || fail "$marker verified refusal was not explicit"
+  assert_verified_refusal "$root" "$reason_text"
+  rm "$root/test-state/$marker"
+  activate "$root" activation-557 >/dev/null
+  assert_verified "$root" 2
+done
+
+# Verification remains bound to the frozen ranking batch. This drift is non-repairable in place.
 root=$(make_case ranking-batch-drift)
 set +e
 activate "$root" activation-557 --simulate-crash-after started >/dev/null 2>"$root/started.err"
@@ -1038,9 +1099,21 @@ rc=$?
 set -e
 [[ "$rc" == 1 ]] || fail "ranking batch drift was accepted"
 grep -q 'differs from the frozen activation batch' "$root/batch.err" || fail "batch refusal was not explicit"
+assert_verified_refusal "$root" 'differs from the frozen activation batch' true
 rm "$root/test-state/ranking-batch-drift"
-activate "$root" activation-557 >/dev/null
-assert_verified "$root"
+set +e
+activate "$root" activation-557 >"$root/forward-blocked.out" 2>"$root/forward-blocked.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "forward rerun after ranking batch drift was accepted"
+grep -q '^FATAL: forward blocked: .*; run rollback_generation.sh$' "$root/forward-blocked.err" ||
+  fail "forward-blocked ranking batch refusal was not explicit"
+rollback "$root" >/dev/null
+[[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+  "$root/pe-activation.json")" == rolled_back ]] || fail "batch-drift rollback did not converge"
+[[ "$(<"$root/test-state/service.active")" == true &&
+   "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "batch-drift rollback did not restore the old service"
 
 # A stale status cannot verify, and the readiness wait is bounded.
 root=$(make_case stale-invocation-status)
@@ -1062,10 +1135,11 @@ rc=$?
 set -e
 [[ "$rc" == 1 ]] || fail "invocation-stale status was accepted"
 grep -q 'did not become healthy and newer' "$root/stale.err" || fail "stale-status refusal was not explicit"
+assert_verified_refusal "$root" 'did not become healthy and newer'
 sed -i 's/2033-05-18T03:33:19Z/2033-05-18T03:33:20Z/' \
   "$root/prediction-markets/gen/557/status.json"
 activate "$root" activation-557 >/dev/null
-assert_verified "$root"
+assert_verified "$root" 2
 
 # Invocation identity is re-read after readiness; a service change during the wait cannot verify.
 root=$(make_case invocation-change-during-wait)
@@ -1128,6 +1202,17 @@ rc=$?
 set -e
 [[ "$rc" == 1 ]] || fail "non-interactive run verified without --site-confirmed"
 grep -q 'requires --site-confirmed' "$root/site.err" || fail "site-confirmation refusal was not explicit"
+[[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+  "$root/pe-activation.json")" == started ]] ||
+  fail "site-attestation exception did not leave the manifest at started"
+[[ "$(<"$root/test-state/service.active")" == true &&
+   "$(<"$root/test-state/service.enabled")" == true ]] ||
+  fail "site-attestation exception did not leave the service running"
+python3 - "$root/pe-activation.json" <<'PY' || fail "site-attestation exception recorded a refusal"
+import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+assert "post_start_refusals" not in value
+PY
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
 
@@ -1233,12 +1318,13 @@ for boundary in rollback-db-restored rollback-started before-manifest-rolling_ba
   [[ "$rc" == 1 ]] || fail "forward rerun of rolled-back id was accepted"
 done
 
-# A corrupt rollback source is rejected before the database or first destination changes.
+# A corrupt rollback source is rejected only after the fresh service is inert; repair then resumes.
 root=$(make_case rollback-corrupt-archive)
 activate "$root" activation-557 >/dev/null
 config_before=$(sha256sum "$root/prediction-markets/smoke-test/service.toml" | awk '{print $1}')
 env_before=$(sha256sum "$root/prediction-markets/.env" | awk '{print $1}')
 binary_before=$(sha256sum "$root/prediction-markets/target/release/pe-service" | awk '{print $1}')
+cp "$root/prediction-markets/gen/557/pre-t0/service.toml" "$root/service.toml.saved"
 printf '%s\n' corrupt >> "$root/prediction-markets/gen/557/pre-t0/service.toml"
 set +e
 rollback "$root" >"$root/corrupt.out" 2>"$root/corrupt.err"
@@ -1247,6 +1333,10 @@ set -e
 [[ "$rc" == 1 ]] || fail "corrupt rollback archive was accepted"
 grep -q 'archived service_toml source hash mismatch' "$root/corrupt.err" ||
   fail "corrupt rollback refusal was not explicit"
+[[ "$(<"$root/test-state/service.active")" == false ]] ||
+  fail "corrupt rollback archive left the fresh service active"
+[[ "$(<"$root/test-state/service.enabled")" == false ]] ||
+  fail "corrupt rollback archive left the fresh service enabled"
 [[ ! -e "$root/test-state/db-restored" ]] || fail "rollback touched the database before archive verification"
 [[ "$(sha256sum "$root/prediction-markets/smoke-test/service.toml" | awk '{print $1}')" == "$config_before" ]] ||
   fail "rollback overwrote config before archive verification"
@@ -1254,6 +1344,9 @@ grep -q 'archived service_toml source hash mismatch' "$root/corrupt.err" ||
   fail "rollback overwrote environment before archive verification"
 [[ "$(sha256sum "$root/prediction-markets/target/release/pe-service" | awk '{print $1}')" == "$binary_before" ]] ||
   fail "rollback overwrote binary before archive verification"
+cp "$root/service.toml.saved" "$root/prediction-markets/gen/557/pre-t0/service.toml"
+rollback "$root" >/dev/null
+assert_rolled_back "$root" true 2
 
 # Forge pause/restore/status serializes every invocation and derives completion from live proofs.
 forge_home="$TEST_TMP/forge/home"
@@ -1291,7 +1384,13 @@ case "$action" in
   enable) printf '%s\n' enabled > "$state/unit.enabled" ;;
   disable) printf '%s\n' disabled > "$state/unit.enabled" ;;
   start) printf '%s\n' active > "$state/unit.active" ;;
-  stop) printf '%s\n' inactive > "$state/unit.active" ;;
+  stop)
+    if [[ -e "$state/stop-leaves-activating" ]]; then
+      printf '%s\n' activating > "$state/unit.active"
+    else
+      printf '%s\n' inactive > "$state/unit.active"
+    fi
+    ;;
   *) exit 2 ;;
 esac
 SH
@@ -1384,12 +1483,12 @@ pause_lock_holder=$!
 for _ in {1..100}; do [[ -e "$forge_state/pause-lock-held" ]] && break; sleep 0.02; done
 [[ -e "$forge_state/pause-lock-held" ]] || fail "Forge pause-lock holder did not start"
 set +e
-forge_run status > "$forge_state/status-contended.out" 2> "$forge_state/status-contended.err"
+forge_run pause > "$forge_state/pause-contended.out" 2> "$forge_state/pause-contended.err"
 rc=$?
 set -e
-[[ "$rc" == 1 ]] || fail "concurrent Forge status returned $rc"
-grep -q 'another Forge pause/restore/status invocation holds' "$forge_state/status-contended.err" ||
-  fail "concurrent Forge invocation refusal was not explicit"
+[[ "$rc" == 1 ]] || fail "concurrent Forge pause returned $rc"
+grep -q 'another Forge pause/restore/status invocation holds' "$forge_state/pause-contended.err" ||
+  fail "concurrent Forge pause refusal was not explicit"
 rm "$forge_state/hold-pause-lock"
 wait "$pause_lock_holder"
 
@@ -1403,10 +1502,45 @@ grep -q '"paused_complete": false' "$forge_state/status-restored.out" ||
 [[ "$(<"$forge_repo/data/eval-results/rank_and_push.loop")" == run ]] ||
   fail "Forge prior run flag was not restored"
 
+# A tri-state enablement probe fails before pause records or mutates anything.
+printf '%s\n' static > "$forge_state/unit.enabled"
+set +e
+forge_run pause > "$forge_state/pause-static.out" 2> "$forge_state/pause-static.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "Forge static enablement during pause returned $rc"
+grep -q 'could not prove pe-rank-loop enablement' "$forge_state/pause-static.err" ||
+  fail "Forge static enablement pause refusal was not explicit"
+[[ ! -e "$forge_repo/data/eval-results/.forge_pause.json" ]] ||
+  fail "Forge static enablement wrote a pause record"
+[[ "$(<"$forge_repo/data/eval-results/rank_and_push.loop")" == run ]] ||
+  fail "Forge static enablement changed the run flag"
+[[ "$(<"$forge_state/unit.active")" == active && "$(<"$forge_state/unit.enabled")" == static ]] ||
+  fail "Forge static enablement mutated unit state"
+
+# A tri-state activity probe during the stop wait fails and never reports a completed pause.
+printf '%s\n' enabled > "$forge_state/unit.enabled"
+: > "$forge_state/stop-leaves-activating"
+set +e
+forge_run pause > "$forge_state/pause-activating.out" 2> "$forge_state/pause-activating.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "Forge activating state during pause returned $rc"
+grep -q 'could not prove pe-rank-loop activity' "$forge_state/pause-activating.err" ||
+  fail "Forge activating pause refusal was not explicit"
+! grep -q 'Forge ranking loop paused' "$forge_state/pause-activating.out" ||
+  fail "Forge activating state reported a completed pause"
+rm "$forge_state/stop-leaves-activating"
+forge_run restore > "$forge_state/restore-after-activating.out"
+[[ "$(<"$forge_state/unit.enabled")" == enabled && "$(<"$forge_state/unit.active")" == active ]] ||
+  fail "Forge activating refusal did not restore its recorded unit bits"
+[[ "$(<"$forge_repo/data/eval-results/rank_and_push.loop")" == run ]] ||
+  fail "Forge activating refusal did not restore its recorded run flag"
+
 echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
 echo "rollback durable-fact restore and forward-refusal matrix: PASS"
 echo "lock, preflight, invocation, batch, site, and reboot: PASS"
-echo "post-start refusal stop, disable, rewind, audit, and repaired rerun: PASS"
+echo "post-start refusal stop, disable, rewind, audit, and rerun-or-rollback recovery: PASS"
 echo "process cwd, stable snapshot, and exact environment ownership: PASS"
 echo "Forge pause tri-state, live status proof, and serialization: PASS"

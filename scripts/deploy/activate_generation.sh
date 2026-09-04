@@ -89,12 +89,9 @@ EOF
   exit 0
 fi
 
-for command in python3 realpath readlink sha256sum sqlite3 psql flock systemctl; do
+for command in python3 realpath readlink sha256sum sqlite3 psql flock systemctl ss; do
   command -v "$command" >/dev/null || die "$command not installed"
 done
-if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
-  command -v ss >/dev/null || die "ss not installed"
-fi
 : "${SUPABASE_DB_URL:?SUPABASE_DB_URL must be exported for activation}"
 
 acquire_deploy_lock
@@ -157,9 +154,10 @@ process_runs_service() {
   # Ownership of what runs NOW, from the process itself (lossless, no unit-file interpretation):
   #   argv  == exactly `<binary> <config>` (NUL-split; empty elements kept)
   #   environ: every variable the installed environment file defines (evaluated with the unit's own
-  #   `set -a; source` semantics) is present with an equal value, and every extra name is one of the
-  #   exact systemd-injected names observed for the production unit or one of the unit's `bash -c`
-  #   wrapper's own variables (PWD, SHLVL, OLDPWD, _; production shows PWD and SHLVL — EVIDENCE F6)
+  #   `set -a; source; exec env -0` semantics) is present with an equal value, and every extra name is
+  #   one of the exact systemd-injected names observed for the production unit or one of the unit's
+  #   `bash -c` wrapper's own variables. PWD, SHLVL, OLDPWD, and _ are stripped from the expected set
+  #   because they do not affect the binary; cwd is proved independently from /proc/<pid>/cwd.
   local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 pid=$5
   python3 -c 'import os,subprocess,sys
 expected_binary,expected_config,expected_env,working,pid,proc_root=sys.argv[1:]
@@ -190,11 +188,14 @@ evaluated=subprocess.run(
     ["env","-i","/bin/bash","-c","""set -a
 source "$1"
 set +a
-while IFS= read -r name; do
-    printf "%s=%s\\0" "$name" "${!name}"
-done < <(compgen -e)""","bash",expected_env],
+if [[ ${LD_PRELOAD+x} == x || ${LD_LIBRARY_PATH+x} == x ]]; then
+    exit 97
+fi
+exec env -0""","bash",expected_env],
     check=False,cwd=working,stdout=subprocess.PIPE,
 )
+if evaluated.returncode == 97:
+    raise SystemExit(1)
 if evaluated.returncode != 0:
     raise SystemExit(1)
 shell_own={b"_",b"PWD",b"SHLVL",b"OLDPWD"}
@@ -383,6 +384,12 @@ if [[ -f "$MANIFEST" ]]; then
     if [[ "$manifest_state" != verified && "$manifest_state" != rolled_back ]]; then
       die "activation $manifest_id is non-terminal at $manifest_state"
     fi
+  elif forward_blocked_reason=$(python3 -c 'import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+blocked=value.get("forward_blocked")
+print(blocked.get("reason", "") if isinstance(blocked,dict) else "")' "$MANIFEST") &&
+      [[ -n "$forward_blocked_reason" ]]; then
+    die "forward blocked: $forward_blocked_reason; run rollback_generation.sh"
   elif [[ "$manifest_state" == verified ]]; then
     echo "activation $activation_id is already verified"
     exit 0
@@ -392,6 +399,10 @@ if [[ -f "$MANIFEST" ]]; then
 fi
 
 if [[ ! -f "$MANIFEST" || "$(manifest_get activation_id 2>/dev/null || true)" != "$activation_id" ]]; then
+  archive_counts=$(activation_archive_counts "$activation_id")
+  if activation_archive_stamp_exists "$archive_counts"; then
+    die "activation id already used: rows stamped $archive_counts; choose a new id"
+  fi
   SIMULATE_CRASH_AFTER="$SIMULATE_CRASH_AFTER" \
     "$REPO_ROOT/scripts/paper_reset/seed_v1_empty.sh" --execute \
     --source-main "$source_v1_main" --generation-dir "$generation_dir" \
@@ -750,26 +761,28 @@ verify_running_generation() {
 }
 
 post_start_refusal() {
-  local reason=$1 at json
+  local reason=$1 forward_blocked=${2:-false} at json
   "${SERVICE_MUTATE[@]}" disable pe-service
   "${SERVICE_MUTATE[@]}" stop pe-service
   [[ "$(systemctl_active pe-service)" == false ]] || die "post-start refusal left pe-service active"
   [[ "$(systemctl_enabled pe-service)" == false ]] || die "post-start refusal left pe-service enabled"
   at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   json=$(python3 -c 'import json,sys
-path,at,reason=sys.argv[1:]
+path,at,reason,forward_blocked=sys.argv[1:]
 value=json.load(open(path, encoding="utf-8"))
 for key in ("invocation_id","active_enter_timestamp","active_enter_unix"):
     value.pop(key,None)
 value.setdefault("post_start_refusals",[]).append({"at":at,"reason":reason})
+if forward_blocked == "true":
+    value["forward_blocked"]={"at":at,"reason":reason}
 value["state"]="switched"
-print(json.dumps(value,sort_keys=True,separators=(",",":")))' "$MANIFEST" "$at" "$reason")
+print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
+    "$MANIFEST" "$at" "$reason" "$forward_blocked")
   atomic_manifest_json "$json" post-start-refusal
   die "$reason; pe-service disabled and stopped, activation rewound to switched"
 }
 
 verify_listening_bind() {
-  [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] && return
   local pid port sockets
   pid=$(systemctl show pe-service -p MainPID --value)
   port=$(python3 -c 'import sys
@@ -855,58 +868,113 @@ verify_started_invocation() {
 }
 
 record_site_confirmation() {
-  local confirmed_by confirmed_at patch
-  if python3 -c 'import json,sys
+  local confirmed_by confirmed_at patch recorded_rc=0
+  python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
-raise SystemExit(0 if value.get("site_confirmed_by") and value.get("site_confirmed_at") else 1)' "$MANIFEST"; then
+raise SystemExit(0 if value.get("site_confirmed_by") and value.get("site_confirmed_at") else 3)' \
+    "$MANIFEST" || recorded_rc=$?
+  if [[ "$recorded_rc" == 0 ]]; then
     return
   fi
+  [[ "$recorded_rc" == 3 ]] || return "$recorded_rc"
   if [[ -t 0 ]]; then
     read -r -p "After signing in, verify the fresh era and enter your operator name to confirm: " confirmed_by
-    [[ -n "$confirmed_by" ]] || die "signed-in site confirmation requires an operator name"
+    if [[ -z "$confirmed_by" ]]; then
+      echo "FATAL: signed-in site confirmation requires an operator name" >&2
+      return 98
+    fi
   else
-    [[ "$site_confirmed" == true ]] ||
-      die "non-interactive verification requires --site-confirmed after the signed-in site check"
+    if [[ "$site_confirmed" != true ]]; then
+      echo "FATAL: non-interactive verification requires --site-confirmed after the signed-in site check" >&2
+      return 98
+    fi
     confirmed_by=${SUDO_USER:-}
-    [[ -n "$confirmed_by" ]] || confirmed_by=$(id -un)
+    [[ -n "$confirmed_by" ]] || confirmed_by=$(id -un) || return $?
   fi
-  confirmed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  confirmed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return $?
   patch=$(python3 -c 'import json,sys; print(json.dumps({"site_confirmed_by":sys.argv[1],"site_confirmed_at":sys.argv[2]}))' \
-    "$confirmed_by" "$confirmed_at")
-  manifest_patch_boundary site-confirmed "$patch"
+    "$confirmed_by" "$confirmed_at") || return $?
+  manifest_patch_boundary site-confirmed "$patch" || return $?
+  python3 -c 'import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if value.get("site_confirmed_by")==sys.argv[2] and value.get("site_confirmed_at")==sys.argv[3] else 1)' \
+    "$MANIFEST" "$confirmed_by" "$confirmed_at"
 }
 
 if (( $(state_rank "$state") < $(state_rank verified) )); then
   if ! (verify_running_generation >/dev/null); then
     post_start_refusal "new pe-service process proof failed while entering verified"
   fi
-  verify_listening_bind
+  if ! (verify_listening_bind); then
+    post_start_refusal "pe-service is not listening on the configured production bind"
+  fi
   if ! (verify_started_invocation); then
     post_start_refusal "recorded pe-service invocation changed while entering verified"
   fi
-  wait_for_invocation_status "$(manifest_get active_enter_unix)"
+  if ! active_enter_unix=$(manifest_get active_enter_unix); then
+    post_start_refusal "recorded pe-service invocation timestamp is unavailable"
+  fi
+  if ! (wait_for_invocation_status "$active_enter_unix"); then
+    post_start_refusal "status.json did not become healthy and newer than the recorded invocation within 120 seconds"
+  fi
   if ! (verify_started_invocation); then
     post_start_refusal "recorded pe-service invocation changed while entering verified"
   fi
-  latest_batch=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;')
-  [[ "$latest_batch" == "$(manifest_get ranking_batch_id)" ]] ||
-    die "latest ranking batch $latest_batch differs from the frozen activation batch $(manifest_get ranking_batch_id)"
-  before=$(manifest_get prepared_anchor_count)
-  approved=$(manifest_get owner_approved_due_subset)
+  if ! latest_batch=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc 'select max(batch_id) from ranking_batches;'); then
+    post_start_refusal "could not verify the frozen activation ranking batch"
+  fi
+  if ! frozen_batch=$(manifest_get ranking_batch_id); then
+    post_start_refusal "frozen activation ranking batch is unavailable"
+  fi
+  if [[ "$latest_batch" != "$frozen_batch" ]]; then
+    post_start_refusal \
+      "latest ranking batch $latest_batch differs from the frozen activation batch $frozen_batch" true
+  fi
+  if ! before=$(manifest_get prepared_anchor_count); then
+    post_start_refusal "prepared anchor count is unavailable"
+  fi
+  if ! approved=$(manifest_get owner_approved_due_subset); then
+    post_start_refusal "owner-approved due subset is unavailable"
+  fi
   [[ -n "$approved" ]] || approved=0
-  after=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" 'select count(*) from position_anchors;')
-  [[ "$after" -eq $((before + approved)) ]] ||
-    die "boot anchor count changed by $((after - before)); expected approved walk of $approved"
-  verify_seed_or_prepared 2
-  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c \
-    'refresh materialized view concurrently wallet_live_stats_mv;'
-  verify_fresh_supabase
-  projection=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
+  if ! after=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" \
+    'select count(*) from position_anchors;'); then
+    post_start_refusal "could not read the generation anchor count"
+  fi
+  if [[ ! "$before" =~ ^[0-9]+$ || ! "$approved" =~ ^[0-9]+$ || ! "$after" =~ ^[0-9]+$ ]]; then
+    post_start_refusal "generation anchor counts are invalid"
+  fi
+  if [[ "$after" -ne $((before + approved)) ]]; then
+    post_start_refusal \
+      "boot anchor count changed by $((after - before)); expected approved walk of $approved"
+  fi
+  if ! (verify_seed_or_prepared 2); then
+    post_start_refusal "prepared generation verification failed after service start"
+  fi
+  if ! psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c \
+    'refresh materialized view concurrently wallet_live_stats_mv;'; then
+    post_start_refusal "wallet_live_stats_mv refresh failed after service start"
+  fi
+  if ! (verify_fresh_supabase); then
+    post_start_refusal "Supabase fresh-book verification failed after service start"
+  fi
+  if ! projection=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
     "select case when (select count(*) from service_watchlist)>0 and
       (select watchlist_size from service_runtime where id=1)=(select count(*) from service_watchlist)
-      then 'ok' else 'mismatch' end;")
-  [[ "$projection" == ok ]] || die "Supabase projection verification failed: $projection"
-  record_site_confirmation
+      then 'ok' else 'mismatch' end;"); then
+    post_start_refusal "could not verify the Supabase watchlist projection"
+  fi
+  if [[ "$projection" != ok ]]; then
+    post_start_refusal "Supabase projection verification failed: $projection"
+  fi
+  site_confirmation_rc=0
+  (record_site_confirmation) || site_confirmation_rc=$?
+  case "$site_confirmation_rc" in
+    0) ;;
+    86) exit 86 ;;
+    98) exit 1 ;;
+    *) post_start_refusal "signed-in site confirmation recording failed" ;;
+  esac
   manifest_advance verified
   state=verified
 fi
