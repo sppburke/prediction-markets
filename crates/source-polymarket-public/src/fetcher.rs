@@ -687,7 +687,10 @@ mod tests {
                     source_id: "test-server",
                     endpoint_kind: "activity-page",
                 },
-                Instant::now() + Duration::from_millis(20),
+                // Well below the handler's 1 s hang, but wide enough that a loaded runner cannot
+                // expire the deadline before the first attempt is even made (CI flaked at 20 ms:
+                // two of three runs on identical code, 2026-09-04).
+                Instant::now() + Duration::from_millis(250),
                 |attempt| {
                     attempts.push(attempt);
                     Ok(())
