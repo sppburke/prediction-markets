@@ -36,8 +36,10 @@
 //! - payload rejected by the normalizer → counted and debug-logged once per frame;
 //!   the REST path parses the same shape with the same converter, so the
 //!   poller either delivers it or freezes the wallet cursor on it (#511).
-//! - reader silence → drop + backoff + re-dial, per slot. `ActivityIngest::run`
-//!   owns every task in one `JoinSet`; no detached reader survives it.
+//! - reader silence → process any ready frame before checking the deadline,
+//!   then drop + backoff + re-dial if the deadline remains expired, per slot.
+//!   `ActivityIngest::run` owns every task in one `JoinSet`; no detached reader
+//!   survives it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -411,40 +413,66 @@ impl Reader {
         loop {
             let frame = tokio::select! {
                 biased;
-                () = tokio::time::sleep_until(deadline) => None,
                 frame = stream.next_frame() => Some(frame),
+                () = tokio::time::sleep_until(deadline) => None,
             };
-            // One deadline check per iteration, BEFORE processing the next frame.
-            // An accepted watched row that blocks on fan-in credits liveness from
-            // a fresh post-delivery instant before this loop can check again.
-            let now = Instant::now();
-            if now >= deadline {
-                warn!(
-                    slot = self.slot,
-                    timeout_secs = ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS,
-                    "activity ws reader produced no normalized activity row; dropping socket"
-                );
+            let Some(frame) = frame else {
+                self.warn_deadline_drop(false);
                 return Ok(());
-            }
-            let text = match frame {
-                None => continue,
-                Some(Ok(Some(WireFrame::Text(text)))) => text,
-                Some(Ok(Some(WireFrame::NonText))) => {
+            };
+            let now = Instant::now();
+            match frame {
+                Ok(Some(WireFrame::Text(text))) => {
+                    self.on_frame(&text, now, &mut deadline, backoff).await?;
+                }
+                Ok(Some(WireFrame::NonText)) => {
                     // Ping/pong/binary: the transport is alive; nothing to normalize.
                     self.set_health(|r| r.last_wire_frame_at = Some(now));
-                    continue;
                 }
-                Some(Ok(None)) => {
+                Ok(None) => {
                     warn!(slot = self.slot, "activity ws closed by peer");
                     return Ok(());
                 }
-                Some(Err(error)) => {
+                Err(error) => {
                     warn!(slot = self.slot, error = %error, "activity ws read error");
                     return Ok(());
                 }
-            };
-            self.on_frame(&text, now, &mut deadline, backoff).await?;
+            }
+            // A ready frame wins over an expired deadline. Accepted activity
+            // renews the deadline in `on_frame`; every other frame still drops
+            // the socket when the deadline remains expired after processing.
+            if Instant::now() >= deadline {
+                self.warn_deadline_drop(true);
+                return Ok(());
+            }
         }
+    }
+
+    fn warn_deadline_drop(&self, buffered_frame_processed: bool) {
+        let now = Instant::now();
+        let (last_wire_frame_age_secs, last_normalized_activity_age_secs) = {
+            let health = self
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let reader = health.ws_readers.get(self.slot);
+            (
+                reader
+                    .and_then(|r| r.last_wire_frame_at)
+                    .map(|at| now.saturating_duration_since(at).as_secs()),
+                reader
+                    .and_then(|r| r.last_normalized_activity_at)
+                    .map(|at| now.saturating_duration_since(at).as_secs()),
+            )
+        };
+        warn!(
+            slot = self.slot,
+            timeout_secs = ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS,
+            ?last_wire_frame_age_secs,
+            ?last_normalized_activity_age_secs,
+            buffered_frame_processed,
+            "activity ws reader produced no normalized activity row; dropping socket"
+        );
     }
 
     /// Parse one text frame received at `now`, normalize every payload once,

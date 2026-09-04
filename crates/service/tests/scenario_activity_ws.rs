@@ -698,7 +698,7 @@ async fn r1_only_normalized_rows_refresh_liveness_drop_is_exact_and_backoff_foll
     );
 
     // Second cycle: a parser-accepted frame becomes ready at the exact deadline
-    // instant — the deadline wins (no refresh, no read); then a 2 s backoff.
+    // instant. The frame wins, refreshes liveness, and resets the backoff.
     let mut server = pool.net.take_server(0);
     server
         .send_text(&activity_frame(&[payload(
@@ -710,18 +710,112 @@ async fn r1_only_normalized_rows_refresh_liveness_drop_is_exact_and_backoff_foll
         .await
         .unwrap();
     advance(Duration::from_secs(30)).await;
-    assert!(server.recv_text().await.is_none());
     let r = pool.reader(0);
+    assert!(r.connected, "a ready frame keeps the socket connected");
     assert_eq!(
-        r.normalized_activity_rows_total, 0,
-        "a frame ready at the deadline cannot refresh liveness"
+        r.normalized_activity_rows_total, 1,
+        "a frame ready at the deadline is consumed before expiry"
     );
-    assert!(r.last_normalized_activity_at.is_none());
-    advance(Duration::from_millis(1_999)).await;
+    assert!(r.last_normalized_activity_at.is_some());
+    assert_eq!(r.consecutive_reconnects, 0);
+    advance(Duration::from_millis(29_999)).await;
+    assert!(pool.reader(0).connected);
+    assert_eq!(pool.net.dial_count(0), 2);
+    advance(Duration::from_millis(1)).await;
+    assert!(!pool.reader(0).connected);
+    assert!(server.recv_text().await.is_none());
+    advance(Duration::from_millis(999)).await;
     assert_eq!(pool.net.dial_count(0), 2);
     advance(Duration::from_millis(1)).await;
     assert_eq!(pool.net.dial_count(0), 3);
-    assert_eq!(pool.reader(0).consecutive_reconnects, 2);
+    assert_eq!(pool.reader(0).consecutive_reconnects, 1);
+    pool.task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_unwatched_frames_at_deadline_credit_all_three_readers_before_drop() {
+    let (pool, _trade_rx) = start_pool(64).await;
+    let mut servers: Vec<ActivityWsPeer> = (0..3).map(|slot| pool.net.take_server(slot)).collect();
+
+    for (slot, server) in servers.iter_mut().enumerate() {
+        server
+            .send_text(&activity_frame(&[payload(
+                &format!("0xprime-{slot}"),
+                STRANGER,
+                &market_b(),
+                now_unix(),
+            )]))
+            .await
+            .unwrap();
+    }
+    settle().await;
+    for slot in 0..3 {
+        assert_eq!(pool.reader(slot).normalized_activity_rows_total, 1);
+        assert!(pool.reader(slot).is_live(Instant::now()));
+    }
+
+    advance(Duration::from_millis(29_999)).await;
+    for (slot, server) in servers.iter_mut().enumerate() {
+        server
+            .send_text(&activity_frame(&[payload(
+                &format!("0xdeadline-{slot}"),
+                STRANGER,
+                &market_b(),
+                now_unix(),
+            )]))
+            .await
+            .unwrap();
+    }
+    advance(Duration::from_millis(1)).await;
+
+    for slot in 0..3 {
+        let reader = pool.reader(slot);
+        assert!(reader.connected, "reader {slot} keeps its socket");
+        assert_eq!(reader.normalized_activity_rows_total, 2);
+        assert!(reader.is_live(Instant::now()));
+        assert_eq!(pool.net.dial_count(slot), 1);
+    }
+    pool.task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_acknowledgements_at_deadline_drop_all_three_silent_readers() {
+    let (pool, _trade_rx) = start_pool(64).await;
+    let mut servers: Vec<ActivityWsPeer> = (0..3).map(|slot| pool.net.take_server(slot)).collect();
+
+    for (slot, server) in servers.iter_mut().enumerate() {
+        server
+            .send_text(&activity_frame(&[payload(
+                &format!("0xprime-{slot}"),
+                STRANGER,
+                &market_b(),
+                now_unix(),
+            )]))
+            .await
+            .unwrap();
+    }
+    settle().await;
+    let credited_at: Vec<Instant> = (0..3)
+        .map(|slot| pool.reader(slot).last_normalized_activity_at.unwrap())
+        .collect();
+
+    advance(Duration::from_millis(29_999)).await;
+    for server in &mut servers {
+        server
+            .send_text(r#"{"status":"subscribed"}"#)
+            .await
+            .unwrap();
+    }
+    advance(Duration::from_millis(1)).await;
+
+    for (slot, credited_at) in credited_at.into_iter().enumerate() {
+        let reader = pool.reader(slot);
+        assert!(!reader.connected, "reader {slot} drops genuine silence");
+        assert_eq!(reader.normalized_activity_rows_total, 1);
+        assert_eq!(reader.last_normalized_activity_at, Some(credited_at));
+        assert_eq!(reader.last_wire_frame_at, Some(Instant::now()));
+        assert_eq!(pool.net.dial_count(slot), 1);
+    }
     pool.task.abort();
 }
 
