@@ -14,7 +14,7 @@ use pe_core_types::{
 use pe_paper_state::{
     DecisionPendingState, NoCopyDisposition, PaperStateDb, WalletHistoryStatusRecord,
 };
-use pe_position_ledger::{LedgerEffect, PositionLedger, WalletFenceCause};
+use pe_position_ledger::{AppliedEffect, LedgerEffect, PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
     BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2, IdentityOverride,
 };
@@ -22,7 +22,9 @@ use pe_service::decision_replay::{
     AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
     DecisionPostBoundaryEvidenceBody, TerminalDispositionEvidence, replay_decision_pending,
 };
-use pe_service::paper_recovery::{build_leader_ledger, replay_wallet_ledger};
+use pe_service::paper_recovery::{
+    WalletLedgerReplayError, build_leader_ledger, replay_wallet_ledger,
+};
 use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
 use pe_source_polymarket_public::{
     ActivityAggregate, ActivityParseContext, ActivityTransport, parse_activity_response,
@@ -362,9 +364,14 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     let result = engine
         .commit(vec![copy], &context(101, true), zero_basis())
         .unwrap();
-    assert_eq!(result.dispositions[&copy_id.0], "not_copy_eligible");
+    assert_eq!(
+        result.dispositions[&copy_id.0],
+        "reanchor_required_late_group"
+    );
     assert!(result.pending.is_empty());
     assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert_eq!(state(&engine, MARKET_C, 0), ShareAmount::ZERO);
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
 }
 
 #[test]
@@ -424,6 +431,19 @@ fn verified_identity_override_commits_v2_and_replays_with_v1() {
     drop(engine);
     drop(paper);
     let restarted = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    let anchor_replayed = replay_wallet_ledger(&restarted, wallet()).unwrap();
+    assert_eq!(
+        anchor_replayed.position(&wallet()).unwrap().positions[&market_outcome(MARKET_A, 0)]
+            .long_contracts
+            .atomic(),
+        2_000_000
+    );
+    assert_eq!(
+        anchor_replayed.position(&wallet()).unwrap().positions[&market_outcome(MARKET_B, 1)]
+            .long_contracts
+            .atomic(),
+        3_000_000
+    );
     let replayed = build_leader_ledger(&restarted).unwrap();
     let restarted_engine = BucketCommitEngine::load(restarted, replayed).unwrap();
     assert_eq!(state(&restarted_engine, MARKET_A, 0).atomic(), 2_000_000);
@@ -576,7 +596,7 @@ fn bracket_unverified_covered_group_is_raw_only_without_reanchor_then_anchors() 
 }
 
 #[test]
-fn unresolved_member_after_partial_durable_bucket_is_raw_only_without_fence() {
+fn unresolved_member_after_partial_durable_bucket_keeps_the_partial_commit_fence() {
     let (_dir, paper, mut engine) = fresh_anchored();
     let committed = position_row(
         "TRADE",
@@ -623,14 +643,24 @@ fn unresolved_member_after_partial_durable_bucket_is_raw_only_without_fence() {
         .unwrap();
 
     assert_eq!(result.dispositions[&committed_id.0], "already_committed");
-    assert_eq!(result.dispositions[&unresolved_id.0], "raw_only");
-    assert_eq!(result.newly_fenced, None);
-    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    assert_eq!(
+        result.dispositions[&unresolved_id.0],
+        "late_group_after_bucket_commit"
+    );
+    assert_eq!(
+        result.newly_fenced,
+        Some(WalletFenceCause::LateEqualSecondGroup)
+    );
+    assert!(paper.is_wallet_fenced(&wallet()).unwrap());
     assert_eq!(
         paper.no_copy_disposition(&unresolved_id).unwrap(),
-        Some(("rest_poll".to_owned(), 0, "identity_unresolved".to_owned()))
+        Some((
+            "reconciled_rest".to_owned(),
+            0,
+            "late_group_after_bucket_commit".to_owned()
+        ))
     );
-    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_000_000);
     assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
 }
@@ -1419,30 +1449,56 @@ fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
     assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
 
-    let zero = aggregate(json!({
-        "timestamp": 561,
-        "conditionId": MARKET_A,
-        "type": "REDEEM",
-        "size": "0",
-        "usdcSize": "0",
-        "transactionHash": "0x73",
-        "price": "0",
-        "asset": "asset-0",
-        "side": "",
-        "outcomeIndex": 0,
-        "outcome": "Yes",
-    }));
-    let zero_id = zero.group_id.key().clone();
+    let pending_before = paper.open_decision_pending().unwrap().len();
+    let buy = position_row("TRADE", "0x73", MARKET_A, 0, "BUY", "2", "0.5", 561);
+    let buy_id = buy.group_id.key().clone();
     let result = engine
-        .commit(vec![zero], &context(561, true), zero_basis())
+        .commit(vec![buy], &context(561, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     assert_eq!(
-        result.dispositions[&zero_id.0],
-        "reanchor_required_redemption"
+        result.dispositions[&buy_id.0],
+        "reanchor_required_late_group"
     );
+    assert!(result.pending.is_empty());
+    assert_eq!(paper.open_decision_pending().unwrap().len(), pending_before);
+    let group = paper
+        .activity_groups_after(&wallet(), 560)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.source_trade_id == buy_id)
+        .unwrap();
+    assert!(matches!(
+        LedgerEffect::from_document(&group.proof_json),
+        Ok(LedgerEffect::RawOnly)
+    ));
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+
+    install_anchor(
+        &mut engine,
+        &paper,
+        561,
+        vec![(
+            MarketId(VenueMarketId(MARKET_A.to_owned())),
+            OutcomeId(0),
+            ShareAmount::from_atomic(4_000_000),
+        )],
+        562,
+    );
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let mut after_anchor = context(562, true);
+    after_anchor.copy_eligible = false;
+    engine
+        .commit(
+            vec![position_row(
+                "TRADE", "0x74", MARKET_A, 0, "BUY", "2", "0.5", 562,
+            )],
+            &after_anchor,
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 6_000_000);
 }
 
 #[test]
@@ -1477,7 +1533,477 @@ fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
 }
 
 #[test]
-fn changed_or_late_equal_second_groups_fence_without_reapplying_prior_state() {
+fn sibling_redeem_residual_commits_version_three_and_replay_checks_it() {
+    let (dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![
+            (
+                MarketId(VenueMarketId(MARKET_A.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(47_094_800),
+            ),
+            (
+                MarketId(VenueMarketId(MARKET_B.to_owned())),
+                OutcomeId(1),
+                ShareAmount::from_atomic(33_322_200),
+            ),
+        ],
+        1,
+    );
+    let exact = position_row(
+        "REDEEM",
+        "0xredeem-exact",
+        MARKET_A,
+        0,
+        "",
+        "47.094800",
+        "0",
+        570,
+    );
+    let clamped = position_row(
+        "REDEEM",
+        "0xredeem-clamped",
+        MARKET_B,
+        1,
+        "",
+        "33.322232",
+        "0",
+        570,
+    );
+    let result = engine
+        .commit(vec![clamped, exact], &context(570, true), zero_basis())
+        .unwrap();
+
+    assert!(
+        result
+            .dispositions
+            .values()
+            .all(|disposition| disposition == "applied")
+    );
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(state(&engine, MARKET_B, 1), ShareAmount::ZERO);
+    let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+    let decoded = groups
+        .iter()
+        .map(|group| {
+            (
+                group.source_trade_id.clone(),
+                AppliedEffect::from_document(&group.proof_json).unwrap(),
+                serde_json::from_str::<Value>(&group.proof_json).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let exact_document = decoded
+        .iter()
+        .find(|(_, effect, _)| effect.clamped_residual.is_none())
+        .unwrap();
+    let clamped_document = decoded
+        .iter()
+        .find(|(_, effect, _)| effect.clamped_residual == Some(32))
+        .unwrap();
+    assert_eq!(exact_document.2["version"], 1);
+    assert!(
+        exact_document.2.get("clamped_residual_atomic").is_none(),
+        "an exact redeem stays on the version-one schema"
+    );
+    assert_eq!(clamped_document.2["version"], 3);
+    assert_eq!(clamped_document.2["clamped_residual_atomic"], 32);
+
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    assert_eq!(
+        replayed.position(&wallet()).unwrap().positions[&market_outcome(MARKET_A, 0)]
+            .long_contracts,
+        ShareAmount::ZERO
+    );
+    assert_eq!(
+        replayed.position(&wallet()).unwrap().positions[&market_outcome(MARKET_B, 1)]
+            .long_contracts,
+        ShareAmount::ZERO
+    );
+
+    let mut mismatched = clamped_document.2.clone();
+    mismatched["clamped_residual_atomic"] = json!(31);
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE activity_groups SET proof_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&mismatched).unwrap(),
+                clamped_document.0.0
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        replay_wallet_ledger(&paper, wallet()),
+        Err(WalletLedgerReplayError::ClampedResidualMismatch {
+            source_epoch: 570,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn replay_rejects_documents_that_attempt_to_stack_redeem_tolerance() {
+    let (dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![
+            (
+                MarketId(VenueMarketId(MARKET_A.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(100),
+            ),
+            (
+                MarketId(VenueMarketId(MARKET_B.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(100),
+            ),
+        ],
+        1,
+    );
+    engine
+        .commit(
+            vec![
+                position_row(
+                    "REDEEM",
+                    "0xreplay-stack-a",
+                    MARKET_A,
+                    0,
+                    "",
+                    "0.000190",
+                    "0",
+                    575,
+                ),
+                position_row(
+                    "REDEEM",
+                    "0xreplay-stack-b",
+                    MARKET_B,
+                    0,
+                    "",
+                    "0.000190",
+                    "0",
+                    575,
+                ),
+            ],
+            &context(575, true),
+            zero_basis(),
+        )
+        .unwrap();
+    let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+    assert_eq!(groups.len(), 2);
+    let documents = [
+        AppliedEffect {
+            effect: LedgerEffect::Redeem {
+                market_id: MarketId(VenueMarketId(MARKET_A.to_owned())),
+                outcome_id: OutcomeId(0),
+                amount: ShareAmount::from_atomic(190),
+            },
+            clamped_residual: Some(90),
+        }
+        .to_document()
+        .unwrap(),
+        AppliedEffect {
+            effect: LedgerEffect::Redeem {
+                market_id: MarketId(VenueMarketId(MARKET_A.to_owned())),
+                outcome_id: OutcomeId(0),
+                amount: ShareAmount::from_atomic(20),
+            },
+            clamped_residual: Some(20),
+        }
+        .to_document()
+        .unwrap(),
+    ];
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    for (group, document) in groups.iter().zip(documents) {
+        connection
+            .execute(
+                "UPDATE activity_groups SET proof_json = ?1 WHERE source_trade_id = ?2",
+                rusqlite::params![document, group.source_trade_id.0],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    assert!(matches!(
+        replay_wallet_ledger(&paper, wallet()),
+        Err(WalletLedgerReplayError::Ledger { .. })
+    ));
+}
+
+#[test]
+fn already_fenced_commit_serializes_only_clamped_redeems_as_version_three() {
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![
+            (
+                MarketId(VenueMarketId(MARKET_A.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(1_000),
+            ),
+            (
+                MarketId(VenueMarketId(MARKET_B.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(1_000),
+            ),
+        ],
+        1,
+    );
+    engine
+        .commit(
+            vec![pair_effect(
+                "CONVERSION",
+                "0xfence-first",
+                MARKET_C,
+                "1",
+                580,
+            )],
+            &context(580, true),
+            zero_basis(),
+        )
+        .unwrap();
+    let clamped = position_row(
+        "REDEEM",
+        "0xfenced-clamped",
+        MARKET_A,
+        0,
+        "",
+        "0.001050",
+        "0",
+        581,
+    );
+    let exact = position_row(
+        "REDEEM",
+        "0xfenced-exact",
+        MARKET_B,
+        0,
+        "",
+        "0.001000",
+        "0",
+        581,
+    );
+    let result = engine
+        .commit(vec![clamped, exact], &context(581, true), zero_basis())
+        .unwrap();
+
+    assert!(
+        result
+            .dispositions
+            .values()
+            .all(|disposition| disposition == "wallet_fenced_applied")
+    );
+    let groups = paper.activity_groups_after(&wallet(), 580).unwrap();
+    let documents = groups
+        .iter()
+        .map(|group| {
+            (
+                AppliedEffect::from_document(&group.proof_json).unwrap(),
+                serde_json::from_str::<Value>(&group.proof_json).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        documents.iter().any(|(effect, value)| {
+            effect.clamped_residual == Some(50) && value["version"] == 3
+        })
+    );
+    assert!(documents.iter().any(|(effect, value)| {
+        effect.clamped_residual.is_none()
+            && value["version"] == 1
+            && value.get("clamped_residual_atomic").is_none()
+    }));
+}
+
+#[test]
+fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() {
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![(
+            MarketId(VenueMarketId(MARKET_A.to_owned())),
+            OutcomeId(0),
+            ShareAmount::from_atomic(100),
+        )],
+        1,
+    );
+    let stacking = vec![
+        position_row("REDEEM", "0xstack-a", MARKET_A, 0, "", "0.000190", "0", 590),
+        position_row("REDEEM", "0xstack-b", MARKET_A, 0, "", "0.000020", "0", 590),
+    ];
+    let result = engine
+        .commit(stacking, &context(590, true), zero_basis())
+        .unwrap();
+    assert_eq!(
+        result.newly_fenced,
+        Some(WalletFenceCause::OrderDependentEqualSecond)
+    );
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 100);
+
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![(
+            MarketId(VenueMarketId(MARKET_A.to_owned())),
+            OutcomeId(0),
+            ShareAmount::from_atomic(100),
+        )],
+        1,
+    );
+    let split_and_redeem = vec![
+        pair_effect("SPLIT", "0xconnected-split", MARKET_A, "0.000050", 591),
+        position_row(
+            "REDEEM",
+            "0xconnected-redeem",
+            MARKET_A,
+            0,
+            "",
+            "0.000150",
+            "0",
+            591,
+        ),
+    ];
+    let result = engine
+        .commit(split_and_redeem, &context(591, true), zero_basis())
+        .unwrap();
+    assert_eq!(
+        result.newly_fenced,
+        Some(WalletFenceCause::OrderDependentEqualSecond)
+    );
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 100);
+    assert_eq!(state(&engine, MARKET_A, 1), ShareAmount::ZERO);
+
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let five_connected = (0..5)
+        .map(|ordinal| {
+            position_row(
+                "TRADE",
+                &format!("0xwide-{ordinal}"),
+                MARKET_A,
+                0,
+                "BUY",
+                "0.000001",
+                "0.5",
+                592,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = engine
+        .commit(five_connected, &context(592, true), zero_basis())
+        .unwrap();
+    assert_eq!(
+        result.newly_fenced,
+        Some(WalletFenceCause::OrderDependentEqualSecond)
+    );
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert!(paper.is_wallet_fenced(&wallet()).unwrap());
+
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![(
+            MarketId(VenueMarketId(MARKET_A.to_owned())),
+            OutcomeId(0),
+            ShareAmount::from_atomic(100),
+        )],
+        1,
+    );
+    let sell_then_redeem = vec![
+        position_row(
+            "TRADE",
+            "0xsell-conflict",
+            MARKET_A,
+            0,
+            "SELL",
+            "0.000020",
+            "0.5",
+            593,
+        ),
+        position_row(
+            "REDEEM",
+            "0xredeem-conflict",
+            MARKET_A,
+            0,
+            "",
+            "0.000100",
+            "0",
+            593,
+        ),
+    ];
+    let result = engine
+        .commit(sell_then_redeem, &context(593, true), zero_basis())
+        .unwrap();
+    assert_eq!(
+        result.newly_fenced,
+        Some(WalletFenceCause::OrderDependentEqualSecond)
+    );
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 100);
+
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![
+            (
+                MarketId(VenueMarketId(MARKET_A.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(200),
+            ),
+            (
+                MarketId(VenueMarketId(MARKET_A.to_owned())),
+                OutcomeId(1),
+                ShareAmount::from_atomic(100),
+            ),
+        ],
+        1,
+    );
+    let merge_and_redeem = vec![
+        pair_effect("MERGE", "0xstrict-merge", MARKET_A, "0.000150", 594),
+        position_row(
+            "REDEEM",
+            "0xmerge-redeem",
+            MARKET_A,
+            0,
+            "",
+            "0.000050",
+            "0",
+            594,
+        ),
+    ];
+    let result = engine
+        .commit(merge_and_redeem, &context(594, true), zero_basis())
+        .unwrap();
+    assert_eq!(
+        result.newly_fenced,
+        Some(WalletFenceCause::OrderDependentEqualSecond)
+    );
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 200);
+    assert_eq!(state(&engine, MARKET_A, 1).atomic(), 100);
+}
+
+#[test]
+fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
     let (_dir, paper, mut engine) = fresh_anchored();
     let mut no_copy = context(600, true);
     no_copy.copy_eligible = false;
@@ -1500,11 +2026,139 @@ fn changed_or_late_equal_second_groups_fence_without_reapplying_prior_state() {
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_250_000);
     assert!(paper.is_wallet_fenced(&wallet()).unwrap());
 
-    let (_dir, paper, mut engine) = fresh_anchored();
-    let first = position_row("TRADE", "0x81", MARKET_A, 0, "BUY", "2", "0.4", 700);
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(
+        &mut engine,
+        &paper,
+        0,
+        vec![
+            (
+                MarketId(VenueMarketId(MARKET_A.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(5_000_000),
+            ),
+            (
+                MarketId(VenueMarketId(MARKET_B.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(5_000_000),
+            ),
+        ],
+        1,
+    );
+    let first = position_row("REDEEM", "0x81", MARKET_A, 0, "", "5", "0", 700);
     engine.commit(vec![first], &no_copy, zero_basis()).unwrap();
-    let late = position_row("TRADE", "0x82", MARKET_B, 0, "BUY", "5", "0.6", 700);
+    let late = position_row("REDEEM", "0x82", MARKET_B, 0, "", "5", "0", 700);
+    let late_id = late.group_id.key().clone();
+    let cursor_before = paper.cursor(&wallet()).unwrap();
     let result = engine.commit(vec![late], &no_copy, zero_basis()).unwrap();
+    assert_eq!(result.newly_fenced, None);
+    assert_eq!(
+        result.dispositions[&late_id.0],
+        "reanchor_required_late_group"
+    );
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 5_000_000);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert_eq!(paper.cursor(&wallet()).unwrap(), cursor_before);
+    assert!(result.pending.is_empty());
+    assert!(paper.open_decision_pending().unwrap().is_empty());
+    let late_group = paper
+        .activity_groups_after(&wallet(), 699)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.source_trade_id == late_id)
+        .unwrap();
+    assert!(matches!(
+        LedgerEffect::from_document(&late_group.proof_json),
+        Ok(LedgerEffect::RawOnly)
+    ));
+
+    let decrement = position_row("TRADE", "0x83", MARKET_B, 0, "SELL", "1", "0.5", 701);
+    let decrement_id = decrement.group_id.key().clone();
+    let result = engine
+        .commit(vec![decrement], &context(701, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.newly_fenced, None);
+    assert_eq!(
+        result.dispositions[&decrement_id.0],
+        "reanchor_required_late_group"
+    );
+    assert!(result.pending.is_empty());
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 5_000_000);
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let decrement_group = paper
+        .activity_groups_after(&wallet(), 700)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.source_trade_id == decrement_id)
+        .unwrap();
+    assert!(matches!(
+        LedgerEffect::from_document(&decrement_group.proof_json),
+        Ok(LedgerEffect::RawOnly)
+    ));
+
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    assert_eq!(
+        replayed.position(&wallet()).unwrap().positions[&market_outcome(MARKET_A, 0)]
+            .long_contracts
+            .atomic(),
+        0
+    );
+    assert_eq!(
+        replayed.position(&wallet()).unwrap().positions[&market_outcome(MARKET_B, 0)]
+            .long_contracts
+            .atomic(),
+        5_000_000
+    );
+
+    install_anchor(&mut engine, &paper, 701, Vec::new(), 702);
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let mut after_anchor = context(702, true);
+    after_anchor.copy_eligible = false;
+    let applied = engine
+        .commit(
+            vec![position_row(
+                "TRADE",
+                "0xafter-late-anchor",
+                MARKET_B,
+                0,
+                "BUY",
+                "2",
+                "0.5",
+                702,
+            )],
+            &after_anchor,
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(applied.newly_fenced, None);
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 2_000_000);
+}
+
+#[test]
+fn mixed_durable_and_unseen_equal_second_groups_still_fence() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let mut no_copy = context(710, true);
+    no_copy.copy_eligible = false;
+    let durable = position_row("TRADE", "0x83", MARKET_A, 0, "BUY", "2", "0.4", 710);
+    let durable_id = durable.group_id.key().clone();
+    engine
+        .commit(vec![durable.clone()], &no_copy, zero_basis())
+        .unwrap();
+    let unseen = position_row("TRADE", "0x84", MARKET_B, 0, "BUY", "5", "0.6", 710);
+    let unseen_id = unseen.group_id.key().clone();
+
+    let result = engine
+        .commit(vec![durable, unseen], &no_copy, zero_basis())
+        .unwrap();
+
+    assert_eq!(result.dispositions[&durable_id.0], "already_committed");
+    assert_eq!(
+        result.dispositions[&unseen_id.0],
+        "late_group_after_bucket_commit"
+    );
     assert_eq!(
         result.newly_fenced,
         Some(WalletFenceCause::LateEqualSecondGroup)

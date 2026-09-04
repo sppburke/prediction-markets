@@ -413,11 +413,11 @@ fn missing_and_unknown_effect_documents_are_typed_replay_failures() {
         replay_with_document("{}"),
         WalletLedgerReplayError::EffectDocument { .. }
     ));
-    let unknown = replay_with_document(r#"{"effect":{"kind":"raw_only"},"version":3}"#);
+    let unknown = replay_with_document(r#"{"effect":{"kind":"raw_only"},"version":4}"#);
     assert!(matches!(
         unknown,
         WalletLedgerReplayError::EffectDocument {
-            source: pe_position_ledger::LedgerEffectDocumentError::UnknownVersion { version: 3 },
+            source: pe_position_ledger::LedgerEffectDocumentError::UnknownVersion { version: 4 },
             ..
         }
     ));

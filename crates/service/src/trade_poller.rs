@@ -41,7 +41,7 @@ use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::LiveRuntimeConfig;
-use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome};
+use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome, anchor_refresh_due};
 
 /// Source id stamped on every fixed-end activity page before it is parsed.
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
@@ -270,7 +270,14 @@ pub struct TradePoller {
     obligations: ReconciliationObligations,
     admission_preparer: Option<AdmissionPreparer>,
     refresh_cursor: usize,
+    refresh_reanchor_turn: bool,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorRefreshClass {
+    ReanchorRequired,
+    AgeDue,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -317,6 +324,7 @@ impl TradePoller {
             obligations,
             admission_preparer,
             refresh_cursor: 0,
+            refresh_reanchor_turn: true,
             now: Arc::new(OffsetDateTime::now_utc),
         }
     }
@@ -434,7 +442,7 @@ impl TradePoller {
             return Ok(());
         }
         let now_unix = (self.now)().unix_timestamp();
-        let refresh_secs = i64::try_from(ANCHOR_REFRESH_SECS).unwrap_or(i64::MAX);
+        let mut candidates = Vec::new();
         for offset in 0..wallets.len() {
             let index = self.refresh_cursor.saturating_add(offset) % wallets.len();
             let wallet = wallets[index];
@@ -442,24 +450,30 @@ impl TradePoller {
                 .paper_state
                 .wallet_coverage(&wallet)
                 .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?;
-            let due = coverage.reanchor_required
-                || coverage
-                    .anchored_at_unix
-                    .is_none_or(|anchored| now_unix.saturating_sub(anchored) > refresh_secs);
-            if !due {
+            if !anchor_refresh_due(&coverage, now_unix, ANCHOR_REFRESH_SECS) {
                 continue;
             }
-            self.refresh_cursor = index.saturating_add(1) % wallets.len();
-            match preparer
-                .prepare_if_due(wallet, now_unix, ANCHOR_REFRESH_SECS)
-                .await
-                .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?
-            {
-                AnchorRefreshOutcome::Anchored
-                | AnchorRefreshOutcome::Skipped
-                | AnchorRefreshOutcome::Deferred => {}
-            }
-            break;
+            let class = if coverage.reanchor_required {
+                AnchorRefreshClass::ReanchorRequired
+            } else {
+                AnchorRefreshClass::AgeDue
+            };
+            candidates.push((index, class));
+        }
+        let Some(index) = select_refresh_candidate(&candidates, &mut self.refresh_reanchor_turn)
+        else {
+            return Ok(());
+        };
+        let wallet = wallets[index];
+        self.refresh_cursor = index.saturating_add(1) % wallets.len();
+        match preparer
+            .prepare_if_due(wallet, now_unix, ANCHOR_REFRESH_SECS)
+            .await
+            .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?
+        {
+            AnchorRefreshOutcome::Anchored
+            | AnchorRefreshOutcome::Skipped
+            | AnchorRefreshOutcome::Deferred => {}
         }
         Ok(())
     }
@@ -698,6 +712,23 @@ impl TradePoller {
     }
 }
 
+fn select_refresh_candidate(
+    candidates: &[(usize, AnchorRefreshClass)],
+    reanchor_turn: &mut bool,
+) -> Option<usize> {
+    let preferred = if *reanchor_turn {
+        AnchorRefreshClass::ReanchorRequired
+    } else {
+        AnchorRefreshClass::AgeDue
+    };
+    *reanchor_turn = !*reanchor_turn;
+    candidates
+        .iter()
+        .find(|(_, class)| *class == preferred)
+        .or_else(|| candidates.first())
+        .map(|(index, _)| *index)
+}
+
 fn bucket_epoch(bucket: &[ActivityAggregate]) -> Result<i64, ReconciliationError> {
     bucket
         .first()
@@ -791,6 +822,41 @@ impl ReconciliationFetcher for RecordingFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_selection_alternates_due_classes_and_falls_through() {
+        let candidates = [
+            (0, AnchorRefreshClass::ReanchorRequired),
+            (1, AnchorRefreshClass::AgeDue),
+            (2, AnchorRefreshClass::ReanchorRequired),
+            (3, AnchorRefreshClass::AgeDue),
+        ];
+        let mut reanchor_turn = true;
+        assert_eq!(
+            select_refresh_candidate(&candidates, &mut reanchor_turn),
+            Some(0)
+        );
+        assert_eq!(
+            select_refresh_candidate(&candidates[1..], &mut reanchor_turn),
+            Some(1)
+        );
+        assert_eq!(
+            select_refresh_candidate(&candidates[2..], &mut reanchor_turn),
+            Some(2)
+        );
+        assert_eq!(
+            select_refresh_candidate(&candidates[3..], &mut reanchor_turn),
+            Some(3)
+        );
+
+        let only_age_due = [(7, AnchorRefreshClass::AgeDue)];
+        assert_eq!(
+            select_refresh_candidate(&only_age_due, &mut reanchor_turn),
+            Some(7),
+            "reanchor turn falls through to age-due"
+        );
+        assert!(!reanchor_turn, "the class turn still advances");
+    }
 
     #[test]
     fn strict_copy_budget_boundary_preserves_both_sides() {

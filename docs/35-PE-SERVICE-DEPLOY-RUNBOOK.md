@@ -8,6 +8,232 @@
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
 deploying it to the VPS with one restart and no stop-before-swap window.
 
+## Issue #557 generation activation
+
+The procedure in this section replaces the ordinary binary swap when a deployment creates a new
+paper-state generation. The AC10 rehearsal is a **mandatory pre-deploy gate**. Do not enter the
+activation driver's `guarded` state without its recorded PASS evidence.
+
+### Mandatory isolated rehearsal
+
+Run the rehearsal from the final reviewed head with the exact staged binary and a VPS copy of
+production state. Rehearsal isolation means all local durable paths and the bind address resolve to a
+dedicated directory/port, the complete staged environment contains no service-role credential, and
+the Polymarket venue remains real. It is not a special application mode and it is not permission to
+write production Supabase.
+
+1. Copy the stopped/checkpointed production SQLite main without opening it read-write:
+
+   ```bash
+   mkdir -p /home/sean/pe-rehearsal-557
+   sqlite3 -readonly /home/sean/prediction-markets/paper_state.db \
+     ".backup '/home/sean/pe-rehearsal-557/paper_state.db'"
+   ```
+
+   Copy the three logs and legacy-history input into that directory without changing the production
+   files. Record source/destination SHA-256 values.
+2. Create a **complete** rehearsal environment. Set all of these explicitly; no inherited production
+   path or bind is permitted:
+
+   ```text
+   PE_BIND=<dedicated-loopback-bind>
+   PE_EVENT_LOG_PATH=/home/sean/pe-rehearsal-557/paper.log
+   PE_SOURCE_EVENT_LOG_PATH=/home/sean/pe-rehearsal-557/source_events.log
+   PE_JSONL_LOG_PATH=/home/sean/pe-rehearsal-557/paper.jsonl
+   PE_STATUS_PATH=/home/sean/pe-rehearsal-557/status.json
+   PE_PAPER_STATE_DB_PATH=/home/sean/pe-rehearsal-557/paper_state.db
+   PE_LEGACY_WALLET_HISTORY_PATH=/home/sean/pe-rehearsal-557/wallet_market_history.json
+   ```
+
+   Preserve every other required production environment entry, except put the Supabase publishable
+   (`anon`) key in `PE_SUPABASE_SECRET_KEY`. The service-role key must not be present in the rehearsal
+   environment or process.
+3. Run `scripts/deploy/rehearsal_preflight.sh <rehearsal-env>`. Its database matrix must prove:
+
+   - `anon` cannot execute any of the six service write RPCs while `service_role` can;
+   - `anon` has no DML grants on the three live tables; and
+   - each other reachable sink has RLS enabled, is not anon-owned, anon cannot bypass RLS, and no
+     anon/PUBLIC/authenticated write policy exists.
+
+   Its representative HTTP canaries must all return 401/403, including
+   `service_watchlist_replace_v1` with the exact argument shape, and the marker-row query must remain
+   zero.
+4. Print and independently compare env-over-TOML effective bind/state/log/history paths before start.
+   Run the staged binary against the rehearsal config and real venue. Let producers run for at least
+   `ANCHOR_REFRESH_SECS`; use the canonical value and rationale in `docs/_GLOSSARY.md` rather than
+   copying it here.
+5. AC10 passes only when its acceptance bounds are met for reader continuity and drops, fence
+   inspection, a full poll/refresh round, refused projection attempts, ERROR count, VmHWM, and the full
+   D11 convergence record (duration, wallets/minute, errors/deferred, oldest final anchor age, and final
+   due-wallet count) at the concurrency being shipped. Use `FIXFWD_SPEC.md` AC10 as the checklist and
+   record every value; do not restate its numeric thresholds in this runbook. A failed or incomplete item
+   is a deployment stop, not a waiver.
+
+Archive the exact config, complete environment with secrets redacted, staged binary hashes, privilege
+matrix/canary output, status snapshots, logs, and measurements with the issue evidence.
+
+### Warm prepare and cutover
+
+The driver holds `/home/sean/.pe-deploy.lock` for its whole run and writes only the fixed
+`/home/sean/pe-activation.json` manifest as activation authority. Its state order is
+`seed → prepared → prechecked → guarded → archived → reset → switched → started → verified`, with
+`refusing` as the durable transient state for a post-start refusal. Use a unique `activation_id`; a
+different id is refused while the manifest is non-terminal.
+When creating a new `seed` manifest, the driver first queries all five archive tables and refuses an
+id that already stamps any row, including an id from an earlier terminal activation. Existing-manifest
+resumes do not repeat that new-id check. When a prior terminal manifest records reset metadata, its
+durable fact also makes zero or partial archive-column presence a corruption during this new-id check;
+the driver refuses before seed creation and leaves the terminal manifest unchanged.
+The lock is a provisioned root-owned mode-`0644` file. The driver only opens it read-only and refuses
+when it is absent; it never creates or touches the production lock.
+
+Stage the exact release binary, the complete service and rehearsal environment files, and the full
+`smoke-test/service.toml` from the reviewed merge commit. The driver changes only the bind and
+generation path owners in that full TOML. Preview first:
+
+```bash
+SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/activate_generation.sh --dry-run \
+  --activation-id <id> \
+  --generation-dir /home/sean/prediction-markets/gen/<generation> \
+  --source-v1-main <production-v1-main-copy> \
+  --legacy-history <captured-legacy-history> \
+  --staged-binary <reviewed-pe-service> \
+  --config-template <merge-commit-service.toml> \
+  --rehearsal-env <complete-rehearsal-env> \
+  --service-env <complete-production-env> \
+  --merge-commit <reviewed-40-hex> \
+  --bind <production-bind> --rehearsal-bind <dedicated-loopback-bind> \
+  --bankroll <fresh-bankroll>
+```
+
+Before starting the driver, pause the ranking loop from an operator host that can reach Forge and
+verify the recorded and live state:
+
+```bash
+scp scripts/deploy/forge_pause.sh forge:/tmp/forge_pause.sh
+ssh forge 'bash /tmp/forge_pause.sh pause'
+ssh forge 'bash /tmp/forge_pause.sh status'
+```
+
+The activation driver runs on the VPS, which cannot resolve or reach Forge. The Forge pause is
+therefore an operator invariant; the driver verifies its consequence by requiring the ranking batch
+to remain frozen. Run the same driver command without `--dry-run`. While the old service still trades,
+`seed` creates the empty schema-v1 generation and `prepared` migrates it with
+`--exit-after-anchors`. If a crash leaves a version-two main before the `prepared` manifest rename, the
+driver re-enters that command so the binary completes or verifies the machine-owned `installed` phase
+and activation-tail bindings; table counts alone never adopt it. At `prechecked`, the driver records the
+latest ranking batch and evaluates the canonical due-wallet rule from `docs/_GLOSSARY.md`. A nonzero
+result stops. Only an explicit owner decision may be supplied as the exact
+`--approve-due-subset <count>`; it is durable in the manifest.
+Immediately before `guarded` disables or stops the service at T0, the driver re-reads the latest batch
+and refuses with the service untouched if it differs from the `prechecked` batch.
+
+Before T0, old state paths are resolved exclusively from the installed `.env` and service TOML, whose
+hashes are bound in the manifest. The driver never parses `ExecStart`, `EnvironmentFile`, or other unit
+text. Instead it proves ownership from the running `MainPID`: `/proc/<pid>/exe` matches the installed
+binary; `/proc/<pid>/cwd` equals the service root and owns normalization of the relative config argv; argv
+is exactly `<installed-binary> <installed-config>`; and every variable the installed environment file
+defines (evaluated with the unit's own `set -a; source` semantics) is present with an equal value. Any
+process variable not defined by that file must be one of exactly `CREDENTIALS_DIRECTORY`, `HOME`,
+`INVOCATION_ID`, `JOURNAL_STREAM`, `LANG`, `LOGNAME`, `MEMORY_PRESSURE_WATCH`,
+`MEMORY_PRESSURE_WRITE`, `PATH`, `SHELL`, `SYSTEMD_EXEC_PID`, `USER`, or the wrapper-owned
+`PWD`, `SHLVL`, `OLDPWD`, or `_`. `CREDENTIALS_DIRECTORY` must equal
+`/run/credentials/pe-service.service`; every other extra is refused. `LD_PRELOAD` and
+`LD_LIBRARY_PATH` are refused even when the installed environment file defines the same value.
+The clean-shell comparison uses `set -a; source "$1"; set +a`, rejects either loader variable by
+set/unset presence, then `exec env -0`. This matches real exec behavior: exported scalars and
+`BASH_FUNC_*` functions cross the boundary, while arrays do not. The wrapper-owned `PWD`, `SHLVL`,
+`OLDPWD`, and `_` names are stripped from the expected set because they do not affect the binary;
+`/proc/<pid>/cwd` proves the working directory separately.
+One systemd snapshot supplies `ActiveState`, `MainPID`, `InvocationID`, and `ActiveEnterTimestamp` before
+the `/proc` proof, and an identical second snapshot must follow it. The loaded manager state must also
+report `NeedDaemonReload=no`. Staged templates are not an old-state authority. Immediately before each
+rehearsal preflight and execution, the driver rechecks the staged rehearsal environment, config, and
+binary against their manifest hashes. Staging runs under a restrictive umask, and secret-bearing
+environment files are mode `0600` from their first open. `guarded` starts T0 by disabling and stopping
+`pe-service`.
+`archived` copies every pre-T0 artifact without deleting it. `reset` applies the activation-stamped
+single Supabase transaction and requires its five stamped counts to equal the recorded pre-reset census.
+The five archive tables may lack their `activation_id` columns only before the manifest carries reset
+metadata. Once `state >= reset` or `archive_counts` is durable, a zero- or partial-column result is
+corruption and rollback stops after making the service inactive and disabled.
+`switched`
+hash-verifies and atomically adopts config, complete environment, and binary, then prints and validates
+their effective paths. The persistence invariant is exact: artifacts are replaced in place at the paths
+the running process proves it uses, so any unit that started the current process starts the next one
+identically. Unit-file edits are outside the driver's control; it neither parses nor reloads them, and
+drift is caught by the next activation's pre-T0 proof or by the immediate post-start proof. Every unit
+bit is read from the exact output of `systemctl is-active` and `systemctl is-enabled`: only
+`active`/`inactive`/`failed` and `enabled`/`disabled`, respectively, are accepted; transitional,
+runtime-only, static, or manager-error results stop the driver. `started`
+adopts an already-running exact generation or runs `systemctl enable pe-service` followed by
+`systemctl start pe-service`, repeats the complete
+running-process proof against the adopted artifacts, and records its `InvocationID` plus
+`ActiveEnterTimestamp`. Both the `started` and `verified` proofs require the unit to be active and
+enabled. `verified` repeats that proof before the manifest advances,
+waits a bounded 120 seconds for `status.json.updated_at` to be newer than that recorded invocation, then
+rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest ranking
+batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
+any approved subset, producer/critical-task health, fresh Supabase book, successful watchlist projection,
+and refreshed materialized view. If the new-process proof fails either while entering `started` or at the
+top of `verified`, or if any later material verification fails (bind, readiness/status, invocation,
+frozen batch, approved walk, prepared generation, materialized view, fresh Supabase book, or
+projection), the driver first atomically records `state=refusing` and the timestamped refusal intent.
+It then attempts both disable and stop even if either command fails, proves the exact inactive and
+disabled states, appends that intent to `post_start_refusals`, removes the recorded invocation fields,
+and atomically rewinds the manifest to `switched`. A run resumed in `refusing` repeats this quiesce and
+rewind sequence before any forward work. Frozen-batch drift after T0 also records `forward_blocked`; that activation
+cannot run forward again and must use `rollback_generation.sh`. After any repairable refusal, the
+operator chooses either to re-run the same activation (which starts and verifies the generation again)
+or to roll it back. The operator-held pause on Forge remains in place through either decision.
+
+The final signed-in site check cannot be automated because the site uses Google single sign-on. The
+driver therefore prompts the operator to inspect the fresh era and records `site_confirmed_by` and
+`site_confirmed_at` in the manifest before advancing to `verified`. A non-interactive
+invocation must include `--site-confirmed`; that flag is the operator's attestation that the signed-in
+check was performed, not an automated site probe. This interactive attestation is the sole verification
+exception that leaves the service running at `started`; supply the attestation on the next identical run
+or choose rollback.
+
+After the driver reaches `verified`, update the Forge checkout to the exact merge commit and restore its
+recorded flag, enablement, and activity independently on Forge itself:
+
+```bash
+ssh forge 'cd ~/prediction-markets && scripts/deploy/forge_pause.sh restore'
+ssh forge 'cd ~/prediction-markets && scripts/deploy/forge_pause.sh status'
+```
+
+Do not restore Forge before `verified`: the driver checks the frozen batch again during verification.
+
+Re-run the identical command after interruption or reboot. Each external boundary is rechecked, and
+the first incomplete durable state resumes. Never edit the manifest or substitute a repository
+checkout for its staged artifact paths. Before live use, run the network-free recovery proof:
+
+```bash
+bash scripts/deploy/test_activate_generation.sh
+```
+
+### Generation rollback
+
+Rollback is also locked and resumable:
+
+```bash
+SUPABASE_DB_URL=<session-pooler-url> \
+  scripts/deploy/rollback_generation.sh --activation-id <id>
+```
+
+It accepts every state from `guarded` onward, including a durable `refusing` intent, and records
+`rolling_back` first without discarding any refusal or forward-blocking audit fields. It then immediately
+disables and stops the service and proves it inactive and disabled. Only then does it validate archived
+config/environment/binary sources when `archive_artifacts` is durable; before that manifest fact exists,
+the installed artifacts must still match the pre-T0 hashes recorded by the driver. It reads the durable
+archive stamp only after those checks. The database restore and materialized-view
+refresh run only when stamped archive rows for this activation exist, and restored counts are compared
+only after that restore. It then restores artifacts when an archive was recorded, enables and starts the
+old generation, and proves the unit active and enabled with the running executable hash equal to the old
+binary before recording `rolled_back`. A forward rerun of that id is thereafter refused. Retain the
+manifest, generation, and pre-T0 archive for audit.
+
 ## Facts
 
 | item | value |

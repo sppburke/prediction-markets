@@ -90,6 +90,8 @@ jobs:
 
       - name: Python drift-guard tests
         run: |
+          bash -n scripts/deploy/*.sh scripts/paper_reset/*.sh
+          python3 scripts/check_sql_unfiltered_dml.py
           python3 scripts/test_push_ranking_filter.py
           python3 scripts/test_ranker_decay.py
           python3 scripts/test_rank_72hr_consolidated.py
@@ -112,6 +114,7 @@ jobs:
           python3 scripts/test_ranker_bench_composition.py
           python3 scripts/test_ranker_clv_source_comparison.py
           python3 scripts/verify_bakeoff_components.py
+          bash scripts/deploy/test_activate_generation.sh
 
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
       # Load both Supabase schema files into the Postgres service (creating the Supabase

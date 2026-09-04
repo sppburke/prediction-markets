@@ -21,8 +21,8 @@ use pe_paper_state::{
     WalletHistoryStatusRecord,
 };
 use pe_position_ledger::{
-    LedgerEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation, PositionLedger,
-    WalletFenceCause,
+    AppliedEffect, LedgerEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation,
+    PositionLedger, WalletFenceCause,
 };
 use pe_source_polymarket_public::ActivityAggregate;
 use rust_decimal::Decimal;
@@ -490,6 +490,38 @@ impl BucketCommitEngine {
                 already_committed: true,
             });
         }
+        if seen == 0
+            && (coverage.reanchor_required
+                || (coverage
+                    .activity_cutoff_unix
+                    .is_some_and(|cutoff| source_epoch > cutoff)
+                    && self
+                        .paper_state
+                        .last_activity_group_epoch(&wallet)?
+                        .is_some_and(|last_epoch| last_epoch >= source_epoch)))
+        {
+            let trigger = aggregates
+                .iter()
+                .find(|aggregate| {
+                    !context
+                        .identity_unresolved
+                        .contains(aggregate.group_id.key())
+                })
+                .map(|aggregate| aggregate.group_id.key().clone())
+                .or_else(|| {
+                    aggregates
+                        .first()
+                        .map(|aggregate| aggregate.group_id.key().clone())
+                })
+                .ok_or(BucketCommitError::Empty)?;
+            return self.commit_late_group_reanchor(
+                &aggregates,
+                wallet,
+                source_epoch,
+                trigger,
+                context,
+            );
+        }
         if coverage
             .activity_cutoff_unix
             .is_none_or(|cutoff| source_epoch <= cutoff)
@@ -510,6 +542,22 @@ impl BucketCommitEngine {
             .filter(|(_, state)| state.is_none())
             .map(|(aggregate, _)| aggregate.group_id.key())
             .collect::<Vec<_>>();
+        if seen != 0 {
+            let trigger = aggregates
+                .iter()
+                .zip(&durable)
+                .find(|(_, state)| state.is_none())
+                .map(|(aggregate, _)| aggregate.group_id.key().clone())
+                .ok_or(BucketCommitError::PartialDurableBucket)?;
+            return self.commit_changed_bucket_fence(
+                &aggregates,
+                &durable,
+                wallet,
+                source_epoch,
+                (WalletFenceCause::LateEqualSecondGroup, trigger),
+                context,
+            );
+        }
         if !unseen.is_empty()
             && unseen
                 .iter()
@@ -522,50 +570,6 @@ impl BucketCommitEngine {
                 wallet,
                 source_epoch,
                 true,
-                context,
-            );
-        }
-        if seen != 0 {
-            let trigger = aggregates
-                .iter()
-                .zip(&durable)
-                .find(|(aggregate, state)| {
-                    state.is_none()
-                        && !context
-                            .identity_unresolved
-                            .contains(aggregate.group_id.key())
-                })
-                .map(|(aggregate, _)| aggregate.group_id.key().clone())
-                .ok_or(BucketCommitError::PartialDurableBucket)?;
-            return self.commit_changed_bucket_fence(
-                &aggregates,
-                &durable,
-                wallet,
-                source_epoch,
-                (WalletFenceCause::LateEqualSecondGroup, trigger),
-                context,
-            );
-        }
-        if self
-            .paper_state
-            .last_activity_group_epoch(&wallet)?
-            .is_some_and(|last_epoch| last_epoch >= source_epoch)
-        {
-            let trigger = aggregates
-                .iter()
-                .find(|aggregate| {
-                    !context
-                        .identity_unresolved
-                        .contains(aggregate.group_id.key())
-                })
-                .map(|aggregate| aggregate.group_id.key().clone())
-                .ok_or(BucketCommitError::Empty)?;
-            return self.commit_changed_bucket_fence(
-                &aggregates,
-                &durable,
-                wallet,
-                source_epoch,
-                (WalletFenceCause::LateEqualSecondGroup, trigger),
                 context,
             );
         }
@@ -640,38 +644,56 @@ impl BucketCommitEngine {
                 None
             }
         });
-        if !order_independent_validity(&self.ledger, wallet, &mutations) {
-            let trigger = mutations
-                .iter()
-                .find(|mutation| {
-                    !context
-                        .identity_unresolved
-                        .contains(&mutation.source_trade_id)
-                })
-                .map(|mutation| mutation.source_trade_id.clone())
-                .ok_or(BucketCommitError::Empty)?;
-            return self.commit_fence(
-                &aggregates,
-                wallet,
-                source_epoch,
-                WalletFenceCause::OrderDependentEqualSecond,
-                trigger,
-                context,
-            );
+        match order_independent_validity(&self.ledger, wallet, &mutations) {
+            Ok(true) => {}
+            Ok(false) => {
+                let trigger = mutations
+                    .iter()
+                    .find(|mutation| {
+                        !context
+                            .identity_unresolved
+                            .contains(&mutation.source_trade_id)
+                    })
+                    .map(|mutation| mutation.source_trade_id.clone())
+                    .ok_or(BucketCommitError::Empty)?;
+                return self.commit_fence(
+                    &aggregates,
+                    wallet,
+                    source_epoch,
+                    WalletFenceCause::OrderDependentEqualSecond,
+                    trigger,
+                    context,
+                );
+            }
+            Err(error) => {
+                let cause = error.fence_cause();
+                let trigger = mutation_error_id(&error);
+                return self.commit_fence(
+                    &aggregates,
+                    wallet,
+                    source_epoch,
+                    cause,
+                    trigger,
+                    context,
+                );
+            }
         }
 
         let pre_snapshot = self.ledger.position(&wallet).cloned();
         let mut candidate = self.ledger.clone();
-        if let Err(error) = candidate.apply_all_or_none(&mutations) {
-            return self.commit_fence(
-                &aggregates,
-                wallet,
-                source_epoch,
-                error.fence_cause(),
-                mutation_error_id(&error),
-                context,
-            );
-        }
+        let applied = match candidate.apply_all_or_none(&mutations) {
+            Ok(applied) => applied,
+            Err(error) => {
+                return self.commit_fence(
+                    &aggregates,
+                    wallet,
+                    source_epoch,
+                    error.fence_cause(),
+                    mutation_error_id(&error),
+                    context,
+                );
+            }
+        };
 
         let mut trade_decisions = Vec::new();
         let mut touched_count: BTreeMap<String, usize> = BTreeMap::new();
@@ -744,7 +766,9 @@ impl BucketCommitEngine {
         let mut pending = Vec::new();
         let mut dispositions = BTreeMap::new();
         let mut disposition_records = Vec::with_capacity(aggregates.len());
-        for (aggregate, mutation) in aggregates.iter().zip(&mutations) {
+        for ((aggregate, mutation), applied_effect) in
+            aggregates.iter().zip(&mutations).zip(&applied)
+        {
             let source_trade_id = aggregate.group_id.key().clone();
             let disposition = match mutation.effect.effective() {
                 LedgerEffect::RawOnly => "raw_only".to_owned(),
@@ -841,7 +865,8 @@ impl BucketCommitEngine {
             disposition_records.push(activity_record(
                 aggregate,
                 disposition,
-                &mutation.effect,
+                &applied_effect.effect,
+                applied_effect.clamped_residual,
                 context.no_copy_dispositions.get(&source_trade_id).cloned(),
             )?);
         }
@@ -875,6 +900,59 @@ impl BucketCommitEngine {
                 .into_iter()
                 .map(|record| record.source_trade_id)
                 .collect(),
+            newly_fenced: None,
+            already_committed: false,
+        })
+    }
+
+    fn commit_late_group_reanchor(
+        &mut self,
+        aggregates: &[ActivityAggregate],
+        wallet: WalletAddress,
+        source_epoch: i64,
+        trigger: SourceTradeId,
+        context: &BucketDecisionContext,
+    ) -> Result<BucketCommitResult, BucketCommitError> {
+        const DISPOSITION: &str = "reanchor_required_late_group";
+        let mut dispositions = BTreeMap::new();
+        let records = aggregates
+            .iter()
+            .map(|aggregate| {
+                dispositions.insert(aggregate.group_id.key().0.clone(), DISPOSITION.to_owned());
+                activity_record(
+                    aggregate,
+                    DISPOSITION.to_owned(),
+                    &LedgerEffect::RawOnly,
+                    None,
+                    context
+                        .no_copy_dispositions
+                        .get(aggregate.group_id.key())
+                        .cloned(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.paper_state
+            .commit_activity_bucket(&ActivityBucketCommit {
+                wallet,
+                source_epoch,
+                dispositions: records,
+                leader_positions: Vec::new(),
+                gate_results: Vec::new(),
+                history_effects: Vec::new(),
+                history_status: context.history_status.clone(),
+                pending: Vec::new(),
+                fence: None,
+                reanchor: Some(ReanchorRecord {
+                    source_trade_id: trigger,
+                    reason: DISPOSITION.to_owned(),
+                }),
+                advance_cursor: false,
+            })?;
+        Ok(BucketCommitResult {
+            wallet,
+            source_epoch,
+            dispositions,
+            pending: Vec::new(),
             newly_fenced: None,
             already_committed: false,
         })
@@ -920,6 +998,7 @@ impl BucketCommitEngine {
                 aggregate,
                 group_disposition.to_owned(),
                 &mutation.effect,
+                None,
                 context
                     .no_copy_dispositions
                     .get(aggregate.group_id.key())
@@ -1163,6 +1242,7 @@ impl BucketCommitEngine {
                 aggregate,
                 disposition,
                 &mutation.effect,
+                None,
                 unresolved
                     .then(|| {
                         context
@@ -1228,9 +1308,10 @@ impl BucketCommitEngine {
                 state.semantic_revision != aggregate.semantic_revision.as_str()
                     || state.transaction_hash != aggregate.group_id.components().transaction_hash
             });
-            let unresolved = context
-                .identity_unresolved
-                .contains(aggregate.group_id.key());
+            let unresolved = cause != WalletFenceCause::LateEqualSecondGroup
+                && context
+                    .identity_unresolved
+                    .contains(aggregate.group_id.key());
             let disposition = if differs {
                 if unresolved {
                     if !context.bracket_commit {
@@ -1252,6 +1333,7 @@ impl BucketCommitEngine {
                     aggregate,
                     disposition,
                     &mutation.effect,
+                    None,
                     unresolved
                         .then(|| {
                             context
@@ -1318,8 +1400,16 @@ impl BucketCommitEngine {
             .cloned()
             .collect();
         let mut candidate = self.ledger.clone();
-        let applied = order_independent_validity(&self.ledger, wallet, &known)
-            && candidate.apply_all_or_none(&known).is_ok();
+        let applied_outcomes = match order_independent_validity(&self.ledger, wallet, &known) {
+            Ok(true) => candidate.apply_all_or_none(&known).ok(),
+            Ok(false) | Err(_) => None,
+        };
+        let applied = applied_outcomes.is_some();
+        let applied_by_id = known
+            .iter()
+            .zip(applied_outcomes.iter().flatten())
+            .map(|(mutation, outcome)| (mutation.source_trade_id.clone(), outcome))
+            .collect::<HashMap<_, _>>();
         let mut dispositions = BTreeMap::new();
         let unresolved_trigger = (!context.bracket_commit)
             .then(|| {
@@ -1351,10 +1441,12 @@ impl BucketCommitEngine {
                     "wallet_fenced"
                 };
                 dispositions.insert(aggregate.group_id.key().0.clone(), disposition.to_owned());
+                let applied_effect = applied_by_id.get(&mutation.source_trade_id);
                 activity_record(
                     aggregate,
                     disposition.to_owned(),
-                    &mutation.effect,
+                    applied_effect.map_or(&mutation.effect, |outcome| &outcome.effect),
+                    applied_effect.and_then(|outcome| outcome.clamped_residual),
                     context
                         .no_copy_dispositions
                         .get(&mutation.source_trade_id)
@@ -1410,6 +1502,7 @@ fn activity_record(
     aggregate: &ActivityAggregate,
     disposition: String,
     effect: &LedgerEffect,
+    clamped_residual: Option<u64>,
     no_copy: Option<NoCopyDisposition>,
 ) -> Result<ActivityDispositionRecord, LedgerEffectDocumentError> {
     let components = aggregate.group_id.components();
@@ -1421,7 +1514,11 @@ fn activity_record(
         semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
         activity_type: components.activity_type.as_str().to_owned(),
         disposition,
-        proof_json: effect.to_document()?,
+        proof_json: AppliedEffect {
+            effect: effect.clone(),
+            clamped_residual,
+        }
+        .to_document()?,
         no_copy,
     })
 }
@@ -1501,180 +1598,100 @@ fn touched_leader_rows(
         .collect()
 }
 
-/// Prove every strict remove is valid even in its worst equal-second position,
-/// and every possible all-additions prefix remains representable. This is the
-/// condition under which canonical storage order cannot change validity/state.
-#[derive(Default)]
-struct OperationTotals {
-    buy: u64,
-    sell: u64,
-    split: u64,
-    remove: u64,
-}
-
 fn order_independent_validity(
     ledger: &PositionLedger,
     wallet: WalletAddress,
     mutations: &[LedgerMutation],
-) -> bool {
-    if mutations.len() <= 1 {
-        return true;
-    }
-    let mut totals: BTreeMap<String, (MarketOutcomeId, OperationTotals)> = BTreeMap::new();
-    for mutation in mutations {
-        match mutation.effect.effective() {
-            LedgerEffect::Trade {
-                market_id,
-                outcome_id,
-                side,
-                amount,
-                ..
-            } => {
-                let key = MarketOutcomeId::new(market_id.clone(), *outcome_id);
-                let entry = totals
-                    .entry(encode_key(&key))
-                    .or_insert_with(|| (key, OperationTotals::default()));
-                let target = if *side == Side::Sell {
-                    &mut entry.1.sell
-                } else {
-                    &mut entry.1.buy
-                };
-                let Some(sum) = target.checked_add(amount.atomic()) else {
-                    return false;
-                };
-                *target = sum;
-            }
-            LedgerEffect::Split { market_id, amount } => {
-                for outcome in [pe_core_types::OutcomeId(0), pe_core_types::OutcomeId(1)] {
-                    let key = MarketOutcomeId::new(market_id.clone(), outcome);
-                    let entry = totals
-                        .entry(encode_key(&key))
-                        .or_insert_with(|| (key, OperationTotals::default()));
-                    let Some(sum) = entry.1.split.checked_add(amount.atomic()) else {
-                        return false;
-                    };
-                    entry.1.split = sum;
-                }
-            }
-            LedgerEffect::Merge { market_id, amount } => {
-                for outcome in [pe_core_types::OutcomeId(0), pe_core_types::OutcomeId(1)] {
-                    let key = MarketOutcomeId::new(market_id.clone(), outcome);
-                    let entry = totals
-                        .entry(encode_key(&key))
-                        .or_insert_with(|| (key, OperationTotals::default()));
-                    let Some(sum) = entry.1.remove.checked_add(amount.atomic()) else {
-                        return false;
-                    };
-                    entry.1.remove = sum;
-                }
-            }
-            LedgerEffect::Redeem {
-                market_id,
-                outcome_id,
-                amount,
-            } => {
-                let key = MarketOutcomeId::new(market_id.clone(), *outcome_id);
-                let entry = totals
-                    .entry(encode_key(&key))
-                    .or_insert_with(|| (key, OperationTotals::default()));
-                let Some(sum) = entry.1.remove.checked_add(amount.atomic()) else {
-                    return false;
-                };
-                entry.1.remove = sum;
-            }
-            LedgerEffect::RequiresAnchor
-            | LedgerEffect::Conversion
-            | LedgerEffect::RawOnly
-            | LedgerEffect::UnknownEffect => {}
-            LedgerEffect::Corrected { .. } => return false,
+) -> Result<bool, LedgerError> {
+    for component in mutation_components(mutations) {
+        if component.len() > 4 || !all_component_orders_match(ledger, wallet, &component)? {
+            return Ok(false);
         }
     }
-    for (_, (key, totals)) in totals {
-        let state = ledger
-            .position(&wallet)
-            .and_then(|snapshot| snapshot.positions.get(&key))
-            .copied()
-            .unwrap_or_default();
-        if !all_operation_orders_match(
-            state.long_contracts.atomic(),
-            state.short_contracts.atomic(),
-            &totals,
-        ) {
-            return false;
-        }
-    }
-    true
+    Ok(true)
 }
 
-fn all_operation_orders_match(
-    initial_long: u64,
-    initial_short: u64,
-    totals: &OperationTotals,
-) -> bool {
-    const ORDERS: [[u8; 4]; 24] = [
-        [0, 1, 2, 3],
-        [0, 1, 3, 2],
-        [0, 2, 1, 3],
-        [0, 2, 3, 1],
-        [0, 3, 1, 2],
-        [0, 3, 2, 1],
-        [1, 0, 2, 3],
-        [1, 0, 3, 2],
-        [1, 2, 0, 3],
-        [1, 2, 3, 0],
-        [1, 3, 0, 2],
-        [1, 3, 2, 0],
-        [2, 0, 1, 3],
-        [2, 0, 3, 1],
-        [2, 1, 0, 3],
-        [2, 1, 3, 0],
-        [2, 3, 0, 1],
-        [2, 3, 1, 0],
-        [3, 0, 1, 2],
-        [3, 0, 2, 1],
-        [3, 1, 0, 2],
-        [3, 1, 2, 0],
-        [3, 2, 0, 1],
-        [3, 2, 1, 0],
-    ];
+fn mutation_components(mutations: &[LedgerMutation]) -> Vec<Vec<&LedgerMutation>> {
+    let mut assigned = vec![false; mutations.len()];
+    let mut components = Vec::new();
+    for seed in 0..mutations.len() {
+        if assigned[seed] {
+            continue;
+        }
+        assigned[seed] = true;
+        let mut component = vec![&mutations[seed]];
+        let mut keys = mutations[seed]
+            .touched_keys()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        loop {
+            let mut changed = false;
+            for (index, mutation) in mutations.iter().enumerate() {
+                if assigned[index] {
+                    continue;
+                }
+                let touched = mutation.touched_keys();
+                if touched.iter().any(|key| keys.contains(key)) {
+                    assigned[index] = true;
+                    keys.extend(touched);
+                    component.push(mutation);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        components.push(component);
+    }
+    components
+}
+
+fn all_component_orders_match(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    component: &[&LedgerMutation],
+) -> Result<bool, LedgerError> {
+    let mut sequences = Vec::new();
+    let mut remaining = component.to_vec();
+    enumerate_mutation_orders(&mut remaining, &mut Vec::new(), &mut sequences);
     let mut expected = None;
-    for order in ORDERS {
-        let Some(final_state) =
-            simulate_operation_order(initial_long, initial_short, totals, order)
-        else {
-            return false;
+    for sequence in sequences {
+        let (candidate, applied) = match ledger.simulate_all_or_none(&sequence) {
+            Ok(result) => result,
+            Err(error) if component.len() == 1 => return Err(error),
+            Err(_) => return Ok(false),
         };
-        if expected.is_some_and(|expected| expected != final_state) {
-            return false;
+        let residuals = applied
+            .into_iter()
+            .map(|outcome| outcome.clamped_residual)
+            .collect::<Vec<_>>();
+        let result = (candidate.position(&wallet).cloned(), residuals);
+        if expected
+            .as_ref()
+            .is_some_and(|expected| expected != &result)
+        {
+            return Ok(false);
         }
-        expected = Some(final_state);
+        expected = Some(result);
     }
-    true
+    Ok(true)
 }
 
-fn simulate_operation_order(
-    initial_long: u64,
-    initial_short: u64,
-    totals: &OperationTotals,
-    order: [u8; 4],
-) -> Option<(u64, u64)> {
-    let (mut long, mut short) = (initial_long, initial_short);
-    for operation in order {
-        match operation {
-            0 => {
-                let covered = short.min(totals.buy);
-                short = short.checked_sub(covered)?;
-                long = long.checked_add(totals.buy.checked_sub(covered)?)?;
-            }
-            1 => {
-                let trimmed = long.min(totals.sell);
-                long = long.checked_sub(trimmed)?;
-                short = short.checked_add(totals.sell.checked_sub(trimmed)?)?;
-            }
-            2 => long = long.checked_add(totals.split)?,
-            3 => long = long.checked_sub(totals.remove)?,
-            _ => return None,
-        }
+fn enumerate_mutation_orders(
+    remaining: &mut Vec<&LedgerMutation>,
+    current: &mut Vec<LedgerMutation>,
+    sequences: &mut Vec<Vec<LedgerMutation>>,
+) {
+    if remaining.is_empty() {
+        sequences.push(current.clone());
+        return;
     }
-    Some((long, short))
+    for index in 0..remaining.len() {
+        let mutation = remaining.remove(index);
+        current.push(mutation.clone());
+        enumerate_mutation_orders(remaining, current, sequences);
+        current.pop();
+        remaining.insert(index, mutation);
+    }
 }

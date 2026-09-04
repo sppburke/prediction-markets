@@ -318,6 +318,35 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
 | `anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors; an owner-selected operational default, not a calibrated value. |
 | `bracket_concurrency` | 4 | **Module const** `BRACKET_CONCURRENCY` in `service` (not a TOML/env key). Maximum wallet brackets in flight at once during the boot bracket and runtime admission batches (#555 addendum D9). Chosen from the measured per-wallet peak of ~304 MB resident on the largest wallet against the 2 GB production host; every bracket still reads the wallet's full history three times. |
+| `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more fences. `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
+
+### Causal re-anchor and rehearsal rules (#557)
+
+**Late-group re-anchor.** Previously unseen activity groups arriving for a wallet at or before an
+already-committed source epoch are recorded raw-only as `reanchor_required_late_group`; they do not
+mutate the ledger or produce a decision. The existing `reanchor_required` flag selects the wallet at
+its class's next fair refresh turn for a fresh complete history/positions bracket. A bucket mixing
+durable and unseen groups, or a revision of an already-durable group, still fences.
+
+**Installed-boot anchor reuse.** An ordinary installed boot reuses a wallet's `leader_positions`
+mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
+activity cutoff, has an installed anchor no older than `ANCHOR_REFRESH_SECS`, and has
+`reanchor_required = false`. Any failed condition walks the wallet through `validate_direct`.
+`position_validation_current` is not a reuse prerequisite.
+
+**Rehearsal isolation.** A #557 rehearsal uses a copy of production durable state at dedicated
+paths, an exclusive loopback bind, and a complete environment that explicitly sets `PE_BIND` plus
+every state/log/history path override. It talks to the real read sources but puts the Supabase
+publishable key in `PE_SUPABASE_SECRET_KEY`; no service-role key may exist in its environment or
+process. The database privilege matrix and representative refused HTTP canaries prove that every
+reachable service write site remains unavailable. Isolation is an operational credential/path
+boundary, not an application mode or write-suppression code path.
+
+**Generation verification.** A #557 generation reaches `verified` only on the ranking batch frozen in
+`prechecked`, with `status.json.updated_at` newer than the recorded systemd invocation's
+`ActiveEnterTimestamp`. The signed-in site check is a recorded operator confirmation because Google
+single sign-on prevents automation: the activation manifest stores `site_confirmed_by` and
+`site_confirmed_at`, and non-interactive driver runs require `--site-confirmed` before Forge is restored.
 
 ### Isolated Polymarket V2 canary (`pe-service-live-canary`)
 

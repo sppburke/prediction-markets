@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pe_core_types::WalletAddress;
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{PaperStateDb, WalletCoverage};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::warn;
 
 use crate::bucket_commit::AnchorInstallError;
 use crate::orchestrator_control::OrchestratorControl;
@@ -47,6 +48,16 @@ pub enum AnchorRefreshOutcome {
     Anchored,
     Skipped,
     Deferred,
+}
+
+/// The runtime predicate shared by periodic refresh and ordinary boot reuse.
+#[must_use]
+pub fn anchor_refresh_due(coverage: &WalletCoverage, now_unix: i64, refresh_secs: u64) -> bool {
+    let refresh_secs = i64::try_from(refresh_secs).unwrap_or(i64::MAX);
+    coverage.reanchor_required
+        || coverage
+            .anchored_at_unix
+            .is_none_or(|anchored| now_unix.saturating_sub(anchored) > refresh_secs)
 }
 
 /// Shared serialized admission coordinator. Its durable checks are repeated by
@@ -118,15 +129,17 @@ impl AdmissionPreparer {
         let preparer = &self.inner;
         let _attempt = preparer.attempt.lock().await;
         let coverage = preparer.paper_state.wallet_coverage(&wallet)?;
-        let refresh_secs = i64::try_from(refresh_secs).unwrap_or(i64::MAX);
-        let due = coverage.reanchor_required
-            || coverage
-                .anchored_at_unix
-                .is_none_or(|anchored| now_unix.saturating_sub(anchored) > refresh_secs);
-        if !due {
+        if !anchor_refresh_due(&coverage, now_unix, refresh_secs) {
             return Ok(AnchorRefreshOutcome::Skipped);
         }
-        self.check_prerequisites(&[wallet])?;
+        match self.check_prerequisites(&[wallet]) {
+            Ok(()) => {}
+            Err(AdmissionError::Fenced { fenced }) => {
+                warn!(wallet = %wallet, fenced, "anchor refresh skipped because wallet is durably fenced");
+                return Ok(AnchorRefreshOutcome::Skipped);
+            }
+            Err(error) => return Err(error),
+        }
         let validator = preparer
             .validator
             .as_ref()
@@ -138,6 +151,10 @@ impl AdmissionPreparer {
             Ok(installs) => installs,
             Err(error) if is_deferred_causal_position_error(&error) => {
                 return Ok(AnchorRefreshOutcome::Deferred);
+            }
+            Err(CausalPositionError::Fenced { wallet }) => {
+                warn!(wallet = %wallet, "anchor refresh skipped because causal validation fenced the wallet");
+                return Ok(AnchorRefreshOutcome::Skipped);
             }
             Err(error) => return Err(AdmissionError::PositionValidation(error)),
         };
