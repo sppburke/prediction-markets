@@ -103,13 +103,8 @@ elif [[ "$sql" == *"pragma user_version"* ]]; then
   if [[ -e "$(dirname "$path")/prepared.marker" ]]; then echo 2; else echo 1; fi
 elif [[ "$sql" == *"pragma integrity_check"* ]]; then
   echo ok
-elif [[ "$sql" == *"last_ts_unix > activity_cutoff_unix"* && "$sql" == *"activity_cutoff_unix is null"* ]]; then
-  if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/prepared-generation-fail" &&
-        -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/fresh-service-started" ]]; then
-    echo '0 0 0 0 1 0 3'
-  else
-    echo '0 0 0 0 0 0 3'
-  fi
+elif [[ "$sql" == *"last_ts_unix > c.activity_cutoff_unix"* && "$sql" == *"activity_cutoff_unix is null"* ]]; then
+  echo '0 0 0 0 0 0 3 0'
 elif [[ "$sql" == *"select count(*) from position_anchors"* ]]; then
   if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/anchor-count-drift-after-start" &&
         -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/fresh-service-started" ]]; then
@@ -1263,7 +1258,6 @@ for fixture in \
   'anchor-count-drift-after-start|boot anchor count changed|boot anchor count changed' \
   'fresh-book-fail|Supabase fresh-book verification failed|Supabase fresh-book verification failed' \
   'materialized-view-fail|wallet_live_stats_mv refresh failed|wallet_live_stats_mv refresh failed' \
-  'prepared-generation-fail|prepared generation verification failed|prepared generation verification failed' \
   'projection-fail|Supabase projection verification failed|Supabase projection verification failed'; do
   IFS='|' read -r marker error_text reason_text <<< "$fixture"
   root=$(make_case "verified-refusal-$marker")

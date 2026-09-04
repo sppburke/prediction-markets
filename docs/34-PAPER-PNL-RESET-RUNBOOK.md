@@ -31,10 +31,12 @@ default. With `--execute` it requires:
 
 The activation driver's `prepared` state then runs the staged binary with
 `--exit-after-anchors`. Its postconditions are schema v2, zero fills and settlements, no authoritative
-watermark, no sealed v1 cursor rows, no delivery cursor beyond its bracket cutoff, every anchored wallet
-carrying a cutoff and every cutoff carrying an anchor (deferred wallets — left unvalidated for runtime
-admission — have a null cutoff and are counted, not refused), header-only paper/live logs, and a source
-log holding frames beyond the header.
+watermark, no sealed v1 cursor rows, no delivery cursor beyond its bracket cutoff for any wallet anchored
+by this prepare run, every anchored wallet carrying a cutoff and every cutoff carrying an anchor,
+header-only paper/live logs, and a source log holding frames beyond the header. Wallets never anchored
+(null cutoff) and wallets anchored by an earlier run but deferred in this one (stale anchor, possibly an
+advanced cursor; the ordinary boot re-walks them or leaves them raw-only) are counted in the manifest
+(`deferred_wallets`, `stale_anchor_wallets`), not refused.
 
 ## Supabase archive and reset
 

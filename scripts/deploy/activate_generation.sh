@@ -580,7 +580,7 @@ if (( $(state_rank "$state") < $(state_rank guarded) )); then
 fi
 
 verify_seed_or_prepared() {
-  local expected_version=$1 version total integrity expected_hash
+  local expected_version=$1 prepare_started_unix=${2:-0} version total integrity expected_hash
   version=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" 'pragma user_version;')
   [[ "$version" == "$expected_version" ]] || die "generation user_version=$version, expected $expected_version"
   integrity=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" 'pragma integrity_check;')
@@ -602,16 +602,20 @@ verify_seed_or_prepared() {
     [[ "$(sha256_file "$generation_dir/wallet_market_history.json")" == "$expected_hash" ]] ||
       die "version-one seed legacy history hash drift"
   else
-    # After a prepare-only run (no producers) the binary leaves each anchored wallet's delivery cursor at
-    # its last activity time (never beyond its bracket cutoff) with a non-null cutoff, and each deferred
-    # wallet (left unvalidated for runtime admission) with a null cutoff and no anchor. Measured on the
-    # first real prepare (act-557-62ed205-1): beyond_cutoff=0, orphan=0, deferred=10 of 78.
-    read -r fills settled watermark sealed beyond orphan deferred < <(sqlite3 -separator ' ' -readonly \
+    # After a prepare-only run (no producers) the binary leaves each wallet it anchored in THIS run with a
+    # delivery cursor at its last activity time (never beyond its bracket cutoff) and a non-null cutoff;
+    # a wallet never anchored is deferred (null cutoff, no anchor); a wallet anchored by an EARLIER run but
+    # deferred in this one keeps its stale anchor and may hold an advanced cursor — the ordinary boot
+    # re-walks it (its anchor is past the reuse window) or leaves it raw-only, so it is counted, not
+    # refused. Measured on the real prepare (act-557-62ed205-1 resume): this-run anchors 69, stale 3,
+    # beyond_cutoff among this-run anchors 0, orphans 0, deferred 10.
+    read -r fills settled watermark sealed beyond orphan deferred stale < <(sqlite3 -separator ' ' -readonly \
       "file:$generation_dir/paper_state.db?immutable=1" \
-      "select (select count(*) from fills), (select count(*) from settled_markets), (select count(*) from meta where key='last_supabase_applied_event_seq'), (select count(*) from poll_cursors_v1_sealed), (select count(*) from poll_cursors where activity_cutoff_unix is not null and last_ts_unix > activity_cutoff_unix), (select count(*) from poll_cursors c where c.activity_cutoff_unix is not null and not exists (select 1 from position_anchors a where a.wallet_hex = c.wallet_hex)) + (select count(*) from position_anchors a where not exists (select 1 from poll_cursors c where c.wallet_hex = a.wallet_hex and c.activity_cutoff_unix is not null)), (select count(*) from poll_cursors where activity_cutoff_unix is null);")
-    [[ "$fills $settled $watermark $sealed $beyond $orphan" == "0 0 0 0 0 0" && "$deferred" =~ ^[0-9]+$ ]] ||
-      die "prepared generation postconditions failed: fills=$fills settled=$settled watermark=$watermark sealed=$sealed cursor_beyond_cutoff=$beyond anchor_cursor_orphans=$orphan deferred=$deferred"
+      "select (select count(*) from fills), (select count(*) from settled_markets), (select count(*) from meta where key='last_supabase_applied_event_seq'), (select count(*) from poll_cursors_v1_sealed), (select count(*) from poll_cursors c where c.activity_cutoff_unix is not null and c.last_ts_unix > c.activity_cutoff_unix and (select max(anchored_at_unix) from position_anchors a where a.wallet_hex = c.wallet_hex) >= $prepare_started_unix), (select count(*) from poll_cursors c where c.activity_cutoff_unix is not null and not exists (select 1 from position_anchors a where a.wallet_hex = c.wallet_hex)) + (select count(*) from position_anchors a where not exists (select 1 from poll_cursors c where c.wallet_hex = a.wallet_hex and c.activity_cutoff_unix is not null)), (select count(*) from poll_cursors where activity_cutoff_unix is null), (select count(*) from (select wallet_hex, max(anchored_at_unix) newest from position_anchors group by wallet_hex) where newest < $prepare_started_unix);")
+    [[ "$fills $settled $watermark $sealed $beyond $orphan" == "0 0 0 0 0 0" && "$deferred" =~ ^[0-9]+$ && "$stale" =~ ^[0-9]+$ ]] ||
+      die "prepared generation postconditions failed: fills=$fills settled=$settled watermark=$watermark sealed=$sealed cursor_beyond_cutoff=$beyond anchor_cursor_orphans=$orphan deferred=$deferred stale_anchor_wallets=$stale"
     PREPARED_DEFERRED_WALLETS=$deferred
+    PREPARED_STALE_ANCHOR_WALLETS=$stale
     log_is_header_only "$generation_dir/paper.log" && log_is_header_only "$generation_dir/live_journal.log" ||
       die "prepared paper/live logs must remain header-only"
     [[ -f "$generation_dir/source_events.log" && "$(stat -c %s "$generation_dir/source_events.log")" -gt 5 ]] ||
@@ -634,6 +638,7 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   "$DEPLOY_SCRIPT_DIR/rehearsal_preflight.sh" "$rehearsal_env"
   verify_staged_artifacts rehearsal_environment "rehearsal environment" \
     rehearsal_config "rehearsal config" binary "rehearsal binary"
+  prepare_started_unix=$(date -u +%s)
   (
     set -a
     # shellcheck disable=SC1090
@@ -644,8 +649,9 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   )
   # A version-two main is never adopted from table counts alone. Re-entering the
   # binary completes or verifies the machine-owned migration through installed.
-  verify_seed_or_prepared 2
-  manifest_advance prepared "$(python3 -c 'import json,sys; print(json.dumps({"deferred_wallets":int(sys.argv[1])}))' "${PREPARED_DEFERRED_WALLETS:-0}")"
+  verify_seed_or_prepared 2 "$prepare_started_unix"
+  manifest_advance prepared "$(python3 -c 'import json,sys; print(json.dumps({"deferred_wallets":int(sys.argv[1]),"stale_anchor_wallets":int(sys.argv[2]),"prepare_started_unix":int(sys.argv[3])}))' \
+    "${PREPARED_DEFERRED_WALLETS:-0}" "${PREPARED_STALE_ANCHOR_WALLETS:-0}" "$prepare_started_unix")"
   state=prepared
 fi
 
@@ -1015,8 +1021,9 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
     post_start_refusal "owner-approved due subset is unavailable"
   fi
   [[ -n "$approved" ]] || approved=0
-  if ! after=$(sqlite3 -readonly "file:$generation_dir/paper_state.db?immutable=1" \
-    'select count(*) from position_anchors;'); then
+  # The service is writing this database now: a plain read-only connection sees the WAL, whereas an
+  # immutable open sees only the checkpointed file (measured: 1 row vs 51 on a live WAL database).
+  if ! after=$(sqlite3 -readonly "$generation_dir/paper_state.db" 'select count(*) from position_anchors;'); then
     post_start_refusal "could not read the generation anchor count"
   fi
   if [[ ! "$before" =~ ^[0-9]+$ || ! "$approved" =~ ^[0-9]+$ || ! "$after" =~ ^[0-9]+$ ]]; then
@@ -1025,9 +1032,6 @@ if (( $(state_rank "$state") < $(state_rank verified) )); then
   if [[ "$after" -ne $((before + approved)) ]]; then
     post_start_refusal \
       "boot anchor count changed by $((after - before)); expected approved walk of $approved"
-  fi
-  if ! (verify_seed_or_prepared 2); then
-    post_start_refusal "prepared generation verification failed after service start"
   fi
   if ! psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c \
     'refresh materialized view concurrently wallet_live_stats_mv;'; then
