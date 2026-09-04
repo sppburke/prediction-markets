@@ -207,6 +207,12 @@ raise SystemExit(0 if counts == [int(recorded[key]) for key in keys] else 1)' \
     "$counts" "$recorded"
 }
 
+# The empty form of every EDGE-framed log the service opens (paper.log, live_journal.log,
+# source_events.log) is exactly the 5-byte header MAGIC "EDGE" + version 0x01.
+log_is_header_only() {
+  [[ -f "$1" && "$(stat -c %s "$1")" == 5 && "$(head -c 5 "$1" | od -An -tx1 | tr -d ' \n')" == 4544474501 ]]
+}
+
 systemctl_enabled_state() {
   local output status=0
   output=$(systemctl is-enabled "$1" 2>/dev/null) || status=$?

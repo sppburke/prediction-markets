@@ -67,9 +67,9 @@ if [[ "$mode" == dry-run ]]; then
     'postcondition.rows_each=0' \
     'postcondition.user_version=1' \
     'postcondition.integrity_check=ok' \
-    'postcondition.paper.log=empty' \
-    'postcondition.live_journal.log=empty' \
-    'postcondition.source_events.log=empty' \
+    'postcondition.paper.log=header-only (EDGE\\x01, 5 bytes)' \
+    'postcondition.live_journal.log=header-only (EDGE\\x01, 5 bytes)' \
+    'postcondition.source_events.log=header-only (EDGE\\x01, 5 bytes)' \
     "legacy_history.copy=$history_destination" \
     "legacy_history.blake3=$legacy_blake3" \
     "legacy_history.sha256=$legacy_sha256"
@@ -127,11 +127,14 @@ done
 [[ "$actual_version" == 1 ]] || { echo "FATAL: seeded user_version=$actual_version" >&2; exit 1; }
 [[ "$integrity" == ok ]] || { echo "FATAL: seeded integrity_check=$integrity" >&2; exit 1; }
 
+# An empty event log is not a zero-byte file: every log the service opens is an EDGE-framed file whose
+# empty form is exactly the 5-byte header MAGIC "EDGE" + version 0x01 (crates/event-log/src/frame.rs).
+# The migration verifies the header with a reader before any writer runs, so a zero-byte file is refused.
 for log_name in paper.log live_journal.log source_events.log; do
   python3 -c 'import os,sys
 path=os.path.join(sys.argv[1],sys.argv[2])
 fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
-with os.fdopen(fd,"wb") as handle: handle.flush(); os.fsync(handle.fileno())' \
+with os.fdopen(fd,"wb") as handle: handle.write(b"EDGE\x01"); handle.flush(); os.fsync(handle.fileno())' \
     "$generation_dir" "$log_name"
   case "$log_name" in
     paper.log) maybe_crash seed-paper-log ;;
@@ -172,9 +175,9 @@ printf '%s\n' \
   'postcondition.rows_each=0' \
   'postcondition.user_version=1' \
   'postcondition.integrity_check=ok' \
-  'postcondition.paper.log=empty' \
-  'postcondition.live_journal.log=empty' \
-  'postcondition.source_events.log=empty' \
+  'postcondition.paper.log=header-only (EDGE\\x01, 5 bytes)' \
+  'postcondition.live_journal.log=header-only (EDGE\\x01, 5 bytes)' \
+  'postcondition.source_events.log=header-only (EDGE\\x01, 5 bytes)' \
   "legacy_history.copy=$history_destination" \
   "legacy_history.blake3=$legacy_blake3" \
   "legacy_history.sha256=$legacy_sha256" \
