@@ -103,12 +103,12 @@ elif [[ "$sql" == *"pragma user_version"* ]]; then
   if [[ -e "$(dirname "$path")/prepared.marker" ]]; then echo 2; else echo 1; fi
 elif [[ "$sql" == *"pragma integrity_check"* ]]; then
   echo ok
-elif [[ "$sql" == *"last_ts_unix <> activity_cutoff_unix"* ]]; then
+elif [[ "$sql" == *"last_ts_unix > activity_cutoff_unix"* && "$sql" == *"activity_cutoff_unix is null"* ]]; then
   if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/prepared-generation-fail" &&
         -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/fresh-service-started" ]]; then
-    echo '0 0 0 0 1'
+    echo '0 0 0 0 1 0 3'
   else
-    echo '0 0 0 0 0'
+    echo '0 0 0 0 0 0 3'
   fi
 elif [[ "$sql" == *"select count(*) from position_anchors"* ]]; then
   if [[ -e "${PE_ACTIVATION_TEST_ROOT:?}/test-state/anchor-count-drift-after-start" &&
