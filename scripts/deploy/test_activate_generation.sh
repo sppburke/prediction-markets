@@ -232,6 +232,12 @@ case "$action" in
       if [[ -e "$state/invocation-changed" ]]; then echo invocation-test-2; else echo invocation-test-1; fi
     elif [[ "$*" == *ActiveEnterTimestamp* ]]; then
       echo 2033-05-18T03:33:19Z
+    elif [[ "$*" == *ExecStart* ]]; then
+      if [[ -f "$state/service.exec-start-rendered" ]]; then
+        cat "$state/service.exec-start-rendered"
+      else
+        echo "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source $root/prediction-markets/.env; set +a; exec $root/prediction-markets/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }"
+      fi
     elif [[ "$*" == *NeedDaemonReload* ]]; then
       if [[ -e "$state/daemon-reload-pending" ]]; then echo yes; else echo no; fi
     elif [[ "$*" == *WorkingDirectory* ]]; then
@@ -494,8 +500,22 @@ root=$(make_case unit-direct-with-environment-file)
 service="$root/prediction-markets"
 printf '%s\n' "[Service]" "WorkingDirectory=$service" "EnvironmentFile=$service/.env" \
   "ExecStart=$service/target/release/pe-service smoke-test/service.toml" > "$root/test-state/service.unit-file"
+echo "{ path=$service/target/release/pe-service ; argv[]=$service/target/release/pe-service smoke-test/service.toml ; ignore_errors=no ; }" > "$root/test-state/service.exec-start-rendered"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root"
+
+# The loaded (rendered) command must match the unit file: a stale loaded command with NeedDaemonReload=no is refused.
+root=$(make_case unit-loaded-differs-from-file)
+service="$root/prediction-markets"
+echo "{ path=/bin/bash ; argv[]=/bin/bash -c set -a; source $service/.env; set +a; exec /tmp/other smoke-test/service.toml ; ignore_errors=no ; }" > "$root/test-state/service.exec-start-rendered"
+set +e
+activate "$root" activation-557 >"$root/unit-loaded.out" 2>"$root/unit-loaded.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "loaded ExecStart differing from the unit file was accepted"
+grep -q 'loaded ExecStart differs from the unit file' "$root/unit-loaded.err" || fail "loaded-differs refusal was not explicit"
+[[ ! -e "$root/pe-activation.json" ]] || fail "loaded-differs unit was adopted into a manifest"
+assert_deploy_lock_unchanged "$root"
 
 refuse_unit_file() {
   local name=$1 exec_line=$2 extra=${3-}
@@ -529,6 +549,7 @@ refuse_unit_file unit-direct-no-environment-file "ExecStart=@SVC@/target/release
 refuse_unit_file unit-direct-environment-attached-hash "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "EnvironmentFile=@SVC@/.env#backup"
 refuse_unit_file unit-spaced-reset-override "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart =\nExecStart =/tmp/other smoke-test/service.toml')"
 refuse_unit_file unit-spaced-extra-environment "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nEnvironmentFile =@SVC@/.env.backup')"
+refuse_unit_file unit-continuation-reset-override "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart \\\n=\nExecStart \\\n=/tmp/other smoke-test/service.toml')"
 refuse_unit_file unit-two-exec-start-lines "ExecStart=@SVC@/target/release/pe-service smoke-test/service.toml" "$(printf 'EnvironmentFile=@SVC@/.env\nExecStart=')"
 
 # A pending daemon-reload means the loaded unit may differ from the files on disk: refuse.

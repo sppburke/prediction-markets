@@ -169,6 +169,8 @@ def norm(path):
 # systemd ignores whitespace around "=": normalise every directive line to KEY=VALUE before matching,
 # so a drop-in "ExecStart =" reset or "ExecStart =/other" override cannot hide behind spacing.
 directives=[]
+# systemd joins backslash-continued lines before parsing directives; do the same first.
+text=re.sub(r"\\\n", " ", text)
 for raw in text.splitlines():
     m=re.fullmatch(r"\s*([A-Za-z]+)\s*=\s*(.*?)\s*", raw)
     if m: directives.append((m.group(1), m.group(2)))
@@ -191,6 +193,32 @@ if direct:
         print("direct"); raise SystemExit(0)
 raise SystemExit(1)' \
     "$expected_binary" "$expected_config" "$expected_env" "$working" "$unit_text"
+}
+
+loaded_exec_matches_unit_file() {
+  # systemd renders argv[] space-joined and unquoted; the accepted unit line flattens to exactly one string.
+  local shape=$1 expected_binary=$2 expected_config=$3 expected_env=$4 working=$5 rendered=$6
+  python3 -c 'import os,re,sys
+shape,binary,config,env,working,value=sys.argv[1:]
+marker="argv[]="
+if marker not in value:
+    raise SystemExit(1)
+argv=value.split(marker,1)[1]
+metadata=re.search(r"\s;\s(?:ignore_errors|start_time|stop_time|pid|code|status)=", argv)
+if metadata:
+    argv=argv[:metadata.start()]
+argv=argv.strip()
+def cfg_forms():
+    # the unit file may name the config relative to the working directory or absolute; accept the one it used
+    return {config, os.path.relpath(config, working)}
+expected=set()
+for c in cfg_forms():
+    if shape == "wrapper":
+        expected.add(f"/bin/bash -c set -a; source {env}; set +a; exec {binary} {c}")
+    else:
+        expected.add(f"{binary} {c}")
+raise SystemExit(0 if argv in expected else 1)' \
+    "$shape" "$expected_binary" "$expected_config" "$expected_env" "$working" "$rendered"
 }
 
 process_runs_service() {
@@ -220,10 +248,15 @@ verify_installed_unit_owner() {
     die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
   [[ "$(systemctl show pe-service -p NeedDaemonReload --value)" == no ]] ||
     die "pe-service unit files differ from the loaded configuration (daemon-reload pending)"
-  local unit_text
+  local unit_text shape
   unit_text=$(systemctl cat pe-service)
-  unit_file_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$unit_text" > /dev/null ||
+  shape=$(unit_file_selects_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$unit_text") ||
     die "pe-service ExecStart does not select the installed binary and service config"
+  # The manager's LOADED command must be the flattening of the accepted unit-file line (mtime-preserving
+  # edits can leave the loaded unit different from the file without NeedDaemonReload=yes).
+  loaded_exec_matches_unit_file "$shape" "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" \
+    "$(systemctl show pe-service -p ExecStart --value)" ||
+    die "pe-service loaded ExecStart differs from the unit file on disk"
   if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
     pid=$(systemctl show pe-service -p MainPID --value)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
