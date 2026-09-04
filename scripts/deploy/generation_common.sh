@@ -37,6 +37,14 @@ die() {
   exit 1
 }
 
+if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]]; then
+  PROC_ROOT=${PROC_ROOT:-/proc}
+else
+  [[ ! -v PROC_ROOT ]] || die "PROC_ROOT is permitted only when PE_ACTIVATION_TESTING=1"
+  PROC_ROOT=/proc
+fi
+readonly PROC_ROOT
+
 maybe_crash() {
   local boundary=$1
   if [[ -n "$SIMULATE_CRASH_AFTER" && "$SIMULATE_CRASH_AFTER" == "$boundary" ]]; then

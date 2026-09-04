@@ -157,11 +157,11 @@ effective_path() {
 process_runs_service() {
   # Ownership of what runs NOW, from the process itself (lossless, no unit-file interpretation):
   #   argv  == exactly `<binary> <config>` (NUL-split; empty elements kept)
-  #   environ PE_* entries == the PE_* entries of the installed environment file (the process loaded
-  #   exactly that content, whichever unit shape sourced it)
-  # PROC_ROOT overrides /proc for the harness.
+  #   environ: every variable the installed environment file defines (evaluated with the unit's own
+  #   `set -a; source` semantics) is present with an equal value, PE_* names match both ways, and the
+  #   dynamic-loader overrides are absent; variables systemd itself injects are not the file's and are ignored
   local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 pid=$5
-  python3 -c 'import os,sys
+  python3 -c 'import os,subprocess,sys
 expected_binary,expected_config,expected_env,working,pid,proc_root=sys.argv[1:]
 def norm(path):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
@@ -172,28 +172,40 @@ if raw.endswith(b"\0"):
 argv=[part.decode() for part in raw.split(b"\0")]
 if not (len(argv) == 2 and argv[0] == expected_binary and norm(argv[1]) == os.path.normpath(expected_config)):
     raise SystemExit(1)
+def parse_environment(raw):
+    entries={}
+    for part in raw.rstrip(b"\0").split(b"\0"):
+        if not part:
+            continue
+        if b"=" not in part:
+            raise SystemExit(1)
+        name,value=part.split(b"=",1)
+        if name in entries:
+            raise SystemExit(1)
+        entries[name]=value
+    return entries
 with open("%s/%s/environ" % (proc_root, pid), "rb") as handle:
-    raw=handle.read()
-if raw.endswith(b"\0"):
-    raw=raw[:-1]
-running={}
-for part in raw.split(b"\0"):
-    if part.startswith(b"PE_") and b"=" in part:
-        k,v=part.decode().split("=",1); running[k]=v
-expected={}
-for line in open(expected_env, encoding="utf-8"):
-    line=line.strip()
-    if not line or line.startswith("#") or "=" not in line or not line.startswith("PE_"):
-        continue
-    k,v=line.split("=",1); expected[k]=v.strip().strip(chr(34)).strip(chr(39))
-raise SystemExit(0 if running == expected else 1)' \
-    "$expected_binary" "$expected_config" "$expected_env" "$working" "$pid" "${PROC_ROOT:-/proc}"
+    running=parse_environment(handle.read())
+if b"LD_PRELOAD" in running or b"LD_LIBRARY_PATH" in running:
+    raise SystemExit(1)
+evaluated=subprocess.run(
+    ["env","-i","/bin/bash","-c","set -a; source \"$1\"; set +a; env -0","bash",expected_env],
+    check=False,cwd=working,stdout=subprocess.PIPE,
+)
+if evaluated.returncode != 0:
+    raise SystemExit(1)
+shell_own={b"_",b"PWD",b"SHLVL",b"OLDPWD"}
+expected={name:value for name,value in parse_environment(evaluated.stdout).items() if name not in shell_own}
+missing=[name for name,value in expected.items() if running.get(name) != value]
+extra_pe=[name for name in running if name.startswith(b"PE_") and name not in expected]
+raise SystemExit(0 if not missing and not extra_pe else 1)' \
+    "$expected_binary" "$expected_config" "$expected_env" "$working" "$pid" "$PROC_ROOT"
 }
 
 verify_installed_unit_owner() {
   # Ownership is proved from the running process, never from unit-file syntax: the manager's working
-  # directory, no pending daemon-reload, the running executable's hash, its exact argv, and its PE_*
-  # environment equal to the installed environment file. The same checks run again on the NEW process in
+  # directory, no pending daemon-reload, the running executable's hash, its exact argv, and its environment
+  # carrying the shell-evaluated installed environment file. The same checks run on the NEW process in
   # `verified`, so what the unit starts after the switch is proved, not parsed.
   local working pid running
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
@@ -206,7 +218,7 @@ verify_installed_unit_owner() {
     die "pe-service unit files differ from the loaded configuration (daemon-reload pending)"
   pid=$(systemctl show pe-service -p MainPID --value)
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
-  running=$(sha256_file "${PROC_ROOT:-/proc}/$pid/exe")
+  running=$(sha256_file "$PROC_ROOT/$pid/exe")
   [[ "$running" == "$(sha256_file "$SERVICE_BINARY")" ]] ||
     die "running pe-service is not the installed binary"
   process_runs_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$pid" ||
@@ -685,6 +697,7 @@ if (( $(state_rank "$state") < $(state_rank switched) )); then
   [[ "$(sha256_file "$staged_config")" == "$(manifest_get artifacts.config.sha256)" ]] || die "staged config hash drift"
   [[ "$(sha256_file "$staged_env")" == "$(manifest_get artifacts.environment.sha256)" ]] || die "staged env hash drift"
   [[ "$(sha256_file "$staged_binary")" == "$(manifest_get artifacts.binary.sha256)" ]] || die "staged binary hash drift"
+  # Replace artifacts in place at the proved paths so the same unit starts them identically; unit-file edits are caught by the next pre-T0 or post-start proof, without parsing or reloading the unit.
   atomic_adopt "$staged_config" "$SERVICE_CONFIG" 0644 adopted-config
   atomic_adopt "$staged_env" "$SERVICE_ENV" 0600 adopted-env
   atomic_adopt "$staged_binary" "$SERVICE_BINARY" 0755 adopted-binary
@@ -695,18 +708,24 @@ if (( $(state_rank "$state") < $(state_rank switched) )); then
 fi
 
 verify_running_generation() {
-  local expected pid running
+  local expected working pid running
   expected=$(manifest_get artifacts.binary.sha256)
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$expected" ]] || die "installed binary is not the generation binary"
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get artifacts.config.sha256)" ]] || die "installed config hash drift"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get artifacts.environment.sha256)" ]] || die "installed env hash drift"
   validate_environment "$SERVICE_ENV" "$production_bind" false
-  if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
-    pid=$(systemctl show pe-service -p MainPID --value)
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
-    running=$(sha256_file "/proc/$pid/exe")
-    [[ "$running" == "$expected" ]] || die "running pe-service hash is not the generation hash"
-  fi
+  [[ "$(systemctl_active pe-service)" == true ]] || die "generation pe-service is not active"
+  working=$(systemctl show pe-service -p WorkingDirectory --value)
+  [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
+    die "pe-service WorkingDirectory is $working, expected $SERVICE_ROOT"
+  [[ "$(systemctl show pe-service -p NeedDaemonReload --value)" == no ]] ||
+    die "pe-service unit files differ from the loaded configuration (daemon-reload pending)"
+  pid=$(systemctl show pe-service -p MainPID --value)
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
+  running=$(sha256_file "$PROC_ROOT/$pid/exe")
+  [[ "$running" == "$expected" ]] || die "running pe-service hash is not the generation hash"
+  process_runs_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$pid" ||
+    die "running pe-service does not run the generation binary, service config and environment"
 }
 
 verify_listening_bind() {

@@ -111,24 +111,34 @@ canonical due-wallet rule from `docs/_GLOSSARY.md`. A nonzero result stops. Only
 decision may be supplied as the exact `--approve-due-subset <count>`; it is durable in the manifest.
 
 Before T0, old state paths are resolved exclusively from the installed `.env` and service TOML, whose
-hashes and systemd `ExecStart`/`EnvironmentFile`/`WorkingDirectory` ownership are bound in the manifest;
-the unit check parses whole path tokens, so suffixed backup paths are never accepted. Staged templates
-are not an old-state authority. Immediately before each rehearsal preflight and execution, the driver
-rechecks the staged rehearsal environment, config, and binary against their manifest hashes. Staging
-runs under a restrictive umask, and secret-bearing environment files are mode `0600` from their first
-open. `guarded` starts T0 by disabling and stopping `pe-service`.
+hashes are bound in the manifest. The driver never parses `ExecStart`, `EnvironmentFile`, or other unit
+text. Instead it proves ownership from the running `MainPID`: `/proc/<pid>/exe` matches the installed
+binary, argv is exactly `<installed-binary> <installed-config>`, every variable the installed environment
+file defines (evaluated with the unit's own `set -a; source` semantics) is present in the process with an
+equal value, and `PE_*` names match both ways. Variables systemd itself injects (its credentials and
+memory-pressure paths, invocation ids, `PATH`, `HOME`) are not the file's and are ignored; `LD_PRELOAD` and
+`LD_LIBRARY_PATH` are always refused. The loaded manager state must also report the expected `WorkingDirectory` and
+`NeedDaemonReload=no`. Staged templates are not an old-state authority. Immediately before each
+rehearsal preflight and execution, the driver rechecks the staged rehearsal environment, config, and
+binary against their manifest hashes. Staging runs under a restrictive umask, and secret-bearing
+environment files are mode `0600` from their first open. `guarded` starts T0 by disabling and stopping
+`pe-service`.
 `archived` copies every pre-T0 artifact without deleting it. `reset` applies the activation-stamped
 single Supabase transaction and requires its five stamped counts to equal the recorded pre-reset census.
 `switched`
 hash-verifies and atomically adopts config, complete environment, and binary, then prints and validates
-their effective paths. `started` adopts an already-running exact generation or uses
-`systemctl enable --now` once and records its `InvocationID` plus `ActiveEnterTimestamp`. `verified`
-waits a bounded 120 seconds for `status.json.updated_at` to be newer than that recorded invocation,
-then rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest
-ranking batch to equal the frozen manifest batch, and proves the running
-binary/config/env hashes, bind and permanent paths, zero replay/walk beyond any approved subset,
-producer/critical-task health, fresh Supabase book, successful watchlist projection, and refreshed
-materialized view.
+their effective paths. The persistence invariant is exact: artifacts are replaced in place at the paths
+the running process proves it uses, so any unit that started the current process starts the next one
+identically. Unit-file edits are outside the driver's control; it neither parses nor reloads them, and
+drift is caught by the next activation's pre-T0 proof or by the immediate post-start proof. `started`
+adopts an already-running exact generation or uses `systemctl enable --now` once, repeats the complete
+running-process proof against the adopted artifacts, and records its `InvocationID` plus
+`ActiveEnterTimestamp`. `verified` repeats that proof before any Forge restoration or manifest advance,
+waits a bounded 120 seconds for `status.json.updated_at` to be newer than that recorded invocation, then
+rechecks both `InvocationID` and `ActiveEnterTimestamp` before continuing. It requires the latest ranking
+batch to equal the frozen manifest batch, and proves the bind and permanent paths, zero replay/walk beyond
+any approved subset, producer/critical-task health, fresh Supabase book, successful watchlist projection,
+and refreshed materialized view.
 
 The final signed-in site check cannot be automated because the site uses Google single sign-on. The
 driver therefore prompts the operator to inspect the fresh era and records `site_confirmed_by` and

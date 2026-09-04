@@ -188,12 +188,28 @@ unit=${*: -1}
 if [[ "$unit" == pe-rank-loop ]]; then prefix=forge; else prefix=service; fi
 read_bit() { [[ -e "$state/$1" ]] && cat "$state/$1" || echo false; }
 write_bit() { printf '%s\n' "$2" > "$state/$1"; }
+refresh_service_process() {
+  local proc="$root/proc/1234"
+  local service="$root/prediction-markets"
+  mkdir -p "$proc"
+  printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml" > "$proc/cmdline"
+  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") > "$proc/environ"
+  cp "$service/target/release/pe-service" "$proc/exe"
+  if [[ -e "$state/post-start-argv-wrong" ]]; then
+    printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml.wrong" > "$proc/cmdline"
+  elif [[ -e "$state/post-start-environ-wrong" ]]; then
+    printf 'PE_POST_START_MISMATCH=1\0' >> "$proc/environ"
+  elif [[ -e "$state/post-start-exe-wrong" ]]; then
+    printf '%s\n' wrong-new-process-executable > "$proc/exe"
+  fi
+}
 start_service() {
   if [[ "$(read_bit service.active)" != true ]]; then
     count=0; [[ ! -f "$state/service-start-count" ]] || count=$(<"$state/service-start-count")
     echo $((count + 1)) > "$state/service-start-count"
   fi
   write_bit service.active true
+  refresh_service_process
   env_file="$root/prediction-markets/.env"
   if [[ -f "$env_file" ]]; then
     set -a; source "$env_file"; set +a
@@ -275,17 +291,13 @@ PE_JSONL_LOG_PATH=$service/old/paper.jsonl
 PE_STATUS_PATH=$service/old/status.json
 PE_PAPER_STATE_DB_PATH=$service/old/paper_state.db
 PE_LEGACY_WALLET_HISTORY_PATH=$service/old/wallet_market_history.json
+NON_PE_BASE='source value'
+export PE_X=
+PE_QUOTED_VALUE="quoted \${NON_PE_BASE} with spaces"
+NON_PE_QUOTED_VALUE="non-PE quoted value"
 EOF
-  # fake /proc: the running process's PE_* environment is exactly the installed .env; its exe is the installed binary
-  python3 - "$service/.env" "$root/proc/1234/environ" <<'PY'
-import sys
-env,out=sys.argv[1:]
-parts=[]
-for line in open(env):
-    line=line.strip()
-    if line.startswith("PE_") and "=" in line: parts.append(line)
-open(out,"wb").write(("\0".join(parts)+"\0").encode())
-PY
+  # fake /proc: the running process has the shell-evaluated installed environment and executable.
+  (cd "$service" && env -i /bin/bash -c 'set -a; source "$1"; set +a; env -0' bash "$service/.env") > "$root/proc/1234/environ"
   cp "$service/target/release/pe-service" "$root/proc/1234/exe"
   mkdir -p "$service/old"
   printf '%s\n' old-paper > "$service/old/paper.log"
@@ -504,6 +516,23 @@ refuse_process() {
     argv) printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml.backup" > "$proc/cmdline" ;;
     argv-empty) printf '%s\0%s\0%s\0' "$service/target/release/pe-service" "" "smoke-test/service.toml" > "$proc/cmdline" ;;
     environ) printf 'PE_SUPABASE_URL=https://other.example\0PE_SUPABASE_SECRET_KEY=x\0' > "$proc/environ" ;;
+    environ-missing) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[part for part in open(path,"rb").read().split(b"\0") if part and not part.startswith(b"PE_QUOTED_VALUE=")]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
+    environ-value) python3 - "$proc/environ" <<'PY'
+import sys
+path=sys.argv[1]
+parts=[(b"PE_STATUS_PATH=/elsewhere/status.json" if part.startswith(b"PE_STATUS_PATH=") else part)
+       for part in open(path,"rb").read().split(b"\0") if part]
+open(path,"wb").write(b"\0".join(parts)+b"\0")
+PY
+      ;;
+    environ-extra-pe) printf 'PE_UNEXPECTED=1\0' >> "$proc/environ" ;;
+    ld-preload) printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ" ;;
     exe) printf 'other-binary-bytes\n' > "$proc/exe" ;;
   esac
   set +e
@@ -518,7 +547,79 @@ refuse_process() {
 refuse_process proc-argv-backup-config argv "does not run the installed binary, service config and environment"
 refuse_process proc-argv-empty-element argv-empty "does not run the installed binary, service config and environment"
 refuse_process proc-environ-differs environ "does not run the installed binary, service config and environment"
+refuse_process proc-environ-missing environ-missing "does not run the installed binary, service config and environment"
+refuse_process proc-environ-value-differs environ-value "does not run the installed binary, service config and environment"
+refuse_process proc-environ-extra-pe environ-extra-pe "does not run the installed binary, service config and environment"
+refuse_process proc-environ-ld-preload ld-preload "does not run the installed binary, service config and environment"
+
+# Variables systemd injects into the process (production shows CREDENTIALS_DIRECTORY, MEMORY_PRESSURE_*) are not the file's: accepted.
+root=$(make_case proc-environ-systemd-extra)
+printf 'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service\0MEMORY_PRESSURE_WATCH=/sys/fs/cgroup/memory.pressure\0' >> "$root/proc/1234/environ"
+activate "$root" activation-557 >/dev/null
+assert_verified "$root"
 refuse_process proc-exe-differs exe "running pe-service is not the installed binary"
+
+# A process-root override is a harness facility, never a production input.
+set +e
+PROC_ROOT="$TEST_TMP/not-proc" "$SCRIPT_DIR/activate_generation.sh" \
+  >"$TEST_TMP/proc-root.out" 2>"$TEST_TMP/proc-root.err"
+rc=$?
+set -e
+[[ "$rc" == 1 ]] || fail "production PROC_ROOT override returned $rc"
+grep -q 'PROC_ROOT is permitted only when PE_ACTIVATION_TESTING=1' "$TEST_TMP/proc-root.err" ||
+  fail "production PROC_ROOT refusal was not explicit"
+
+# The process started from the adopted artifacts is proved before both started and verified advance.
+corrupt_new_process() {
+  local root=$1 kind=$2 service="$1/prediction-markets" proc="$1/proc/1234"
+  case "$kind" in
+    argv) printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml.wrong" > "$proc/cmdline" ;;
+    environ) printf 'PE_POST_START_MISMATCH=1\0' >> "$proc/environ" ;;
+    exe) printf '%s\n' wrong-new-process-executable > "$proc/exe" ;;
+  esac
+}
+
+refuse_post_start_process() {
+  local phase=$1 kind=$2 message=$3 root rc state expected_state marker
+  root=$(make_case "post-start-$phase-$kind")
+  if [[ "$phase" == started ]]; then
+    marker="$root/test-state/post-start-$kind-wrong"
+    : > "$marker"
+  else
+    set +e
+    activate "$root" activation-557 --simulate-crash-after started \
+      >"$root/started.out" 2>"$root/started.err"
+    rc=$?
+    set -e
+    [[ "$rc" == 86 ]] || fail "$kind verified fixture did not reach started"
+    corrupt_new_process "$root" "$kind"
+  fi
+  set +e
+  activate "$root" activation-557 >"$root/$phase.out" 2>"$root/$phase.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "$kind new-process mismatch advanced through $phase"
+  grep -q "$message" "$root/$phase.err" || fail "$kind $phase refusal was not explicit"
+  state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+    "$root/pe-activation.json")
+  if [[ "$phase" == started ]]; then expected_state=switched; else expected_state=started; fi
+  [[ "$state" == "$expected_state" ]] ||
+    fail "$kind mismatch advanced manifest to $state while proving $phase"
+  [[ "$(<"$root/test-state/forge.active")" == false ]] ||
+    fail "$kind mismatch restored Forge before $phase proof"
+  [[ "$(<"$root/prediction-markets/data/eval-results/rank_and_push.loop")" == stop ]] ||
+    fail "$kind mismatch restored the Forge flag before $phase proof"
+  [[ "$(<"$root/test-state/service-start-count")" == 1 ]] ||
+    fail "$kind mismatch caused an unexpected fresh-service start count"
+}
+
+for phase in started verified; do
+  refuse_post_start_process "$phase" argv \
+    "does not run the generation binary, service config and environment"
+  refuse_post_start_process "$phase" environ \
+    "does not run the generation binary, service config and environment"
+  refuse_post_start_process "$phase" exe "running pe-service hash is not the generation hash"
+done
 
 # A pending daemon-reload means the loaded unit may differ from the files on disk: refuse.
 root=$(make_case unit-daemon-reload-pending)
@@ -531,14 +632,6 @@ set -e
 grep -q 'daemon-reload pending' "$root/unit-reload.err" || fail "daemon-reload refusal was not explicit"
 [[ ! -e "$root/pe-activation.json" ]] || fail "pending daemon-reload was adopted into a manifest"
 assert_deploy_lock_unchanged "$root"
-
-# Whitespace around "=" is legal systemd syntax and must still match the exact template.
-root=$(make_case unit-spaced-valid)
-service="$root/prediction-markets"
-printf '%s\n' "[Service]" "WorkingDirectory = $service" \
-  "ExecStart = /bin/bash -c 'set -a; source $service/.env; set +a; exec $service/target/release/pe-service smoke-test/service.toml'" > "$root/test-state/service.unit-file"
-activate "$root" activation-557 >/dev/null
-assert_verified "$root"
 
 # A different id is rejected while durable state is non-terminal.
 root=$(make_case different-id)
