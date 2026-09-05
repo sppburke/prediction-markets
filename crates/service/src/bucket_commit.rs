@@ -12,6 +12,8 @@ use pe_core_types::{
     LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, Probability, ProbabilityPpm,
     ReconstructionQuality, ShareAmount, Side, SourceTradeId, WalletAddress,
 };
+use pe_event_log::AppendReceipt;
+use pe_execution_core::ObservationEvidence;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, ActivityGroupState, AnchorInstallRecord,
     DecisionPendingRecord, DecisionPendingRow, EntryGateResultRecord, LeaderPositionRow,
@@ -108,6 +110,84 @@ pub struct DecisionContinuationV2 {
     pub decision_inputs: Value,
 }
 
+/// One occurrence of a fixed-end activity page and the receipt assigned by the source log.
+/// Repeated request URLs and payload hashes remain distinct entries (#545).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageOccurrence {
+    pub request_url: String,
+    pub raw_hash: String,
+    pub receipt: AppendReceipt,
+}
+
+/// Receipt-bearing successor to [`DecisionContinuationV2`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionContinuationV3 {
+    #[serde(flatten)]
+    pub prior: DecisionContinuationV2,
+    pub observed_source_receipt: Option<AppendReceipt>,
+    pub page_occurrences: Vec<PageOccurrence>,
+}
+
+impl DecisionContinuationV2 {
+    /// Greatest synchronized activity-page receipt in this complete read.
+    #[must_use]
+    pub fn complete_bound(&self) -> Option<AppendReceipt> {
+        self.page_occurrences()
+            .ok()?
+            .iter()
+            .map(|page| page.receipt)
+            .max_by_key(|receipt| receipt.sequence)
+    }
+
+    /// Earliest complete observation and its envelope receive time. Legacy V2 rows have no
+    /// receipt evidence and return `None`.
+    #[must_use]
+    pub fn observation(&self) -> Option<ObservationEvidence> {
+        let complete_bound_receipt = self.complete_bound()?;
+        let observed_source_receipt = self
+            .decision_inputs
+            .get("observed_source_receipt")
+            .cloned()
+            .map(serde_json::from_value::<Option<AppendReceipt>>)
+            .transpose()
+            .ok()?
+            .flatten();
+        let (source_receipt, provenance) = match observed_source_receipt {
+            Some(websocket) if websocket.sequence < complete_bound_receipt.sequence => {
+                (websocket, "activity_ws")
+            }
+            Some(websocket) if websocket.sequence == complete_bound_receipt.sequence => {
+                if websocket.this_hash != complete_bound_receipt.this_hash {
+                    return None;
+                }
+                (websocket, "activity_ws")
+            }
+            _ => (complete_bound_receipt, "rest_poll"),
+        };
+        let observed_unix_ms = self
+            .decision_inputs
+            .get("receipt_received_at_unix_ms")?
+            .get(source_receipt.sequence.0.to_string())?
+            .as_i64()?;
+        Some(ObservationEvidence {
+            source_receipt,
+            complete_bound_receipt,
+            observed_unix_ms,
+            provenance: provenance.to_owned(),
+        })
+    }
+
+    fn page_occurrences(&self) -> Result<Vec<PageOccurrence>, serde_json::Error> {
+        self.decision_inputs
+            .get("page_occurrences")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionContinuationError {
     #[error("invalid frozen continuation json: {0}")]
@@ -123,10 +203,33 @@ pub enum DecisionContinuationError {
 impl DecisionContinuationV2 {
     /// Decode and bind a frozen continuation to its durable outer row.
     pub fn from_durable(row: &DecisionPendingRow) -> Result<Self, DecisionContinuationError> {
-        let frozen: Self = serde_json::from_str(&row.frozen_inputs_json)?;
-        if frozen.version != 2 {
-            return Err(DecisionContinuationError::Version(frozen.version));
-        }
+        let value: Value = serde_json::from_str(&row.frozen_inputs_json)?;
+        let version = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or(DecisionContinuationError::Version(0))?;
+        let frozen = match version {
+            2 => serde_json::from_value(value)?,
+            3 => {
+                let version_three: DecisionContinuationV3 = serde_json::from_value(value)?;
+                let mut prior = version_three.prior;
+                let object = prior
+                    .decision_inputs
+                    .as_object_mut()
+                    .ok_or(DecisionContinuationError::DurableMismatch)?;
+                object.insert(
+                    "page_occurrences".to_owned(),
+                    serde_json::to_value(&version_three.page_occurrences)?,
+                );
+                object.insert(
+                    "observed_source_receipt".to_owned(),
+                    serde_json::to_value(version_three.observed_source_receipt)?,
+                );
+                prior
+            }
+            version => return Err(DecisionContinuationError::Version(version)),
+        };
         if frozen.source_trade_id != row.source_trade_id
             || frozen.semantic_revision != row.semantic_revision
             || frozen.wallet != row.wallet
@@ -136,6 +239,19 @@ impl DecisionContinuationV2 {
             || frozen.applied_configuration.canonical_hash() != frozen.applied_configuration_hash
         {
             return Err(DecisionContinuationError::DurableMismatch);
+        }
+        if version == 3 {
+            let page_occurrences = frozen.page_occurrences()?;
+            if frozen.version != 3 || page_occurrences.is_empty() {
+                return Err(DecisionContinuationError::DurableMismatch);
+            }
+            let mut previous = None;
+            for page in &page_occurrences {
+                if previous.is_some_and(|sequence| page.receipt.sequence <= sequence) {
+                    return Err(DecisionContinuationError::DurableMismatch);
+                }
+                previous = Some(page.receipt.sequence);
+            }
         }
         Ok(frozen)
     }
@@ -751,8 +867,8 @@ impl BucketCommitEngine {
                         else {
                             return Err(BucketCommitError::Empty);
                         };
-                        let frozen = DecisionContinuationV2 {
-                            version: 2,
+                        let prior = DecisionContinuationV2 {
+                            version: 3,
                             source_trade_id: source_trade_id.clone(),
                             semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
                             transaction_hash: aggregate
@@ -785,12 +901,35 @@ impl BucketCommitEngine {
                             applied_configuration: context.applied_configuration.clone(),
                             decision_inputs: decision_inputs.clone(),
                         };
+                        let page_occurrences = decision_inputs
+                            .get("page_occurrences")
+                            .cloned()
+                            .map(serde_json::from_value::<Vec<PageOccurrence>>)
+                            .transpose()?
+                            .unwrap_or_default();
+                        let observed_source_receipt = decision_inputs
+                            .get("observed_source_receipts")
+                            .and_then(|receipts| receipts.get(&source_trade_id.0))
+                            .cloned()
+                            .map(serde_json::from_value::<AppendReceipt>)
+                            .transpose()?;
+                        let frozen_inputs_json = if page_occurrences.is_empty() {
+                            let mut legacy = prior;
+                            legacy.version = 2;
+                            serde_json::to_string(&legacy)?
+                        } else {
+                            serde_json::to_string(&DecisionContinuationV3 {
+                                prior,
+                                observed_source_receipt,
+                                page_occurrences,
+                            })?
+                        };
                         pending.push(DecisionPendingRecord {
                             source_trade_id: source_trade_id.clone(),
                             semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
                             wallet,
                             source_epoch,
-                            frozen_inputs_json: serde_json::to_string(&frozen)?,
+                            frozen_inputs_json,
                             updated_at_unix: context.recorded_at_unix,
                         });
                         "decision_pending".to_owned()
@@ -1512,4 +1651,146 @@ fn touched_leader_rows(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod continuation_v3_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use pe_core_types::{EventSeq, Probability};
+    use pe_paper_state::DecisionPendingState;
+    use rust_decimal_macros::dec;
+    use serde_json::json;
+
+    use super::*;
+
+    fn receipt(sequence: u64) -> AppendReceipt {
+        AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap_or(u8::MAX); 32]),
+        }
+    }
+
+    fn prior(decision_inputs: Value) -> DecisionContinuationV2 {
+        let configuration =
+            RuntimeConfig::from_service_config(&crate::config::ServiceConfig::default());
+        DecisionContinuationV2 {
+            version: 3,
+            source_trade_id: SourceTradeId("g2:continuation".to_owned()),
+            semantic_revision: "semantic".to_owned(),
+            transaction_hash: "0xtransaction".to_owned(),
+            wallet: WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap(),
+            source_epoch: 1_700_000_000,
+            market_id: MarketId(pe_core_types::VenueMarketId("market".to_owned())),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            price: Price::new(dec!(0.5)).unwrap(),
+            share_amount: ShareAmount::from_whole(1).unwrap(),
+            provenance: TradeProvenance::ActivityWs,
+            pre_bucket_action: LeaderAction::Entry,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+            gate_result: "admitted".to_owned(),
+            applied_configuration_hash: configuration.canonical_hash(),
+            applied_configuration: configuration,
+            frozen_basis: FrozenDecisionBasis {
+                win_rate_p: Probability::new(dec!(0.6)).unwrap(),
+                bankroll: dec!(100),
+            },
+            decision_inputs,
+        }
+    }
+
+    fn durable(value: &impl Serialize) -> DecisionPendingRow {
+        let frozen_inputs_json = serde_json::to_string(value).unwrap();
+        let prior: DecisionContinuationV3 = serde_json::from_str(&frozen_inputs_json).unwrap();
+        DecisionPendingRow {
+            source_trade_id: prior.prior.source_trade_id.clone(),
+            semantic_revision: prior.prior.semantic_revision.clone(),
+            wallet: prior.prior.wallet,
+            source_epoch: prior.prior.source_epoch,
+            frozen_inputs_json,
+            post_commit_inputs_json: String::new(),
+            state: DecisionPendingState::Open,
+            terminal_disposition: None,
+            updated_at_unix: 1_700_000_001,
+        }
+    }
+
+    /// PASS: V3 keeps repeated payload occurrences, derives the greatest complete bound, and picks
+    /// the lower websocket receipt with the timestamp bound to that exact envelope.
+    #[test]
+    fn v3_observation_uses_lower_receipt_and_preserves_multiplicity() {
+        let pages = vec![
+            PageOccurrence {
+                request_url: "https://source/page".to_owned(),
+                raw_hash: "same".to_owned(),
+                receipt: receipt(9),
+            },
+            PageOccurrence {
+                request_url: "https://source/page".to_owned(),
+                raw_hash: "same".to_owned(),
+                receipt: receipt(11),
+            },
+        ];
+        let value = DecisionContinuationV3 {
+            prior: prior(json!({
+                "receipt_received_at_unix_ms": {
+                    "7": 1_700_000_000_007_i64,
+                    "9": 1_700_000_000_009_i64,
+                    "11": 1_700_000_000_011_i64,
+                }
+            })),
+            observed_source_receipt: Some(receipt(7)),
+            page_occurrences: pages,
+        };
+        let decoded = DecisionContinuationV2::from_durable(&durable(&value)).unwrap();
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.page_occurrences().unwrap().len(), 2);
+        assert_eq!(decoded.complete_bound(), Some(receipt(11)));
+        assert_eq!(
+            decoded.observation(),
+            Some(ObservationEvidence {
+                source_receipt: receipt(7),
+                complete_bound_receipt: receipt(11),
+                observed_unix_ms: 1_700_000_000_007,
+                provenance: "activity_ws".to_owned(),
+            })
+        );
+    }
+
+    /// PASS: polling-only V3 uses the complete page bound, while a legacy V2 row has no fabricated
+    /// observation evidence.
+    #[test]
+    fn poll_only_v3_and_legacy_v2_have_distinct_observation_semantics() {
+        let value = DecisionContinuationV3 {
+            prior: prior(json!({
+                "receipt_received_at_unix_ms": {"4": 1_700_000_000_004_i64}
+            })),
+            observed_source_receipt: None,
+            page_occurrences: vec![PageOccurrence {
+                request_url: "https://source/page".to_owned(),
+                raw_hash: "hash".to_owned(),
+                receipt: receipt(4),
+            }],
+        };
+        let decoded = DecisionContinuationV2::from_durable(&durable(&value)).unwrap();
+        assert_eq!(
+            decoded.observation(),
+            Some(ObservationEvidence {
+                source_receipt: receipt(4),
+                complete_bound_receipt: receipt(4),
+                observed_unix_ms: 1_700_000_000_004,
+                provenance: "rest_poll".to_owned(),
+            })
+        );
+
+        let mut legacy = prior(json!({"fixed_end": 1_700_000_010_i64}));
+        legacy.version = 2;
+        let mut row = durable(&value);
+        row.frozen_inputs_json = serde_json::to_string(&legacy).unwrap();
+        let decoded = DecisionContinuationV2::from_durable(&row).unwrap();
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.observation(), None);
+    }
 }

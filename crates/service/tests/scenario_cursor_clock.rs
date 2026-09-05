@@ -502,6 +502,10 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
                 source_trade_id: pe_core_types::SourceTradeId("g2:same".to_owned()),
                 provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
                 received_at: OffsetDateTime::from_unix_timestamp(received_at).unwrap(),
+                receipt: pe_event_log::AppendReceipt {
+                    sequence: pe_core_types::EventSeq(u64::try_from(received_at).unwrap()),
+                    this_hash: blake3::Hash::from_bytes([0; 32]),
+                },
             })
             .await
             .unwrap();

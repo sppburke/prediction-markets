@@ -22,7 +22,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use futures::stream::{self, StreamExt};
-use pe_core_types::{OutcomeId, PolymarketConditionId, PolymarketTokenId, ReceivedAt, SourceId};
+use pe_core_types::{
+    OutcomeId, PolymarketConditionId, PolymarketTokenId, Price, ReceivedAt, SourceId,
+};
 use pe_source_core::SourceError;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,9 @@ pub struct GammaMarket {
     /// mids. `None` when Gamma omits the field or the array is malformed. Individual non-decimal
     /// entries fall back to `0` (the lenient paper-pnl semantic, issue #382 Q7).
     pub outcome_prices: Option<Vec<Decimal>>,
+    /// Strict financial projection of `outcomePrices`; malformed, out-of-range, or non-decimal
+    /// entries make the whole vector unavailable instead of becoming zero.
+    pub strict_outcome_prices: Option<Vec<Price>>,
     /// Cumulative traded volume (USD). `None` when Gamma omits or sends an unparseable value.
     /// Consumed by the service mid-price cache's WS2 liquidity snapshot (issue #382 Phase 3b).
     pub volume: Option<Decimal>,
@@ -130,6 +135,22 @@ pub struct MetadataPageEvidence {
 pub struct GammaMarketsWithPages {
     pub markets: GammaMarkets,
     pub page: Option<(MetadataPageEvidence, Vec<u8>)>,
+}
+
+/// A condition-targeted Gamma result and every transport-successful raw page occurrence.
+pub struct GammaConditionMarketsWithPages {
+    pub markets: GammaMarkets,
+    pub pages: Vec<(MetadataPageEvidence, Vec<u8>)>,
+    pub conflicting_condition_ids: Vec<String>,
+    pub condition_page_hashes: HashMap<String, String>,
+}
+
+/// A condition-targeted Gamma failure and every transport-successful page received first.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct GammaConditionMarketsError {
+    pub source: GammaMarketsError,
+    pub pages: Vec<(MetadataPageEvidence, Vec<u8>)>,
 }
 
 /// A token-targeted Gamma failure and any transport-successful page received before it failed.
@@ -233,6 +254,19 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         ids: &[String],
         filter: MarketFilter,
     ) -> Result<GammaMarkets, GammaMarketsError> {
+        self.fetch_markets_with_pages(ids, filter)
+            .await
+            .map(|result| result.markets)
+            .map_err(|error| error.source)
+    }
+
+    /// Condition-targeted batch fetch retaining each successful raw page occurrence for a
+    /// service-owned append before financial classification (#545).
+    pub async fn fetch_markets_with_pages(
+        &self,
+        ids: &[String],
+        filter: MarketFilter,
+    ) -> Result<GammaConditionMarketsWithPages, GammaConditionMarketsError> {
         // Dedup preserving first-seen order — deterministic batch URLs, no sort.
         let mut seen: HashSet<&str> = HashSet::with_capacity(ids.len());
         let unique: Vec<&str> = ids
@@ -261,6 +295,9 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
 
         let mut out: HashMap<String, GammaMarket> = HashMap::new();
         let mut unfetched: Vec<String> = Vec::new();
+        let mut pages = Vec::new();
+        let mut conflicting_condition_ids = Vec::new();
+        let mut condition_page_hashes = HashMap::new();
         while let Some((chunk, result)) = stream.next().await {
             let bytes = match result {
                 Ok(b) => b,
@@ -272,33 +309,51 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                     unfetched.extend(chunk);
                     continue;
                 }
-                Err(e) => return Err(GammaMarketsError::Fetch(e.to_string())),
+                Err(e) => {
+                    return Err(GammaConditionMarketsError {
+                        source: GammaMarketsError::Fetch(e.to_string()),
+                        pages,
+                    });
+                }
             };
 
-            let markets: Vec<GammaMarketRaw> = serde_json::from_slice(&bytes)
-                .map_err(|e| GammaMarketsError::Parse(e.to_string()))?;
+            let url = build_batch_url(&self.base_url, &chunk, filter.closed_param(), self.limit);
+            let evidence = metadata_page_evidence(&url, &bytes, ReceivedAt::now_utc());
+            let markets: Vec<GammaMarketRaw> = match serde_json::from_slice(&bytes) {
+                Ok(markets) => markets,
+                Err(error) => {
+                    pages.push((evidence, bytes));
+                    return Err(GammaConditionMarketsError {
+                        source: GammaMarketsError::Parse(error.to_string()),
+                        pages,
+                    });
+                }
+            };
+            pages.push((evidence, bytes));
             for m in markets {
-                let end_date_unix = m.end_date.as_deref().and_then(parse_rfc3339_unix);
-                let created_at_unix = m.created_at.as_deref().and_then(parse_rfc3339_unix);
-                let outcome_prices = m.outcome_prices.as_deref().and_then(parse_outcome_prices);
-                out.insert(
-                    m.condition_id.clone(),
-                    GammaMarket {
-                        condition_id: m.condition_id,
-                        end_date_unix,
-                        created_at_unix,
-                        liquidity: m.liquidity,
-                        closed: m.closed,
-                        outcome_prices,
-                        volume: m.volume,
-                        clob_token_ids: m.clob_token_ids,
-                    },
+                let market = gamma_market(m);
+                if out.get(&market.condition_id).is_some_and(|prior| {
+                    prior.strict_outcome_prices != market.strict_outcome_prices
+                }) {
+                    conflicting_condition_ids.push(market.condition_id.clone());
+                }
+                condition_page_hashes.insert(
+                    market.condition_id.clone(),
+                    pages
+                        .last()
+                        .map_or_else(String::new, |page| page.0.raw_page_hash.clone()),
                 );
+                out.insert(market.condition_id.clone(), market);
             }
         }
-        Ok(GammaMarkets {
-            markets: out,
-            unfetched,
+        Ok(GammaConditionMarketsWithPages {
+            markets: GammaMarkets {
+                markets: out,
+                unfetched,
+            },
+            pages,
+            conflicting_condition_ids,
+            condition_page_hashes,
         })
     }
 
@@ -629,6 +684,10 @@ fn gamma_market(market: GammaMarketRaw) -> GammaMarket {
         .outcome_prices
         .as_deref()
         .and_then(parse_outcome_prices);
+    let strict_outcome_prices = market
+        .outcome_prices
+        .as_deref()
+        .and_then(parse_outcome_prices_strict);
     GammaMarket {
         condition_id: market.condition_id,
         end_date_unix,
@@ -636,6 +695,7 @@ fn gamma_market(market: GammaMarketRaw) -> GammaMarket {
         liquidity: market.liquidity,
         closed: market.closed,
         outcome_prices,
+        strict_outcome_prices,
         volume: market.volume,
         clob_token_ids: market.clob_token_ids,
     }
@@ -739,6 +799,18 @@ pub fn parse_outcome_prices(prices_str: &str) -> Option<Vec<Decimal>> {
             .map(|s| s.parse::<Decimal>().unwrap_or(Decimal::ZERO))
             .collect(),
     )
+}
+
+fn parse_outcome_prices_strict(prices_str: &str) -> Option<Vec<Price>> {
+    let raw: Vec<String> = serde_json::from_str(prices_str).ok()?;
+    raw.into_iter()
+        .map(|value| {
+            value
+                .parse::<Decimal>()
+                .ok()
+                .and_then(|value| Price::new(value).ok())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1011,6 +1083,40 @@ mod tests {
         // The lenient paper-pnl semantic (issue #382 Q7): a bad entry → 0, the array still parses.
         let parsed = parse_outcome_prices(r#"["x","0.5"]"#).unwrap();
         assert_eq!(parsed, vec![Decimal::ZERO, Decimal::new(5, 1)]);
+    }
+
+    /// PASS: condition-batch callers retain a raw page while strict financial prices reject a
+    /// malformed element that the legacy display projection represents as zero.
+    #[tokio::test]
+    async fn condition_batch_exposes_raw_page_and_strict_prices() {
+        let ids = ids(&["condition"]);
+        let url = build_batch_url("https://g", &ids, "", GAMMA_BATCH_LIMIT_PARAM);
+        let raw = br#"[{"conditionId":"condition","outcomePrices":"[\"x\",\"0.5\"]"}]"#.to_vec();
+        let fetcher = FixtureFetcher::new(HashMap::from([(url.clone(), raw.clone())]));
+        let result = GammaMarketsClient::new("https://g".to_owned(), fetcher)
+            .fetch_markets_with_pages(&ids, MarketFilter::OpenOnly)
+            .await
+            .unwrap();
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.pages[0].0.request_url, url);
+        assert_eq!(result.pages[0].1, raw);
+        let market = result.markets.markets.get("condition").unwrap();
+        assert_eq!(market.outcome_prices.as_ref().unwrap()[0], Decimal::ZERO);
+        assert!(market.strict_outcome_prices.is_none());
+    }
+
+    /// PASS: two rows for one condition with different strict prices are retained as a conflict.
+    #[tokio::test]
+    async fn condition_batch_reports_conflicting_duplicate_prices() {
+        let ids = ids(&["condition"]);
+        let url = build_batch_url("https://g", &ids, "", GAMMA_BATCH_LIMIT_PARAM);
+        let raw = br#"[{"conditionId":"condition","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"condition","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec();
+        let fetcher = FixtureFetcher::new(HashMap::from([(url, raw)]));
+        let result = GammaMarketsClient::new("https://g".to_owned(), fetcher)
+            .fetch_markets_with_pages(&ids, MarketFilter::OpenOnly)
+            .await
+            .unwrap();
+        assert_eq!(result.conflicting_condition_ids, vec!["condition"]);
     }
 
     #[test]

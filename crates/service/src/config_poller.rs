@@ -23,6 +23,61 @@ use crate::supabase_reader::{SupabaseError, auth_token};
 /// Seconds between `service_config` polls. Boot-frozen (the poll cadence cannot govern itself).
 /// Canonical default lives in `docs/_GLOSSARY.md`: `config_poll_interval_secs`.
 pub const CONFIG_POLL_INTERVAL_SECS: u64 = 30;
+pub const RISK_HALT_RELEASE_HASH_KEY: &str = "risk_halt_release_hash";
+
+/// Non-economic incident control separated from one fetched config proposal (#545).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedConfigRows {
+    pub economic_rows: Vec<ConfigRow>,
+    pub risk_halt_release_hash: Option<String>,
+    pub warning: Option<RiskHaltReleaseRowWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskHaltReleaseRowWarning {
+    Duplicate,
+    WrongValueType,
+    Malformed,
+}
+
+/// Remove the optional audited incident-control row before economic parsing and hashing.
+#[must_use]
+pub fn partition_risk_halt_release_hash(rows: &[ConfigRow]) -> PartitionedConfigRows {
+    let mut economic_rows = Vec::with_capacity(rows.len());
+    let release_rows = rows
+        .iter()
+        .filter(|row| row.key == RISK_HALT_RELEASE_HASH_KEY)
+        .collect::<Vec<_>>();
+    economic_rows.extend(
+        rows.iter()
+            .filter(|row| row.key != RISK_HALT_RELEASE_HASH_KEY)
+            .cloned(),
+    );
+
+    let (risk_halt_release_hash, warning) = match release_rows.as_slice() {
+        [] => (None, None),
+        [row] if row.value_type != "text" => {
+            (None, Some(RiskHaltReleaseRowWarning::WrongValueType))
+        }
+        [row] if row.value.is_empty() => (None, None),
+        [row]
+            if row.value.len() == 64
+                && row
+                    .value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            (Some(row.value.clone()), None)
+        }
+        [_] => (None, Some(RiskHaltReleaseRowWarning::Malformed)),
+        _ => (None, Some(RiskHaltReleaseRowWarning::Duplicate)),
+    };
+    PartitionedConfigRows {
+        economic_rows,
+        risk_halt_release_hash,
+        warning,
+    }
+}
 
 /// A config read may consume only part of a poll period. This prevents a stalled socket from
 /// stopping later 30-second reloads indefinitely.
@@ -242,12 +297,16 @@ pub async fn poll_once<F: ConfigFetcher>(
             }
         };
 
+    let partitioned = partition_risk_halt_release_hash(&rows);
+    if let Some(warning) = partitioned.warning {
+        warn!(?warning, "risk halt release row ignored");
+    }
     let applied = live.snapshot();
-    let parsed = match parse_config(&rows, &applied, clob_creds_present) {
+    let parsed = match parse_config(&partitioned.economic_rows, &applied, clob_creds_present) {
         Ok(parsed) => parsed,
         Err(error) => {
             warn!(%error, "service_config snapshot rejected; keeping whole last-good config");
-            status.record_rejected(&rows, error);
+            status.record_rejected(&partitioned.economic_rows, error);
             return;
         }
     };
@@ -494,6 +553,76 @@ mod tests {
             service_config_url("https://x.supabase.co/"),
             "https://x.supabase.co/rest/v1/service_config?select=key,value,value_type"
         );
+    }
+
+    /// PASS: a valid incident hash is excluded from economic rows and round-trips exactly.
+    #[test]
+    fn partitions_valid_risk_halt_release_hash() {
+        let mut rows = rows_with("max_fill_price", "0.50");
+        rows.push(cfg_row(
+            RISK_HALT_RELEASE_HASH_KEY,
+            &"ab".repeat(32),
+            "text",
+        ));
+        let partitioned = partition_risk_halt_release_hash(&rows);
+        assert_eq!(partitioned.risk_halt_release_hash, Some("ab".repeat(32)));
+        assert_eq!(partitioned.warning, None);
+        assert!(
+            partitioned
+                .economic_rows
+                .iter()
+                .all(|row| row.key != RISK_HALT_RELEASE_HASH_KEY)
+        );
+        let without = parse_config(&rows[..rows.len() - 1], &boot(), false).unwrap();
+        let partitioned_config = parse_config(&partitioned.economic_rows, &boot(), false).unwrap();
+        assert_eq!(
+            without.canonical_hash(),
+            partitioned_config.canonical_hash()
+        );
+    }
+
+    /// PASS: empty is unseeded, while malformed, uppercase, wrong-type, and duplicate rows are
+    /// excluded with typed warnings and never reach the economic parser.
+    #[test]
+    fn invalid_release_rows_warn_without_poisoning_economics() {
+        let cases = [
+            (vec![cfg_row(RISK_HALT_RELEASE_HASH_KEY, "", "text")], None),
+            (
+                vec![cfg_row(RISK_HALT_RELEASE_HASH_KEY, "a", "text")],
+                Some(RiskHaltReleaseRowWarning::Malformed),
+            ),
+            (
+                vec![cfg_row(
+                    RISK_HALT_RELEASE_HASH_KEY,
+                    &"AB".repeat(32),
+                    "text",
+                )],
+                Some(RiskHaltReleaseRowWarning::Malformed),
+            ),
+            (
+                vec![cfg_row(
+                    RISK_HALT_RELEASE_HASH_KEY,
+                    &"ab".repeat(32),
+                    "decimal",
+                )],
+                Some(RiskHaltReleaseRowWarning::WrongValueType),
+            ),
+            (
+                vec![
+                    cfg_row(RISK_HALT_RELEASE_HASH_KEY, &"ab".repeat(32), "text"),
+                    cfg_row(RISK_HALT_RELEASE_HASH_KEY, &"cd".repeat(32), "text"),
+                ],
+                Some(RiskHaltReleaseRowWarning::Duplicate),
+            ),
+        ];
+        for (release_rows, expected_warning) in cases {
+            let mut rows = rows_with("max_fill_price", "0.50");
+            rows.extend(release_rows);
+            let partitioned = partition_risk_halt_release_hash(&rows);
+            assert_eq!(partitioned.warning, expected_warning);
+            assert!(partitioned.risk_halt_release_hash.is_none());
+            assert!(parse_config(&partitioned.economic_rows, &boot(), false).is_ok());
+        }
     }
 
     #[tokio::test]

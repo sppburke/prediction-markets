@@ -12,15 +12,23 @@
 //! Open vs settled classification is the caller's job (via the resolution store) —
 //! this cache only fetches mids for the open markets it is handed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pe_core_types::MarketId;
-use pe_source_polymarket_public::{GammaMarketsClient, MarketFilter, PageFetcher, ReqwestFetcher};
+use pe_core_types::{MarketId, MarketOutcomeId, Price, ReceivedAt, SourceTimestamp};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
+use pe_source_polymarket_public::{
+    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
+    GammaMarketsClient, MarketFilter, MetadataPageEvidence, PageFetcher, ReqwestFetcher,
+};
+use pe_strategy_winner_follow::RiskInputsUnavailable;
 use rust_decimal::Decimal;
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::warn;
+
+use crate::activity_ingest::SourceLogHandle;
 
 /// How long a cached mid stays fresh before a refetch.
 const TTL: Duration = Duration::from_secs(60);
@@ -50,8 +58,20 @@ pub struct MidMarketSnapshot {
 #[derive(Clone)]
 struct CachedEntry {
     mids: Vec<Decimal>,
+    strict_mids: Option<Vec<Price>>,
     snapshot: MidMarketSnapshot,
     at: Instant,
+    observed_at: OffsetDateTime,
+    receipt: Option<AppendReceipt>,
+    conflicting: bool,
+}
+
+/// Strict current-price evidence used by financial risk inputs (#545).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MidPriceObservation {
+    pub price: Price,
+    pub receipt: AppendReceipt,
+    pub observed_unix: i64,
 }
 
 /// Thread-safe TTL cache of open-market mid prices. Generic over the fetcher so
@@ -61,6 +81,7 @@ pub struct MidPriceCache<F: PageFetcher = ReqwestFetcher> {
     /// Shared batched Gamma `/markets` client. Held behind an `Arc` so the cache stays `Clone`
     /// even though the underlying [`ReqwestFetcher`] (rate-limit `Mutex`) is not `Clone`.
     client: Arc<GammaMarketsClient<F>>,
+    source_log: Option<SourceLogHandle>,
 }
 
 // Manual Clone: the `Arc`s clone regardless of whether `F: Clone` (`ReqwestFetcher` is not — it
@@ -70,6 +91,7 @@ impl<F: PageFetcher> Clone for MidPriceCache<F> {
         Self {
             inner: self.inner.clone(),
             client: self.client.clone(),
+            source_log: self.source_log.clone(),
         }
     }
 }
@@ -90,7 +112,16 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             client: Arc::new(GammaMarketsClient::new(gamma_base_url, fetcher)),
+            source_log: None,
         }
+    }
+
+    /// Bind the service's sole source-log coordinator. Every subsequent successful Gamma page is
+    /// appended once before its values can enter the cache.
+    #[must_use]
+    pub fn with_source_log(mut self, source_log: SourceLogHandle) -> Self {
+        self.source_log = Some(source_log);
+        self
     }
 
     /// Current mids (per `outcome_id`) for `market_ids`, served from cache within
@@ -119,6 +150,65 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             .into_iter()
             .map(|(id, entry)| (id, entry.snapshot))
             .collect()
+    }
+
+    /// Complete, fresh outcome prices for entry risk. Unlike the display methods, this rejects the
+    /// entire request when any requested outcome lacks one unambiguous durable observation.
+    pub async fn fetch_mids_strict(
+        &self,
+        ids: &[MarketOutcomeId],
+    ) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
+        self.fetch_mids_strict_at(ids, OffsetDateTime::now_utc())
+            .await
+    }
+
+    async fn fetch_mids_strict_at(
+        &self,
+        ids: &[MarketOutcomeId],
+        now: OffsetDateTime,
+    ) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
+        let mut markets = ids.iter().map(|id| id.market().clone()).collect::<Vec<_>>();
+        markets.sort_by_key(ToString::to_string);
+        markets.dedup();
+        let _ = self.ensure_entries(&markets).await;
+
+        let map = self.inner.lock().await;
+        let mut output = BTreeMap::new();
+        for id in ids {
+            let entry = map
+                .get(id.market())
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            if entry.conflicting {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            if entry.observed_at > now {
+                return Err(RiskInputsUnavailable::PriceFuture);
+            }
+            if now - entry.observed_at
+                >= time::Duration::seconds(
+                    i64::try_from(TTL.as_secs()).map_err(|_| RiskInputsUnavailable::Overflow)?,
+                )
+            {
+                return Err(RiskInputsUnavailable::PriceStale);
+            }
+            let receipt = entry.receipt.ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let outcome = usize::from(id.outcome().0);
+            let price = entry
+                .strict_mids
+                .as_ref()
+                .and_then(|prices| prices.get(outcome))
+                .copied()
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            output.insert(
+                (id.market().to_string(), id.outcome().0),
+                MidPriceObservation {
+                    price,
+                    receipt,
+                    observed_unix: entry.observed_at.unix_timestamp(),
+                },
+            );
+        }
+        Ok(output)
     }
 
     /// Serve fresh [`CachedEntry`]s for `market_ids` from the cache and fetch the stale/missing ones
@@ -159,24 +249,38 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         // Open query (no `&closed=true`) → live mids in `outcomePrices`. The client batches and
         // demuxes by `conditionId`; the whole call is best-effort (see method doc).
         let ids: Vec<String> = stale.iter().map(|m| m.to_string()).collect();
-        let markets = match self
+        let fetched = match self
             .client
-            .fetch_markets(&ids, MarketFilter::OpenOnly)
+            .fetch_markets_with_pages(&ids, MarketFilter::OpenOnly)
             .await
         {
-            Ok(fetched) => fetched.markets,
-            Err(e) => {
-                warn!(error = %e, stale = stale.len(), "mid-cache: batch fetch error, omitting this tick");
+            Ok(fetched) => fetched,
+            Err(error) => {
+                if self.record_pages(&error.pages).await.is_err() {
+                    warn!("mid-cache: source log closed while recording rejected Gamma pages");
+                }
+                warn!(error = %error, stale = stale.len(), "mid-cache: batch fetch error, omitting this tick");
                 return out;
             }
         };
+        let receipts = match self.record_pages(&fetched.pages).await {
+            Ok(receipts) => receipts,
+            Err(()) => {
+                warn!("mid-cache: source log closed, omitting unrecorded Gamma prices");
+                return out;
+            }
+        };
+        let conflicts = fetched
+            .conflicting_condition_ids
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         let now = Instant::now();
         let mut map = self.inner.lock().await;
         for id in stale {
             // Demux by the echoed `conditionId`: a hit is structurally the requested market, so a
             // cross-market row (keyed under its own id) can never be attributed here.
-            let Some(m) = markets.get(&id.to_string()) else {
+            let Some(m) = fetched.markets.markets.get(&id.to_string()) else {
                 continue; // unknown / 4xx-unfetched / absent → omit (P&L stays null)
             };
             // No / malformed `outcomePrices` → skip rather than mis-value the market.
@@ -190,13 +294,52 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             };
             let entry = CachedEntry {
                 mids,
+                strict_mids: m.strict_outcome_prices.clone(),
                 snapshot,
                 at: now,
+                observed_at: fetched
+                    .condition_page_hashes
+                    .get(&id.to_string())
+                    .and_then(|hash| receipts.get(hash))
+                    .map_or_else(OffsetDateTime::now_utc, |(_, observed)| *observed),
+                receipt: fetched
+                    .condition_page_hashes
+                    .get(&id.to_string())
+                    .and_then(|hash| receipts.get(hash))
+                    .map(|(receipt, _)| *receipt),
+                conflicting: conflicts.contains(&id.to_string()),
             };
             map.insert(id.clone(), entry.clone());
             out.insert(id, entry);
         }
         out
+    }
+
+    async fn record_pages(
+        &self,
+        pages: &[(MetadataPageEvidence, Vec<u8>)],
+    ) -> Result<HashMap<String, (AppendReceipt, OffsetDateTime)>, ()> {
+        let Some(source_log) = &self.source_log else {
+            return Ok(HashMap::new());
+        };
+        let mut receipts = HashMap::new();
+        for (evidence, payload) in pages {
+            let observed = evidence.received_at.0;
+            let receipt = source_log
+                .append(EnvelopeIn {
+                    source_id: pe_core_types::SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
+                    schema_version: GAMMA_MARKETS_SCHEMA_VERSION,
+                    parser_version: GAMMA_MARKETS_PARSER_VERSION,
+                    observed_at: SourceTimestamp(observed),
+                    received_at: ReceivedAt(observed),
+                    content_type: ContentType::Json,
+                    payload: payload.clone(),
+                })
+                .await
+                .map_err(|_| ())?;
+            receipts.insert(evidence.raw_page_hash.clone(), (receipt, observed));
+        }
+        Ok(receipts)
     }
 }
 
@@ -204,7 +347,9 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use pe_core_types::{EventSeq, OutcomeId};
     use pe_source_polymarket_public::FixtureFetcher;
+    use time::macros::datetime;
 
     fn mid(s: &str) -> MarketId {
         s.parse().unwrap()
@@ -218,6 +363,180 @@ mod tests {
     }
 
     const BASE: &str = "https://gamma-api.polymarket.com";
+
+    fn outcome(market: &str, index: u16) -> MarketOutcomeId {
+        MarketOutcomeId::new(mid(market), OutcomeId(index))
+    }
+
+    fn receipt(sequence: u64) -> AppendReceipt {
+        AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap_or(u8::MAX); 32]),
+        }
+    }
+
+    async fn insert_strict_entry(
+        cache: &MidPriceCache<FixtureFetcher>,
+        market: &str,
+        prices: Option<Vec<Price>>,
+        observed_at: OffsetDateTime,
+        receipt: Option<AppendReceipt>,
+        conflicting: bool,
+    ) {
+        let mids = prices
+            .as_ref()
+            .map(|values| values.iter().map(|price| price.0).collect())
+            .unwrap_or_default();
+        cache.inner.lock().await.insert(
+            mid(market),
+            CachedEntry {
+                mids,
+                strict_mids: prices,
+                snapshot: MidMarketSnapshot::default(),
+                at: Instant::now(),
+                observed_at,
+                receipt,
+                conflicting,
+            },
+        );
+    }
+
+    /// PASS: a complete strict cache hit returns exact prices and reuses its original receipt.
+    #[tokio::test]
+    async fn strict_hit_is_complete_and_receipt_stable() {
+        let cache =
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), BASE.to_owned());
+        let now = datetime!(2026-09-05 12:00 UTC);
+        insert_strict_entry(
+            &cache,
+            "0xstrict",
+            Some(vec![
+                Price::new(Decimal::new(6, 1)).unwrap(),
+                Price::new(Decimal::new(4, 1)).unwrap(),
+            ]),
+            now,
+            Some(receipt(7)),
+            false,
+        )
+        .await;
+        let ids = [outcome("0xstrict", 0), outcome("0xstrict", 1)];
+        let first = cache.fetch_mids_strict_at(&ids, now).await.unwrap();
+        let second = cache.fetch_mids_strict_at(&ids, now).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.get(&("0xstrict".to_owned(), 0)).unwrap().receipt,
+            receipt(7)
+        );
+        assert_eq!(
+            first.get(&("0xstrict".to_owned(), 1)).unwrap().price.0,
+            Decimal::new(4, 1)
+        );
+    }
+
+    /// PASS: any absent market, outcome, strict parse, or durable receipt fails the whole request.
+    #[tokio::test]
+    async fn strict_missing_and_incomplete_inputs_fail_closed() {
+        let cache =
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), BASE.to_owned());
+        let now = datetime!(2026-09-05 12:00 UTC);
+        assert_eq!(
+            cache
+                .fetch_mids_strict_at(&[outcome("missing", 0)], now)
+                .await,
+            Err(RiskInputsUnavailable::PriceMissing)
+        );
+        insert_strict_entry(
+            &cache,
+            "incomplete",
+            Some(vec![Price::new(Decimal::new(5, 1)).unwrap()]),
+            now,
+            Some(receipt(1)),
+            false,
+        )
+        .await;
+        assert_eq!(
+            cache
+                .fetch_mids_strict_at(&[outcome("incomplete", 1)], now)
+                .await,
+            Err(RiskInputsUnavailable::PriceMissing)
+        );
+        insert_strict_entry(&cache, "malformed", None, now, Some(receipt(2)), false).await;
+        assert_eq!(
+            cache
+                .fetch_mids_strict_at(&[outcome("malformed", 0)], now)
+                .await,
+            Err(RiskInputsUnavailable::PriceMissing)
+        );
+        insert_strict_entry(
+            &cache,
+            "unrecorded",
+            Some(vec![Price::new(Decimal::new(5, 1)).unwrap()]),
+            now,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            cache
+                .fetch_mids_strict_at(&[outcome("unrecorded", 0)], now)
+                .await,
+            Err(RiskInputsUnavailable::PriceMissing)
+        );
+    }
+
+    /// PASS: exact TTL, future, and conflicting evidence return their distinct typed refusals.
+    #[tokio::test]
+    async fn strict_time_and_conflict_failures_are_distinct() {
+        let cache =
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), BASE.to_owned());
+        let now = datetime!(2026-09-05 12:00 UTC);
+        let one_price = || vec![Price::new(Decimal::new(5, 1)).unwrap()];
+        insert_strict_entry(
+            &cache,
+            "stale",
+            Some(one_price()),
+            now - time::Duration::seconds(60),
+            Some(receipt(1)),
+            false,
+        )
+        .await;
+        assert_eq!(
+            cache
+                .fetch_mids_strict_at(&[outcome("stale", 0)], now)
+                .await,
+            Err(RiskInputsUnavailable::PriceStale)
+        );
+        insert_strict_entry(
+            &cache,
+            "future",
+            Some(one_price()),
+            now + time::Duration::nanoseconds(1),
+            Some(receipt(2)),
+            false,
+        )
+        .await;
+        assert_eq!(
+            cache
+                .fetch_mids_strict_at(&[outcome("future", 0)], now)
+                .await,
+            Err(RiskInputsUnavailable::PriceFuture)
+        );
+        insert_strict_entry(
+            &cache,
+            "conflict",
+            Some(one_price()),
+            now,
+            Some(receipt(3)),
+            true,
+        )
+        .await;
+        assert_eq!(
+            cache
+                .fetch_mids_strict_at(&[outcome("conflict", 0)], now)
+                .await,
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+    }
 
     #[tokio::test]
     async fn fetches_and_parses_open_mid() {

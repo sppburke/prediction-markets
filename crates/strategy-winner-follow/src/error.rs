@@ -25,9 +25,41 @@ pub enum WinnerFollowError {
     #[error("risk blocked: {0:?}")]
     Blocked(RiskBlock),
 
+    /// The durable financial/source evidence required to build a risk snapshot was unavailable.
+    #[error("risk inputs unavailable: {0}")]
+    RiskInputsUnavailable(RiskInputsUnavailable),
+
     /// Underlying Kelly sizing computation failed (invalid inputs).
     #[error("Kelly sizing error: {0}")]
     KellySizing(#[from] KellyError),
+}
+
+/// Fail-closed reasons an entry cannot obtain a replayable risk snapshot (#545).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskInputsUnavailable {
+    #[error("financial snapshot sequence does not match the completed paper-log prefix")]
+    SnapshotSequenceMismatch,
+    #[error("the paper log has an unmatched FinancialPrepared record")]
+    UnmatchedPrepared,
+    #[error("a required position price is missing")]
+    PriceMissing,
+    #[error("a required position price is stale")]
+    PriceStale,
+    #[error("a required position price is from the future")]
+    PriceFuture,
+    #[error("position price evidence conflicts")]
+    PriceConflict,
+    #[error("the immediately preceding midnight mark is missing")]
+    MarkMissing,
+    #[error("the immediately preceding midnight mark is duplicated")]
+    MarkDuplicate,
+    #[error("the immediately preceding midnight mark is invalid")]
+    MarkInvalid,
+    #[error("the fixed qualification baseline is not positive")]
+    BaselineNonPositive,
+    #[error("exact risk arithmetic overflowed")]
+    Overflow,
 }
 
 /// Durable, replay-safe projection of an entry refusal.
@@ -38,6 +70,7 @@ pub enum WinnerFollowDeclineAudit {
     FlipNotApproved,
     NoEdge,
     Blocked(RiskBlock),
+    RiskInputsUnavailable(RiskInputsUnavailable),
     KellySizing(KellyErrorAudit),
 }
 
@@ -58,6 +91,9 @@ impl From<&WinnerFollowError> for WinnerFollowDeclineAudit {
             WinnerFollowError::FlipNotApproved => Self::FlipNotApproved,
             WinnerFollowError::NoEdge => Self::NoEdge,
             WinnerFollowError::Blocked(reason) => Self::Blocked(*reason),
+            WinnerFollowError::RiskInputsUnavailable(reason) => {
+                Self::RiskInputsUnavailable(*reason)
+            }
             WinnerFollowError::KellySizing(error) => Self::KellySizing(match error {
                 KellyError::InvalidProbability { value } => {
                     KellyErrorAudit::InvalidProbability { value: *value }
@@ -110,6 +146,7 @@ mod tests {
             WinnerFollowError::FlipNotApproved,
             WinnerFollowError::NoEdge,
             WinnerFollowError::Blocked(RiskBlock::CopyLatencyKillSwitch),
+            WinnerFollowError::RiskInputsUnavailable(RiskInputsUnavailable::PriceStale),
             WinnerFollowError::KellySizing(KellyError::InvalidProbability { value: dec!(1.1) }),
             WinnerFollowError::KellySizing(KellyError::InvalidNetPrice { value: dec!(0) }),
             WinnerFollowError::KellySizing(KellyError::InvalidBankroll { value: dec!(-1) }),

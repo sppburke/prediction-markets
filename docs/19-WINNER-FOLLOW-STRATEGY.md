@@ -337,8 +337,8 @@ All values in basis points (1 bp = 0.01 %). Comments show the percent equivalent
 # - Concentration caps: UN-ENFORCED BY DECISION on the production copy path. The values below
 #   remain canonical for backtest/tests, carried as `RiskSnapshot.concentration_caps =
 #   Some(ConcentrationCaps::CANONICAL)`; production passes `None` (typed, not accidental).
-# - Drawdown stops + latency kill switch: code ARMED but currently inert in production — the
-#   Phase-0B stub feeds zeroed PnL/latency inputs (real exposure tracking is future work).
+# - Drawdown stops + latency kill switch: ARMED from exact owner-local financial snapshots,
+#   durable paper/live evidence, and completed-prior-hour latency samples.
 
 [winner_follow.modes]
 leader_follow                = "live_tiny"   # paper -> live_tiny -> promoted (see promotion criteria below)
@@ -361,11 +361,12 @@ max_market_bps                       = 200   # 2.00 % per market
 max_family_bps                       = 800   # 8.00 % per MarketFamily
 max_total_copy_bps                   = 2500  # 25.00 % total open copy exposure
 
-# Drawdown stops (armed; inert via zeroed stub inputs — header note)
+# Drawdown stops and latency switch (armed; fixed owner-local baseline and denominator)
 intraday_stop_bps                    = -200  # halt new entries at -2.00 % intraday
 rolling_7d_stop_bps                  = -600  # halt at -6.00 % over rolling 7d
 kill_switch_drawdown_bps             = -1000 # -10.00 % bankroll absolute kill
-copy_latency_kill_switch_ms          = 3000  # fire when p95 > 1.5× the 2000 ms p95 budget
+copy_latency_kill_switch_ms          = 3000  # two completed prior-hour p95 values strictly above
+copy_latency_release_ms              = 2000  # active switch releases at or below; missing holds
 
 [winner_follow.copy]
 max_slippage_from_leader_bps         = 75    # 0.75 % from leader observed price
@@ -410,7 +411,7 @@ These five gates live in `crates/strategy-winner-follow/src/evaluate.rs` and fir
 | 4 | Kelly sizes to zero | `size_contracts(kelly_input) == 0` | `evaluate.rs:112–114` | `NoEdge` | Kelly sizing returned zero contracts — the bankroll is too small to buy even one contract at this price with the configured fraction. Not an error; the signal is valid but unsizeable. |
 | 5 | Cap-clamp to zero | `clamp_contracts_to_cap(...) == 0` | `evaluate.rs:124–126` | `NoEdge` | After applying the per-trade cap (basis points of bankroll), available bankroll is smaller than the price of a single contract. Fractional contracts are not supported; skip this trade. |
 
-Gates 1–5 fire in order. Gate 6 onward is the risk-engine (`evaluate_risk`), which returns `RiskDecision::Blocked(reason)` → `Err(WinnerFollowError::Blocked(reason))`. See the risk-block taxonomy below for the 10 risk-engine block reasons.
+Gates 1–5 fire in order. Gate 6 onward is the risk-engine (`evaluate_risk`), which returns `RiskDecision::Blocked(reason)` → `Err(WinnerFollowError::Blocked(reason))`. See the risk-block taxonomy below for the ordinary risk-engine block reasons.
 
 **Relationship between layers:**
 
@@ -426,11 +427,10 @@ simulation.rs gates (backtest only, lines 457-518)
 
 | Block reason | Halt scope |
 |---|---|
-| `KillSwitchDrawdown` | strategy-wide; manual review required to resume |
-| `IntradayDrawdownStop` | strategy-wide new entries until calendar reset |
-| `Rolling7dDrawdownStop` | strategy-wide new entries until 7-day window clears |
-| `CopyLatencyKillSwitch` | strategy-wide new entries until p95 returns under budget |
-| `OnchainSourceUnhealthy` | this trade (on-chain resolution source is Degraded or Dead) |
+| `KillSwitchDrawdown` | strategy-wide new entries; absolute-loss cause remains latched until its own audited append hash releases it |
+| `IntradayDrawdownStop` | strategy-wide new entries; releases mechanically when the current fixed-denominator intraday value clears the threshold |
+| `Rolling7dDrawdownStop` | strategy-wide new entries; releases mechanically when closes age out or the fixed-denominator value clears the threshold |
+| `CopyLatencyKillSwitch` | strategy-wide new entries; releases on an available p95 at or below `copy_latency_release_ms` above, while missing holds; sample-starved release requires its own audited append hash |
 | `PerTradeSizeExceeded` | this trade |
 | `LeaderConcentrationExceeded` | this trade |
 | `MarketConcentrationExceeded` | this trade |
@@ -446,7 +446,9 @@ simulation.rs gates (backtest only, lines 457-518)
 5. Recheck risk after partial fills.
 6. Reconcile against venue state before the next order.
 7. Current production Winner-Follow ignores all SELL/Trim/Exit signals and holds copied BUYs to resolution. Any future exit-following profile must require matching inventory and `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
-8. Block live orders when the on-chain resolution source is unhealthy (`OnchainSourceUnhealthy`; see "Risk-block taxonomy" above).
+8. Require current source-health/readiness and resolver-card tradability before risk evaluation;
+   missing, stale, ambiguous, or deferred resolver evidence fails closed independently of the
+   owner-local financial risk snapshot.
 
 ## Isolated Polymarket V2 canary
 

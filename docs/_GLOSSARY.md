@@ -32,7 +32,19 @@ End-to-end target from `leader_trade_observed_at` (gateway receive) to `follower
 | p95 | ≤ 2.0 s |
 | p99 | ≤ 3.0 s |
 
-If running p95 over the prior hour exceeds budget by 50 % for two consecutive 5-minute windows, the **copy-latency kill switch** (see `19-WINNER-FOLLOW-STRATEGY.md`) blocks new entries until p95 returns under budget.
+The **copy-latency kill switch** uses nearest-rank p95 values for the last two completed
+prior UTC clock hours (see the canonical `copy_latency_kill_switch_ms` and
+`copy_latency_release_ms` values in `19-WINNER-FOLLOW-STRATEGY.md`). Two consecutive available
+values strictly above the engage threshold activate it. While active, a missing value or a value
+above the release threshold holds it; the first available value at or below the release threshold
+releases it. A missing hour breaks the engage pair while inactive.
+
+Paper samples span the chosen source envelope's `received_at` to the synchronized
+`FinancialFinal` envelope's `received_at`. Live samples span request start to every
+transport-successful `OrderPosted` response's `received_at`, irrespective of HTTP status or later
+classification; transport failures and chain-finality time are excluded. Samples belong to the
+hour containing that endpoint. The paper owner and every live account derive the switch locally;
+any active owner blocks strategy-wide new entries.
 
 > **Two latency metrics, deliberately distinct (#530).** The budget above measures
 > `gateway receive → venue ack` (the service's internal span). The ranker's latency
@@ -425,6 +437,14 @@ proposal and retain the whole last-good snapshot. The one canonical applied iden
 hash of the values actually applied; a pending watchlist-capacity transition continues to hash
 the old applied capacity. Rejected raw rows and their typed error are status evidence, not a
 second revision.
+
+After `QualificationStarted`, optional text row `risk_halt_release_hash` is incident control, not
+economic configuration. The boot and poll paths partition it before exact-key parsing and exclude
+it from the applied economic hash. A value must be exactly 64 lowercase hexadecimal characters
+and name the append hash of the currently active `RiskHaltChanged` engagement. It may release only
+that same absolute-loss cause, or a latency cause held by a missing sample; the synchronized
+release consumes it. Missing, empty, malformed, stale, already-consumed, or cause-mismatched
+values only warn and change neither economics nor halt state.
 
 The guarded operator migration removes these database rows while preserving the corresponding
 restart-owned `ServiceConfig` TOML/environment contracts where they still exist:
