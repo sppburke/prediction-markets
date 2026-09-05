@@ -32,11 +32,9 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import holdout_baseline as hb  # noqa: E402
 
-# Codebase models this as WinnerFollowConfig.polymarket_fee_rate (docs/_GLOSSARY.md).
-# It feeds Kelly's net-cost `c`, NOT the backtest PnL accounting -- so realized
-# PnL in report.json is gross of it. Whether 0.04 matches live Polymarket is a
-# separate open question; both gross and net columns are shown so the reader can
-# judge. Override with --fee-rate.
+# Research-local sensitivity assumption only. Production economics use the compact
+# CLOB fee schedule and exact venue fee function; this calculation intentionally
+# remains a historical gross/net comparison. Override with --fee-rate.
 DEFAULT_FEE_RATE = 0.04
 
 BUCKET_EDGES = [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.85,

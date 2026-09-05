@@ -201,6 +201,90 @@ def positions_set(path: str) -> set[tuple]:
 
 
 class DuckParityTest(unittest.TestCase):
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_schema_two_verified_projection_and_engine_refusal(self) -> None:
+        """PASS: DuckDB 1.3.2 reads the joined exact schema-two projection;
+        auto selects it, while forced SQLite is a typed refusal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "v2.db")
+            pq = str(Path(tmp) / "pq")
+            conn = sqlite3.connect(db)
+            conn.execute("PRAGMA user_version=2")
+            conn.execute(
+                "CREATE TABLE ranker_entries_v2 (source_trade_id TEXT PRIMARY KEY, "
+                "activity_generation INTEGER, classifier_version INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE activity_groups_v2 (source_trade_id TEXT PRIMARY KEY, "
+                "coverage_generation INTEGER, wallet_hex TEXT, condition_id TEXT, asset TEXT, "
+                "outcome_id INTEGER, side TEXT, share_amount_str TEXT, "
+                "price_weighted_share_amount_str TEXT, source_usdc_amount_str TEXT, "
+                "source_time_unix INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE clob_payout_evidence_v2 (market_id TEXT PRIMARY KEY, "
+                "payout_vector_json TEXT, end_date_unix INTEGER, payout_status TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE activity_coverage_manifests_v2 (generation INTEGER PRIMARY KEY, "
+                "reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT, "
+                "aggregate_digest TEXT, source_row_count INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE clob_payout_coverage_manifests_v2 "
+                "(generation INTEGER PRIMARY KEY, terminal_kind TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE cache_v2_migration_state (singleton INTEGER PRIMARY KEY, "
+                "phase TEXT, ranker_projection_count INTEGER, ranker_projection_digest TEXT, "
+                "ranker_classifier_version INTEGER)"
+            )
+            gid = "g2:" + "a" * 64
+            entry = ts(2026, 2, 5)
+            conn.execute("INSERT INTO ranker_entries_v2 VALUES (?,?,?)", (gid, 7, 1))
+            conn.execute(
+                "INSERT INTO activity_groups_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (gid, 7, W("a"), "condition", "token", 1, "buy", "1.250000",
+                 "0.500000000000", "0.490000", entry),
+            )
+            conn.execute(
+                "INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?)",
+                ("condition", '[\"0.5\",\"0.5\"]', entry + 3600, "resolved"),
+            )
+            conn.execute("INSERT INTO activity_coverage_manifests_v2 VALUES (?,?,?,?,?,?)",
+                         (7, "b" * 64, 1, "c" * 64, "d" * 64, 1))
+            conn.execute("INSERT INTO clob_payout_coverage_manifests_v2 VALUES (?,?)",
+                         (8, "end_cursor"))
+            rows = [{
+                "source_trade_id": gid, "activity_generation": 7,
+                "classifier_version": 1, "wallet_hex": W("a"),
+                "condition_id": "condition", "asset": "token", "outcome_id": 1,
+                "side": "buy", "share_amount_str": "1.250000",
+                "price_weighted_share_amount_str": "0.500000000000",
+                "source_usdc_amount_str": "0.490000", "source_time_unix": entry,
+                "payout_vector_json": '[\"0.5\",\"0.5\"]',
+                "end_date_unix": entry + 3600,
+            }]
+            conn.execute("INSERT INTO cache_v2_migration_state VALUES (?,?,?,?,?)",
+                         (1, "finalized", 1, exp._projection_digest(rows), 1))
+            conn.commit()
+            conn.close()
+
+            export(db, pq)
+            with self.assertRaises(ranker_duck.SchemaTwoEngineError):
+                ranker_duck.get_engine(force="sqlite", parquet_dir=pq, schema_version=2)
+            engine = ranker_duck.get_engine(
+                force="auto", parquet_dir=pq, max_age_hours=0, schema_version=2
+            )
+            frame = ranker_duck.duck_extract_positions_v2(
+                engine, [W("a")], entry - 1, entry + 1
+            )
+            self.assertEqual(len(frame), 1)
+            self.assertEqual(str(frame.iloc[0]["contracts"]), "1.250000")
+            self.assertAlmostEqual(float(frame.iloc[0]["price"]), 0.4)
+            self.assertAlmostEqual(float(frame.iloc[0]["payoff"]), 0.5)
+            print("PASS: schema-two projection verified; SQLite refused; half payout exact")
+
     def test_v2_repaired_payouts_do_not_change_v1_ranking_or_survivors(self) -> None:
         """#544 boundary: stored repaired payouts are replay evidence only.
 

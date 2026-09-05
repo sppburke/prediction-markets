@@ -1260,6 +1260,30 @@ pub fn classify_complete_second(
     })
 }
 
+/// Classify one complete historical second with the canonical signal defaults.
+///
+/// Bootstrap supplies the reconstruction quality explicitly because it owns the
+/// proof that the fixed-end wallet history is complete. Keeping the signal
+/// configuration here prevents the cache builder from acquiring a second direct
+/// dependency on the copy-signal classifier.
+pub fn classify_complete_historical_second(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    mutations: &[LedgerMutation],
+    reconstruction_quality: ReconstructionQuality,
+    has_market: &dyn Fn(&MarketId) -> bool,
+) -> Result<SecondVerdict, LedgerError> {
+    classify_complete_second(
+        ledger,
+        wallet,
+        mutations,
+        reconstruction_quality,
+        &SignalConfig::default(),
+        true,
+        has_market,
+    )
+}
+
 fn order_independent_validity(
     ledger: &PositionLedger,
     wallet: WalletAddress,

@@ -8,7 +8,9 @@ dedup + the high-selectivity filters in DuckDB over a Parquet snapshot
 SQLite path would produce, so ALL scoring stays in shared Python — one
 `eff`/`gross`/`net` + `weighted_stats` code path, hence bit-parity.
 
-`get_engine()` is the single decision point: it returns a configured DuckDB
+`get_engine()` is the single decision point. Schema one retains the optional
+DuckDB/SQLite behavior. Schema two requires its count/hash-verified Parquet
+projection and refuses SQLite; there is no second schema-two extraction engine.
 connection ONLY when DuckDB is importable, the Parquet snapshot exists, and (unless
 forced) is fresh; otherwise it returns `None` and the caller runs the unchanged
 SQLite path. The fallback is logged, never silent. SQLite stays the
@@ -26,6 +28,7 @@ Engine selection (env, overridable by the caller):
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -46,6 +49,21 @@ TOKEN_CONDITIONS_PARQUET = "token_conditions.parquet"
 # #544: stored-only v2 payout evidence. Registration never changes ranker
 # queries; #545 owns switching any economic consumer to this view.
 CLOB_PAYOUT_EVIDENCE_V2_PARQUET = "clob_payout_evidence_v2.parquet"
+RANKER_ENTRIES_V2_PARQUET = "ranker_entries_v2.parquet"
+ACTIVITY_GROUPS_V2_PARQUET = "activity_groups_v2.parquet"
+ACTIVITY_COVERAGE_V2_PARQUET = "activity_coverage_manifests_v2.parquet"
+CLOB_PAYOUT_COVERAGE_V2_PARQUET = "clob_payout_coverage_manifests_v2.parquet"
+CACHE_V2_STATE_PARQUET = "cache_v2_migration_state.parquet"
+V2_EXPORT_MANIFEST = "schema_v2_export_manifest.json"
+REQUIRED_V2_PARQUET = (
+    RANKER_ENTRIES_V2_PARQUET,
+    ACTIVITY_GROUPS_V2_PARQUET,
+    CLOB_PAYOUT_EVIDENCE_V2_PARQUET,
+    ACTIVITY_COVERAGE_V2_PARQUET,
+    CLOB_PAYOUT_COVERAGE_V2_PARQUET,
+    CACHE_V2_STATE_PARQUET,
+)
+REQUIRED_V2_FILES = REQUIRED_V2_PARQUET + (V2_EXPORT_MANIFEST,)
 
 DEFAULT_PARQUET_DIR = "data/parquet"
 DEFAULT_MAX_AGE_HOURS = 4.0
@@ -60,11 +78,43 @@ def _q(s: str) -> str:
     return s.replace("'", "''")
 
 
-def _snapshot_state(parquet_dir: str, max_age_hours: float) -> tuple[bool, str]:
+class SchemaTwoEngineError(RuntimeError):
+    """Schema two cannot run without its verified DuckDB/Parquet projection."""
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_v2_export_manifest(parquet_dir: str) -> dict:
+    path = os.path.join(parquet_dir, V2_EXPORT_MANIFEST)
+    with open(path, encoding="utf-8") as source:
+        value = json.load(source)
+    if value.get("version") != 1 or set(value.get("tables", {})) != {
+        name.removesuffix(".parquet") for name in REQUIRED_V2_PARQUET
+    }:
+        raise SchemaTwoEngineError("schema-two export manifest has an invalid shape")
+    for name in REQUIRED_V2_PARQUET:
+        table = name.removesuffix(".parquet")
+        expected = value["tables"][table].get("sha256")
+        actual = _sha256_file(os.path.join(parquet_dir, name))
+        if expected != actual:
+            raise SchemaTwoEngineError(
+                f"schema-two Parquet hash mismatch for {name}"
+            )
+    return value
+
+
+def _snapshot_state(parquet_dir: str, max_age_hours: float,
+                    required=REQUIRED_PARQUET) -> tuple[bool, str]:
     """Return (usable, reason). Usable iff every required Parquet file exists and —
     when `max_age_hours > 0` — the oldest is younger than that bound."""
     now = time.time()
-    for name in REQUIRED_PARQUET:
+    for name in required:
         path = os.path.join(parquet_dir, name)
         if not os.path.exists(path):
             return False, f"missing {name}"
@@ -91,7 +141,8 @@ def engine_settings(force: str | None = None,
 
 def get_engine(force: str | None = None,
                parquet_dir: str | None = None,
-               max_age_hours: float | None = None):
+               max_age_hours: float | None = None,
+               *, schema_version: int = 1):
     """Return a configured DuckDB connection over the Parquet snapshot, or `None` to
     fall back to the SQLite path.
 
@@ -101,6 +152,12 @@ def get_engine(force: str | None = None,
     """
     force, parquet_dir, max_age_hours = engine_settings(force, parquet_dir, max_age_hours)
 
+    schema_two = schema_version >= 2
+    if force == "sqlite" and schema_two:
+        raise SchemaTwoEngineError(
+            "--engine sqlite is unsupported for schema-two caches; export the "
+            "verified Parquet projection and use DuckDB"
+        )
     if force == "sqlite":
         log("engine=sqlite (forced)")
         return None
@@ -110,18 +167,30 @@ def get_engine(force: str | None = None,
     except ImportError:
         if force == "duck":
             raise
+        if schema_two:
+            raise SchemaTwoEngineError(
+                "schema-two cache requires DuckDB, but duckdb is not importable"
+            )
         log("duckdb not importable -> SQLite path")
         return None
 
+    required = REQUIRED_V2_FILES if schema_two else REQUIRED_PARQUET
     if force == "duck":
-        usable, reason = _snapshot_state(parquet_dir, 0.0)  # forced: existence only
+        usable, reason = _snapshot_state(
+            parquet_dir, 0.0, required
+        )  # forced: existence only
         if not usable:
             raise FileNotFoundError(
                 f"--engine duck but Parquet snapshot unusable: {reason} (run export_trades_parquet.py)"
             )
     else:
-        usable, reason = _snapshot_state(parquet_dir, max_age_hours)
+        usable, reason = _snapshot_state(parquet_dir, max_age_hours, required)
         if not usable:
+            if schema_two:
+                raise SchemaTwoEngineError(
+                    f"schema-two Parquet snapshot unusable: {reason} "
+                    "(run export_trades_parquet.py)"
+                )
             log(f"Parquet snapshot unusable ({reason}) -> SQLite path")
             return None
 
@@ -153,13 +222,44 @@ def get_engine(force: str | None = None,
     con.execute(f"SET temp_directory='{_q(tmp)}';")
     # Views over the Parquet snapshot — typed by the export (BIGINT/VARCHAR), so
     # outcome_id/contracts are BIGINT and price_str is VARCHAR, matching the contract.
-    for tbl, name in (
-        ("trades", TRADES_PARQUET),
-        ("market_resolutions", RESOLUTIONS_PARQUET),
-        ("market_schedules", SCHEDULES_PARQUET),
-    ):
+    base_views = (
+        (
+            ("ranker_entries_v2", RANKER_ENTRIES_V2_PARQUET),
+            ("activity_groups_v2", ACTIVITY_GROUPS_V2_PARQUET),
+            ("clob_payout_evidence_v2", CLOB_PAYOUT_EVIDENCE_V2_PARQUET),
+            ("activity_coverage_manifests_v2", ACTIVITY_COVERAGE_V2_PARQUET),
+            ("clob_payout_coverage_manifests_v2", CLOB_PAYOUT_COVERAGE_V2_PARQUET),
+            ("cache_v2_migration_state", CACHE_V2_STATE_PARQUET),
+        ) if schema_two else (
+            ("trades", TRADES_PARQUET),
+            ("market_resolutions", RESOLUTIONS_PARQUET),
+            ("market_schedules", SCHEDULES_PARQUET),
+        )
+    )
+    for tbl, name in base_views:
         path = _q(os.path.join(parquet_dir, name))
         con.execute(f"CREATE VIEW {tbl} AS SELECT * FROM read_parquet('{path}');")
+    if schema_two:
+        export_manifest = _load_v2_export_manifest(parquet_dir)
+        for name in REQUIRED_V2_PARQUET:
+            table = name.removesuffix(".parquet")
+            actual_count = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            if actual_count != int(export_manifest["tables"][table]["count"]):
+                raise SchemaTwoEngineError(
+                    f"schema-two Parquet count mismatch for {table}"
+                )
+        state = con.execute(
+            "SELECT phase, ranker_projection_count, ranker_projection_digest, "
+            "ranker_classifier_version FROM cache_v2_migration_state WHERE singleton = 1"
+        ).fetchone()
+        projection = export_manifest.get("projection", {})
+        if (state is None or state[0] != "finalized"
+                or int(state[1]) != int(projection.get("count", -1))
+                or str(state[2]) != str(projection.get("digest", ""))
+                or int(state[3]) != int(projection.get("classifier_version", -1))):
+            raise SchemaTwoEngineError(
+                "schema-two export manifest does not match finalized projection state"
+            )
     # Optional CLV view (issue #421 PR4) — registered only when its parquet exists, so the engine
     # stays usable for proxy-CLV / non-CLV runs before the prices-history backfill has run.
     mph_path = os.path.join(parquet_dir, MARKET_PRICE_HISTORY_PARQUET)
@@ -177,7 +277,7 @@ def get_engine(force: str | None = None,
         )
         log(f"registered optional view token_conditions ({TOKEN_CONDITIONS_PARQUET})")
     payout_path = os.path.join(parquet_dir, CLOB_PAYOUT_EVIDENCE_V2_PARQUET)
-    if os.path.exists(payout_path):
+    if not schema_two and os.path.exists(payout_path):
         con.execute(
             "CREATE VIEW clob_payout_evidence_v2 AS SELECT * "
             f"FROM read_parquet('{_q(payout_path)}');"
@@ -209,6 +309,7 @@ class ClobPayoutEvidenceV2:
     parser_version: int
     fetched_at_unix: int
     origin: str
+    end_date_unix: int | None
 
 
 def _canonical_payout_vector(value: str) -> str:
@@ -249,7 +350,7 @@ def load_clob_payout_evidence_v2(con, market_id: str) -> ClobPayoutEvidenceV2 | 
     row = con.execute(
         "SELECT market_id, is_50_50_outcome, payout_status, payout_vector_json, "
         "closed, tokens_json, raw_page_sha256, coverage_generation, page_ordinal, "
-        "schema_version, parser_version, fetched_at_unix, origin "
+        "schema_version, parser_version, fetched_at_unix, origin, end_date_unix "
         "FROM clob_payout_evidence_v2 WHERE market_id = ?",
         [market_id],
     ).fetchone()
@@ -289,6 +390,7 @@ def load_clob_payout_evidence_v2(con, market_id: str) -> ClobPayoutEvidenceV2 | 
         parser_version=int(row[10]),
         fetched_at_unix=int(row[11]),
         origin=str(row[12]),
+        end_date_unix=None if row[13] is None else int(row[13]),
     )
 
 
@@ -431,3 +533,60 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     finally:
         con.unregister("universe")
     return df
+
+
+def duck_extract_positions_v2(con, wallets, win_start, win_end):
+    """Return every structurally valid Rust-classified schema-two first buy.
+
+    No leader-price, scheduled-horizon, price-band, or statistical filter is
+    applied here. Those eligibility decisions belong to pass two after the
+    minute-price approximation is selected.
+    """
+    import pandas as pd
+
+    con.register(
+        "universe",
+        pd.DataFrame({"wallet_hex": pd.Series(list(wallets), dtype=object)}),
+    )
+    try:
+        bad = con.execute(
+            "SELECT COUNT(*) FROM ranker_entries_v2 r "
+            "LEFT JOIN activity_groups_v2 g "
+            "ON g.source_trade_id = r.source_trade_id "
+            "AND g.coverage_generation = r.activity_generation "
+            "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
+            "WHERE NOT regexp_full_match(r.source_trade_id, 'g2:[0-9a-f]{64}') "
+            "OR g.source_trade_id IS NULL OR p.market_id IS NULL OR g.condition_id IS NULL "
+            "OR g.asset IS NULL OR g.outcome_id IS NULL OR g.side != 'buy' "
+            "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) IS NULL "
+            "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) <= 0 "
+            "OR TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) IS NULL "
+            "OR p.end_date_unix IS NULL OR p.payout_status != 'resolved' "
+            "OR p.payout_vector_json NOT IN ('[\"1\",\"0\"]','[\"0\",\"1\"]',"
+            "'[\"0.5\",\"0.5\"]')"
+        ).fetchone()[0]
+        if bad:
+            raise RuntimeError(
+                f"schema-two projection contains {bad} structurally invalid row(s)"
+            )
+        return con.execute(
+            "SELECT g.wallet_hex AS wallet, g.condition_id AS market_id, "
+            "g.outcome_id, g.source_time_unix AS entry_ts, "
+            "CAST(p.end_date_unix - g.source_time_unix AS BIGINT) AS ttr_secs, "
+            "CAST(TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) / "
+            "TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) AS DOUBLE) AS price, "
+            "g.share_amount_str AS contracts, "
+            "CAST(json_extract_string(p.payout_vector_json, "
+            "'$[' || CAST(g.outcome_id AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
+            "p.end_date_unix AS resolved_at "
+            "FROM ranker_entries_v2 r "
+            "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
+            "AND g.coverage_generation = r.activity_generation "
+            "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
+            "JOIN universe u ON u.wallet_hex = g.wallet_hex "
+            "WHERE g.source_time_unix >= ? AND g.source_time_unix < ? "
+            "ORDER BY g.wallet_hex, g.source_time_unix, r.source_trade_id",
+            [win_start, win_end],
+        ).df()
+    finally:
+        con.unregister("universe")
