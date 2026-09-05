@@ -6,13 +6,11 @@ use pe_core_types::{
 };
 use pe_event_log::AppendReceipt;
 use pe_risk_engine::{RiskBlock, RiskSnapshot};
-use pe_venue_polymarket::{
-    CompactFeeSchedule, FeeError, LadderError, LadderPlan, fee_reserve, taker_fee,
-};
+use pe_venue_polymarket::{CompactFeeSchedule, FeeError, LadderPlan, fee_reserve, taker_fee};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::live_executor::LiveAdmissionArtifact;
+use crate::LiveAdmissionArtifact;
 use crate::live_journal::{
     LadderPlanAudit, LiveAdmissionArtifactAudit, LiveJournalError, hash_serializable,
 };
@@ -115,12 +113,15 @@ pub struct EconomicPrepared {
     pub applied_configuration_hash: String,
 }
 
-/// Inputs to the one economic composition shared by paper and live. Every field is evidence the
-/// caller already holds; composition performs no I/O and reads no clocks.
+/// Inputs to the one economic composition shared by paper and live (#545). Every field is
+/// evidence the caller already holds; the composer adds no I/O and reads no clocks.
 pub struct EconomicInputs<'a> {
     pub market: MarketSelection,
+    /// Admission artifact returned by `LiveAdmissionBuilder`.
     pub admission: &'a LiveAdmissionArtifact,
+    /// The exact collateral-path plan selected by `plan_sized_buy`.
     pub plan: &'a LadderPlan,
+    /// Receipt of the exact `/book` body walked by `plan`.
     pub book_receipt: AppendReceipt,
     pub observation: Option<ObservationEvidence>,
     pub sizing_mode: SizingModeAudit,
@@ -137,58 +138,66 @@ pub struct EconomicInputs<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EconomicError {
-    #[error("fee economics: {0}")]
+    #[error("fee calculation failed: {0}")]
     Fee(#[from] FeeError),
-    #[error("exact amount arithmetic: {0}")]
+    #[error("exact economic arithmetic failed: {0}")]
     Arithmetic(#[from] pe_core_types::Error),
-    #[error("ladder economics: {0}")]
-    Ladder(#[from] LadderError),
-    #[error("the book append receipt is not bound to a source frame")]
+    #[error("the ladder audit has no valid expected VWAP")]
+    InvalidLadderAudit,
+    #[error("the book source receipt is unbound")]
     MissingBookReceipt,
 }
 
 impl EconomicPrepared {
-    /// Compose fee, reserve, all-in price, expected fill, and audit facts exactly once.
+    /// Compose the canonical economic record exactly once from already-acquired evidence.
     pub fn compose(inputs: EconomicInputs<'_>) -> Result<Self, EconomicError> {
         if inputs.book_receipt.this_hash == blake3::Hash::from_bytes([0; 32]) {
             return Err(EconomicError::MissingBookReceipt);
         }
-        let expected_fee = taker_fee(
-            inputs.admission.fee_schedule,
-            inputs.plan.shares,
-            inputs.plan.limit_price,
-        )?;
+
+        let ladder = LadderPlanAudit::new(inputs.plan);
+        let expected_shares = ladder.expected_shares()?;
+        let expected_vwap = ladder
+            .expected_vwap()
+            .ok_or(EconomicError::InvalidLadderAudit)?;
+        let expected_spend = ladder.expected_spend()?;
+        if expected_shares < inputs.plan.shares || expected_spend > inputs.plan.worst_case_debit {
+            return Err(EconomicError::InvalidLadderAudit);
+        }
+
+        let schedule = inputs.admission.fee_schedule;
+        let expected_fee = taker_fee(schedule, inputs.plan.shares, inputs.plan.limit_price)?;
         let reserve = fee_reserve(
-            inputs.admission.fee_schedule,
+            schedule,
             inputs.plan.worst_case_debit,
             inputs.plan.shares,
             inputs.plan.best_ask,
             inputs.plan.limit_price,
         )?;
-        let ladder = LadderPlanAudit::new(inputs.plan);
-        let expected_shares = ladder.expected_shares()?;
-        let expected_vwap = ladder.expected_vwap().ok_or(LadderError::Amount)?;
-        let principal_plus_fee = inputs.plan.worst_case_debit.checked_add(expected_fee)?;
-        let all_in_decimal = principal_plus_fee
-            .to_decimal()
-            .checked_div(inputs.plan.shares.to_decimal())
-            .and_then(|price| {
-                Decimal::ONE
-                    .checked_add(inputs.slippage_rate)
-                    .and_then(|multiplier| price.checked_mul(multiplier))
-            })
-            .ok_or(pe_core_types::Error::OutOfRange {
-                field: "EconomicPrepared.all_in_price",
-            })?;
-        let all_in_price = Price::new(all_in_decimal)?;
+        let expected_debit = inputs.plan.worst_case_debit.checked_add(expected_fee)?;
+        let slippage_multiplier = Decimal::ONE.checked_add(inputs.slippage_rate).ok_or(
+            pe_core_types::Error::OutOfRange {
+                field: "EconomicInputs.slippage_rate",
+            },
+        )?;
+        let all_in_price = Price::new(
+            expected_debit
+                .to_decimal()
+                .checked_div(inputs.plan.shares.to_decimal())
+                .and_then(|price| price.checked_mul(slippage_multiplier))
+                .ok_or(pe_core_types::Error::OutOfRange {
+                    field: "EconomicPrepared.all_in_price",
+                })?,
+        )?;
         let worst_case_debit = inputs.plan.worst_case_debit.checked_add(reserve)?;
+
         Ok(Self {
             version: ECONOMIC_PREPARED_VERSION,
             market: inputs.market,
             admission: LiveAdmissionArtifactAudit::new(
                 &inputs.admission.market,
                 &inputs.admission.settlement,
-                inputs.admission.fee_schedule,
+                schedule,
                 inputs.admission.receipts,
             ),
             ladder,
@@ -205,7 +214,7 @@ impl EconomicPrepared {
                 slippage_rate: inputs.slippage_rate,
             },
             fee: FeeAudit {
-                schedule: inputs.admission.fee_schedule,
+                schedule,
                 expected_fee,
                 reserve,
             },
@@ -233,5 +242,166 @@ impl EconomicPrepared {
 
     pub fn worst_case_all_in_debit(&self) -> Result<CollateralAmount, pe_core_types::Error> {
         self.sizing.principal.checked_add(self.fee.reserve)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use pe_core_types::{BasisPoints, EventSeq};
+    use pe_resolver_card::{
+        VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+    };
+    use pe_risk_engine::RiskSnapshot;
+    use pe_source_polymarket_public::{
+        LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveMarketEvidence,
+    };
+    use pe_venue_polymarket::AskLevel;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::{AdmissionReceipts, LiveAdmissionArtifact};
+
+    fn receipt(byte: u8) -> AppendReceipt {
+        AppendReceipt {
+            sequence: EventSeq(u64::from(byte)),
+            this_hash: blake3::Hash::from_bytes([byte; 32]),
+        }
+    }
+
+    fn admission() -> LiveAdmissionArtifact {
+        let now = 1_800_000_000;
+        LiveAdmissionArtifact {
+            market: LiveMarketEvidence {
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                ordered_outcome_token_ids: [
+                    PolymarketTokenId("11".to_owned()),
+                    PolymarketTokenId("22".to_owned()),
+                ],
+                neg_risk: false,
+                minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                minimum_order_size: ShareAmount::from_atomic(1_000_000),
+                scheduled_end_unix: Some(now + 3_600),
+                observed_at_unix: now,
+                schema_version: LIVE_MARKET_SCHEMA_VERSION,
+                parser_version: LIVE_MARKET_PARSER_VERSION,
+                freshness_window_secs: 60,
+            },
+            settlement: VenueSettlementRecord {
+                schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                status: VenueResolutionStatus::Unresolved,
+                raw_evidence_hash: blake3::hash(b"settlement").to_hex().to_string(),
+                source_timestamp_unix: Some(now),
+                observed_at_unix: now,
+                parser_version: 1,
+                freshness_window_secs: 60,
+            },
+            fee_schedule: CompactFeeSchedule::Taker { rate: dec!(0.04) },
+            receipts: AdmissionReceipts {
+                gamma: receipt(1),
+                clob_long: receipt(2),
+                clob_compact: receipt(3),
+            },
+        }
+    }
+
+    fn risk() -> RiskAudit {
+        RiskAudit {
+            snapshot: RiskSnapshot {
+                leader_exposure_bps: BasisPoints::ZERO,
+                market_exposure_bps: BasisPoints::ZERO,
+                family_exposure_bps: BasisPoints::ZERO,
+                total_copy_exposure_bps: BasisPoints::ZERO,
+                intraday_pnl_bps: BasisPoints::ZERO,
+                rolling_7d_pnl_bps: BasisPoints::ZERO,
+                absolute_pnl_bps: BasisPoints::ZERO,
+                copy_latency_kill_switch_active: false,
+                proposed_trade_bps: BasisPoints(50),
+                per_trade_cap_bps: 100,
+                concentration_caps: None,
+            },
+            decision: RiskDecisionAudit::Approved,
+        }
+    }
+
+    fn plan() -> LadderPlan {
+        LadderPlan {
+            used_asks: vec![
+                AskLevel {
+                    price: Price::new(dec!(0.49)).unwrap(),
+                    shares: ShareAmount::from_decimal_exact(dec!(2)).unwrap(),
+                },
+                AskLevel {
+                    price: Price::new(dec!(0.50)).unwrap(),
+                    shares: ShareAmount::from_decimal_exact(dec!(3.02)).unwrap(),
+                },
+            ],
+            best_ask: Price::new(dec!(0.49)).unwrap(),
+            limit_price: Price::new(dec!(0.50)).unwrap(),
+            shares: ShareAmount::from_decimal_exact(dec!(5)).unwrap(),
+            worst_case_debit: CollateralAmount::from_decimal_exact(dec!(2.50)).unwrap(),
+        }
+    }
+
+    fn inputs<'a>(
+        admission: &'a LiveAdmissionArtifact,
+        plan: &'a LadderPlan,
+    ) -> EconomicInputs<'a> {
+        EconomicInputs {
+            market: MarketSelection {
+                condition_id: admission.market.condition_id.clone(),
+                outcome_index: 0,
+                token_id: admission.market.ordered_outcome_token_ids[0].clone(),
+                side: Side::Buy,
+                market_id: "condition".to_owned(),
+            },
+            admission,
+            plan,
+            book_receipt: receipt(4),
+            observation: None,
+            sizing_mode: SizingModeAudit::Contract { contracts: 5 },
+            budget: CollateralAmount::from_decimal_exact(dec!(3)).unwrap(),
+            slippage_rate: dec!(0.01),
+            risk: risk(),
+            cash_before: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+            price_impact_cap_bps: 100,
+            chase_ceiling: Price::new(dec!(0.50)).unwrap(),
+            band_floor: Price::new(dec!(0.15)).unwrap(),
+            band_ceiling_exclusive: Price::new(dec!(0.85)).unwrap(),
+            applied_configuration_hash: "config".to_owned(),
+        }
+    }
+
+    #[test]
+    fn composer_derives_improved_quantity_and_signed_price_fee_once() {
+        let admission = admission();
+        let plan = plan();
+        let prepared = EconomicPrepared::compose(inputs(&admission, &plan)).unwrap();
+
+        assert_eq!(prepared.sizing.minimum_shares.to_decimal(), dec!(5));
+        assert_eq!(prepared.sizing.expected_shares.to_decimal(), dec!(5.02));
+        assert_eq!(prepared.sizing.principal.to_decimal(), dec!(2.5));
+        assert_eq!(prepared.fee.expected_fee.to_decimal(), dec!(0.05));
+        assert_eq!(prepared.sizing.all_in_price.0, dec!(0.5151));
+        assert_eq!(prepared.book_receipt, receipt(4));
+        assert_eq!(prepared.admission.receipts.gamma, receipt(1));
+        assert!(prepared.fee.reserve >= prepared.fee.expected_fee);
+    }
+
+    #[test]
+    fn composer_rejects_an_unbound_book_receipt() {
+        let admission = admission();
+        let plan = plan();
+        let mut inputs = inputs(&admission, &plan);
+        inputs.book_receipt = AppendReceipt {
+            sequence: EventSeq(0),
+            this_hash: blake3::Hash::from_bytes([0; 32]),
+        };
+        assert!(matches!(
+            EconomicPrepared::compose(inputs),
+            Err(EconomicError::MissingBookReceipt)
+        ));
     }
 }

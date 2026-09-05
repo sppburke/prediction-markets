@@ -1,48 +1,57 @@
 //! Strictly sequential ordinary-live dispatch consumer (#508 Decision 10).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use age::x25519::Identity;
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    AccountId, BasisPoints, CollateralAmount, EventSeq, KellyFraction, PolymarketConditionId,
-    Price, Probability, RawHttpAttempt, ShareAmount, Side,
+    AccountId, CollateralAmount, KellyFraction, MarketId, MarketOutcomeId, OutcomeId,
+    PolymarketConditionId, Price, Probability, RawHttpAttempt, ReceivedAt, ShareAmount, Side,
+    SourceId, SourceTimestamp, VenueMarketId, WalletAddress,
 };
-use pe_event_log::AppendReceipt;
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_execution_core::{
-    BalanceAudit, CanonicalPositionAudit, CredentialBindingIdentity, ECONOMIC_PREPARED_VERSION,
-    EconomicPrepared, FeeAudit, FrozenLiveTarget, LadderPlanAudit, LiveAdmissionArtifactAudit,
-    LiveAdmissionRefusal, LiveControlMode, LiveExecutor, LiveFillProjectionIdentity, LiveJournal,
-    LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot,
-    LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
-    LiveOrderOutcome, LiveOrderReconciliationAudit, LiveOrderVenue, LivePrepareResult,
-    LiveReconciliationSource, LiveVenueReconciledOutcome, MarkKind, MarketSelection,
-    MatchedLogIdentity, OrderFillFinalizedAudit, RedemptionAttempt, RedemptionAttemptIdentity,
-    RedemptionAttemptState, RedemptionPassInput, RiskAudit, RiskDecisionAudit, SizingAudit,
-    SizingModeAudit, reconstruct_redemption_attempts, redemption_posture, replay_account,
-    run_redemption_pass,
+    CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
+    FrozenLiveTarget, LiveAdmissionRefusal, LiveControlMode, LiveExecutor,
+    LiveFillProjectionIdentity, LiveJournal, LiveJournalEvent, LiveJournalOrderOutcome,
+    LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit, LiveModeTransitionReason,
+    LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome, LiveOrderReconciliationAudit,
+    LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveVenueReconciledOutcome,
+    MarkKind, MatchedLogIdentity, OrderFillFinalizedAudit, RedemptionAttempt,
+    RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput, RiskAudit,
+    RiskDecisionAudit, SizingModeAudit, reconstruct_redemption_attempts, redemption_posture,
+    replay_account, run_redemption_pass,
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
-use pe_source_polymarket_public::BinaryPayoutVector;
-use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
-use pe_venue_polymarket::{
-    CustodyKind, DecodedOrderFill, LadderError, MatchedReceipt, ReceiptError, RedemptionTransport,
-    RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy, build_redemption_call,
-    canonical_block_matches, decode_order_fills, fee_reserve, fee_within_reserve,
-    parse_chain_id_response, parse_finalized_block_response, parse_receipt_response,
-    plan_budget_buy, sign_deposit_wallet_redemption, taker_fee,
+use pe_source_core::SourceError;
+use pe_source_polymarket_public::{
+    ActivityAssetMapping, BinaryPayoutVector, ClassifiedPricesHistory, ClobPayoutResolution,
+    ClobPricesHistoryClient, FixtureFetcher, HttpRequestContext, ReconciliationFetcher,
+    ReqwestFetcher, fetch_complete_positions, parse_clob_market,
 };
-use rust_decimal::prelude::ToPrimitive as _;
+use pe_strategy_winner_follow::{
+    ExecutionMode, RiskInputsUnavailable, SizingMode, WinnerFollowError, WinnerFollowStrategy,
+};
+use pe_venue_polymarket::{
+    BuySizing, CustodyKind, DecodedOrderFill, LadderError, MatchedReceipt, ReceiptError,
+    RedemptionTransport, RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy,
+    build_redemption_call, canonical_block_matches, decode_order_fills, fee_within_reserve,
+    parse_chain_id_response, parse_finalized_block_response, parse_receipt_response,
+    plan_sized_buy, sign_deposit_wallet_redemption,
+};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
+use crate::activity_ingest::SourceLogHandle;
 use crate::clob_book::{ClobBookFetcher, ReqwestClobBookFetcher};
 use crate::live_accounts::{AccountContext, LiveAccounts};
 use crate::live_credentials::{
@@ -57,9 +66,10 @@ use crate::live_projections::{
 };
 use crate::live_venue_adapter::{
     LiveAdmissionBuilder, LiveRedemptionAdapter, LiveVenueAdapterError, PolygonReceiptReader,
-    PolymarketLiveVenue,
+    PolygonReceiptRpc, PolymarketLiveVenue,
 };
 use crate::live_watchlist::LiveWatchlist;
+use crate::mid_price_cache::MidPriceCache;
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::supabase_reader::auth_token;
 
@@ -70,8 +80,7 @@ const DISPATCH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const REDEMPTION_RETRY_SECS: i64 = 30;
 /// Ordinary redemption inventory/status reconcile cadence (Decision 12).
 const REDEMPTION_RECONCILE_CADENCE_SECS: i64 = 300;
-const REDEEMABLE_POSITION_PAGE_LIMIT: usize = 500;
-const REDEEMABLE_POSITION_MAX_OFFSET: usize = 10_000;
+const COMPLETE_POSITIONS_SOURCE_ID: &str = "polymarket.data.complete-positions";
 // verified 2026-08-11 from the official four-minute Deposit Wallet batch example:
 // https://github.com/Polymarket/builder-relayer-client#execute-deposit-wallet-batch
 const DEPOSIT_WALLET_REDEMPTION_DEADLINE_SECS: u64 = 4 * 60;
@@ -85,9 +94,14 @@ pub struct LiveFanoutConfig {
     pub identity: Option<Identity>,
     pub journal: Arc<LiveJournal>,
     pub journal_path: PathBuf,
+    /// QualificationStart-bound live prefix, verified once before this fanout is constructed.
+    pub era_live_prefix: Option<pe_event_log::LogTailBinding>,
     pub projection: LiveProjectionWriter,
     pub book_fetcher: Arc<ReqwestClobBookFetcher>,
+    pub mid_price_cache: MidPriceCache,
+    pub source_log: SourceLogHandle,
     pub http: reqwest::Client,
+    pub polygon_receipt_rpc_url: String,
     pub supabase_url: String,
     pub supabase_anon_key: String,
     pub supabase_secret_key: String,
@@ -115,11 +129,24 @@ impl AdmissionClosures {
 struct FanoutState {
     config: LiveFanoutConfig,
     admission: LiveAdmissionBuilder,
+    polygon_receipt_rpc: PolygonReceiptRpc,
+    history_fetcher: ReqwestFetcher,
     closures: AdmissionClosures,
     last_mode_unix: Option<i64>,
     last_redemption_unix: Option<i64>,
     last_projection_unix: Option<i64>,
     last_prune_unix: Option<i64>,
+}
+
+fn replay_live_account(
+    state: &FanoutState,
+    account_id: &AccountId,
+) -> Result<Vec<LiveJournalEvent>, pe_execution_core::LiveJournalError> {
+    let mut events = replay_account(&state.config.journal_path, account_id)?;
+    if let Some(prefix) = &state.config.era_live_prefix {
+        events.retain(|event| prefix.last_sequence.is_none_or(|last| event.seq > last.0));
+    }
+    Ok(events)
 }
 
 /// Start the first-boot arming fence, then drive mode, redemption, retention, and ordered fan-out.
@@ -164,10 +191,16 @@ pub async fn run_live_fanout_until(
         config.http.clone(),
         config.gamma_base_url.clone(),
         config.clob_base_url.clone(),
+        config.source_log.clone(),
     );
+    let polygon_receipt_rpc =
+        PolygonReceiptRpc::new(config.http.clone(), config.polygon_receipt_rpc_url.clone());
+    let history_fetcher = ReqwestFetcher::new(config.http.clone()).with_min_interval_ms(200);
     let mut state = FanoutState {
         config,
         admission,
+        polygon_receipt_rpc,
+        history_fetcher,
         closures: AdmissionClosures::default(),
         last_mode_unix: None,
         last_redemption_unix: None,
@@ -783,11 +816,12 @@ async fn run_recovery_pass(
     state: &mut FanoutState,
     now: OffsetDateTime,
 ) -> Result<(), FanoutError> {
-    for seed in state
+    let mut freeze = false;
+    let seeds = state
         .config
         .paper_state
-        .unfinalized_ready_dispatch_seeds()?
-    {
+        .unfinalized_ready_dispatch_seeds()?;
+    for seed in &seeds {
         let signal = parse_frozen_signal(&seed)?;
         for target in state
             .config
@@ -798,13 +832,83 @@ async fn run_recovery_pass(
         {
             if process_target(state, &seed, &target, &signal, now).await? == PassControl::FreezePass
             {
-                return Ok(());
+                freeze = true;
             }
         }
+    }
+
+    // One Polygon batch shares chain identity, finalized head, receipts, and canonical blocks
+    // across every authenticated target relevant to this recovery pass.
+    let mut finality_targets = Vec::new();
+    let mut pending = Vec::new();
+    for seed in &seeds {
+        for target in state
+            .config
+            .paper_state
+            .dispatch_targets(&seed.dispatch_id)?
+            .into_iter()
+            .filter(|target| target.state == "submitted" || target.state == "ambiguous")
+        {
+            let Some(recovered) = recovered_prepared(state, &target)? else {
+                continue;
+            };
+            if recovered.finalized || recovered.transaction_hashes.is_empty() {
+                continue;
+            }
+            pending.push(PendingOrderFinality {
+                prepared_journal_seq: recovered.journal_seq,
+                prepared: recovered.audit,
+                transaction_hashes: recovered.transaction_hashes.into_iter().collect(),
+            });
+            finality_targets.push(target);
+        }
+    }
+    let results = collect_order_finality(&state.polygon_receipt_rpc, pending).await;
+    for (target, result) in finality_targets.into_iter().zip(results) {
+        let account_id = AccountId::new(&target.account_id)
+            .map_err(|error| FanoutError::Signal(error.to_string()))?;
+        match append_order_finality_result(state.config.journal.as_ref(), account_id, now, result)?
+        {
+            FinalityJournalEffect::Pending => {
+                state.config.paper_state.set_dispatch_target_state(
+                    &target.dispatch_id,
+                    &target.account_id,
+                    "submitted",
+                    None,
+                    now.unix_timestamp(),
+                )?;
+            }
+            FinalityJournalEffect::Conflict => {
+                state.config.paper_state.set_dispatch_target_state(
+                    &target.dispatch_id,
+                    &target.account_id,
+                    "ambiguous",
+                    Some("polygon_finality_conflict"),
+                    now.unix_timestamp(),
+                )?;
+                freeze = true;
+            }
+            FinalityJournalEffect::Finalized => {
+                terminalize(state, &target, "filled", now)?;
+                let snapshot = state.config.live_accounts.snapshot();
+                if let Some(account) = snapshot
+                    .accounts
+                    .iter()
+                    .find(|account| account.account_id.as_str() == target.account_id)
+                {
+                    reconcile_account_projection(state, account, now).await;
+                }
+            }
+        }
+    }
+    for seed in &seeds {
         state
             .config
             .paper_state
             .finalize_dispatch_if_terminal(&seed.dispatch_id, now.unix_timestamp())?;
+    }
+    if freeze {
+        warn!("one or more live targets remain frozen after recovery");
     }
     Ok(())
 }
@@ -934,6 +1038,10 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
     };
+    let Some(book_receipt) = book.source_receipt else {
+        warn!(account_id = %target.account_id, "recorded /book receipt missing; seed paused");
+        return Ok(PassControl::StopSeed);
+    };
     let now_ms = unix_ms(now);
     if pe_venue_polymarket::ladder_is_stale(now_ms, book.fetched_at_ms) {
         return Ok(PassControl::StopSeed);
@@ -965,19 +1073,39 @@ async fn process_target(
     strategy_config.sizing_mode = sizing;
     let strategy = WinnerFollowStrategy::new(strategy_config.clone());
     let probability = probability_for(&state.config.live_watchlist, signal);
+    let per_trade_cap_bps = strategy_config
+        .per_trade_cap
+        .resolve_bps(TradingMode::LiveTiny);
+    let initial_risk = match live_risk_audit(
+        state,
+        account,
+        signal,
+        CollateralAmount::ZERO,
+        per_trade_cap_bps,
+        now,
+    )
+    .await
+    {
+        Ok(risk) => risk,
+        Err(reason) => {
+            let decline = WinnerFollowError::RiskInputsUnavailable(reason);
+            warn!(account_id = %target.account_id, decline = %decline, "live risk inputs unavailable; seed paused");
+            return Ok(PassControl::StopSeed);
+        }
+    };
     let intent = match strategy.evaluate_at_price(
         signal,
         best_ask,
         probability,
-        zeroed_risk_snapshot(),
+        initial_risk.snapshot,
         account_state.reconciled_free_collateral.to_decimal(),
         ExecutionMode::LiveTiny,
         None,
         Some(best_ask),
     ) {
         Ok(intent) => intent,
-        Err(_) => {
-            terminalize(state, target, "live_sizing_refused", now)?;
+        Err(error) => {
+            terminalize(state, target, winner_follow_terminal_reason(&error), now)?;
             return Ok(PassControl::Continue);
         }
     };
@@ -1009,38 +1137,126 @@ async fn process_target(
             return Ok(PassControl::Continue);
         }
     };
-    let plan = match plan_budget_buy(
+    let policy_cap = collateral_cap(account_state.reconciled_free_collateral, per_trade_cap_bps)
+        .ok_or_else(|| FanoutError::Signal("live per-trade cap arithmetic failed".to_owned()))?;
+    let requested_sizing = match strategy_config.sizing_mode {
+        SizingMode::Dollar { usd } => {
+            let budget = CollateralAmount::from_decimal_exact(
+                usd.round_dp_with_strategy(6, RoundingStrategy::ToNegativeInfinity),
+            )
+            .map_err(|error| FanoutError::Signal(error.to_string()))?;
+            BuySizing::Dollar { budget }
+        }
+        SizingMode::Contract { contracts } => BuySizing::Contract { contracts },
+        SizingMode::Kelly => BuySizing::Kelly {
+            contracts: intent.contracts.0,
+        },
+    };
+    let sized = match plan_sized_buy(
         &ladder,
-        account_state.reconciled_free_collateral,
-        Some(intent.contracts.0),
+        admission.fee_schedule,
+        requested_sizing,
+        &[account_state.reconciled_free_collateral, policy_cap],
+        admission.market.minimum_order_size,
+        admission.market.minimum_tick_size,
         minimum_price,
         maximum_price,
+        signal.leader_price,
         ceiling,
     ) {
-        Ok(plan) if plan.shares >= admission.market.minimum_order_size => plan,
-        Ok(_) => {
-            terminalize(state, target, "below_minimum_order", now)?;
-            return Ok(PassControl::Continue);
-        }
+        Ok(plan) => plan,
         Err(error) => {
             terminalize(state, target, ladder_terminal_reason(&error), now)?;
             return Ok(PassControl::Continue);
         }
     };
-    let identity = build_order_identity(seed, target, signal, &admission, &plan, &strategy_config)?;
-    let economic = build_economic_prepared(
+    let plan = sized.ladder;
+    let proposed_debit = plan
+        .worst_case_debit
+        .checked_add(sized.reserve)
+        .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    let risk = match live_risk_audit(
+        state,
+        account,
         signal,
-        &identity,
+        proposed_debit,
+        per_trade_cap_bps,
+        now,
+    )
+    .await
+    {
+        Ok(risk) => risk,
+        Err(reason) => {
+            let decline = WinnerFollowError::RiskInputsUnavailable(reason);
+            warn!(account_id = %target.account_id, decline = %decline, "live risk inputs unavailable; seed paused");
+            return Ok(PassControl::StopSeed);
+        }
+    };
+    let identity = build_order_identity(
+        seed,
+        target,
+        signal,
         &admission,
         &plan,
+        book_receipt,
         &strategy_config,
-        probability,
-        account_state.reconciled_free_collateral,
-        price_impact_cap_bps,
-        ceiling,
-        minimum_price,
-        maximum_price,
     )?;
+    let outcome_index = u8::try_from(signal.outcome_id.0)
+        .map_err(|_| FanoutError::Signal("outcome index exceeds u8".to_owned()))?;
+    let sizing_mode = match strategy_config.sizing_mode {
+        SizingMode::Kelly => SizingModeAudit::Kelly {
+            fraction: strategy_config
+                .kelly_fraction_override
+                .unwrap_or(KellyFraction(Decimal::new(25, 2))),
+            probability,
+        },
+        SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },
+        SizingMode::Contract { contracts } => SizingModeAudit::Contract { contracts },
+    };
+    let economic = EconomicPrepared::compose(EconomicInputs {
+        market: pe_execution_core::MarketSelection {
+            condition_id: admission.market.condition_id.clone(),
+            outcome_index,
+            token_id: token_id.clone(),
+            side: Side::Buy,
+            market_id: signal.market_id.to_string(),
+        },
+        admission: &admission,
+        plan: &plan,
+        book_receipt,
+        observation: None,
+        sizing_mode,
+        budget: sized.budget,
+        slippage_rate: strategy_config.slippage_rate,
+        risk,
+        cash_before: account_state.reconciled_free_collateral,
+        price_impact_cap_bps,
+        chase_ceiling: signal.leader_price,
+        band_floor: minimum_price,
+        band_ceiling_exclusive: maximum_price,
+        applied_configuration_hash: identity.config_hash.clone(),
+    })
+    .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    if let Err(decline) = strategy.evaluate_at_price(
+        signal,
+        economic.sizing.all_in_price,
+        probability,
+        economic.risk.snapshot.clone(),
+        account_state.reconciled_free_collateral.to_decimal(),
+        ExecutionMode::LiveTiny,
+        None,
+        Some(economic.sizing.all_in_price),
+    ) {
+        terminalize(state, target, winner_follow_terminal_reason(&decline), now)?;
+        return Ok(PassControl::Continue);
+    }
+    if ensure_live_portfolio_marks(state, account, &account_state, &venue.deposit_wallet(), now)
+        .await
+        != CheckOutcome::Pass
+    {
+        warn!(account_id = %target.account_id, "immediate pre-post inventory reconciliation failed; seed paused");
+        return Ok(PassControl::StopSeed);
+    }
     let binding = CredentialBindingIdentity {
         version: target.credential_bundle_version,
         key_id: target.credential_key_id.clone(),
@@ -1121,6 +1337,18 @@ fn parse_band_price(value: Decimal, disabled: Price) -> Result<Price, ()> {
     Price::new(value).map_err(|_| ())
 }
 
+fn collateral_cap(bankroll: CollateralAmount, cap_bps: i32) -> Option<CollateralAmount> {
+    if !(0..=10_000).contains(&cap_bps) {
+        return None;
+    }
+    let value = bankroll
+        .to_decimal()
+        .checked_mul(Decimal::from(cap_bps))?
+        .checked_div(Decimal::from(10_000i32))?
+        .round_dp_with_strategy(6, RoundingStrategy::ToNegativeInfinity);
+    CollateralAmount::from_decimal_exact(value).ok()
+}
+
 fn probability_for(live: &LiveWatchlist, signal: &LeaderSignal) -> Probability {
     let bps = live
         .snapshot()
@@ -1133,20 +1361,171 @@ fn probability_for(live: &LiveWatchlist, signal: &LeaderSignal) -> Probability {
     Probability::new(Decimal::from(bps) / Decimal::from(10_000i32)).unwrap_or(Probability::ZERO)
 }
 
-fn zeroed_risk_snapshot() -> RiskSnapshot {
-    RiskSnapshot {
-        leader_exposure_bps: BasisPoints(0),
-        market_exposure_bps: BasisPoints(0),
-        family_exposure_bps: BasisPoints(0),
-        total_copy_exposure_bps: BasisPoints(0),
-        intraday_pnl_bps: BasisPoints(0),
-        rolling_7d_pnl_bps: BasisPoints(0),
-        absolute_pnl_bps: BasisPoints(0),
-        copy_latency_kill_switch_active: false,
-        proposed_trade_bps: BasisPoints(0),
-        per_trade_cap_bps: 0,
+async fn live_risk_audit(
+    state: &FanoutState,
+    account: &AccountContext,
+    signal: &LeaderSignal,
+    proposed_debit: CollateralAmount,
+    per_trade_cap_bps: i32,
+    now: OffsetDateTime,
+) -> Result<RiskAudit, RiskInputsUnavailable> {
+    let events = replay_live_account(state, &account.account_id)
+        .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+    let derived = derive_projection_rows(&account.account_id, &events)
+        .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+    let baseline = derived
+        .baseline_equity
+        .filter(|value| *value != CollateralAmount::ZERO)
+        .ok_or(RiskInputsUnavailable::BaselineNonPositive)?;
+    let cash = derived
+        .economic_cash
+        .ok_or(RiskInputsUnavailable::BaselineNonPositive)?;
+
+    let ids = derived
+        .positions
+        .iter()
+        .map(|position| {
+            let outcome =
+                u16::try_from(position.outcome_id).map_err(|_| RiskInputsUnavailable::Overflow)?;
+            Ok(MarketOutcomeId::new(
+                MarketId(VenueMarketId(position.market_id.clone())),
+                OutcomeId(outcome),
+            ))
+        })
+        .collect::<Result<Vec<_>, RiskInputsUnavailable>>()?;
+    let mids = state.config.mid_price_cache.fetch_mids_strict(&ids).await?;
+    let marked_positions = derived
+        .positions
+        .iter()
+        .map(|position| {
+            if position.short_contracts != Decimal::ZERO {
+                return Err(RiskInputsUnavailable::Overflow);
+            }
+            let quantity = ShareAmount::from_decimal_exact(position.long_contracts)
+                .map_err(|_| RiskInputsUnavailable::Overflow)?;
+            let outcome =
+                u16::try_from(position.outcome_id).map_err(|_| RiskInputsUnavailable::Overflow)?;
+            let price = mids
+                .get(&(position.market_id.clone(), outcome))
+                .ok_or(RiskInputsUnavailable::PriceMissing)?
+                .price;
+            Ok((quantity, price))
+        })
+        .collect::<Result<Vec<_>, RiskInputsUnavailable>>()?;
+    let equity = pe_risk_engine::current_equity(&pe_risk_engine::EquityInputs {
+        cash,
+        positions: &marked_positions,
+    })
+    .map_err(|_| RiskInputsUnavailable::Overflow)?;
+    let midnight = now.unix_timestamp().div_euclid(86_400) * 86_400;
+    let baseline_cutoff = derived
+        .baseline_cutoff_unix
+        .ok_or(RiskInputsUnavailable::MarkMissing)?;
+    let preceding_mark_equity = if baseline_cutoff < midnight {
+        Some(
+            derived
+                .daily_marks
+                .get(&midnight)
+                .ok_or(RiskInputsUnavailable::MarkMissing)?
+                .to_decimal(),
+        )
+    } else {
+        None
+    };
+    let realized_closes_7d =
+        pe_risk_engine::realized_closes_7d(&derived.realized_closes, now.unix_timestamp())
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+    let pnl = pe_risk_engine::pnl_bps(
+        equity,
+        &pe_risk_engine::PnlWindow {
+            starting_bankroll: baseline.to_decimal(),
+            preceding_mark_equity,
+            realized_closes_7d,
+        },
+    )
+    .map_err(|_| RiskInputsUnavailable::Overflow)?;
+
+    let exposure = |leader: Option<&str>, market: Option<&str>| {
+        derived
+            .open_exposures
+            .iter()
+            .filter(|item| leader.is_none_or(|value| item.leader_wallet == value))
+            .filter(|item| market.is_none_or(|value| item.market_id == value))
+            .try_fold(CollateralAmount::ZERO, |total, item| {
+                total
+                    .checked_add(item.debit)
+                    .map_err(|_| RiskInputsUnavailable::Overflow)
+            })
+    };
+    let total = exposure(None, None)?;
+    let leader = exposure(Some(&signal.leader.to_string()), None)?;
+    let market = exposure(None, Some(&signal.market_id.to_string()))?;
+    let to_bps = |amount| {
+        pe_risk_engine::exposure_bps_ceil(amount, baseline).ok_or(RiskInputsUnavailable::Overflow)
+    };
+    let snapshot = RiskSnapshot {
+        leader_exposure_bps: to_bps(leader)?,
+        market_exposure_bps: to_bps(market)?,
+        // The live protocol has no independent family identity. Treating every open position as
+        // one family is the conservative receipt-backed view, never a fabricated zero.
+        family_exposure_bps: to_bps(total)?,
+        total_copy_exposure_bps: to_bps(total)?,
+        intraday_pnl_bps: pnl.intraday,
+        rolling_7d_pnl_bps: pnl.rolling_7d,
+        absolute_pnl_bps: pnl.absolute,
+        copy_latency_kill_switch_active: live_latency_switch(&events, now),
+        proposed_trade_bps: to_bps(proposed_debit)?,
+        per_trade_cap_bps,
         concentration_caps: None,
+    };
+    let decision = match pe_risk_engine::evaluate_risk(&snapshot) {
+        pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
+        pe_risk_engine::RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
+    };
+    Ok(RiskAudit { snapshot, decision })
+}
+
+fn live_latency_switch(events: &[LiveJournalEvent], now: OffsetDateTime) -> bool {
+    let latest_completed_hour = now.unix_timestamp().div_euclid(3_600) * 3_600 - 3_600;
+    let mut samples = BTreeMap::<i64, Vec<u64>>::new();
+    for event in events {
+        let LiveJournalPayload::OrderPosted(posted) = &event.payload else {
+            continue;
+        };
+        let RawHttpAttempt::Response(response) = &posted.evidence else {
+            continue;
+        };
+        let hour = response.received_at.unix_timestamp().div_euclid(3_600) * 3_600;
+        if hour > latest_completed_hour {
+            continue;
+        }
+        let elapsed = response.received_at - response.observed_at;
+        if let Ok(value) = u64::try_from(elapsed.whole_milliseconds()) {
+            samples.entry(hour).or_default().push(value);
+        }
     }
+    let hourly = samples
+        .into_iter()
+        .filter_map(|(hour, values)| {
+            pe_risk_engine::nearest_rank_p95(&values).map(|p95| (hour, p95))
+        })
+        .collect::<Vec<_>>();
+    let mut active = false;
+    let mut previous = None;
+    for (hour, value) in hourly {
+        if active {
+            active = pe_risk_engine::latency_switch(true, None, Some(value));
+        } else {
+            let adjacent = previous.filter(|(prior_hour, _)| *prior_hour == hour - 3_600);
+            active = pe_risk_engine::latency_switch(
+                false,
+                adjacent.map(|(_, prior)| prior),
+                Some(value),
+            );
+        }
+        previous = Some((hour, value));
+    }
+    active
 }
 
 fn build_order_identity(
@@ -1155,6 +1534,7 @@ fn build_order_identity(
     signal: &LeaderSignal,
     admission: &pe_execution_core::LiveAdmissionArtifact,
     plan: &pe_venue_polymarket::LadderPlan,
+    book_receipt: AppendReceipt,
     strategy: &pe_strategy_winner_follow::WinnerFollowConfig,
 ) -> Result<LiveOrderIdentity, FanoutError> {
     let asks = plan
@@ -1168,14 +1548,25 @@ fn build_order_identity(
         plan.best_ask,
         plan.limit_price,
         plan.shares,
-        plan.estimated_ladder_spend,
+        plan.expected_shares()
+            .map_err(|error| FanoutError::Signal(error.to_string()))?,
+        plan.expected_spend()
+            .map_err(|error| FanoutError::Signal(error.to_string()))?,
+        plan.vwap(),
         plan.worst_case_debit,
+        book_receipt,
     ))?;
     let config_hash = hash_json(&("prediction-edge/live-config/v1", strategy))?;
     let evidence_hashes = vec![
-        admission.market.raw_gamma_market_hash.to_hex().to_string(),
-        admission.market.raw_clob_market_hash.to_hex().to_string(),
-        admission.settlement.raw_evidence_hash.clone(),
+        admission.receipts.gamma.this_hash.to_hex().to_string(),
+        admission.receipts.clob_long.this_hash.to_hex().to_string(),
+        admission
+            .receipts
+            .clob_compact
+            .this_hash
+            .to_hex()
+            .to_string(),
+        book_receipt.this_hash.to_hex().to_string(),
         quote_id.clone(),
     ];
     let decision_hash = hash_json(&(
@@ -1202,143 +1593,6 @@ fn build_order_identity(
         })),
         schema_version: 1,
         parser_version: 1,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_economic_prepared(
-    signal: &LeaderSignal,
-    identity: &LiveOrderIdentity,
-    admission: &pe_execution_core::LiveAdmissionArtifact,
-    plan: &pe_venue_polymarket::LadderPlan,
-    strategy: &pe_strategy_winner_follow::WinnerFollowConfig,
-    probability: Probability,
-    cash_before: CollateralAmount,
-    price_impact_cap_bps: i32,
-    chase_ceiling: Price,
-    band_floor: Price,
-    band_ceiling_exclusive: Price,
-) -> Result<EconomicPrepared, FanoutError> {
-    let outcome_index = u8::try_from(signal.outcome_id.0)
-        .map_err(|_| FanoutError::Signal("outcome index exceeds u8".to_owned()))?;
-    let token_id = admission
-        .market
-        .ordered_outcome_token_ids
-        .get(usize::from(outcome_index))
-        .cloned()
-        .ok_or_else(|| FanoutError::Signal("outcome token is missing".to_owned()))?;
-    let ladder = LadderPlanAudit::new(plan);
-    let expected_shares = ladder
-        .expected_shares()
-        .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let expected_vwap = ladder
-        .expected_vwap()
-        .ok_or_else(|| FanoutError::Signal("ladder VWAP is invalid".to_owned()))?;
-    let schedule = admission.fee_schedule;
-    let expected_fee = taker_fee(schedule, plan.shares, plan.limit_price)
-        .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let reserve = fee_reserve(
-        schedule,
-        plan.worst_case_debit,
-        plan.best_ask,
-        plan.limit_price,
-    )
-    .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let paper_debit = plan
-        .worst_case_debit
-        .checked_add(expected_fee)
-        .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let all_in_price = Price::new(
-        paper_debit
-            .to_decimal()
-            .checked_div(plan.shares.to_decimal())
-            .and_then(|price| {
-                Decimal::ONE
-                    .checked_add(strategy.slippage_rate)
-                    .and_then(|slippage| price.checked_mul(slippage))
-            })
-            .ok_or_else(|| FanoutError::Signal("all-in price arithmetic failed".to_owned()))?,
-    )
-    .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let sizing_mode = match strategy.sizing_mode {
-        SizingMode::Kelly => SizingModeAudit::Kelly {
-            fraction: strategy
-                .kelly_fraction_override
-                .unwrap_or(KellyFraction(Decimal::new(25, 2))),
-            probability,
-        },
-        SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },
-        SizingMode::Contract { contracts } => SizingModeAudit::Contract { contracts },
-    };
-    let mut snapshot = zeroed_risk_snapshot();
-    let proposed_trade_bps = plan
-        .shares
-        .to_decimal()
-        .checked_mul(plan.best_ask.0)
-        .and_then(|notional| notional.checked_div(cash_before.to_decimal()))
-        .and_then(|ratio| ratio.checked_mul(Decimal::from(10_000u32)))
-        .map(|value| value.ceil())
-        .and_then(|value| value.to_i32())
-        .ok_or_else(|| FanoutError::Signal("risk exposure arithmetic failed".to_owned()))?;
-    snapshot.proposed_trade_bps = BasisPoints(proposed_trade_bps);
-    snapshot.per_trade_cap_bps = strategy.per_trade_cap.resolve_bps(TradingMode::LiveTiny);
-    let worst_case_debit = plan
-        .worst_case_debit
-        .checked_add(reserve)
-        .map_err(|error| FanoutError::Signal(error.to_string()))?;
-
-    // #545 lane E fills this with the synchronized `/book` source-log receipt. The current book
-    // fetcher exposes only its raw response digest, so no append sequence exists at this boundary.
-    let book_receipt = AppendReceipt {
-        sequence: EventSeq(0),
-        this_hash: blake3::Hash::from_bytes([0; 32]),
-    };
-    Ok(EconomicPrepared {
-        version: ECONOMIC_PREPARED_VERSION,
-        market: MarketSelection {
-            condition_id: admission.market.condition_id.clone(),
-            outcome_index,
-            token_id,
-            side: Side::Buy,
-            market_id: signal.market_id.to_string(),
-        },
-        admission: LiveAdmissionArtifactAudit::new(
-            &admission.market,
-            &admission.settlement,
-            admission.fee_schedule,
-            admission.receipts,
-        ),
-        ladder,
-        book_receipt,
-        observation: None,
-        sizing: SizingAudit {
-            mode: sizing_mode,
-            budget: cash_before,
-            principal: plan.worst_case_debit,
-            minimum_shares: plan.shares,
-            expected_shares,
-            expected_vwap,
-            all_in_price,
-            slippage_rate: strategy.slippage_rate,
-        },
-        fee: FeeAudit {
-            schedule,
-            expected_fee,
-            reserve,
-        },
-        risk: RiskAudit {
-            snapshot,
-            decision: RiskDecisionAudit::Approved,
-        },
-        balance: BalanceAudit {
-            cash_before,
-            worst_case_debit,
-            price_impact_cap_bps,
-            chase_ceiling,
-            band_floor,
-            band_ceiling_exclusive,
-        },
-        applied_configuration_hash: identity.config_hash.clone(),
     })
 }
 
@@ -1409,6 +1663,7 @@ fn admission_error_is_transient(error: &LiveVenueAdapterError) -> bool {
         error,
         LiveVenueAdapterError::MarketTransport(_)
             | LiveVenueAdapterError::MarketStatus(429 | 500..=599)
+            | LiveVenueAdapterError::SourceLogClosed
     )
 }
 
@@ -1419,7 +1674,8 @@ fn admission_terminal_reason(error: &LiveVenueAdapterError) -> &'static str {
         LiveVenueAdapterError::MarketValidation(_) => "market_evidence_invalid",
         LiveVenueAdapterError::Client(_)
         | LiveVenueAdapterError::MarketTransport(_)
-        | LiveVenueAdapterError::Redemption(_) => "market_evidence_invalid",
+        | LiveVenueAdapterError::Redemption(_)
+        | LiveVenueAdapterError::SourceLogClosed => "market_evidence_invalid",
     }
 }
 
@@ -1428,7 +1684,21 @@ fn ladder_terminal_reason(error: &LadderError) -> &'static str {
         LadderError::NothingAffordable => "nothing_affordable",
         LadderError::BelowBandAsk => "below_live_price_band",
         LadderError::InsufficientDepth => "insufficient_live_depth",
+        LadderError::BelowMinimum => "below_minimum_order",
+        LadderError::CapExceeded => "cap_exceeded",
+        LadderError::Fee(_) => "fee_schedule_invalid",
         LadderError::Amount => "ladder_amount_invalid",
+    }
+}
+
+fn winner_follow_terminal_reason(error: &WinnerFollowError) -> &'static str {
+    match error {
+        WinnerFollowError::ShadowMode => "shadow_mode",
+        WinnerFollowError::FlipNotApproved => "flip_not_approved",
+        WinnerFollowError::NoEdge => "no_edge",
+        WinnerFollowError::Blocked(_) => "risk_blocked",
+        WinnerFollowError::RiskInputsUnavailable(_) => "risk_inputs_unavailable",
+        WinnerFollowError::KellySizing(_) => "kelly_sizing_invalid",
     }
 }
 
@@ -1442,6 +1712,19 @@ pub(crate) struct ProjectionDerivation {
     pub(crate) receivable: Decimal,
     pub(crate) latest_free_collateral: Option<Decimal>,
     pub(crate) latest_reconciled_at: Option<String>,
+    pub(crate) baseline_equity: Option<CollateralAmount>,
+    pub(crate) baseline_cutoff_unix: Option<i64>,
+    pub(crate) daily_marks: BTreeMap<i64, CollateralAmount>,
+    pub(crate) realized_closes: Vec<(i64, Decimal)>,
+    open_exposures: Vec<LiveOpenExposure>,
+    receivable_by_condition: BTreeMap<String, CollateralAmount>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveOpenExposure {
+    leader_wallet: String,
+    market_id: String,
+    debit: CollateralAmount,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1497,6 +1780,9 @@ pub(crate) fn derive_projection_rows(
     let mut latest_free_collateral = None;
     let mut latest_reconciled_at = None;
     let mut daily_marks = BTreeMap::new();
+    let mut baseline_equity = None;
+    let mut baseline_cutoff_unix = None;
+    let mut realized_closes = Vec::new();
 
     for event in events {
         if let LiveJournalPayload::AccountPortfolioMarked(mark) = &event.payload
@@ -1513,6 +1799,8 @@ pub(crate) fn derive_projection_rows(
                 return Err(ProjectionReducerError::InvalidBaseline);
             }
             baseline_seen = true;
+            baseline_equity = Some(mark.equity);
+            baseline_cutoff_unix = Some(mark.cutoff_unix);
             economic_cash = Some(mark.equity.to_decimal());
             latest_free_collateral = Some(mark.account_state.collateral_balance.to_decimal());
             latest_reconciled_at = format_observed_at(mark.account_state.observed_at);
@@ -1655,6 +1943,29 @@ pub(crate) fn derive_projection_rows(
                     return Err(ProjectionReducerError::ResolutionWithPendingOrder);
                 }
                 let credit = resolution_credit(&condition, &payout, &prepared_orders, &fills)?;
+                let closed_cost =
+                    fills
+                        .iter()
+                        .try_fold(CollateralAmount::ZERO, |total, (key, (fill, _))| {
+                            let Some((_, order, _)) = prepared_orders.get(key) else {
+                                return Err(ProjectionReducerError::MissingPrepared);
+                            };
+                            if order.prepared.condition_id.0 != condition {
+                                return Ok(total);
+                            }
+                            let debit = fill
+                                .principal
+                                .checked_add(fill.fee)
+                                .map_err(|_| ProjectionReducerError::Arithmetic)?;
+                            total
+                                .checked_add(debit)
+                                .map_err(|_| ProjectionReducerError::Arithmetic)
+                        })?;
+                let realized = credit
+                    .to_decimal()
+                    .checked_sub(closed_cost.to_decimal())
+                    .ok_or(ProjectionReducerError::Arithmetic)?;
+                realized_closes.push((event.timestamp.unix_timestamp(), realized));
                 economic_cash = Some(
                     economic_cash
                         .ok_or(ProjectionReducerError::InvalidBaseline)?
@@ -1771,6 +2082,28 @@ pub(crate) fn derive_projection_rows(
     positions.sort_by(|left, right| {
         (&left.market_id, left.outcome_id).cmp(&(&right.market_id, right.outcome_id))
     });
+    let mut open_exposures = Vec::new();
+    for (key, (finalized, _)) in &fills {
+        let Some((_, order, _)) = prepared_orders.get(key) else {
+            return Err(ProjectionReducerError::MissingPrepared);
+        };
+        if resolutions.contains_key(&order.prepared.condition_id.0) {
+            continue;
+        }
+        let projection = order
+            .identity
+            .fill_projection
+            .as_deref()
+            .ok_or(ProjectionReducerError::MissingProjectionIdentity)?;
+        open_exposures.push(LiveOpenExposure {
+            leader_wallet: projection.leader_wallet.clone(),
+            market_id: projection.market_id.clone(),
+            debit: finalized
+                .principal
+                .checked_add(finalized.fee)
+                .map_err(|_| ProjectionReducerError::Arithmetic)?,
+        });
+    }
 
     let custody_positions = derive_custody_positions(
         &prepared_orders,
@@ -1795,6 +2128,12 @@ pub(crate) fn derive_projection_rows(
         receivable,
         latest_free_collateral,
         latest_reconciled_at,
+        baseline_equity,
+        baseline_cutoff_unix,
+        daily_marks,
+        realized_closes,
+        open_exposures,
+        receivable_by_condition,
     })
 }
 
@@ -1830,7 +2169,7 @@ fn resolution_credit(
     prepared: &PreparedOrders,
     fills: &FinalizedFills,
 ) -> Result<CollateralAmount, ProjectionReducerError> {
-    let mut atomic_by_outcome = [0_u64; 2];
+    let mut positions = Vec::new();
     for (key, (fill, _)) in fills {
         let Some((_, order, _)) = prepared.get(key) else {
             return Err(ProjectionReducerError::MissingPrepared);
@@ -1838,29 +2177,13 @@ fn resolution_credit(
         if order.prepared.condition_id.0 != condition {
             continue;
         }
-        let outcome = usize::from(order.prepared.outcome_id.0);
-        let Some(total) = atomic_by_outcome.get_mut(outcome) else {
-            return Err(ProjectionReducerError::IdentityConflict);
-        };
-        *total = total
-            .checked_add(fill.quantity.atomic())
-            .ok_or(ProjectionReducerError::Arithmetic)?;
+        positions.push((order.prepared.outcome_id.0, fill.quantity));
     }
-    let credit_atomic = atomic_by_outcome
-        .into_iter()
-        .zip(payout.decimals())
-        .try_fold(0_u64, |total, (shares, payout)| {
-            let component = Decimal::from(shares)
-                .checked_mul(*payout)
-                .ok_or(ProjectionReducerError::Arithmetic)?
-                .round_dp_with_strategy(0, RoundingStrategy::ToNegativeInfinity)
-                .to_u64()
-                .ok_or(ProjectionReducerError::Arithmetic)?;
-            total
-                .checked_add(component)
-                .ok_or(ProjectionReducerError::Arithmetic)
-        })?;
-    Ok(CollateralAmount::from_atomic(credit_atomic))
+    let decimals = payout.decimals();
+    let payout = pe_risk_engine::BinaryPayout::new(decimals[0], decimals[1])
+        .map_err(|_| ProjectionReducerError::InvalidPayout)?;
+    pe_risk_engine::aggregate_resolution_credit(&positions, &payout)
+        .map_err(|_| ProjectionReducerError::Arithmetic)
 }
 
 fn derive_custody_positions(
@@ -2023,7 +2346,7 @@ async fn reconcile_account_projection(
     account: &AccountContext,
     _now: OffsetDateTime,
 ) {
-    let events = match replay_account(&state.config.journal_path, &account.account_id) {
+    let events = match replay_live_account(state, &account.account_id) {
         Ok(events) => events,
         Err(error) => {
             error!(account_id = %account.account_id, error = %error, "live projection journal replay failed");
@@ -2107,7 +2430,7 @@ fn recovered_prepared(
 ) -> Result<Option<RecoveredPrepared>, FanoutError> {
     let account_id = AccountId::new(&target.account_id)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let events = replay_account(&state.config.journal_path, &account_id)?;
+    let events = replay_live_account(state, &account_id)?;
     let mut recovered = None;
     for event in events {
         match event.payload {
@@ -2541,6 +2864,7 @@ struct StaticProbe {
     account: CheckOutcome,
     geoblock: CheckOutcome,
     balance: CheckOutcome,
+    polygon: CheckOutcome,
 }
 
 impl ArmingProbe for StaticProbe {
@@ -2554,6 +2878,10 @@ impl ArmingProbe for StaticProbe {
 
     fn balance_and_both_spender_allowances(&self) -> CheckOutcome {
         self.balance.clone()
+    }
+
+    fn polygon_finality(&self) -> CheckOutcome {
+        self.polygon.clone()
     }
 }
 
@@ -2601,8 +2929,9 @@ async fn drive_modes(state: &mut FanoutState, now: OffsetDateTime) {
         .iter()
         .filter(|account| account.effective_live_mode == "live_tiny")
         .count();
+    let polygon = polygon_arming_health(state).await;
     for account in &snapshot.accounts {
-        let (credential_outcome, probe) = mode_probe(state, account, now).await;
+        let (credential_outcome, probe) = mode_probe(state, account, now, polygon.clone()).await;
         let facts = promotions
             .get(account.account_id.as_str())
             .cloned()
@@ -2701,11 +3030,13 @@ async fn mode_probe(
     state: &mut FanoutState,
     account: &AccountContext,
     _now: OffsetDateTime,
+    polygon: CheckOutcome,
 ) -> (CheckOutcome, StaticProbe) {
     let unavailable = StaticProbe {
         account: CheckOutcome::Transient("account query unavailable"),
         geoblock: CheckOutcome::Transient("geoblock query unavailable"),
         balance: CheckOutcome::Transient("balance query unavailable"),
+        polygon: polygon.clone(),
     };
     // Operator kill/disabled and already-off accounts need no credentialed network probe. The
     // pure machine handles those control paths before inspecting probe results.
@@ -2716,6 +3047,7 @@ async fn mode_probe(
                 account: CheckOutcome::Pass,
                 geoblock: CheckOutcome::Pass,
                 balance: CheckOutcome::Pass,
+                polygon,
             },
         );
     }
@@ -2777,6 +3109,29 @@ async fn mode_probe(
     } else {
         CheckOutcome::Pass
     };
+    let portfolio = if standard.collateral_balance != neg_risk.collateral_balance {
+        CheckOutcome::PersistentFail("spender account reads disagree on collateral")
+    } else {
+        ensure_live_portfolio_marks(
+            state,
+            account,
+            &standard,
+            &venue.deposit_wallet(),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    };
+    if portfolio != CheckOutcome::Pass {
+        return (
+            CheckOutcome::Pass,
+            StaticProbe {
+                account: account_outcome,
+                geoblock,
+                balance: portfolio,
+                polygon,
+            },
+        );
+    }
     let settings = match fetch_account_settings(state, account.account_id.as_str()).await {
         Ok(settings) => settings,
         Err(_) => {
@@ -2786,6 +3141,7 @@ async fn mode_probe(
                     account: account_outcome,
                     geoblock,
                     balance: CheckOutcome::Transient("sizing posture unavailable"),
+                    polygon,
                 },
             );
         }
@@ -2800,6 +3156,7 @@ async fn mode_probe(
                     account: account_outcome,
                     geoblock,
                     balance: CheckOutcome::PersistentFail("sizing posture invalid"),
+                    polygon,
                 },
             );
         }
@@ -2834,8 +3191,294 @@ async fn mode_probe(
             account: account_outcome,
             geoblock,
             balance: balance_outcome,
+            polygon,
         },
     )
+}
+
+async fn polygon_arming_health(state: &FanoutState) -> CheckOutcome {
+    let chain_attempt = state.polygon_receipt_rpc.chain_id().await;
+    match response_body(&chain_attempt)
+        .ok()
+        .and_then(|body| parse_chain_id_response(body).ok())
+    {
+        Some(pe_venue_polymarket::FINALIZED_CHAIN_ID) => {}
+        Some(_) => return CheckOutcome::PersistentFail("wrong chain identity"),
+        None => return CheckOutcome::Transient("receipt RPC unavailable"),
+    }
+    let finalized_attempt = state.polygon_receipt_rpc.finalized_block().await;
+    match response_body(&finalized_attempt)
+        .ok()
+        .and_then(|body| parse_finalized_block_response(body).ok())
+    {
+        Some(_) => CheckOutcome::Pass,
+        None => CheckOutcome::Transient("finalized receipt tag unavailable"),
+    }
+}
+
+async fn ensure_live_portfolio_marks(
+    state: &mut FanoutState,
+    account: &AccountContext,
+    account_state: &pe_execution_core::LiveVenueAccountState,
+    custody_wallet: &str,
+    now: OffsetDateTime,
+) -> CheckOutcome {
+    let mut events = match replay_live_account(state, &account.account_id) {
+        Ok(events) => events,
+        Err(_) => return CheckOutcome::Transient("live journal unavailable"),
+    };
+    let inventory = match fetch_complete_venue_inventory(state, custody_wallet, &events).await {
+        Ok(inventory) => inventory,
+        Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
+    };
+    let mut derived = match derive_projection_rows(&account.account_id, &events) {
+        Ok(derived) => derived,
+        Err(_) => return CheckOutcome::PersistentFail("live financial journal conflicts"),
+    };
+    if derived.baseline_equity.is_none() {
+        // The first Baseline is the account's era boundary. Older records remain readable audit
+        // history and deliberately create no managed state; only current complete venue inventory
+        // can disprove the required empty start.
+        if !inventory.positions.is_empty() {
+            return CheckOutcome::PersistentFail("nonempty inventory before live Baseline");
+        }
+        if account_state.collateral_balance == CollateralAmount::ZERO {
+            return CheckOutcome::PersistentFail("live Baseline equity is nonpositive");
+        }
+        let audit = match account_state.audit() {
+            Ok(audit) => audit,
+            Err(_) => return CheckOutcome::PersistentFail("account audit invalid"),
+        };
+        if state
+            .config
+            .journal
+            .append(
+                account.account_id.clone(),
+                now,
+                LiveJournalPayload::AccountPortfolioMarked(Box::new(
+                    pe_execution_core::AccountPortfolioMarkedAudit {
+                        kind: MarkKind::Baseline,
+                        cutoff_unix: now.unix_timestamp(),
+                        account_state: audit,
+                        venue_positions: Vec::new(),
+                        venue_position_receipts: inventory.receipts.clone(),
+                        prices: Vec::new(),
+                        equity: account_state.collateral_balance,
+                    },
+                )),
+            )
+            .is_err()
+        {
+            return CheckOutcome::Transient("live Baseline journal append failed");
+        }
+        events = match replay_live_account(state, &account.account_id) {
+            Ok(events) => events,
+            Err(_) => return CheckOutcome::Transient("live Baseline replay failed"),
+        };
+        derived = match derive_projection_rows(&account.account_id, &events) {
+            Ok(derived) => derived,
+            Err(_) => return CheckOutcome::PersistentFail("live Baseline conflicts"),
+        };
+    }
+
+    let expected = match canonical_positions(&derived.custody_positions) {
+        Ok(expected) => expected,
+        Err(_) => return CheckOutcome::PersistentFail("managed inventory conflicts"),
+    };
+    let observed = match canonical_positions(&inventory.positions) {
+        Ok(observed) => observed,
+        Err(_) => return CheckOutcome::PersistentFail("venue inventory conflicts"),
+    };
+    if expected != observed {
+        return CheckOutcome::PersistentFail("venue inventory drift");
+    }
+    let Some(economic_cash) = derived.economic_cash else {
+        return CheckOutcome::Transient("live Baseline unavailable");
+    };
+    if account_state
+        .collateral_balance
+        .to_decimal()
+        .checked_add(derived.receivable)
+        != Some(economic_cash)
+    {
+        return CheckOutcome::PersistentFail("authenticated cash drift");
+    }
+
+    let Some(mut cutoff) = derived
+        .baseline_cutoff_unix
+        .and_then(|value| value.div_euclid(86_400).checked_add(1))
+        .and_then(|day| day.checked_mul(86_400))
+    else {
+        return CheckOutcome::PersistentFail("live boundary arithmetic overflow");
+    };
+    let completed_cutoff = now.unix_timestamp().div_euclid(86_400) * 86_400;
+    while cutoff <= completed_cutoff {
+        if !derived.daily_marks.contains_key(&cutoff) {
+            let mut prices = Vec::new();
+            for position in derived
+                .custody_positions
+                .iter()
+                .filter(|position| !position.redeemable)
+            {
+                let price = match fetch_historical_live_mark(state, position, cutoff).await {
+                    Ok(price) => price,
+                    Err(_) => return CheckOutcome::Transient("daily mark price unavailable"),
+                };
+                prices.push(price);
+            }
+            let marked = prices
+                .iter()
+                .map(|price| {
+                    let quantity = derived
+                        .custody_positions
+                        .iter()
+                        .find(|position| {
+                            position.condition_id == price.condition_id
+                                && position.outcome_index == price.outcome_index
+                        })
+                        .ok_or(())?;
+                    Ok((quantity.size, price.price))
+                })
+                .collect::<Result<Vec<_>, ()>>();
+            let Ok(marked) = marked else {
+                return CheckOutcome::PersistentFail("daily mark identity conflict");
+            };
+            let equity = match pe_risk_engine::current_equity(&pe_risk_engine::EquityInputs {
+                cash: economic_cash,
+                positions: &marked,
+            })
+            .ok()
+            .map(|value| value.round_dp_with_strategy(6, RoundingStrategy::ToNegativeInfinity))
+            .and_then(|value| CollateralAmount::from_decimal_exact(value).ok())
+            {
+                Some(equity) => equity,
+                None => return CheckOutcome::PersistentFail("daily mark equity overflow"),
+            };
+            let audit = match account_state.audit() {
+                Ok(audit) => audit,
+                Err(_) => return CheckOutcome::PersistentFail("account audit invalid"),
+            };
+            if state
+                .config
+                .journal
+                .append(
+                    account.account_id.clone(),
+                    now,
+                    LiveJournalPayload::AccountPortfolioMarked(Box::new(
+                        pe_execution_core::AccountPortfolioMarkedAudit {
+                            kind: MarkKind::Daily,
+                            cutoff_unix: cutoff,
+                            account_state: audit,
+                            venue_positions: inventory.positions.clone(),
+                            venue_position_receipts: inventory.receipts.clone(),
+                            prices,
+                            equity,
+                        },
+                    )),
+                )
+                .is_err()
+            {
+                return CheckOutcome::Transient("daily mark journal append failed");
+            }
+            derived.daily_marks.insert(cutoff, equity);
+        }
+        cutoff = match cutoff.checked_add(86_400) {
+            Some(next) => next,
+            None => return CheckOutcome::PersistentFail("live boundary arithmetic overflow"),
+        };
+    }
+    CheckOutcome::Pass
+}
+
+async fn fetch_historical_live_mark(
+    state: &FanoutState,
+    position: &CanonicalPositionAudit,
+    cutoff_unix: i64,
+) -> Result<pe_execution_core::MarkPrice, RiskInputsUnavailable> {
+    let start = cutoff_unix
+        .checked_sub(120)
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let url = format!(
+        "{}/prices-history?market={}&startTs={start}&endTs={cutoff_unix}&fidelity=1",
+        state.config.clob_base_url.trim_end_matches('/'),
+        position.token_id.0,
+    );
+    let mut attempts = Vec::new();
+    let fetched = state
+        .history_fetcher
+        .fetch_page_observed(
+            &url,
+            HttpRequestContext {
+                source_id: "polymarket.clob.prices-history",
+                endpoint_kind: "prices-history",
+            },
+            |attempt| {
+                attempts.push(attempt);
+                Ok(())
+            },
+        )
+        .await;
+    let mut receipts = Vec::new();
+    for attempt in &attempts {
+        if let RawHttpAttempt::Response(response) = attempt {
+            let schema_version = u32::from(response.schema_version);
+            let parser_version = u32::from(response.parser_version);
+            let receipt = state
+                .config
+                .source_log
+                .append(EnvelopeIn {
+                    source_id: SourceId(response.source_id.clone()),
+                    schema_version,
+                    parser_version,
+                    observed_at: SourceTimestamp(response.observed_at),
+                    received_at: ReceivedAt(response.received_at),
+                    content_type: ContentType::Json,
+                    payload: response.body.clone(),
+                })
+                .await
+                .map_err(|_| RiskInputsUnavailable::MarkInvalid)?;
+            receipts.push((blake3::hash(&response.body), receipt));
+        }
+    }
+    let classified = match fetched {
+        Ok(body) => {
+            let mut pages = HashMap::new();
+            pages.insert(url.clone(), body.clone());
+            ClobPricesHistoryClient::new(
+                state.config.clob_base_url.clone(),
+                FixtureFetcher::new(pages),
+            )
+            .with_fidelity_minutes(1)
+            .fetch_prices_history_classified(&position.token_id.0, start, cutoff_unix)
+            .await
+            .map_err(|_| RiskInputsUnavailable::MarkInvalid)?
+            .outcome
+        }
+        Err(SourceError::Fatal { message }) => ClassifiedPricesHistory::Rejected { message },
+        Err(SourceError::Transient { .. } | SourceError::RateLimited { .. }) => {
+            return Err(RiskInputsUnavailable::PriceMissing);
+        }
+    };
+    let receipt = attempts
+        .iter()
+        .rev()
+        .find_map(|attempt| match attempt {
+            RawHttpAttempt::Response(response) => receipts
+                .iter()
+                .rev()
+                .find(|(hash, _)| *hash == blake3::hash(&response.body))
+                .map(|(_, receipt)| *receipt),
+            RawHttpAttempt::TransportFailure(_) => None,
+        })
+        .ok_or(RiskInputsUnavailable::MarkInvalid)?;
+    let mark = crate::risk_inputs::historical_mark_price(&classified, cutoff_unix, receipt)?;
+    Ok(pe_execution_core::MarkPrice {
+        condition_id: position.condition_id.clone(),
+        outcome_index: position.outcome_index,
+        price: mark.price,
+        receipt: mark.receipt,
+        observed_unix: mark.sample_unix,
+    })
 }
 
 fn live_financial_posture(
@@ -2844,7 +3487,7 @@ fn live_financial_posture(
     authenticated_cash: CollateralAmount,
     require_empty_inventory: bool,
 ) -> CheckOutcome {
-    let events = match replay_account(&state.config.journal_path, &account.account_id) {
+    let events = match replay_live_account(state, &account.account_id) {
         Ok(events) => events,
         Err(_) => return CheckOutcome::Transient("live journal unavailable"),
     };
@@ -2889,13 +3532,182 @@ fn arming_posture(sizing: SizingMode, balance: CollateralAmount, cap_bps: i32) -
     CollateralAmount::from_decimal_exact(amount).unwrap_or(CollateralAmount::ZERO)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RedeemablePositionRow {
     condition_id: String,
     size: Decimal,
     #[serde(rename = "negativeRisk")]
     neg_risk: bool,
+}
+
+#[derive(Clone)]
+struct ResolutionDiscovery {
+    token_ids: [pe_core_types::PolymarketTokenId; 2],
+    payout: Option<BinaryPayoutVector>,
+    receipt: AppendReceipt,
+}
+
+async fn discover_live_resolutions(
+    state: &FanoutState,
+    account: &AccountContext,
+    events: &[LiveJournalEvent],
+    discoveries: &mut BTreeMap<String, Result<ResolutionDiscovery, &'static str>>,
+    now: OffsetDateTime,
+) -> Result<(), &'static str> {
+    let mut prepared = BTreeMap::<String, Box<pe_execution_core::LiveOrderPreparedAudit>>::new();
+    let mut terminal = BTreeSet::new();
+    let mut filled_conditions = BTreeSet::new();
+    let mut resolved_conditions = BTreeSet::new();
+    for event in events {
+        match &event.payload {
+            LiveJournalPayload::OrderPrepared(order) => {
+                prepared.insert(order.identity.idempotency_key.clone(), order.clone());
+            }
+            LiveJournalPayload::OrderReconciled(reconciled)
+                if matches!(
+                    reconciled.outcome,
+                    LiveJournalOrderOutcome::Killed { .. }
+                        | LiveJournalOrderOutcome::Rejected { .. }
+                ) =>
+            {
+                terminal.insert(reconciled.identity.idempotency_key.clone());
+            }
+            LiveJournalPayload::OrderFillFinalized(fill) => {
+                terminal.insert(fill.identity.idempotency_key.clone());
+                let order = prepared
+                    .get(&fill.identity.idempotency_key)
+                    .ok_or("finalized fill has no prepared admission")?;
+                filled_conditions.insert(order.economic.market.condition_id.0.clone());
+            }
+            LiveJournalPayload::ResolutionFinalized(resolution) => {
+                resolved_conditions.insert(resolution.condition_id.0.clone());
+            }
+            _ => {}
+        }
+    }
+    for condition in filled_conditions {
+        if resolved_conditions.contains(&condition)
+            || prepared.values().any(|order| {
+                order.economic.market.condition_id.0 == condition
+                    && !terminal.contains(&order.identity.idempotency_key)
+            })
+        {
+            continue;
+        }
+        let admissions = prepared
+            .values()
+            .filter(|order| order.economic.market.condition_id.0 == condition)
+            .collect::<Vec<_>>();
+        let first = admissions
+            .first()
+            .copied()
+            .ok_or("condition admission missing")?;
+        if admissions.iter().any(|order| {
+            order.economic.admission.market.ordered_outcome_token_ids
+                != first.economic.admission.market.ordered_outcome_token_ids
+        }) {
+            return Err("condition admission mapping conflicts");
+        }
+        let expected_tokens = &first.economic.admission.market.ordered_outcome_token_ids;
+        let discovery = if let Some(discovery) = discoveries.get(&condition) {
+            discovery.clone()?
+        } else {
+            let fetched = async {
+                let url = format!(
+                    "{}/markets/{condition}",
+                    state.config.clob_base_url.trim_end_matches('/')
+                );
+                let observed_at = OffsetDateTime::now_utc();
+                let response = state
+                    .config
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|_| "CLOB resolution transport")?;
+                let status = response.status();
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(|_| "CLOB resolution body")?
+                    .to_vec();
+                let received_at = OffsetDateTime::now_utc();
+                let receipt = state
+                    .config
+                    .source_log
+                    .append(EnvelopeIn {
+                        source_id: SourceId("polymarket.clob.resolution".to_owned()),
+                        schema_version: pe_source_polymarket_public::CLOB_RESOLUTION_SCHEMA_VERSION,
+                        parser_version: pe_source_polymarket_public::CLOB_RESOLUTION_PARSER_VERSION,
+                        observed_at: SourceTimestamp(observed_at),
+                        received_at: ReceivedAt(received_at),
+                        content_type: ContentType::Json,
+                        payload: body.clone(),
+                    })
+                    .await
+                    .map_err(|_| "resolution source append")?;
+                if !status.is_success() {
+                    return Err("CLOB resolution status");
+                }
+                let market = parse_clob_market(&body).map_err(|_| "CLOB resolution parse")?;
+                if market
+                    .condition_id
+                    .as_deref()
+                    .is_none_or(|value| !value.eq_ignore_ascii_case(&condition))
+                {
+                    return Err("CLOB resolution condition mismatch");
+                }
+                let token_ids: [pe_core_types::PolymarketTokenId; 2] = market
+                    .tokens
+                    .iter()
+                    .map(|token| {
+                        token
+                            .token_id
+                            .as_ref()
+                            .map(|token| pe_core_types::PolymarketTokenId(token.clone()))
+                            .ok_or("CLOB resolution token mapping missing")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .map_err(|_| "CLOB resolution token mapping cardinality")?;
+                let payout = match market.resolution_evidence().payout {
+                    ClobPayoutResolution::Resolved(payout) => Some(payout),
+                    ClobPayoutResolution::Unresolved(_) => None,
+                };
+                Ok(ResolutionDiscovery {
+                    token_ids,
+                    payout,
+                    receipt,
+                })
+            }
+            .await;
+            discoveries.insert(condition.clone(), fetched.clone());
+            fetched?
+        };
+        if &discovery.token_ids != expected_tokens {
+            return Err("CLOB resolution token mapping mismatch");
+        }
+        let Some(payout) = discovery.payout else {
+            continue;
+        };
+        state
+            .config
+            .journal
+            .append(
+                account.account_id.clone(),
+                now,
+                LiveJournalPayload::ResolutionFinalized(Box::new(
+                    pe_execution_core::ResolutionFinalizedAudit {
+                        condition_id: PolymarketConditionId(condition),
+                        payout_by_outcome_index_json: payout.canonical_json(),
+                        source_append_receipt: discovery.receipt,
+                    },
+                )),
+            )
+            .map_err(|_| "resolution journal append")?;
+    }
+    Ok(())
 }
 
 /// Redemption discovery and submission remain fail-closed for every custody kind except the
@@ -2911,14 +3723,35 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
         .closures
         .redemption
         .retain(|account, _| account_ids.contains(account));
+    let mut resolution_discoveries = BTreeMap::new();
     for account in &snapshot.accounts {
-        let events = match replay_account(&state.config.journal_path, &account.account_id) {
+        let events = match replay_live_account(state, &account.account_id) {
             Ok(events) => events,
             Err(error) => {
                 error!(account_id = %account.account_id, error = %error, "redemption journal replay failed; attempt frozen");
                 state.closures.redemption.insert(
                     account.account_id.as_str().to_owned(),
                     "redemption journal unavailable; attempt frozen".to_owned(),
+                );
+                continue;
+            }
+        };
+        if let Err(reason) =
+            discover_live_resolutions(state, account, &events, &mut resolution_discoveries, now)
+                .await
+        {
+            state.closures.redemption.insert(
+                account.account_id.as_str().to_owned(),
+                format!("resolution discovery unavailable: {reason}"),
+            );
+            continue;
+        }
+        let events = match replay_live_account(state, &account.account_id) {
+            Ok(events) => events,
+            Err(_) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    "resolution replay unavailable".to_owned(),
                 );
                 continue;
             }
@@ -2972,16 +3805,44 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         };
-        let positions = match fetch_redeemable_positions(state, &venue.deposit_wallet()).await {
-            Ok(positions) => positions,
+        let inventory =
+            match fetch_complete_venue_inventory(state, &venue.deposit_wallet(), &events).await {
+                Ok(inventory) => inventory,
+                Err(reason) => {
+                    state.closures.redemption.insert(
+                        account.account_id.as_str().to_owned(),
+                        format!("redemption inventory unavailable: {reason}"),
+                    );
+                    continue;
+                }
+            };
+        let positions = inventory.redeemable.clone();
+        match append_ready_redemption_custody(
+            state,
+            account,
+            &venue,
+            &inventory,
+            attempts.values(),
+            now,
+        )
+        .await
+        {
+            Ok(true) => {
+                state
+                    .closures
+                    .redemption
+                    .remove(account.account_id.as_str());
+                continue;
+            }
+            Ok(false) => {}
             Err(reason) => {
                 state.closures.redemption.insert(
                     account.account_id.as_str().to_owned(),
-                    format!("redemption inventory unavailable: {reason}"),
+                    format!("redemption custody unavailable: {reason}"),
                 );
                 continue;
             }
-        };
+        }
         if positions.is_empty() && attempts.is_empty() {
             state
                 .closures
@@ -3194,6 +4055,84 @@ fn redemption_needs_fresh_submission(state: &RedemptionAttemptState, now: Offset
     }
 }
 
+async fn append_ready_redemption_custody<'a>(
+    state: &FanoutState,
+    account: &AccountContext,
+    venue: &PolymarketLiveVenue,
+    inventory: &CompleteVenueInventory,
+    attempts: impl Iterator<Item = &'a RedemptionAttempt>,
+    now: OffsetDateTime,
+) -> Result<bool, &'static str> {
+    let Some(attempt) = attempts
+        .filter(|attempt| {
+            matches!(
+                attempt.state,
+                RedemptionAttemptState::ConfirmedAwaitingBalance { .. }
+            )
+        })
+        .min_by(|left, right| {
+            left.identity
+                .condition_id
+                .0
+                .cmp(&right.identity.condition_id.0)
+        })
+    else {
+        return Ok(false);
+    };
+    let events = replay_live_account(state, &account.account_id).map_err(|_| "journal replay")?;
+    let derived =
+        derive_projection_rows(&account.account_id, &events).map_err(|_| "journal reducer")?;
+    let credit = derived
+        .receivable_by_condition
+        .get(&attempt.identity.condition_id.0)
+        .copied()
+        .ok_or("condition receivable missing")?;
+    let expected = derived
+        .custody_positions
+        .iter()
+        .filter(|position| position.condition_id != attempt.identity.condition_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if canonical_positions(&expected).map_err(|_| "expected inventory")?
+        != canonical_positions(&inventory.positions).map_err(|_| "venue inventory")?
+    {
+        return Err("remaining inventory mismatch");
+    }
+    let account_state = venue
+        .read_balance_and_allowance(false)
+        .await
+        .map_err(|_| "account state")?;
+    let remaining_receivable = derived
+        .receivable
+        .checked_sub(credit.to_decimal())
+        .ok_or("receivable arithmetic")?;
+    if account_state
+        .collateral_balance
+        .to_decimal()
+        .checked_add(remaining_receivable)
+        != derived.economic_cash
+    {
+        return Err("cash reconciliation mismatch");
+    }
+    state
+        .config
+        .journal
+        .append(
+            account.account_id.clone(),
+            now,
+            LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+                pe_execution_core::RedemptionCustodyReconciledAudit {
+                    identity: attempt.identity.clone(),
+                    account_state: account_state.audit().map_err(|_| "account audit")?,
+                    venue_positions: inventory.positions.clone(),
+                    venue_position_receipts: inventory.receipts.clone(),
+                },
+            )),
+        )
+        .map_err(|_| "journal append")?;
+    Ok(true)
+}
+
 fn redeemable_amount(size: Decimal) -> CollateralAmount {
     CollateralAmount::from_decimal_exact(
         size.max(Decimal::ZERO)
@@ -3268,58 +4207,185 @@ fn custody_kind(value: Option<&str>) -> Option<CustodyKind> {
     }
 }
 
-async fn fetch_redeemable_positions(
-    state: &FanoutState,
-    wallet: &str,
-) -> Result<Vec<RedeemablePositionRow>, &'static str> {
-    fetch_redeemable_positions_from(&state.config.http, &state.config.data_base_url, wallet).await
+#[derive(Debug, Clone)]
+struct RecordedPositionPage {
+    request_url: String,
+    raw_hash: String,
+    receipt: AppendReceipt,
 }
 
-async fn fetch_redeemable_positions_from(
-    client: &reqwest::Client,
-    data_base_url: &str,
+struct LivePositionFetcher {
+    http: reqwest::Client,
+    source_log: SourceLogHandle,
+    pages: Mutex<Vec<RecordedPositionPage>>,
+}
+
+impl ReconciliationFetcher for LivePositionFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let observed_at = OffsetDateTime::now_utc();
+            let response =
+                self.http
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|error| SourceError::Transient {
+                        message: error.to_string(),
+                    })?;
+            let status = response.status();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| SourceError::Transient {
+                    message: error.to_string(),
+                })?
+                .to_vec();
+            let received_at = OffsetDateTime::now_utc();
+            let receipt = self
+                .source_log
+                .append(EnvelopeIn {
+                    source_id: SourceId(COMPLETE_POSITIONS_SOURCE_ID.to_owned()),
+                    schema_version: 1,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(observed_at),
+                    received_at: ReceivedAt(received_at),
+                    content_type: ContentType::Json,
+                    payload: body.clone(),
+                })
+                .await
+                .map_err(|error| SourceError::Fatal {
+                    message: error.to_string(),
+                })?;
+            self.pages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(RecordedPositionPage {
+                    request_url: url.to_owned(),
+                    raw_hash: blake3::hash(&body).to_hex().to_string(),
+                    receipt,
+                });
+            if !status.is_success() {
+                return Err(if status.as_u16() == 429 {
+                    SourceError::RateLimited {
+                        retry_after_secs: 0,
+                    }
+                } else {
+                    SourceError::Transient {
+                        message: format!("positions status {}", status.as_u16()),
+                    }
+                });
+            }
+            Ok(body)
+        })
+    }
+}
+
+struct CompleteVenueInventory {
+    positions: Vec<CanonicalPositionAudit>,
+    receipts: Vec<AppendReceipt>,
+    redeemable: Vec<RedeemablePositionRow>,
+}
+
+async fn fetch_complete_venue_inventory(
+    state: &FanoutState,
     wallet: &str,
-) -> Result<Vec<RedeemablePositionRow>, &'static str> {
-    let mut positions = Vec::new();
-    for offset in (0..=REDEEMABLE_POSITION_MAX_OFFSET).step_by(REDEEMABLE_POSITION_PAGE_LIMIT) {
-        let url = format!(
-            "{}/positions?user={wallet}&redeemable=true&sizeThreshold=0&limit={REDEEMABLE_POSITION_PAGE_LIMIT}&offset={offset}",
-            data_base_url.trim_end_matches('/')
-        );
-        let response = client.get(url).send().await.map_err(|_| "transport")?;
-        if !response.status().is_success() {
-            return Err("status");
-        }
-        let page: Vec<serde_json::Value> = response.json().await.map_err(|_| "decode")?;
-        let page_len = page.len();
-        for (index, value) in page.into_iter().enumerate() {
-            match serde_json::from_value(value) {
-                Ok(position) => positions.push(position),
-                Err(parse_error) => {
-                    error!(
-                        wallet,
-                        offset,
-                        index,
-                        error = %parse_error,
-                        "redeemable position is unparseable; redemption pass fails closed"
-                    );
-                    return Err("unparseable position");
-                }
+    events: &[LiveJournalEvent],
+) -> Result<CompleteVenueInventory, &'static str> {
+    let wallet = WalletAddress::from_hex(wallet).map_err(|_| "invalid custody wallet")?;
+    let mut mapping = ActivityAssetMapping::from_rows(&[]);
+    for event in events {
+        if let LiveJournalPayload::OrderPrepared(prepared) = &event.payload {
+            for (outcome, token) in prepared
+                .economic
+                .admission
+                .market
+                .ordered_outcome_token_ids
+                .iter()
+                .enumerate()
+            {
+                mapping
+                    .insert_verified_ordinary(
+                        token.clone(),
+                        prepared.economic.market.condition_id.clone(),
+                        OutcomeId(u16::try_from(outcome).map_err(|_| "outcome overflow")?),
+                    )
+                    .map_err(|_| "journal admission mapping conflict")?;
             }
         }
-        if page_len < REDEEMABLE_POSITION_PAGE_LIMIT {
-            return Ok(positions);
-        }
-        if offset == REDEEMABLE_POSITION_MAX_OFFSET {
-            error!(
-                wallet,
-                offset,
-                "redeemable positions pagination bound reached; redemption pass fails closed"
-            );
-            return Err("pagination bound reached");
-        }
     }
-    Err("pagination bound reached")
+    let fetcher = LivePositionFetcher {
+        http: state.config.http.clone(),
+        source_log: state.config.source_log.clone(),
+        pages: Mutex::new(Vec::new()),
+    };
+    let complete =
+        fetch_complete_positions(&fetcher, &state.config.data_base_url, wallet, &mapping)
+            .await
+            .map_err(|_| "complete position read failed")?;
+    let mut recorded = fetcher
+        .pages
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut receipts = Vec::with_capacity(complete.pages.len());
+    for page in &complete.pages {
+        let index = recorded
+            .iter()
+            .position(|candidate| {
+                candidate.request_url == page.request_url
+                    && candidate.raw_hash == page.raw_page_hash
+            })
+            .ok_or("position page receipt mismatch")?;
+        receipts.push(recorded.remove(index).receipt);
+    }
+    if !recorded.is_empty() {
+        return Err("unmatched position page receipt");
+    }
+    let positions = complete
+        .positions
+        .iter()
+        .map(|position| {
+            Ok::<CanonicalPositionAudit, &'static str>(CanonicalPositionAudit {
+                condition_id: position.condition_id.clone(),
+                outcome_index: u8::try_from(position.outcome.0).map_err(|_| "outcome overflow")?,
+                token_id: position.asset.clone(),
+                size: position.size,
+                redeemable: position.redeemable,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut by_condition = BTreeMap::<String, (Decimal, bool)>::new();
+    for position in complete
+        .positions
+        .iter()
+        .filter(|position| position.redeemable)
+    {
+        let entry = by_condition
+            .entry(position.condition_id.0.clone())
+            .or_insert((Decimal::ZERO, position.neg_risk));
+        if entry.1 != position.neg_risk {
+            return Err("condition negativeRisk conflict");
+        }
+        entry.0 = entry
+            .0
+            .checked_add(position.size.to_decimal())
+            .ok_or("redeemable size overflow")?;
+    }
+    let redeemable = by_condition
+        .into_iter()
+        .map(|(condition_id, (size, neg_risk))| RedeemablePositionRow {
+            condition_id,
+            size,
+            neg_risk,
+        })
+        .collect();
+    Ok(CompleteVenueInventory {
+        positions,
+        receipts,
+        redeemable,
+    })
 }
 
 #[cfg(test)]
@@ -3336,14 +4402,16 @@ mod tests {
 
     use pe_core_types::SourceTimestamp;
     use pe_core_types::{
-        LeaderAction, MarketId, OutcomeId, ProbabilityPpm, ReconstructionQuality, Side,
-        SourceTradeId, TraderId, VenueId, VenueMarketId, WalletAddress,
+        BasisPoints, EventSeq, LeaderAction, MarketId, OutcomeId, ProbabilityPpm,
+        ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
+        WalletAddress,
     };
     use pe_execution_core::{
-        LiveAccountReadFailure, LiveOrderRejectKind, LivePostClassification, LivePostParseError,
-        LiveVenueAccountReadError, LiveVenueAccountState, LiveVenuePreparationError,
-        LiveVenuePrepareRequest, LiveVenuePrepared, LiveVenueReconciliation,
-        LiveVenueReconciliationError,
+        BalanceAudit, ECONOMIC_PREPARED_VERSION, FeeAudit, LadderPlanAudit, LiveAccountReadFailure,
+        LiveAdmissionArtifactAudit, LiveOrderRejectKind, LivePostClassification,
+        LivePostParseError, LiveVenueAccountReadError, LiveVenueAccountState,
+        LiveVenuePreparationError, LiveVenuePrepareRequest, LiveVenuePrepared,
+        LiveVenueReconciliation, LiveVenueReconciliationError, MarketSelection, SizingAudit,
     };
     use pe_paper_state::{DispatchSeedRecord, DispatchTargetSeed};
     use pe_trader_index::Watchlist;
@@ -3427,6 +4495,58 @@ mod tests {
     #[test]
     fn redemption_reconcile_cadence_is_named_five_minutes() {
         assert_eq!(REDEMPTION_RECONCILE_CADENCE_SECS, 300);
+    }
+
+    fn latency_posted_event(seq: u64, received_unix_ms: i64, latency_ms: i64) -> LiveJournalEvent {
+        let received_at =
+            OffsetDateTime::from_unix_timestamp_nanos(i128::from(received_unix_ms) * 1_000_000)
+                .unwrap();
+        let observed_at = received_at - time::Duration::milliseconds(latency_ms);
+        LiveJournalEvent {
+            account_id: AccountId::new("latency-account").unwrap(),
+            seq,
+            timestamp: received_at,
+            payload: LiveJournalPayload::OrderPosted(Box::new(
+                pe_execution_core::LiveOrderPostAudit {
+                    identity: projection_identity(&format!("latency-{seq}")),
+                    order_hash: format!("order-{seq}"),
+                    evidence: RawHttpAttempt::Response(pe_core_types::RawHttpResponse {
+                        source_id: "polymarket-clob-v2".to_owned(),
+                        endpoint_kind: "order-post".to_owned(),
+                        method: "POST".to_owned(),
+                        path: "/order".to_owned(),
+                        ordered_query: Vec::new(),
+                        status: 200,
+                        headers: Vec::new(),
+                        body: b"{}".to_vec(),
+                        attempt_ordinal: 1,
+                        source_at: None,
+                        observed_at,
+                        received_at,
+                        schema_version: 1,
+                        parser_version: 1,
+                        adapter_version: "fixture".to_owned(),
+                    }),
+                    evidence_hash: format!("evidence-{seq}"),
+                },
+            )),
+        }
+    }
+
+    /// PASS: the live owner engages on two consecutive completed high-latency hours and releases
+    /// on the first completed hour at the release threshold.
+    #[test]
+    fn live_post_latency_window_engages_and_releases_hysteretically() {
+        let mut events = vec![
+            latency_posted_event(0, 3_601_000, 3_001),
+            latency_posted_event(1, 7_201_000, 3_001),
+        ];
+        let after_two_hours = OffsetDateTime::from_unix_timestamp(3 * 3_600 + 1).unwrap();
+        assert!(live_latency_switch(&events, after_two_hours));
+
+        events.push(latency_posted_event(2, 10_801_000, 2_000));
+        let after_release_hour = OffsetDateTime::from_unix_timestamp(4 * 3_600 + 1).unwrap();
+        assert!(!live_latency_switch(&events, after_release_hour));
     }
 
     fn settings(
@@ -3818,7 +4938,9 @@ mod tests {
                 parser_version: 1,
                 freshness_window_secs: 60,
             },
-            fee_schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
+            fee_schedule: pe_venue_polymarket::CompactFeeSchedule::Taker {
+                rate: dec!(0.00024),
+            },
             scheduled_end_unix: None,
             receipts: pe_execution_core::AdmissionReceipts {
                 gamma: receipt,
@@ -3827,7 +4949,10 @@ mod tests {
             },
         };
         let ladder = LadderPlanAudit {
-            used_asks: Vec::new(),
+            used_asks: vec![pe_execution_core::LadderAskAudit {
+                price: Price(dec!(0.80)),
+                shares: ShareAmount::from_atomic(3_125_000),
+            }],
             best_ask: Price(dec!(0.80)),
             limit_price: Price(dec!(0.80)),
             minimum_shares: ShareAmount::from_atomic(3_125_000),
@@ -3858,12 +4983,26 @@ mod tests {
                 slippage_rate: Decimal::ZERO,
             },
             fee: FeeAudit {
-                schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
-                expected_fee: CollateralAmount::ZERO,
+                schedule: pe_venue_polymarket::CompactFeeSchedule::Taker {
+                    rate: dec!(0.00024),
+                },
+                expected_fee: CollateralAmount::from_atomic(120),
                 reserve: CollateralAmount::from_atomic(120),
             },
             risk: RiskAudit {
-                snapshot: zeroed_risk_snapshot(),
+                snapshot: RiskSnapshot {
+                    leader_exposure_bps: BasisPoints(0),
+                    market_exposure_bps: BasisPoints(0),
+                    family_exposure_bps: BasisPoints(0),
+                    total_copy_exposure_bps: BasisPoints(0),
+                    intraday_pnl_bps: BasisPoints(0),
+                    rolling_7d_pnl_bps: BasisPoints(0),
+                    absolute_pnl_bps: BasisPoints(0),
+                    copy_latency_kill_switch_active: false,
+                    proposed_trade_bps: BasisPoints(0),
+                    per_trade_cap_bps: 25,
+                    concentration_caps: None,
+                },
                 decision: RiskDecisionAudit::Approved,
             },
             balance: BalanceAudit {
@@ -4080,6 +5219,7 @@ mod tests {
     #[tokio::test]
     async fn finality_batch_deduplicates_receipts_and_block_reads() {
         let rpc = FakePolygonRpc::new(101);
+        let reserve = finality_prepared().economic.fee.reserve;
         let order = PendingOrderFinality {
             prepared_journal_seq: 9,
             prepared: finality_prepared(),
@@ -4107,6 +5247,10 @@ mod tests {
             );
             assert_eq!(finalized.quantity, ShareAmount::from_atomic(3_125_000));
             assert_eq!(finalized.fee, CollateralAmount::from_atomic(120));
+            assert_eq!(
+                finalized.fee, reserve,
+                "the reserve equality edge finalizes"
+            );
         }
         assert_eq!(rpc.call_count("eth_chainId"), 1);
         assert_eq!(rpc.call_count("eth_getTransactionReceipt"), 1);
@@ -4184,6 +5328,72 @@ mod tests {
         }));
         assert_eq!(rpc.call_count("eth_getTransactionReceipt"), 2);
         assert_eq!(rpc.call_count("eth_getBlockByNumber.canonical"), 1);
+    }
+
+    /// PASS: one multi-level collateral plan retains its improved paper quantity, its distinct
+    /// signed minimum, and the exact finalized live quantity without a prefix rewalk.
+    #[tokio::test]
+    async fn multilevel_plan_signed_minimum_and_finalized_quantity_share_one_audit() {
+        let ladder = vec![
+            pe_venue_polymarket::AskLevel {
+                price: Price(dec!(0.70)),
+                shares: ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+            },
+            pe_venue_polymarket::AskLevel {
+                price: Price(dec!(0.80)),
+                shares: ShareAmount::from_decimal_exact(dec!(10)).unwrap(),
+            },
+        ];
+        let sized = plan_sized_buy(
+            &ladder,
+            pe_venue_polymarket::CompactFeeSchedule::Zero,
+            BuySizing::Dollar {
+                budget: CollateralAmount::from_decimal_exact(dec!(2.5)).unwrap(),
+            },
+            &[CollateralAmount::from_decimal_exact(dec!(2.5)).unwrap()],
+            ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+            Price(dec!(0.01)),
+            Price(dec!(0.15)),
+            Price(dec!(0.85)),
+            Price(dec!(0.80)),
+            Price(dec!(0.80)),
+        )
+        .unwrap();
+        assert_eq!(sized.ladder.shares.to_decimal(), dec!(3.125));
+        assert_eq!(
+            sized.ladder.expected_shares().unwrap().to_decimal(),
+            dec!(3.25)
+        );
+
+        let mut prepared = finality_prepared();
+        prepared.economic.ladder = LadderPlanAudit::new(&sized.ladder);
+        prepared.economic.sizing.principal = sized.ladder.worst_case_debit;
+        prepared.economic.sizing.minimum_shares = sized.ladder.shares;
+        prepared.economic.sizing.expected_shares = sized.ladder.expected_shares().unwrap();
+        prepared.economic.sizing.expected_vwap = sized.ladder.vwap().unwrap();
+        prepared.prepared.maker_collateral = sized.ladder.worst_case_debit;
+        prepared.prepared.taker_shares = sized.ladder.shares;
+        prepared.prepared.limit_price = sized.ladder.limit_price;
+        assert_eq!(prepared.prepared.taker_shares.to_decimal(), dec!(3.125));
+        assert_eq!(
+            prepared.economic.sizing.expected_shares.to_decimal(),
+            dec!(3.25)
+        );
+        let mut results = collect_order_finality(
+            &FakePolygonRpc::new(101).with_receipt(receipt_with_word(3, 3_250_000)),
+            vec![PendingOrderFinality {
+                prepared_journal_seq: 9,
+                prepared,
+                transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+            }],
+        )
+        .await;
+        let exact = match results.pop().unwrap().disposition {
+            OrderFinalityDisposition::Finalized(finalized) => finalized,
+            other => panic!("expected exact multi-level finality, got {other:?}"),
+        };
+        assert_eq!(exact.quantity.to_decimal(), dec!(3.25));
+        assert_eq!(exact.principal.to_decimal(), dec!(2.5));
     }
 
     /// PASS: a receipt at the head reuses that head; an above-head receipt stays pending.
@@ -4699,10 +5909,26 @@ mod tests {
             .unwrap();
         let journal_path = dir.path().join("live.journal");
         let journal = Arc::new(LiveJournal::open(&journal_path).unwrap());
+        let (source_log, source_rx) = SourceLogHandle::channel(8);
+        let source_sink =
+            crate::source_event_sink::SourceEventSink::open(dir.path().join("live-source.log"))
+                .unwrap();
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(1);
+        let source_health = crate::health::new_shared_health_with_ws(false, true, 90);
+        tokio::spawn(
+            crate::activity_ingest::ActivityIngest::poll_only(
+                source_sink,
+                source_rx,
+                trigger_tx,
+                source_health,
+            )
+            .run(),
+        );
         let admission = LiveAdmissionBuilder::new(
             http.clone(),
             "http://127.0.0.1:9".to_owned(),
             "http://127.0.0.1:9".to_owned(),
+            source_log.clone(),
         );
         FanoutState {
             config: LiveFanoutConfig {
@@ -4720,9 +5946,13 @@ mod tests {
                 identity,
                 journal,
                 journal_path,
+                era_live_prefix: None,
                 projection: LiveProjectionWriter::new(http.clone(), supabase_url, "anon", ""),
                 book_fetcher: Arc::new(ReqwestClobBookFetcher::new(http.clone())),
-                http,
+                mid_price_cache: MidPriceCache::new("http://127.0.0.1:9".to_owned()),
+                source_log,
+                http: http.clone(),
+                polygon_receipt_rpc_url: "http://127.0.0.1:9".to_owned(),
                 supabase_url: supabase_url.to_owned(),
                 supabase_anon_key: "anon".to_owned(),
                 supabase_secret_key: String::new(),
@@ -4732,6 +5962,8 @@ mod tests {
                 projection_reconcile_interval_secs: 3_600,
             },
             admission,
+            polygon_receipt_rpc: PolygonReceiptRpc::new(http, "http://127.0.0.1:9"),
+            history_fetcher: ReqwestFetcher::new(reqwest::Client::new()),
             closures: AdmissionClosures::default(),
             last_mode_unix: None,
             last_redemption_unix: None,
@@ -4923,64 +6155,6 @@ mod tests {
             stale_state.closures.mode.is_empty(),
             "no mode decision is taken from stale evidence"
         );
-    }
-
-    #[derive(Clone)]
-    struct PositionPageState {
-        offsets: Arc<Mutex<Vec<usize>>>,
-    }
-
-    async fn position_page(
-        State(state): State<PositionPageState>,
-        Query(query): Query<HashMap<String, String>>,
-    ) -> Json<Vec<serde_json::Value>> {
-        let offset = query
-            .get("offset")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap();
-        assert_eq!(query.get("redeemable").map(String::as_str), Some("true"));
-        assert_eq!(query.get("limit").map(String::as_str), Some("500"));
-        state.offsets.lock().unwrap().push(offset);
-        let count = if offset == 0 { 500 } else { 1 };
-        Json(
-            (0..count)
-                .map(|index| {
-                    serde_json::json!({
-                        "conditionId": format!(
-                            "0x{index:064x}"
-                        ),
-                        "size": 1,
-                        "negativeRisk": index % 2 == 0
-                    })
-                })
-                .collect(),
-        )
-    }
-
-    #[tokio::test]
-    async fn redeemable_positions_fetch_walks_offset_pages_to_exhaustion() {
-        let offsets = Arc::new(Mutex::new(Vec::new()));
-        let app = Router::new()
-            .route("/positions", get(position_page))
-            .with_state(PositionPageState {
-                offsets: offsets.clone(),
-            });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .unwrap();
-        let positions = fetch_redeemable_positions_from(
-            &client,
-            &format!("http://{address}"),
-            "0x1111111111111111111111111111111111111111",
-        )
-        .await
-        .unwrap();
-        assert_eq!(positions.len(), 501);
-        assert_eq!(*offsets.lock().unwrap(), vec![0, 500]);
     }
 
     fn stage(db: &PaperStateDb, id: &str, created: i64, accounts: &[&str]) {

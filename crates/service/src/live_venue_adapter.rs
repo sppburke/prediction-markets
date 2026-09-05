@@ -1223,10 +1223,153 @@ impl RedemptionStatusReader for LiveRedemptionAdapter {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use axum::Router;
+    use axum::http::{StatusCode, Uri};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use pe_event_log::Reader;
     use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
+    use crate::clob_book::ClobBookFetcher as _;
+
+    const ADMISSION_CONDITION: &str =
+        "0x4c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ee";
+
+    async fn admission_and_book_fixture(uri: Uri) -> Response {
+        let path = uri.path();
+        let body = if path == "/markets" {
+            json!([{
+                "conditionId": ADMISSION_CONDITION,
+                "active": true,
+                "closed": false,
+                "acceptingOrders": true,
+                "enableOrderBook": true,
+                "negRisk": false,
+                "outcomes": "[\"Yes\",\"No\"]",
+                "clobTokenIds": "[\"11\",\"22\"]",
+                "orderPriceMinTickSize": "0.01",
+                "orderMinSize": "5",
+                "secondsDelay": 0
+            }])
+        } else if path.strip_prefix("/markets/") == Some(ADMISSION_CONDITION) {
+            json!({
+                "condition_id": ADMISSION_CONDITION,
+                "end_date_iso": "2026-09-06T12:00:00Z",
+                "active": true,
+                "closed": false,
+                "accepting_orders": true,
+                "enable_order_book": true,
+                "minimum_order_size": "5",
+                "minimum_tick_size": "0.01",
+                "neg_risk": false,
+                "seconds_delay": 0,
+                "tokens": [
+                    {"token_id": "11", "outcome": "Yes"},
+                    {"token_id": "22", "outcome": "No"}
+                ],
+                "maker_base_fee": 0,
+                "taker_base_fee": 0
+            })
+        } else if path.strip_prefix("/clob-markets/") == Some(ADMISSION_CONDITION) {
+            json!({
+                "c": ADMISSION_CONDITION,
+                "t": [{"t":"11","o":"Yes"},{"t":"22","o":"No"}],
+                "mts": 0.01,
+                "mos": 5,
+                "nr": false,
+                "mbf": 0,
+                "tbf": 0
+            })
+        } else if path == "/book" {
+            json!({
+                "asks": [{"price":"0.50","size":"5"}],
+                "bids": []
+            })
+        } else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        (StatusCode::OK, axum::Json(body)).into_response()
+    }
+
+    /// PASS: Gamma-long, CLOB-long, compact, and the consumed book each append exactly once and
+    /// return the receipt of the exact synchronized source frame.
+    #[tokio::test]
+    async fn admission_and_book_append_each_response_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(get(admission_and_book_fixture)),
+            )
+            .await
+            .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let source_sink = crate::source_event_sink::SourceEventSink::open(&source_path).unwrap();
+        let (source_log, source_rx) = crate::activity_ingest::SourceLogHandle::channel(8);
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(1);
+        let coordinator = tokio::spawn(
+            crate::activity_ingest::ActivityIngest::poll_only(
+                source_sink,
+                source_rx,
+                trigger_tx,
+                crate::health::new_shared_health_with_ws(false, true, 90),
+            )
+            .run(),
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let admission = LiveAdmissionBuilder::new(
+            client.clone(),
+            base.clone(),
+            base.clone(),
+            source_log.clone(),
+        )
+        .build(
+            &pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned()),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        let book = crate::clob_book::ReqwestClobBookFetcher::new(client)
+            .with_base_url(base)
+            .with_source_log(source_log.clone())
+            .fetch_book("11")
+            .await
+            .unwrap();
+
+        let frames = Reader::replay(&source_path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|(_, frame)| frame.source_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "polymarket.gamma.markets",
+                "polymarket.clob.markets",
+                "polymarket.clob.compact-market",
+                "polymarket.clob.book"
+            ]
+        );
+        assert_eq!(admission.receipts.gamma.sequence, frames[0].0);
+        assert_eq!(admission.receipts.clob_long.sequence, frames[1].0);
+        assert_eq!(admission.receipts.clob_compact.sequence, frames[2].0);
+        assert_eq!(book.source_receipt.unwrap().sequence, frames[3].0);
+
+        drop(source_log);
+        coordinator.abort();
+        server.abort();
+    }
 
     fn post_response(body: serde_json::Value) -> RawHttpResponse {
         RawHttpResponse {

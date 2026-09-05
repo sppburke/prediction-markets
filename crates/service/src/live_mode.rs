@@ -39,6 +39,9 @@ pub trait ArmingProbe {
     /// Balance + allowance for BOTH V2 exchange spenders (standard AND NegRisk —
     /// mirroring Decision 12's both-adapter approval).
     fn balance_and_both_spender_allowances(&self) -> CheckOutcome;
+    /// Key-free Polygon finalized-receipt endpoint identity/health. Failure is order-scoped and
+    /// prevents arming or new BUYs without demoting an already-armed account.
+    fn polygon_finality(&self) -> CheckOutcome;
 }
 
 /// The promotion-review facts for one account, read from `account_events`.
@@ -146,6 +149,7 @@ pub fn evaluate_mode<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> ModeDecision
             inputs.probe.balance_and_both_spender_allowances(),
             false,
         ),
+        ("polygon_finality", inputs.probe.polygon_finality(), false),
     ];
 
     let mut transient: Option<String> = None;
@@ -234,6 +238,7 @@ mod tests {
         account_state: CheckOutcome,
         geoblock: CheckOutcome,
         balance: CheckOutcome,
+        polygon: CheckOutcome,
     }
 
     impl ArmingProbe for FixtureProbe {
@@ -246,6 +251,9 @@ mod tests {
         fn balance_and_both_spender_allowances(&self) -> CheckOutcome {
             self.balance.clone()
         }
+        fn polygon_finality(&self) -> CheckOutcome {
+            self.polygon.clone()
+        }
     }
 
     fn all_pass() -> FixtureProbe {
@@ -253,6 +261,7 @@ mod tests {
             account_state: CheckOutcome::Pass,
             geoblock: CheckOutcome::Pass,
             balance: CheckOutcome::Pass,
+            polygon: CheckOutcome::Pass,
         }
     }
 
@@ -423,6 +432,35 @@ mod tests {
                 if reason.contains("balance_allowance")),
             "{decision:?}"
         );
+    }
+
+    #[test]
+    fn polygon_finality_health_is_required_but_never_demotes() {
+        let promo = reviewed(true);
+        let probe = FixtureProbe {
+            polygon: CheckOutcome::PersistentFail("wrong chain identity"),
+            ..all_pass()
+        };
+        let arming = evaluate_mode(&inputs(
+            "live_tiny",
+            "off",
+            CheckOutcome::Pass,
+            &promo,
+            &probe,
+        ));
+        assert!(
+            matches!(arming, ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("polygon_finality")),
+            "{arming:?}"
+        );
+        let armed = evaluate_mode(&inputs(
+            "live_tiny",
+            "live_tiny",
+            CheckOutcome::Pass,
+            &promo,
+            &probe,
+        ));
+        assert!(matches!(armed, ModeDecision::RefuseOrders { .. }));
     }
 
     #[test]

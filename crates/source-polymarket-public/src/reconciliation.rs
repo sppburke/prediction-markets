@@ -638,6 +638,10 @@ pub struct CanonicalPosition {
     pub outcome: OutcomeId,
     pub classification: PositionClassification,
     pub size: ShareAmount,
+    /// Partition returned by the complete two-part read.
+    pub redeemable: bool,
+    /// Venue redemption adapter selector retained from the same position row.
+    pub neg_risk: bool,
 }
 
 /// One independently complete union of the two explicit position partitions.
@@ -726,6 +730,8 @@ struct RawPosition<'a> {
     condition_id: Option<&'a RawValue>,
     outcome_index: Option<u16>,
     size: ExactDecimal,
+    #[serde(rename = "negativeRisk")]
+    neg_risk: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -857,6 +863,11 @@ pub async fn fetch_complete_positions(
                     outcome,
                     classification: identity.classification,
                     size,
+                    redeemable: partition == PositionPartition::Redeemable,
+                    neg_risk: decoded.neg_risk.ok_or(PositionReadError::MissingField {
+                        row_index,
+                        field: "negativeRisk",
+                    })?,
                 };
                 if positions.insert(asset_key.clone(), position).is_some() {
                     return Err(PositionReadError::DuplicateAsset { asset: asset_key });
@@ -938,6 +949,8 @@ fn position_semantic_hash(positions: &[CanonicalPosition]) -> Result<String, Pos
             },
         )?;
         proof_component(&mut hasher, &position.size.atomic().to_be_bytes())?;
+        proof_component(&mut hasher, &[u8::from(position.redeemable)])?;
+        proof_component(&mut hasher, &[u8::from(position.neg_risk)])?;
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

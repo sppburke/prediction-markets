@@ -123,7 +123,8 @@ pub struct LiveVenueAccountState {
 }
 
 impl LiveVenueAccountState {
-    fn audit(&self) -> Result<LiveAccountStateAudit, LiveJournalError> {
+    /// Project the authenticated response into the durable, credential-free journal shape.
+    pub fn audit(&self) -> Result<LiveAccountStateAudit, LiveJournalError> {
         Ok(LiveAccountStateAudit {
             observed_at: self.observed_at,
             closed_only: self.closed_only,

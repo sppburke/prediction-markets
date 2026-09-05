@@ -1147,14 +1147,98 @@ mod tests {
                 payload: serde_json::to_vec(&legacy).unwrap(),
             })
             .unwrap();
+        let (admission, ladder) = match &legacy.payload {
+            legacy_v1::LiveJournalPayload::AdmissionEvaluated(audit) => {
+                (audit.artifact.clone(), audit.ladder.clone())
+            }
+            _ => unreachable!(),
+        };
+        let amount =
+            CollateralAmount::from_decimal_exact(rust_decimal::Decimal::new(5, 1)).unwrap();
+        let shares = ShareAmount::from_whole(1).unwrap();
+        let price = Price::new(rust_decimal::Decimal::new(5, 1)).unwrap();
+        let prepared = legacy_v1::LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 1,
+            timestamp: at,
+            payload: legacy_v1::LiveJournalPayload::OrderPrepared(Box::new(
+                legacy_v1::LiveOrderPreparedAudit {
+                    identity: identity("legacy-prepared"),
+                    frozen_binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
+                    admission,
+                    account_state: LiveAccountStateAudit {
+                        observed_at: at,
+                        closed_only: false,
+                        geoblocked: false,
+                        selected_spender: "spender".to_owned(),
+                        collateral_balance: CollateralAmount::from_whole(10).unwrap(),
+                        allowance: CollateralAmount::from_whole(10).unwrap(),
+                        reconciled_free_collateral: CollateralAmount::from_whole(10).unwrap(),
+                        schema_version: 1,
+                        parser_version: 1,
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                    ladder,
+                    prepared: PreparedPolymarketBuy {
+                        condition_id: PolymarketConditionId("condition".to_owned()),
+                        outcome_id: pe_core_types::OutcomeId(0),
+                        token_id: PolymarketTokenId("yes".to_owned()),
+                        maker: "maker".to_owned(),
+                        signer: "signer".to_owned(),
+                        funder: "funder".to_owned(),
+                        verifying_contract: "exchange".to_owned(),
+                        spender: "exchange".to_owned(),
+                        exchange_domain_version: 2,
+                        neg_risk: false,
+                        side: "BUY".to_owned(),
+                        salt: "1".to_owned(),
+                        timestamp_ms: 1,
+                        expiration: "0".to_owned(),
+                        maker_collateral: amount,
+                        taker_shares: shares,
+                        limit_price: price,
+                        minimum_tick_size: Price::new(rust_decimal::Decimal::new(1, 2)).unwrap(),
+                        signature_type: 1,
+                        order_type: "FOK".to_owned(),
+                        post_only: false,
+                        defer_exec: false,
+                        metadata: "metadata".to_owned(),
+                        builder: "0".to_owned(),
+                        order_hash: "order".to_owned(),
+                        post_body_hash: "body".to_owned(),
+                        sdk_version: "fixture".to_owned(),
+                        sdk_archive_sha256: "fixture".to_owned(),
+                        metadata_hashes: Vec::new(),
+                        worst_case_debit: amount,
+                    },
+                    prepared_audit_hash: "legacy-prepared-audit".to_owned(),
+                },
+            )),
+        };
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(LIVE_JOURNAL_SOURCE.to_owned()),
+                schema_version: 1,
+                parser_version: LIVE_JOURNAL_PARSER_VERSION,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&prepared).unwrap(),
+            })
+            .unwrap();
         drop(writer);
 
         let replayed = replay_account(&path, &account_id).unwrap();
-        assert_eq!(replayed.len(), 1);
-        assert!(matches!(
-            replayed[0].payload,
-            LiveJournalPayload::LegacyV1(_)
-        ));
+        assert_eq!(replayed.len(), 2);
+        assert!(
+            replayed
+                .iter()
+                .all(|event| matches!(event.payload, LiveJournalPayload::LegacyV1(_)))
+        );
     }
 
     #[test]
