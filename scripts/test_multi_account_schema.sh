@@ -99,5 +99,10 @@ expect_err "ledgered account DELETE restricted"  "delete from accounts where acc
 expect_err "duplicate live fill rejected by PK"  "insert into live_fills(account_id,idempotency_key,leader_wallet,market_id,outcome_id,side,contracts,fill_price,event_seq) values('ledgered','k1','0xw','0xm',0,'buy',10,0.5,1)"
 expect_err "service_role UPDATE live_fills denied" "set role service_role; update live_fills set contracts=99 where true"
 
+# 14. Exact fractional live-position quantities round trip through the numeric columns.
+expect_ok  "fractional live position inserts" "insert into live_positions(account_id,market_id,outcome_id,long_contracts,short_contracts,cost_basis) values('ledgered','0xfractional',1,3.125001,0.000001,2.5)"
+fractional=$(psql "$URL" -Atc "select long_contracts::text || ',' || short_contracts::text from live_positions where account_id='ledgered' and market_id='0xfractional' and outcome_id=1")
+if [ "$fractional" = "3.125001,0.000001" ]; then echo "PASS: fractional live position round trip"; else echo "FAIL: fractional live position changed ($fractional)"; fails=$((fails+1)); fi
+
 echo "---"
 if [ "$fails" = "0" ]; then echo "ALL PHASE-B SQL ACCEPTANCE CHECKS PASSED"; else echo "$fails CHECK(S) FAILED"; exit 1; fi

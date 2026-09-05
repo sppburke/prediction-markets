@@ -164,6 +164,7 @@ pub enum LivePostClassification {
     Matched {
         venue_order_id: String,
         executed: LiveExecutedAmounts,
+        transaction_hashes: Vec<String>,
     },
     Killed {
         venue_order_id: Option<String>,
@@ -179,10 +180,19 @@ pub enum LivePostClassification {
 /// Result of the order-hash lookup and cancel-unexpected-order seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveVenueReconciledOutcome {
-    Matched { venue_order_id: String },
-    Killed { venue_order_id: Option<String> },
-    Rejected { venue_order_id: Option<String> },
-    Ambiguous { kind: LiveOrderAmbiguityKind },
+    Matched {
+        venue_order_id: String,
+        transaction_hashes: Vec<String>,
+    },
+    Killed {
+        venue_order_id: Option<String>,
+    },
+    Rejected {
+        venue_order_id: Option<String>,
+    },
+    Ambiguous {
+        kind: LiveOrderAmbiguityKind,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,8 +297,8 @@ pub enum LiveOrderOutcome {
     Matched {
         order_hash: String,
         venue_order_id: String,
-        /// Absent only when order-hash reconciliation proves a match without retaining the
-        /// venue's executed amount fields. Projection must wait rather than guess.
+        transaction_hashes: Vec<String>,
+        /// Retained for legacy audit only; receipt logs own financial projection.
         executed: Option<LiveExecutedAmounts>,
     },
     Killed {
@@ -312,11 +322,9 @@ impl LiveOrderOutcome {
     #[must_use]
     pub const fn dispatch_state(&self) -> &'static str {
         match self {
+            Self::Matched { .. } => "submitted",
             Self::Ambiguous { .. } => "ambiguous",
-            Self::Refused { .. }
-            | Self::Matched { .. }
-            | Self::Killed { .. }
-            | Self::Rejected { .. } => "terminal",
+            Self::Refused { .. } | Self::Killed { .. } | Self::Rejected { .. } => "terminal",
         }
     }
 
@@ -328,7 +336,7 @@ impl LiveOrderOutcome {
                 reason: LiveAdmissionRefusal::CredentialVersionChanged,
             } => Some("credential_version_changed"),
             Self::Refused { .. } => Some("admission_refused"),
-            Self::Matched { .. } => Some("filled"),
+            Self::Matched { .. } => None,
             Self::Killed { .. } => Some("killed"),
             Self::Rejected { .. } => Some("rejected"),
             Self::Ambiguous { .. } => None,
@@ -596,9 +604,11 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     Ok(LivePostClassification::Matched {
                         venue_order_id,
                         executed,
+                        transaction_hashes,
                     }) => {
                         let journal_outcome = LiveJournalOrderOutcome::Matched {
                             venue_order_id: venue_order_id.clone(),
+                            transaction_hashes: transaction_hashes.clone(),
                             executed: Some(executed.clone()),
                         };
                         self.journal_reconciliation(
@@ -613,6 +623,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                         Ok(LiveOrderOutcome::Matched {
                             order_hash,
                             venue_order_id,
+                            transaction_hashes,
                             executed: Some(executed),
                         })
                     }
@@ -810,7 +821,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             }
         };
         match outcome {
-            LiveVenueReconciledOutcome::Matched { venue_order_id } => {
+            LiveVenueReconciledOutcome::Matched {
+                venue_order_id,
+                transaction_hashes,
+            } => {
                 self.journal_reconciliation(
                     &account_id,
                     &identity,
@@ -819,6 +833,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     LiveReconciliationSource::OrderHashLookupAndCancel,
                     LiveJournalOrderOutcome::Matched {
                         venue_order_id: venue_order_id.clone(),
+                        transaction_hashes: transaction_hashes.clone(),
                         executed: None,
                     },
                     evidence,
@@ -826,6 +841,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 Ok(LiveOrderOutcome::Matched {
                     order_hash,
                     venue_order_id,
+                    transaction_hashes,
                     executed: None,
                 })
             }
@@ -1431,8 +1447,10 @@ mod tests {
 
     #[tokio::test]
     async fn matched_post_is_typed_and_fully_journaled() {
+        let transaction_hash = format!("0x{}", "11".repeat(32));
         let (outcome, events, posts, reconciliations) = execute(LivePostClassification::Matched {
             venue_order_id: "venue-1".to_owned(),
+            transaction_hashes: vec![transaction_hash.clone()],
             executed: LiveExecutedAmounts {
                 making_amount: dec!(4.00),
                 taking_amount: dec!(10),
@@ -1440,15 +1458,21 @@ mod tests {
         })
         .await;
         assert!(matches!(
-            outcome,
+            &outcome,
             LiveOrderOutcome::Matched {
+                transaction_hashes,
                 executed: Some(LiveExecutedAmounts {
                     making_amount,
                     taking_amount,
                 }),
                 ..
-            } if making_amount == dec!(4.00) && taking_amount == dec!(10)
+            } if transaction_hashes.len() == 1
+                && transaction_hashes.first() == Some(&transaction_hash)
+                && *making_amount == dec!(4.00)
+                && *taking_amount == dec!(10)
         ));
+        assert_eq!(outcome.dispatch_state(), "submitted");
+        assert_eq!(outcome.terminal_reason(), None);
         assert_eq!(posts, 1);
         assert_eq!(reconciliations, 0);
         assert_common_terminal_evidence(&events);
@@ -1504,6 +1528,7 @@ mod tests {
         let journal = LiveJournal::open(&path).unwrap();
         let venue = FixtureVenue::new(LivePostClassification::Matched {
             venue_order_id: "venue-1".to_owned(),
+            transaction_hashes: Vec::new(),
             executed: LiveExecutedAmounts {
                 making_amount: dec!(4.00),
                 taking_amount: dec!(10),

@@ -11,6 +11,7 @@
 pub mod canary_market;
 pub mod fee;
 pub mod ladder;
+pub mod receipt;
 pub mod redemption;
 pub mod v2;
 
@@ -24,6 +25,12 @@ pub use fee::{
 };
 pub use ladder::{
     LADDER_MAX_AGE_MS, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy, plan_exact_shares,
+};
+pub use receipt::{
+    CTF_EXCHANGE_V2, DecodedOrderFill, FINALIZED_CHAIN_ID, FinalizedBlock, MatchedReceipt,
+    NEG_RISK_CTF_EXCHANGE_V2, ReceiptError, TOPIC_ORDER_FILLED_V2, canonical_block_matches,
+    decode_order_fills, parse_chain_id_response, parse_finalized_block_response,
+    parse_receipt_response,
 };
 pub use redemption::{
     ApprovalCheckRequest, ApprovalEvidence, ApprovalReadError, ApprovalReader,
