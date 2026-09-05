@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pe_copy_signal_engine::{SignalConfig, TradeProvenance};
@@ -20,7 +20,7 @@ use pe_core_types::{
     MarketId, MarketOutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{ContentType, EnvelopeIn, Reader};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader};
 use pe_paper_state::{NoCopyDisposition, PaperStateDb};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
@@ -36,7 +36,9 @@ use crate::activity_ingest::{
     ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger, SourceLogHandle, SourceLogHandleError,
 };
 use crate::asset_identity::AssetIdentityResolver;
-use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext, IdentityOverride};
+use crate::bucket_commit::{
+    BucketCommitResult, BucketDecisionContext, IdentityOverride, PageOccurrence,
+};
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::orchestrator_control::OrchestratorControl;
@@ -47,6 +49,43 @@ use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome, anchor
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
 /// Best-effort cadence for refreshing venue-authoritative position anchors.
 pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
+const SECONDS_PER_DAY: i64 = 86_400;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BoundaryScheduleError {
+    #[error("daily boundary timestamp arithmetic overflow")]
+    Overflow,
+}
+
+/// Every completed UTC midnight strictly after the latest boundary or Start, oldest first.
+pub fn completed_midnight_cutoffs_after(
+    anchor_unix: i64,
+    now_unix: i64,
+) -> Result<Vec<i64>, BoundaryScheduleError> {
+    if now_unix <= anchor_unix {
+        return Ok(Vec::new());
+    }
+    let anchor_day = anchor_unix.div_euclid(SECONDS_PER_DAY);
+    let mut cutoff = anchor_day
+        .checked_add(1)
+        .and_then(|day| day.checked_mul(SECONDS_PER_DAY))
+        .ok_or(BoundaryScheduleError::Overflow)?;
+    let latest_completed = now_unix
+        .div_euclid(SECONDS_PER_DAY)
+        .checked_mul(SECONDS_PER_DAY)
+        .ok_or(BoundaryScheduleError::Overflow)?;
+    let mut cutoffs = Vec::new();
+    while cutoff <= latest_completed {
+        cutoffs.push(cutoff);
+        if cutoff == latest_completed {
+            break;
+        }
+        cutoff = cutoff
+            .checked_add(SECONDS_PER_DAY)
+            .ok_or(BoundaryScheduleError::Overflow)?;
+    }
+    Ok(cutoffs)
+}
 
 /// Configuration for the existing per-wallet polling cadence.
 #[derive(Debug, Clone)]
@@ -60,7 +99,8 @@ pub struct TradePollerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Obligation {
     group_id: SourceTradeId,
-    received_at_unix: i64,
+    received_at: OffsetDateTime,
+    receipt: pe_event_log::AppendReceipt,
 }
 
 #[derive(Default)]
@@ -73,6 +113,14 @@ struct BucketIdentities {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationObligations {
     by_wallet: HashMap<WalletAddress, BTreeMap<i64, BTreeMap<String, Obligation>>>,
+    boundary: Option<PendingBoundary>,
+}
+
+/// The sole source-ordered daily boundary waiting for qualifying activity acknowledgements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingBoundary {
+    pub cutoff_unix: i64,
+    pub receipt: AppendReceipt,
 }
 
 impl ReconciliationObligations {
@@ -89,13 +137,15 @@ impl ReconciliationObligations {
         groups
             .entry(trigger.source_trade_id.0.clone())
             .and_modify(|obligation| {
-                obligation.received_at_unix = obligation
-                    .received_at_unix
-                    .min(trigger.received_at.unix_timestamp());
+                if trigger.receipt.sequence < obligation.receipt.sequence {
+                    obligation.received_at = trigger.received_at;
+                    obligation.receipt = trigger.receipt;
+                }
             })
             .or_insert(Obligation {
                 group_id: trigger.source_trade_id,
-                received_at_unix: trigger.received_at.unix_timestamp(),
+                received_at: trigger.received_at,
+                receipt: trigger.receipt,
             });
     }
 
@@ -113,6 +163,46 @@ impl ReconciliationObligations {
             .sum()
     }
 
+    /// Install one pending boundary. A second boundary never replaces the oldest.
+    pub fn install_boundary(&mut self, boundary: PendingBoundary) -> bool {
+        if self.boundary.is_some() {
+            return false;
+        }
+        self.boundary = Some(boundary);
+        true
+    }
+
+    /// The oldest pending boundary, if any.
+    #[must_use]
+    pub fn pending_boundary(&self) -> Option<PendingBoundary> {
+        self.boundary
+    }
+
+    /// True after every obligation inside both the receipt and receive-time bounds is gone.
+    #[must_use]
+    pub fn boundary_ready(&self) -> bool {
+        let Some(boundary) = self.boundary else {
+            return false;
+        };
+        !self.by_wallet.values().any(|epochs| {
+            epochs.values().any(|groups| {
+                groups.values().any(|obligation| {
+                    obligation.receipt.sequence <= boundary.receipt.sequence
+                        && obligation.received_at.unix_timestamp() < boundary.cutoff_unix
+                })
+            })
+        })
+    }
+
+    /// Remove and return the boundary only after its qualifying obligations are acknowledged.
+    pub fn take_ready_boundary(&mut self) -> Option<PendingBoundary> {
+        if self.boundary_ready() {
+            self.boundary.take()
+        } else {
+            None
+        }
+    }
+
     /// Stable activation census persisted with the paper migration record.
     #[must_use]
     pub fn migration_evidence(&self) -> serde_json::Value {
@@ -126,7 +216,8 @@ impl ReconciliationObligations {
                             "wallet": wallet.to_string(),
                             "source_epoch": epoch,
                             "source_trade_id": obligation.group_id.0,
-                            "received_at_unix": obligation.received_at_unix,
+                            "received_at_unix": obligation.received_at.unix_timestamp(),
+                            "receipt": obligation.receipt,
                         })
                     })
                 })
@@ -164,6 +255,19 @@ impl ReconciliationObligations {
             .get(wallet)
             .and_then(|epochs| epochs.get(&epoch))
             .is_some_and(|groups| groups.contains_key(&group.0))
+    }
+
+    fn observation(
+        &self,
+        wallet: &WalletAddress,
+        epoch: i64,
+        group: &SourceTradeId,
+    ) -> Option<(AppendReceipt, OffsetDateTime)> {
+        self.by_wallet
+            .get(wallet)?
+            .get(&epoch)?
+            .get(&group.0)
+            .map(|obligation| (obligation.receipt, obligation.received_at))
     }
 
     fn remove(&mut self, wallet: &WalletAddress, epoch: i64, group: &SourceTradeId) {
@@ -218,6 +322,10 @@ pub fn rebuild_reconciliation_obligations(
                 source_trade_id: activity.group_id.key().clone(),
                 provenance: TradeProvenance::ActivityWs,
                 received_at: envelope.received_at.0,
+                receipt: pe_event_log::AppendReceipt {
+                    sequence: envelope.seq,
+                    this_hash: envelope.this_hash,
+                },
             });
         }
     }
@@ -242,6 +350,10 @@ enum ReconciliationError {
     ReconstructionQuality,
     #[error("decision evidence json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("activity page receipts do not match the complete read")]
+    PageReceiptMismatch,
+    #[error("source receive time is outside the supported millisecond range")]
+    ReceiveTimeRange,
 }
 
 impl ReconciliationError {
@@ -500,6 +612,7 @@ impl TradePoller {
             inner: self.fetcher.clone(),
             source_log: self.source_log.clone(),
             append_closed: append_closed.clone(),
+            occurrences: Arc::new(Mutex::new(Vec::new())),
         };
         let activity = match fetch_complete_activity(
             &recording,
@@ -516,6 +629,8 @@ impl TradePoller {
             }
             Err(error) => return Err(error.into()),
         };
+        let (page_occurrences, mut receipt_received_at_unix_ms) =
+            recording.join_occurrences(&activity.pages)?;
         let buckets = activity.buckets()?;
         if let Some(latest_activity) = buckets
             .iter()
@@ -562,6 +677,8 @@ impl TradePoller {
                 quality,
                 copy_eligible,
                 &activity.pages,
+                &page_occurrences,
+                &mut receipt_received_at_unix_ms,
                 &bucket,
                 identities,
             )?;
@@ -589,19 +706,26 @@ impl TradePoller {
         reconstruction_quality: ReconstructionQuality,
         copy_eligible: bool,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
+        page_occurrences: &[PageOccurrence],
+        receipt_received_at_unix_ms: &mut BTreeMap<String, i64>,
         bucket: &[ActivityAggregate],
         identities: BucketIdentities,
     ) -> Result<BucketDecisionContext, ReconciliationError> {
         let now = (self.now)();
         let mut observation_provenance = HashMap::new();
         let mut no_copy_dispositions = HashMap::new();
+        let mut observed_source_receipts = BTreeMap::<String, AppendReceipt>::new();
         for aggregate in bucket {
             let group = aggregate.group_id.key().clone();
-            let provenance = if self.obligations.contains(&wallet, source_epoch, &group) {
-                TradeProvenance::ActivityWs
-            } else {
-                TradeProvenance::RestPoll
-            };
+            let observation = self.obligations.observation(&wallet, source_epoch, &group);
+            let provenance = observation
+                .map(|_| TradeProvenance::ActivityWs)
+                .unwrap_or(TradeProvenance::RestPoll);
+            if let Some((receipt, received_at)) = observation {
+                observed_source_receipts.insert(group.0.clone(), receipt);
+                receipt_received_at_unix_ms
+                    .insert(receipt.sequence.0.to_string(), unix_millis(received_at)?);
+            }
             observation_provenance.insert(group.clone(), provenance);
             if aggregate.group_id.components().activity_type == ActivityType::Trade
                 && let Some(disposition) = stale_disposition(
@@ -635,6 +759,9 @@ impl TradePoller {
             decision_inputs_json: serde_json::to_string(&serde_json::json!({
                 "fixed_end": fixed_end,
                 "pages": pages,
+                "page_occurrences": page_occurrences,
+                "observed_source_receipts": observed_source_receipts,
+                "receipt_received_at_unix_ms": receipt_received_at_unix_ms,
             }))?,
             reconstruction_quality,
             signal_config: self.signal_config.clone(),
@@ -785,6 +912,49 @@ struct RecordingFetcher {
     inner: Arc<dyn ReconciliationFetcher>,
     source_log: SourceLogHandle,
     append_closed: Arc<AtomicBool>,
+    occurrences: Arc<Mutex<Vec<RecordedPageOccurrence>>>,
+}
+
+struct RecordedPageOccurrence {
+    page: PageOccurrence,
+    received_at_unix_ms: i64,
+}
+
+fn unix_millis(value: OffsetDateTime) -> Result<i64, ReconciliationError> {
+    i64::try_from(value.unix_timestamp_nanos().div_euclid(1_000_000))
+        .map_err(|_| ReconciliationError::ReceiveTimeRange)
+}
+
+impl RecordingFetcher {
+    fn join_occurrences(
+        &self,
+        pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
+    ) -> Result<(Vec<PageOccurrence>, BTreeMap<String, i64>), ReconciliationError> {
+        let occurrences = self
+            .occurrences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if occurrences.len() != pages.len()
+            || occurrences.iter().zip(pages).any(|(occurrence, evidence)| {
+                occurrence.page.request_url != evidence.request_url
+                    || occurrence.page.raw_hash != evidence.raw_page_hash
+            })
+        {
+            return Err(ReconciliationError::PageReceiptMismatch);
+        }
+        let mut times = BTreeMap::new();
+        let pages = occurrences
+            .iter()
+            .map(|occurrence| {
+                times.insert(
+                    occurrence.page.receipt.sequence.0.to_string(),
+                    occurrence.received_at_unix_ms,
+                );
+                occurrence.page.clone()
+            })
+            .collect();
+        Ok((pages, times))
+    }
 }
 
 impl ReconciliationFetcher for RecordingFetcher {
@@ -804,15 +974,31 @@ impl ReconciliationFetcher for RecordingFetcher {
                 content_type: ContentType::Json,
                 payload: payload.clone(),
             };
-            self.source_log
-                .append(envelope)
-                .await
-                .map_err(|SourceLogHandleError::Closed| {
+            let receipt = self.source_log.append(envelope).await.map_err(
+                |SourceLogHandleError::Closed| {
                     self.append_closed.store(true, Ordering::Release);
                     SourceError::Fatal {
                         message: "source-log coordinator closed".to_owned(),
                     }
-                })?;
+                },
+            )?;
+            let received_at_unix_ms = i64::try_from(
+                received_at.unix_timestamp_nanos().div_euclid(1_000_000),
+            )
+            .map_err(|_| SourceError::Fatal {
+                message: "source receive time exceeds i64 milliseconds".to_owned(),
+            })?;
+            self.occurrences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(RecordedPageOccurrence {
+                    page: PageOccurrence {
+                        request_url: url.to_owned(),
+                        raw_hash: blake3::hash(&payload).to_hex().to_string(),
+                        receipt,
+                    },
+                    received_at_unix_ms,
+                });
             Ok(payload)
         })
     }
@@ -905,9 +1091,76 @@ mod tests {
                 source_trade_id: SourceTradeId("g2:a".to_owned()),
                 provenance: TradeProvenance::ActivityWs,
                 received_at: OffsetDateTime::from_unix_timestamp(received).unwrap(),
+                receipt: pe_event_log::AppendReceipt {
+                    sequence: pe_core_types::EventSeq(u64::try_from(received).unwrap()),
+                    this_hash: blake3::Hash::from_bytes([u8::try_from(received).unwrap_or(0); 32]),
+                },
             });
         }
         assert_eq!(obligations.len(), 1);
         assert_eq!(obligations.earliest_epoch(&wallet), Some(100));
+        let observation = obligations
+            .observation(&wallet, 100, &SourceTradeId("g2:a".to_owned()))
+            .unwrap();
+        assert_eq!(observation.0.sequence, pe_core_types::EventSeq(101));
+        assert_eq!(observation.1.unix_timestamp(), 101);
+    }
+
+    /// PASS: only an obligation received before the cutoff and appended inside the boundary prefix
+    /// delays the boundary; either crossing order belongs to the later interval.
+    #[test]
+    fn boundary_uses_both_receipt_and_receive_time_bounds() {
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let source_time = OffsetDateTime::from_unix_timestamp(900).unwrap();
+        let trigger = |id: &str, sequence: u64, received_at: i64| ReconciliationTrigger {
+            wallet,
+            source_time,
+            source_trade_id: SourceTradeId(id.to_owned()),
+            provenance: TradeProvenance::ActivityWs,
+            received_at: OffsetDateTime::from_unix_timestamp(received_at).unwrap(),
+            receipt: AppendReceipt {
+                sequence: pe_core_types::EventSeq(sequence),
+                this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap_or(0); 32]),
+            },
+        };
+        let mut obligations = ReconciliationObligations::default();
+        assert!(obligations.install_boundary(PendingBoundary {
+            cutoff_unix: 1_000,
+            receipt: trigger("boundary", 10, 1_000).receipt,
+        }));
+        assert!(!obligations.install_boundary(PendingBoundary {
+            cutoff_unix: 2_000,
+            receipt: trigger("later", 20, 2_000).receipt,
+        }));
+        obligations.insert(trigger("post-receive", 9, 1_001));
+        obligations.insert(trigger("late-append", 11, 999));
+        assert!(obligations.boundary_ready());
+
+        obligations.insert(trigger("qualifying", 8, 999));
+        assert!(!obligations.boundary_ready());
+        obligations.remove(&wallet, 900, &SourceTradeId("qualifying".to_owned()));
+        assert_eq!(
+            obligations.take_ready_boundary().unwrap().cutoff_unix,
+            1_000
+        );
+    }
+
+    /// PASS: restart/quiet-day catch-up yields every completed midnight after Start in oldest-first
+    /// order and never repeats an existing boundary cutoff.
+    #[test]
+    fn completed_midnights_catch_up_oldest_first() {
+        assert_eq!(
+            completed_midnight_cutoffs_after(100, 3 * SECONDS_PER_DAY + 1).unwrap(),
+            vec![SECONDS_PER_DAY, 2 * SECONDS_PER_DAY, 3 * SECONDS_PER_DAY]
+        );
+        assert_eq!(
+            completed_midnight_cutoffs_after(SECONDS_PER_DAY, 2 * SECONDS_PER_DAY).unwrap(),
+            vec![2 * SECONDS_PER_DAY]
+        );
+        assert!(
+            completed_midnight_cutoffs_after(100, 99)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -17,7 +17,8 @@ pub mod paper;
 
 pub use config::{PerTradeCap, SizingMode, WinnerFollowConfig};
 pub use error::{
-    KellyErrorAudit, PaperExecutionError, WinnerFollowDeclineAudit, WinnerFollowError,
+    KellyErrorAudit, PaperExecutionError, RiskInputsUnavailable, WinnerFollowDeclineAudit,
+    WinnerFollowError,
 };
 pub use evaluate::{
     OrganicCanaryOrder, OrganicCanaryPolicy, OrganicDecisionProof, WinnerFollowStrategy,

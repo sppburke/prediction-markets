@@ -79,6 +79,7 @@ pub struct ReconciliationTrigger {
     pub source_trade_id: SourceTradeId,
     pub provenance: TradeProvenance,
     pub received_at: OffsetDateTime,
+    pub receipt: AppendReceipt,
 }
 
 /// Bounded producer handle for non-websocket source pages. The coordinator
@@ -140,7 +141,16 @@ fn activity_timeout() -> Duration {
 struct Observation {
     slot: usize,
     payload: Vec<u8>,
-    trigger: ReconciliationTrigger,
+    trigger: PendingReconciliationTrigger,
+}
+
+/// Normalized websocket identity before the coordinator assigns its durable receipt.
+struct PendingReconciliationTrigger {
+    wallet: WalletAddress,
+    source_time: OffsetDateTime,
+    source_trade_id: SourceTradeId,
+    provenance: TradeProvenance,
+    received_at: OffsetDateTime,
 }
 
 /// A downstream receiver closed: the service is shutting down.
@@ -529,7 +539,7 @@ impl Reader {
             self.deliver(Observation {
                 slot: self.slot,
                 payload: payload.to_vec(),
-                trigger: ReconciliationTrigger {
+                trigger: PendingReconciliationTrigger {
                     wallet: activity.wallet,
                     source_time: activity.source_time.0,
                     source_trade_id: activity.group_id.key().clone(),
@@ -648,16 +658,21 @@ impl Coordinator {
                     };
                     let label = observation.trigger.source_trade_id.clone();
                     let slot = Some(observation.slot);
-                    if self
-                        .append_with_recovery(envelope, &label, slot)
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                    let receipt = match self.append_with_recovery(envelope, &label, slot).await {
+                        Ok(receipt) => receipt,
+                        Err(Shutdown) => return,
+                    };
+                    let trigger = ReconciliationTrigger {
+                        wallet: observation.trigger.wallet,
+                        source_time: observation.trigger.source_time,
+                        source_trade_id: observation.trigger.source_trade_id,
+                        provenance: observation.trigger.provenance,
+                        received_at: observation.trigger.received_at,
+                        receipt,
+                    };
                     // Trigger delivery follows sync. A full queue drops only this
                     // durable obligation; polling and restart replay recover it.
-                    match self.trigger_tx.try_send(observation.trigger) {
+                    match self.trigger_tx.try_send(trigger) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
                             self.reconciliation_triggers_dropped
@@ -778,7 +793,7 @@ mod tests {
         Observation {
             slot: 0,
             payload,
-            trigger: ReconciliationTrigger {
+            trigger: PendingReconciliationTrigger {
                 wallet: activity.wallet,
                 source_time: activity.source_time.0,
                 source_trade_id: activity.group_id.key().clone(),
@@ -959,8 +974,19 @@ mod tests {
         let (source_log, source_rx) = SourceLogHandle::channel(1);
         let health = new_shared_health_with_ws(false, true, 90);
         let dropped = Arc::new(AtomicU64::new(0));
+        let queued = observation("0xqueued").trigger;
         trigger_tx
-            .try_send(observation("0xqueued").trigger)
+            .try_send(ReconciliationTrigger {
+                wallet: queued.wallet,
+                source_time: queued.source_time,
+                source_trade_id: queued.source_trade_id,
+                provenance: queued.provenance,
+                received_at: queued.received_at,
+                receipt: AppendReceipt {
+                    sequence: pe_core_types::EventSeq(0),
+                    this_hash: blake3::Hash::from_bytes([0; 32]),
+                },
+            })
             .unwrap();
         let task = tokio::spawn(
             Coordinator {

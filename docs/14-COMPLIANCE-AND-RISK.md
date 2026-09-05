@@ -99,7 +99,6 @@ pub enum RiskBlock {
     MarketConcentrationExceeded,
     FamilyConcentrationExceeded,
     TotalCopyExposureExceeded,
-    OnchainSourceUnhealthy,
     PerTradeSizeExceeded,
     IntradayDrawdownStop,
     Rolling7dDrawdownStop,
@@ -108,4 +107,9 @@ pub enum RiskBlock {
 }
 ```
 
-The halt scope for each variant (this trade, strategy-wide) is documented canonically in `19-`. Manual review is required to clear any `KillSwitchDrawdown`.
+The halt scope for each variant (this trade, strategy-wide) is documented canonically in `19-`.
+Source health remains a separate service-readiness/admission gate; it is not a fabricated field in
+the pure risk snapshot. Absolute loss remains latched until its own audited
+`risk_halt_release_hash` is synchronized. Intraday and rolling causes release mechanically;
+latency releases at its canonical lower threshold or, when sample-starved, through its own audited
+hash. One cause never releases another.
