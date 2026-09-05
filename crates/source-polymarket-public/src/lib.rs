@@ -59,8 +59,8 @@ pub use gamma_markets::{
     MetadataPageEvidence, VerifiedTokenIdentity, parse_outcome_prices,
 };
 pub use live_admission::{
-    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveFeeEvidence, LiveMarketError,
-    LiveMarketEvidence, validate_live_market,
+    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveMarketError, LiveMarketEvidence,
+    validate_live_market,
 };
 pub use reconciliation::{
     ACTIVITY_MAX_OFFSET, ActivityAssetIdentity, ActivityAssetMapping, ActivityReadError,

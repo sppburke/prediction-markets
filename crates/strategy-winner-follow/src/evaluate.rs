@@ -134,7 +134,8 @@ impl WinnerFollowStrategy {
     /// Thin wrapper over [`Self::evaluate_at_price`] that sizes against
     /// `signal.leader_price` — the historical/replay basis. The live copy path calls
     /// [`Self::evaluate_at_price`] with the *current* market price instead (issue #339);
-    /// backtest/replay keep this leader-price basis so their output is unchanged.
+    /// legacy callers may retain this leader-price basis; economic paper/live/backtest callers
+    /// supply their derived all-in price explicitly.
     pub fn evaluate(
         &self,
         signal: &LeaderSignal,
@@ -157,7 +158,7 @@ impl WinnerFollowStrategy {
         )
     }
 
-    /// Evaluate a leader signal at an explicit `current_price` and produce an `OrderIntent`
+    /// Evaluate a leader signal at an explicit all-in Kelly price and produce an `OrderIntent`
     /// if all gates pass.
     ///
     /// Steps:
@@ -165,28 +166,26 @@ impl WinnerFollowStrategy {
     /// 2. Use the requested `mode` directly as the effective mode (no signal-kind clamping).
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Size contracts by `config.sizing_mode`:
-    ///    `Dollar { usd }` → `max(1, floor(usd / dollar_sizing_price ?? current_price))` (bypasses Kelly + `p`);
+    ///    `Dollar { usd }` → `floor(usd / dollar_sizing_price ?? all_in_kelly_price)` (bypasses Kelly + `p`);
     ///    `Contract { contracts }` → exactly `contracts` (bypasses Kelly + price math);
-    ///    `Kelly` → select the mode fraction, compute cost-adjusted `c`, call `size_contracts`.
+    ///    `Kelly` → select the mode fraction and pass the caller's exact all-in `c` unchanged to
+    ///    `size_contracts`.
     /// 5. Clamp to `per_trade_cap`, then `min` with `book_cap_contracts` (the price-impact book
     ///    cap, #398 WS2). Return `NoEdge` if the result is 0 (per-trade cap exhausted, or a
     ///    `Some(0)` book cap → trade skipped).
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
     ///
-    /// `current_price` — the RAW (fee-exclusive) per-share price used only to derive the Kelly
-    /// cost `c` (which adds fee + slippage on top). In replay/backtest it is the leader's entry
-    /// price; on the live copy path the caller passes the leader's just-executed trade price (a
-    /// reliable current-price proxy — the Gamma mid is unreliable, #484). The emitted
-    /// `limit_price` stays at `signal.leader_price` regardless (don't-chase).
+    /// `all_in_kelly_price` — exact `c` derived by the caller from the signed principal/minimum
+    /// shares, compact taker fee, and configured slippage. The strategy never recomputes or
+    /// substitutes any fee input. The emitted `limit_price` stays at `signal.leader_price`
+    /// regardless (don't-chase).
     ///
     /// `dollar_sizing_price` — the realistic per-share COST of the position (leader + haircut on
     /// the live path). When `Some(p)`, it is the divisor for `SizingMode::Dollar` (`floor(usd /
-    /// p)` → `contracts × fill == usd`) AND the basis for the per-trade cap and exposure bps, so
-    /// all three bound the real money at risk; `current_price` stays fee-exclusive for the Kelly
-    /// `c`, avoiding a double-count. `None` falls back to `current_price` for all of them
-    /// (replay/backtest, which size and cost against one price). No effect on the Kelly fraction
-    /// or the Contract arm's count.
+    /// p)` → `contracts × fill == usd`) AND the basis for the preliminary strategy cap/exposure
+    /// checks. `None` falls back to `all_in_kelly_price`. The venue planner performs the final
+    /// principal-plus-reserve cap checks.
     ///
     /// `p` — empirical win rate supplied by caller. Used only when `sizing_mode` is `Kelly`.
     ///
@@ -195,14 +194,12 @@ impl WinnerFollowStrategy {
     /// `Some(0)` = a successful read with nothing absorbable (the trade is skipped, distinct from
     /// fail-open). The orchestrator computes it; replay/backtest pass `None`.
     ///
-    /// `c` — computed internally as `current_price + taker fee + slippage` for BUY orders.
-    /// `fee_per_share = current_price × fee_rate`; `slippage_per_share = current_price × slippage_rate`.
-    /// SELL orders pay neither. See `_GLOSSARY.md` `polymarket_fee_rate`, `slippage_rate`.
+    /// `c` is never computed internally.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_at_price(
         &self,
         signal: &LeaderSignal,
-        current_price: Price,
+        all_in_kelly_price: Price,
         p: Probability,
         mut snapshot: RiskSnapshot,
         bankroll: Decimal,
@@ -223,15 +220,7 @@ impl WinnerFollowStrategy {
             return Err(WinnerFollowError::ShadowMode);
         }
 
-        // `notional_price` = the realistic per-share cost of the position, used for the dollar
-        // divisor AND the per-trade cap / exposure bps so all three agree on the money at risk.
-        // When the caller supplies `dollar_sizing_price` (the live path's fill price = leader +
-        // haircut), everything is `contracts × fill`-accurate; else it falls back to
-        // `current_price` (replay/backtest, which cost against the same price they size at).
-        // `current_price` itself stays the RAW price for the Kelly fee model below (so the
-        // fee-additive `c` is not double-counted against a fee-inclusive price). Guard a
-        // degenerate zero (`Price::new` admits 0) before it can divide-by-zero.
-        let notional_price = dollar_sizing_price.unwrap_or(current_price);
+        let notional_price = dollar_sizing_price.unwrap_or(all_in_kelly_price);
         if notional_price.0.is_zero() {
             return Err(WinnerFollowError::NoEdge);
         }
@@ -245,8 +234,7 @@ impl WinnerFollowStrategy {
                 (usd / notional_price.0)
                     .floor()
                     .to_u64()
-                    .unwrap_or(1)
-                    .max(1)
+                    .ok_or(WinnerFollowError::NoEdge)?
             }
             SizingMode::Contract { contracts } => {
                 // Exactly N contracts: bypass Kelly + price math. Downstream caps still apply; a
@@ -257,26 +245,9 @@ impl WinnerFollowStrategy {
                 // 4. Kelly fraction.
                 let kf = kelly_fraction(effective_mode, self.config.kelly_fraction_override);
 
-                // 5. Size contracts.
-                // c = current_price + Polymarket BUY taker fee + expected fill slippage (SELL pays neither).
-                // fee_per_share = current_price × fee_rate (flat taker fee on notional).
-                // slippage_per_share = current_price × slippage_rate (proportional fill impact on BUY).
-                let fee_per_share = if signal.leader_side == Side::Buy {
-                    current_price.0 * self.config.polymarket_fee_rate
-                } else {
-                    Decimal::ZERO
-                };
-                let slippage_per_share = if signal.leader_side == Side::Buy {
-                    current_price.0 * self.config.slippage_rate
-                } else {
-                    Decimal::ZERO
-                };
-                let c_raw = current_price.0 + fee_per_share + slippage_per_share;
-                let c = Price::new(c_raw).map_err(|_| WinnerFollowError::NoEdge)?;
-
                 let kelly_input = KellyInput {
                     p,
-                    c,
+                    c: all_in_kelly_price,
                     kelly_fraction: kf,
                     bankroll,
                 };

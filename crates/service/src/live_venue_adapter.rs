@@ -3,19 +3,20 @@
 //! The V2 client intentionally exposes raw, observed reconciliation rather than separate
 //! authenticated account/order methods. This adapter consumes that one composite seam for both
 //! account admission and order-hash recovery, preserving every raw observation in the
-//! execution-core audit types. Market admission uses a fresh Gamma long-market response and the
-//! corresponding CLOB long-market response. Both halves use a 60-second freshness window; the
-//! independently fetched executable ladder keeps its stricter two-second venue-owned bound.
+//! execution-core audit types. Market admission records fresh Gamma-long, CLOB-long, and compact
+//! CLOB responses before composing the shared artifact. The long observations use a 60-second
+//! freshness window; the independently fetched executable ladder keeps its stricter two-second
+//! venue-owned bound.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use pe_core_types::{
-    CollateralAmount, EventSeq, Price, RawEvidence, RawHttpAttempt, RawHttpResponse,
-    RawTransportFailure, TransportErrorClass,
+    CollateralAmount, Price, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
+    ReceivedAt, SourceId, SourceTimestamp, TransportErrorClass,
 };
-use pe_event_log::AppendReceipt;
+use pe_event_log::{ContentType, EnvelopeIn};
 use pe_execution_core::{
     AdmissionReceipts, LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact,
     LiveExecutedAmounts, LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification,
@@ -28,25 +29,31 @@ use pe_execution_core::{
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
-use pe_source_polymarket_public::validate_live_market;
+use pe_source_polymarket_public::{
+    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
+    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, validate_live_market,
+};
 use pe_venue_polymarket::{
-    CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CompactFeeSchedule, CustodyKind,
-    PreparedSubmission, REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION,
-    REDEMPTION_SCHEMA_VERSION, RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX,
+    CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
+    REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION, REDEMPTION_SCHEMA_VERSION,
+    RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX,
     RELAYER_LEGACY_TRANSACTION_PATH, RedemptionTransport, RedemptionTransportError,
     RelayerCredentials, RelayerPollPolicy, RelayerTransportClient, SignedRedemptionRequest,
-    V2BuyRequest,
+    V2BuyRequest, parse_compact_market,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::live_credentials::LiveAccountCredentials;
 
 const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
 const MARKET_REQUEST_TIMEOUT_SECS: u64 = 10;
 const RECONCILIATION_TIMEOUT_SECS: u64 = 30;
+const CLOB_LONG_MARKET_SOURCE_ID: &str = "polymarket.clob.markets";
+const CLOB_COMPACT_MARKET_SOURCE_ID: &str = "polymarket.clob.compact-market";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveVenueAdapterError {
@@ -58,6 +65,8 @@ pub enum LiveVenueAdapterError {
     MarketStatus(u16),
     #[error("live market validation failed: {0}")]
     MarketValidation(String),
+    #[error("source-log coordinator closed while recording live admission")]
+    SourceLogClosed,
     #[error("requested outcome is not binary")]
     Outcome,
     #[error("redemption transport configuration failed: {0}")]
@@ -251,7 +260,6 @@ fn classify_order_post_response(
         if parsed.order_id.trim().is_empty()
             || parsed.making_amount <= Decimal::ZERO
             || parsed.taking_amount <= Decimal::ZERO
-            || parsed.taking_amount.fract() != Decimal::ZERO
             || parsed
                 .making_amount
                 .checked_div(parsed.taking_amount)
@@ -542,6 +550,7 @@ pub struct LiveAdmissionBuilder {
     client: reqwest::Client,
     gamma_base_url: String,
     clob_base_url: String,
+    source_log: SourceLogHandle,
 }
 
 impl LiveAdmissionBuilder {
@@ -549,11 +558,13 @@ impl LiveAdmissionBuilder {
         client: reqwest::Client,
         gamma_base_url: impl Into<String>,
         clob_base_url: impl Into<String>,
+        source_log: SourceLogHandle,
     ) -> Self {
         Self {
             client,
             gamma_base_url: gamma_base_url.into().trim_end_matches('/').to_owned(),
             clob_base_url: clob_base_url.into().trim_end_matches('/').to_owned(),
+            source_log,
         }
     }
 
@@ -567,8 +578,23 @@ impl LiveAdmissionBuilder {
             self.gamma_base_url, condition_id.0
         );
         let clob_url = format!("{}/markets/{}", self.clob_base_url, condition_id.0);
-        let gamma_raw = self.fetch(&gamma_url).await?;
-        let clob_raw = self.fetch(&clob_url).await?;
+        let compact_url = format!("{}/clob-markets/{}", self.clob_base_url, condition_id.0);
+        let (gamma_raw, gamma_receipt) = self
+            .fetch_and_record(
+                &gamma_url,
+                GAMMA_MARKETS_SOURCE_ID,
+                GAMMA_MARKETS_SCHEMA_VERSION,
+                GAMMA_MARKETS_PARSER_VERSION,
+            )
+            .await?;
+        let (clob_raw, clob_long_receipt) = self
+            .fetch_and_record(
+                &clob_url,
+                CLOB_LONG_MARKET_SOURCE_ID,
+                LIVE_MARKET_SCHEMA_VERSION,
+                LIVE_MARKET_PARSER_VERSION,
+            )
+            .await?;
         let market = validate_live_market(
             &gamma_raw,
             &clob_raw,
@@ -577,6 +603,28 @@ impl LiveAdmissionBuilder {
             LIVE_MARKET_FRESHNESS_SECS,
         )
         .map_err(|error| LiveVenueAdapterError::MarketValidation(error.to_string()))?;
+        let (compact_raw, clob_compact_receipt) = self
+            .fetch_and_record(
+                &compact_url,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+                LIVE_MARKET_SCHEMA_VERSION,
+                LIVE_MARKET_PARSER_VERSION,
+            )
+            .await?;
+        let compact = parse_compact_market(
+            &compact_raw,
+            condition_id,
+            &market.ordered_outcome_token_ids,
+        )
+        .map_err(|error| LiveVenueAdapterError::MarketValidation(error.to_string()))?;
+        if compact.minimum_order_size != market.minimum_order_size
+            || compact.minimum_tick_size != market.minimum_tick_size
+            || compact.neg_risk != market.neg_risk
+        {
+            return Err(LiveVenueAdapterError::MarketValidation(
+                "compact and long CLOB market rules disagree".to_owned(),
+            ));
+        }
         // validate_live_market admits only active=true, closed=false evidence from BOTH
         // payloads. Therefore the same observed payloads prove the entry settlement status is
         // unresolved; any resolved/ambiguous shape was already rejected above.
@@ -590,26 +638,25 @@ impl LiveAdmissionBuilder {
             parser_version: 1,
             freshness_window_secs: LIVE_MARKET_FRESHNESS_SECS,
         };
-        // #545 lane E fills these with synchronized source-log receipts when admission logging is
-        // wired; the interface-freeze slice has no SourceLogHandle at this boundary yet.
-        let unbound_receipt = AppendReceipt {
-            sequence: EventSeq(0),
-            this_hash: blake3::Hash::from_bytes([0; 32]),
-        };
         Ok(LiveAdmissionArtifact {
             market,
             settlement,
-            // #545 lane B fills this from compact CLOB and Gamma schedule evidence.
-            fee_schedule: CompactFeeSchedule::Zero,
+            fee_schedule: compact.fee_schedule,
             receipts: AdmissionReceipts {
-                gamma: unbound_receipt,
-                clob_long: unbound_receipt,
-                clob_compact: unbound_receipt,
+                gamma: gamma_receipt,
+                clob_long: clob_long_receipt,
+                clob_compact: clob_compact_receipt,
             },
         })
     }
 
-    async fn fetch(&self, url: &str) -> Result<Vec<u8>, LiveVenueAdapterError> {
+    async fn fetch_and_record(
+        &self,
+        url: &str,
+        source_id: &str,
+        schema_version: u32,
+        parser_version: u32,
+    ) -> Result<(Vec<u8>, pe_event_log::AppendReceipt), LiveVenueAdapterError> {
         let response = self
             .client
             .get(url)
@@ -618,14 +665,29 @@ impl LiveAdmissionBuilder {
             .await
             .map_err(|error| LiveVenueAdapterError::MarketTransport(error.to_string()))?;
         let status = response.status();
-        if !status.is_success() {
-            return Err(LiveVenueAdapterError::MarketStatus(status.as_u16()));
-        }
-        response
+        let body = response
             .bytes()
             .await
             .map(|bytes| bytes.to_vec())
-            .map_err(|error| LiveVenueAdapterError::MarketTransport(error.to_string()))
+            .map_err(|error| LiveVenueAdapterError::MarketTransport(error.to_string()))?;
+        let received_at = OffsetDateTime::now_utc();
+        let receipt = self
+            .source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(source_id.to_owned()),
+                schema_version,
+                parser_version,
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                content_type: ContentType::Json,
+                payload: body.clone(),
+            })
+            .await
+            .map_err(|SourceLogHandleError::Closed| LiveVenueAdapterError::SourceLogClosed)?;
+        if !status.is_success() {
+            return Err(LiveVenueAdapterError::MarketStatus(status.as_u16()));
+        }
+        Ok((body, receipt))
     }
 }
 
@@ -910,11 +972,11 @@ mod tests {
     }
 
     #[test]
-    fn matched_post_classification_retains_executed_price_improvement_amounts() {
+    fn matched_post_classification_retains_fractional_price_improvement_amounts() {
         let response = post_response(json!({
             "errorMsg": null,
-            "makingAmount": "4.00",
-            "takingAmount": "10",
+            "makingAmount": "4.05",
+            "takingAmount": "10.125",
             "orderID": "venue-order",
             "status": "MATCHED",
             "success": true,
@@ -926,8 +988,8 @@ mod tests {
             LivePostClassification::Matched {
                 venue_order_id: "venue-order".to_owned(),
                 executed: LiveExecutedAmounts {
-                    making_amount: dec!(4.00),
-                    taking_amount: dec!(10),
+                    making_amount: dec!(4.05),
+                    taking_amount: dec!(10.125),
                 },
             }
         );

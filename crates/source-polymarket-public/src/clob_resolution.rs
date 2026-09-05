@@ -242,6 +242,24 @@ pub struct ClobMarket {
     pub end_date_iso: Option<String>,
     pub closed: Option<bool>,
     pub active: Option<bool>,
+    #[serde(default)]
+    pub accepting_orders: Option<bool>,
+    #[serde(default)]
+    pub enable_order_book: Option<bool>,
+    #[serde(default)]
+    pub minimum_order_size: Option<serde_json::Value>,
+    #[serde(default)]
+    pub minimum_tick_size: Option<serde_json::Value>,
+    #[serde(default)]
+    pub neg_risk: Option<bool>,
+    #[serde(default)]
+    pub seconds_delay: Option<u64>,
+    /// Legacy long-row maker fee field retained only by the raw source envelope.
+    #[serde(default)]
+    pub maker_base_fee: Option<serde_json::Value>,
+    /// Legacy long-row taker fee field retained only by the raw source envelope.
+    #[serde(default)]
+    pub taker_base_fee: Option<serde_json::Value>,
     pub is_50_50_outcome: Option<bool>,
     #[serde(default)]
     pub tokens: Vec<ClobToken>,

@@ -3,8 +3,22 @@
 use pe_core_types::{
     CollateralAmount, PolymarketConditionId, PolymarketTokenId, Price, ShareAmount,
 };
+use polymarket_client_sdk_v2::clob::types::response::ClobMarketInfoResponse;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+
+use crate::fee::{CompactFeeSchedule, FeeScheduleError, parse_compact_fee_schedule};
+
+/// Economics-bearing projection of the compact `/clob-markets/{condition}` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactMarketEvidence {
+    pub condition_id: PolymarketConditionId,
+    pub token_ids: [PolymarketTokenId; 2],
+    pub minimum_order_size: ShareAmount,
+    pub minimum_tick_size: Price,
+    pub neg_risk: bool,
+    pub fee_schedule: CompactFeeSchedule,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClobMarketEvidence {
@@ -52,6 +66,8 @@ pub enum CanaryMarketError {
     Ineligible,
     #[error("fee metadata is nonzero or ambiguous")]
     FeeEvidence,
+    #[error("compact fee schedule is unsupported: {0}")]
+    FeeSchedule(#[from] FeeScheduleError),
     #[error("tick or minimum order size is invalid or inconsistent")]
     MarketRules,
     #[error("book is stale or from the future")]
@@ -84,22 +100,47 @@ struct LongToken {
     token_id: String,
 }
 
-#[derive(Deserialize)]
-struct ShortMarket {
-    t: Vec<ShortToken>,
-    mos: Decimal,
-    mts: Decimal,
-    mbf: Option<i64>,
-    tbf: Option<i64>,
-    itode: Option<bool>,
-    fd: Option<serde_json::Value>,
-    #[serde(default)]
-    nr: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct ShortToken {
-    t: String,
+/// Parse and validate the vendored compact market wire shape for shared economics.
+pub fn parse_compact_market(
+    short_raw: &[u8],
+    expected_condition: &PolymarketConditionId,
+    expected_tokens: &[PolymarketTokenId; 2],
+) -> Result<CompactMarketEvidence, CanaryMarketError> {
+    // Classify from the raw wire bytes before deserializing the shared DTO so an explicit
+    // `null` base fee cannot collapse into the same `Option::None` as an absent field.
+    let fee_schedule = parse_compact_fee_schedule(short_raw)?;
+    let short: ClobMarketInfoResponse = serde_json::from_slice(short_raw)
+        .map_err(|error| CanaryMarketError::Json(error.to_string()))?;
+    let condition_id = PolymarketConditionId(short.condition_id.to_string());
+    let token_ids: [PolymarketTokenId; 2] = short
+        .tokens
+        .into_iter()
+        .map(|token| {
+            token
+                .map(|token| PolymarketTokenId(token.token_id.to_string()))
+                .ok_or(CanaryMarketError::IdentityMismatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| CanaryMarketError::IdentityMismatch)?;
+    if &condition_id != expected_condition || &token_ids != expected_tokens {
+        return Err(CanaryMarketError::IdentityMismatch);
+    }
+    let minimum_order_size = ShareAmount::from_decimal_exact(short.min_order_size)
+        .map_err(|_| CanaryMarketError::MarketRules)?;
+    let minimum_tick_size =
+        Price::new(short.min_tick_size.as_decimal()).map_err(|_| CanaryMarketError::MarketRules)?;
+    if minimum_order_size == ShareAmount::ZERO || minimum_tick_size == Price::ZERO {
+        return Err(CanaryMarketError::MarketRules);
+    }
+    Ok(CompactMarketEvidence {
+        condition_id,
+        token_ids,
+        minimum_order_size,
+        minimum_tick_size,
+        neg_risk: short.neg_risk,
+        fee_schedule,
+    })
 }
 
 pub fn parse_market_evidence(
@@ -110,8 +151,13 @@ pub fn parse_market_evidence(
 ) -> Result<ClobMarketEvidence, CanaryMarketError> {
     let long: LongMarket =
         serde_json::from_slice(long_raw).map_err(|e| CanaryMarketError::Json(e.to_string()))?;
-    let short: ShortMarket =
-        serde_json::from_slice(short_raw).map_err(|e| CanaryMarketError::Json(e.to_string()))?;
+    let short =
+        parse_compact_market(short_raw, expected_condition, expected_tokens).map_err(|error| {
+            match error {
+                CanaryMarketError::FeeSchedule(_) => CanaryMarketError::FeeEvidence,
+                other => other,
+            }
+        })?;
     if long.condition_id != expected_condition.0 {
         return Err(CanaryMarketError::IdentityMismatch);
     }
@@ -120,15 +166,11 @@ pub fn parse_market_evidence(
         || !long.accepting_orders
         || long.neg_risk
         || long.seconds_delay != Some(0)
-        || short.itode == Some(true)
-        || short.nr == Some(true)
+        || short.neg_risk
     {
         return Err(CanaryMarketError::Ineligible);
     }
-    if short.mbf.is_some_and(|fee| fee != 0)
-        || short.tbf.is_some_and(|fee| fee != 0)
-        || short.fd.as_ref().is_some_and(fee_detail_is_nonzero)
-    {
+    if short.fee_schedule != CompactFeeSchedule::Zero {
         return Err(CanaryMarketError::FeeEvidence);
     }
     let long_tokens: [PolymarketTokenId; 2] = long
@@ -138,23 +180,15 @@ pub fn parse_market_evidence(
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| CanaryMarketError::IdentityMismatch)?;
-    let short_tokens: [PolymarketTokenId; 2] = short
-        .t
-        .into_iter()
-        .map(|token| PolymarketTokenId(token.t))
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| CanaryMarketError::IdentityMismatch)?;
-    if &long_tokens != expected_tokens || &short_tokens != expected_tokens {
+    if &long_tokens != expected_tokens || &short.token_ids != expected_tokens {
         return Err(CanaryMarketError::IdentityMismatch);
     }
     let minimum_order_size = ShareAmount::from_decimal_exact(long.minimum_order_size)
         .map_err(|_| CanaryMarketError::MarketRules)?;
-    let short_minimum =
-        ShareAmount::from_decimal_exact(short.mos).map_err(|_| CanaryMarketError::MarketRules)?;
+    let short_minimum = short.minimum_order_size;
     let minimum_tick_size =
         Price::new(long.minimum_tick_size).map_err(|_| CanaryMarketError::MarketRules)?;
-    let short_tick = Price::new(short.mts).map_err(|_| CanaryMarketError::MarketRules)?;
+    let short_tick = short.minimum_tick_size;
     if minimum_order_size == ShareAmount::ZERO
         || minimum_tick_size == Price::ZERO
         || short_minimum != minimum_order_size
@@ -170,16 +204,6 @@ pub fn parse_market_evidence(
         raw_market_hash: blake3::hash(long_raw),
         raw_clob_market_hash: blake3::hash(short_raw),
     })
-}
-
-fn fee_detail_is_nonzero(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Null => false,
-        serde_json::Value::Number(number) => number.as_i64() != Some(0),
-        serde_json::Value::String(text) => text.parse::<Decimal>() != Ok(Decimal::ZERO),
-        serde_json::Value::Object(map) => !map.is_empty(),
-        _ => true,
-    }
 }
 
 #[derive(Deserialize)]
@@ -284,10 +308,14 @@ pub fn executable_ladder(
         origin_ceiling,
     )
     .map_err(|e| match e {
-        crate::ladder::LadderError::Amount => CanaryMarketError::Amount,
+        crate::ladder::LadderError::Amount | crate::ladder::LadderError::Fee(_) => {
+            CanaryMarketError::Amount
+        }
         crate::ladder::LadderError::BelowBandAsk
         | crate::ladder::LadderError::InsufficientDepth
-        | crate::ladder::LadderError::NothingAffordable => CanaryMarketError::InsufficientDepth,
+        | crate::ladder::LadderError::NothingAffordable
+        | crate::ladder::LadderError::BelowMinimum
+        | crate::ladder::LadderError::CapExceeded => CanaryMarketError::InsufficientDepth,
     })?;
     Ok(ExecutableLadder {
         used_asks: plan.used_asks,
@@ -306,6 +334,25 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    const CONDITION: &str = "0x4c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ee";
+
+    fn compact_with_fee(fee: &str) -> Vec<u8> {
+        format!(
+            r#"{{"c":"{CONDITION}","t":[{{"t":"11","o":"Yes"}},{{"t":"22","o":"No"}}],"mts":0.01,"mos":5,"nr":false,{fee}}}"#
+        )
+        .into_bytes()
+    }
+
+    fn compact_identity() -> (PolymarketConditionId, [PolymarketTokenId; 2]) {
+        (
+            PolymarketConditionId(CONDITION.to_owned()),
+            [
+                PolymarketTokenId("11".to_owned()),
+                PolymarketTokenId("22".to_owned()),
+            ],
+        )
+    }
 
     fn evidence() -> ClobMarketEvidence {
         ClobMarketEvidence {
@@ -334,9 +381,25 @@ mod tests {
             Price::new(dec!(0.11)).unwrap(),
         )
         .unwrap();
-        assert_eq!(ladder.best_ask.0, dec!(0.10));
-        assert_eq!(ladder.limit_price.0, dec!(0.11));
-        assert_eq!(ladder.maximum_collateral.to_decimal(), dec!(0.55));
+        assert_eq!(
+            ladder,
+            ExecutableLadder {
+                used_asks: vec![
+                    AskLevel {
+                        price: Price::new(dec!(0.10)).unwrap(),
+                        shares: ShareAmount::from_decimal_exact(dec!(2)).unwrap(),
+                    },
+                    AskLevel {
+                        price: Price::new(dec!(0.11)).unwrap(),
+                        shares: ShareAmount::from_decimal_exact(dec!(3)).unwrap(),
+                    },
+                ],
+                best_ask: Price::new(dec!(0.10)).unwrap(),
+                limit_price: Price::new(dec!(0.11)).unwrap(),
+                shares: ShareAmount::from_decimal_exact(dec!(5)).unwrap(),
+                maximum_collateral: CollateralAmount::from_decimal_exact(dec!(0.55)).unwrap(),
+            }
+        );
     }
 
     #[test]
@@ -373,6 +436,40 @@ mod tests {
                 Price::new(dec!(0.10)).unwrap(),
             ),
             Err(CanaryMarketError::InsufficientDepth)
+        );
+    }
+
+    #[test]
+    fn shared_compact_parser_retains_supported_nonzero_schedule() {
+        let (condition, tokens) = compact_identity();
+        let parsed = parse_compact_market(
+            &compact_with_fee(r#""fd":{"r":0.0025,"e":1,"to":true}"#),
+            &condition,
+            &tokens,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.fee_schedule,
+            CompactFeeSchedule::Taker { rate: dec!(0.0025) }
+        );
+        assert_eq!(parsed.minimum_order_size.to_decimal(), dec!(5));
+        assert_eq!(parsed.minimum_tick_size.0, dec!(0.01));
+    }
+
+    #[test]
+    fn canary_wrapper_preserves_nonzero_fee_rejection() {
+        let (condition, tokens) = compact_identity();
+        let long = format!(
+            r#"{{"condition_id":"{CONDITION}","active":true,"closed":false,"accepting_orders":true,"minimum_order_size":5,"minimum_tick_size":0.01,"neg_risk":false,"seconds_delay":0,"tokens":[{{"token_id":"11"}},{{"token_id":"22"}}]}}"#
+        );
+        assert_eq!(
+            parse_market_evidence(
+                long.as_bytes(),
+                &compact_with_fee(r#""fd":{"r":0.0025,"e":1,"to":true}"#),
+                &condition,
+                &tokens,
+            ),
+            Err(CanaryMarketError::FeeEvidence)
         );
     }
 }

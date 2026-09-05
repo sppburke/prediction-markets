@@ -2,12 +2,12 @@
 //!
 //! Scenarios:
 //! 1. `override_changes_sizing_vs_default` — `kelly_fraction_override: Some(kf)` causes
-//!    `WinnerFollowStrategy::evaluate()` to produce more contracts than the default fraction.
+//!    `WinnerFollowStrategy::evaluate_at_price()` to produce more contracts than the default fraction.
 //!    Tested at the evaluate() layer to avoid the simulation's per-trade risk cap.
 //! 2. `sweep_produces_correct_run_count` — a 3-fraction sweep via `run_one_kelly_fraction`
 //!    produces exactly 3 runs in `KellySweepReport`.
 //! 3. `higher_fraction_yields_more_contracts` — across [0.10, 0.25, 0.50, 0.75, 1.0],
-//!    contract count from evaluate() increases monotonically with the Kelly fraction.
+//!    contract count from evaluate_at_price() increases monotonically with the Kelly fraction.
 //! 4. `to_markdown_table_covers_all_runs` — the markdown table contains one row per run.
 //! 5. `sweep_suppresses_per_run_output` — per-run report.json is NOT written in sweep mode.
 //! 6. `parallel_sweep_matches_sequential` — equivalence: rayon `par_iter` sweep produces
@@ -97,6 +97,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         bootstrap_cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
         bankroll_usd: Decimal::from(10_000u32),
+        modeled_polymarket_fee_rate: dec!(0.04),
         step_days: 1,
         max_hours_to_expiry: None,
         audit_window_days: 90,
@@ -180,13 +181,14 @@ fn clean_risk_snapshot() -> RiskSnapshot {
 
 // ── Scenario 1 ─────────────────────────────────────────────────────────────────
 
-/// PASS: `kelly_fraction_override: Some(1.0)` causes `evaluate()` to size more contracts
+/// PASS: `kelly_fraction_override: Some(1.0)` causes `evaluate_at_price()` to size more contracts
 ///       than the default `KELLY_PAPER_BACKTEST = 0.10` on an identical signal.
 /// FAIL: both strategies return the same contract count.
 #[test]
 fn override_changes_sizing_vs_default() {
     let signal = thin_edge_signal();
     let p = Probability::new(dec!(0.421)).unwrap();
+    let all_in = Price::new(dec!(0.4202)).unwrap();
     let bankroll = Decimal::from(10_000u32);
 
     let default_strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
@@ -196,22 +198,28 @@ fn override_changes_sizing_vs_default() {
     });
 
     let intent_default = default_strategy
-        .evaluate(
+        .evaluate_at_price(
             &signal,
+            all_in,
             p,
             clean_risk_snapshot(),
             bankroll,
             ExecutionMode::Paper,
+            None,
+            None,
         )
         .expect("default strategy should approve");
 
     let intent_override = override_strategy
-        .evaluate(
+        .evaluate_at_price(
             &signal,
+            all_in,
             p,
             clean_risk_snapshot(),
             bankroll,
             ExecutionMode::Paper,
+            None,
+            None,
         )
         .expect("override strategy should approve");
 
@@ -268,12 +276,13 @@ async fn sweep_produces_correct_run_count() {
 // ── Scenario 3 ─────────────────────────────────────────────────────────────────
 
 /// PASS: across fractions [0.10, 0.25, 0.50, 0.75, 1.0], the contract count returned
-///       by `evaluate()` increases strictly monotonically.
+///       by `evaluate_at_price()` increases strictly monotonically.
 /// FAIL: any adjacent pair has equal or decreasing contracts.
 #[test]
 fn higher_fraction_yields_more_contracts() {
     let signal = thin_edge_signal();
     let p = Probability::new(dec!(0.421)).unwrap();
+    let all_in = Price::new(dec!(0.4202)).unwrap();
     let bankroll = Decimal::from(10_000u32);
     let fractions = [dec!(0.10), dec!(0.25), dec!(0.50), dec!(0.75), dec!(1.0)];
 
@@ -285,12 +294,15 @@ fn higher_fraction_yields_more_contracts() {
             ..WinnerFollowConfig::default()
         });
         let intent = strategy
-            .evaluate(
+            .evaluate_at_price(
                 &signal,
+                all_in,
                 p,
                 clean_risk_snapshot(),
                 bankroll,
                 ExecutionMode::Paper,
+                None,
+                None,
             )
             .unwrap_or_else(|e| panic!("evaluate failed for fraction {frac}: {e}"));
         counts.push(intent.contracts.0);

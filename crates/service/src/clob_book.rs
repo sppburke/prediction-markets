@@ -19,8 +19,12 @@ use std::str::FromStr as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+
+use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 
 /// Live Polymarket CLOB REST base URL.
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
@@ -35,6 +39,9 @@ const CLOB_MIN_INTERVAL_MS: u64 = 200;
 /// path (PR-H's snapshot worker), so a slow book is dropped to a partial
 /// snapshot rather than blocking a trade.
 const CLOB_REQUEST_TIMEOUT_SECS: u64 = 5;
+const CLOB_BOOK_SOURCE_ID: &str = "polymarket.clob.book";
+const CLOB_BOOK_SCHEMA_VERSION: u32 = 1;
+const CLOB_BOOK_PARSER_VERSION: u32 = 1;
 
 /// Errors from a `/book` fetch or parse.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +58,9 @@ pub enum ClobBookError {
     /// No fixture configured for the requested token id (test fetcher only).
     #[error("no fixture book for token id {0}")]
     MissingFixture(String),
+    /// The synchronized source-log owner closed before acknowledging the body.
+    #[error("source-log coordinator closed while recording clob /book")]
+    SourceLogClosed,
 }
 
 /// A single ask-side order-book level, parsed to `Decimal` (never `f64`).
@@ -80,6 +90,9 @@ pub struct OrderBook {
     /// planner refuses to price an order off a snapshot older than the shared
     /// ladder staleness bound. `from_book_json` leaves it `0` (parse-only).
     pub fetched_at_ms: u64,
+    /// Synchronized identity of the exact raw body when recording is enabled.
+    /// Parse-only and deterministic fixture books leave this absent.
+    pub source_receipt: Option<AppendReceipt>,
 }
 
 impl OrderBook {
@@ -106,6 +119,7 @@ impl OrderBook {
             asks,
             response_blake3: blake3::hash(bytes).to_hex().to_string(),
             fetched_at_ms: 0,
+            source_receipt: None,
         })
     }
 
@@ -175,6 +189,7 @@ pub struct ReqwestClobBookFetcher {
     min_interval: Duration,
     timeout: Duration,
     last_request_at: Mutex<Option<Instant>>,
+    source_log: Option<SourceLogHandle>,
 }
 
 impl ReqwestClobBookFetcher {
@@ -186,7 +201,15 @@ impl ReqwestClobBookFetcher {
             min_interval: Duration::from_millis(CLOB_MIN_INTERVAL_MS),
             timeout: Duration::from_secs(CLOB_REQUEST_TIMEOUT_SECS),
             last_request_at: Mutex::new(None),
+            source_log: None,
         }
+    }
+
+    /// Record each transport-successful `/book` body exactly once before returning it.
+    #[must_use]
+    pub fn with_source_log(mut self, source_log: SourceLogHandle) -> Self {
+        self.source_log = Some(source_log);
+        self
     }
 
     /// Override the base URL (e.g. a local mock server in tests). Defaults to
@@ -235,15 +258,35 @@ impl ClobBookFetcher for ReqwestClobBookFetcher {
             .await
             .map_err(|e| ClobBookError::Request(e.to_string()))?;
         let status = resp.status();
-        if !status.is_success() {
-            return Err(ClobBookError::Status(status.as_u16()));
-        }
         let body = resp
             .bytes()
             .await
             .map_err(|e| ClobBookError::Request(e.to_string()))?;
+        let received_at = time::OffsetDateTime::now_utc();
+        let source_receipt = if let Some(source_log) = &self.source_log {
+            Some(
+                source_log
+                    .append(EnvelopeIn {
+                        source_id: SourceId(CLOB_BOOK_SOURCE_ID.to_owned()),
+                        schema_version: CLOB_BOOK_SCHEMA_VERSION,
+                        parser_version: CLOB_BOOK_PARSER_VERSION,
+                        observed_at: SourceTimestamp(received_at),
+                        received_at: ReceivedAt(received_at),
+                        content_type: ContentType::Json,
+                        payload: body.to_vec(),
+                    })
+                    .await
+                    .map_err(|SourceLogHandleError::Closed| ClobBookError::SourceLogClosed)?,
+            )
+        } else {
+            None
+        };
+        if !status.is_success() {
+            return Err(ClobBookError::Status(status.as_u16()));
+        }
         let mut book = OrderBook::from_book_json(&body)?;
         book.fetched_at_ms = now_unix_ms();
+        book.source_receipt = source_receipt;
         Ok(book)
     }
 }
@@ -401,6 +444,7 @@ mod tests {
                 }],
                 response_blake3: String::new(),
                 fetched_at_ms: 0,
+                source_receipt: None,
             },
         );
         let fetcher = FixtureClobBookFetcher::new(books);

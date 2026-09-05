@@ -58,7 +58,7 @@ pub fn compact_fee_schedule(
     if details.exponent != 1 {
         return Err(FeeScheduleError::Exponent);
     }
-    if details.rate <= Decimal::ZERO || details.rate >= Decimal::ONE || details.rate.scale() > 6 {
+    if details.rate < Decimal::ZERO || details.rate >= Decimal::ONE || details.rate.scale() > 6 {
         return Err(FeeScheduleError::Unrepresentable);
     }
 
@@ -68,12 +68,16 @@ pub fn compact_fee_schedule(
 /// Deserialize a compact response into the vendored SDK wire DTO, then validate its fee fields.
 pub fn parse_compact_fee_schedule(bytes: &[u8]) -> Result<CompactFeeSchedule, FeeScheduleError> {
     let mut raw: Value = serde_json::from_slice(bytes).map_err(|_| FeeScheduleError::Malformed)?;
-    if let Some(details) = raw
-        .as_object_mut()
-        .ok_or(FeeScheduleError::Malformed)?
-        .get_mut("fd")
-        && !details.is_null()
-    {
+    let fields = raw.as_object_mut().ok_or(FeeScheduleError::Malformed)?;
+    for base in ["mbf", "tbf"] {
+        if fields.get(base).is_some_and(Value::is_null) {
+            return Err(FeeScheduleError::UnknownBase);
+        }
+    }
+    if let Some(details) = fields.get_mut("fd") {
+        if details.is_null() {
+            return Err(FeeScheduleError::Malformed);
+        }
         normalize_fee_details(details)?;
     }
     let info: ClobMarketInfoResponse =
@@ -86,7 +90,7 @@ fn normalize_fee_details(details: &mut Value) -> Result<(), FeeScheduleError> {
     let rate = take_alias(fields, &["r", "rate"])?;
     let exponent = take_alias(fields, &["e", "exponent"])?;
     let taker_only = take_alias(fields, &["to", "taker_only", "takerOnly"])?;
-    if !fields.is_empty() {
+    if !fields.is_empty() || rate.is_none() || exponent.is_none() || taker_only.is_none() {
         return Err(FeeScheduleError::Malformed);
     }
     if let Some(value) = rate {
@@ -132,7 +136,7 @@ pub fn taker_fee(
     shares: ShareAmount,
     price: Price,
 ) -> Result<CollateralAmount, FeeError> {
-    let CompactFeeSchedule::Taker { rate } = schedule else {
+    let Some(rate) = validated_rate(schedule)? else {
         return Ok(CollateralAmount::ZERO);
     };
     let fee = shares
@@ -145,21 +149,47 @@ pub fn taker_fee(
     CollateralAmount::from_decimal_exact(fee).map_err(|_| FeeError::Arithmetic)
 }
 
-/// Greatest fee reachable for `principal` over the inclusive signed-price band.
+/// Greatest fee reachable for the signed minimum shares over the inclusive price band.
+///
+/// The supported exponent-one curve reaches its maximum at one half, so only the interval
+/// endpoints and `0.5` can be the maximizer. The result is rounded upward to the venue's
+/// five-decimal fee quantum.
 pub fn fee_reserve(
     schedule: CompactFeeSchedule,
     principal: CollateralAmount,
+    minimum_shares: ShareAmount,
     floor: Price,
     ceiling: Price,
 ) -> Result<CollateralAmount, FeeError> {
     validate_band(floor, ceiling)?;
-    let CompactFeeSchedule::Taker { rate } = schedule else {
+    let Some(rate) = validated_rate(schedule)? else {
         return Ok(CollateralAmount::ZERO);
     };
-    let reserve = principal
+    if principal == CollateralAmount::ZERO && minimum_shares == ShareAmount::ZERO {
+        return Ok(CollateralAmount::ZERO);
+    }
+    if principal == CollateralAmount::ZERO
+        || minimum_shares == ShareAmount::ZERO
+        || ceiling == Price::ZERO
+        || minimum_shares
+            .to_decimal()
+            .checked_mul(ceiling.0)
+            .is_none_or(|signed_notional| signed_notional > principal.to_decimal())
+    {
+        return Err(FeeError::Arithmetic);
+    }
+    let curve_price = maximum_curve_price(floor, ceiling);
+    let curve = curve_price
+        .checked_mul(
+            Decimal::ONE
+                .checked_sub(curve_price)
+                .ok_or(FeeError::Arithmetic)?,
+        )
+        .ok_or(FeeError::Arithmetic)?;
+    let reserve = minimum_shares
         .to_decimal()
         .checked_mul(rate)
-        .and_then(|value| value.checked_mul(Decimal::ONE.checked_sub(floor.0)?))
+        .and_then(|value| value.checked_mul(curve))
         .ok_or(FeeError::Arithmetic)?
         .round_dp_with_strategy(5, RoundingStrategy::ToPositiveInfinity);
     CollateralAmount::from_decimal_exact(reserve).map_err(|_| FeeError::Arithmetic)
@@ -173,7 +203,7 @@ pub fn principal_for_budget(
     ceiling: Price,
 ) -> Result<CollateralAmount, FeeError> {
     validate_band(floor, ceiling)?;
-    let CompactFeeSchedule::Taker { rate } = schedule else {
+    let Some(rate) = validated_rate(schedule)? else {
         return Ok(budget);
     };
     let fee_ratio = rate
@@ -225,14 +255,48 @@ fn validate_band(floor: Price, ceiling: Price) -> Result<(), FeeError> {
     Ok(())
 }
 
+fn validated_rate(schedule: CompactFeeSchedule) -> Result<Option<Decimal>, FeeError> {
+    match schedule {
+        CompactFeeSchedule::Zero => Ok(None),
+        CompactFeeSchedule::Taker { rate }
+            if rate >= Decimal::ZERO && rate < Decimal::ONE && rate.scale() <= 6 =>
+        {
+            Ok(Some(rate))
+        }
+        CompactFeeSchedule::Taker { .. } => Err(FeeError::Arithmetic),
+    }
+}
+
+fn maximum_curve_price(floor: Price, ceiling: Price) -> Decimal {
+    let half = Decimal::new(5, 1);
+    if floor.0 <= half && ceiling.0 >= half {
+        half
+    } else if ceiling.0 < half {
+        ceiling.0
+    } else {
+        floor.0
+    }
+}
+
 fn all_in_reserve(
     schedule: CompactFeeSchedule,
     principal: CollateralAmount,
     floor: Price,
-    ceiling: Price,
+    _ceiling: Price,
 ) -> Result<CollateralAmount, FeeError> {
+    let Some(rate) = validated_rate(schedule)? else {
+        return Ok(principal);
+    };
+    let reserve = principal
+        .to_decimal()
+        .checked_mul(rate)
+        .and_then(|value| value.checked_mul(Decimal::ONE.checked_sub(floor.0)?))
+        .ok_or(FeeError::Arithmetic)?
+        .round_dp_with_strategy(5, RoundingStrategy::ToPositiveInfinity);
     principal
-        .checked_add(fee_reserve(schedule, principal, floor, ceiling)?)
+        .checked_add(
+            CollateralAmount::from_decimal_exact(reserve).map_err(|_| FeeError::Arithmetic)?,
+        )
         .map_err(|_| FeeError::Arithmetic)
 }
 
@@ -271,14 +335,22 @@ mod tests {
             );
         }
         for fields in [
+            json!({"fd": {"r": 0, "e": 1, "to": true}}),
             json!({"fd": {"r": 0.0025, "e": 1, "to": true}}),
             json!({"fd": {"rate": 0.0025, "exponent": 1, "taker_only": true}}),
             json!({"fd": {"rate": 0.0025, "exponent": 1, "takerOnly": true}}),
             json!({"fd": {"r": 0.0025, "e": 1, "to": true}, "mbf": 0, "tbf": 0}),
         ] {
+            let expected_rate = fields
+                .get("fd")
+                .and_then(|details| details.get("r"))
+                .and_then(Value::as_i64)
+                .map_or(dec!(0.0025), Decimal::from);
             assert_eq!(
-                parse_compact_fee_schedule(&compact(fields)).unwrap(),
-                CompactFeeSchedule::Taker { rate: dec!(0.0025) }
+                parse_compact_fee_schedule(&compact(fields.clone())).unwrap(),
+                CompactFeeSchedule::Taker {
+                    rate: expected_rate
+                }
             );
         }
     }
@@ -286,6 +358,9 @@ mod tests {
     #[test]
     fn rejects_every_invalid_compact_fee_class() {
         let cases = [
+            (json!({"mbf": null}), FeeScheduleError::UnknownBase),
+            (json!({"tbf": null}), FeeScheduleError::UnknownBase),
+            (json!({"fd": null}), FeeScheduleError::Malformed),
             (json!({"mbf": 1}), FeeScheduleError::MakerFee),
             (json!({"tbf": 1}), FeeScheduleError::UnknownBase),
             (
@@ -295,10 +370,6 @@ mod tests {
             (
                 json!({"fd": {"r": 0.0025, "e": 2, "to": true}}),
                 FeeScheduleError::Exponent,
-            ),
-            (
-                json!({"fd": {"r": 0, "e": 1, "to": true}}),
-                FeeScheduleError::Unrepresentable,
             ),
             (
                 json!({"fd": {"r": 1, "e": 1, "to": true}}),
@@ -320,6 +391,18 @@ mod tests {
                 json!({"fd": {"r": 0.0025, "e": 1, "to": true, "unknown": 1}}),
                 FeeScheduleError::Malformed,
             ),
+            (
+                json!({"fd": {"e": 1, "to": true}}),
+                FeeScheduleError::Malformed,
+            ),
+            (
+                json!({"fd": {"r": 0.0025, "to": true}}),
+                FeeScheduleError::Malformed,
+            ),
+            (
+                json!({"fd": {"r": 0.0025, "e": 1}}),
+                FeeScheduleError::Malformed,
+            ),
         ];
         for (fields, expected) in cases {
             assert_eq!(parse_compact_fee_schedule(&compact(fields)), Err(expected));
@@ -327,6 +410,18 @@ mod tests {
         assert_eq!(
             parse_compact_fee_schedule(br#"{"fd":"bad"}"#),
             Err(FeeScheduleError::Malformed)
+        );
+    }
+
+    #[test]
+    fn directly_constructed_invalid_schedule_fails_economics() {
+        assert_eq!(
+            taker_fee(
+                CompactFeeSchedule::Taker { rate: dec!(1) },
+                ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+                Price::new(dec!(0.5)).unwrap(),
+            ),
+            Err(FeeError::Arithmetic)
         );
     }
 
@@ -364,24 +459,25 @@ mod tests {
             fee_reserve(
                 schedule,
                 CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                ShareAmount::from_decimal_exact(dec!(1.333333)).unwrap(),
                 floor,
                 ceiling
             )
             .unwrap()
             .to_decimal(),
-            dec!(0.00123)
+            dec!(0.00084)
         );
 
         let budget = CollateralAmount::from_decimal_exact(dec!(100)).unwrap();
         let principal = principal_for_budget(schedule, budget, floor, ceiling).unwrap();
-        let reserve = fee_reserve(schedule, principal, floor, ceiling).unwrap();
+        let shares = ShareAmount::from_decimal_exact(
+            (principal.to_decimal() / ceiling.0)
+                .round_dp_with_strategy(6, RoundingStrategy::ToZero),
+        )
+        .unwrap();
+        let reserve = fee_reserve(schedule, principal, shares, floor, ceiling).unwrap();
         assert!(principal.checked_add(reserve).unwrap() <= budget);
         for price in [floor, ceiling] {
-            let shares = ShareAmount::from_decimal_exact(
-                (principal.to_decimal() / price.0)
-                    .round_dp_with_strategy(6, RoundingStrategy::ToZero),
-            )
-            .unwrap();
             let fee = taker_fee(schedule, shares, price).unwrap();
             assert!(fee <= reserve);
             assert!(principal.checked_add(fee).unwrap() <= budget);
@@ -404,7 +500,14 @@ mod tests {
             CollateralAmount::ZERO
         );
         assert_eq!(
-            fee_reserve(CompactFeeSchedule::Zero, budget, floor, ceiling).unwrap(),
+            fee_reserve(
+                CompactFeeSchedule::Zero,
+                budget,
+                ShareAmount::from_decimal_exact(dec!(20)).unwrap(),
+                floor,
+                ceiling
+            )
+            .unwrap(),
             CollateralAmount::ZERO
         );
         assert_eq!(
@@ -420,8 +523,61 @@ mod tests {
             CollateralAmount::from_atomic(30)
         ));
         assert!(matches!(
-            fee_reserve(CompactFeeSchedule::Zero, budget, ceiling, floor),
+            fee_reserve(
+                CompactFeeSchedule::Zero,
+                budget,
+                ShareAmount::from_decimal_exact(dec!(20)).unwrap(),
+                ceiling,
+                floor
+            ),
             Err(FeeError::Band)
         ));
+    }
+
+    #[test]
+    fn aggregate_fee_is_computed_once_not_per_level() {
+        let schedule = CompactFeeSchedule::Taker { rate: dec!(0.04) };
+        let price = Price::new(dec!(0.5)).unwrap();
+        let aggregate = taker_fee(
+            schedule,
+            ShareAmount::from_decimal_exact(dec!(0.302)).unwrap(),
+            price,
+        )
+        .unwrap();
+        let per_level = taker_fee(
+            schedule,
+            ShareAmount::from_decimal_exact(dec!(0.1509)).unwrap(),
+            price,
+        )
+        .unwrap()
+        .checked_add(
+            taker_fee(
+                schedule,
+                ShareAmount::from_decimal_exact(dec!(0.1511)).unwrap(),
+                price,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(aggregate.atomic(), 3_020);
+        assert_eq!(per_level.atomic(), 3_010);
+    }
+
+    #[test]
+    fn signed_price_is_the_only_fee_price() {
+        let schedule = CompactFeeSchedule::Taker { rate: dec!(0.0025) };
+        let shares = ShareAmount::from_decimal_exact(dec!(0.32)).unwrap();
+        assert_eq!(
+            taker_fee(schedule, shares, Price::new(dec!(0.4)).unwrap())
+                .unwrap()
+                .atomic(),
+            190
+        );
+        assert_eq!(
+            taker_fee(schedule, shares, Price::new(dec!(0.5)).unwrap())
+                .unwrap()
+                .atomic(),
+            200
+        );
     }
 }

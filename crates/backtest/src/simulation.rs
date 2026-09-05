@@ -14,8 +14,9 @@ use pe_bootstrap::cache::{
 };
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, KellyFraction, LeaderAction, MarketId, OutcomeId, Probability, ProbabilityPpm,
-    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
+    BasisPoints, CollateralAmount, KellyFraction, LeaderAction, MarketId, OutcomeId, Price,
+    Probability, ProbabilityPpm, ReconstructionQuality, ShareAmount, Side, SourceTimestamp,
+    TraderId, VenueId, WalletAddress,
 };
 use pe_risk_engine::clamp_contracts_to_liquidity;
 use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
@@ -23,6 +24,7 @@ use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::ledger::TraderLedger;
 use pe_trader_index::snapshot::RawTrade;
 use pe_trader_index::{IncrementalLedger, RankerConfig, build_watchlist};
+use pe_venue_polymarket::{CompactFeeSchedule, principal_for_budget, taker_fee};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use serde::Serialize;
@@ -123,6 +125,7 @@ impl SuppressionTracker {
 #[derive(Debug, Clone)]
 struct OpenPosition {
     contracts: u64,
+    /// Principal plus modeled platform fee per share.
     avg_fill_price: Decimal,
     /// Calendar date on which the copy was opened. Used by the resolution sweep to
     /// guard against anomalies where a market's resolved_at precedes the bought_on date.
@@ -159,6 +162,86 @@ impl PositionLifetime {
     fn open_at(&self, t: i64) -> bool {
         self.open_unix <= t && self.close_unix.is_none_or(|c| c > t)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModeledBuyEconomics {
+    principal: Decimal,
+    fee: Decimal,
+    all_in_debit: Decimal,
+    all_in_price: Decimal,
+}
+
+fn modeled_schedule(rate: Decimal) -> Result<CompactFeeSchedule, BacktestError> {
+    if rate < Decimal::ZERO || rate >= Decimal::ONE {
+        return Err(BacktestError::Internal(format!(
+            "modeled_polymarket_fee_rate must be in [0,1), got {rate}"
+        )));
+    }
+    Ok(if rate == Decimal::ZERO {
+        CompactFeeSchedule::Zero
+    } else {
+        CompactFeeSchedule::Taker { rate }
+    })
+}
+
+fn modeled_buy_economics(
+    rate: Decimal,
+    contracts: u64,
+    fill_price: Decimal,
+) -> Result<ModeledBuyEconomics, BacktestError> {
+    if contracts == 0 {
+        return Err(BacktestError::Internal(
+            "modeled BUY economics received zero contracts".to_owned(),
+        ));
+    }
+    let shares = ShareAmount::from_whole(contracts)
+        .map_err(|error| BacktestError::Internal(error.to_string()))?;
+    let price =
+        Price::new(fill_price).map_err(|error| BacktestError::Internal(error.to_string()))?;
+    let fee = taker_fee(modeled_schedule(rate)?, shares, price)
+        .map_err(|error| BacktestError::Internal(error.to_string()))?
+        .to_decimal();
+    let principal = Decimal::from(contracts)
+        .checked_mul(fill_price)
+        .ok_or_else(|| BacktestError::Internal("modeled principal overflow".to_owned()))?;
+    let all_in_debit = principal
+        .checked_add(fee)
+        .ok_or_else(|| BacktestError::Internal("modeled all-in debit overflow".to_owned()))?;
+    let all_in_price = all_in_debit
+        .checked_div(Decimal::from(contracts))
+        .ok_or_else(|| BacktestError::Internal("modeled all-in price overflow".to_owned()))?;
+    Ok(ModeledBuyEconomics {
+        principal,
+        fee,
+        all_in_debit,
+        all_in_price,
+    })
+}
+
+fn flat_contracts_for_budget(
+    rate: Decimal,
+    budget: Decimal,
+    fill_price: Decimal,
+) -> Result<u64, BacktestError> {
+    let budget = CollateralAmount::from_decimal_exact(budget)
+        .map_err(|error| BacktestError::Internal(error.to_string()))?;
+    let price =
+        Price::new(fill_price).map_err(|error| BacktestError::Internal(error.to_string()))?;
+    let principal = principal_for_budget(modeled_schedule(rate)?, budget, price, price)
+        .map_err(|error| BacktestError::Internal(error.to_string()))?;
+    principal
+        .to_decimal()
+        .checked_div(fill_price)
+        .ok_or_else(|| BacktestError::Internal("flat modeled price division failed".to_owned()))?
+        .floor()
+        .to_u64()
+        .ok_or_else(|| BacktestError::Internal("flat modeled contract count overflow".to_owned()))
+}
+
+fn modeled_kelly_price(rate: Decimal, fill_price: Decimal) -> Result<Option<Price>, BacktestError> {
+    let economics = modeled_buy_economics(rate, 1, fill_price)?;
+    Ok(Price::new(economics.all_in_price).ok())
 }
 
 /// Exposure tracker: per-leader, per-market.
@@ -284,6 +367,8 @@ pub fn run_simulation_with(
         all_trades.is_sorted_by_key(|t| t.timestamp.0),
         "run_simulation precondition violated: all_trades must be sorted by t.timestamp.0",
     );
+
+    modeled_schedule(config.modeled_polymarket_fee_rate)?;
 
     if all_trades.is_empty() {
         return Err(BacktestError::Internal("no trades in cache".to_owned()));
@@ -508,6 +593,8 @@ pub fn run_simulation_with(
                 contracts: open.contracts,
                 signal_price: close_price,
                 fill_price: close_price,
+                modeled_fee: Decimal::ZERO,
+                all_in_debit: Decimal::ZERO,
             };
             write_fill(fills_writer.as_mut(), &fill)?;
         }
@@ -747,29 +834,46 @@ pub fn run_simulation_with(
 
                     // Flat-USD short-circuit (issue #134): backtest-only research
                     // lever that bypasses Kelly, per-trade cap, mode clamp,
-                    // `risk-engine`, and the liquidity clamp. `floor(flat /
-                    // fill_price).max(1)` — degenerate `fill_price > flat` opens
-                    // at 1 contract (best-effort). Skip when bankroll cannot
-                    // cover the full notional (all-or-nothing semantics). The
+                    // `risk-engine`, and the liquidity clamp. The shared fee budget owner derives
+                    // a conservative principal before flooring contracts; a zero result is a
+                    // typed no-fill rather than a one-contract fallback. Skip when bankroll cannot
+                    // cover principal plus modeled fee. The
                     // Kelly-path counters (`total_signals_evaluated`,
                     // `snapshot_prior_*`, `liquidity_*`) stay zero because the
                     // corresponding code paths never execute.
                     if let Some(flat) = config.flat_usd {
-                        let contracts = ((flat / fill_price).floor().to_u64().unwrap_or(1)).max(1);
-                        let notional = Decimal::from(contracts) * fill_price;
-                        if bankroll < notional {
+                        let contracts = flat_contracts_for_budget(
+                            config.modeled_polymarket_fee_rate,
+                            flat,
+                            fill_price,
+                        )?;
+                        if contracts == 0 {
                             continue;
                         }
-                        bankroll -= notional;
+                        let economics = modeled_buy_economics(
+                            config.modeled_polymarket_fee_rate,
+                            contracts,
+                            fill_price,
+                        )?;
+                        if bankroll < economics.all_in_debit || economics.all_in_debit > flat {
+                            continue;
+                        }
+                        bankroll =
+                            bankroll
+                                .checked_sub(economics.all_in_debit)
+                                .ok_or_else(|| {
+                                    BacktestError::Internal("modeled BUY debit overflow".to_owned())
+                                })?;
 
-                        let actual_bps = proposed_trade_bps(contracts, fill_price, bankroll);
+                        let actual_bps =
+                            proposed_trade_bps(contracts, economics.all_in_price, bankroll);
                         exposure.add(leader, &trade.market_id, actual_bps);
 
                         open_positions.insert(
                             wallet_pos_key,
                             OpenPosition {
                                 contracts,
-                                avg_fill_price: fill_price,
+                                avg_fill_price: economics.all_in_price,
                                 bought_on: sim_date,
                                 open_unix: trade.timestamp.0.unix_timestamp(),
                             },
@@ -778,7 +882,14 @@ pub fn run_simulation_with(
                         if emit_period_pnl {
                             let acc = period_pnl.entry((leader, sim_date)).or_default();
                             acc.n_fills += 1;
-                            acc.notional += notional;
+                            acc.notional = acc
+                                .notional
+                                .checked_add(economics.all_in_debit)
+                                .ok_or_else(|| {
+                                    BacktestError::Internal(
+                                        "modeled period notional overflow".to_owned(),
+                                    )
+                                })?;
                         }
 
                         let fill = TradeFill {
@@ -790,6 +901,8 @@ pub fn run_simulation_with(
                             contracts,
                             signal_price: trade.price.0,
                             fill_price,
+                            modeled_fee: economics.fee,
+                            all_in_debit: economics.all_in_debit,
                         };
                         write_fill(fills_writer.as_mut(), &fill)?;
                         continue;
@@ -854,12 +967,20 @@ pub fn run_simulation_with(
                         proposed_bps: 0, // evaluate() overwrites this
                     });
 
-                    let contracts_count = match strategy.evaluate(
+                    let Some(all_in_kelly_price) =
+                        modeled_kelly_price(config.modeled_polymarket_fee_rate, fill_price)?
+                    else {
+                        continue;
+                    };
+                    let contracts_count = match strategy.evaluate_at_price(
                         &signal,
+                        all_in_kelly_price,
                         p,
                         risk_snapshot,
                         bankroll,
                         pe_strategy_winner_follow::ExecutionMode::Paper,
+                        None,
+                        None,
                     ) {
                         Ok(intent) => intent.contracts.0,
                         Err(e) => {
@@ -916,24 +1037,38 @@ pub fn run_simulation_with(
                         liquidity_below_floor_bypasses =
                             liquidity_below_floor_bypasses.saturating_add(1);
                     }
-                    let contracts_count = clamped;
+                    let affordable = flat_contracts_for_budget(
+                        config.modeled_polymarket_fee_rate,
+                        bankroll,
+                        fill_price,
+                    )?;
+                    let contracts_count = clamped.min(affordable);
 
                     if contracts_count == 0 {
                         continue;
                     }
 
                     // Record fill.
-                    let notional = Decimal::from(contracts_count) * fill_price;
-                    bankroll -= notional;
+                    let economics = modeled_buy_economics(
+                        config.modeled_polymarket_fee_rate,
+                        contracts_count,
+                        fill_price,
+                    )?;
+                    bankroll = bankroll
+                        .checked_sub(economics.all_in_debit)
+                        .ok_or_else(|| {
+                            BacktestError::Internal("modeled BUY debit overflow".to_owned())
+                        })?;
 
-                    let actual_bps = proposed_trade_bps(contracts_count, fill_price, bankroll);
+                    let actual_bps =
+                        proposed_trade_bps(contracts_count, economics.all_in_price, bankroll);
                     exposure.add(leader, &trade.market_id, actual_bps);
 
                     open_positions.insert(
                         wallet_pos_key,
                         OpenPosition {
                             contracts: contracts_count,
-                            avg_fill_price: fill_price,
+                            avg_fill_price: economics.all_in_price,
                             bought_on: sim_date,
                             open_unix: trade.timestamp.0.unix_timestamp(),
                         },
@@ -948,6 +1083,8 @@ pub fn run_simulation_with(
                         contracts: contracts_count,
                         signal_price: trade.price.0,
                         fill_price,
+                        modeled_fee: economics.fee,
+                        all_in_debit: economics.all_in_debit,
                     };
                     write_fill(fills_writer.as_mut(), &fill)?;
                 }
@@ -1010,6 +1147,8 @@ pub fn run_simulation_with(
                         contracts: closed_contracts,
                         signal_price: trade.price.0,
                         fill_price,
+                        modeled_fee: Decimal::ZERO,
+                        all_in_debit: Decimal::ZERO,
                     };
                     write_fill(fills_writer.as_mut(), &fill)?;
                 }

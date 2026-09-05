@@ -1,101 +1,269 @@
-//! Shared executable-ask-ladder planner (#508 Phase A).
+//! Shared collateral-path executable-ask planner (#545).
 //!
-//! One owner for the ladder math that both the isolated canary and the ordinary paper/live
-//! copy path use: walk the ask ladder inside a price band, accumulate shares, and report the
-//! exact spend (`estimated_ladder_spend`), the VWAP-consistent fill basis, the worst accepted
-//! tick (`limit_price`), and the signed-FOK maximum (`worst_case_debit = shares × limit`).
-//!
-//! Two entry points share one exact walk:
-//! - [`plan_exact_shares`] — fill exactly N shares or fail (`InsufficientDepth`); the
-//!   all-or-nothing contract [`crate::canary_market::executable_ladder`] wraps (canary
-//!   behavior must not drift — its wrapper keeps the staleness and minimum-order checks).
-//! - [`plan_budget_buy`] — the budget-based planner: the largest WHOLE-share quantity whose
-//!   ladder spend stays within `budget` (and, optionally, within `max_shares`), then the
-//!   exact walk for that quantity. Zero affordable whole shares is the typed
-//!   [`LadderError::NothingAffordable`] (the caller skips the trade; distinct from an
-//!   unusable book, which the caller never hands to the planner).
-//!
-//! Band semantics (both entry points): a level priced below `minimum_price` fails closed
-//! (`InsufficientDepth` — an executable below-band ask is evidence the fill would land below
-//! the band); a level at/above `maximum_price_exclusive` or above the inclusive
-//! `origin_ceiling` ends the walk. Levels must be sorted ascending by price with positive
-//! sizes — [`plan_budget_buy`] callers filter zero-size dust before planning.
+//! Ordinary BUYs sign an exact collateral principal. The expected paper quantity is the sum of
+//! improved ask quantities, while `shares` is the minimum taker quantity signed at the worst
+//! accepted tick. The isolated canary keeps its exact-share behavior through
+//! [`plan_exact_shares`], which uses the same private ask walk.
 
 use pe_core_types::{CollateralAmount, Price, ShareAmount};
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive as _;
+use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::canary_market::AskLevel;
+use crate::fee::{CompactFeeSchedule, FeeError, fee_reserve, principal_for_budget};
 
-/// Atomic share units per whole share (`ShareAmount` fixed-point scale).
 const ATOMICS_PER_SHARE: u64 = 1_000_000;
 
-/// Shared ladder staleness bound (ms). The canary's reviewed 2 s guard, now the one canonical
-/// bound for every ladder consumer: a book snapshot older than this (or from the future) must
-/// not price an order.
 pub const LADDER_MAX_AGE_MS: u64 = 2_000;
 
-/// `true` when a book snapshot observed at `observed_ms` is unusable at `now_ms`: from the
-/// future, or older than [`LADDER_MAX_AGE_MS`].
 #[must_use]
 pub fn ladder_is_stale(now_ms: u64, observed_ms: u64) -> bool {
     now_ms < observed_ms || now_ms - observed_ms > LADDER_MAX_AGE_MS
 }
 
-/// Typed planner failures. Every variant fails closed at the caller (no order).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LadderError {
-    /// An executable ask sits below the band floor — the fill would land below band.
     #[error("ask ladder holds an executable level below the band floor")]
     BelowBandAsk,
-    /// The in-band ladder cannot fill the requested share count.
     #[error("ask ladder cannot fill the request within its price bounds")]
     InsufficientDepth,
-    /// The budget affords no whole share inside the band (or `max_shares` was zero).
-    #[error("budget affords no whole share within the band")]
+    #[error("budget affords no atomic share within the band")]
     NothingAffordable,
-    /// Exact `Decimal`/amount arithmetic failed (implausible book magnitudes).
+    #[error("signed minimum shares are below the venue minimum")]
+    BelowMinimum,
+    #[error("principal plus fee reserve exceeds a monetary cap")]
+    CapExceeded,
+    #[error("fee calculation failed: {0}")]
+    Fee(#[from] FeeError),
     #[error("exact amount arithmetic failed")]
     Amount,
 }
 
-/// One planned BUY over an ask ladder: the exact levels used, the price bounds, and the
-/// canonical money figures (`_GLOSSARY.md` #508: `estimated_ladder_spend`,
-/// `worst_case_debit`).
+/// One collateral-path BUY plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LadderPlan {
-    /// The ladder levels consumed, in ascending price order, with the used share amounts.
+    /// Expected improved quantities at each crossed ask.
     pub used_asks: Vec<AskLevel>,
-    /// Lowest used level — the fresh best ask actually crossed.
     pub best_ask: Price,
-    /// Worst (highest) used level: the live FOK limit price.
+    /// Worst accepted tick and therefore the signed price.
     pub limit_price: Price,
-    /// Planned share quantity.
+    /// Signed minimum taker quantity, `floor_atomic(principal / limit_price)`.
     pub shares: ShareAmount,
-    /// Σ(level price × used quantity) — the exact expected spend; `paper_fill_vwap =
-    /// estimated_ladder_spend / shares`.
-    pub estimated_ladder_spend: CollateralAmount,
-    /// `shares × limit_price` — the signed-FOK maximum debit (≥ `estimated_ladder_spend`).
+    /// Exact signed maker principal.
     pub worst_case_debit: CollateralAmount,
 }
 
 impl LadderPlan {
-    /// Volume-weighted average fill price: `estimated_ladder_spend / shares`. `None` only
-    /// when the resulting value is not a valid `Price` (degenerate zero-share plan — the
-    /// constructors never produce one).
+    pub fn expected_shares(&self) -> Result<ShareAmount, LadderError> {
+        self.used_asks
+            .iter()
+            .try_fold(ShareAmount::ZERO, |total, ask| {
+                total
+                    .checked_add(ask.shares)
+                    .map_err(|_| LadderError::Amount)
+            })
+    }
+
+    pub fn expected_spend(&self) -> Result<CollateralAmount, LadderError> {
+        collateral_floor(expected_spend_decimal(&self.used_asks)?)
+    }
+
     #[must_use]
     pub fn vwap(&self) -> Option<Price> {
-        let shares = self.shares.to_decimal();
+        let shares = self.expected_shares().ok()?.to_decimal();
         if shares <= Decimal::ZERO {
             return None;
         }
-        Price::new(self.estimated_ladder_spend.to_decimal() / shares).ok()
+        let spend = self.expected_spend().ok()?.to_decimal();
+        Price::new(spend.checked_div(shares)?).ok()
     }
 }
 
-/// Fill exactly `requested_shares` from `asks` within the band, or fail. The extracted body
-/// of the reviewed canary walk — [`crate::canary_market::executable_ladder`] wraps this with
-/// its staleness and minimum-order checks, so canary behavior cannot drift.
+/// Requested sizing before the common ladder and cap checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuySizing {
+    Dollar { budget: CollateralAmount },
+    Contract { contracts: u64 },
+    Kelly { contracts: u64 },
+}
+
+/// A plan together with the exact conservative fee reserve used by every monetary cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizedBuyPlan {
+    pub ladder: LadderPlan,
+    pub budget: CollateralAmount,
+    pub reserve: CollateralAmount,
+}
+
+impl SizedBuyPlan {
+    pub fn worst_case_all_in_debit(&self) -> Result<CollateralAmount, LadderError> {
+        self.ladder
+            .worst_case_debit
+            .checked_add(self.reserve)
+            .map_err(|_| LadderError::Amount)
+    }
+}
+
+/// Plan Dollar, Contract, or Kelly output through one collateral ladder and cap owner.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_sized_buy(
+    asks: &[AskLevel],
+    schedule: CompactFeeSchedule,
+    sizing: BuySizing,
+    monetary_caps: &[CollateralAmount],
+    minimum_order_size: ShareAmount,
+    minimum_tick_size: Price,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    chase_ceiling: Price,
+    impact_ceiling: Price,
+) -> Result<SizedBuyPlan, LadderError> {
+    let signed_share_scale = minimum_tick_size
+        .0
+        .normalize()
+        .scale()
+        .checked_add(2)
+        .filter(|scale| *scale <= 6)
+        .ok_or(LadderError::Amount)?;
+    if minimum_tick_size == Price::ZERO {
+        return Err(LadderError::Amount);
+    }
+    let ceiling = chase_ceiling.min(impact_ceiling);
+    let best_ask = first_eligible_ask(asks, minimum_price, maximum_price_exclusive, ceiling)?;
+    let smallest_cap = monetary_caps
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(CollateralAmount::from_atomic(u64::MAX));
+
+    let (budget, ladder) = match sizing {
+        BuySizing::Dollar { budget } => {
+            let budget = budget.min(smallest_cap);
+            let principal = principal_for_budget(schedule, budget, best_ask, ceiling)?;
+            let ladder = plan_principal_buy_with_scale(
+                asks,
+                principal,
+                signed_share_scale,
+                minimum_price,
+                maximum_price_exclusive,
+                chase_ceiling,
+                impact_ceiling,
+            )
+            .map_err(|error| {
+                if error == LadderError::NothingAffordable
+                    && minimum_order_size != ShareAmount::ZERO
+                {
+                    LadderError::BelowMinimum
+                } else {
+                    error
+                }
+            })?;
+            (budget, ladder)
+        }
+        BuySizing::Contract { contracts } | BuySizing::Kelly { contracts } => {
+            let requested = whole_shares(contracts)?;
+            if requested < minimum_order_size {
+                return Err(LadderError::BelowMinimum);
+            }
+            let exact = plan_exact_shares(
+                asks,
+                requested,
+                minimum_price,
+                maximum_price_exclusive,
+                ceiling,
+            )?;
+            let ladder = plan_principal_buy_with_scale(
+                asks,
+                exact.worst_case_debit,
+                signed_share_scale,
+                minimum_price,
+                maximum_price_exclusive,
+                chase_ceiling,
+                impact_ceiling,
+            )?;
+            (smallest_cap, ladder)
+        }
+    };
+
+    let reserve = fee_reserve(
+        schedule,
+        ladder.worst_case_debit,
+        ladder.shares,
+        ladder.best_ask,
+        ladder.limit_price,
+    )?;
+    let all_in = ladder
+        .worst_case_debit
+        .checked_add(reserve)
+        .map_err(|_| LadderError::Amount)?;
+
+    if all_in > budget || monetary_caps.iter().any(|cap| all_in > *cap) {
+        return Err(LadderError::CapExceeded);
+    }
+    if ladder.shares < minimum_order_size {
+        return Err(LadderError::BelowMinimum);
+    }
+    Ok(SizedBuyPlan {
+        ladder,
+        budget,
+        reserve,
+    })
+}
+
+/// Walk the full signed principal across asks. The signed minimum quantity is determined only by
+/// the worst accepted tick; improved quantities remain in `used_asks` for paper/replay.
+pub fn plan_principal_buy(
+    asks: &[AskLevel],
+    principal: CollateralAmount,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    chase_ceiling: Price,
+    impact_ceiling: Price,
+) -> Result<LadderPlan, LadderError> {
+    plan_principal_buy_with_scale(
+        asks,
+        principal,
+        6,
+        minimum_price,
+        maximum_price_exclusive,
+        chase_ceiling,
+        impact_ceiling,
+    )
+}
+
+fn plan_principal_buy_with_scale(
+    asks: &[AskLevel],
+    principal: CollateralAmount,
+    signed_share_scale: u32,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    chase_ceiling: Price,
+    impact_ceiling: Price,
+) -> Result<LadderPlan, LadderError> {
+    if principal == CollateralAmount::ZERO {
+        return Err(LadderError::NothingAffordable);
+    }
+    let ceiling = chase_ceiling.min(impact_ceiling);
+    let walked = walk_principal(
+        asks,
+        principal,
+        minimum_price,
+        maximum_price_exclusive,
+        ceiling,
+    )?;
+    let shares = shares_for_principal(principal, walked.limit_price, signed_share_scale)?;
+    if shares == ShareAmount::ZERO {
+        return Err(LadderError::NothingAffordable);
+    }
+    Ok(LadderPlan {
+        used_asks: walked.used_asks,
+        best_ask: walked.best_ask,
+        limit_price: walked.limit_price,
+        shares,
+        worst_case_debit: principal,
+    })
+}
+
+/// Exact-share compatibility adapter used by the isolated canary.
 pub fn plan_exact_shares(
     asks: &[AskLevel],
     requested_shares: ShareAmount,
@@ -103,71 +271,41 @@ pub fn plan_exact_shares(
     maximum_price_exclusive: Price,
     origin_ceiling: Price,
 ) -> Result<LadderPlan, LadderError> {
-    let mut remaining = requested_shares.atomic();
-    let mut used_asks = Vec::new();
-    for level in asks {
-        if level.price < minimum_price {
-            return Err(LadderError::BelowBandAsk);
-        }
-        if level.price >= maximum_price_exclusive || level.price > origin_ceiling {
-            break;
-        }
-        let used = remaining.min(level.shares.atomic());
-        if used > 0 {
-            used_asks.push(AskLevel {
-                price: level.price,
-                shares: ShareAmount::from_atomic(used),
-            });
-            remaining -= used;
-        }
-        if remaining == 0 {
-            break;
-        }
+    if requested_shares == ShareAmount::ZERO {
+        return Err(LadderError::NothingAffordable);
     }
-    if remaining != 0 {
-        return Err(LadderError::InsufficientDepth);
-    }
+    let used_asks = walk_shares(
+        asks,
+        requested_shares,
+        minimum_price,
+        maximum_price_exclusive,
+        origin_ceiling,
+    )?;
     let best_ask = used_asks
         .first()
-        .map(|level| level.price)
+        .map(|ask| ask.price)
         .ok_or(LadderError::InsufficientDepth)?;
     let limit_price = used_asks
         .last()
-        .map(|level| level.price)
+        .map(|ask| ask.price)
         .ok_or(LadderError::InsufficientDepth)?;
-    let mut spend = Decimal::ZERO;
-    for level in &used_asks {
-        let cost = level
-            .shares
+    let principal = CollateralAmount::from_decimal_exact(
+        requested_shares
             .to_decimal()
-            .checked_mul(level.price.0)
-            .ok_or(LadderError::Amount)?;
-        spend = spend.checked_add(cost).ok_or(LadderError::Amount)?;
-    }
-    let estimated_ladder_spend =
-        CollateralAmount::from_decimal_exact(spend).map_err(|_| LadderError::Amount)?;
-    let worst_case_debit =
-        CollateralAmount::from_decimal_exact(requested_shares.to_decimal() * limit_price.0)
-            .map_err(|_| LadderError::Amount)?;
+            .checked_mul(limit_price.0)
+            .ok_or(LadderError::Amount)?,
+    )
+    .map_err(|_| LadderError::Amount)?;
     Ok(LadderPlan {
         used_asks,
         best_ask,
         limit_price,
         shares: requested_shares,
-        estimated_ladder_spend,
-        worst_case_debit,
+        worst_case_debit: principal,
     })
 }
 
-/// The budget-based planner (#508 Phase A): the largest whole-share quantity whose ladder
-/// spend stays within `budget` — and within `max_shares` when supplied — planned over the
-/// same band walk as [`plan_exact_shares`].
-///
-/// The affordability walk consumes atomic share units level-by-level while the exact spend
-/// stays ≤ `budget`, floors the total to whole shares (paper/live contracts are whole), then
-/// delegates to [`plan_exact_shares`] for the exact spend/limit of that quantity. Callers
-/// pass a zero-size-filtered, ascending ladder; staleness is guarded separately via
-/// [`ladder_is_stale`].
+/// Backward-compatible budget entry point. `budget` is now the exact signed principal.
 pub fn plan_budget_buy(
     asks: &[AskLevel],
     budget: CollateralAmount,
@@ -176,62 +314,209 @@ pub fn plan_budget_buy(
     maximum_price_exclusive: Price,
     origin_ceiling: Price,
 ) -> Result<LadderPlan, LadderError> {
-    let mut share_cap_atomic = max_shares
-        .unwrap_or(u64::MAX / ATOMICS_PER_SHARE)
-        .saturating_mul(ATOMICS_PER_SHARE);
-    let mut remaining_budget = budget.to_decimal();
-    let mut affordable_atomic: u64 = 0;
-    for level in asks {
-        if share_cap_atomic == 0 || remaining_budget <= Decimal::ZERO {
-            break;
-        }
-        if level.price < minimum_price {
-            return Err(LadderError::BelowBandAsk);
-        }
-        if level.price >= maximum_price_exclusive || level.price > origin_ceiling {
-            break;
-        }
-        // Whole-atomic affordability at this level's price (exact Decimal math, floor).
-        let price = level.price.0;
-        if price <= Decimal::ZERO {
-            return Err(LadderError::Amount);
-        }
-        let afford = (remaining_budget / price)
-            .checked_mul(Decimal::from(ATOMICS_PER_SHARE))
-            .ok_or(LadderError::Amount)?
-            .floor()
-            .to_u64()
-            .ok_or(LadderError::Amount)?;
-        let take = level.shares.atomic().min(afford).min(share_cap_atomic);
-        if take == 0 {
-            break;
-        }
-        let cost = ShareAmount::from_atomic(take)
-            .to_decimal()
-            .checked_mul(price)
-            .ok_or(LadderError::Amount)?;
-        remaining_budget = remaining_budget
-            .checked_sub(cost)
-            .ok_or(LadderError::Amount)?;
-        affordable_atomic = affordable_atomic
-            .checked_add(take)
-            .ok_or(LadderError::Amount)?;
-        share_cap_atomic -= take;
-        if take < level.shares.atomic() {
-            break; // budget or share cap exhausted mid-level
+    if let Some(maximum) = max_shares {
+        let capped = plan_exact_shares(
+            asks,
+            whole_shares(maximum)?,
+            minimum_price,
+            maximum_price_exclusive,
+            origin_ceiling,
+        )?;
+        if capped.worst_case_debit <= budget {
+            return Ok(capped);
         }
     }
-    let whole_shares = affordable_atomic / ATOMICS_PER_SHARE;
-    if whole_shares == 0 {
-        return Err(LadderError::NothingAffordable);
-    }
-    plan_exact_shares(
+    plan_principal_buy(
         asks,
-        ShareAmount::from_atomic(whole_shares * ATOMICS_PER_SHARE),
+        budget,
         minimum_price,
         maximum_price_exclusive,
         origin_ceiling,
+        origin_ceiling,
     )
+}
+
+struct PrincipalWalk {
+    used_asks: Vec<AskLevel>,
+    best_ask: Price,
+    limit_price: Price,
+}
+
+fn walk_principal(
+    asks: &[AskLevel],
+    principal: CollateralAmount,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    ceiling: Price,
+) -> Result<PrincipalWalk, LadderError> {
+    let mut remaining = principal.to_decimal();
+    let mut used_asks = Vec::new();
+    let mut in_band_capacity = Decimal::ZERO;
+    let mut best_ask = None;
+    let mut limit_price = None;
+    for level in asks {
+        validate_level_order(&used_asks, level)?;
+        if level.price < minimum_price {
+            return Err(LadderError::BelowBandAsk);
+        }
+        if level.price >= maximum_price_exclusive || level.price > ceiling {
+            break;
+        }
+        if level.price == Price::ZERO || level.shares == ShareAmount::ZERO {
+            return Err(LadderError::Amount);
+        }
+        best_ask.get_or_insert(level.price);
+        limit_price = Some(level.price);
+        let level_cost = level
+            .shares
+            .to_decimal()
+            .checked_mul(level.price.0)
+            .ok_or(LadderError::Amount)?;
+        in_band_capacity = in_band_capacity
+            .checked_add(level_cost)
+            .ok_or(LadderError::Amount)?;
+        if remaining >= level_cost {
+            used_asks.push(level.clone());
+            remaining = remaining
+                .checked_sub(level_cost)
+                .ok_or(LadderError::Amount)?;
+            if remaining == Decimal::ZERO {
+                break;
+            }
+            continue;
+        }
+        let shares = decimal_to_atomic_shares(
+            remaining
+                .checked_div(level.price.0)
+                .ok_or(LadderError::Amount)?,
+        )?;
+        if shares != ShareAmount::ZERO {
+            used_asks.push(AskLevel {
+                price: level.price,
+                shares,
+            });
+        }
+        break;
+    }
+    if in_band_capacity < principal.to_decimal() {
+        return Err(LadderError::InsufficientDepth);
+    }
+    let best_ask = best_ask.ok_or(LadderError::NothingAffordable)?;
+    let limit_price = limit_price.ok_or(LadderError::NothingAffordable)?;
+    Ok(PrincipalWalk {
+        used_asks,
+        best_ask,
+        limit_price,
+    })
+}
+
+fn walk_shares(
+    asks: &[AskLevel],
+    requested_shares: ShareAmount,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    ceiling: Price,
+) -> Result<Vec<AskLevel>, LadderError> {
+    let mut remaining = requested_shares.atomic();
+    let mut used_asks = Vec::new();
+    for level in asks {
+        validate_level_order(&used_asks, level)?;
+        if level.price < minimum_price {
+            return Err(LadderError::BelowBandAsk);
+        }
+        if level.price >= maximum_price_exclusive || level.price > ceiling {
+            break;
+        }
+        if level.price == Price::ZERO || level.shares == ShareAmount::ZERO {
+            return Err(LadderError::Amount);
+        }
+        let used = remaining.min(level.shares.atomic());
+        if used != 0 {
+            used_asks.push(AskLevel {
+                price: level.price,
+                shares: ShareAmount::from_atomic(used),
+            });
+            remaining = remaining.checked_sub(used).ok_or(LadderError::Amount)?;
+        }
+        if remaining == 0 {
+            return Ok(used_asks);
+        }
+    }
+    Err(LadderError::InsufficientDepth)
+}
+
+fn validate_level_order(used: &[AskLevel], next: &AskLevel) -> Result<(), LadderError> {
+    if used.last().is_some_and(|prior| next.price < prior.price) {
+        return Err(LadderError::Amount);
+    }
+    Ok(())
+}
+
+fn first_eligible_ask(
+    asks: &[AskLevel],
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    ceiling: Price,
+) -> Result<Price, LadderError> {
+    let Some(first) = asks.first() else {
+        return Err(LadderError::InsufficientDepth);
+    };
+    if first.price < minimum_price {
+        return Err(LadderError::BelowBandAsk);
+    }
+    if first.price >= maximum_price_exclusive || first.price > ceiling {
+        return Err(LadderError::InsufficientDepth);
+    }
+    Ok(first.price)
+}
+
+fn shares_for_principal(
+    principal: CollateralAmount,
+    price: Price,
+    scale: u32,
+) -> Result<ShareAmount, LadderError> {
+    if price == Price::ZERO {
+        return Err(LadderError::Amount);
+    }
+    ShareAmount::from_decimal_exact(
+        principal
+            .to_decimal()
+            .checked_div(price.0)
+            .ok_or(LadderError::Amount)?
+            .round_dp_with_strategy(scale, RoundingStrategy::ToNegativeInfinity),
+    )
+    .map_err(|_| LadderError::Amount)
+}
+
+fn decimal_to_atomic_shares(value: Decimal) -> Result<ShareAmount, LadderError> {
+    ShareAmount::from_decimal_exact(
+        value.round_dp_with_strategy(6, RoundingStrategy::ToNegativeInfinity),
+    )
+    .map_err(|_| LadderError::Amount)
+}
+
+fn collateral_floor(value: Decimal) -> Result<CollateralAmount, LadderError> {
+    CollateralAmount::from_decimal_exact(
+        value.round_dp_with_strategy(6, RoundingStrategy::ToNegativeInfinity),
+    )
+    .map_err(|_| LadderError::Amount)
+}
+
+fn whole_shares(value: u64) -> Result<ShareAmount, LadderError> {
+    value
+        .checked_mul(ATOMICS_PER_SHARE)
+        .map(ShareAmount::from_atomic)
+        .ok_or(LadderError::Amount)
+}
+
+fn expected_spend_decimal(asks: &[AskLevel]) -> Result<Decimal, LadderError> {
+    asks.iter().try_fold(Decimal::ZERO, |total, ask| {
+        ask.shares
+            .to_decimal()
+            .checked_mul(ask.price.0)
+            .and_then(|cost| total.checked_add(cost))
+            .ok_or(LadderError::Amount)
+    })
 }
 
 #[cfg(test)]
@@ -249,163 +534,219 @@ mod tests {
         }
     }
 
-    fn wide_band() -> (Price, Price, Price) {
-        (
-            Price::ZERO,
-            Price::new(dec!(1)).unwrap(),
-            Price::new(dec!(1)).unwrap(),
-        )
+    fn price(value: Decimal) -> Price {
+        Price::new(value).unwrap()
     }
 
     #[test]
-    fn budget_planner_reproduces_the_500_to_230_downsize() {
-        // The #508 canonical shape: a $500 budget against a band absorbing only $230.
-        // Band: best 0.50, 100 bps ceiling = 0.505 (inclusive via origin_ceiling).
-        // Levels: 300 @ 0.50 ($150) + 160 @ 0.50125 ($80.20) in-band; 1000 @ 0.60 outside.
-        let asks = vec![
-            level(dec!(0.50), dec!(300)),
-            level(dec!(0.50125), dec!(160)),
-            level(dec!(0.60), dec!(1000)),
-        ];
-        let plan = plan_budget_buy(
+    fn collateral_walk_separates_signed_minimum_from_improved_quantity() {
+        let asks = vec![level(dec!(0.40), dec!(1)), level(dec!(0.50), dec!(10))];
+        let plan = plan_principal_buy(
             &asks,
-            CollateralAmount::from_decimal_exact(dec!(500)).unwrap(),
-            None,
-            Price::ZERO,
-            Price::new(dec!(1)).unwrap(),
-            Price::new(dec!(0.505)).unwrap(),
+            CollateralAmount::from_decimal_exact(dec!(1.40)).unwrap(),
+            price(dec!(0.05)),
+            price(dec!(0.99)),
+            price(dec!(0.60)),
+            price(dec!(0.50)),
         )
         .unwrap();
-        assert_eq!(plan.shares.to_decimal(), dec!(460));
-        assert_eq!(plan.estimated_ladder_spend.to_decimal(), dec!(230.20));
-        assert_eq!(plan.best_ask.0, dec!(0.50));
-        assert_eq!(plan.limit_price.0, dec!(0.50125));
-        // worst_case_debit = shares × limit ≥ estimated_ladder_spend.
-        assert_eq!(plan.worst_case_debit.to_decimal(), dec!(230.575));
-        assert!(plan.worst_case_debit >= plan.estimated_ladder_spend);
-        // VWAP is the exact spend over shares (Decimal division, 28-digit precision).
-        let vwap = plan.vwap().unwrap();
-        assert_eq!(vwap.0, dec!(230.20) / dec!(460));
-    }
-
-    #[test]
-    fn budget_planner_rounds_down_to_whole_shares() {
-        // $1 at 0.30/share affords 3.33… shares → 3 whole shares, spend 0.90.
-        let asks = vec![level(dec!(0.30), dec!(50))];
-        let (min, max, ceil) = wide_band();
-        let plan = plan_budget_buy(
-            &asks,
-            CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
-            None,
-            min,
-            max,
-            ceil,
-        )
-        .unwrap();
-        assert_eq!(plan.shares.to_decimal(), dec!(3));
-        assert_eq!(plan.estimated_ladder_spend.to_decimal(), dec!(0.90));
-        assert_eq!(plan.worst_case_debit.to_decimal(), dec!(0.90));
-    }
-
-    #[test]
-    fn budget_planner_vwap_spans_levels() {
-        // $100 over 100 @ 0.40 + deep 0.404: buys 100 + 148 = 248 shares.
-        // spend = 40 + 148×0.404 = 99.792; vwap = 99.792/248; limit = 0.404.
-        let asks = vec![level(dec!(0.40), dec!(100)), level(dec!(0.404), dec!(1000))];
-        let (min, max, _) = wide_band();
-        let plan = plan_budget_buy(
-            &asks,
-            CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
-            None,
-            min,
-            max,
-            Price::new(dec!(0.404)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(plan.shares.to_decimal(), dec!(248));
-        assert_eq!(plan.estimated_ladder_spend.to_decimal(), dec!(99.792));
-        assert_eq!(plan.limit_price.0, dec!(0.404));
-        assert_eq!(plan.worst_case_debit.to_decimal(), dec!(100.192));
-    }
-
-    #[test]
-    fn nothing_affordable_is_typed() {
-        // Budget below one whole share.
-        let asks = vec![level(dec!(0.50), dec!(10))];
-        let (min, max, ceil) = wide_band();
         assert_eq!(
-            plan_budget_buy(
-                &asks,
-                CollateralAmount::from_decimal_exact(dec!(0.49)).unwrap(),
-                None,
-                min,
-                max,
-                ceil,
-            ),
-            Err(LadderError::NothingAffordable)
+            plan.used_asks,
+            vec![level(dec!(0.40), dec!(1)), level(dec!(0.50), dec!(2))]
         );
-        // An empty in-band ladder (ceiling below every level) is likewise unaffordable.
-        assert_eq!(
-            plan_budget_buy(
-                &asks,
-                CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
-                None,
-                min,
-                max,
-                Price::new(dec!(0.40)).unwrap(),
-            ),
-            Err(LadderError::NothingAffordable)
-        );
+        assert_eq!(plan.shares.to_decimal(), dec!(2.8));
+        assert_eq!(plan.expected_shares().unwrap().to_decimal(), dec!(3));
+        assert_eq!(plan.expected_spend().unwrap().to_decimal(), dec!(1.4));
+        assert_eq!(plan.vwap().unwrap().0, dec!(1.4) / dec!(3));
+        assert_eq!(plan.worst_case_debit.to_decimal(), dec!(1.4));
     }
 
     #[test]
-    fn max_shares_caps_the_budget_walk() {
-        let asks = vec![level(dec!(0.50), dec!(100))];
-        let (min, max, ceil) = wide_band();
-        let plan = plan_budget_buy(
+    fn exact_share_adapter_preserves_canary_output() {
+        let asks = vec![level(dec!(0.10), dec!(2)), level(dec!(0.11), dec!(10))];
+        let plan = plan_exact_shares(
             &asks,
-            CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
-            Some(7),
-            min,
-            max,
-            ceil,
+            ShareAmount::from_decimal_exact(dec!(5)).unwrap(),
+            price(dec!(0.05)),
+            price(dec!(0.99)),
+            price(dec!(0.11)),
         )
         .unwrap();
-        assert_eq!(plan.shares.to_decimal(), dec!(7));
         assert_eq!(
-            plan_budget_buy(
-                &asks,
-                CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
-                Some(0),
-                min,
-                max,
-                ceil,
-            ),
-            Err(LadderError::NothingAffordable)
+            plan.used_asks,
+            vec![level(dec!(0.10), dec!(2)), level(dec!(0.11), dec!(3))]
         );
+        assert_eq!(plan.shares.to_decimal(), dec!(5));
+        assert_eq!(plan.worst_case_debit.to_decimal(), dec!(0.55));
     }
 
     #[test]
-    fn below_band_executable_ask_fails_closed() {
-        let asks = vec![level(dec!(0.04), dec!(1)), level(dec!(0.10), dec!(5))];
+    fn lesser_chase_impact_and_band_bounds_are_independent() {
+        let asks = vec![level(dec!(0.40), dec!(1)), level(dec!(0.41), dec!(10))];
+        let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
         assert_eq!(
-            plan_budget_buy(
+            plan_principal_buy(
                 &asks,
-                CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
-                None,
-                Price::new(dec!(0.05)).unwrap(),
-                Price::new(dec!(0.99)).unwrap(),
-                Price::new(dec!(0.10)).unwrap(),
+                principal,
+                price(dec!(0.41)),
+                price(dec!(0.99)),
+                price(dec!(0.50)),
+                price(dec!(0.50))
             ),
             Err(LadderError::BelowBandAsk)
         );
+        assert_eq!(
+            plan_principal_buy(
+                &asks,
+                principal,
+                Price::ZERO,
+                price(dec!(0.41)),
+                price(dec!(0.50)),
+                price(dec!(0.50))
+            ),
+            Err(LadderError::InsufficientDepth)
+        );
+        assert_eq!(
+            plan_principal_buy(
+                &asks,
+                principal,
+                Price::ZERO,
+                price(dec!(0.99)),
+                price(dec!(0.40)),
+                price(dec!(0.50))
+            ),
+            Err(LadderError::InsufficientDepth)
+        );
+        assert_eq!(
+            plan_principal_buy(
+                &asks,
+                principal,
+                Price::ZERO,
+                price(dec!(0.99)),
+                price(dec!(0.50)),
+                price(dec!(0.40))
+            ),
+            Err(LadderError::InsufficientDepth)
+        );
     }
 
     #[test]
-    fn staleness_guard_bounds_both_directions() {
-        assert!(!ladder_is_stale(2_000, 1_000));
-        assert!(!ladder_is_stale(3_000, 1_000));
-        assert!(ladder_is_stale(3_001, 1_000), "older than 2 s is stale");
-        assert!(ladder_is_stale(999, 1_000), "future books are stale");
+    fn sized_buy_enforces_minimum_and_principal_plus_reserve_caps() {
+        let asks = vec![level(dec!(0.40), dec!(100))];
+        let schedule = CompactFeeSchedule::Taker { rate: dec!(0.04) };
+        let cap = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
+        let sized = plan_sized_buy(
+            &asks,
+            schedule,
+            BuySizing::Dollar { budget: cap },
+            &[cap],
+            ShareAmount::from_decimal_exact(dec!(2)).unwrap(),
+            price(dec!(0.01)),
+            Price::ZERO,
+            price(dec!(0.99)),
+            price(dec!(0.50)),
+            price(dec!(0.50)),
+        )
+        .unwrap();
+        assert!(sized.worst_case_all_in_debit().unwrap() <= cap);
+        assert!(sized.ladder.shares >= ShareAmount::from_decimal_exact(dec!(2)).unwrap());
+
+        assert_eq!(
+            plan_sized_buy(
+                &asks,
+                schedule,
+                BuySizing::Contract { contracts: 3 },
+                &[CollateralAmount::from_decimal_exact(dec!(1.20)).unwrap()],
+                ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+                price(dec!(0.01)),
+                Price::ZERO,
+                price(dec!(0.99)),
+                price(dec!(0.50)),
+                price(dec!(0.50)),
+            ),
+            Err(LadderError::CapExceeded)
+        );
+    }
+
+    #[test]
+    fn contract_sizing_fixes_minimum_but_retains_price_improvement() {
+        let asks = vec![level(dec!(0.10), dec!(2)), level(dec!(0.11), dec!(10))];
+        let plan = plan_sized_buy(
+            &asks,
+            CompactFeeSchedule::Zero,
+            BuySizing::Contract { contracts: 5 },
+            &[CollateralAmount::from_decimal_exact(dec!(10)).unwrap()],
+            ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+            price(dec!(0.01)),
+            price(dec!(0.05)),
+            price(dec!(0.99)),
+            price(dec!(0.11)),
+            price(dec!(0.11)),
+        )
+        .unwrap();
+        assert_eq!(plan.ladder.limit_price, price(dec!(0.11)));
+        assert_eq!(plan.ladder.worst_case_debit.to_decimal(), dec!(0.55));
+        assert_eq!(plan.ladder.shares.to_decimal(), dec!(5));
+        assert_eq!(
+            plan.ladder.expected_shares().unwrap().to_decimal(),
+            dec!(5.181818)
+        );
+        assert_eq!(
+            plan.ladder.expected_spend().unwrap().to_decimal(),
+            dec!(0.549999)
+        );
+        assert_eq!(
+            plan.ladder.vwap().unwrap().0,
+            dec!(0.549999) / dec!(5.181818)
+        );
+    }
+
+    #[test]
+    fn empty_stale_and_dust_inputs_fail_closed() {
+        assert!(ladder_is_stale(3_001, 1_000));
+        assert!(ladder_is_stale(999, 1_000));
+        assert_eq!(
+            plan_principal_buy(
+                &[],
+                CollateralAmount::from_atomic(1),
+                Price::ZERO,
+                price(dec!(1)),
+                price(dec!(1)),
+                price(dec!(1)),
+            ),
+            Err(LadderError::InsufficientDepth)
+        );
+        assert_eq!(
+            plan_sized_buy(
+                &[level(dec!(0.50), dec!(1))],
+                CompactFeeSchedule::Zero,
+                BuySizing::Dollar {
+                    budget: CollateralAmount::from_atomic(1),
+                },
+                &[CollateralAmount::from_atomic(1)],
+                ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+                price(dec!(0.01)),
+                Price::ZERO,
+                price(dec!(1)),
+                price(dec!(1)),
+                price(dec!(1)),
+            ),
+            Err(LadderError::BelowMinimum)
+        );
+        assert_eq!(
+            plan_sized_buy(
+                &[level(dec!(0.50), dec!(10))],
+                CompactFeeSchedule::Zero,
+                BuySizing::Contract { contracts: 0 },
+                &[],
+                ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+                price(dec!(0.01)),
+                Price::ZERO,
+                price(dec!(1)),
+                price(dec!(1)),
+                price(dec!(1)),
+            ),
+            Err(LadderError::BelowMinimum)
+        );
     }
 }

@@ -351,31 +351,23 @@ fn scenario_kelly_path_used_when_flat_none() {
 
 // ─── scenario F8 ─────────────────────────────────────────────────────────────
 
-/// When flat < price, floor(flat/price) = 0, clamped to 1 by `.max(1)`.
+/// A dollar allocation below one contract has no executable size.
 ///
-/// flat=$0.30, price=$0.50 → floor(0.30/0.50)=floor(0.60)=0 → max(1,0)=1 contract.
-///
-/// PASS: `intent.contracts.0 == 1`.
+/// PASS: flat=$0.30 at price=$0.50 returns the typed `NoEdge` refusal.
 #[test]
-fn scenario_flat_below_price_yields_one_contract() {
+fn scenario_flat_below_price_is_rejected() {
     let signal = make_signal(0xF8, LeaderAction::Entry);
     let strategy = WinnerFollowStrategy::new(flat_config(dec!(0.30)));
 
-    let intent = strategy
-        .evaluate(
-            &signal,
-            p_high(),
-            clean_snapshot(),
-            dec!(10_000),
-            ExecutionMode::LiveTiny,
-        )
-        .expect("flat<price should still produce 1-contract order");
-
-    assert_eq!(
-        intent.contracts.0, 1,
-        "flat=$0.30 < price=$0.50: floor=0 must be clamped to 1, got {}",
-        intent.contracts.0
+    let result = strategy.evaluate(
+        &signal,
+        p_high(),
+        clean_snapshot(),
+        dec!(10_000),
+        ExecutionMode::LiveTiny,
     );
+
+    assert!(matches!(result, Err(WinnerFollowError::NoEdge)));
 }
 
 // ─── scenario F9 ─────────────────────────────────────────────────────────────

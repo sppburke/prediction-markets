@@ -100,6 +100,7 @@ fn base_config(dir: &TempDir, cooldown_days: Option<u32>) -> BacktestConfig {
         bootstrap_cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
         bankroll_usd: Decimal::from(10_000u32),
+        modeled_polymarket_fee_rate: dec!(0.04),
         step_days: 1,
         max_hours_to_expiry: None,
         audit_window_days: 365,

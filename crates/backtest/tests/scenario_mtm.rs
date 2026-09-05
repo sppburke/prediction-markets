@@ -256,46 +256,47 @@ fn mtm_row<'a>(rows: &'a [PnlRow], hex: &str) -> Option<&'a PnlRow> {
     rows.iter().find(|r| r.wallet == hex && r.is_horizon_mtm)
 }
 
-// Marks are exact f64 (10.0 / 5.0 / 0.0 / 25.0 from exact Decimal arithmetic), so exact `==` is
+// Marks are exact f64 projections of exact Decimal arithmetic, so exact `==` is
 // correct here — and `clippy::float_cmp` exempts comparisons against a constant literal.
 
 #[test]
 fn scenario_mtm_marks_opened_in_window_covered_position() {
     // PASS: a position opened inside the window and open at the horizon is marked at its CLOB mid,
-    // unrealized flow = (mark_H − cost) × contracts = (0.70 − 0.50) × 50 = +10. FAIL otherwise.
+    // Fee-aware sizing buys 49 shares for a $25 budget; all-in cost is $24.99, so the horizon
+    // value $34.30 produces +9.31. FAIL otherwise.
     let (rows, a, _b, _d, _e) = run_fixture();
     let row = mtm_row(&rows, &a).expect("wallet A must have a horizon MTM row");
-    let pass = row.unrealized_pnl == 10.0
+    let pass = row.unrealized_pnl == 9.31
         && row.is_horizon_mtm
         && row.period_end == HORIZON
         && row.open_at_horizon == 1
         && row.marked_at_horizon == 1
         && row.realized_pnl == 0.0;
     println!(
-        "PASS={pass} mtm.marks_opened_in_window: A unrealized={} (want 10.0), period_end={} (want {HORIZON}), open={}, marked={}",
+        "PASS={pass} mtm.marks_opened_in_window: A unrealized={} (want 9.31), period_end={} (want {HORIZON}), open={}, marked={}",
         row.unrealized_pnl, row.period_end, row.open_at_horizon, row.marked_at_horizon
     );
     assert!(
         pass,
-        "covered opened-in-window position must mark to +10 at the horizon"
+        "covered opened-in-window position must retain modeled fee in its horizon cost"
     );
 }
 
 #[test]
 fn scenario_mtm_flow_subtracts_as_of_leg_for_spanning_position() {
     // PASS: a position open at BOTH boundaries contributes the FLOW (mark_H − mark_as_of)·contracts,
-    // i.e. (0.65 − 0.55) × 50 = +5 — NOT the stock (0.65 − 0.50) × 50 = 7.5. The as_of subtraction is
+    // i.e. (0.65 − 0.55) × 49 = +4.9 — NOT the stock from the fee-aware cost. The as_of subtraction is
     // what prevents the cross-window double-count. FAIL otherwise.
     let (rows, _a, b, _d, _e) = run_fixture();
     let row = mtm_row(&rows, &b).expect("wallet B must have a horizon MTM row");
-    let pass = row.unrealized_pnl == 5.0 && row.open_at_horizon == 1 && row.marked_at_horizon == 1;
+    let pass = row.unrealized_pnl == 4.9 && row.open_at_horizon == 1 && row.marked_at_horizon == 1;
     println!(
-        "PASS={pass} mtm.flow_subtracts_as_of: B unrealized={} (flow want 5.0, NOT stock 7.5), open={}, marked={}",
+        "PASS={pass} mtm.flow_subtracts_as_of: B unrealized={} (flow want 4.9), open={}, marked={}",
         row.unrealized_pnl, row.open_at_horizon, row.marked_at_horizon
     );
     assert!(
         pass,
-        "spanning position must use the FLOW (mark_H − mark_as_of), giving +5 not +7.5"
+        "spanning position must use the 49-share fee-aware mark flow"
     );
 }
 
@@ -327,10 +328,10 @@ fn scenario_mtm_resolved_position_is_realized_not_marked() {
         .map(|r| r.realized_pnl)
         .sum();
     let has_mtm = mtm_row(&rows, &e).is_some();
-    // E wins outcome 0: realized = (1.0 − 0.50) × 50 = +25.
-    let pass = realized_day == 25.0 && !has_mtm;
+    // E wins outcome 0: 49 shares pay $49 after the $24.99 all-in debit, realizing $24.01.
+    let pass = realized_day == 24.01 && !has_mtm;
     println!(
-        "PASS={pass} mtm.resolved_realized_not_marked: E realized_day={realized_day} (want 25.0), has_mtm_row={has_mtm} (want false)"
+        "PASS={pass} mtm.resolved_realized_not_marked: E realized_day={realized_day} (want 24.01), has_mtm_row={has_mtm} (want false)"
     );
     assert!(
         pass,
@@ -434,19 +435,15 @@ fn run_span_window(as_of: i64, horizon: i64) -> f64 {
 fn scenario_mtm_partial_coverage_telescopes_no_double_count() {
     // A spanning position covered only from D20 (uncovered at as_of_1=D10), across two ADJACENT
     // windows (as_of_2 = horizon_1 = D20). Telescoping requires the per-window flows to sum to the
-    // single true gain (mark_H2 − cost)·50 = (0.70 − 0.50)·50 = 10:
-    //   - w1 (D10→D20): as_of uncovered → 0; horizon 0.60 → first credit (0.60−0.50)·50 = +5.
-    //   - w2 (D20→D30): as_of 0.60 (covered, == w1's horizon) → −5; horizon 0.70 → +10; flow = +5.
-    // The literal `mark − cost` stock would give w2 = +10 (no as_of subtraction) → 5 + 10 = 15, a
-    // double-count. PASS = both flows are +5 (so they sum to the true +10), NOT w2 = +10.
+    // single fee-aware gain: $4.41 in the first window plus $4.90 in the second = $9.31.
     let d10 = T0 + 10 * SEC_PER_DAY;
     let d20 = T0 + 20 * SEC_PER_DAY;
     let d30 = T0 + 30 * SEC_PER_DAY;
     let flow_w1 = run_span_window(d10, d20);
     let flow_w2 = run_span_window(d20, d30);
-    let pass = flow_w1 == 5.0 && flow_w2 == 5.0;
+    let pass = flow_w1 == 4.41 && flow_w2 == 4.9;
     println!(
-        "PASS={pass} mtm.partial_coverage_telescopes: flow_w1={flow_w1} (want 5.0) + flow_w2={flow_w2} (want 5.0, NOT stock 10.0) = true gain 10.0"
+        "PASS={pass} mtm.partial_coverage_telescopes: flow_w1={flow_w1} (want 4.41) + flow_w2={flow_w2} (want 4.9) = fee-aware gain 9.31"
     );
     assert!(
         pass,
@@ -731,7 +728,7 @@ fn run_quiet_resolution_fixture() -> (Vec<PnlRow>, String) {
 #[test]
 fn scenario_mtm_quiet_wallet_in_window_resolution_is_realized_not_marked() {
     // PASS: a copied position that resolves INSIDE the window with no later trade to advance the date
-    // axis is realized on a day row INSIDE `(as_of, horizon]` (+25) and is NOT marked at the stale
+    // axis is realized on a day row INSIDE `(as_of, horizon]` (+24.01 after the modeled fee) and is NOT marked at the stale
     // CLOB mid (no horizon MTM row). Without the #445 end-of-run sweep it would be mismarked at +5
     // (the stale 0.60 mark) and emit no realized row. FAIL otherwise.
     let (rows, z) = run_quiet_resolution_fixture();
@@ -744,9 +741,9 @@ fn scenario_mtm_quiet_wallet_in_window_resolution_is_realized_not_marked() {
         .iter()
         .all(|r| r.period_end > AS_OF && r.period_end <= HORIZON);
     let has_mtm = mtm_row(&rows, &z).is_some();
-    let pass = realized_sum == 25.0 && all_in_window && !has_mtm && !realized.is_empty();
+    let pass = realized_sum == 24.01 && all_in_window && !has_mtm && !realized.is_empty();
     println!(
-        "PASS={pass} mtm.quiet_wallet_resolution: Z realized_sum={realized_sum} (want 25.0), \
+        "PASS={pass} mtm.quiet_wallet_resolution: Z realized_sum={realized_sum} (want 24.01), \
          realized_in_window={all_in_window} (want true), has_mtm={has_mtm} (want false), \
          realized_rows={}",
         realized.len()
