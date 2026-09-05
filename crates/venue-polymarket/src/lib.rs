@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod canary_market;
+pub mod fee;
 pub mod ladder;
 pub mod redemption;
 pub mod v2;
@@ -16,6 +17,10 @@ pub mod v2;
 pub use canary_market::{
     AskLevel, CanaryBookSnapshot, CanaryMarketError, ClobMarketEvidence, ExecutableLadder,
     executable_ladder, parse_book, parse_market_evidence,
+};
+pub use fee::{
+    CompactFeeSchedule, FeeError, FeeScheduleError, compact_fee_schedule, fee_reserve,
+    fee_within_reserve, parse_compact_fee_schedule, principal_for_budget, taker_fee,
 };
 pub use ladder::{
     LADDER_MAX_AGE_MS, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy, plan_exact_shares,

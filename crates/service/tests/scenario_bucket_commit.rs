@@ -1303,6 +1303,8 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             reason: "test_terminal".to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         };
         let evidence = DecisionPostBoundaryEvidence::from_body(DecisionPostBoundaryEvidenceBody {
             version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,

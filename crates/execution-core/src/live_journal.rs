@@ -16,12 +16,12 @@ use pe_core_types::{
 use pe_event_log::{ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer};
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
-use pe_venue_polymarket::{LadderPlan, PreparedPolymarketBuy};
+use pe_venue_polymarket::{CompactFeeSchedule, LadderPlan, PreparedPolymarketBuy};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 const LIVE_JOURNAL_SOURCE: &str = "ordinary-live-execution";
-const LIVE_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const LIVE_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const LIVE_JOURNAL_PARSER_VERSION: u32 = 1;
 
 /// A frozen credential identity. It deliberately cannot carry decrypted credential material.
@@ -67,18 +67,6 @@ pub enum LiveControlMode {
     LiveTiny,
 }
 
-/// Complete fee fields retained by [`LiveMarketEvidence`]. They are audit inputs, not secrets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LiveFeeEvidenceAudit {
-    pub gamma_fees_enabled: Option<serde_json::Value>,
-    pub gamma_fee_schedule: Option<serde_json::Value>,
-    pub gamma_maker_base_fee_bps: Option<serde_json::Value>,
-    pub gamma_taker_base_fee_bps: Option<serde_json::Value>,
-    pub clob_maker_base_fee_bps: Option<serde_json::Value>,
-    pub clob_taker_base_fee_bps: Option<serde_json::Value>,
-}
-
 /// Serializable, replay-complete projection of the source-owned market evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,9 +76,6 @@ pub struct LiveMarketEvidenceAudit {
     pub neg_risk: bool,
     pub minimum_tick_size: Price,
     pub minimum_order_size: ShareAmount,
-    pub fee_evidence: LiveFeeEvidenceAudit,
-    pub raw_gamma_market_hash: String,
-    pub raw_clob_market_hash: String,
     pub observed_at_unix: i64,
     pub schema_version: u32,
     pub parser_version: u32,
@@ -105,16 +90,6 @@ impl From<&LiveMarketEvidence> for LiveMarketEvidenceAudit {
             neg_risk: value.neg_risk,
             minimum_tick_size: value.minimum_tick_size,
             minimum_order_size: value.minimum_order_size,
-            fee_evidence: LiveFeeEvidenceAudit {
-                gamma_fees_enabled: value.fee_evidence.gamma_fees_enabled.clone(),
-                gamma_fee_schedule: value.fee_evidence.gamma_fee_schedule.clone(),
-                gamma_maker_base_fee_bps: value.fee_evidence.gamma_maker_base_fee_bps.clone(),
-                gamma_taker_base_fee_bps: value.fee_evidence.gamma_taker_base_fee_bps.clone(),
-                clob_maker_base_fee_bps: value.fee_evidence.clob_maker_base_fee_bps.clone(),
-                clob_taker_base_fee_bps: value.fee_evidence.clob_taker_base_fee_bps.clone(),
-            },
-            raw_gamma_market_hash: value.raw_gamma_market_hash.to_hex().to_string(),
-            raw_clob_market_hash: value.raw_clob_market_hash.to_hex().to_string(),
             observed_at_unix: value.observed_at_unix,
             schema_version: value.schema_version,
             parser_version: value.parser_version,
@@ -123,31 +98,40 @@ impl From<&LiveMarketEvidence> for LiveMarketEvidenceAudit {
     }
 }
 
-/// Both halves of ordinary live admission, plus a stable commitment to their full typed payload.
+/// Durable receipts for the three source responses composing admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionReceipts {
+    pub gamma: pe_event_log::AppendReceipt,
+    pub clob_long: pe_event_log::AppendReceipt,
+    pub clob_compact: pe_event_log::AppendReceipt,
+}
+
+/// Both halves of ordinary live admission and their synchronized source identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveAdmissionArtifactAudit {
     pub market: LiveMarketEvidenceAudit,
     pub settlement: VenueSettlementRecord,
-    pub artifact_bundle_hash: String,
+    pub fee_schedule: CompactFeeSchedule,
+    pub scheduled_end_unix: Option<i64>,
+    pub receipts: AdmissionReceipts,
 }
 
 impl LiveAdmissionArtifactAudit {
     pub fn new(
         market: &LiveMarketEvidence,
         settlement: &VenueSettlementRecord,
-    ) -> Result<Self, LiveJournalError> {
-        let market = LiveMarketEvidenceAudit::from(market);
-        let bundle_hash = hash_serializable(&(
-            "prediction-edge/live-admission-artifact/v1",
-            &market,
-            settlement,
-        ))?;
-        Ok(Self {
-            market,
+        fee_schedule: CompactFeeSchedule,
+        receipts: AdmissionReceipts,
+    ) -> Self {
+        Self {
+            market: LiveMarketEvidenceAudit::from(market),
             settlement: settlement.clone(),
-            artifact_bundle_hash: bundle_hash,
-        })
+            fee_schedule,
+            scheduled_end_unix: market.scheduled_end_unix,
+            receipts,
+        }
     }
 }
 
@@ -158,10 +142,8 @@ pub struct LadderPlanAudit {
     pub used_asks: Vec<LadderAskAudit>,
     pub best_ask: Price,
     pub limit_price: Price,
-    pub shares: ShareAmount,
-    pub estimated_ladder_spend: CollateralAmount,
-    pub worst_case_debit: CollateralAmount,
-    pub plan_hash: String,
+    pub minimum_shares: ShareAmount,
+    pub principal: CollateralAmount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,7 +154,8 @@ pub struct LadderAskAudit {
 }
 
 impl LadderPlanAudit {
-    pub fn new(plan: &LadderPlan) -> Result<Self, LiveJournalError> {
+    #[must_use]
+    pub fn new(plan: &LadderPlan) -> Self {
         let used_asks = plan
             .used_asks
             .iter()
@@ -181,24 +164,52 @@ impl LadderPlanAudit {
                 shares: ask.shares,
             })
             .collect::<Vec<_>>();
-        let plan_hash = hash_serializable(&(
-            "prediction-edge/live-ladder-plan/v1",
-            &used_asks,
-            plan.best_ask,
-            plan.limit_price,
-            plan.shares,
-            plan.estimated_ladder_spend,
-            plan.worst_case_debit,
-        ))?;
-        Ok(Self {
+        Self {
             used_asks,
             best_ask: plan.best_ask,
             limit_price: plan.limit_price,
-            shares: plan.shares,
-            estimated_ladder_spend: plan.estimated_ladder_spend,
-            worst_case_debit: plan.worst_case_debit,
-            plan_hash,
-        })
+            minimum_shares: plan.shares,
+            principal: plan.worst_case_debit,
+        }
+    }
+
+    pub fn expected_shares(&self) -> Result<ShareAmount, pe_core_types::Error> {
+        self.used_asks
+            .iter()
+            .try_fold(ShareAmount::ZERO, |total, ask| {
+                total.checked_add(ask.shares)
+            })
+    }
+
+    pub fn expected_spend(&self) -> Result<CollateralAmount, pe_core_types::Error> {
+        let spend = self
+            .used_asks
+            .iter()
+            .try_fold(rust_decimal::Decimal::ZERO, |total, ask| {
+                ask.shares
+                    .to_decimal()
+                    .checked_mul(ask.price.0)
+                    .and_then(|value| total.checked_add(value))
+                    .ok_or(pe_core_types::Error::OutOfRange {
+                        field: "LadderPlanAudit.expected_spend",
+                    })
+            })?;
+        CollateralAmount::from_decimal_exact(spend)
+    }
+
+    #[must_use]
+    pub fn expected_vwap(&self) -> Option<Price> {
+        let shares = self.expected_shares().ok()?.to_decimal();
+        if shares <= rust_decimal::Decimal::ZERO {
+            return None;
+        }
+        Price::new(
+            self.expected_spend()
+                .ok()?
+                .to_decimal()
+                .checked_div(shares)?,
+        )
+        .ok()
     }
 }
 
@@ -289,8 +300,7 @@ pub struct LiveAdmissionEvaluationAudit {
     pub current_binding: CredentialBindingIdentity,
     pub requested_mode: LiveControlMode,
     pub effective_mode: LiveControlMode,
-    pub artifact: LiveAdmissionArtifactAudit,
-    pub ladder: LadderPlanAudit,
+    pub economic: crate::economic::EconomicPrepared,
     pub account_state: Option<LiveAccountStateAudit>,
     pub account_read_failure_evidence: Vec<RawHttpAttempt>,
     pub account_read_failure_evidence_hashes: Vec<String>,
@@ -316,40 +326,26 @@ pub struct LiveOrderPreparationFailedAudit {
 pub struct LiveOrderPreparedAudit {
     pub identity: LiveOrderIdentity,
     pub frozen_binding: CredentialBindingIdentity,
-    pub admission: LiveAdmissionArtifactAudit,
+    pub economic: crate::economic::EconomicPrepared,
     pub account_state: LiveAccountStateAudit,
-    pub ladder: LadderPlanAudit,
     pub prepared: PreparedPolymarketBuy,
-    pub prepared_audit_hash: String,
 }
 
 impl LiveOrderPreparedAudit {
     pub fn new(
         identity: LiveOrderIdentity,
         frozen_binding: CredentialBindingIdentity,
-        admission: LiveAdmissionArtifactAudit,
+        economic: crate::economic::EconomicPrepared,
         account_state: LiveAccountStateAudit,
-        ladder: LadderPlanAudit,
         prepared: PreparedPolymarketBuy,
-    ) -> Result<Self, LiveJournalError> {
-        let prepared_audit_hash = hash_serializable(&(
-            "prediction-edge/prepared-live-order/v1",
-            &identity,
-            &frozen_binding,
-            &admission,
-            &account_state,
-            &ladder,
-            &prepared,
-        ))?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             identity,
             frozen_binding,
-            admission,
+            economic,
             account_state,
-            ladder,
             prepared,
-            prepared_audit_hash,
-        })
+        }
     }
 }
 
@@ -526,6 +522,89 @@ pub struct LiveModeTransitionAudit {
     pub reason: LiveModeTransitionReason,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchedLogIdentity {
+    pub transaction_hash: String,
+    pub log_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderFillFinalizedAudit {
+    pub identity: LiveOrderIdentity,
+    pub prepared_journal_seq: u64,
+    pub principal: CollateralAmount,
+    pub quantity: ShareAmount,
+    pub fee: CollateralAmount,
+    pub matched_logs: Vec<MatchedLogIdentity>,
+    pub chain_id: u64,
+    pub finalized_head: u64,
+    pub receipts: Vec<RawHttpAttempt>,
+    pub blocks: Vec<RawHttpAttempt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionFinalizedAudit {
+    pub condition_id: PolymarketConditionId,
+    pub payout_by_outcome_index_json: String,
+    pub source_append_receipt: pe_event_log::AppendReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalPositionAudit {
+    pub condition_id: PolymarketConditionId,
+    pub outcome_index: u8,
+    pub token_id: PolymarketTokenId,
+    pub size: ShareAmount,
+    pub redeemable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedemptionCustodyReconciledAudit {
+    pub identity: RedemptionAttemptIdentity,
+    pub account_state: LiveAccountStateAudit,
+    pub venue_positions: Vec<CanonicalPositionAudit>,
+    pub venue_position_receipts: Vec<pe_event_log::AppendReceipt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkKind {
+    Baseline,
+    Daily,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkPrice {
+    pub condition_id: PolymarketConditionId,
+    pub outcome_index: u8,
+    pub price: Price,
+    pub receipt: pe_event_log::AppendReceipt,
+    pub observed_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountPortfolioMarkedAudit {
+    pub kind: MarkKind,
+    pub cutoff_unix: i64,
+    pub account_state: LiveAccountStateAudit,
+    pub venue_positions: Vec<CanonicalPositionAudit>,
+    pub venue_position_receipts: Vec<pe_event_log::AppendReceipt>,
+    pub prices: Vec<MarkPrice>,
+    pub equity: CollateralAmount,
+}
+
+/// Opaque schema-one payload retained when the superseding schema cannot represent it losslessly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LegacyV1Payload(serde_json::Value);
+
 /// Payload variants are sanitized by construction: there is no credential, secret, passphrase,
 /// private key, nonce, or signature field anywhere in the journal schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,11 +618,16 @@ pub enum LiveJournalPayload {
     RedemptionRequested(Box<RedemptionRequestedAudit>),
     RedemptionTransactionIdentified(Box<RedemptionTransactionAudit>),
     RedemptionReceiptTransition(Box<RedemptionReceiptAudit>),
+    OrderFillFinalized(Box<OrderFillFinalizedAudit>),
+    ResolutionFinalized(Box<ResolutionFinalizedAudit>),
+    RedemptionCustodyReconciled(Box<RedemptionCustodyReconciledAudit>),
+    AccountPortfolioMarked(Box<AccountPortfolioMarkedAudit>),
     CredentialBindingMismatch {
         frozen: CredentialBindingIdentity,
         current: CredentialBindingIdentity,
     },
     ModeTransitionApplied(LiveModeTransitionAudit),
+    LegacyV1(Box<LegacyV1Payload>),
 }
 
 /// One globally sequenced, account-tagged journal event.
@@ -688,18 +772,170 @@ pub fn replay_account(
     })
 }
 
+mod legacy_v1 {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LiveFeeEvidenceAudit {
+        pub gamma_fees_enabled: Option<serde_json::Value>,
+        pub gamma_fee_schedule: Option<serde_json::Value>,
+        pub gamma_maker_base_fee_bps: Option<serde_json::Value>,
+        pub gamma_taker_base_fee_bps: Option<serde_json::Value>,
+        pub clob_maker_base_fee_bps: Option<serde_json::Value>,
+        pub clob_taker_base_fee_bps: Option<serde_json::Value>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LiveMarketEvidenceAudit {
+        pub condition_id: PolymarketConditionId,
+        pub ordered_outcome_token_ids: [PolymarketTokenId; 2],
+        pub neg_risk: bool,
+        pub minimum_tick_size: Price,
+        pub minimum_order_size: ShareAmount,
+        pub fee_evidence: LiveFeeEvidenceAudit,
+        pub raw_gamma_market_hash: String,
+        pub raw_clob_market_hash: String,
+        pub observed_at_unix: i64,
+        pub schema_version: u32,
+        pub parser_version: u32,
+        pub freshness_window_secs: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LiveAdmissionArtifactAudit {
+        pub market: LiveMarketEvidenceAudit,
+        pub settlement: VenueSettlementRecord,
+        pub artifact_bundle_hash: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LadderPlanAudit {
+        pub used_asks: Vec<LadderAskAudit>,
+        pub best_ask: Price,
+        pub limit_price: Price,
+        pub shares: ShareAmount,
+        pub estimated_ladder_spend: CollateralAmount,
+        pub worst_case_debit: CollateralAmount,
+        pub plan_hash: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LiveAdmissionEvaluationAudit {
+        pub identity: LiveOrderIdentity,
+        pub frozen_binding: CredentialBindingIdentity,
+        pub current_binding: CredentialBindingIdentity,
+        pub requested_mode: LiveControlMode,
+        pub effective_mode: LiveControlMode,
+        pub artifact: LiveAdmissionArtifactAudit,
+        pub ladder: LadderPlanAudit,
+        pub account_state: Option<LiveAccountStateAudit>,
+        pub account_read_failure_evidence: Vec<RawHttpAttempt>,
+        pub account_read_failure_evidence_hashes: Vec<String>,
+        pub verdict: LiveAdmissionVerdict,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LiveOrderPreparedAudit {
+        pub identity: LiveOrderIdentity,
+        pub frozen_binding: CredentialBindingIdentity,
+        pub admission: LiveAdmissionArtifactAudit,
+        pub account_state: LiveAccountStateAudit,
+        pub ladder: LadderPlanAudit,
+        pub prepared: PreparedPolymarketBuy,
+        pub prepared_audit_hash: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case", tag = "kind", content = "payload")]
+    pub(super) enum LiveJournalPayload {
+        AdmissionEvaluated(Box<LiveAdmissionEvaluationAudit>),
+        OrderPreparationFailed(Box<LiveOrderPreparationFailedAudit>),
+        OrderPrepared(Box<LiveOrderPreparedAudit>),
+        OrderPosted(Box<LiveOrderPostAudit>),
+        OrderReconciled(Box<LiveOrderReconciliationAudit>),
+        RedemptionRequested(Box<RedemptionRequestedAudit>),
+        RedemptionTransactionIdentified(Box<RedemptionTransactionAudit>),
+        RedemptionReceiptTransition(Box<RedemptionReceiptAudit>),
+        CredentialBindingMismatch {
+            frozen: CredentialBindingIdentity,
+            current: CredentialBindingIdentity,
+        },
+        ModeTransitionApplied(LiveModeTransitionAudit),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct LiveJournalEvent {
+        pub account_id: AccountId,
+        pub seq: u64,
+        pub timestamp: OffsetDateTime,
+        pub payload: LiveJournalPayload,
+    }
+
+    pub(super) fn convert(
+        event: LiveJournalEvent,
+        raw_event: serde_json::Value,
+    ) -> super::LiveJournalEvent {
+        let payload = match event.payload {
+            LiveJournalPayload::AdmissionEvaluated(_) | LiveJournalPayload::OrderPrepared(_) => {
+                super::LiveJournalPayload::LegacyV1(Box::new(super::LegacyV1Payload(raw_event)))
+            }
+            LiveJournalPayload::OrderPreparationFailed(value) => {
+                super::LiveJournalPayload::OrderPreparationFailed(value)
+            }
+            LiveJournalPayload::OrderPosted(value) => super::LiveJournalPayload::OrderPosted(value),
+            LiveJournalPayload::OrderReconciled(value) => {
+                super::LiveJournalPayload::OrderReconciled(value)
+            }
+            LiveJournalPayload::RedemptionRequested(value) => {
+                super::LiveJournalPayload::RedemptionRequested(value)
+            }
+            LiveJournalPayload::RedemptionTransactionIdentified(value) => {
+                super::LiveJournalPayload::RedemptionTransactionIdentified(value)
+            }
+            LiveJournalPayload::RedemptionReceiptTransition(value) => {
+                super::LiveJournalPayload::RedemptionReceiptTransition(value)
+            }
+            LiveJournalPayload::CredentialBindingMismatch { frozen, current } => {
+                super::LiveJournalPayload::CredentialBindingMismatch { frozen, current }
+            }
+            LiveJournalPayload::ModeTransitionApplied(value) => {
+                super::LiveJournalPayload::ModeTransitionApplied(value)
+            }
+        };
+        super::LiveJournalEvent {
+            account_id: event.account_id,
+            seq: event.seq,
+            timestamp: event.timestamp,
+            payload,
+        }
+    }
+}
+
 fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJournalError> {
     let mut events = Vec::new();
     for item in Reader::replay(path)? {
         let (seq, envelope) = item?;
         if envelope.source_id != SourceId(LIVE_JOURNAL_SOURCE.to_owned())
-            || envelope.schema_version != LIVE_JOURNAL_SCHEMA_VERSION
+            || !matches!(envelope.schema_version, 1 | LIVE_JOURNAL_SCHEMA_VERSION)
             || envelope.parser_version != LIVE_JOURNAL_PARSER_VERSION
             || envelope.content_type != ContentType::Json
         {
             return Err(LiveJournalError::UnexpectedEnvelope);
         }
-        let event: LiveJournalEvent = serde_json::from_slice(&envelope.payload)?;
+        let event = if envelope.schema_version == 1 {
+            let raw_event = serde_json::from_slice(&envelope.payload)?;
+            let legacy = serde_json::from_slice(&envelope.payload)?;
+            legacy_v1::convert(legacy, raw_event)
+        } else {
+            serde_json::from_slice(&envelope.payload)?
+        };
         let expected =
             u64::try_from(events.len()).map_err(|_| LiveJournalError::SequenceMismatch)?;
         if seq.0 != expected || event.seq != expected || event.timestamp != envelope.observed_at.0 {
@@ -800,6 +1036,149 @@ mod tests {
         drop(journal);
 
         assert_eq!(replay_account(&path, &first).unwrap(), vec![event0, event2]);
+    }
+
+    #[test]
+    fn schema_one_changed_payload_replays_as_explicit_legacy_audit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-live.log");
+        let account_id = AccountId::new("legacy").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let legacy = legacy_v1::LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 0,
+            timestamp: at,
+            payload: legacy_v1::LiveJournalPayload::AdmissionEvaluated(Box::new(
+                legacy_v1::LiveAdmissionEvaluationAudit {
+                    identity: identity("legacy-dispatch"),
+                    frozen_binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
+                    current_binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
+                    requested_mode: LiveControlMode::LiveTiny,
+                    effective_mode: LiveControlMode::LiveTiny,
+                    artifact: legacy_v1::LiveAdmissionArtifactAudit {
+                        market: legacy_v1::LiveMarketEvidenceAudit {
+                            condition_id: PolymarketConditionId("condition".to_owned()),
+                            ordered_outcome_token_ids: [
+                                PolymarketTokenId("yes".to_owned()),
+                                PolymarketTokenId("no".to_owned()),
+                            ],
+                            neg_risk: false,
+                            minimum_tick_size: Price::new(rust_decimal::Decimal::new(1, 2))
+                                .unwrap(),
+                            minimum_order_size: ShareAmount::from_whole(1).unwrap(),
+                            fee_evidence: legacy_v1::LiveFeeEvidenceAudit {
+                                gamma_fees_enabled: None,
+                                gamma_fee_schedule: None,
+                                gamma_maker_base_fee_bps: None,
+                                gamma_taker_base_fee_bps: None,
+                                clob_maker_base_fee_bps: None,
+                                clob_taker_base_fee_bps: None,
+                            },
+                            raw_gamma_market_hash: "gamma".to_owned(),
+                            raw_clob_market_hash: "clob".to_owned(),
+                            observed_at_unix: at.unix_timestamp(),
+                            schema_version: 1,
+                            parser_version: 1,
+                            freshness_window_secs: 60,
+                        },
+                        settlement: VenueSettlementRecord {
+                            schema_version: 1,
+                            condition_id: PolymarketConditionId("condition".to_owned()),
+                            status: pe_resolver_card::VenueResolutionStatus::Unresolved,
+                            raw_evidence_hash: "settlement".to_owned(),
+                            source_timestamp_unix: Some(at.unix_timestamp()),
+                            observed_at_unix: at.unix_timestamp(),
+                            parser_version: 1,
+                            freshness_window_secs: 60,
+                        },
+                        artifact_bundle_hash: "bundle".to_owned(),
+                    },
+                    ladder: legacy_v1::LadderPlanAudit {
+                        used_asks: vec![LadderAskAudit {
+                            price: Price::new(rust_decimal::Decimal::new(5, 1)).unwrap(),
+                            shares: ShareAmount::from_whole(1).unwrap(),
+                        }],
+                        best_ask: Price::new(rust_decimal::Decimal::new(5, 1)).unwrap(),
+                        limit_price: Price::new(rust_decimal::Decimal::new(5, 1)).unwrap(),
+                        shares: ShareAmount::from_whole(1).unwrap(),
+                        estimated_ladder_spend: CollateralAmount::from_decimal_exact(
+                            rust_decimal::Decimal::new(5, 1),
+                        )
+                        .unwrap(),
+                        worst_case_debit: CollateralAmount::from_decimal_exact(
+                            rust_decimal::Decimal::new(5, 1),
+                        )
+                        .unwrap(),
+                        plan_hash: "plan".to_owned(),
+                    },
+                    account_state: None,
+                    account_read_failure_evidence: Vec::new(),
+                    account_read_failure_evidence_hashes: Vec::new(),
+                    verdict: LiveAdmissionVerdict::Approved,
+                },
+            )),
+        };
+        let mut writer = Writer::open(&path).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(LIVE_JOURNAL_SOURCE.to_owned()),
+                schema_version: 1,
+                parser_version: LIVE_JOURNAL_PARSER_VERSION,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&legacy).unwrap(),
+            })
+            .unwrap();
+        drop(writer);
+
+        let replayed = replay_account(&path, &account_id).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert!(matches!(
+            replayed[0].payload,
+            LiveJournalPayload::LegacyV1(_)
+        ));
+    }
+
+    #[test]
+    fn ladder_audit_derives_exact_totals_and_vwap() {
+        let first_price = Price::new(rust_decimal::Decimal::new(4, 1)).unwrap();
+        let second_price = Price::new(rust_decimal::Decimal::new(6, 1)).unwrap();
+        let audit = LadderPlanAudit {
+            used_asks: vec![
+                LadderAskAudit {
+                    price: first_price,
+                    shares: ShareAmount::from_whole(1).unwrap(),
+                },
+                LadderAskAudit {
+                    price: second_price,
+                    shares: ShareAmount::from_whole(1).unwrap(),
+                },
+            ],
+            best_ask: first_price,
+            limit_price: second_price,
+            minimum_shares: ShareAmount::from_whole(2).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(rust_decimal::Decimal::new(12, 1))
+                .unwrap(),
+        };
+        assert_eq!(
+            audit.expected_shares().unwrap(),
+            ShareAmount::from_whole(2).unwrap()
+        );
+        assert_eq!(
+            audit.expected_spend().unwrap(),
+            CollateralAmount::from_whole(1).unwrap()
+        );
+        assert_eq!(
+            audit.expected_vwap(),
+            Some(Price::new(rust_decimal::Decimal::new(5, 1)).unwrap())
+        );
     }
 
     #[test]

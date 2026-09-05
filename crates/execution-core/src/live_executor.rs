@@ -11,18 +11,18 @@ use pe_resolver_card::{VenueSettlementError, VenueSettlementRecord};
 use pe_source_polymarket_public::{
     LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveMarketError, LiveMarketEvidence,
 };
-use pe_venue_polymarket::{LadderPlan, PreparedPolymarketBuy};
+use pe_venue_polymarket::{CompactFeeSchedule, LadderPlan, PreparedPolymarketBuy};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use crate::live_journal::{
-    CredentialBindingIdentity, LadderPlanAudit, LiveAccountReadFailure, LiveAccountStateAudit,
-    LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit, LiveAdmissionRefusal,
-    LiveAdmissionVerdict, LiveControlMode, LiveExecutedAmounts, LiveJournal, LiveJournalError,
-    LiveJournalOrderOutcome, LiveJournalPayload, LiveOrderAmbiguityKind, LiveOrderIdentity,
-    LiveOrderPostAudit, LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure,
-    LiveOrderPreparedAudit, LiveOrderReconciliationAudit, LiveOrderRejectKind,
-    LiveReconciliationSource, http_attempt_hash, http_attempt_hashes,
+    AdmissionReceipts, CredentialBindingIdentity, LiveAccountReadFailure, LiveAccountStateAudit,
+    LiveAdmissionEvaluationAudit, LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode,
+    LiveExecutedAmounts, LiveJournal, LiveJournalError, LiveJournalOrderOutcome,
+    LiveJournalPayload, LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderPostAudit,
+    LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure, LiveOrderPreparedAudit,
+    LiveOrderReconciliationAudit, LiveOrderRejectKind, LiveReconciliationSource, http_attempt_hash,
+    http_attempt_hashes,
 };
 
 /// Frozen per-target account and credential identity supplied by the dispatch aggregate.
@@ -47,11 +47,13 @@ impl LiveModeSnapshot {
     }
 }
 
-/// The two source-owned halves of ordinary live admission.
+/// Frozen ordinary live admission evidence composed by the service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveAdmissionArtifact {
     pub market: LiveMarketEvidence,
     pub settlement: VenueSettlementRecord,
+    pub fee_schedule: CompactFeeSchedule,
+    pub receipts: AdmissionReceipts,
 }
 
 /// One complete frozen order target presented to [`LiveExecutor::prepare`].
@@ -66,6 +68,7 @@ pub struct LiveOrderRequest {
     pub token_id: PolymarketTokenId,
     pub admission: LiveAdmissionArtifact,
     pub ladder: LadderPlan,
+    pub economic: crate::economic::EconomicPrepared,
 }
 
 /// Venue-neutral negRisk-aware preparation request.
@@ -356,19 +359,14 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         request: LiveOrderRequest,
         now: OffsetDateTime,
     ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError> {
-        let artifact_audit = LiveAdmissionArtifactAudit::new(
-            &request.admission.market,
-            &request.admission.settlement,
-        )?;
-        let ladder_audit = LadderPlanAudit::new(&request.ladder)?;
+        let economic = request.economic.clone();
 
         // The per-account kill is local and therefore precedes any authenticated venue I/O.
         if !request.mode.is_armed() {
             return self.refuse(
                 &request,
                 now,
-                artifact_audit,
-                ladder_audit,
+                economic,
                 None,
                 Vec::new(),
                 LiveAdmissionRefusal::ModeNotArmed,
@@ -388,8 +386,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             return self.refuse(
                 &request,
                 now,
-                artifact_audit,
-                ladder_audit,
+                economic,
                 None,
                 Vec::new(),
                 LiveAdmissionRefusal::CredentialVersionChanged,
@@ -398,15 +395,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
 
         // Ordered admission check 2: both artifact halves and the frozen quote/ladder.
         if let Err(reason) = validate_artifact_and_ladder(&request, now) {
-            return self.refuse(
-                &request,
-                now,
-                artifact_audit,
-                ladder_audit,
-                None,
-                Vec::new(),
-                reason,
-            );
+            return self.refuse(&request, now, economic, None, Vec::new(), reason);
         }
 
         let account = match self
@@ -419,8 +408,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 return self.refuse(
                     &request,
                     now,
-                    artifact_audit,
-                    ladder_audit,
+                    economic,
                     None,
                     error.evidence,
                     LiveAdmissionRefusal::AccountStateUnavailable(error.kind),
@@ -434,8 +422,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             return self.refuse(
                 &request,
                 now,
-                artifact_audit,
-                ladder_audit,
+                economic,
                 Some(account_audit),
                 Vec::new(),
                 LiveAdmissionRefusal::AccountClosedOnly,
@@ -445,8 +432,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             return self.refuse(
                 &request,
                 now,
-                artifact_audit,
-                ladder_audit,
+                economic,
                 Some(account_audit),
                 Vec::new(),
                 LiveAdmissionRefusal::Geoblocked,
@@ -459,8 +445,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             return self.refuse(
                 &request,
                 now,
-                artifact_audit,
-                ladder_audit,
+                economic,
                 Some(account_audit),
                 Vec::new(),
                 LiveAdmissionRefusal::InsufficientBalance {
@@ -473,8 +458,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             return self.refuse(
                 &request,
                 now,
-                artifact_audit,
-                ladder_audit,
+                economic,
                 Some(account_audit),
                 Vec::new(),
                 LiveAdmissionRefusal::InsufficientAllowance {
@@ -489,8 +473,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             return self.refuse(
                 &request,
                 now,
-                artifact_audit,
-                ladder_audit,
+                economic,
                 Some(account_audit),
                 Vec::new(),
                 LiveAdmissionRefusal::WorstCaseDebitExceedsFreeCollateral {
@@ -503,8 +486,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         self.journal_admission(
             &request,
             now,
-            artifact_audit.clone(),
-            ladder_audit.clone(),
+            economic.clone(),
             Some(account_audit.clone()),
             Vec::new(),
             LiveAdmissionVerdict::Approved,
@@ -563,11 +545,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         let prepared_audit = LiveOrderPreparedAudit::new(
             request.identity.clone(),
             request.target.credential_binding,
-            artifact_audit,
+            economic,
             account_audit,
-            ladder_audit,
             prepared.clone(),
-        )?;
+        );
         self.journal.append(
             request.target.account_id.clone(),
             now,
@@ -697,8 +678,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         &self,
         request: &LiveOrderRequest,
         now: OffsetDateTime,
-        artifact: LiveAdmissionArtifactAudit,
-        ladder: LadderPlanAudit,
+        economic: crate::economic::EconomicPrepared,
         account_state: Option<LiveAccountStateAudit>,
         failure_evidence: Vec<RawHttpAttempt>,
         reason: LiveAdmissionRefusal,
@@ -706,8 +686,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         self.journal_admission(
             request,
             now,
-            artifact,
-            ladder,
+            economic,
             account_state,
             failure_evidence,
             LiveAdmissionVerdict::Refused(reason.clone()),
@@ -722,8 +701,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         &self,
         request: &LiveOrderRequest,
         now: OffsetDateTime,
-        artifact: LiveAdmissionArtifactAudit,
-        ladder: LadderPlanAudit,
+        economic: crate::economic::EconomicPrepared,
         account_state: Option<LiveAccountStateAudit>,
         failure_evidence: Vec<RawHttpAttempt>,
         verdict: LiveAdmissionVerdict,
@@ -738,8 +716,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 current_binding: request.current_credential_binding.clone(),
                 requested_mode: request.mode.requested,
                 effective_mode: request.mode.effective,
-                artifact,
-                ladder,
+                economic,
                 account_state,
                 account_read_failure_evidence: failure_evidence,
                 account_read_failure_evidence_hashes: failure_hashes,
@@ -1055,7 +1032,13 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
-    use crate::live_journal::{LiveJournalPayload, replay_account};
+    use crate::economic::{
+        BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit, MarketSelection,
+        RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
+    };
+    use crate::live_journal::{
+        LadderPlanAudit, LiveAdmissionArtifactAudit, LiveJournalPayload, replay_account,
+    };
 
     struct FixtureVenue {
         account: Mutex<Result<LiveVenueAccountState, LiveVenueAccountReadError>>,
@@ -1204,6 +1187,7 @@ mod tests {
             neg_risk: true,
             minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
             minimum_order_size: ShareAmount::from_atomic(5_000_000),
+            scheduled_end_unix: None,
             fee_evidence: LiveFeeEvidence {
                 gamma_fees_enabled: Some(serde_json::json!(false)),
                 gamma_fee_schedule: None,
@@ -1248,6 +1232,88 @@ mod tests {
     }
 
     fn request(account_id: &AccountId) -> LiveOrderRequest {
+        let identity = LiveOrderIdentity {
+            dispatch_id: "dispatch-1".to_owned(),
+            idempotency_key: "idempotency-1".to_owned(),
+            quote_id: "quote-1".to_owned(),
+            config_hash: "config-hash".to_owned(),
+            decision_hash: "decision-hash".to_owned(),
+            evidence_hashes: vec!["market-hash".to_owned()],
+            fill_projection: None,
+            schema_version: 1,
+            parser_version: 1,
+        };
+        let market = market();
+        let settlement = settlement();
+        let plan = ladder();
+        let receipt = pe_event_log::AppendReceipt {
+            sequence: pe_core_types::EventSeq(1),
+            this_hash: blake3::Hash::from_bytes([1; 32]),
+        };
+        let receipts = AdmissionReceipts {
+            gamma: receipt,
+            clob_long: receipt,
+            clob_compact: receipt,
+        };
+        let fee_schedule = CompactFeeSchedule::Zero;
+        let admission_audit =
+            LiveAdmissionArtifactAudit::new(&market, &settlement, fee_schedule, receipts);
+        let ladder_audit = LadderPlanAudit::new(&plan);
+        let risk_snapshot = pe_risk_engine::RiskSnapshot {
+            leader_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            market_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            family_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            total_copy_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            intraday_pnl_bps: pe_core_types::BasisPoints::ZERO,
+            rolling_7d_pnl_bps: pe_core_types::BasisPoints::ZERO,
+            absolute_pnl_bps: pe_core_types::BasisPoints::ZERO,
+            copy_latency_kill_switch_active: false,
+            proposed_trade_bps: pe_core_types::BasisPoints(10),
+            per_trade_cap_bps: 25,
+            concentration_caps: None,
+        };
+        let economic = EconomicPrepared {
+            version: ECONOMIC_PREPARED_VERSION,
+            market: MarketSelection {
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                outcome_index: 0,
+                token_id: PolymarketTokenId("11".to_owned()),
+                side: pe_core_types::Side::Buy,
+                market_id: "condition".to_owned(),
+            },
+            admission: admission_audit,
+            ladder: ladder_audit,
+            book_receipt: receipt,
+            observation: None,
+            sizing: SizingAudit {
+                mode: SizingModeAudit::Contract { contracts: 5 },
+                budget: CollateralAmount::from_atomic(10_000_000),
+                principal: plan.worst_case_debit,
+                minimum_shares: plan.shares,
+                expected_shares: plan.shares,
+                expected_vwap: plan.vwap().unwrap(),
+                all_in_price: plan.limit_price,
+                slippage_rate: Decimal::ZERO,
+            },
+            fee: FeeAudit {
+                schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
+                expected_fee: CollateralAmount::ZERO,
+                reserve: CollateralAmount::ZERO,
+            },
+            risk: RiskAudit {
+                snapshot: risk_snapshot,
+                decision: RiskDecisionAudit::Approved,
+            },
+            balance: BalanceAudit {
+                cash_before: CollateralAmount::from_atomic(10_000_000),
+                worst_case_debit: plan.worst_case_debit,
+                price_impact_cap_bps: 100,
+                chase_ceiling: plan.limit_price,
+                band_floor: Price::ZERO,
+                band_ceiling_exclusive: Price::ONE,
+            },
+            applied_configuration_hash: identity.config_hash.clone(),
+        };
         LiveOrderRequest {
             target: FrozenLiveTarget {
                 account_id: account_id.clone(),
@@ -1264,25 +1330,18 @@ mod tests {
                 requested: LiveControlMode::LiveTiny,
                 effective: LiveControlMode::LiveTiny,
             },
-            identity: LiveOrderIdentity {
-                dispatch_id: "dispatch-1".to_owned(),
-                idempotency_key: "idempotency-1".to_owned(),
-                quote_id: "quote-1".to_owned(),
-                config_hash: "config-hash".to_owned(),
-                decision_hash: "decision-hash".to_owned(),
-                evidence_hashes: vec!["market-hash".to_owned()],
-                fill_projection: None,
-                schema_version: 1,
-                parser_version: 1,
-            },
+            identity,
             condition_id: PolymarketConditionId("condition".to_owned()),
             outcome_id: OutcomeId(0),
             token_id: PolymarketTokenId("11".to_owned()),
             admission: LiveAdmissionArtifact {
-                market: market(),
-                settlement: settlement(),
+                market,
+                settlement,
+                fee_schedule,
+                receipts,
             },
-            ladder: ladder(),
+            ladder: plan,
+            economic,
         }
     }
 

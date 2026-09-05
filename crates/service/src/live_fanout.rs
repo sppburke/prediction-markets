@@ -9,16 +9,20 @@ use std::time::Duration;
 use age::x25519::Identity;
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    AccountId, BasisPoints, CollateralAmount, PolymarketConditionId, Price, Probability,
+    AccountId, BasisPoints, CollateralAmount, EventSeq, KellyFraction, PolymarketConditionId,
+    Price, Probability, Side,
 };
+use pe_event_log::AppendReceipt;
 use pe_execution_core::{
-    CredentialBindingIdentity, FrozenLiveTarget, LiveAdmissionRefusal, LiveControlMode,
-    LiveExecutedAmounts, LiveExecutor, LiveFillProjectionIdentity, LiveJournal, LiveJournalEvent,
-    LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit,
-    LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome,
-    LiveOrderReconciliationAudit, LiveOrderVenue, LivePrepareResult, LiveReconciliationSource,
-    LiveVenueReconciledOutcome, RedemptionAttempt, RedemptionAttemptIdentity,
-    RedemptionAttemptState, RedemptionEvent, RedemptionPassInput, advance,
+    BalanceAudit, CredentialBindingIdentity, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
+    FrozenLiveTarget, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveAdmissionRefusal,
+    LiveControlMode, LiveExecutedAmounts, LiveExecutor, LiveFillProjectionIdentity, LiveJournal,
+    LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot,
+    LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
+    LiveOrderOutcome, LiveOrderReconciliationAudit, LiveOrderVenue, LivePrepareResult,
+    LiveReconciliationSource, LiveVenueReconciledOutcome, MarketSelection, RedemptionAttempt,
+    RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionEvent, RedemptionPassInput,
+    RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit, advance,
     reconstruct_redemption_attempts, redemption_posture, replay_account, run_redemption_pass,
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
@@ -26,7 +30,8 @@ use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
 use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
 use pe_venue_polymarket::{
     CustodyKind, LadderError, RedemptionTransport, RelayerApiKeyCredentials, RelayerCredentials,
-    RelayerPollPolicy, build_redemption_call, plan_budget_buy, sign_deposit_wallet_redemption,
+    RelayerPollPolicy, build_redemption_call, fee_reserve, plan_budget_buy,
+    sign_deposit_wallet_redemption, taker_fee,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
@@ -611,6 +616,8 @@ async fn process_target(
         terminalize(state, target, "live_price_impact_cap_invalid", now)?;
         return Ok(PassControl::Continue);
     };
+    let price_impact_cap_bps = i32::try_from(cap_bps)
+        .map_err(|_| FanoutError::Signal("live price-impact cap exceeds i32".to_owned()))?;
     let ceiling_raw = (best_ask.0
         * (Decimal::from(10_000u32 + cap_bps) / Decimal::from(10_000u32)))
     .min(Decimal::ONE);
@@ -640,6 +647,19 @@ async fn process_target(
         }
     };
     let identity = build_order_identity(seed, target, signal, &admission, &plan, &strategy_config)?;
+    let economic = build_economic_prepared(
+        signal,
+        &identity,
+        &admission,
+        &plan,
+        &strategy_config,
+        probability,
+        account_state.reconciled_free_collateral,
+        price_impact_cap_bps,
+        ceiling,
+        minimum_price,
+        maximum_price,
+    )?;
     let binding = CredentialBindingIdentity {
         version: target.credential_bundle_version,
         key_id: target.credential_key_id.clone(),
@@ -660,6 +680,7 @@ async fn process_target(
         token_id,
         admission,
         ladder: plan.clone(),
+        economic,
     };
     let executor = LiveExecutor::new(&venue, state.config.journal.as_ref());
     match executor.prepare(request, now).await? {
@@ -802,6 +823,143 @@ fn build_order_identity(
         })),
         schema_version: 1,
         parser_version: 1,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_economic_prepared(
+    signal: &LeaderSignal,
+    identity: &LiveOrderIdentity,
+    admission: &pe_execution_core::LiveAdmissionArtifact,
+    plan: &pe_venue_polymarket::LadderPlan,
+    strategy: &pe_strategy_winner_follow::WinnerFollowConfig,
+    probability: Probability,
+    cash_before: CollateralAmount,
+    price_impact_cap_bps: i32,
+    chase_ceiling: Price,
+    band_floor: Price,
+    band_ceiling_exclusive: Price,
+) -> Result<EconomicPrepared, FanoutError> {
+    let outcome_index = u8::try_from(signal.outcome_id.0)
+        .map_err(|_| FanoutError::Signal("outcome index exceeds u8".to_owned()))?;
+    let token_id = admission
+        .market
+        .ordered_outcome_token_ids
+        .get(usize::from(outcome_index))
+        .cloned()
+        .ok_or_else(|| FanoutError::Signal("outcome token is missing".to_owned()))?;
+    let ladder = LadderPlanAudit::new(plan);
+    let expected_shares = ladder
+        .expected_shares()
+        .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    let expected_vwap = ladder
+        .expected_vwap()
+        .ok_or_else(|| FanoutError::Signal("ladder VWAP is invalid".to_owned()))?;
+    let schedule = admission.fee_schedule;
+    let expected_fee = taker_fee(schedule, plan.shares, plan.limit_price)
+        .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    let reserve = fee_reserve(
+        schedule,
+        plan.worst_case_debit,
+        plan.best_ask,
+        plan.limit_price,
+    )
+    .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    let paper_debit = plan
+        .worst_case_debit
+        .checked_add(expected_fee)
+        .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    let all_in_price = Price::new(
+        paper_debit
+            .to_decimal()
+            .checked_div(plan.shares.to_decimal())
+            .and_then(|price| {
+                Decimal::ONE
+                    .checked_add(strategy.slippage_rate)
+                    .and_then(|slippage| price.checked_mul(slippage))
+            })
+            .ok_or_else(|| FanoutError::Signal("all-in price arithmetic failed".to_owned()))?,
+    )
+    .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    let sizing_mode = match strategy.sizing_mode {
+        SizingMode::Kelly => SizingModeAudit::Kelly {
+            fraction: strategy
+                .kelly_fraction_override
+                .unwrap_or(KellyFraction(Decimal::new(25, 2))),
+            probability,
+        },
+        SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },
+        SizingMode::Contract { contracts } => SizingModeAudit::Contract { contracts },
+    };
+    let mut snapshot = zeroed_risk_snapshot();
+    let proposed_trade_bps = plan
+        .shares
+        .to_decimal()
+        .checked_mul(plan.best_ask.0)
+        .and_then(|notional| notional.checked_div(cash_before.to_decimal()))
+        .and_then(|ratio| ratio.checked_mul(Decimal::from(10_000u32)))
+        .map(|value| value.ceil())
+        .and_then(|value| value.to_i32())
+        .ok_or_else(|| FanoutError::Signal("risk exposure arithmetic failed".to_owned()))?;
+    snapshot.proposed_trade_bps = BasisPoints(proposed_trade_bps);
+    snapshot.per_trade_cap_bps = strategy.per_trade_cap.resolve_bps(TradingMode::LiveTiny);
+    let worst_case_debit = plan
+        .worst_case_debit
+        .checked_add(reserve)
+        .map_err(|error| FanoutError::Signal(error.to_string()))?;
+
+    // #545 lane E fills this with the synchronized `/book` source-log receipt. The current book
+    // fetcher exposes only its raw response digest, so no append sequence exists at this boundary.
+    let book_receipt = AppendReceipt {
+        sequence: EventSeq(0),
+        this_hash: blake3::Hash::from_bytes([0; 32]),
+    };
+    Ok(EconomicPrepared {
+        version: ECONOMIC_PREPARED_VERSION,
+        market: MarketSelection {
+            condition_id: admission.market.condition_id.clone(),
+            outcome_index,
+            token_id,
+            side: Side::Buy,
+            market_id: signal.market_id.to_string(),
+        },
+        admission: LiveAdmissionArtifactAudit::new(
+            &admission.market,
+            &admission.settlement,
+            admission.fee_schedule,
+            admission.receipts,
+        ),
+        ladder,
+        book_receipt,
+        observation: None,
+        sizing: SizingAudit {
+            mode: sizing_mode,
+            budget: cash_before,
+            principal: plan.worst_case_debit,
+            minimum_shares: plan.shares,
+            expected_shares,
+            expected_vwap,
+            all_in_price,
+            slippage_rate: strategy.slippage_rate,
+        },
+        fee: FeeAudit {
+            schedule,
+            expected_fee,
+            reserve,
+        },
+        risk: RiskAudit {
+            snapshot,
+            decision: RiskDecisionAudit::Approved,
+        },
+        balance: BalanceAudit {
+            cash_before,
+            worst_case_debit,
+            price_impact_cap_bps,
+            chase_ceiling,
+            band_floor,
+            band_ceiling_exclusive,
+        },
+        applied_configuration_hash: identity.config_hash.clone(),
     })
 }
 
@@ -969,7 +1127,7 @@ fn derive_projection_rows(
             LiveJournalPayload::OrderPrepared(prepared) => {
                 reservations.insert(
                     prepared.identity.idempotency_key.clone(),
-                    prepared.ladder.worst_case_debit.to_decimal(),
+                    prepared.economic.balance.worst_case_debit.to_decimal(),
                 );
             }
             LiveJournalPayload::OrderReconciled(reconciled) => {
@@ -1074,11 +1232,16 @@ fn derive_projection_rows(
             }
             LiveJournalPayload::OrderPreparationFailed(_)
             | LiveJournalPayload::OrderPosted(_)
+            | LiveJournalPayload::OrderFillFinalized(_)
+            | LiveJournalPayload::ResolutionFinalized(_)
+            | LiveJournalPayload::RedemptionCustodyReconciled(_)
+            | LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::RedemptionRequested(_)
             | LiveJournalPayload::RedemptionTransactionIdentified(_)
             | LiveJournalPayload::RedemptionReceiptTransition(_)
             | LiveJournalPayload::CredentialBindingMismatch { .. }
-            | LiveJournalPayload::ModeTransitionApplied(_) => {}
+            | LiveJournalPayload::ModeTransitionApplied(_)
+            | LiveJournalPayload::LegacyV1(_) => {}
         }
     }
 

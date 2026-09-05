@@ -12,25 +12,27 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use pe_core_types::{
-    CollateralAmount, Price, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
-    TransportErrorClass,
+    CollateralAmount, EventSeq, Price, RawEvidence, RawHttpAttempt, RawHttpResponse,
+    RawTransportFailure, TransportErrorClass,
 };
+use pe_event_log::AppendReceipt;
 use pe_execution_core::{
-    LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutedAmounts,
-    LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification, LivePostFuture,
-    LivePostParseError, LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
-    LiveVenuePreparationError, LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared,
-    LiveVenueReconciledOutcome, LiveVenueReconciliation, LiveVenueReconciliationError,
-    RedemptionStatusObservation, RedemptionStatusReadError, RedemptionStatusReader,
+    AdmissionReceipts, LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact,
+    LiveExecutedAmounts, LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification,
+    LivePostFuture, LivePostParseError, LiveReconciliationFuture, LiveVenueAccountReadError,
+    LiveVenueAccountState, LiveVenuePreparationError, LiveVenuePrepareFuture,
+    LiveVenuePrepareRequest, LiveVenuePrepared, LiveVenueReconciledOutcome,
+    LiveVenueReconciliation, LiveVenueReconciliationError, RedemptionStatusObservation,
+    RedemptionStatusReadError, RedemptionStatusReader,
 };
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
 use pe_source_polymarket_public::validate_live_market;
 use pe_venue_polymarket::{
-    CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
-    REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION, REDEMPTION_SCHEMA_VERSION,
-    RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX,
+    CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CompactFeeSchedule, CustodyKind,
+    PreparedSubmission, REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION,
+    REDEMPTION_SCHEMA_VERSION, RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX,
     RELAYER_LEGACY_TRANSACTION_PATH, RedemptionTransport, RedemptionTransportError,
     RelayerCredentials, RelayerPollPolicy, RelayerTransportClient, SignedRedemptionRequest,
     V2BuyRequest,
@@ -588,7 +590,23 @@ impl LiveAdmissionBuilder {
             parser_version: 1,
             freshness_window_secs: LIVE_MARKET_FRESHNESS_SECS,
         };
-        Ok(LiveAdmissionArtifact { market, settlement })
+        // #545 lane E fills these with synchronized source-log receipts when admission logging is
+        // wired; the interface-freeze slice has no SourceLogHandle at this boundary yet.
+        let unbound_receipt = AppendReceipt {
+            sequence: EventSeq(0),
+            this_hash: blake3::Hash::from_bytes([0; 32]),
+        };
+        Ok(LiveAdmissionArtifact {
+            market,
+            settlement,
+            // #545 lane B fills this from compact CLOB and Gamma schedule evidence.
+            fee_schedule: CompactFeeSchedule::Zero,
+            receipts: AdmissionReceipts {
+                gamma: unbound_receipt,
+                clob_long: unbound_receipt,
+                clob_compact: unbound_receipt,
+            },
+        })
     }
 
     async fn fetch(&self, url: &str) -> Result<Vec<u8>, LiveVenueAdapterError> {
