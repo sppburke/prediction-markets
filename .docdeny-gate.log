@@ -1,0 +1,11 @@
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+doc_rc=0
+
+advisories ok, bans ok, licenses ok, sources ok
+deny_rc=0
+
+warning: 4 allowed warnings found
+audit_rc=0

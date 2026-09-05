@@ -143,7 +143,7 @@ jobs:
       - name: Postgres RPC parity + concurrency test (issue #397)
         env:
           PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: cargo nextest run -p pe-service --features scenario pg_parity
+        run: cargo nextest run -p pe-service --features scenario --test pg_parity
 
       - name: Ranking publication RPC idempotency + rollback test
         env:

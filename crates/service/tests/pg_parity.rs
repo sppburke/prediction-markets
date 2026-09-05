@@ -13,7 +13,7 @@
 //!   docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
 //!   psql "$URL" -c "create role anon; create role authenticated; create role service_role;"
 //!   psql "$URL" -f scripts/supabase_schema.sql -f scripts/supabase_paper_state_schema.sql
-//!   PE_TEST_PG_URL="$URL" cargo nextest run -p pe-service --features scenario pg_parity
+//!   PE_TEST_PG_URL="$URL" cargo nextest run -p pe-service --features scenario --test pg_parity
 //!
 //! Phases (one sequential test so the shared `paper_bankroll` singleton is not raced):
 //!   PG-PARITY — SQL `commit_fill` bankroll + positions == `PaperStateDb::commit_fill`.
