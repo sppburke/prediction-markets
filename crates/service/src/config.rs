@@ -116,23 +116,6 @@ pub struct ServiceConfig {
     #[serde(default = "default_legacy_wallet_history_path")]
     pub legacy_wallet_history_path: PathBuf,
 
-    /// BUY-side paper fill haircut (fee + slippage) in basis points.
-    /// See `docs/_GLOSSARY.md`: `paper_fill_haircut_bps`.
-    #[serde(default = "default_paper_fill_haircut_bps")]
-    pub paper_fill_haircut_bps: u32,
-
-    /// SELL-side paper fill slippage (no taker fee) in basis points.
-    /// See `docs/_GLOSSARY.md`: `paper_fill_slippage_bps`.
-    #[serde(default = "default_paper_fill_slippage_bps")]
-    pub paper_fill_slippage_bps: u32,
-
-    /// Paper fill-price mode (#486): `clob_best_ask` (default — a paper BUY fills at the fresh
-    /// CLOB best-ask, and sizing/band-gates key off it) or `leader_haircut` (the pre-#486
-    /// boot-frozen leader-price haircut). Runtime-mutable via `service_config`; an unknown value
-    /// warns and keeps the last-known-good. See `docs/_GLOSSARY.md`: `fill_mode`.
-    #[serde(default = "default_fill_mode")]
-    pub fill_mode: String,
-
     // ── Gamma / resolution polling ───────────────────────────────────────────
     /// Gamma API base URL (no trailing slash). See `docs/_GLOSSARY.md`.
     #[serde(default = "default_gamma_base_url")]
@@ -438,18 +421,6 @@ fn default_legacy_wallet_history_path() -> PathBuf {
     PathBuf::from("./wallet_market_history.json")
 }
 
-const fn default_paper_fill_haircut_bps() -> u32 {
-    500
-}
-
-const fn default_paper_fill_slippage_bps() -> u32 {
-    100
-}
-
-fn default_fill_mode() -> String {
-    "clob_best_ask".to_string() // #486: paper BUY fills at the fresh CLOB best-ask
-}
-
 fn default_bankroll_usd() -> String {
     "10000".to_string()
 }
@@ -494,9 +465,6 @@ impl Default for ServiceConfig {
             log_retention_days: default_log_retention_days(),
             paper_state_db_path: default_paper_state_db_path(),
             legacy_wallet_history_path: default_legacy_wallet_history_path(),
-            paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
-            paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
-            fill_mode: default_fill_mode(),
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
@@ -574,9 +542,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "log_retention_days",
         "paper_state_db_path",
         "legacy_wallet_history_path",
-        "paper_fill_haircut_bps",
-        "paper_fill_slippage_bps",
-        "fill_mode",
         "gamma_base_url",
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
@@ -641,9 +606,6 @@ mod tests {
         assert_eq!(cfg.trade_poll_interval_secs, 30);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");
-        assert_eq!(cfg.paper_fill_haircut_bps, 500);
-        assert_eq!(cfg.paper_fill_slippage_bps, 100);
-        assert_eq!(cfg.fill_mode, "clob_best_ask");
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
         assert_eq!(
             cfg.legacy_wallet_history_path,

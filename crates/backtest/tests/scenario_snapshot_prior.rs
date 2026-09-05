@@ -115,6 +115,7 @@ fn base_config(dir: &TempDir, min_snapshots: u32, extra_per_missing: u32) -> Bac
         bootstrap_cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
         bankroll_usd: Decimal::from(10_000u32),
+        modeled_polymarket_fee_rate: dec!(0.04),
         step_days: 1,
         max_hours_to_expiry: None,
         audit_window_days: 365,

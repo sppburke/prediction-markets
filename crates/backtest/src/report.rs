@@ -182,6 +182,10 @@ pub struct TradeFill {
     pub contracts: u64,
     pub signal_price: Decimal,
     pub fill_price: Decimal,
+    /// Modeled, non-promotional exponent-one platform fee. Zero for non-BUY records.
+    pub modeled_fee: Decimal,
+    /// Principal plus modeled fee debited for a BUY. Zero for non-BUY records.
+    pub all_in_debit: Decimal,
 }
 
 /// Per-operator PnL accumulator.

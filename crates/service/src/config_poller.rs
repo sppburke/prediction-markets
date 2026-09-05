@@ -430,7 +430,6 @@ mod tests {
             ("min_fill_price", "0.15", "decimal"),
             ("min_resolution_horizon_secs", "60", "integer"),
             ("max_resolution_horizon_secs", "172800", "integer"),
-            ("fill_mode", "clob_best_ask", "text"),
             ("price_impact_cap_bps", "100", "integer"),
             ("flip_human_approved", "false", "bool"),
             (
@@ -438,7 +437,6 @@ mod tests {
                 "false",
                 "bool",
             ),
-            ("polymarket_fee_rate", "0.04", "decimal"),
             ("per_trade_cap", "unlimited", "text"),
             ("slippage_rate", "0.01", "decimal"),
             ("sizing_mode", "dollar", "text"),

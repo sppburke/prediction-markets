@@ -2,28 +2,18 @@
 //!
 //! This generalizes the isolated canary checks without changing them. Unlike canary admission,
 //! NegRisk markets are admitted and `neg_risk` is carried into order preparation. Gamma and CLOB
-//! legacy fee flags/rates remain available during the #545 transition. The scheduled end is an
-//! explicit source-owned evidence field parsed from the CLOB long-market row.
+//! legacy fee flags/rates remain audit-only in their raw source envelopes. The scheduled end is
+//! an explicit source-owned evidence field parsed from the shared CLOB long-market row.
 
 use pe_core_types::{PolymarketConditionId, PolymarketTokenId, Price, ShareAmount};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::clob_resolution::parse_clob_end_date;
+use crate::clob_resolution::{ClobMarket, parse_clob_end_date, parse_clob_market};
 
 pub const LIVE_MARKET_SCHEMA_VERSION: u32 = 1;
 pub const LIVE_MARKET_PARSER_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveFeeEvidence {
-    pub gamma_fees_enabled: Option<Value>,
-    pub gamma_fee_schedule: Option<Value>,
-    pub gamma_maker_base_fee_bps: Option<Value>,
-    pub gamma_taker_base_fee_bps: Option<Value>,
-    pub clob_maker_base_fee_bps: Option<Value>,
-    pub clob_taker_base_fee_bps: Option<Value>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveMarketEvidence {
@@ -33,9 +23,6 @@ pub struct LiveMarketEvidence {
     pub minimum_tick_size: Price,
     pub minimum_order_size: ShareAmount,
     pub scheduled_end_unix: Option<i64>,
-    pub fee_evidence: LiveFeeEvidence,
-    pub raw_gamma_market_hash: blake3::Hash,
-    pub raw_clob_market_hash: blake3::Hash,
     pub observed_at_unix: i64,
     pub schema_version: u32,
     pub parser_version: u32,
@@ -102,33 +89,6 @@ struct GammaMarket {
     order_price_min_tick_size: Option<Value>,
     order_min_size: Option<Value>,
     seconds_delay: Option<u64>,
-    fees_enabled: Option<Value>,
-    fee_schedule: Option<Value>,
-    maker_base_fee: Option<Value>,
-    taker_base_fee: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct ClobMarket {
-    condition_id: String,
-    end_date_iso: Option<String>,
-    active: Option<bool>,
-    closed: Option<bool>,
-    accepting_orders: Option<bool>,
-    enable_order_book: Option<bool>,
-    minimum_order_size: Option<Value>,
-    minimum_tick_size: Option<Value>,
-    neg_risk: Option<bool>,
-    seconds_delay: Option<u64>,
-    tokens: Option<Vec<ClobToken>>,
-    maker_base_fee: Option<Value>,
-    taker_base_fee: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct ClobToken {
-    token_id: String,
-    outcome: String,
 }
 
 pub fn validate_live_market(
@@ -150,23 +110,19 @@ pub fn validate_live_market(
     if matching.next().is_some() {
         return Err(LiveMarketError::MarketCardinality);
     }
-    let clob: ClobMarket =
-        serde_json::from_slice(clob_raw).map_err(|error| LiveMarketError::Json {
-            origin: "CLOB",
-            message: error.to_string(),
-        })?;
+    let clob = parse_clob_market(clob_raw).map_err(|error| LiveMarketError::Json {
+        origin: "CLOB",
+        message: error.to_string(),
+    })?;
 
     validate_state(&gamma, &clob)?;
-    if clob.condition_id != expected_condition.0 {
+    if clob.condition_id.as_deref() != Some(expected_condition.0.as_str()) {
         return Err(LiveMarketError::SourceDisagreement);
     }
 
     let gamma_outcomes = string_array(gamma.outcomes.as_ref())?;
     let gamma_tokens = string_array(gamma.clob_token_ids.as_ref())?;
-    let clob_tokens = clob
-        .tokens
-        .as_ref()
-        .ok_or(LiveMarketError::MissingMapping)?;
+    let clob_tokens = &clob.tokens;
     if gamma_outcomes.len() != 2
         || gamma_tokens.len() != 2
         || clob_tokens.len() != 2
@@ -174,9 +130,16 @@ pub fn validate_live_market(
             .iter()
             .any(|outcome| outcome.trim().is_empty())
         || gamma_tokens.iter().any(|token| token.trim().is_empty())
-        || clob_tokens
-            .iter()
-            .any(|token| token.outcome.trim().is_empty() || token.token_id.trim().is_empty())
+        || clob_tokens.iter().any(|token| {
+            token
+                .outcome
+                .as_deref()
+                .is_none_or(|outcome| outcome.trim().is_empty())
+                || token
+                    .token_id
+                    .as_deref()
+                    .is_none_or(|token_id| token_id.trim().is_empty())
+        })
         || gamma_outcomes[0] == gamma_outcomes[1]
         || gamma_tokens[0] == gamma_tokens[1]
         || clob_tokens[0].token_id == clob_tokens[1].token_id
@@ -186,11 +149,11 @@ pub fn validate_live_market(
     if gamma_outcomes
         .iter()
         .zip(clob_tokens)
-        .any(|(outcome, token)| outcome != &token.outcome)
+        .any(|(outcome, token)| token.outcome.as_ref() != Some(outcome))
         || gamma_tokens
             .iter()
             .zip(clob_tokens)
-            .any(|(token_id, token)| token_id != &token.token_id)
+            .any(|(token_id, token)| token.token_id.as_ref() != Some(token_id))
     {
         return Err(LiveMarketError::SourceDisagreement);
     }
@@ -227,16 +190,6 @@ pub fn validate_live_market(
         minimum_tick_size: gamma_tick,
         minimum_order_size: gamma_minimum,
         scheduled_end_unix,
-        fee_evidence: LiveFeeEvidence {
-            gamma_fees_enabled: gamma.fees_enabled,
-            gamma_fee_schedule: gamma.fee_schedule,
-            gamma_maker_base_fee_bps: gamma.maker_base_fee,
-            gamma_taker_base_fee_bps: gamma.taker_base_fee,
-            clob_maker_base_fee_bps: clob.maker_base_fee,
-            clob_taker_base_fee_bps: clob.taker_base_fee,
-        },
-        raw_gamma_market_hash: blake3::hash(gamma_raw),
-        raw_clob_market_hash: blake3::hash(clob_raw),
         observed_at_unix,
         schema_version: LIVE_MARKET_SCHEMA_VERSION,
         parser_version: LIVE_MARKET_PARSER_VERSION,
@@ -376,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn fee_flagged_market_is_admitted_with_verbatim_evidence() {
+    fn long_row_fee_flags_are_audit_only_and_do_not_classify() {
         let mut gamma = gamma(false);
         gamma[0]["feesEnabled"] = json!(true);
         gamma[0]["feeSchedule"] = json!({"rate": 25, "takerOnly": true});
@@ -387,15 +340,7 @@ mod tests {
         clob["taker_base_fee"] = json!("9");
 
         let evidence = validate(&gamma, &clob).unwrap();
-        assert_eq!(evidence.fee_evidence.gamma_fees_enabled, Some(json!(true)));
-        assert_eq!(
-            evidence.fee_evidence.gamma_fee_schedule,
-            Some(json!({"rate": 25, "takerOnly": true}))
-        );
-        assert_eq!(
-            evidence.fee_evidence.clob_taker_base_fee_bps,
-            Some(json!("9"))
-        );
+        assert_eq!(evidence.condition_id, condition());
     }
 
     #[test]

@@ -70,6 +70,12 @@ pub struct BacktestConfig {
     #[serde(default = "default_bankroll")]
     pub bankroll_usd: Decimal,
 
+    /// Backtest-only modeled Polymarket exponent-one taker rate. Reports embed this resolved
+    /// value; it is not compact venue evidence and is never promotional/runtime economics.
+    /// `PE_BACKTEST_MODELED_POLYMARKET_FEE_RATE` overrides.
+    #[serde(default = "default_modeled_polymarket_fee_rate")]
+    pub modeled_polymarket_fee_rate: Decimal,
+
     /// Walk-forward step in days. `PE_BACKTEST_STEP_DAYS` overrides.
     #[serde(default = "default_step_days")]
     pub step_days: u32,
@@ -329,6 +335,10 @@ fn default_bankroll() -> Decimal {
     Decimal::from(10_000u32)
 }
 
+fn default_modeled_polymarket_fee_rate() -> Decimal {
+    Decimal::new(4, 2)
+}
+
 const fn default_step_days() -> u32 {
     DEFAULT_STEP_DAYS
 }
@@ -417,6 +427,7 @@ impl Default for BacktestConfig {
             bootstrap_cache_path: default_cache_path(),
             output_dir: PathBuf::from("./pe-backtest-output"),
             bankroll_usd: default_bankroll(),
+            modeled_polymarket_fee_rate: default_modeled_polymarket_fee_rate(),
             step_days: default_step_days(),
             max_hours_to_expiry: None,
             audit_window_days: default_audit_window_days(),

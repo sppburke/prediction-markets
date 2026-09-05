@@ -194,7 +194,9 @@ impl LadderPlanAudit {
                         field: "LadderPlanAudit.expected_spend",
                     })
             })?;
-        CollateralAmount::from_decimal_exact(spend)
+        CollateralAmount::from_decimal_exact(
+            spend.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToNegativeInfinity),
+        )
     }
 
     #[must_use]

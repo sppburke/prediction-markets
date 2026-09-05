@@ -3560,6 +3560,7 @@ dependencies = [
  "pe-source-core",
  "pe-strategy-winner-follow",
  "pe-trader-index",
+ "pe-venue-polymarket",
  "rayon",
  "reqwest 0.12.28",
  "rust_decimal",
