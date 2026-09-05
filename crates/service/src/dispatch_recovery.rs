@@ -23,11 +23,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use pe_core_types::WalletAddress;
-use pe_event_log::Reader;
 use pe_paper_state::PaperStateDb;
-use pe_strategy_winner_follow::PaperFill;
 use serde::Deserialize;
 use tracing::{info, warn};
+
+use crate::paper_recovery::{
+    FinancialPayload, FinancialResult, PaperLogFrame, PaperLogRecord, paper_era, scan_paper_log,
+};
 
 /// The subset of the frozen `signal_json` the boot resume needs. The staged JSON is
 /// `{"schema_version":1,"signal":{...LeaderSignal...},...}` (see the orchestrator's
@@ -80,16 +82,51 @@ pub fn resume_dispatch_seeds(
         return Ok(out);
     }
 
-    // One event-log pass: fill idempotency key → frame seq for durably logged frames.
+    // One shared verified paper-log pass: fill idempotency key → terminal frame sequence.
+    // In an active era only a matching FinancialFinal is terminal; pre-Start legacy fills
+    // retain the old disposition rules.
     let mut logged_keys: HashMap<String, u64> = HashMap::new();
+    let mut active_era = false;
     if event_log_path.exists() {
-        let replay = Reader::replay(event_log_path)
-            .with_context(|| format!("open event log {}", event_log_path.display()))?;
-        for frame in replay {
-            let (seq, envelope) = frame.context("read event-log frame")?;
-            let fill: PaperFill =
-                serde_json::from_slice(&envelope.payload).context("decode PaperFill")?;
-            logged_keys.insert(fill.intent.idempotency_key, seq.0);
+        let era = paper_era(
+            scan_paper_log(event_log_path)
+                .with_context(|| format!("scan paper log {}", event_log_path.display()))?,
+        );
+        active_era = era.start.is_some();
+        let mut prepared_keys = HashMap::new();
+        for frame in era.frames {
+            match frame.frame {
+                PaperLogFrame::LegacyFill(fill) if !active_era => {
+                    logged_keys.insert(fill.intent.idempotency_key, frame.receipt.sequence.0);
+                }
+                PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                    payload:
+                        FinancialPayload::Fill {
+                            operation,
+                            economic,
+                        },
+                    ..
+                }) if active_era => {
+                    let key = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                        &operation.leader_wallet.to_string(),
+                        &operation.source_trade_id.0,
+                        &economic.market.market_id,
+                        u16::from(economic.market.outcome_index),
+                        economic.market.side,
+                        operation.observed_at_bucket,
+                    );
+                    prepared_keys.insert(frame.receipt.sequence, key);
+                }
+                PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                    prepared_receipt,
+                    result: FinancialResult::Fill { .. },
+                }) if active_era => {
+                    if let Some(key) = prepared_keys.get(&prepared_receipt.sequence) {
+                        logged_keys.insert(key.clone(), frame.receipt.sequence.0);
+                    }
+                }
+                _ => {}
+            }
         }
     }
     let last_applied = paper_state
@@ -103,7 +140,12 @@ pub fn resume_dispatch_seeds(
             // row-less frame at or below `last_applied` = the terminal settled refusal;
             // a row-less frame ABOVE `last_applied` has no disposition yet (the boot
             // frame-walk halted before it) — leave it pending for the next pass.
-            if paper_state
+            if active_era {
+                paper_state
+                    .flip_dispatch_ready(&seed.dispatch_id, "fill")
+                    .context("flip recovered finalized fill seed")?;
+                out.flipped_fill += 1;
+            } else if paper_state
                 .fill_exists(&seed.dispatch_id)
                 .context("check fill disposition")?
             {

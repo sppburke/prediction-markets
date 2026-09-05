@@ -304,7 +304,7 @@ async fn run_with(
         .unwrap();
     drop(trade_tx);
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
@@ -434,7 +434,7 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
         ),
     ]);
     let leader_ledger = pe_service::paper_recovery::build_leader_ledger(&paper_state).unwrap();
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
@@ -568,7 +568,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     ]);
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(8);
     let (control_tx, control_rx) = mpsc::channel(4);
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
@@ -723,7 +723,7 @@ async fn run_gate_with(
         .unwrap();
     drop(tx);
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {

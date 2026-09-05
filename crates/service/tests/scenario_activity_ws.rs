@@ -342,7 +342,7 @@ fn build_orchestrator(
         })
         .collect();
     let leader_ledger = build_leader_ledger(&paper_state).unwrap();
-    let mut orch = Orchestrator::new(
+    let mut orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {

@@ -252,7 +252,7 @@ async fn run_gate_capped(
     }
     drop(trade_tx);
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
@@ -647,7 +647,7 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
         .unwrap();
     drop(tx);
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
@@ -898,7 +898,7 @@ async fn live_mode_never_fetches_book_ac6() {
         .unwrap();
     drop(tx);
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {

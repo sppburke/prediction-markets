@@ -47,11 +47,18 @@ use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
+#[cfg(not(test))]
+use crate::paper_recovery::{PAPER_LOG_SCHEMA_VERSION_V2, PaperLogRecord};
 use crate::runtime_config::{self, FillMode, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::{SinkHandle, SupabaseFillRow, supabase_fill_from};
 use crate::supabase_state::{
     AuthoritativeFillOutcome, SupabaseStateClient, commit_fill_authoritative,
+};
+#[cfg(not(test))]
+use crate::supabase_state::{
+    PreparedResolutionRequest, SupabaseStateTrait, apply_financial_result,
+    resolution_source_received_at,
 };
 
 /// Hot-path `/book` fetch timeout for the price-impact gate (#398 WS2). Tighter than the worker's
@@ -273,7 +280,9 @@ pub struct ScenarioHooks {
 }
 
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
-    trade_rx: mpsc::Receiver<IncomingTrade>,
+    /// Scenario-only compatibility input. Production activity enters exclusively through the
+    /// acknowledged complete-bucket control path.
+    trade_rx: Option<mpsc::Receiver<IncomingTrade>>,
     bucket_engine: BucketCommitEngine,
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
@@ -353,6 +362,7 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     /// remains the owner; this queue only preserves its causal boot order.
     pending_boot: VecDeque<IncomingTrade>,
     pending_continuations: HashMap<SourceTradeId, DecisionContinuationV2>,
+    financial_log_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -366,6 +376,122 @@ pub enum OrchestratorRunError {
 }
 
 impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
+    #[cfg(not(test))]
+    fn append_paper_record(
+        &mut self,
+        record: &PaperLogRecord,
+    ) -> Result<pe_event_log::AppendReceipt, String> {
+        let payload = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+        self.dispatcher
+            .append_paper_payload_synced(
+                PAPER_LOG_SCHEMA_VERSION_V2,
+                1,
+                SourceTimestamp(OffsetDateTime::now_utc()),
+                payload,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(test))]
+    async fn apply_resolution_candidate(
+        &mut self,
+        condition: pe_core_types::PolymarketConditionId,
+        payout_by_outcome_index_json: String,
+        source_receipt: pe_event_log::AppendReceipt,
+    ) -> Result<(), String> {
+        let (paper_log_path, source_log_path) = self
+            .financial_log_paths
+            .clone()
+            .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
+        let start = self
+            .paper_state
+            .financial_start()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "resolution candidate precedes QualificationStarted".to_owned())?;
+        let era = crate::paper_recovery::paper_era(
+            crate::paper_recovery::scan_paper_log(&paper_log_path)
+                .map_err(|error| error.to_string())?,
+        );
+        if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
+            return Err("oldest paper Prepared is unmatched".to_owned());
+        }
+        let completed = era
+            .frames
+            .iter()
+            .rev()
+            .find_map(|frame| match &frame.frame {
+                crate::paper_recovery::PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                    prepared_receipt,
+                    ..
+                }) => Some(prepared_receipt.sequence),
+                _ => None,
+            });
+        let local_completed = self
+            .paper_state
+            .financial_last_prepared_seq()
+            .map_err(|error| error.to_string())?;
+        if local_completed != completed {
+            return Err(
+                "local financial snapshot sequence differs from the verified paper prefix"
+                    .to_owned(),
+            );
+        }
+        let expected = crate::paper_recovery::ExpectedAuthority {
+            qualification_start_receipt: start,
+            prior_completed_prepared_sequence: completed,
+        };
+        let prepared_record = PaperLogRecord::FinancialPrepared {
+            expected_authority: expected.clone(),
+            payload: crate::paper_recovery::FinancialPayload::Resolution {
+                condition_id: condition.clone(),
+                payout_by_outcome_index_json: payout_by_outcome_index_json.clone(),
+                resolution_source_receipt: source_receipt,
+            },
+        };
+        let prepared_receipt = self.append_paper_record(&prepared_record)?;
+        let settled_at_unix = resolution_source_received_at(
+            &source_log_path,
+            source_receipt,
+            &condition,
+            &payout_by_outcome_index_json,
+        )
+        .map_err(|error| error.to_string())?;
+        let authority = self
+            .supabase_state
+            .as_ref()
+            .ok_or_else(|| "active financial era has no authority client".to_owned())?;
+        let request = PreparedResolutionRequest {
+            expected_authority: expected.clone(),
+            prepared_receipt,
+            condition,
+            payout_by_outcome_index_json,
+            settled_at_unix,
+        };
+        let canonical = authority
+            .apply_prepared_resolution(&request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = crate::paper_recovery::FinancialResult::Resolution { canonical };
+        let PaperLogRecord::FinancialPrepared { payload, .. } = &prepared_record else {
+            return Err("internal financial Prepared kind mismatch".to_owned());
+        };
+        apply_financial_result(
+            &self.paper_state,
+            start,
+            &expected,
+            prepared_receipt,
+            payload,
+            &result,
+            &source_log_path,
+        )
+        .map_err(|error| error.to_string())?;
+        self.append_paper_record(&PaperLogRecord::FinancialFinal {
+            prepared_receipt,
+            result,
+        })?;
+        Ok(())
+    }
+
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
             OrchestratorControl::PrepareAdmissions {
@@ -461,6 +587,72 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 let result = result.map_err(|error| error.to_string());
                 let _ = committed.send(result);
             }
+            #[cfg(not(test))]
+            OrchestratorControl::ResolutionCandidate {
+                condition,
+                payout_by_outcome_index_json,
+                receipt,
+                acknowledged,
+            } => {
+                let result = self
+                    .apply_resolution_candidate(condition, payout_by_outcome_index_json, receipt)
+                    .await;
+                if result.is_err() {
+                    self.intake_stopped = true;
+                }
+                let _ = acknowledged.send(result);
+            }
+            #[cfg(not(test))]
+            OrchestratorControl::PublishMembership {
+                change,
+                acknowledged,
+            } => {
+                let removed = change.removed.iter().copied().collect::<HashSet<_>>();
+                let writer_lock = self.watchlist_writer_lock.clone();
+                let result = if let Some(writer_lock) = writer_lock {
+                    let _guard = writer_lock.lock().await;
+                    let receipt = self.append_paper_record(&change.into_record());
+                    if receipt.is_ok() && !removed.is_empty() {
+                        self.live_watchlist.remove_fenced(&removed);
+                    }
+                    receipt
+                } else {
+                    let receipt = self.append_paper_record(&change.into_record());
+                    if receipt.is_ok() && !removed.is_empty() {
+                        self.live_watchlist.remove_fenced(&removed);
+                    }
+                    receipt
+                };
+                let _ = acknowledged.send(result);
+            }
+            #[cfg(not(test))]
+            OrchestratorControl::RiskHaltChange {
+                owner,
+                cause,
+                state,
+                evidence,
+                acknowledged,
+            } => {
+                let result = self.append_paper_record(&PaperLogRecord::RiskHaltChanged {
+                    owner,
+                    cause,
+                    state,
+                    evidence,
+                });
+                let _ = acknowledged.send(result);
+            }
+            #[cfg(not(test))]
+            OrchestratorControl::DailyBoundary { acknowledged, .. } => {
+                let _ = acknowledged.send(Err(
+                    "daily boundary requires Lane D's complete PortfolioMark record".to_owned(),
+                ));
+            }
+            #[cfg(not(test))]
+            OrchestratorControl::SealCheck { acknowledged, .. } => {
+                let _ = acknowledged.send(Err(
+                    "seal check requires Lane F's complete QualificationSealed record".to_owned(),
+                ));
+            }
         }
     }
 }
@@ -468,7 +660,83 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        live_watchlist: LiveWatchlist,
+        config: OrchestratorConfig,
+        strategy: WinnerFollowStrategy,
+        dispatcher: ExecutionDispatcher,
+        paper_state: Arc<PaperStateDb>,
+        leader_ledger: PositionLedger,
+        health: SharedHealth,
+        market_end_cache: MarketEndCache,
+        mid_price_cache: MidPriceCache<F>,
+        control_rx: mpsc::Receiver<OrchestratorControl>,
+        sink: Option<SinkHandle>,
+        snapshot_sink: Option<SnapshotHandle>,
+        supabase_state: Option<SupabaseStateClient>,
+        book_fetcher: Arc<B>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::new_inner(
+            None,
+            live_watchlist,
+            config,
+            strategy,
+            dispatcher,
+            paper_state,
+            leader_ledger,
+            health,
+            market_end_cache,
+            mid_price_cache,
+            control_rx,
+            sink,
+            snapshot_sink,
+            supabase_state,
+            book_fetcher,
+        )
+    }
+
+    /// Deterministic compatibility seam for existing scenarios. Production has no direct trade
+    /// sender or receiver and cannot call this constructor without the `scenario` feature.
+    #[cfg(feature = "scenario")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_trade_input(
         trade_rx: mpsc::Receiver<IncomingTrade>,
+        live_watchlist: LiveWatchlist,
+        config: OrchestratorConfig,
+        strategy: WinnerFollowStrategy,
+        dispatcher: ExecutionDispatcher,
+        paper_state: Arc<PaperStateDb>,
+        leader_ledger: PositionLedger,
+        health: SharedHealth,
+        market_end_cache: MarketEndCache,
+        mid_price_cache: MidPriceCache<F>,
+        control_rx: mpsc::Receiver<OrchestratorControl>,
+        sink: Option<SinkHandle>,
+        snapshot_sink: Option<SnapshotHandle>,
+        supabase_state: Option<SupabaseStateClient>,
+        book_fetcher: Arc<B>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::new_inner(
+            Some(trade_rx),
+            live_watchlist,
+            config,
+            strategy,
+            dispatcher,
+            paper_state,
+            leader_ledger,
+            health,
+            market_end_cache,
+            mid_price_cache,
+            control_rx,
+            sink,
+            snapshot_sink,
+            supabase_state,
+            book_fetcher,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        trade_rx: Option<mpsc::Receiver<IncomingTrade>>,
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
@@ -567,7 +835,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             watchlist_writer_lock: config.watchlist_writer_lock,
             pending_boot,
             pending_continuations,
+            financial_log_paths: None,
         })
+    }
+
+    /// Install the verified log pair used by the Start-bound financial protocol.
+    pub fn configure_financial_log_paths(
+        &mut self,
+        paper_log_path: std::path::PathBuf,
+        source_log_path: std::path::PathBuf,
+    ) {
+        self.financial_log_paths = Some((paper_log_path, source_log_path));
     }
 
     /// Install the scenario-only clock/fault seams (#546). Scenario builds only.
@@ -647,21 +925,27 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             error!(%error, "decision_pending boot recovery failed");
             return;
         }
-        let mut trades_done = false;
+        let mut trades_done = self.trade_rx.is_none();
         let mut control_done = false;
         // #511 frozen-retry ticker: drives parked post-frame fills to a terminal outcome.
         let mut parked_tick = tokio::time::interval(Duration::from_secs(PARKED_RETRY_SECS));
         parked_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
-            if trades_done {
+            if trades_done && control_done {
                 break;
             }
 
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    while let Ok(trade) = self.trade_rx.try_recv() {
+                    let mut drained = Vec::new();
+                    if let Some(receiver) = self.trade_rx.as_mut() {
+                        while let Ok(trade) = receiver.try_recv() {
+                            drained.push(trade);
+                        }
+                    }
+                    for trade in drained {
                         self.handle_trade(trade).await;
                     }
                     break;
@@ -675,7 +959,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         None => control_done = true,
                     }
                 }
-                result = self.trade_rx.recv(), if !trades_done => {
+                result = async {
+                    match self.trade_rx.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending::<Option<IncomingTrade>>().await,
+                    }
+                }, if !trades_done => {
                     match result {
                         Some(trade) => {
                             self.handle_trade(trade).await;
@@ -702,7 +991,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .await
             .map_err(|error| OrchestratorRunError::PendingRecovery(error.to_string()))?;
         let mut draining = false;
-        let mut trades_done = false;
+        let mut trades_done = self.trade_rx.is_none();
         let mut control_done = false;
         let mut parked_tick = tokio::time::interval(Duration::from_secs(PARKED_RETRY_SECS));
         parked_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -730,7 +1019,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         }),
                     }
                 }
-                result = self.trade_rx.recv(), if !trades_done => {
+                result = async {
+                    match self.trade_rx.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending::<Option<IncomingTrade>>().await,
+                    }
+                }, if !trades_done => {
                     match result {
                         Some(trade) => self.handle_trade(trade).await,
                         None if draining => trades_done = true,
@@ -1104,6 +1398,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     }
 
     async fn handle_trade(&mut self, trade: IncomingTrade) {
+        if self.financial_log_paths.is_some() {
+            error!(
+                trade = %trade.source_trade_id,
+                "post-Start fill reached the retired legacy paper executor; stopping intake"
+            );
+            self.intake_stopped = true;
+            return;
+        }
         let source_trade_id = trade.source_trade_id.clone();
         let pending_owned = self.pending_continuations.contains_key(&source_trade_id);
         self.handle_trade_once(trade).await;

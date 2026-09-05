@@ -7,7 +7,7 @@
 //! `PaperExecutor` is imported from `pe-strategy-winner-follow` — not moved.
 
 use pe_core_types::{EventSeq, Price, SourceTimestamp};
-use pe_event_log::PoisonReason;
+use pe_event_log::{AppendReceipt, PoisonReason};
 use pe_strategy_winner_follow::{ExecutionMode, FillSource, PaperExecutor, PaperFill};
 use pe_venue_core::OrderIntent;
 
@@ -31,6 +31,19 @@ impl ExecutionDispatcher {
     /// Typed paper-log durability state for readiness and bounded producer shutdown (#544).
     pub fn paper_poisoned(&self) -> Option<&PoisonReason> {
         self.paper.poisoned()
+    }
+
+    /// Append one orchestrator-serialized paper record through the sole paper writer.
+    pub fn append_paper_payload_synced(
+        &mut self,
+        schema_version: u32,
+        parser_version: u32,
+        observed_at: SourceTimestamp,
+        payload: Vec<u8>,
+    ) -> Result<AppendReceipt, ExecutionError> {
+        self.paper
+            .append_payload_synced(schema_version, parser_version, observed_at, payload)
+            .map_err(ExecutionError::from)
     }
 
     /// Route `intent` to paper or live executor based on `mode`.
