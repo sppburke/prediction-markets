@@ -232,9 +232,76 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(man["versions"]["activity_schema"], 2)
         self.assertEqual(man["versions"]["clob_resolution_parser"], 2)
         self.assertEqual(man["versions"]["clob_resolution_schema"], 2)
-        self.assertEqual(man["versions"]["ranker"], 1)
+        self.assertEqual(man["versions"]["ranker"], 2)
         self.assertEqual(man["versions"]["configuration"], 1)
         print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
+
+    def test_schema_two_price_horizon_edges_and_deterministic_diff(self):
+        """PASS: schema two applies [0.15,0.85) and [60,max) only after
+        +1-cent repricing, and binds a deterministic before/after diff."""
+        con = sqlite3.connect(self.db)
+        con.execute("PRAGMA user_version=2")
+        con.commit()
+        con.close()
+        cases = [
+            (1_000_000, 62, "0.14"),       # shifted horizon=60, effective=.15: include
+            (1_010_000, 3599, "0.839"),    # shifted horizon=3597, effective=.849: include
+            (1_020_000, 3599, "0.84"),     # effective=.85: exclude
+            (1_030_000, 61, "0.50"),       # shifted horizon=59: exclude
+            (1_040_000, 3602, "0.50"),     # shifted horizon=max: exclude
+        ]
+        with open(self.positions, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(POSITIONS_HEADER)
+            for entry, ttr, _price in cases:
+                writer.writerow([W1, "0xm", 0, entry, ttr, 0.99, "1.250000", 1.0,
+                                 0, 0, entry + ttr])
+        con = sqlite3.connect(self.db)
+        for entry, _ttr, price in cases:
+            con.execute("INSERT INTO ranker_price_points VALUES ('TOK', ?, ?, 1)",
+                        (entry + SHIFT, price))
+        con.execute(
+            "INSERT INTO ranker_price_pages VALUES ('TOK', ?, ?, 1, 'complete', 5, "
+            "'00', 'test', 1, 1, 1, 1, 'url')",
+            (cases[0][0] + SHIFT - WINDOW - 1, cases[-1][0] + SHIFT + 1),
+        )
+        con.commit()
+        con.close()
+        before = self.root / "before.json"
+        before.write_text(json.dumps([{
+            "wallet": "0x" + "2" * 40, "score": 3.0, "survives": True, "rank": 1,
+        }]))
+        cycle = self.root / "cycle.json"
+        cycle.write_text('{"cache_schema":2}\n')
+        stage = self.root / "cache-stage.json"
+        stage.write_text('{"cache_sha256":"aa"}\n')
+        args = (
+            "--min-ttr-secs", "60", "--ttr-max-secs", "3600",
+            "--price-min", "0.15", "--price-max", "0.85",
+            "--before-ranking-json", str(before),
+            "--cycle-manifest-file", str(cycle),
+            "--cache-stage-record", str(stage),
+        )
+        result, out = self.run_pass2(*args)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        with open(out / "oracle_outcomes.csv", newline="") as source:
+            reasons = [row["outcome"] for row in csv.DictReader(source)]
+        self.assertEqual(
+            reasons,
+            ["repriced", "repriced", "price_band", "scheduled_horizon",
+             "scheduled_horizon"],
+        )
+        first = (out / "before_after_diff.json").read_bytes()
+        result, out = self.run_pass2(*args)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(first, (out / "before_after_diff.json").read_bytes())
+        manifest = json.loads((out / "oracle_manifest.json").read_text())
+        import hashlib
+        self.assertEqual(
+            manifest["outputs"]["before_after_diff_sha256"],
+            hashlib.sha256(first).hexdigest(),
+        )
+        print("PASS: schema-two horizon/band edges and before/after diff are deterministic")
 
     def test_nonpositive_fill_window_is_fatal(self):
         # #536 review M2: staleness bound 0 would admit every stale sample; reject

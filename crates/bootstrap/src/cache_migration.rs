@@ -1,18 +1,30 @@
-//! Resumable, generation-sealed wallet-cache migration and fixed-path cutover (#544).
+//! Resumable, generation-sealed wallet-cache migration and fixed-path cutover (#544, #545).
 //!
 //! Version one remains available only as `*_v1_sealed` audit tables. Version-two
 //! consumers use the typed `activity_groups_v2` and CLOB payout APIs; no Rust API
 //! unions the generations. This makes a cross-generation ranking/state read a
 //! schema/API error instead of a filter callers can forget.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 use std::time::Duration;
 
-use pe_core_types::WalletAddress;
-use pe_source_polymarket_public::{ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION};
+use futures::{StreamExt as _, stream};
+use pe_core_types::{
+    CollateralAmount, MarketId, ReconstructionQuality, ShareAmount, SourceTimestamp, WalletAddress,
+};
+use pe_position_ledger::{
+    EntryClassification, LedgerEffect, LedgerMutation, PositionLedger, SecondVerdict,
+    classify_complete_historical_second,
+};
+use pe_source_polymarket_public::{
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivitySemanticRevision,
+    PriceWeightedShareAmount, ReconciliationPageEvidence, SourceActivityGroupComponents,
+    SourceActivityGroupId,
+};
 use pe_source_polymarket_public::{
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest,
     ReconciliationFetcher, fetch_complete_activity,
@@ -21,6 +33,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use time::OffsetDateTime;
 
 use crate::cache::{CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2, REQUIRED_TRADES_INDEXES};
 use crate::error::BootstrapError;
@@ -31,7 +44,9 @@ use crate::reclamation_evidence::{
 
 const CACHE_BUILD_MANIFEST_VERSION: u32 = 1;
 const FROZEN_PAYLOAD_REFERENCE_VERSION: u32 = 1;
-const FINAL_STAGE_RECORD_VERSION: u32 = 1;
+const FINAL_STAGE_RECORD_VERSION: u32 = 2;
+const RANKER_CLASSIFIER_VERSION: u32 = 1;
+const MAX_ACTIVITY_WALLET_FETCHES: usize = 16;
 
 const V2_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sealed_generation_manifests (
@@ -48,6 +63,11 @@ CREATE TABLE IF NOT EXISTS sealed_generation_manifests (
 
 CREATE TABLE IF NOT EXISTS activity_coverage_manifests_v2 (
     generation          INTEGER PRIMARY KEY NOT NULL,
+    reference_sha256    TEXT    NOT NULL,
+    wallet_count        INTEGER NOT NULL,
+    receipt_set_digest  TEXT    NOT NULL,
+    aggregate_digest    TEXT    NOT NULL,
+    source_row_count    INTEGER NOT NULL,
     source_bounds_json  TEXT    NOT NULL,
     cursors_json        TEXT    NOT NULL,
     page_hashes_json    TEXT    NOT NULL,
@@ -55,6 +75,21 @@ CREATE TABLE IF NOT EXISTS activity_coverage_manifests_v2 (
     schema_version      INTEGER NOT NULL CHECK(schema_version = 2),
     parser_version      INTEGER NOT NULL CHECK(parser_version = 2),
     completed_at_unix   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (
+    generation                INTEGER NOT NULL,
+    wallet_hex               TEXT    NOT NULL,
+    reference_sha256         TEXT    NOT NULL,
+    fixed_end_unix           INTEGER NOT NULL,
+    page_evidence_json       TEXT    NOT NULL,
+    ordered_aggregate_digest TEXT    NOT NULL,
+    source_row_count         INTEGER NOT NULL,
+    aggregate_count          INTEGER NOT NULL,
+    schema_version           INTEGER NOT NULL CHECK(schema_version = 2),
+    parser_version           INTEGER NOT NULL CHECK(parser_version = 2),
+    completed_at_unix        INTEGER NOT NULL,
+    PRIMARY KEY (generation, wallet_hex)
 );
 
 CREATE TABLE IF NOT EXISTS activity_groups_v2 (
@@ -84,12 +119,21 @@ CREATE INDEX IF NOT EXISTS idx_activity_groups_v2_wallet_time
 CREATE INDEX IF NOT EXISTS idx_activity_groups_v2_condition
     ON activity_groups_v2(condition_id, outcome_id, source_time_unix);
 
+CREATE TABLE IF NOT EXISTS ranker_entries_v2 (
+    source_trade_id       TEXT PRIMARY KEY NOT NULL
+        CHECK(substr(source_trade_id, 1, 3) = 'g2:'),
+    activity_generation  INTEGER NOT NULL,
+    classifier_version   INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cache_frozen_payload_verifications (
     reference_sha256          TEXT PRIMARY KEY NOT NULL,
     active_wallets_json       TEXT    NOT NULL,
     freshness_json            TEXT    NOT NULL,
     legacy_trade_count        INTEGER NOT NULL,
     cross_generation_matches  INTEGER NOT NULL CHECK(cross_generation_matches = 0),
+    activity_generation       INTEGER NULL,
+    fixed_end_unix            INTEGER NULL,
     verified_at_unix          INTEGER NOT NULL
 );
 
@@ -99,6 +143,9 @@ CREATE TABLE IF NOT EXISTS cache_v2_migration_state (
         'schema_sealed','frozen_payload_verified','finalized'
     )),
     input_manifest_sha256  TEXT    NOT NULL,
+    ranker_projection_count INTEGER NULL,
+    ranker_projection_digest TEXT NULL,
+    ranker_classifier_version INTEGER NULL,
     updated_at_unix        INTEGER NOT NULL
 );
 ";
@@ -120,6 +167,12 @@ pub struct CacheV2BuildManifest {
 #[serde(deny_unknown_fields)]
 pub struct ActivityCoverageManifestV2 {
     pub generation: u64,
+    pub reference_sha256: String,
+    pub wallet_count: u64,
+    pub receipt_set_digest: String,
+    pub aggregate_digest: String,
+    pub source_row_count: u64,
+    pub group_count: u64,
     pub source_bounds: Value,
     pub cursors: Value,
     pub page_hashes: Vec<String>,
@@ -137,6 +190,8 @@ pub struct FrozenCacheFreshness {
     pub clob_cursor: String,
     pub clob_cursor_updated_at: i64,
 }
+
+type FinalizedProjectionState = (String, Option<i64>, Option<String>, Option<i64>);
 
 /// Supplied frozen reference used to rerun the production active filter against
 /// the sealed v1 tables. `ranked_wallets` is the pre-filter universe and
@@ -182,13 +237,16 @@ pub struct CacheFinalStageRecord {
     pub sealed_generation: u64,
     pub activity_coverage_generation: u64,
     pub payout_coverage_generation: u64,
+    pub ranker_projection_count: u64,
+    pub ranker_projection_digest: String,
+    pub ranker_classifier_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheActivationRequest {
     pub fixed_path: PathBuf,
     pub side_path: PathBuf,
-    pub version_one_backup_path: PathBuf,
+    pub prior_cache_backup_path: PathBuf,
     pub expected_side_sha256: String,
 }
 
@@ -196,35 +254,80 @@ pub struct CacheActivationRequest {
 pub struct CacheActivationReport {
     pub installed_path: PathBuf,
     pub installed_sha256: String,
-    pub version_one_backup_path: PathBuf,
+    pub prior_cache_backup_path: PathBuf,
+    pub prior_cache_sha256: String,
+    pub prior_cache_schema: i64,
     pub activation_evidence: Option<ReclamationEvidenceReport>,
     pub resumed: bool,
 }
 
-/// Populate a complete fixed-end v2 activity generation for the preserved
-/// active/tradeable universe. Partial rows are harmless: the coverage manifest
-/// is written only after every wallet completes, and exact group inserts make a
-/// retry idempotent.
+/// Hash/schema binding recorded from activation for a pre-publication restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorCacheBinding {
+    pub sha256: String,
+    pub schema_version: i64,
+}
+
+/// Populate per-wallet v2 activity checkpoints for one verified frozen universe.
+///
+/// The frozen reference is revalidated before any source call. Up to sixteen
+/// wallet reads run concurrently through the caller's one shared fetcher; only
+/// each wallet's aggregate-and-receipt SQLite transaction is serialized here.
 pub async fn populate_activity_v2(
     cache_path: &Path,
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
+    frozen_reference_path: &Path,
     fixed_end_unix: i64,
     generation: u64,
     completed_at_unix: i64,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
-    let mut cache = crate::cache::WalletCache::open(cache_path)?;
-    if cache.schema_version()? != CACHE_SCHEMA_VERSION_V2 {
-        return invalid("activity v2 population requires a schema-v2 side cache".to_owned());
-    }
-    let mut wallets = cache.active_tradeable_wallet_hexes()?;
+    let schema_connection = open_existing_rw(cache_path)?;
+    require_schema(&schema_connection, CACHE_SCHEMA_VERSION_V2)?;
+    ensure_lane_a_v2_schema(&schema_connection)?;
+    schema_connection.close().map_err(|(_, error)| error)?;
+    let verification =
+        verify_frozen_payload_v1(cache_path, frozen_reference_path, completed_at_unix)?;
+    let mut wallets = verification.active_wallets;
     wallets.sort();
-    let mut page_hashes = Vec::new();
-    let mut cursors = BTreeMap::new();
-    for wallet_hex in &wallets {
+    wallets.dedup();
+
+    let mut connection = open_existing_rw(cache_path)?;
+    require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
+    bind_frozen_activity_identity(
+        &connection,
+        &verification.reference_sha256,
+        generation,
+        fixed_end_unix,
+    )?;
+    if let Some(manifest) = completed_activity_manifest(
+        &connection,
+        generation,
+        &verification.reference_sha256,
+        fixed_end_unix,
+        &wallets,
+    )? {
+        return Ok(manifest);
+    }
+    let completed = validate_activity_staging(
+        &connection,
+        generation,
+        &verification.reference_sha256,
+        fixed_end_unix,
+        &wallets,
+        false,
+    )?
+    .completed_wallets;
+    let missing = wallets
+        .iter()
+        .filter(|wallet| !completed.contains(*wallet))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let reads = stream::iter(missing.into_iter().map(|wallet_hex| async move {
         let wallet =
-            WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
-                message: format!("active universe contains invalid wallet {wallet_hex}: {error}"),
+            WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
+                message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
             })?;
         let complete = fetch_complete_activity(fetcher, base_url, wallet, None, fixed_end_unix)
             .await
@@ -232,39 +335,60 @@ pub async fn populate_activity_v2(
                 wallet: wallet_hex.clone(),
                 message: error.to_string(),
             })?;
-        for page in &complete.pages {
-            page_hashes.push(format!("{wallet_hex}:{}", page.raw_page_hash));
-        }
-        for bucket in complete
+        let source_row_count =
+            u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Invalid {
+                message: format!("activity source-row count overflow for {wallet_hex}"),
+            })?;
+        let mut aggregates = complete
             .buckets()
             .map_err(|error| BootstrapError::Polymarket {
                 wallet: wallet_hex.clone(),
                 message: error.to_string(),
             })?
-        {
-            for aggregate in bucket {
-                cache.insert_activity_aggregate_v2(generation, &aggregate)?;
-            }
-        }
-        cursors.insert(wallet_hex.clone(), fixed_end_unix);
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        aggregates.sort_by(|left, right| {
+            left.source_time
+                .0
+                .unix_timestamp()
+                .cmp(&right.source_time.0.unix_timestamp())
+                .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
+        });
+        Ok::<_, BootstrapError>(WalletActivityCompletion {
+            wallet_hex,
+            pages: complete.pages,
+            aggregates,
+            source_row_count,
+        })
+    }))
+    .buffer_unordered(MAX_ACTIVITY_WALLET_FETCHES);
+    futures::pin_mut!(reads);
+    while let Some(completion) = reads.next().await {
+        commit_activity_wallet_v2(
+            &mut connection,
+            generation,
+            &verification.reference_sha256,
+            fixed_end_unix,
+            completed_at_unix,
+            &completion?,
+        )?;
     }
-    drop(cache);
-    page_hashes.sort();
-    let manifest = ActivityCoverageManifestV2 {
+
+    let staged = validate_activity_staging(
+        &connection,
         generation,
-        source_bounds: serde_json::json!({
-            "start_exclusive": null,
-            "end_inclusive": fixed_end_unix,
-            "wallet_count": wallets.len(),
-        }),
-        cursors: serde_json::to_value(cursors)?,
-        page_hashes,
+        &verification.reference_sha256,
+        fixed_end_unix,
+        &wallets,
+        true,
+    )?;
+    staged.into_manifest(
+        generation,
+        verification.reference_sha256,
+        fixed_end_unix,
         completed_at_unix,
-        schema_version: ACTIVITY_SCHEMA_VERSION,
-        parser_version: ACTIVITY_PARSER_VERSION,
-    };
-    record_activity_coverage_v2(cache_path, &manifest)?;
-    Ok(manifest)
+    )
 }
 
 /// Seal a verified hash-qualified online backup as generation two.
@@ -294,6 +418,7 @@ pub fn migrate_cache_v2(
     let mut connection = open_existing_rw(cache_path)?;
     let found: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if found == CACHE_SCHEMA_VERSION_V2 {
+        ensure_lane_a_v2_schema(&connection)?;
         integrity_check(&connection)?;
         checkpoint_truncate(&connection)?;
         let stored: Option<(String, i64, i64, i64)> = connection
@@ -352,6 +477,7 @@ pub fn migrate_cache_v2(
          ALTER TABLE source_cursor RENAME TO source_cursor_v1_sealed;",
     )?;
     transaction.execute_batch(V2_SCHEMA)?;
+    ensure_lane_a_v2_schema(&transaction)?;
     transaction.execute(
         "INSERT INTO sealed_generation_manifests
              (generation, input_manifest_sha256, source_bounds_json, cursors_json, hashes_json,
@@ -391,68 +517,682 @@ pub fn migrate_cache_v2(
     })
 }
 
-/// Install a complete v2 activity-coverage manifest after normalized groups
-/// have been stored through [`crate::cache::WalletCache::insert_activity_aggregate_v2`].
-pub fn record_activity_coverage_v2(
-    cache_path: &Path,
-    manifest: &ActivityCoverageManifestV2,
-) -> Result<(), BootstrapError> {
-    if manifest.schema_version != ACTIVITY_SCHEMA_VERSION
-        || manifest.parser_version != ACTIVITY_PARSER_VERSION
-    {
-        return invalid(
-            "activity coverage manifest has the wrong parser/schema version".to_owned(),
-        );
+struct WalletActivityCompletion {
+    wallet_hex: String,
+    pages: Vec<ReconciliationPageEvidence>,
+    aggregates: Vec<ActivityAggregate>,
+    source_row_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityWalletReceiptProof {
+    wallet_hex: String,
+    pages: Vec<ReconciliationPageEvidence>,
+    ordered_aggregate_digest: String,
+    source_row_count: u64,
+    aggregate_count: u64,
+    schema_version: u32,
+    parser_version: u32,
+}
+
+struct ValidatedActivityStaging {
+    completed_wallets: BTreeSet<String>,
+    receipts: Vec<ActivityWalletReceiptProof>,
+    aggregates: Vec<ActivityAggregate>,
+}
+
+impl ValidatedActivityStaging {
+    fn into_manifest(
+        self,
+        generation: u64,
+        reference_sha256: String,
+        fixed_end_unix: i64,
+        completed_at_unix: i64,
+    ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+        let wallets = self.completed_wallets.into_iter().collect::<Vec<_>>();
+        let wallet_count = u64::try_from(wallets.len()).map_err(|_| BootstrapError::Invalid {
+            message: "activity wallet count overflow".to_owned(),
+        })?;
+        let source_row_count = self.receipts.iter().try_fold(0_u64, |total, receipt| {
+            total
+                .checked_add(receipt.source_row_count)
+                .ok_or_else(|| BootstrapError::Invalid {
+                    message: "activity source-row count overflow".to_owned(),
+                })
+        })?;
+        let group_count =
+            u64::try_from(self.aggregates.len()).map_err(|_| BootstrapError::Invalid {
+                message: "activity aggregate count overflow".to_owned(),
+            })?;
+        let mut page_hashes = self
+            .receipts
+            .iter()
+            .flat_map(|receipt| {
+                receipt
+                    .pages
+                    .iter()
+                    .map(move |page| format!("{}:{}", receipt.wallet_hex, page.raw_page_hash))
+            })
+            .collect::<Vec<_>>();
+        page_hashes.sort();
+        let receipt_set_digest = receipt_set_digest(
+            generation,
+            &reference_sha256,
+            fixed_end_unix,
+            &self.receipts,
+        )?;
+        Ok(ActivityCoverageManifestV2 {
+            generation,
+            reference_sha256: reference_sha256.clone(),
+            wallet_count,
+            receipt_set_digest,
+            aggregate_digest: aggregate_digest(&self.aggregates)?,
+            source_row_count,
+            group_count,
+            source_bounds: serde_json::json!({
+                "start_exclusive": null,
+                "end_inclusive": fixed_end_unix,
+                "wallet_count": wallet_count,
+            }),
+            cursors: serde_json::to_value(&self.receipts)?,
+            page_hashes,
+            completed_at_unix,
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+        })
     }
-    let mut connection = open_existing_rw(cache_path)?;
-    require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
-    let group_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?1",
-        params![to_i64(manifest.generation, "activity coverage generation")?],
-        |row| row.get(0),
+}
+
+fn bind_frozen_activity_identity(
+    connection: &Connection,
+    reference_sha256: &str,
+    generation: u64,
+    fixed_end_unix: i64,
+) -> Result<(), BootstrapError> {
+    let generation = to_i64(generation, "activity generation")?;
+    let changed = connection.execute(
+        "UPDATE cache_frozen_payload_verifications
+         SET activity_generation = COALESCE(activity_generation, ?2),
+             fixed_end_unix = COALESCE(fixed_end_unix, ?3)
+         WHERE reference_sha256 = ?1
+           AND (activity_generation IS NULL OR activity_generation = ?2)
+           AND (fixed_end_unix IS NULL OR fixed_end_unix = ?3)",
+        params![reference_sha256, generation, fixed_end_unix],
     )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        invalid("frozen payload was rebound to another activity generation or end".to_owned())
+    }
+}
+
+fn commit_activity_wallet_v2(
+    connection: &mut Connection,
+    generation: u64,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    completed_at_unix: i64,
+    completion: &WalletActivityCompletion,
+) -> Result<(), BootstrapError> {
+    let generation_i64 = to_i64(generation, "activity generation")?;
+    let aggregate_count =
+        u64::try_from(completion.aggregates.len()).map_err(|_| BootstrapError::Invalid {
+            message: format!(
+                "activity aggregate count overflow for {}",
+                completion.wallet_hex
+            ),
+        })?;
+    let digest = aggregate_digest(&completion.aggregates)?;
+    let page_evidence_json = canonical_json(&completion.pages)?;
     let transaction = connection.transaction()?;
+    transaction.execute(
+        "DELETE FROM activity_groups_v2
+         WHERE coverage_generation = ?1 AND wallet_hex = ?2",
+        params![generation_i64, completion.wallet_hex],
+    )?;
+    for aggregate in &completion.aggregates {
+        insert_activity_aggregate(
+            &transaction,
+            generation_i64,
+            &completion.wallet_hex,
+            aggregate,
+        )?;
+    }
     let changed = transaction.execute(
-        "INSERT INTO activity_coverage_manifests_v2
-             (generation, source_bounds_json, cursors_json, page_hashes_json, group_count,
-              schema_version, parser_version, completed_at_unix)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(generation) DO UPDATE SET
-             source_bounds_json = excluded.source_bounds_json,
-             cursors_json = excluded.cursors_json,
-             page_hashes_json = excluded.page_hashes_json,
-             group_count = excluded.group_count,
+        "INSERT INTO activity_wallet_coverage_staging_v2
+             (generation, wallet_hex, reference_sha256, fixed_end_unix,
+              page_evidence_json, ordered_aggregate_digest, source_row_count,
+              aggregate_count, schema_version, parser_version, completed_at_unix)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(generation, wallet_hex) DO UPDATE SET
+             reference_sha256 = excluded.reference_sha256,
+             fixed_end_unix = excluded.fixed_end_unix,
+             page_evidence_json = excluded.page_evidence_json,
+             ordered_aggregate_digest = excluded.ordered_aggregate_digest,
+             source_row_count = excluded.source_row_count,
+             aggregate_count = excluded.aggregate_count,
              schema_version = excluded.schema_version,
              parser_version = excluded.parser_version,
              completed_at_unix = excluded.completed_at_unix
-         WHERE activity_coverage_manifests_v2.source_bounds_json = excluded.source_bounds_json
-           AND activity_coverage_manifests_v2.cursors_json = excluded.cursors_json
-           AND activity_coverage_manifests_v2.page_hashes_json = excluded.page_hashes_json
-           AND activity_coverage_manifests_v2.group_count = excluded.group_count
-           AND activity_coverage_manifests_v2.schema_version = excluded.schema_version
-           AND activity_coverage_manifests_v2.parser_version = excluded.parser_version
-           AND activity_coverage_manifests_v2.completed_at_unix = excluded.completed_at_unix",
+         WHERE activity_wallet_coverage_staging_v2.reference_sha256 = excluded.reference_sha256
+           AND activity_wallet_coverage_staging_v2.fixed_end_unix = excluded.fixed_end_unix
+           AND activity_wallet_coverage_staging_v2.page_evidence_json = excluded.page_evidence_json
+           AND activity_wallet_coverage_staging_v2.ordered_aggregate_digest = excluded.ordered_aggregate_digest
+           AND activity_wallet_coverage_staging_v2.source_row_count = excluded.source_row_count
+           AND activity_wallet_coverage_staging_v2.aggregate_count = excluded.aggregate_count
+           AND activity_wallet_coverage_staging_v2.schema_version = excluded.schema_version
+           AND activity_wallet_coverage_staging_v2.parser_version = excluded.parser_version",
         params![
-            to_i64(manifest.generation, "activity coverage generation")?,
-            canonical_json(&manifest.source_bounds)?,
-            canonical_json(&manifest.cursors)?,
-            canonical_json(&manifest.page_hashes)?,
-            group_count,
-            i64::from(manifest.schema_version),
-            i64::from(manifest.parser_version),
-            manifest.completed_at_unix,
+            generation_i64,
+            completion.wallet_hex,
+            reference_sha256,
+            fixed_end_unix,
+            page_evidence_json,
+            digest,
+            to_i64(completion.source_row_count, "activity source-row count")?,
+            to_i64(aggregate_count, "activity aggregate count")?,
+            i64::from(ACTIVITY_SCHEMA_VERSION),
+            i64::from(ACTIVITY_PARSER_VERSION),
+            completed_at_unix,
         ],
     )?;
-    if changed == 0 {
+    if changed != 1 {
         return invalid(format!(
-            "activity coverage generation {} was replayed with different evidence",
-            manifest.generation
+            "activity wallet {} was replayed with different receipt evidence",
+            completion.wallet_hex
         ));
     }
     transaction.commit()?;
-    checkpoint_truncate(&connection)?;
-    connection.close().map_err(|(_, error)| error)?;
-    sync_file_and_parent(cache_path)
+    Ok(())
+}
+
+fn insert_activity_aggregate(
+    transaction: &rusqlite::Transaction<'_>,
+    generation: i64,
+    expected_wallet: &str,
+    aggregate: &ActivityAggregate,
+) -> Result<(), BootstrapError> {
+    let source_trade_id = aggregate.group_id.key();
+    validate_g2_id(&source_trade_id.0)?;
+    let components = aggregate.group_id.components();
+    if components.wallet.to_string() != expected_wallet {
+        return invalid(format!(
+            "activity aggregate {} belongs to another wallet",
+            source_trade_id.0
+        ));
+    }
+    let side = components.side.map(|value| match value {
+        pe_core_types::Side::Buy => "buy",
+        pe_core_types::Side::Sell => "sell",
+    });
+    let changed = transaction.execute(
+        "INSERT INTO activity_groups_v2
+             (source_trade_id, coverage_generation, semantic_revision, components_json,
+              wallet_hex, transaction_hash, activity_type, condition_id, asset, outcome_id,
+              side, row_count, share_amount_str, price_weighted_share_amount_str,
+              source_usdc_amount_str, source_time_unix, is_combo, schema_version,
+              parser_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19)
+         ON CONFLICT(source_trade_id) DO UPDATE SET
+             coverage_generation = excluded.coverage_generation,
+             semantic_revision = excluded.semantic_revision,
+             components_json = excluded.components_json,
+             wallet_hex = excluded.wallet_hex,
+             transaction_hash = excluded.transaction_hash,
+             activity_type = excluded.activity_type,
+             condition_id = excluded.condition_id,
+             asset = excluded.asset,
+             outcome_id = excluded.outcome_id,
+             side = excluded.side,
+             row_count = excluded.row_count,
+             share_amount_str = excluded.share_amount_str,
+             price_weighted_share_amount_str = excluded.price_weighted_share_amount_str,
+             source_usdc_amount_str = excluded.source_usdc_amount_str,
+             source_time_unix = excluded.source_time_unix,
+             is_combo = excluded.is_combo,
+             schema_version = excluded.schema_version,
+             parser_version = excluded.parser_version
+         WHERE activity_groups_v2.semantic_revision = excluded.semantic_revision",
+        params![
+            source_trade_id.0,
+            generation,
+            aggregate.semantic_revision.as_str(),
+            canonical_json(components)?,
+            expected_wallet,
+            components.transaction_hash,
+            components.activity_type.as_str(),
+            components.condition_id.as_ref().map(ToString::to_string),
+            components.asset.as_ref().map(ToString::to_string),
+            components.outcome.map(|value| i64::from(value.0)),
+            side,
+            to_i64(aggregate.row_count, "activity row count")?,
+            aggregate.share_sum.to_decimal().to_string(),
+            aggregate.price_weighted_share_sum.0.to_string(),
+            aggregate.source_usdc_sum.to_decimal().to_string(),
+            aggregate.source_time.0.unix_timestamp(),
+            i64::from(aggregate.is_combo),
+            i64::from(ACTIVITY_SCHEMA_VERSION),
+            i64::from(ACTIVITY_PARSER_VERSION),
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        invalid(format!(
+            "activity group {} was replayed with a different semantic revision",
+            source_trade_id.0
+        ))
+    }
+}
+
+fn validate_activity_staging(
+    connection: &Connection,
+    generation: u64,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    wallets: &[String],
+    require_complete: bool,
+) -> Result<ValidatedActivityStaging, BootstrapError> {
+    let generation_i64 = to_i64(generation, "activity generation")?;
+    let expected = wallets.iter().cloned().collect::<BTreeSet<_>>();
+    let mut statement = connection.prepare(
+        "SELECT wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
+                ordered_aggregate_digest, source_row_count, aggregate_count,
+                schema_version, parser_version
+         FROM activity_wallet_coverage_staging_v2
+         WHERE generation = ?1 ORDER BY wallet_hex",
+    )?;
+    let rows = statement.query_map(params![generation_i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+        ))
+    })?;
+    let mut completed_wallets = BTreeSet::new();
+    let mut receipts = Vec::new();
+    let mut all_aggregates = Vec::new();
+    for row in rows {
+        let row = row?;
+        if !expected.contains(&row.0) {
+            return invalid(format!(
+                "activity receipt contains wallet outside frozen universe: {}",
+                row.0
+            ));
+        }
+        if row.1 != reference_sha256
+            || row.2 != fixed_end_unix
+            || row.7 != i64::from(ACTIVITY_SCHEMA_VERSION)
+            || row.8 != i64::from(ACTIVITY_PARSER_VERSION)
+        {
+            return invalid(format!("activity receipt identity mismatch for {}", row.0));
+        }
+        validate_hex_sha256(&row.4, "ordered aggregate digest")?;
+        let pages: Vec<ReconciliationPageEvidence> = serde_json::from_str(&row.3)?;
+        if pages.iter().any(|page| {
+            page.schema_version != ACTIVITY_SCHEMA_VERSION
+                || page.parser_version != ACTIVITY_PARSER_VERSION
+        }) {
+            return invalid(format!("activity page version mismatch for {}", row.0));
+        }
+        let aggregates = load_activity_aggregates(connection, generation_i64, &row.0)?;
+        let aggregate_count = to_u64(row.6, "activity receipt aggregate count")?;
+        let source_row_count = to_u64(row.5, "activity receipt source-row count")?;
+        let derived_source_rows = aggregates.iter().try_fold(0_u64, |total, aggregate| {
+            total
+                .checked_add(aggregate.row_count)
+                .ok_or_else(|| BootstrapError::Invalid {
+                    message: format!("activity source-row count overflow for {}", row.0),
+                })
+        })?;
+        if aggregate_count
+            != u64::try_from(aggregates.len()).map_err(|_| BootstrapError::Internal)?
+            || source_row_count != derived_source_rows
+            || aggregate_digest(&aggregates)? != row.4
+        {
+            return invalid(format!("activity receipt aggregate mismatch for {}", row.0));
+        }
+        completed_wallets.insert(row.0.clone());
+        receipts.push(ActivityWalletReceiptProof {
+            wallet_hex: row.0.clone(),
+            pages,
+            ordered_aggregate_digest: row.4,
+            source_row_count,
+            aggregate_count,
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+        });
+        all_aggregates.extend(aggregates);
+    }
+    if require_complete && completed_wallets != expected {
+        let missing = expected
+            .difference(&completed_wallets)
+            .cloned()
+            .collect::<Vec<_>>();
+        return invalid(format!(
+            "activity coverage is missing frozen wallets: {missing:?}"
+        ));
+    }
+    all_aggregates.sort_by(|left, right| {
+        left.group_id
+            .components()
+            .wallet
+            .to_string()
+            .cmp(&right.group_id.components().wallet.to_string())
+            .then_with(|| {
+                left.source_time
+                    .0
+                    .unix_timestamp()
+                    .cmp(&right.source_time.0.unix_timestamp())
+            })
+            .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
+    });
+    Ok(ValidatedActivityStaging {
+        completed_wallets,
+        receipts,
+        aggregates: all_aggregates,
+    })
+}
+
+fn load_activity_aggregates(
+    connection: &Connection,
+    generation: i64,
+    wallet_hex: &str,
+) -> Result<Vec<ActivityAggregate>, BootstrapError> {
+    let mut statement = connection.prepare(
+        "SELECT source_trade_id, semantic_revision, components_json, row_count,
+                share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str,
+                source_time_unix, is_combo
+         FROM activity_groups_v2
+         WHERE coverage_generation = ?1 AND wallet_hex = ?2
+         ORDER BY source_time_unix, source_trade_id",
+    )?;
+    let rows = statement.query_map(params![generation, wallet_hex], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+        ))
+    })?;
+    let mut aggregates = Vec::new();
+    for row in rows {
+        let row = row?;
+        validate_g2_id(&row.0)?;
+        let components: SourceActivityGroupComponents = serde_json::from_str(&row.2)?;
+        if components.wallet.to_string() != wallet_hex {
+            return invalid(format!("activity component wallet mismatch for {}", row.0));
+        }
+        let group_id =
+            SourceActivityGroupId::derive(components).map_err(|error| BootstrapError::Invalid {
+                message: format!("activity identity reconstruction failed: {error}"),
+            })?;
+        if group_id.key().0 != row.0 {
+            return invalid(format!(
+                "activity component identity mismatch for {}",
+                row.0
+            ));
+        }
+        let semantic_revision: ActivitySemanticRevision =
+            serde_json::from_value(Value::String(row.1))?;
+        let share_decimal =
+            rust_decimal::Decimal::from_str(&row.4).map_err(|error| BootstrapError::Invalid {
+                message: format!("invalid activity share amount for {}: {error}", row.0),
+            })?;
+        let source_usdc_decimal =
+            rust_decimal::Decimal::from_str(&row.6).map_err(|error| BootstrapError::Invalid {
+                message: format!("invalid activity collateral amount for {}: {error}", row.0),
+            })?;
+        let weighted =
+            rust_decimal::Decimal::from_str(&row.5).map_err(|error| BootstrapError::Invalid {
+                message: format!("invalid activity weighted amount for {}: {error}", row.0),
+            })?;
+        let source_time = OffsetDateTime::from_unix_timestamp(row.7).map_err(|error| {
+            BootstrapError::Invalid {
+                message: format!("invalid activity timestamp for {}: {error}", row.0),
+            }
+        })?;
+        aggregates.push(ActivityAggregate {
+            group_id,
+            row_count: to_u64(row.3, "activity aggregate row count")?,
+            share_sum: ShareAmount::from_decimal_exact(share_decimal).map_err(|error| {
+                BootstrapError::Invalid {
+                    message: format!("invalid exact activity shares for {}: {error}", row.0),
+                }
+            })?,
+            price_weighted_share_sum: PriceWeightedShareAmount(weighted),
+            source_usdc_sum: CollateralAmount::from_decimal_exact(source_usdc_decimal).map_err(
+                |error| BootstrapError::Invalid {
+                    message: format!("invalid exact activity collateral for {}: {error}", row.0),
+                },
+            )?,
+            source_time: SourceTimestamp(source_time),
+            is_combo: match row.8 {
+                0 => false,
+                1 => true,
+                value => return invalid(format!("invalid activity combo flag {value}")),
+            },
+            semantic_revision,
+        });
+    }
+    Ok(aggregates)
+}
+
+fn aggregate_digest(aggregates: &[ActivityAggregate]) -> Result<String, BootstrapError> {
+    Ok(sha256_bytes(canonical_json(aggregates)?.as_bytes()))
+}
+
+fn receipt_set_digest(
+    generation: u64,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    receipts: &[ActivityWalletReceiptProof],
+) -> Result<String, BootstrapError> {
+    Ok(sha256_bytes(
+        canonical_json(&serde_json::json!({
+            "generation": generation,
+            "reference_sha256": reference_sha256,
+            "fixed_end_unix": fixed_end_unix,
+            "receipts": receipts,
+        }))?
+        .as_bytes(),
+    ))
+}
+
+fn completed_activity_manifest(
+    connection: &Connection,
+    generation: u64,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    wallets: &[String],
+) -> Result<Option<ActivityCoverageManifestV2>, BootstrapError> {
+    let stored = connection
+        .query_row(
+            "SELECT reference_sha256, wallet_count, receipt_set_digest, aggregate_digest,
+                    source_row_count, source_bounds_json, cursors_json, page_hashes_json,
+                    group_count, schema_version, parser_version, completed_at_unix
+             FROM activity_coverage_manifests_v2 WHERE generation = ?1",
+            params![to_i64(generation, "activity generation")?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let manifest = ActivityCoverageManifestV2 {
+        generation,
+        reference_sha256: stored.0,
+        wallet_count: to_u64(stored.1, "activity wallet count")?,
+        receipt_set_digest: stored.2,
+        aggregate_digest: stored.3,
+        source_row_count: to_u64(stored.4, "activity source-row count")?,
+        source_bounds: serde_json::from_str(&stored.5)?,
+        cursors: serde_json::from_str(&stored.6)?,
+        page_hashes: serde_json::from_str(&stored.7)?,
+        group_count: to_u64(stored.8, "activity group count")?,
+        schema_version: u32::try_from(stored.9).map_err(|_| BootstrapError::Invalid {
+            message: "invalid activity schema version".to_owned(),
+        })?,
+        parser_version: u32::try_from(stored.10).map_err(|_| BootstrapError::Invalid {
+            message: "invalid activity parser version".to_owned(),
+        })?,
+        completed_at_unix: stored.11,
+    };
+    verify_activity_manifest(
+        connection,
+        &manifest,
+        reference_sha256,
+        fixed_end_unix,
+        wallets,
+    )?;
+    let staged_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1",
+        params![to_i64(generation, "activity generation")?],
+        |row| row.get(0),
+    )?;
+    if staged_count != 0 {
+        return invalid("final activity manifest retained staging receipts".to_owned());
+    }
+    Ok(Some(manifest))
+}
+
+fn verify_activity_manifest(
+    connection: &Connection,
+    manifest: &ActivityCoverageManifestV2,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    wallets: &[String],
+) -> Result<(), BootstrapError> {
+    validate_hex_sha256(&manifest.receipt_set_digest, "receipt set digest")?;
+    validate_hex_sha256(&manifest.aggregate_digest, "activity aggregate digest")?;
+    let wallet_count = u64::try_from(wallets.len()).map_err(|_| BootstrapError::Internal)?;
+    let expected_bounds = serde_json::json!({
+        "start_exclusive": null,
+        "end_inclusive": fixed_end_unix,
+        "wallet_count": wallet_count,
+    });
+    let receipts: Vec<ActivityWalletReceiptProof> =
+        serde_json::from_value(manifest.cursors.clone())?;
+    let receipt_wallets = receipts
+        .iter()
+        .map(|receipt| receipt.wallet_hex.clone())
+        .collect::<Vec<_>>();
+    let mut expected_page_hashes = receipts
+        .iter()
+        .flat_map(|receipt| {
+            receipt
+                .pages
+                .iter()
+                .map(move |page| format!("{}:{}", receipt.wallet_hex, page.raw_page_hash))
+        })
+        .collect::<Vec<_>>();
+    expected_page_hashes.sort();
+    if manifest.reference_sha256 != reference_sha256
+        || manifest.wallet_count != wallet_count
+        || manifest.schema_version != ACTIVITY_SCHEMA_VERSION
+        || manifest.parser_version != ACTIVITY_PARSER_VERSION
+        || canonical_json(&manifest.source_bounds)? != canonical_json(&expected_bounds)?
+        || receipt_wallets != wallets
+        || manifest.page_hashes != expected_page_hashes
+        || manifest.receipt_set_digest
+            != receipt_set_digest(
+                manifest.generation,
+                reference_sha256,
+                fixed_end_unix,
+                &receipts,
+            )?
+    {
+        return invalid("activity coverage manifest identity mismatch".to_owned());
+    }
+    let generation = to_i64(manifest.generation, "activity generation")?;
+    let mut aggregates = Vec::new();
+    for receipt in &receipts {
+        if receipt.schema_version != ACTIVITY_SCHEMA_VERSION
+            || receipt.parser_version != ACTIVITY_PARSER_VERSION
+            || receipt.pages.iter().any(|page| {
+                page.schema_version != ACTIVITY_SCHEMA_VERSION
+                    || page.parser_version != ACTIVITY_PARSER_VERSION
+            })
+        {
+            return invalid("activity manifest receipt version mismatch".to_owned());
+        }
+        let wallet_aggregates =
+            load_activity_aggregates(connection, generation, &receipt.wallet_hex)?;
+        let source_rows = wallet_aggregates
+            .iter()
+            .try_fold(0_u64, |total, aggregate| {
+                total
+                    .checked_add(aggregate.row_count)
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "activity receipt source-row count overflow".to_owned(),
+                    })
+            })?;
+        if receipt.aggregate_count
+            != u64::try_from(wallet_aggregates.len()).map_err(|_| BootstrapError::Internal)?
+            || receipt.source_row_count != source_rows
+            || receipt.ordered_aggregate_digest != aggregate_digest(&wallet_aggregates)?
+        {
+            return invalid("activity manifest receipt aggregate mismatch".to_owned());
+        }
+        aggregates.extend(wallet_aggregates);
+    }
+    aggregates.sort_by(|left, right| {
+        left.group_id
+            .components()
+            .wallet
+            .to_string()
+            .cmp(&right.group_id.components().wallet.to_string())
+            .then_with(|| {
+                left.source_time
+                    .0
+                    .unix_timestamp()
+                    .cmp(&right.source_time.0.unix_timestamp())
+            })
+            .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
+    });
+    let source_rows = aggregates.iter().try_fold(0_u64, |total, aggregate| {
+        total
+            .checked_add(aggregate.row_count)
+            .ok_or_else(|| BootstrapError::Invalid {
+                message: "activity source-row count overflow".to_owned(),
+            })
+    })?;
+    if manifest.group_count
+        != u64::try_from(aggregates.len()).map_err(|_| BootstrapError::Internal)?
+        || manifest.source_row_count != source_rows
+        || manifest.aggregate_digest != aggregate_digest(&aggregates)?
+    {
+        return invalid("activity coverage manifest aggregate digest mismatch".to_owned());
+    }
+    Ok(())
 }
 
 /// Re-run the exact active/freshness filter against the sealed v1 generation.
@@ -576,59 +1316,291 @@ pub fn verify_frozen_payload_v1(
     })
 }
 
+fn activity_identity(
+    connection: &Connection,
+) -> Result<(u64, String, i64, Vec<String>), BootstrapError> {
+    let rows = connection
+        .prepare(
+            "SELECT activity_generation, reference_sha256, fixed_end_unix, active_wallets_json
+             FROM cache_frozen_payload_verifications
+             WHERE activity_generation IS NOT NULL AND fixed_end_unix IS NOT NULL
+             ORDER BY activity_generation DESC, reference_sha256",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(selected) = rows.first() else {
+        return invalid("frozen activity identity is missing".to_owned());
+    };
+    if rows.iter().skip(1).any(|row| row.0 == selected.0) {
+        return invalid("activity generation is bound to multiple frozen references".to_owned());
+    }
+    let mut wallets: Vec<String> = serde_json::from_str(&selected.3)?;
+    wallets.sort();
+    wallets.dedup();
+    Ok((
+        to_u64(selected.0, "activity generation")?,
+        selected.1.clone(),
+        selected.2,
+        wallets,
+    ))
+}
+
+fn install_activity_manifest(
+    transaction: &rusqlite::Transaction<'_>,
+    finalized_at_unix: i64,
+) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let (generation, reference_sha256, fixed_end_unix, wallets) = activity_identity(transaction)?;
+    if let Some(manifest) = completed_activity_manifest(
+        transaction,
+        generation,
+        &reference_sha256,
+        fixed_end_unix,
+        &wallets,
+    )? {
+        return Ok(manifest);
+    }
+    let manifest = validate_activity_staging(
+        transaction,
+        generation,
+        &reference_sha256,
+        fixed_end_unix,
+        &wallets,
+        true,
+    )?
+    .into_manifest(
+        generation,
+        reference_sha256,
+        fixed_end_unix,
+        finalized_at_unix,
+    )?;
+    transaction.execute(
+        "INSERT INTO activity_coverage_manifests_v2
+             (generation, reference_sha256, wallet_count, receipt_set_digest,
+              aggregate_digest, source_row_count, source_bounds_json, cursors_json,
+              page_hashes_json, group_count, schema_version, parser_version,
+              completed_at_unix)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            to_i64(manifest.generation, "activity generation")?,
+            manifest.reference_sha256,
+            to_i64(manifest.wallet_count, "activity wallet count")?,
+            manifest.receipt_set_digest,
+            manifest.aggregate_digest,
+            to_i64(manifest.source_row_count, "activity source-row count")?,
+            canonical_json(&manifest.source_bounds)?,
+            canonical_json(&manifest.cursors)?,
+            canonical_json(&manifest.page_hashes)?,
+            to_i64(manifest.group_count, "activity group count")?,
+            i64::from(manifest.schema_version),
+            i64::from(manifest.parser_version),
+            manifest.completed_at_unix,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1",
+        params![to_i64(generation, "activity generation")?],
+    )?;
+    Ok(manifest)
+}
+
+fn rebuild_ranker_projection(
+    transaction: &rusqlite::Transaction<'_>,
+    activity_generation: u64,
+    wallets: &[String],
+) -> Result<(u64, String), BootstrapError> {
+    let generation = to_i64(activity_generation, "activity generation")?;
+    let payout_markets = transaction
+        .prepare(
+            "SELECT market_id FROM clob_payout_evidence_v2
+             WHERE end_date_unix IS NOT NULL
+               AND payout_status = 'resolved'
+               AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
+             ORDER BY market_id",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
+        message: format!("bootstrap reconstruction quality is invalid: {error}"),
+    })?;
+    let mut admitted = BTreeSet::new();
+    for wallet_hex in wallets {
+        let wallet =
+            WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
+                message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
+            })?;
+        let aggregates = load_activity_aggregates(transaction, generation, wallet_hex)?;
+        let mut buckets = BTreeMap::<i64, Vec<ActivityAggregate>>::new();
+        for aggregate in aggregates {
+            buckets
+                .entry(aggregate.source_time.0.unix_timestamp())
+                .or_default()
+                .push(aggregate);
+        }
+        let mut ledger = PositionLedger::new();
+        let mut history = BTreeSet::<String>::new();
+        for aggregates in buckets.into_values() {
+            let mutations = match aggregates
+                .iter()
+                .map(LedgerMutation::from_activity)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(mutations) => mutations,
+                Err(_) => break,
+            };
+            if mutations
+                .iter()
+                .any(|mutation| matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor))
+            {
+                break;
+            }
+            let decisions = match classify_complete_historical_second(
+                &ledger,
+                wallet,
+                &mutations,
+                quality,
+                &|market: &MarketId| history.contains(&market.to_string()),
+            ) {
+                Ok(SecondVerdict::OrderIndependent { decisions, .. }) => decisions,
+                Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => break,
+            };
+            for decision in decisions {
+                if decision.entry != EntryClassification::Admitted
+                    || decision.amount == ShareAmount::ZERO
+                    || !payout_markets.contains(&decision.market_id.to_string())
+                {
+                    continue;
+                }
+                let complete_identifiers = aggregates.iter().any(|aggregate| {
+                    aggregate.group_id.key() == &decision.source_trade_id
+                        && aggregate.group_id.components().condition_id.is_some()
+                        && aggregate.group_id.components().asset.is_some()
+                        && aggregate.group_id.components().outcome.is_some()
+                        && aggregate.group_id.components().side.is_some()
+                });
+                if complete_identifiers {
+                    validate_g2_id(&decision.source_trade_id.0)?;
+                    admitted.insert(decision.source_trade_id.0);
+                }
+            }
+            if ledger.apply_all_or_none(&mutations).is_err() {
+                break;
+            }
+            for mutation in &mutations {
+                for key in mutation.touched_keys() {
+                    history.insert(key.market().to_string());
+                }
+            }
+        }
+    }
+
+    transaction.execute("DELETE FROM ranker_entries_v2", [])?;
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO ranker_entries_v2
+                 (source_trade_id, activity_generation, classifier_version)
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for source_trade_id in &admitted {
+            insert.execute(params![
+                source_trade_id,
+                generation,
+                i64::from(RANKER_CLASSIFIER_VERSION),
+            ])?;
+        }
+    }
+    let digest = ranker_projection_digest(transaction, activity_generation)?;
+    let count = u64::try_from(admitted.len()).map_err(|_| BootstrapError::Internal)?;
+    Ok((count, digest))
+}
+
+fn ranker_projection_digest(
+    connection: &Connection,
+    activity_generation: u64,
+) -> Result<String, BootstrapError> {
+    let mut statement = connection.prepare(
+        "SELECT ranker.source_trade_id, ranker.activity_generation,
+                ranker.classifier_version, groups_v2.wallet_hex,
+                groups_v2.condition_id, groups_v2.asset, groups_v2.outcome_id,
+                groups_v2.side, groups_v2.share_amount_str,
+                groups_v2.price_weighted_share_amount_str,
+                groups_v2.source_usdc_amount_str, groups_v2.source_time_unix,
+                payout.payout_vector_json, payout.end_date_unix
+         FROM ranker_entries_v2 ranker
+         JOIN activity_groups_v2 groups_v2
+           ON groups_v2.source_trade_id = ranker.source_trade_id
+          AND groups_v2.coverage_generation = ranker.activity_generation
+         JOIN clob_payout_evidence_v2 payout
+           ON payout.market_id = groups_v2.condition_id
+         WHERE ranker.activity_generation = ?1
+         ORDER BY ranker.source_trade_id",
+    )?;
+    let rows = statement.query_map(
+        params![to_i64(activity_generation, "activity generation")?],
+        |row| {
+            Ok(serde_json::json!({
+                "source_trade_id": row.get::<_, String>(0)?,
+                "activity_generation": row.get::<_, i64>(1)?,
+                "classifier_version": row.get::<_, i64>(2)?,
+                "wallet_hex": row.get::<_, String>(3)?,
+                "condition_id": row.get::<_, String>(4)?,
+                "asset": row.get::<_, String>(5)?,
+                "outcome_id": row.get::<_, i64>(6)?,
+                "side": row.get::<_, String>(7)?,
+                "share_amount_str": row.get::<_, String>(8)?,
+                "price_weighted_share_amount_str": row.get::<_, String>(9)?,
+                "source_usdc_amount_str": row.get::<_, String>(10)?,
+                "source_time_unix": row.get::<_, i64>(11)?,
+                "payout_vector_json": row.get::<_, String>(12)?,
+                "end_date_unix": row.get::<_, i64>(13)?,
+            }))
+        },
+    )?;
+    let rows = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(sha256_bytes(canonical_json(&rows)?.as_bytes()))
+}
+
 /// Close and seal a complete v2 side cache, then emit a hash-bound stage record.
 pub fn finalize_cache_v2(
     cache_path: &Path,
     stage_record_path: &Path,
     finalized_at_unix: i64,
 ) -> Result<CacheFinalStageRecord, BootstrapError> {
-    let connection = open_existing_rw(cache_path)?;
+    let mut connection = open_existing_rw(cache_path)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
+    ensure_lane_a_v2_schema(&connection)?;
     integrity_check(&connection)?;
     let sealed_generation = required_max(&connection, "sealed_generation_manifests", "generation")?;
-    let activity_generation =
-        required_max(&connection, "activity_coverage_manifests_v2", "generation")?;
     let payout_generation = required_max(
         &connection,
         "clob_payout_coverage_manifests_v2",
         "generation",
     )?;
     verify_payout_coverage(&connection, payout_generation)?;
-    let orphan_activity: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM activity_groups_v2 groups_v2
-         LEFT JOIN activity_coverage_manifests_v2 manifests
-           ON manifests.generation = groups_v2.coverage_generation
-         WHERE manifests.generation IS NULL",
-        [],
-        |row| row.get(0),
-    )?;
-    let changed_activity_generation: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM activity_coverage_manifests_v2 manifests
-         WHERE manifests.group_count != (
-             SELECT COUNT(*) FROM activity_groups_v2 groups_v2
-             WHERE groups_v2.coverage_generation = manifests.generation
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if orphan_activity != 0 || changed_activity_generation != 0 {
-        return invalid(format!(
-            "activity coverage is incomplete: orphan_groups={orphan_activity}, changed_generations={changed_activity_generation}"
-        ));
-    }
-    let frozen_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM cache_frozen_payload_verifications",
-        [],
-        |row| row.get(0),
-    )?;
-    if frozen_count == 0 {
-        return invalid("frozen-payload verification is missing".to_owned());
-    }
-    connection.execute(
+    let transaction = connection.transaction()?;
+    let activity_manifest = install_activity_manifest(&transaction, finalized_at_unix)?;
+    let (_, _, _, wallets) = activity_identity(&transaction)?;
+    let (ranker_projection_count, ranker_projection_digest) =
+        rebuild_ranker_projection(&transaction, activity_manifest.generation, &wallets)?;
+    transaction.execute(
         "UPDATE cache_v2_migration_state
-         SET phase = 'finalized', updated_at_unix = ?1 WHERE singleton = 1",
-        params![finalized_at_unix],
+         SET phase = 'finalized', ranker_projection_count = ?1,
+             ranker_projection_digest = ?2, ranker_classifier_version = ?3,
+             updated_at_unix = ?4 WHERE singleton = 1",
+        params![
+            to_i64(ranker_projection_count, "ranker projection count")?,
+            ranker_projection_digest,
+            i64::from(RANKER_CLASSIFIER_VERSION),
+            finalized_at_unix,
+        ],
     )?;
+    transaction.commit()?;
     checkpoint_truncate(&connection)?;
     integrity_check(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
@@ -640,8 +1612,11 @@ pub fn finalize_cache_v2(
         cache_sha256: sha256_file(cache_path)?,
         schema_version: CACHE_SCHEMA_VERSION_V2,
         sealed_generation: to_u64(sealed_generation, "sealed generation")?,
-        activity_coverage_generation: to_u64(activity_generation, "activity generation")?,
+        activity_coverage_generation: activity_manifest.generation,
         payout_coverage_generation: to_u64(payout_generation, "payout generation")?,
+        ranker_projection_count,
+        ranker_projection_digest,
+        ranker_classifier_version: RANKER_CLASSIFIER_VERSION,
     };
     atomic_write_json(stage_record_path, &record)?;
     Ok(record)
@@ -662,8 +1637,9 @@ pub fn activate_cache_v2(
                 "v2 side cache is missing and the fixed cache has another hash".to_owned(),
             );
         }
-        require_regular_file(&request.version_one_backup_path, "version-one cache backup")?;
-        verify_version_one_main(&request.version_one_backup_path)?;
+        require_regular_file(&request.prior_cache_backup_path, "prior cache backup")?;
+        let prior_cache_sha256 = sha256_file(&request.prior_cache_backup_path)?;
+        let prior_cache_schema = verified_cache_schema(&request.prior_cache_backup_path)?;
         let installed = open_existing_ro(&request.fixed_path)?;
         require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
         integrity_check(&installed)?;
@@ -673,42 +1649,50 @@ pub fn activate_cache_v2(
         return Ok(CacheActivationReport {
             installed_path: std::fs::canonicalize(&request.fixed_path)?,
             installed_sha256: installed_hash,
-            version_one_backup_path: std::fs::canonicalize(&request.version_one_backup_path)?,
+            prior_cache_backup_path: std::fs::canonicalize(&request.prior_cache_backup_path)?,
+            prior_cache_sha256,
+            prior_cache_schema,
             activation_evidence: None,
             resumed: true,
         });
     }
     require_regular_file(&request.side_path, "version-two side cache")?;
-    let activation_evidence = capture_reclamation_evidence(
-        &request.fixed_path,
-        &eval_results_dir_for_cache(&request.fixed_path),
-    )?;
-    if !activation_evidence.activation_ready {
-        return invalid(
-            "current cache failed the locked reclamation/index activation gate".to_owned(),
-        );
-    }
     if sha256_file(&request.side_path)? != request.expected_side_sha256 {
         return invalid("version-two side-cache hash changed after finalization".to_owned());
     }
     require_same_device(
         &request.fixed_path,
         &request.side_path,
-        &request.version_one_backup_path,
+        &request.prior_cache_backup_path,
     )?;
 
     let current = open_existing_rw(&request.fixed_path)?;
-    require_reclamation_ready(&current)?;
     checkpoint_truncate(&current)?;
     integrity_check(&current)?;
     let current_version: i64 =
         current.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current_version != 0 && current_version != CACHE_SCHEMA_VERSION_V1 {
-        return invalid(format!(
-            "cache activation expected version one at the fixed path, found {current_version}"
-        ));
+    match current_version {
+        0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
+        CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(&current)?,
+        other => return invalid(format!("unsupported prior cache schema {other}")),
     }
     current.close().map_err(|(_, error)| error)?;
+    let prior_cache_sha256 = sha256_file(&request.fixed_path)?;
+    let activation_evidence = if current_version == 0 || current_version == CACHE_SCHEMA_VERSION_V1
+    {
+        let evidence = capture_reclamation_evidence(
+            &request.fixed_path,
+            &eval_results_dir_for_cache(&request.fixed_path),
+        )?;
+        if !evidence.activation_ready {
+            return invalid(
+                "current cache failed the locked reclamation/index activation gate".to_owned(),
+            );
+        }
+        Some(evidence)
+    } else {
+        None
+    };
 
     let side = open_existing_rw(&request.side_path)?;
     require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
@@ -716,17 +1700,19 @@ pub fn activate_cache_v2(
     checkpoint_truncate(&side)?;
     side.close().map_err(|(_, error)| error)?;
     reject_nonempty_sidecars(&request.side_path)?;
-    if request.version_one_backup_path.exists() {
-        if sha256_file(&request.version_one_backup_path)? != sha256_file(&request.fixed_path)? {
+    if request.prior_cache_backup_path.exists() {
+        if sha256_file(&request.prior_cache_backup_path)? != prior_cache_sha256 {
             return invalid(format!(
-                "existing version-one backup differs from the fixed cache: {}",
-                request.version_one_backup_path.display()
+                "existing prior-cache backup differs from the fixed cache: {}",
+                request.prior_cache_backup_path.display()
             ));
         }
     } else {
-        preserve_main_and_sidecars(&request.fixed_path, &request.version_one_backup_path)?;
+        preserve_main_and_sidecars(&request.fixed_path, &request.prior_cache_backup_path)?;
     }
-    verify_version_one_main(&request.version_one_backup_path)?;
+    if verified_cache_schema(&request.prior_cache_backup_path)? != current_version {
+        return invalid("prior-cache backup schema changed during activation".to_owned());
+    }
     remove_sidecars(&request.fixed_path)?;
     std::fs::rename(&request.side_path, &request.fixed_path).map_err(map_rename_error)?;
     sync_parent(&request.fixed_path)?;
@@ -748,49 +1734,66 @@ pub fn activate_cache_v2(
     Ok(CacheActivationReport {
         installed_path: std::fs::canonicalize(&request.fixed_path)?,
         installed_sha256: installed_hash,
-        version_one_backup_path: std::fs::canonicalize(&request.version_one_backup_path)?,
-        activation_evidence: Some(activation_evidence),
+        prior_cache_backup_path: std::fs::canonicalize(&request.prior_cache_backup_path)?,
+        prior_cache_sha256,
+        prior_cache_schema: current_version,
+        activation_evidence,
         resumed: false,
     })
 }
 
-/// Pre-activation rollback: restore only a checkpointed v1 main. WAL/SHM
-/// sidecars are never restored.
-pub fn rollback_cache_to_v1(
+/// Restore the hash-bound prior cache only before its corrected publication is current.
+pub fn restore_prior_cache(
     fixed_path: &Path,
-    version_one_backup_path: &Path,
-    failed_v2_backup_path: &Path,
+    prior_cache_backup_path: &Path,
+    displaced_cache_backup_path: &Path,
+    binding: &PriorCacheBinding,
+    bound_batch_is_current: bool,
 ) -> Result<(), BootstrapError> {
+    if bound_batch_is_current {
+        return invalid(
+            "prior-cache restore is retired after the bound ranking batch becomes current"
+                .to_owned(),
+        );
+    }
     let _locks = ForgeActivationLocks::acquire(fixed_path)?;
-    require_regular_file(version_one_backup_path, "version-one rollback main")?;
-    verify_version_one_main(version_one_backup_path)?;
-    require_same_device(fixed_path, version_one_backup_path, failed_v2_backup_path)?;
+    validate_hex_sha256(&binding.sha256, "prior cache sha256")?;
+    require_regular_file(prior_cache_backup_path, "prior cache restore main")?;
+    if sha256_file(prior_cache_backup_path)? != binding.sha256
+        || verified_cache_schema(prior_cache_backup_path)? != binding.schema_version
+    {
+        return invalid("prior cache does not match its recorded schema/hash".to_owned());
+    }
+    require_same_device(
+        fixed_path,
+        prior_cache_backup_path,
+        displaced_cache_backup_path,
+    )?;
     if fixed_path.is_file() {
         let current = open_existing_rw(fixed_path)?;
         checkpoint_truncate(&current)?;
         integrity_check(&current)?;
         current.close().map_err(|(_, error)| error)?;
-        if failed_v2_backup_path.exists() {
-            if sha256_file(failed_v2_backup_path)? != sha256_file(fixed_path)? {
+        if displaced_cache_backup_path.exists() {
+            if sha256_file(displaced_cache_backup_path)? != sha256_file(fixed_path)? {
                 return invalid(format!(
-                    "existing failed-v2 backup differs from the fixed cache: {}",
-                    failed_v2_backup_path.display()
+                    "existing displaced-cache backup differs from the fixed cache: {}",
+                    displaced_cache_backup_path.display()
                 ));
             }
         } else {
-            preserve_main_and_sidecars(fixed_path, failed_v2_backup_path)?;
+            preserve_main_and_sidecars(fixed_path, displaced_cache_backup_path)?;
         }
     }
     remove_sidecars(fixed_path)?;
-    std::fs::rename(version_one_backup_path, fixed_path).map_err(map_rename_error)?;
+    std::fs::rename(prior_cache_backup_path, fixed_path).map_err(map_rename_error)?;
     sync_parent(fixed_path)?;
     reject_nonempty_sidecars(fixed_path)?;
-    let restored = open_existing_ro(fixed_path)?;
-    let version: i64 = restored.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != CACHE_SCHEMA_VERSION_V1 {
-        return invalid(format!("rollback main is not version one: {version}"));
+    if sha256_file(fixed_path)? != binding.sha256
+        || verified_cache_schema(fixed_path)? != binding.schema_version
+    {
+        return invalid("restored cache does not match its recorded schema/hash".to_owned());
     }
-    integrity_check(&restored)?;
     Ok(())
 }
 
@@ -895,6 +1898,80 @@ fn integrity_check(connection: &Connection) -> Result<(), BootstrapError> {
     }
 }
 
+fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError> {
+    connection.execute_batch(V2_SCHEMA)?;
+    for (table, column, definition) in [
+        (
+            "activity_coverage_manifests_v2",
+            "reference_sha256",
+            "TEXT NULL",
+        ),
+        (
+            "activity_coverage_manifests_v2",
+            "wallet_count",
+            "INTEGER NULL",
+        ),
+        (
+            "activity_coverage_manifests_v2",
+            "receipt_set_digest",
+            "TEXT NULL",
+        ),
+        (
+            "activity_coverage_manifests_v2",
+            "aggregate_digest",
+            "TEXT NULL",
+        ),
+        (
+            "activity_coverage_manifests_v2",
+            "source_row_count",
+            "INTEGER NULL",
+        ),
+        (
+            "cache_frozen_payload_verifications",
+            "activity_generation",
+            "INTEGER NULL",
+        ),
+        (
+            "cache_frozen_payload_verifications",
+            "fixed_end_unix",
+            "INTEGER NULL",
+        ),
+        (
+            "cache_v2_migration_state",
+            "ranker_projection_count",
+            "INTEGER NULL",
+        ),
+        (
+            "cache_v2_migration_state",
+            "ranker_projection_digest",
+            "TEXT NULL",
+        ),
+        (
+            "cache_v2_migration_state",
+            "ranker_classifier_version",
+            "INTEGER NULL",
+        ),
+        ("clob_payout_evidence_v2", "end_date_unix", "INTEGER NULL"),
+        (
+            "clob_payout_evidence_staging_v2",
+            "end_date_unix",
+            "INTEGER NULL",
+        ),
+    ] {
+        let exists: bool = connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
+            params![column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn checkpoint_truncate(connection: &Connection) -> Result<(), BootstrapError> {
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
@@ -934,17 +2011,17 @@ fn require_schema(connection: &Connection, expected: i64) -> Result<(), Bootstra
     }
 }
 
-fn verify_version_one_main(path: &Path) -> Result<(), BootstrapError> {
+fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
     let connection = open_existing_ro(path)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != CACHE_SCHEMA_VERSION_V1 {
-        return invalid(format!(
-            "version-one backup has unsupported cache schema {version}"
-        ));
+    match version {
+        0 | CACHE_SCHEMA_VERSION_V1 => {}
+        CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(&connection)?,
+        other => return invalid(format!("prior cache has unsupported schema {other}")),
     }
     integrity_check(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
-    Ok(())
+    Ok(version)
 }
 
 fn require_table(connection: &Connection, table: &str) -> Result<(), BootstrapError> {
@@ -979,27 +2056,55 @@ fn verify_finalized_v2_manifests(connection: &Connection) -> Result<(), Bootstra
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
     }
-    required_max(connection, "activity_coverage_manifests_v2", "generation")?;
-    required_max(
+    let (activity_generation, reference_sha256, fixed_end_unix, wallets) =
+        activity_identity(connection)?;
+    completed_activity_manifest(
+        connection,
+        activity_generation,
+        &reference_sha256,
+        fixed_end_unix,
+        &wallets,
+    )?
+    .ok_or_else(|| BootstrapError::Invalid {
+        message: "installed cache has no matching activity manifest".to_owned(),
+    })?;
+    let payout_generation = required_max(
         connection,
         "clob_payout_coverage_manifests_v2",
         "generation",
     )?;
+    verify_payout_coverage(connection, payout_generation)?;
     let frozen: i64 = connection.query_row(
         "SELECT COUNT(*) FROM cache_frozen_payload_verifications",
         [],
         |row| row.get(0),
     )?;
-    let phase: Option<String> = connection
+    let state: Option<FinalizedProjectionState> = connection
         .query_row(
-            "SELECT phase FROM cache_v2_migration_state WHERE singleton = 1",
+            "SELECT phase, ranker_projection_count, ranker_projection_digest,
+                    ranker_classifier_version
+             FROM cache_v2_migration_state WHERE singleton = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if frozen == 0 || phase.as_deref() != Some("finalized") {
+    let Some((phase, projection_count, projection_digest, classifier_version)) = state else {
+        return invalid("installed cache omitted its finalized migration state".to_owned());
+    };
+    let actual_projection_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM ranker_entries_v2 WHERE activity_generation = ?1",
+        params![to_i64(activity_generation, "activity generation")?],
+        |row| row.get(0),
+    )?;
+    let actual_projection_digest = ranker_projection_digest(connection, activity_generation)?;
+    if frozen == 0
+        || phase != "finalized"
+        || projection_count != Some(actual_projection_count)
+        || projection_digest.as_deref() != Some(actual_projection_digest.as_str())
+        || classifier_version != Some(i64::from(RANKER_CLASSIFIER_VERSION))
+    {
         return invalid(
-            "installed cache omitted its frozen-payload proof or finalized stage".to_owned(),
+            "installed cache omitted or changed its frozen/activity/ranker proof".to_owned(),
         );
     }
     Ok(())
@@ -1084,7 +2189,22 @@ fn validate_hex_sha256(value: &str, field: &str) -> Result<(), BootstrapError> {
     }
 }
 
-fn canonical_json(value: &impl Serialize) -> Result<String, BootstrapError> {
+fn validate_g2_id(value: &str) -> Result<(), BootstrapError> {
+    if value.len() == 67
+        && value.starts_with("g2:")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        invalid(format!(
+            "non-canonical version-two activity identity {value:?}"
+        ))
+    }
+}
+
+fn canonical_json(value: &(impl Serialize + ?Sized)) -> Result<String, BootstrapError> {
     serde_json::to_string(value).map_err(BootstrapError::from)
 }
 

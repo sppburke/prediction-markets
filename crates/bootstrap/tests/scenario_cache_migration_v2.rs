@@ -1,7 +1,7 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-//! Scenario: sealed v1 cache, exact frozen proof, finalized v2, and fixed-path cutover (#544).
+//! Scenario: sealed v1 cache, exact frozen proof, finalized v2, and fixed-path cutover (#544, #545).
 //!
 //! PASS: a row committed while the input is in WAL survives sealing; legacy rows
 //! remain audit-readable only in `*_v1_sealed`; v2 typed reads contain no legacy
@@ -11,19 +11,21 @@
 //! missing, a stale sidecar survives, or the installed hash changes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::cache_migration::{
-    ActivityCoverageManifestV2, CacheActivationRequest, CacheV2BuildManifest, FrozenCacheFreshness,
-    FrozenPayloadReference, activate_cache_v2, finalize_cache_v2, migrate_cache_v2,
-    populate_activity_v2, record_activity_coverage_v2, rollback_cache_to_v1, sha256_file,
-    verify_frozen_payload_v1,
+    CacheActivationRequest, CacheV2BuildManifest, FrozenCacheFreshness, FrozenPayloadReference,
+    PriorCacheBinding, activate_cache_v2, finalize_cache_v2, migrate_cache_v2,
+    populate_activity_v2, restore_prior_cache, sha256_file, verify_frozen_payload_v1,
 };
 use pe_bootstrap::clob::ClobFetcher;
 use pe_bootstrap::pile::SRC_TRADES;
+use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, CLOB_RESOLUTION_PARSER_VERSION,
-    CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest, ClobCoveragePage, FixtureFetcher,
+    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest,
+    ClobCoveragePage, FixtureFetcher, PageFetcher,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -81,6 +83,57 @@ fn write_build_manifest(dir: &TempDir, cache_path: &std::path::Path) -> std::pat
     path
 }
 
+fn write_frozen_reference(
+    dir: &TempDir,
+    watermark: i64,
+    active_wallets: Vec<String>,
+) -> std::path::PathBuf {
+    let path = dir.path().join("frozen.json");
+    let frozen = FrozenPayloadReference {
+        version: 1,
+        process_now_unix: watermark + 60,
+        active_window_hours: 72,
+        max_cache_staleness_hours: 24,
+        ranked_wallets: active_wallets.clone(),
+        active_wallets,
+        freshness: FrozenCacheFreshness {
+            newest_trade_unix: watermark,
+            newest_resolution_fetch_unix: watermark,
+            clob_cursor: String::new(),
+            clob_cursor_updated_at: watermark,
+        },
+    };
+    std::fs::write(&path, serde_json::to_vec_pretty(&frozen).unwrap()).unwrap();
+    path
+}
+
+#[derive(Clone, Default)]
+struct YieldingFetcher {
+    active: Arc<AtomicUsize>,
+    maximum: Arc<AtomicUsize>,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl PageFetcher for YieldingFetcher {
+    fn fetch_page(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send {
+        let active = Arc::clone(&self.active);
+        let maximum = Arc::clone(&self.maximum);
+        let calls = Arc::clone(&self.calls);
+        let url = url.to_owned();
+        async move {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, Ordering::SeqCst);
+            calls.lock().unwrap().push(url);
+            tokio::task::yield_now().await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(b"[]".to_vec())
+        }
+    }
+}
+
 fn install_payout_manifest(path: &std::path::Path) {
     let manifest = ClobCoverageManifest::complete(
         1,
@@ -117,8 +170,8 @@ fn install_payout_manifest(path: &std::path::Path) {
         .unwrap();
 }
 
-#[test]
-fn migration_is_resumable_and_activation_installs_only_the_finalized_main() {
+#[tokio::test]
+async fn migration_is_resumable_and_activation_installs_only_the_finalized_main() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir(dir.path().join("eval-results")).unwrap();
     let side = dir.path().join("wallet_cache.v2.side.db");
@@ -156,39 +209,27 @@ fn migration_is_resumable_and_activation_installs_only_the_finalized_main() {
     );
     drop(cache);
 
-    let frozen_path = dir.path().join("frozen.json");
-    let frozen = FrozenPayloadReference {
-        version: 1,
-        process_now_unix: watermark + 60,
-        active_window_hours: 72,
-        max_cache_staleness_hours: 24,
-        ranked_wallets: vec![WALLET.to_owned()],
-        active_wallets: vec![WALLET.to_owned()],
-        freshness: FrozenCacheFreshness {
-            newest_trade_unix: watermark,
-            newest_resolution_fetch_unix: watermark,
-            clob_cursor: String::new(),
-            clob_cursor_updated_at: watermark,
-        },
-    };
-    std::fs::write(&frozen_path, serde_json::to_vec_pretty(&frozen).unwrap()).unwrap();
+    let frozen_path = write_frozen_reference(&dir, watermark, vec![WALLET.to_owned()]);
     let verified = verify_frozen_payload_v1(&side, &frozen_path, watermark + 70).unwrap();
     assert_eq!(verified.active_wallets, vec![WALLET]);
     assert_eq!(verified.cross_generation_matches, 0);
 
-    record_activity_coverage_v2(
+    let activity_url = format!(
+        "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={watermark}"
+    );
+    let activity = populate_activity_v2(
         &side,
-        &ActivityCoverageManifestV2 {
-            generation: 1,
-            source_bounds: serde_json::json!({"end": watermark}),
-            cursors: serde_json::json!({WALLET: watermark}),
-            page_hashes: vec!["b".repeat(64)],
-            completed_at_unix: watermark + 80,
-            schema_version: ACTIVITY_SCHEMA_VERSION,
-            parser_version: ACTIVITY_PARSER_VERSION,
-        },
+        &FixtureFetcher::new(HashMap::from([(activity_url, b"[]".to_vec())])),
+        "https://data.example",
+        &frozen_path,
+        watermark,
+        1,
+        watermark + 80,
     )
+    .await
     .unwrap();
+    assert_eq!(activity.source_row_count, 0);
+    assert_eq!(activity.group_count, 0);
     install_payout_manifest(&side);
     let stage = finalize_cache_v2(
         &side,
@@ -202,7 +243,7 @@ fn migration_is_resumable_and_activation_installs_only_the_finalized_main() {
     let activation_request = CacheActivationRequest {
         fixed_path: fixed.clone(),
         side_path: side,
-        version_one_backup_path: v1_backup.clone(),
+        prior_cache_backup_path: v1_backup.clone(),
         expected_side_sha256: stage.cache_sha256.clone(),
     };
     let mut interrupted_backup = v1_backup.as_os_str().to_owned();
@@ -225,14 +266,63 @@ fn migration_is_resumable_and_activation_installs_only_the_finalized_main() {
         WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
         2
     );
-    let failed_v2 = dir.path().join("wallet_cache.v2.failed.db");
-    rollback_cache_to_v1(&fixed, &v1_backup, &failed_v2).unwrap();
+    let first_binding = PriorCacheBinding {
+        sha256: activated.prior_cache_sha256,
+        schema_version: activated.prior_cache_schema,
+    };
+
+    let next_side = dir.path().join("wallet_cache.next.v2.db");
+    std::fs::copy(&fixed, &next_side).unwrap();
+    let next = Connection::open(&next_side).unwrap();
+    next.execute(
+        "UPDATE cache_v2_migration_state SET updated_at_unix = updated_at_unix + 1",
+        [],
+    )
+    .unwrap();
+    next.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(next);
+    let next_hash = sha256_file(&next_side).unwrap();
+    let prior_v2 = dir.path().join("wallet_cache.prior.v2.db");
+    let v2_to_v2 = activate_cache_v2(&CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: next_side,
+        prior_cache_backup_path: prior_v2.clone(),
+        expected_side_sha256: next_hash,
+    })
+    .unwrap();
+    assert_eq!(v2_to_v2.prior_cache_schema, 2);
+    assert!(v2_to_v2.activation_evidence.is_none());
+    let v2_binding = PriorCacheBinding {
+        sha256: v2_to_v2.prior_cache_sha256,
+        schema_version: v2_to_v2.prior_cache_schema,
+    };
+    let current_hash = sha256_file(&fixed).unwrap();
+    let refused = restore_prior_cache(
+        &fixed,
+        &prior_v2,
+        &dir.path().join("must-not-exist.db"),
+        &v2_binding,
+        true,
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("bound ranking batch"));
+    assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+    let displaced_next = dir.path().join("wallet_cache.displaced.next.v2.db");
+    restore_prior_cache(&fixed, &prior_v2, &displaced_next, &v2_binding, false).unwrap();
+    assert_eq!(
+        WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
+        2
+    );
+
+    let displaced_v2 = dir.path().join("wallet_cache.displaced.v2.db");
+    restore_prior_cache(&fixed, &v1_backup, &displaced_v2, &first_binding, false).unwrap();
     assert_eq!(
         WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
         1
     );
     assert_eq!(
-        WalletCache::open(&failed_v2)
+        WalletCache::open(&displaced_v2)
             .unwrap()
             .schema_version()
             .unwrap(),
@@ -353,10 +443,7 @@ fn activation_refuses_a_side_main_changed_after_finalization() {
     Connection::open(&side)
         .unwrap()
         .execute(
-            "INSERT INTO activity_coverage_manifests_v2
-                 (generation, source_bounds_json, cursors_json, page_hashes_json, group_count,
-                  schema_version, parser_version, completed_at_unix)
-             VALUES (99, '{}', '{}', '[]', 0, 2, 2, 1)",
+            "UPDATE cache_v2_migration_state SET updated_at_unix = updated_at_unix + 1",
             [],
         )
         .unwrap();
@@ -364,7 +451,7 @@ fn activation_refuses_a_side_main_changed_after_finalization() {
     let error = activate_cache_v2(&CacheActivationRequest {
         fixed_path: fixed.clone(),
         side_path: side,
-        version_one_backup_path: backup,
+        prior_cache_backup_path: backup,
         expected_side_sha256: expected,
     })
     .unwrap_err()
@@ -404,6 +491,14 @@ async fn v2_payout_walk_never_touches_sealed_resolution_or_cursor_rows() {
     );
     assert_eq!(
         cache
+            .clob_payout_evidence_v2("0xsecondwalk")
+            .unwrap()
+            .unwrap()
+            .end_date_unix,
+        Some(1_730_678_400)
+    );
+    assert_eq!(
+        cache
             .raw_conn_for_test()
             .query_row(
                 "SELECT COUNT(*) FROM market_resolutions_v1_sealed",
@@ -434,19 +529,37 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
     drop(seed_v1(&side, fixed_end - 10));
     let manifest = write_build_manifest(&dir, &side);
     migrate_cache_v2(&side, &manifest).unwrap();
+    let frozen_path = write_frozen_reference(&dir, fixed_end - 10, vec![WALLET.to_owned()]);
 
     let url = format!(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={fixed_end}"
     );
+    // Source order is newest first. The causal replay is therefore split ->
+    // merge -> entry -> funded redemption -> RequiresAnchor -> later buy. The
+    // final buy has complete payout evidence and would be projected if the
+    // wallet fence were accidentally treated as a no-op.
     let body = format!(
-        r#"[{{"proxyWallet":"{WALLET}","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5.25","usdcSize":"2.625","price":"0.5","timestamp":{},"transactionHash":"0xabc","outcomeIndex":"0"}}]"#,
-        fixed_end - 1
+        r#"[
+          {{"proxyWallet":"{WALLET}","type":"TRADE","conditionId":"0xafter","asset":"789","outcome":"No","side":"BUY","size":"1","usdcSize":"0.4","price":"0.4","timestamp":{},"transactionHash":"0xafter","outcomeIndex":"1"}},
+          {{"proxyWallet":"{WALLET}","type":"REDEEM","conditionId":"0xanchor","asset":"","side":"","size":"0","usdcSize":"0","price":"0","timestamp":{},"transactionHash":"0xanchor","outcomeIndex":"0"}},
+          {{"proxyWallet":"{WALLET}","type":"REDEEM","conditionId":"0xcondition","asset":"123","outcome":"Yes","side":"","size":"1","usdcSize":"1","price":"1","timestamp":{},"transactionHash":"0xredeem","outcomeIndex":"0"}},
+          {{"proxyWallet":"{WALLET}","type":"TRADE","conditionId":"0xcondition","asset":"123","outcome":"Yes","side":"BUY","size":"5.25","usdcSize":"2.625","price":"0.5","timestamp":{},"transactionHash":"0xabc","outcomeIndex":"0"}},
+          {{"proxyWallet":"{WALLET}","type":"MERGE","conditionId":"0xeffects","asset":"","side":"","size":"2","usdcSize":"2","price":"1","timestamp":{},"transactionHash":"0xmerge"}},
+          {{"proxyWallet":"{WALLET}","type":"SPLIT","conditionId":"0xeffects","asset":"","side":"","size":"2","usdcSize":"2","price":"1","timestamp":{},"transactionHash":"0xsplit"}}
+        ]"#,
+        fixed_end - 1,
+        fixed_end - 2,
+        fixed_end - 3,
+        fixed_end - 4,
+        fixed_end - 5,
+        fixed_end - 6,
     );
     let fetcher = FixtureFetcher::new(HashMap::from([(url, body.into_bytes())]));
     let first = populate_activity_v2(
         &side,
         &fetcher,
         "https://data.example",
+        &frozen_path,
         fixed_end,
         7,
         fixed_end + 1,
@@ -458,6 +571,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
         &side,
         &fetcher,
         "https://data.example",
+        &frozen_path,
         fixed_end,
         7,
         fixed_end + 1,
@@ -466,11 +580,101 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
     .unwrap();
     assert_eq!(second, first);
 
+    let staging = Connection::open(&side).unwrap();
+    assert_eq!(
+        staging
+            .query_row(
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(staging);
+    let payout_fetcher = ClobFetcher::new(
+        "https://clob.example".to_owned(),
+        FixtureFetcher::new(HashMap::from([(
+            "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+            br#"{"data":[{"condition_id":"0xcondition","active":true,"closed":true,"end_date_iso":"2027-01-16T00:00:00Z","is_50_50_outcome":false,"tokens":[{"token_id":"123","outcome":"Yes","price":1,"winner":true},{"token_id":"456","outcome":"No","price":0,"winner":false}]},{"condition_id":"0xafter","active":true,"closed":true,"end_date_iso":"2027-01-17T00:00:00Z","is_50_50_outcome":true,"tokens":[{"token_id":"321","outcome":"Yes","price":"0.5","winner":false},{"token_id":"789","outcome":"No","price":"0.5","winner":false}]}],"next_cursor":"LTE="}"#.to_vec(),
+        )])),
+    );
+    payout_fetcher
+        .fetch_closed_markets(&mut WalletCache::open(&side).unwrap())
+        .await
+        .unwrap();
+    let stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("activity-final.json"),
+        fixed_end + 2,
+    )
+    .unwrap();
+    assert_eq!(stage.version, 2);
+    assert_eq!(stage.ranker_projection_count, 1);
+
     let cache = WalletCache::open(&side).unwrap();
     let active = cache.activity_aggregates_v2().unwrap();
-    assert_eq!(active.len(), 1);
-    assert!(active[0].source_trade_id.0.starts_with("g2:"));
-    assert_eq!(active[0].share_amount.to_string(), "5.25");
+    assert_eq!(active.len(), 6);
+    assert!(
+        active
+            .iter()
+            .all(|aggregate| aggregate.source_trade_id.0.starts_with("g2:"))
+    );
+    let projected: (String, String, String, i64, i64) = cache
+        .raw_conn_for_test()
+        .query_row(
+            "SELECT groups_v2.share_amount_str,
+                    groups_v2.price_weighted_share_amount_str,
+                    groups_v2.source_usdc_amount_str,
+                    payout.end_date_unix,
+                    ranker.classifier_version
+             FROM ranker_entries_v2 ranker
+             JOIN activity_groups_v2 groups_v2 USING (source_trade_id)
+             JOIN clob_payout_evidence_v2 payout ON payout.market_id = groups_v2.condition_id
+             WHERE groups_v2.condition_id = '0xcondition'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(projected.0, "5.25");
+    assert_eq!(projected.1, "2.625");
+    assert_eq!(projected.2, "2.625");
+    assert_eq!(projected.3, 1_800_057_600);
+    assert_eq!(projected.4, 1);
+    assert_eq!(
+        cache
+            .raw_conn_for_test()
+            .query_row(
+                "SELECT COUNT(*) FROM ranker_entries_v2 ranker
+                 JOIN activity_groups_v2 groups_v2 USING (source_trade_id)
+                 WHERE groups_v2.condition_id = '0xafter'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "RequiresAnchor must stop every later bucket for the wallet"
+    );
+    assert_eq!(
+        cache
+            .raw_conn_for_test()
+            .query_row(
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "activity staging must be deleted atomically with its manifest"
+    );
     assert_eq!(
         cache
             .raw_conn_for_test()
@@ -479,5 +683,224 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
             })
             .unwrap(),
         1
+    );
+}
+
+/// PASS: the activity fan-out reaches but never exceeds 16 in-flight wallets;
+/// a receipt-insert crash rolls back its wallet transaction, restart fetches
+/// only an exactly missing wallet, malformed receipt identity/digest fail, and
+/// manifest installation plus staging deletion is atomic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    let fixed_end = 1_800_000_000_i64;
+    let mut cache = seed_v1(&side, fixed_end - 10);
+    let mut wallets = vec![WALLET.to_owned()];
+    for ordinal in 2_u64..=17 {
+        let wallet = format!("0x{ordinal:040x}");
+        cache
+            .upsert_wallets_bulk(&[(wallet.clone(), SRC_TRADES, false, None, None, None, 0)])
+            .unwrap();
+        cache.conn_for_test_set_active(&wallet, 1);
+        cache.conn_for_test_insert_trade(&wallet, &format!("0xlegacy{ordinal}"), fixed_end - 10);
+        wallets.push(wallet);
+    }
+    drop(cache);
+    let manifest = write_build_manifest(&dir, &side);
+    migrate_cache_v2(&side, &manifest).unwrap();
+    let frozen = write_frozen_reference(&dir, fixed_end - 10, wallets.clone());
+
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER abort_activity_receipt
+             BEFORE INSERT ON activity_wallet_coverage_staging_v2
+             BEGIN SELECT RAISE(ABORT, 'forced receipt crash'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let failed = populate_activity_v2(
+        &side,
+        &YieldingFetcher::default(),
+        "https://data.example",
+        &frozen,
+        fixed_end,
+        9,
+        fixed_end + 1,
+    )
+    .await
+    .unwrap_err();
+    assert!(failed.to_string().contains("forced receipt crash"));
+    let connection = Connection::open(&side).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    connection
+        .execute_batch("DROP TRIGGER abort_activity_receipt")
+        .unwrap();
+    drop(connection);
+
+    let fetcher = YieldingFetcher::default();
+    let preview = populate_activity_v2(
+        &side,
+        &fetcher,
+        "https://data.example",
+        &frozen,
+        fixed_end,
+        9,
+        fixed_end + 2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview.wallet_count, 17);
+    assert_eq!(preview.group_count, 0);
+    assert_eq!(fetcher.maximum.load(Ordering::SeqCst), 16);
+    assert_eq!(fetcher.calls.lock().unwrap().len(), 17);
+
+    let missing = wallets[7].clone();
+    let connection = Connection::open(&side).unwrap();
+    let original_digest: String = connection
+        .query_row(
+            "SELECT ordered_aggregate_digest
+             FROM activity_wallet_coverage_staging_v2
+             WHERE generation = 9 AND wallet_hex = ?1",
+            params![missing],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE activity_wallet_coverage_staging_v2 SET fixed_end_unix = fixed_end_unix + 1
+             WHERE generation = 9 AND wallet_hex = ?1",
+            params![missing],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        populate_activity_v2(
+            &side,
+            &YieldingFetcher::default(),
+            "https://data.example",
+            &frozen,
+            fixed_end,
+            9,
+            fixed_end + 3,
+        )
+        .await
+        .is_err()
+    );
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute(
+            "UPDATE activity_wallet_coverage_staging_v2
+             SET fixed_end_unix = ?1, ordered_aggregate_digest = ?2
+             WHERE generation = 9 AND wallet_hex = ?3",
+            params![fixed_end, "f".repeat(64), missing],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        populate_activity_v2(
+            &side,
+            &YieldingFetcher::default(),
+            "https://data.example",
+            &frozen,
+            fixed_end,
+            9,
+            fixed_end + 4,
+        )
+        .await
+        .is_err()
+    );
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute(
+            "UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = ?1
+             WHERE generation = 9 AND wallet_hex = ?2",
+            params![original_digest, missing],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM activity_wallet_coverage_staging_v2
+             WHERE generation = 9 AND wallet_hex = ?1",
+            params![missing],
+        )
+        .unwrap();
+    drop(connection);
+    let resumed = YieldingFetcher::default();
+    populate_activity_v2(
+        &side,
+        &resumed,
+        "https://data.example",
+        &frozen,
+        fixed_end,
+        9,
+        fixed_end + 5,
+    )
+    .await
+    .unwrap();
+    let calls = resumed.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].contains(&format!("user={missing}")));
+    drop(calls);
+
+    install_payout_manifest(&side);
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER abort_activity_staging_delete
+             BEFORE DELETE ON activity_wallet_coverage_staging_v2
+             BEGIN SELECT RAISE(ABORT, 'forced finalize crash'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        finalize_cache_v2(&side, &dir.path().join("failed-stage.json"), fixed_end + 6).is_err()
+    );
+    let connection = Connection::open(&side).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM activity_coverage_manifests_v2",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        17
+    );
+    connection
+        .execute_batch("DROP TRIGGER abort_activity_staging_delete")
+        .unwrap();
+    drop(connection);
+    finalize_cache_v2(&side, &dir.path().join("stage.json"), fixed_end + 7).unwrap();
+    let connection = Connection::open(&side).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
     );
 }

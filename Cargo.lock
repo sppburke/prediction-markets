@@ -3586,6 +3586,7 @@ dependencies = [
  "fs2",
  "futures",
  "pe-core-types",
+ "pe-position-ledger",
  "pe-source-core",
  "pe-source-polymarket-public",
  "pe-trader-index",

@@ -2,8 +2,8 @@ use pe_bootstrap::{
     BootstrapConfig, backfill,
     cache::WalletCache,
     cache_migration::{
-        CacheActivationRequest, activate_cache_v2, finalize_cache_v2, migrate_cache_v2,
-        populate_activity_v2, rollback_cache_to_v1, verify_frozen_payload_v1,
+        CacheActivationRequest, PriorCacheBinding, activate_cache_v2, finalize_cache_v2,
+        migrate_cache_v2, populate_activity_v2, restore_prior_cache, verify_frozen_payload_v1,
     },
     config, coverage,
     error::BootstrapError,
@@ -61,7 +61,7 @@ async fn main() {
                 | "cache-populate-payout-v2"
                 | "cache-finalize-v2"
                 | "cache-activate"
-                | "cache-rollback-v1"
+                | "cache-restore-prior"
                 | "pipeline-versions"
         )
     );
@@ -103,8 +103,11 @@ async fn main() {
         let mut stage_record_arg: Option<std::path::PathBuf> = None;
         let mut fixed_db_arg: Option<std::path::PathBuf> = None;
         let mut backup_arg: Option<std::path::PathBuf> = None;
-        let mut failed_backup_arg: Option<std::path::PathBuf> = None;
+        let mut displaced_backup_arg: Option<std::path::PathBuf> = None;
         let mut expected_sha256_arg: Option<String> = None;
+        let mut prior_sha256_arg: Option<String> = None;
+        let mut prior_schema_arg: Option<i64> = None;
+        let mut bound_batch_is_current = false;
         let mut fixed_end_arg: Option<i64> = None;
         let mut generation_arg: Option<u64> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -122,6 +125,8 @@ async fn main() {
                 defer_activation = true;
             } else if a == "--confirm" {
                 confirm = true;
+            } else if a == "--bound-batch-current" {
+                bound_batch_is_current = true;
             } else if a == "--batch-id" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -196,18 +201,30 @@ async fn main() {
                 backup_arg = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--backup=") {
                 backup_arg = Some(std::path::PathBuf::from(v));
-            } else if a == "--failed-backup" && i + 1 < rest.len() {
+            } else if a == "--displaced-backup" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
-                failed_backup_arg = Some(std::path::PathBuf::from(rest[i]));
-            } else if let Some(v) = a.strip_prefix("--failed-backup=") {
-                failed_backup_arg = Some(std::path::PathBuf::from(v));
+                displaced_backup_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--displaced-backup=") {
+                displaced_backup_arg = Some(std::path::PathBuf::from(v));
             } else if a == "--expected-sha256" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
                 expected_sha256_arg = Some(rest[i].to_owned());
             } else if let Some(v) = a.strip_prefix("--expected-sha256=") {
                 expected_sha256_arg = Some(v.to_owned());
+            } else if a == "--prior-sha256" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                prior_sha256_arg = Some(rest[i].to_owned());
+            } else if let Some(v) = a.strip_prefix("--prior-sha256=") {
+                prior_sha256_arg = Some(v.to_owned());
+            } else if a == "--prior-schema" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                prior_schema_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--prior-schema=") {
+                prior_schema_arg = v.parse().ok();
             } else if a == "--fixed-end" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -255,7 +272,7 @@ async fn main() {
                 | "cache-populate-payout-v2"
                 | "cache-finalize-v2"
                 | "cache-activate"
-                | "cache-rollback-v1"
+                | "cache-restore-prior"
         ) {
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             let result = match sub {
@@ -291,6 +308,12 @@ async fn main() {
                                     .to_owned(),
                             },
                         )?;
+                        let frozen_reference = frozen_payload_arg.as_deref().ok_or_else(|| {
+                            BootstrapError::Invalid {
+                                message: "cache-populate-activity-v2 requires --frozen-payload"
+                                    .to_owned(),
+                            }
+                        })?;
                         let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                             &bootstrap_config.cache_path,
                         )?;
@@ -301,6 +324,7 @@ async fn main() {
                             &bootstrap_config.cache_path,
                             &fetcher,
                             &bootstrap_config.polymarket_base_url,
+                            frozen_reference,
                             fixed_end,
                             generation,
                             now,
@@ -343,26 +367,33 @@ async fn main() {
                                 .to_owned(),
                     })
                     .and_then(
-                        |((fixed_path, version_one_backup_path), expected_side_sha256)| {
+                        |((fixed_path, prior_cache_backup_path), expected_side_sha256)| {
                             activate_cache_v2(&CacheActivationRequest {
                                 fixed_path,
                                 side_path: bootstrap_config.cache_path.clone(),
-                                version_one_backup_path,
+                                prior_cache_backup_path,
                                 expected_side_sha256,
                             })
                             .and_then(json_report)
                         },
                     ),
-                "cache-rollback-v1" => fixed_db_arg
+                "cache-restore-prior" => fixed_db_arg
                     .zip(backup_arg)
-                    .zip(failed_backup_arg)
+                    .zip(displaced_backup_arg)
+                    .zip(prior_sha256_arg.zip(prior_schema_arg))
                     .ok_or_else(|| BootstrapError::Invalid {
-                        message:
-                            "cache-rollback-v1 requires --fixed-db, --backup, and --failed-backup"
-                                .to_owned(),
+                        message: "cache-restore-prior requires --fixed-db, --backup, \
+                                  --displaced-backup, --prior-sha256, and --prior-schema"
+                            .to_owned(),
                     })
-                    .and_then(|((fixed, backup), failed)| {
-                        rollback_cache_to_v1(&fixed, &backup, &failed)
+                    .and_then(|(((fixed, backup), displaced), (sha256, schema_version))| {
+                        restore_prior_cache(
+                            &fixed,
+                            &backup,
+                            &displaced,
+                            &PriorCacheBinding { sha256, schema_version },
+                            bound_batch_is_current,
+                        )
                             .map(|()| serde_json::json!({"restored": fixed}))
                     }),
                 _ => Err(BootstrapError::Internal),

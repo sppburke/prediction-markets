@@ -13,6 +13,8 @@ Run: `python3 scripts/test_push_ranking_filter.py`
   or: `pytest scripts/test_push_ranking_filter.py -v`
 """
 import io
+import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -348,6 +350,52 @@ class PublishRequestTest(unittest.TestCase):
             tampered["entries"][0]["wallet_hex"] = "0xchanged"
             with self.assertRaisesRegex(ValueError, "content hash mismatch"):
                 pr.validate_publish_request(tampered)
+
+    def test_cache_activation_is_bound_into_publish_key(self):
+        """PASS: exact request recovery retains the side/fixed/prior/hash tuple;
+        changing any activation field invalidates the publication key."""
+        activation = {
+            "side_path": "data/side.db",
+            "fixed_path": "data/wallet_cache.db",
+            "prior_cache_backup_path": "data/wallet_cache.prior.db",
+            "expected_sha256": "a" * 64,
+        }
+        baseline = self._request()
+        request = pr.build_publish_request(
+            baseline["batch"], baseline["entries"], baseline["keep_batches"], activation
+        )
+        self.assertEqual(request["cache_activation"], activation)
+        changed = json.loads(json.dumps(request))
+        changed["cache_activation"]["expected_sha256"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+            pr.validate_publish_request(changed)
+        print("PASS: publication key binds the exact cache activation tuple")
+
+    def test_current_batch_snapshot_is_atomic_and_normalized(self):
+        """PASS: cycle start freezes the active batch before any publication write."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "before.json"
+            with (
+                mock.patch.object(sys, "argv", ["push", "--snapshot-current", str(output)]),
+                mock.patch.dict(
+                    os.environ,
+                    {"SUPABASE_URL": "https://x.supabase.co",
+                     "SUPABASE_SECRET_KEY": "secret"},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    pr, "_req",
+                    return_value=(200, [{
+                        "rank": 1, "wallet_hex": "0xABC", "ls_tstat": 3.5,
+                        "survives": True,
+                    }]),
+                ),
+            ):
+                self.assertEqual(pr.main(), 0)
+            self.assertEqual(json.loads(output.read_text()), [{
+                "rank": 1, "score": 3.5, "survives": True, "wallet": "0xabc",
+            }])
+        print("PASS: active published batch snapshot is deterministic")
 
     def test_pending_pointer_is_atomic_repository_relative(self):
         with tempfile.TemporaryDirectory() as tmp, chdir(tmp):

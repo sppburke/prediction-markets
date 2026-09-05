@@ -333,10 +333,13 @@ def build_entries(top, last_trade_map):
     return entries
 
 
-def publication_key(batch: dict, entries: list[dict]) -> str:
+def publication_key(batch: dict, entries: list[dict], cache_activation: dict | None = None) -> str:
     """Content-address one immutable ranking publication."""
+    identity = {"batch": batch, "entries": entries}
+    if cache_activation is not None:
+        identity["cache_activation"] = cache_activation
     canonical = json.dumps(
-        {"batch": batch, "entries": entries},
+        identity,
         allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -345,14 +348,17 @@ def publication_key(batch: dict, entries: list[dict]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def build_publish_request(batch: dict, entries: list[dict], keep_batches: int) -> dict:
+def build_publish_request(batch: dict, entries: list[dict], keep_batches: int,
+                          cache_activation: dict | None = None) -> dict:
     request = {
         "version": PUBLISH_REQUEST_VERSION,
         "batch": batch,
         "entries": entries,
         "keep_batches": keep_batches,
     }
-    request["publish_key"] = publication_key(batch, entries)
+    if cache_activation is not None:
+        request["cache_activation"] = cache_activation
+    request["publish_key"] = publication_key(batch, entries, cache_activation)
     validate_publish_request(request)
     return request
 
@@ -366,6 +372,7 @@ def validate_publish_request(request: dict) -> None:
     batch = request.get("batch")
     entries = request.get("entries")
     keep_batches = request.get("keep_batches")
+    cache_activation = request.get("cache_activation")
     if not isinstance(batch, dict):
         raise ValueError("publish request batch must be an object")
     if not isinstance(entries, list) or not entries:
@@ -378,7 +385,18 @@ def validate_publish_request(request: dict) -> None:
         raise ValueError("publish request entry ranks must be contiguous from 1")
     if any(not entry.get("wallet_hex") for entry in entries):
         raise ValueError("publish request entries require wallet_hex")
-    expected_key = publication_key(batch, entries)
+    if cache_activation is not None:
+        required = {"side_path", "fixed_path", "prior_cache_backup_path", "expected_sha256"}
+        if not isinstance(cache_activation, dict) or set(cache_activation) != required:
+            raise ValueError("publish request cache activation has an invalid shape")
+        if any(not isinstance(cache_activation[key], str) or not cache_activation[key]
+               or "\n" in cache_activation[key] or "\t" in cache_activation[key]
+               for key in required):
+            raise ValueError("publish request cache activation values must be one-line strings")
+        digest = cache_activation["expected_sha256"]
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError("publish request cache activation hash is invalid")
+    expected_key = publication_key(batch, entries, cache_activation)
     if request.get("publish_key") != expected_key:
         raise ValueError("publish request content hash mismatch")
 
@@ -461,6 +479,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="persist request/pending state without contacting Supabase",
     )
+    ap.add_argument(
+        "--snapshot-current",
+        help="atomically freeze the active published batch for a prospective diff and exit",
+    )
+    ap.add_argument("--cache-stage-record",
+                    help="finalized schema-two stage record bound to this request")
+    ap.add_argument("--cache-side-db", help="schema-two side cache to activate")
+    ap.add_argument("--cache-fixed-db", help="fixed cache path replaced after preparation")
+    ap.add_argument("--prior-cache-backup", help="generic prior-main backup path")
     ap.add_argument("--top-n", type=int, default=200)
     ap.add_argument("--band-lo", type=float, default=0.15)
     ap.add_argument("--band-hi", type=float, default=0.85)
@@ -566,6 +593,7 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
         raise ValueError("no rows to push (empty CSV, or the active filter removed all)")
 
     config_hash = None
+    manifest = None
     if a.manifest_file is not None:
         # "" is a caller bug, not "no manifest": open() fails loudly below (#536).
         with open(a.manifest_file, encoding="utf-8") as mf:
@@ -596,7 +624,40 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
         "notes": a.notes or None,
     }
     entries = build_entries(top, last_trade_map)
-    return build_publish_request(batch, entries, a.keep_batches)
+    activation_args = (
+        getattr(a, "cache_stage_record", None), getattr(a, "cache_side_db", None),
+        getattr(a, "cache_fixed_db", None), getattr(a, "prior_cache_backup", None),
+    )
+    cache_activation = None
+    if any(activation_args):
+        if not all(activation_args):
+            raise ValueError(
+                "cache activation requires --cache-stage-record, --cache-side-db, "
+                "--cache-fixed-db, and --prior-cache-backup"
+            )
+        with open(a.cache_stage_record, encoding="utf-8") as stage_file:
+            stage = json.load(stage_file)
+        expected_sha256 = stage.get("cache_sha256")
+        stage_cache_path = stage.get("cache_path")
+        if not isinstance(expected_sha256, str):
+            raise ValueError("cache stage record omitted cache_sha256")
+        if stage_cache_path is not None and Path(stage_cache_path).resolve() != Path(
+            a.cache_side_db
+        ).resolve():
+            raise ValueError("cache stage record belongs to another side cache")
+        if manifest is None:
+            raise ValueError("cache activation requires the bound oracle manifest")
+        declared_stage = manifest.get("inputs", {}).get("cache_stage_record_sha256")
+        actual_stage = hashlib.sha256(Path(a.cache_stage_record).read_bytes()).hexdigest()
+        if declared_stage != actual_stage:
+            raise ValueError("oracle manifest does not bind the supplied cache stage record")
+        cache_activation = {
+            "side_path": str(Path(a.cache_side_db)),
+            "fixed_path": str(Path(a.cache_fixed_db)),
+            "prior_cache_backup_path": str(Path(a.prior_cache_backup)),
+            "expected_sha256": expected_sha256,
+        }
+    return build_publish_request(batch, entries, a.keep_batches, cache_activation)
 
 
 def _batch_id_from_rpc_response(response) -> int:
@@ -699,10 +760,55 @@ def main() -> int:
     a = build_parser().parse_args()
     process_now = int(time.time())  # single time anchor: active filter + last-trade stamps
 
+    if a.snapshot_current:
+        if any((a.ranked_csv, a.request_file, a.pending_file, a.resume_request,
+                a.prepare_only, a.manifest_file is not None, a.cache_stage_record,
+                a.cache_side_db, a.cache_fixed_db, a.prior_cache_backup)):
+            print("FATAL: --snapshot-current cannot be combined with publication arguments",
+                  file=sys.stderr)
+            return 1
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SECRET_KEY")
+        if not url or not key:
+            print("FATAL: set SUPABASE_URL and SUPABASE_SECRET_KEY in env (.env)",
+                  file=sys.stderr)
+            return 1
+        try:
+            _, current = _req(
+                "GET",
+                f"{url.rstrip('/')}/rest/v1/latest_ranking"
+                "?select=rank,wallet_hex,ls_tstat,survives&order=rank.asc",
+                key,
+            )
+            if not isinstance(current, list):
+                raise ValueError("latest_ranking snapshot was not an array")
+            snapshot = [
+                {
+                    "wallet": str(row["wallet_hex"]).lower(),
+                    "score": row.get("ls_tstat"),
+                    "survives": bool(row.get("survives", False)),
+                    "rank": int(row["rank"]),
+                }
+                for row in current
+            ]
+            _atomic_write_text(
+                Path(a.snapshot_current),
+                json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+            )
+            print(f"snapshotted current ranking: {len(snapshot)} rows -> {a.snapshot_current}")
+            return 0
+        except TransientRetriesExhausted as error:
+            print(f"TEMPFAIL: current-ranking snapshot failed: {error}", file=sys.stderr)
+            return TEMPFAIL_EXIT
+        except (SupabaseRequestError, OSError, ValueError, KeyError) as error:
+            print(f"FATAL: current-ranking snapshot failed: {error}", file=sys.stderr)
+            return 1
+
     try:
         if a.resume_request:
             if (a.ranked_csv or a.request_file or a.pending_file or a.prepare_only
-                    or a.manifest_file is not None):
+                    or a.manifest_file is not None or a.cache_stage_record
+                    or a.cache_side_db or a.cache_fixed_db or a.prior_cache_backup):
                 raise ValueError(
                     "--resume-request cannot be combined with ranking preparation arguments"
                 )

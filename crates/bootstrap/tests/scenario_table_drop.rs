@@ -3,10 +3,9 @@
 //!
 //! The reclaim removes `counterparty_edges` / `funder_edges` / `funder_lookup_done`
 //! / `delta_audit` (≈ half the production cache — `counterparty_edges` alone was
-//! ~275M rows) via an idempotent `DROP TABLE IF EXISTS` migration, while KEEPING
-//! `market_fees` + `token_conditions` (still written by the surviving `events`
-//! sweep). These pin that an existing cache carrying the legacy tables is
-//! reclaimed on the next open, and that fresh opens never recreate them.
+//! ~275M rows) via an idempotent `DROP TABLE IF EXISTS` migration. The retired
+//! `market_fees` table is left unread in existing caches but is not created in a
+//! fresh cache. These pin both compatibility and fresh-schema retirement.
 //!
 //! Determinism: pure in-process; fresh `TempDir` per test, no network/clock.
 
@@ -46,11 +45,11 @@ const DROPPED: [&str; 4] = [
 
 /// PASS: after `WalletCache::open()`, the four operator/funder/delta tables are
 ///       GONE even though they existed (with data) beforehand, while the kept
-///       tables `market_fees` + `token_conditions` + `wallets` remain.
+///       legacy `market_fees` and current `token_conditions` + `wallets` remain.
 /// FAIL: any dropped table survives, OR a kept table is missing, OR `open()`
 ///       errors on the legacy DB.
 #[test]
-fn open_drops_operator_tables_and_keeps_market_fees_and_token_conditions() {
+fn open_drops_operator_tables_and_leaves_retired_market_fees_unread() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("wallet_cache.db");
 
@@ -62,6 +61,7 @@ fn open_drops_operator_tables_and_keeps_market_fees_and_token_conditions() {
              CREATE TABLE funder_edges (funder_hex TEXT, funded_hex TEXT, PRIMARY KEY (funder_hex, funded_hex));
              CREATE TABLE funder_lookup_done (wallet_hex TEXT PRIMARY KEY, fetched_at_unix INTEGER);
              CREATE TABLE delta_audit (run_at_unix INTEGER, wallet_hex TEXT, PRIMARY KEY (run_at_unix, wallet_hex));
+             CREATE TABLE market_fees (condition_id TEXT PRIMARY KEY, taker_base_fee_bps INTEGER, maker_base_fee_bps INTEGER, fee_active_from_unix INTEGER, fetched_at_unix INTEGER);
              INSERT INTO counterparty_edges VALUES ('0xtx', 1);
              INSERT INTO funder_edges VALUES ('0xf', '0xw');
              INSERT INTO funder_lookup_done VALUES ('0xw', 1);
@@ -95,15 +95,12 @@ fn open_drops_operator_tables_and_keeps_market_fees_and_token_conditions() {
             "{kept} must survive the migration (created from SCHEMA / kept)"
         );
     }
-    println!(
-        "PASS: open_drops_operator_tables_and_keeps_market_fees_and_token_conditions \
-         — 4 dropped, market_fees+token_conditions+wallets kept"
-    );
+    println!("PASS: existing market_fees remains unread while current tables survive");
 }
 
-/// PASS: opening a FRESH DB never creates the four dropped tables (they are out
-///       of SCHEMA), and a second open is a clean idempotent no-op.
-/// FAIL: a fresh open recreates a dropped table, OR the second open errors.
+/// PASS: opening a FRESH DB creates neither the four dropped tables nor retired
+///       `market_fees`, and a second open is a clean idempotent no-op.
+/// FAIL: a fresh open creates a retired table, OR the second open errors.
 #[test]
 fn fresh_open_never_creates_dropped_tables_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
@@ -119,6 +116,10 @@ fn fresh_open_never_creates_dropped_tables_and_is_idempotent() {
             "fresh open must NOT create {dropped}"
         );
     }
+    assert!(
+        !table_exists(&conn, "market_fees"),
+        "fresh open must NOT create retired market_fees"
+    );
     println!("PASS: fresh_open_never_creates_dropped_tables_and_is_idempotent");
 }
 

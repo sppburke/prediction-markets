@@ -71,6 +71,53 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                     "SELECT completed_at_unix FROM activity_coverage_manifests_v2 "
                     "ORDER BY generation DESC LIMIT 1",
                 ),
+                "reference_sha256": _one(
+                    connection,
+                    "SELECT reference_sha256 FROM activity_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (activity_generation,),
+                ),
+                "wallet_count": _one(
+                    connection,
+                    "SELECT wallet_count FROM activity_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (activity_generation,),
+                ),
+                "receipt_set_digest": _one(
+                    connection,
+                    "SELECT receipt_set_digest FROM activity_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (activity_generation,),
+                ),
+                "aggregate_digest": _one(
+                    connection,
+                    "SELECT aggregate_digest FROM activity_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (activity_generation,),
+                ),
+                "source_row_count": _one(
+                    connection,
+                    "SELECT source_row_count FROM activity_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (activity_generation,),
+                ),
+                "ranker_projection": {
+                    "count": _one(
+                        connection,
+                        "SELECT ranker_projection_count FROM cache_v2_migration_state "
+                        "WHERE singleton = 1",
+                    ),
+                    "digest": _one(
+                        connection,
+                        "SELECT ranker_projection_digest FROM cache_v2_migration_state "
+                        "WHERE singleton = 1",
+                    ),
+                    "classifier_version": _one(
+                        connection,
+                        "SELECT ranker_classifier_version FROM cache_v2_migration_state "
+                        "WHERE singleton = 1",
+                    ),
+                },
             }
             resolution = {
                 "generation": payout_generation,
@@ -95,6 +142,18 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 "terminal_kind": _one(
                     connection,
                     "SELECT terminal_kind FROM clob_payout_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (payout_generation,),
+                ),
+                "manifest_json": _one(
+                    connection,
+                    "SELECT manifest_json "
+                    "FROM clob_payout_coverage_manifests_v2 WHERE generation = ?",
+                    (payout_generation,),
+                ),
+                "terminal_page_sha256": _one(
+                    connection,
+                    "SELECT terminal_page_sha256 FROM clob_payout_coverage_manifests_v2 "
                     "WHERE generation = ?",
                     (payout_generation,),
                 ),

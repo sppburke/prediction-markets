@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Export the ranker's read tables from SQLite to Parquet for the DuckDB read-layer
-(issue #375).
+"""Export the ranker's read tables from SQLite to Parquet (#375, #545).
 
 FULL ATOMIC REWRITE each run: `trades` + `market_resolutions` + `market_schedules`
 (+ optional `market_price_history`, issue #421 PR4, `token_conditions`, issue #429 PR4,
@@ -25,10 +24,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 import time
 
-# The three tables the ranker reads. Order is irrelevant (independent files).
+# The three schema-one tables the ranker reads. Order is irrelevant (independent files).
 # `market_schedules` now also carries `start_date_unix` (issue #421 PR4); it rides along free via
 # `SELECT *`, so no change is needed here for that column.
 TABLES = ("trades", "market_resolutions", "market_schedules")
@@ -37,6 +37,19 @@ TABLES = ("trades", "market_resolutions", "market_schedules")
 # is skipped with a warning rather than aborting the whole export. `ranker_duck.py` registers each
 # view conditionally to match. `true_clv` needs both `market_price_history` and `token_conditions`.
 OPTIONAL_TABLES = ("market_price_history", "token_conditions", "clob_payout_evidence_v2")
+
+# Schema two has one ranker input.  The marker table is intentionally tiny; the
+# identifiers, exact amounts, payout vector, and scheduled end remain owned by
+# their normalized tables and are recovered by the DuckDB join.
+V2_TABLES = (
+    "ranker_entries_v2",
+    "activity_groups_v2",
+    "clob_payout_evidence_v2",
+    "activity_coverage_manifests_v2",
+    "clob_payout_coverage_manifests_v2",
+    "cache_v2_migration_state",
+)
+V2_EXPORT_MANIFEST = "schema_v2_export_manifest.json"
 
 
 def log(msg: str) -> None:
@@ -56,7 +69,7 @@ def _table_exists(con, tbl: str) -> bool:
         return False
 
 
-def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> None:
+def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     """Atomically export `src.{tbl}` to `{out_dir}/{tbl}.parquet` (zstd) via tmp + os.replace."""
     final = os.path.join(out_dir, f"{tbl}.parquet")
     tmp = final + ".tmp"
@@ -66,8 +79,123 @@ def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> None:
     )
     os.replace(tmp, final)
     n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')").fetchone()[0]
+    source_n = con.execute(f"SELECT COUNT(*) FROM src.{tbl}").fetchone()[0]
+    if n != source_n:
+        raise ValueError(f"{tbl}: Parquet count {n} != SQLite count {source_n}")
     size_gb = os.path.getsize(final) / 1e9
     log(f"{tbl}: {n:,} rows -> {final} ({size_gb:.2f} GB)")
+    return int(n)
+
+
+def _projection_rows(con, relation_prefix: str) -> list[dict]:
+    """Canonical joined schema-two rows, matching Rust's projection digest."""
+    prefix = f"{relation_prefix}." if relation_prefix else ""
+    rows = con.execute(
+        f"SELECT ranker.source_trade_id, ranker.activity_generation, "
+        f"ranker.classifier_version, groups_v2.wallet_hex, "
+        f"groups_v2.condition_id, groups_v2.asset, groups_v2.outcome_id, "
+        f"groups_v2.side, groups_v2.share_amount_str, "
+        f"groups_v2.price_weighted_share_amount_str, "
+        f"groups_v2.source_usdc_amount_str, groups_v2.source_time_unix, "
+        f"payout.payout_vector_json, payout.end_date_unix "
+        f"FROM {prefix}ranker_entries_v2 ranker "
+        f"JOIN {prefix}activity_groups_v2 groups_v2 "
+        "ON groups_v2.source_trade_id = ranker.source_trade_id "
+        "AND groups_v2.coverage_generation = ranker.activity_generation "
+        f"JOIN {prefix}clob_payout_evidence_v2 payout "
+        "ON payout.market_id = groups_v2.condition_id "
+        "ORDER BY ranker.source_trade_id"
+    ).fetchall()
+    names = (
+        "source_trade_id", "activity_generation", "classifier_version",
+        "wallet_hex", "condition_id", "asset", "outcome_id", "side",
+        "share_amount_str", "price_weighted_share_amount_str",
+        "source_usdc_amount_str", "source_time_unix", "payout_vector_json",
+        "end_date_unix",
+    )
+    return [dict(zip(names, row, strict=True)) for row in rows]
+
+
+def _projection_digest(rows: list[dict]) -> str:
+    import hashlib
+    import json
+
+    rendered = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(rendered.encode()).hexdigest()
+
+
+def _file_sha256(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_v2_projection(con, out_dir: str) -> dict:
+    """Verify SQLite authority and the exported logical projection agree exactly."""
+    state = con.execute(
+        "SELECT phase, ranker_projection_count, ranker_projection_digest, "
+        "ranker_classifier_version FROM src.cache_v2_migration_state "
+        "WHERE singleton = 1"
+    ).fetchone()
+    if state is None or state[0] != "finalized":
+        raise ValueError("schema-two cache is not finalized")
+    source_rows = _projection_rows(con, "src")
+    expected_count = int(state[1]) if state[1] is not None else -1
+    expected_digest = str(state[2]) if state[2] is not None else ""
+    if len(source_rows) != expected_count or _projection_digest(source_rows) != expected_digest:
+        raise ValueError("schema-two SQLite projection count/digest does not match final state")
+
+    con.execute("CREATE SCHEMA IF NOT EXISTS exported")
+    for table in V2_TABLES:
+        path = _q(os.path.join(out_dir, f"{table}.parquet"))
+        con.execute(
+            f"CREATE OR REPLACE VIEW exported.{table} AS "
+            f"SELECT * FROM read_parquet('{path}')"
+        )
+    exported_rows = _projection_rows(con, "exported")
+    # `_projection_rows` addresses `exported.<table>`; DuckDB schemas are used here
+    # so that the exact same join text verifies the Parquet side.
+    if len(exported_rows) != expected_count or _projection_digest(exported_rows) != expected_digest:
+        raise ValueError("schema-two Parquet projection count/digest mismatch")
+    log(
+        "schema-two projection verified: "
+        f"count={expected_count:,} digest={expected_digest[:16]}… "
+        f"classifier_version={state[3]}"
+    )
+    return {
+        "count": expected_count,
+        "digest": expected_digest,
+        "classifier_version": int(state[3]),
+    }
+
+
+def _write_v2_export_manifest(out_dir: str, counts: dict[str, int], projection: dict) -> None:
+    import json
+
+    value = {
+        "version": 1,
+        "tables": {
+            table: {
+                "count": counts[table],
+                "sha256": _file_sha256(os.path.join(out_dir, f"{table}.parquet")),
+            }
+            for table in sorted(V2_TABLES)
+        },
+        "projection": projection,
+    }
+    final = os.path.join(out_dir, V2_EXPORT_MANIFEST)
+    temporary = final + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as destination:
+        json.dump(value, destination, sort_keys=True, separators=(",", ":"))
+        destination.write("\n")
+        destination.flush()
+        os.fsync(destination.fileno())
+    os.replace(temporary, final)
+    log(f"schema-two export manifest -> {final}")
 
 
 def main() -> int:
@@ -86,14 +214,26 @@ def main() -> int:
     db_abs = _q(os.path.abspath(a.db))
     con.execute(f"ATTACH '{db_abs}' AS src (TYPE sqlite, READ_ONLY);")
 
+    with sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True) as sqlite:
+        schema = int(sqlite.execute("PRAGMA user_version").fetchone()[0])
+
     t0 = time.time()
-    for tbl in TABLES:
-        _export_table(con, a.out_dir, tbl, a.row_group_size)
-    for tbl in OPTIONAL_TABLES:
-        if _table_exists(con, tbl):
+    if schema >= 2:
+        counts = {}
+        for tbl in V2_TABLES:
+            if not _table_exists(con, tbl):
+                raise ValueError(f"schema-two cache is missing required table {tbl}")
+            counts[tbl] = _export_table(con, a.out_dir, tbl, a.row_group_size)
+        projection = _verify_v2_projection(con, a.out_dir)
+        _write_v2_export_manifest(a.out_dir, counts, projection)
+    else:
+        for tbl in TABLES:
             _export_table(con, a.out_dir, tbl, a.row_group_size)
-        else:
-            log(f"{tbl}: table absent (pre-migration cache) -> skipped")
+        for tbl in OPTIONAL_TABLES:
+            if _table_exists(con, tbl):
+                _export_table(con, a.out_dir, tbl, a.row_group_size)
+            else:
+                log(f"{tbl}: table absent (pre-migration cache) -> skipped")
 
     log(f"export complete in {time.time() - t0:.0f}s -> {a.out_dir}")
     return 0

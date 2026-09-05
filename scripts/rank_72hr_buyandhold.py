@@ -208,12 +208,20 @@ def load_universe(path: str, limit: int) -> list[str]:
     return wallets
 
 
-def load_universe_from_trades(conn: sqlite3.Connection, limit: int) -> list[str]:
+def load_universe_from_trades(conn: sqlite3.Connection, limit: int,
+                              schema_version: int = 1) -> list[str]:
     """Universe = every distinct wallet_hex in `trades` (have-trade-data => in-universe,
     issue #370). Same validation as load_universe (0x-prefixed, length 42, lowercased);
     malformed rows are dropped. The ranker's own filters then decide the cohort."""
     wallets: list[str] = []
-    for (wh,) in conn.execute("SELECT DISTINCT wallet_hex FROM trades"):
+    query = (
+        "SELECT DISTINCT g.wallet_hex FROM ranker_entries_v2 r "
+        "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
+        "AND g.coverage_generation = r.activity_generation"
+        if schema_version >= 2
+        else "SELECT DISTINCT wallet_hex FROM trades"
+    )
+    for (wh,) in conn.execute(query):
         if wh is None:
             continue
         s = str(wh).strip()
@@ -327,7 +335,7 @@ def process_wallet_positions(w, positions, prm, writer, summaries, floor_pos):
         g = time.gmtime(p["entry_ts"])
         months.add((g.tm_year, g.tm_mon))
         rows_out.append((w, p["market_id"], p["outcome_id"], p["entry_ts"], p["ttr"],
-                         price, int(p["contracts"]), payoff, gross, net, p["resolved_at"]))
+                         price, p["contracts"], payoff, gross, net, p["resolved_at"]))
 
     writer.writerows(rows_out)
 
@@ -448,9 +456,10 @@ def main() -> int:
     # Open the read-only cache first: --universe-from-trades enumerates from it.
     conn = sqlite3.connect(f"file:{prm.db}?mode=ro", uri=True)
     conn.execute("PRAGMA query_only=ON;")
+    schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
 
     if prm.universe_from_trades:
-        wallets = load_universe_from_trades(conn, prm.limit_wallets)
+        wallets = load_universe_from_trades(conn, prm.limit_wallets, schema_version)
         universe_label = "trades-distinct"
         log(f"universe: {len(wallets)} wallets (all distinct trade wallets, #370)")
     else:
@@ -461,7 +470,7 @@ def main() -> int:
     # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
     # Market maps (resolutions + schedules) are only needed by the SQLite path; the
     # DuckDB path joins them in SQL over the Parquet snapshot.
-    engine = ranker_duck.get_engine()
+    engine = ranker_duck.get_engine(schema_version=schema_version)
     res, sched = (None, None) if engine is not None else load_market_maps(conn)
 
     decay = "flat (no decay)" if prm.half_life_days <= 0 else f"half_life={prm.half_life_days}d"
@@ -485,11 +494,19 @@ def main() -> int:
         # SQL over the Parquet snapshot; the SHARED Python tail scores every wallet, so
         # eff/gross/net + weighted_stats are byte-identical to the SQLite path.
         log("extraction engine: DuckDB (Parquet read-layer, #375)")
-        ttr_lo = max(prm.min_ttr_secs, 1)
-        df = ranker_duck.duck_extract_positions(
-            engine, wallets, prm.win_start, prm.win_end, ttr_lo, prm.ttr_secs,
-            prm.scheduled_only, prm.price_min, prm.price_max,
-        )
+        if schema_version >= 2:
+            # Rust has already proved the first-entry semantics. Pass every
+            # structurally valid projected buy to the reference-price pass;
+            # leader price, horizon, band, and pass-one statistics are not gates.
+            df = ranker_duck.duck_extract_positions_v2(
+                engine, wallets, prm.win_start, prm.win_end
+            )
+        else:
+            ttr_lo = max(prm.min_ttr_secs, 1)
+            df = ranker_duck.duck_extract_positions(
+                engine, wallets, prm.win_start, prm.win_end, ttr_lo, prm.ttr_secs,
+                prm.scheduled_only, prm.price_min, prm.price_max,
+            )
         diag["wallets_seen"] = len(wallets)
         diag["qualified"] = len(df)
         # Stable per-wallet order so summation is deterministic run-to-run; the stats
@@ -499,7 +516,9 @@ def main() -> int:
             positions = [{
                 "market_id": row.market_id, "outcome_id": int(row.outcome_id),
                 "entry_ts": int(row.entry_ts), "ttr": int(row.ttr_secs),
-                "price": float(row.price), "contracts": int(row.contracts),
+                "price": float(row.price),
+                "contracts": (str(row.contracts) if schema_version >= 2
+                              else int(row.contracts)),
                 "payoff": float(row.payoff), "resolved_at": int(row.resolved_at),
             } for row in grp.itertuples(index=False)]
             total_qualified += process_wallet_positions(
