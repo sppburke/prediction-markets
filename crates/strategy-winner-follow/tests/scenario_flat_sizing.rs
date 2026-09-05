@@ -143,8 +143,6 @@ fn scenario_evaluate_at_price_sizes_at_current_keeps_leader_limit() {
             clean_snapshot(),
             dec!(10_000),
             ExecutionMode::LiveTiny,
-            None,
-            None,
         )
         .expect("current-price sizing should produce order");
     assert_eq!(
@@ -203,14 +201,13 @@ fn scenario_flat_sizing_low_price_large_count() {
 
 // ─── scenario F3 ─────────────────────────────────────────────────────────────
 
-/// Per-trade cap still clamps the flat-path result.
+/// The strategy returns the Dollar allocation unchanged; the venue planner owns every cap.
 ///
 /// flat=$10_000, price=$0.50 → 20_000 contracts raw.
-/// Cap=25 bps on $10_000 bankroll → cap_usd=$25.00 → max_contracts=floor(25/0.50)=50.
 ///
-/// PASS: `intent.contracts.0 == 50`.
+/// PASS: `intent.contracts.0 == 20_000` even when config carries a 25 bps cap.
 #[test]
-fn scenario_flat_sizing_per_trade_cap_still_clamps() {
+fn scenario_flat_sizing_leaves_cap_enforcement_to_venue() {
     let signal = make_signal(0xF3, LeaderAction::Entry);
     let config = WinnerFollowConfig {
         sizing_mode: SizingMode::Dollar { usd: dec!(10_000) },
@@ -227,12 +224,11 @@ fn scenario_flat_sizing_per_trade_cap_still_clamps() {
             dec!(10_000),
             ExecutionMode::LiveTiny,
         )
-        .expect("clamped flat sizing should produce order");
+        .expect("uncapped strategy allocation should produce order");
 
-    // cap_usd = 10_000 × 25/10_000 = $25.00; max = floor(25.00/0.50) = 50
     assert_eq!(
-        intent.contracts.0, 50,
-        "25-bps cap on $10k at $0.50 must clamp flat result to 50, got {}",
+        intent.contracts.0, 20_000,
+        "strategy must return the Dollar allocation unchanged, got {}",
         intent.contracts.0
     );
 }
@@ -411,14 +407,11 @@ fn scenario_flat_sizing_is_deterministic() {
 
 // ─── scenario F10 ─────────────────────────────────────────────────────────────
 
-/// Bankroll too small to cover even 1 contract at price → NoEdge (clamp returns 0).
+/// The strategy does not duplicate the venue planner's affordability cap.
 ///
-/// flat=$100 (would give 200 contracts), bankroll=$0.30 < price=$0.50.
-/// `clamp_contracts_to_cap` returns 0 when bankroll < price → NoEdge.
-///
-/// PASS: `Err(NoEdge)`.
+/// PASS: flat=$100 at price=$0.50 returns 200 even with a supplied $0.30 bankroll.
 #[test]
-fn scenario_flat_sizing_bankroll_below_price_yields_no_edge() {
+fn scenario_flat_sizing_does_not_duplicate_affordability_cap() {
     let signal = make_signal(0xFA, LeaderAction::Entry);
     let config = WinnerFollowConfig {
         sizing_mode: SizingMode::Dollar { usd: dec!(100) },
@@ -427,18 +420,16 @@ fn scenario_flat_sizing_bankroll_below_price_yields_no_edge() {
     };
     let strategy = WinnerFollowStrategy::new(config);
 
-    let result = strategy.evaluate(
-        &signal,
-        p_high(),
-        clean_snapshot(),
-        dec!(0.30), // bankroll $0.30 < price $0.50
-        ExecutionMode::LiveTiny,
-    );
-
-    assert!(
-        matches!(result, Err(WinnerFollowError::NoEdge)),
-        "bankroll < price must yield NoEdge even on flat path; got {result:?}"
-    );
+    let intent = strategy
+        .evaluate(
+            &signal,
+            p_high(),
+            clean_snapshot(),
+            dec!(0.30),
+            ExecutionMode::LiveTiny,
+        )
+        .expect("strategy returns its allocation before venue affordability checks");
+    assert_eq!(intent.contracts.0, 200);
 }
 
 // ─── scenario F8: contract sizing mode (#398 WS2) ─────────────────────────────
@@ -473,13 +464,12 @@ fn scenario_contract_sizing_uncapped_yields_exact_n() {
     );
 }
 
-/// `sizing_mode = Contract { contracts: 1000 }` with a 25 bps per-trade cap and a $10 000
-/// bankroll at price $0.50 → cap_usd = 25, max = floor(25/0.50) = 50, so 1000 is clamped to 50
-/// (the capped < N case).
+/// `sizing_mode = Contract { contracts: 1000 }` passes fixed N through unchanged. The venue
+/// planner rejects an over-cap plan instead of silently changing N.
 ///
-/// PASS: `intent.contracts.0 == 50` (< 1000).
+/// PASS: `intent.contracts.0 == 1000`.
 #[test]
-fn scenario_contract_sizing_is_clamped_by_per_trade_cap() {
+fn scenario_contract_sizing_is_not_clamped_by_per_trade_cap() {
     let signal = make_signal(0xF8, LeaderAction::Entry); // price $0.50
     let config = WinnerFollowConfig {
         sizing_mode: SizingMode::Contract { contracts: 1000 },
@@ -498,85 +488,8 @@ fn scenario_contract_sizing_is_clamped_by_per_trade_cap() {
         )
         .expect("contract sizing should produce order");
     assert_eq!(
-        intent.contracts.0, 50,
-        "contract N=1000 must clamp to the 25 bps per-trade cap (50), got {}",
+        intent.contracts.0, 1000,
+        "contract N must pass through unchanged, got {}",
         intent.contracts.0
-    );
-    assert!(intent.contracts.0 < 1000, "capped count must be < N");
-}
-
-// ─── scenario F9: price-impact book cap (#398 WS2 step 5c) ─────────────────────
-
-/// `book_cap_contracts = None` (gate off / fail-open) leaves the size unchanged: $100/0.50 = 200.
-///
-/// PASS: `intent.contracts.0 == 200`.
-#[test]
-fn scenario_book_cap_none_is_fail_open_passthrough() {
-    let signal = make_signal(0xF9, LeaderAction::Entry); // price $0.50
-    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
-    let intent = strategy
-        .evaluate_at_price(
-            &signal,
-            price(dec!(0.50)),
-            p_high(),
-            clean_snapshot(),
-            dec!(10_000),
-            ExecutionMode::LiveTiny,
-            None,
-            None,
-        )
-        .expect("fail-open should produce order");
-    assert_eq!(
-        intent.contracts.0, 200,
-        "None book cap must not change the size"
-    );
-}
-
-/// `book_cap_contracts = Some(40)` caps the 200-contract size down to 40 (the absorbable depth).
-///
-/// PASS: `intent.contracts.0 == 40` (< 200).
-#[test]
-fn scenario_book_cap_some_reduces_size() {
-    let signal = make_signal(0xF9, LeaderAction::Entry);
-    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
-    let intent = strategy
-        .evaluate_at_price(
-            &signal,
-            price(dec!(0.50)),
-            p_high(),
-            clean_snapshot(),
-            dec!(10_000),
-            ExecutionMode::LiveTiny,
-            Some(40),
-            None,
-        )
-        .expect("capped size should still produce order");
-    assert_eq!(
-        intent.contracts.0, 40,
-        "book cap must min the size to absorbable depth"
-    );
-}
-
-/// `book_cap_contracts = Some(0)` (a successful /book with nothing absorbable within bps) skips the
-/// trade — distinct from the fail-open `None` path.
-///
-/// PASS: `Err(NoEdge)`.
-#[test]
-fn scenario_book_cap_zero_skips_trade() {
-    let signal = make_signal(0xF9, LeaderAction::Entry);
-    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
-    let result = strategy.evaluate_at_price(
-        &signal,
-        price(dec!(0.50)),
-        p_high(),
-        clean_snapshot(),
-        dec!(10_000),
-        ExecutionMode::LiveTiny,
-        Some(0),
-        None,
-    );
-    assert!(
-        matches!(result, Err(WinnerFollowError::NoEdge)),
-        "Some(0) book cap must skip the trade (NoEdge); got {result:?}"
     );
 }

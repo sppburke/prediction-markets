@@ -28,18 +28,14 @@ Every live strategy requires:
 
 `risk-engine` contains pure replayable checks:
 
-- account-level max loss;
-- venue-level exposure;
-- market-level exposure;
-- family-level exposure;
-- source-health gate (using `_GLOSSARY.md` freshness defaults);
-- resolver-card tradability gate;
-- stale-model gate;
-- order-rate gate;
-- reject-rate gate;
-- venue-reconciliation gate;
-- cross-venue fake-hedge gate (`09-`);
-- copy-latency kill switch (production budget in `_GLOSSARY.md`).
+- leader, market, family, and total-copy concentration;
+- exact proposed-trade size against the resolved cap;
+- intraday, rolling-seven-day, and absolute drawdown;
+- the service-derived copy-latency kill-switch state.
+
+Source health, resolver tradability, authenticated account state, jurisdiction, venue reconciliation,
+and reservation/allowance checks remain admission or canary gates around the pure ordinary risk
+snapshot; they are not fabricated financial fields.
 
 ## False edge taxonomy
 
@@ -70,11 +66,13 @@ Every live strategy requires:
 - minimal containers;
 - non-root runtime;
 - signing modules isolated;
-- `flip_human_approved` and `kelly_fraction_above_default_human_approved` (`_GLOSSARY.md`) require signed config changes; both are audit-logged on every change.
+- `flip_human_approved` and `kelly_fraction_above_default_human_approved` (`_GLOSSARY.md`) are exact hot-configuration inputs; changed economic configuration is hash-bound and seals the current qualification evidence before publication.
 
 ## Responsible scaling
 
-Scale only when backtest, shadow, paper, and live-tiny behavior agree per the "close to simulation" definition in `_GLOSSARY.md`.
+Scale only after the sealed paper stream replays exactly, satisfies the promotion gates in
+`_GLOSSARY.md`, and receives the one manual review allowed after a `Pass`. Backtest remains
+non-promotional research evidence; live-tiny is not part of issue #545 qualification.
 
 ## Winner-Follow compliance and risk
 

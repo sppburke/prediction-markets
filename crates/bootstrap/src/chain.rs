@@ -2,8 +2,9 @@
 //!
 //! The `source-onchain-polygon` crate was deleted in the operator/funder purge
 //! (#326), and the on-chain CTF resolution scan was removed when CLOB became the
-//! sole market-resolution source (#369). The surviving bootstrap paths only need
-//! a small, self-contained set of Polygon PoS contract constants:
+//! sole market-resolution source (#369). The surviving bootstrap paths need a
+//! small set of Polygon PoS contract constants; V1 stays local for legacy migration,
+//! while V2 is re-exported from the venue owner:
 //!
 //! - [`auto_migrate_legacy`](crate::migrate::auto_migrate_legacy) — legacy
 //!   V1-done enum-state synthesis for the `wallet_set.json` one-shot
@@ -16,9 +17,11 @@
 //! abstraction and the `eth_getLogs` bisect primitive did NOT survive — only the
 //! exchange/order-filled constants and `normalise_condition_id` remain here.
 //!
-//! Every constant carries its original `verified <date> from <source>` comment.
+//! Every locally owned constant carries its original `verified <date> from <source>` comment.
 
 use alloy_primitives::{Address, B256, address, b256};
+
+pub use pe_venue_polymarket::{CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V2, TOPIC_ORDER_FILLED_V2};
 
 // ── Contract addresses ───────────────────────────────────────────────────────
 
@@ -29,14 +32,6 @@ pub const CTF_EXCHANGE_V1: Address = address!("4bFb41d5B3570DeFd03C39a9A4D8dE6Bd
 /// Polymarket NegRiskCtfExchange V1 (multi-outcome / neg-risk markets).
 /// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
 pub const NEG_RISK_CTF_EXCHANGE_V1: Address = address!("C5d563A36AE78145C45a50134d48A1215220f80a");
-
-/// Polymarket CTFExchange V2 (binary YES/NO markets — current).
-/// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
-pub const CTF_EXCHANGE_V2: Address = address!("E111180000d2663C0091e4f400237545B87B996B");
-
-/// Polymarket NegRiskCtfExchange V2 (multi-outcome / neg-risk — current).
-/// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
-pub const NEG_RISK_CTF_EXCHANGE_V2: Address = address!("e2222d279d744050d28e00520010520000310F59");
 
 /// All Polymarket exchange contracts (V1 + V2). Used to synthesize the legacy
 /// "all contracts enumerated" enum-state marker in
@@ -55,12 +50,6 @@ pub const ALL_EXCHANGE_CONTRACTS: [Address; 4] = [
 /// verified 2026-05-16 via Polygonscan getabi on 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
 pub const TOPIC_ORDER_FILLED_V1: B256 =
     b256!("d0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6");
-
-/// V2 `OrderFilled` — emitted by [`CTF_EXCHANGE_V2`] and [`NEG_RISK_CTF_EXCHANGE_V2`].
-/// Self-validated by [`tests::topic_order_filled_v2_matches_signature`].
-/// verified 2026-05-16 via Polygonscan getabi on 0xE111180000d2663C0091e4f400237545B87B996B
-pub const TOPIC_ORDER_FILLED_V2: B256 =
-    b256!("d543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee");
 
 /// Canonical "what to scan" set used by the legacy enum-state synthesis.
 pub const ALL_ORDER_FILLED_TOPICS: [B256; 2] = [TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2];

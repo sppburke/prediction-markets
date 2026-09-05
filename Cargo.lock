@@ -3591,6 +3591,7 @@ dependencies = [
  "pe-source-core",
  "pe-source-polymarket-public",
  "pe-trader-index",
+ "pe-venue-polymarket",
  "reqwest 0.12.28",
  "rusqlite",
  "rust_decimal",

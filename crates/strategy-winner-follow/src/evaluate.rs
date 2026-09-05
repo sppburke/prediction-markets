@@ -5,8 +5,8 @@ use rust_decimal::prelude::ToPrimitive as _;
 
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, CollateralAmount, ContractQty, KellyFraction, LeaderAction, Price, Probability,
-    ShareAmount, Side, StrategyId,
+    CollateralAmount, ContractQty, KellyFraction, LeaderAction, Price, Probability, ShareAmount,
+    Side, StrategyId,
 };
 use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
 use pe_risk_engine::{
@@ -16,10 +16,7 @@ use pe_risk_engine::{
 use pe_venue_core::OrderIntent;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    SizingMode, WinnerFollowConfig, WinnerFollowError,
-    mode::{ExecutionMode, to_risk_trading_mode},
-};
+use crate::{SizingMode, WinnerFollowConfig, WinnerFollowError, mode::ExecutionMode};
 
 const STRATEGY_ID: &str = "winner-follow";
 const ORDER_VALIDITY_SECONDS: u32 = 30;
@@ -144,18 +141,7 @@ impl WinnerFollowStrategy {
         bankroll: Decimal,
         mode: ExecutionMode,
     ) -> Result<OrderIntent, WinnerFollowError> {
-        // The leader-price wrapper (replay/backtest) applies no price-impact book cap and sizes
-        // the dollar notional at the same price it cost-adjusts against (`None`).
-        self.evaluate_at_price(
-            signal,
-            signal.leader_price,
-            p,
-            snapshot,
-            bankroll,
-            mode,
-            None,
-            None,
-        )
+        self.evaluate_at_price(signal, signal.leader_price, p, snapshot, bankroll, mode)
     }
 
     /// Evaluate a leader signal at an explicit all-in Kelly price and produce an `OrderIntent`
@@ -166,46 +152,32 @@ impl WinnerFollowStrategy {
     /// 2. Use the requested `mode` directly as the effective mode (no signal-kind clamping).
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Size contracts by `config.sizing_mode`:
-    ///    `Dollar { usd }` → `floor(usd / dollar_sizing_price ?? all_in_kelly_price)` (bypasses Kelly + `p`);
+    ///    `Dollar { usd }` → `floor(usd / all_in_kelly_price)` (bypasses Kelly + `p`);
     ///    `Contract { contracts }` → exactly `contracts` (bypasses Kelly + price math);
     ///    `Kelly` → select the mode fraction and pass the caller's exact all-in `c` unchanged to
     ///    `size_contracts`.
-    /// 5. Clamp to `per_trade_cap`, then `min` with `book_cap_contracts` (the price-impact book
-    ///    cap, #398 WS2). Return `NoEdge` if the result is 0 (per-trade cap exhausted, or a
-    ///    `Some(0)` book cap → trade skipped).
-    /// 6. Gate on risk snapshot.
-    /// 7. Build and return `OrderIntent`.
+    /// 5. Return `NoEdge` if the allocation is zero.
+    /// 6. Gate on the caller's complete risk snapshot.
+    /// 7. Build and return `OrderIntent` with that allocation unchanged.
     ///
     /// `all_in_kelly_price` — exact `c` derived by the caller from the signed principal/minimum
     /// shares, compact taker fee, and configured slippage. The strategy never recomputes or
     /// substitutes any fee input. The emitted `limit_price` stays at `signal.leader_price`
     /// regardless (don't-chase).
     ///
-    /// `dollar_sizing_price` — the realistic per-share COST of the position (leader + haircut on
-    /// the live path). When `Some(p)`, it is the divisor for `SizingMode::Dollar` (`floor(usd /
-    /// p)` → `contracts × fill == usd`) AND the basis for the preliminary strategy cap/exposure
-    /// checks. `None` falls back to `all_in_kelly_price`. The venue planner performs the final
-    /// principal-plus-reserve cap checks.
-    ///
     /// `p` — empirical win rate supplied by caller. Used only when `sizing_mode` is `Kelly`.
     ///
-    /// `book_cap_contracts` — contracts absorbable within `price_impact_cap_bps` of best ask, from
-    /// the live `/book` (#398 WS2). `None` = no book result / gate disabled (fail-open passthrough);
-    /// `Some(0)` = a successful read with nothing absorbable (the trade is skipped, distinct from
-    /// fail-open). The orchestrator computes it; replay/backtest pass `None`.
-    ///
-    /// `c` is never computed internally.
-    #[allow(clippy::too_many_arguments)]
+    /// Every book, collateral, and monetary cap is owned by
+    /// `pe_venue_polymarket::plan_sized_buy`; this strategy API neither accepts nor applies a
+    /// second cap. `c` is never computed internally.
     pub fn evaluate_at_price(
         &self,
         signal: &LeaderSignal,
         all_in_kelly_price: Price,
         p: Probability,
-        mut snapshot: RiskSnapshot,
+        snapshot: RiskSnapshot,
         bankroll: Decimal,
         mode: ExecutionMode,
-        book_cap_contracts: Option<u64>,
-        dollar_sizing_price: Option<Price>,
     ) -> Result<OrderIntent, WinnerFollowError> {
         // 1. Flip gate.
         if signal.action == LeaderAction::Flip && !self.config.flip_human_approved {
@@ -220,27 +192,20 @@ impl WinnerFollowStrategy {
             return Err(WinnerFollowError::ShadowMode);
         }
 
-        let notional_price = dollar_sizing_price.unwrap_or(all_in_kelly_price);
-        if notional_price.0.is_zero() {
+        if all_in_kelly_price.0.is_zero() {
             return Err(WinnerFollowError::NoEdge);
         }
 
-        // 4–5. Size contracts by sizing mode.
-        let trading_mode = to_risk_trading_mode(effective_mode);
-        let raw_contracts: u64 = match self.config.sizing_mode {
+        // 4. Produce the uncapped allocation. The venue planner is the sole cap owner.
+        let contracts: u64 = match self.config.sizing_mode {
             SizingMode::Dollar { usd } => {
-                // Fixed USD notional: bypass Kelly fraction + size_contracts. `contracts × fill
-                // == usd`. The per-trade cap (5b), book cap (5c), and risk gate (6) remain active.
-                (usd / notional_price.0)
+                // Fixed USD allocation: bypass Kelly fraction + size_contracts.
+                (usd / all_in_kelly_price.0)
                     .floor()
                     .to_u64()
                     .ok_or(WinnerFollowError::NoEdge)?
             }
-            SizingMode::Contract { contracts } => {
-                // Exactly N contracts: bypass Kelly + price math. Downstream caps still apply; a
-                // configured 0 falls through to the clamped==0 skip below.
-                contracts
-            }
+            SizingMode::Contract { contracts } => contracts,
             SizingMode::Kelly => {
                 // 4. Kelly fraction.
                 let kf = kelly_fraction(effective_mode, self.config.kelly_fraction_override);
@@ -258,36 +223,18 @@ impl WinnerFollowStrategy {
                 contracts.0
             }
         };
-
-        // 5b. Clamp to per-trade cap — against `notional_price` (the real per-share cost), so
-        // the cap bounds `contracts × fill`, the actual money at risk (not the fee-exclusive
-        // raw price).
-        let cap_bps = self.config.per_trade_cap.resolve_bps(trading_mode);
-        let capped =
-            clamp_contracts_to_policy_cap(raw_contracts, notional_price, bankroll, cap_bps, None);
-        // 5c. Price-impact book cap (#398 WS2): `min` with the contracts absorbable within
-        // `price_impact_cap_bps` of best ask. `None` = no `/book` result / gate off (fail-open
-        // passthrough); `Some(0)` = a successful read with nothing absorbable → clamp to 0 → skip.
-        let clamped = match book_cap_contracts {
-            Some(n) => capped.min(n),
-            None => capped,
-        };
-        // Guard: 0 from the per-trade cap (available_bankroll < price) OR a Some(0) book cap → skip.
-        if clamped == 0 {
+        if contracts == 0 {
             return Err(WinnerFollowError::NoEdge);
         }
 
-        // 6. Risk gate. Exposure bps on `notional_price` (the real per-share cost).
-        snapshot.proposed_trade_bps = proposed_trade_bps(clamped, notional_price.0, bankroll);
-        snapshot.per_trade_cap_bps = cap_bps;
-
+        // 6. Risk gate. The caller's snapshot already describes the planned economic proposal.
         match evaluate_risk(&snapshot) {
             RiskDecision::Approved => {}
             RiskDecision::Blocked(reason) => return Err(WinnerFollowError::Blocked(reason)),
         }
 
         // 7. Build OrderIntent.
-        Ok(build_order_intent(signal, clamped, signal.leader_price))
+        Ok(build_order_intent(signal, contracts, signal.leader_price))
     }
 }
 
@@ -336,21 +283,6 @@ fn kelly_fraction(
         // Shadow is filtered before reaching here; fall back to most conservative.
         ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
     }
-}
-
-/// Compute the positive proposed exposure in basis points, rounded outward.
-///
-/// Exposure is a safety limit, so any positive fractional basis point counts as the next whole
-/// basis point. This prevents one atomic unit above a cap from appearing to be within it.
-///
-/// Returns `BasisPoints(0)` if the bankroll is zero or conversion fails.
-fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> BasisPoints {
-    if bankroll <= Decimal::ZERO {
-        return BasisPoints(0);
-    }
-    let notional = Decimal::from(contracts) * price;
-    let bps_decimal = (notional / bankroll) * Decimal::from(10_000u32);
-    BasisPoints(bps_decimal.ceil().to_i32().unwrap_or(i32::MAX))
 }
 
 /// Build the idempotency key per `_GLOSSARY.md` — public so the #508 dispatch aggregate

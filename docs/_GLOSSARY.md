@@ -397,11 +397,8 @@ Campaign financial limits and eligibility are canonical in
 | Key | Default | Meaning |
 |---|---:|---|
 | `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror. Schema three stores quantities, principal, and fees as exact decimal strings and binds each financial mutation to its prepared sequence and `QualificationStarted` identity. It also durably owns reconciled activity revisions, first-entry evidence, terminal `decision_pending`, monotonic wallet fences, position validations, and machine-owned migration metadata. |
-| `paper_fill_haircut_bps` | 500 | Legacy pre-financial-era paper compatibility input. Corrected Winner-Follow economics do not read it. |
-| `paper_fill_slippage_bps` | 100 | Legacy pre-financial-era paper compatibility input. Corrected Winner-Follow economics use the shared signed ladder and configured proportional slippage instead. |
-| `fill_mode` | `clob_best_ask` | Required and ignored only under the pre-Start 17-name compatibility contract. It is rejected as unknown after `QualificationStarted`; corrected economics have one signed-ladder fill path. |
-| `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
-| `gamma_resolution_poll_interval_secs` | 120 | Seconds between Gamma resolution poll rounds in the live service. 2-minute cadence (issue #343) keeps the settled-markets set and "just resolved" wins within ≤2 min of actual resolution; the poll is gated to markets with open unsettled positions and rate-limited (50 ms min-interval), so the frequency increase is bounded by the open-position set, not the full universe |
+| `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for Polymarket Gamma market metadata and mark-price reads. Resolution payout evidence comes from the CLOB market endpoint. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms`. |
+| `gamma_resolution_poll_interval_secs` | 120 | Legacy-named cadence for the service's CLOB resolution poll. The poll is limited to conditions with open unsettled positions; Gamma is not a payout authority. |
 | `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market resolves further than this many seconds into the future. 0 disables the upper bound. Guards against locking capital in months-long markets (issue #290). **172_800 since the 2026-07-03 run28 cutover** — the copy-time twin of `ranker_ttr_hours` (48 h ≈ 72 h on paired weekly P&L, `docs/33` §5; was 259_200/72 h). Paired with `min_resolution_horizon_secs` — one resolution lookup serves both. NOTE: the live `service_config` row must be PATCHed at deploy (`on conflict do nothing` never updates an already-seeded row). |
 | `min_resolution_horizon_secs` | 60 | `ServiceConfig` field. Drop entry signals whose market resolves *sooner* than this many seconds from now — a copy cannot realistically fill and hold a market about to resolve. 0 disables the lower bound. `docs/29`: the 1-minute copy floor; sub-minute "breaks down" (issue #339). |
 
@@ -422,18 +419,17 @@ from effective membership/projection and cannot copy; there is no delete owner f
 
 ### Hot runtime configuration (`service_config`, issues #544 and #545)
 
-The service derives its configuration era once from the verified paper log. Before
-`QualificationStarted`, it accepts the legacy complete 17-name snapshot; `fill_mode` and
-`polymarket_fee_rate` remain required but do not drive corrected economics. After Start it accepts
-the 15 economic names formed by removing those two. In either era every era-owned key is mandatory
-exactly once except `kelly_fraction_override`, which may be absent. A separate optional
-`risk_halt_release_hash` row is incident control and is excluded from the economic configuration
-hash.
+The service derives `ConfigEra` once from the verified paper log. Before
+`QualificationStarted`, `Legacy17` accepts the historical complete snapshot only to preserve its
+canonical pre-Start hash; its two superseded values are private compatibility data and never enter
+corrected economics. After Start, `Financial15` accepts exactly the economic names below. In either
+era every era-owned key is mandatory exactly once except `kelly_fraction_override`, which may be
+absent. A separate optional `risk_halt_release_hash` row is incident control and is excluded from
+the economic configuration hash.
 
 `active_watchlist_size`, `mode`, `max_fill_price`, `min_fill_price`,
-`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `fill_mode`,
-`price_impact_cap_bps`, `flip_human_approved`,
-`kelly_fraction_above_default_human_approved`, `polymarket_fee_rate`,
+`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `price_impact_cap_bps`,
+`flip_human_approved`, `kelly_fraction_above_default_human_approved`,
 `kelly_fraction_override`, `per_trade_cap`, `slippage_rate`, `sizing_mode`,
 `sizing_dollar_usd`, and `sizing_contracts`.
 
@@ -457,8 +453,7 @@ restart-owned `ServiceConfig` TOML/environment contracts where they still exist:
 `bankroll_usd`, `bench_overfetch`, `demotion_cb_alpha`, `demotion_min_trades`,
 `demotion_pnl_window_secs`, `gamma_resolution_poll_interval_secs`,
 `inactivity_hard_cap_secs`, `inactivity_threshold_secs`, `log_retention_days`,
-`maintenance_interval_secs`, `paper_fill_haircut_bps`, `paper_fill_slippage_bps`,
-`status_interval_secs`, `supabase_refresh_interval_secs`, and
+`maintenance_interval_secs`, `status_interval_secs`, `supabase_refresh_interval_secs`, and
 `supabase_sink_reconcile_interval_secs`. It also deletes the retired keys
 `entry_gate_fail_closed`, `position_page_limit`, `position_reseed_interval_secs`,
 `position_size_threshold`, `wallet_market_history_path`,
@@ -558,9 +553,10 @@ few Polygon PoS contract constants the surviving migration/events paths still
 need were relocated into `crates/bootstrap/src/chain.rs` (each keeps its
 `verified <date> from <source>` comment and a self-validating keccak test):
 
-| Symbol (`pe_bootstrap::chain::*`) | Purpose |
+| Symbol | Purpose |
 |---|---|
-| `ALL_EXCHANGE_CONTRACTS`, `ALL_ORDER_FILLED_TOPICS`, `TOPIC_ORDER_FILLED_V1`, `TOPIC_ORDER_FILLED_V2` | Legacy enum-state synthesis in `migrate::auto_migrate_legacy`. |
+| `pe_venue_polymarket::{CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V2, TOPIC_ORDER_FILLED_V2}` | Sole owner of the surviving V2 exchange identities and topic. Bootstrap re-exports these names for legacy enum-state synthesis rather than duplicating their bytes. |
+| `pe_bootstrap::chain::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, TOPIC_ORDER_FILLED_V1}` | Legacy enum-state synthesis in `migrate::auto_migrate_legacy`; the aggregates include the venue-owned V2 constants. |
 | `normalise_condition_id` | `0x` condition-id canonicalisation shared by the Gamma `/events` sweep (relocated from `dune.rs` in #335). |
 
 Surviving cache/cursor artifacts — legacy, **read-only** on the Dune path:
@@ -591,7 +587,6 @@ call count.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `polymarket_fee_rate` | 0.04 | Legacy pre-Start compatibility row, required and ignored in the 17-name era and absent in the 15-name financial era. The compact CLOB market response is the sole runtime fee schedule authority. |
 | `slippage_rate` | 0.01 | Expected proportional BUY slippage applied once to the all-in per-share cost after signed principal and the compact-schedule fee. Canonical default: 100 bps. |
 
 ### Service health (`HealthState`)
@@ -815,7 +810,7 @@ looks, extensions, and second windows are not promotion inputs.
 | `bootstrap_polymarket_wallet_timeout_secs` | 300 | Per-wallet wall-clock budget (seconds) for `pe-bootstrap backfill` / `run`'s Polymarket fetch loop (issue #173). `0` disables the timeout; positive values wrap each `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets that trip the budget are soft-failed (added to `FetchOutcome::failed`); the post-fetch pipeline still runs and `last_polymarket_fetch_at` remains NULL so the next backfill re-queues them. Set via `PE_BOOTSTRAP_POLYMARKET_WALLET_TIMEOUT_SECS`. |
 | `bootstrap_wallet_cache_path` | `"wallet_cache.db"` | SQLite trade cache. WAL mode provides per-commit durability — at most one in-flight wallet's transaction is lost on crash. Set via `PE_BOOTSTRAP_CACHE_PATH`. |
 | `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to a legacy enumerated wallet address list. Consumed once by `migrate::auto_migrate_legacy` (ingested into the pile, then deleted). Not produced by any current path; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
-| `bootstrap_fetch_resolutions` | `false` | When `true`, `pe-bootstrap` fetches resolution data from the Polymarket Gamma API after the trade-fetch phase and stores it in `market_resolutions`. Set `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1` to enable. |
+| `bootstrap_fetch_resolutions` | `false` | When `true`, `pe-bootstrap` runs the Polymarket CLOB closed-market payout walk after trade fetch and stores validated resolution data in `market_resolutions`. Gamma schedule enrichment is separate. Set `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1` to enable. |
 | `bootstrap_rebuild_resolutions` | `false` | One-shot retroactive correction (issue #149 follow-up): when `true`, stage 6 deletes every `market_resolutions` row tagged with an imprecise source (`'gamma'`, `'clob'`) before any fetcher runs; the CLOB stage then re-populates the `'clob'` rows via `INSERT OR IGNORE`. Retained `'polygon'` rows are **not** deleted — they keep their exact block-timestamp `resolved_at_unix`. **#369:** with the on-chain scan removed, CLOB is the only source that re-derives `'clob'` rows (with `end_date_iso`-approximate timestamps); there is no precise on-chain backfill. Idempotent — safe to set on every run. Set `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` to enable. |
 | `bootstrap_skip_trade_fetch` | `false` | When `true`, `pe-bootstrap` skips the Polymarket trade-fetch step entirely. Safe when the trade cache is already fully populated and only subsequent steps (resolutions, filters) need to run. Emits a warn-level log. Set `PE_BOOTSTRAP_SKIP_TRADE_FETCH=1` to enable. |
 | `infra_probe_span_secs` | `3600` | Maximum span (newest − oldest, seconds) across the first 500 trades of a cold-start wallet for it to be classified as infrastructure (issue #197). 500 trades in < 1 h ⇒ > 8 trades/min ⇒ market-maker / treasury / arbitrage bot. Below threshold: wallet is flagged `is_infra = 1`, the probe page is discarded, and downstream consumers skip via the `active_tradeable_wallets` view. The same threshold drives the `pe-bootstrap classify-infra` retroactive sweep over already-cached trades. Override via `PE_BOOTSTRAP_INFRA_SPAN_SECS`; canonical const lives in `pe_bootstrap::infra_probe::DEFAULT_INFRA_SPAN_SECS`. |
@@ -940,6 +935,7 @@ CREATE TABLE leaderboard_snapshots (
 | Key | Default | Meaning |
 |---|---:|---|
 | `backtest_slippage_bps` | 100 | Conservative fill-cost assumption per trade; converted to a rate (`bps / 10_000`) and applied proportionally: BUY fill = `price × (1 + rate)`, SELL fill = `price × (1 − rate)`. The same rate feeds `WinnerFollowConfig.slippage_rate` so Kelly sizing and fill accounting are consistent. |
+| `modeled_polymarket_fee_rate` | 0.04 | Backtest-only, non-promotional exponent-one CLOB fee model. Every BUY calls the venue fee owner once for the final aggregate quantity and signed price, stores the exact modeled fee and aggregate all-in debit, and closes from that aggregate cost. Runtime and qualification never read this setting. Set via `PE_BACKTEST_MODELED_POLYMARKET_FEE_RATE`. |
 | `backtest_step_days` | 1 | Walk-forward simulation step in days; set via `PE_BACKTEST_STEP_DAYS` |
 | `backtest_bankroll_usd` | 10000 | Starting bankroll in USD; set via `PE_BANKROLL_USD` |
 | `backtest_audit_window_days` | 90 | Trade lookback window for ledger reconstruction during simulation; set via `PE_BACKTEST_AUDIT_WINDOW_DAYS` |
@@ -958,8 +954,8 @@ CREATE TABLE leaderboard_snapshots (
 | `liquidity_min_required_usd_default` | 200 | Minimum Gamma `liquidity` USD required to apply the clamp. Below this floor, depth data is too noisy to act on — clamp is bypassed (passthrough with `tracing::warn!`). Tracked via report counter `liquidity_below_floor_bypasses`. Set via `PE_BACKTEST_LIQUIDITY_MIN_REQUIRED_USD`. |
 | `per_trade_cap_default` | `mode_default` | Default `PerTradeCap` variant for `WinnerFollowConfig` and backtest: resolves to 25 bps for LiveTiny, 100 bps for Promoted. Override with `PE_BACKTEST_PER_TRADE_CAP=bps:N` or `PE_BACKTEST_PER_TRADE_CAP=unlimited` in backtest. Ordinary service production requires the complete initial hot snapshot before producers; its reviewed `service_config.per_trade_cap` value is `unlimited`. |
 | `per_trade_cap_unlimited_resolved_bps` | 10 000 | Effective cap in basis points when `PerTradeCap::Unlimited` is selected. Full bankroll — Kelly fraction is the only size constraint. |
-| `sizing_mode_default` | `kelly` | Default for `WinnerFollowConfig.sizing_mode` (#398 WS2; replaced `flat_usd_per_trade`). `kelly` = fractional-Kelly sizing. `dollar` (`sizing_dollar_usd`) sizes each BUY as `max(1, floor(usd / resolved_fill_basis))` contracts; `contract` (`sizing_contracts`) sizes exactly N contracts. The per-trade cap, risk gate, and mandatory price-impact book cap remain active in all modes. The deployed service's reviewed hot snapshot uses `dollar` / `sizing_dollar_usd = 25`; an ordinary-live account with NULL `accounts.live_sizing_mode` falls back to this shared mode, otherwise `accounts.live_sizing_*` overrides it (#516). |
-| `price_impact_cap_bps_default` | `100` | Mandatory hot `RuntimeConfig.price_impact_cap_bps` and new-install seed (#544): **the sole policy order-size limit** below the always-applying available-bankroll bound. One CLOB `/book` fetch per admitted BUY feeds the shared band gate, budget-based executable-ladder planner, and — in paper `clob_best_ask` mode — exact ladder-VWAP fill basis. Missing, unusable, corrupt, empty, stale, or timed-out evidence fails closed before any destination stages. A successful read with no paper-affordable whole share anchors the shared band at best ask, permits any otherwise-admissible live staging, and then records a paper-only skip. Boot requires the row; edits accept only `1..=10_000`. Zero and out-of-range values reject the whole snapshot and retain the last-good one; there is no gate-off construction path. |
+| `sizing_mode_default` | `kelly` | Default for `WinnerFollowConfig.sizing_mode`. `kelly` uses the venue planner's aggregate-fee convergence chain; `dollar` derives conservative principal from `sizing_dollar_usd`; `contract` passes exactly `sizing_contracts` shares and declines rather than shrinking when any cap is exceeded. No mode has a one-contract fallback. The deployed service's reviewed hot snapshot uses `dollar` / `sizing_dollar_usd = 25`; an ordinary-live account with NULL `accounts.live_sizing_mode` falls back to this shared mode, otherwise `accounts.live_sizing_*` overrides it (#516). |
+| `price_impact_cap_bps_default` | `100` | Mandatory hot `RuntimeConfig.price_impact_cap_bps` and new-install seed (#544). One recorded CLOB `/book` read feeds the sole tick-aware sized-buy planner. Every monetary cap bounds signed principal plus the conservative fee reserve; unusable evidence, insufficient depth, venue dust, or a cap excess is a typed decline. Boot requires the row; edits accept only `1..=10_000`. |
 | `clob_book_hot_path_timeout_secs` | `2` | Timeout for the orchestrator's single mandatory hot-path CLOB `/book` fetch. A timeout fails closed; no cap bypass or haircut fallback remains. |
 | `backtest_suppression_warn_threshold_pct` | 30 | Single warn threshold shared by every per-quarter BUY-signal suppression diagnostic (`expiry_filter_suppression_pct`, `high_price_suppression_pct`, …). Logged as a warning when any quarter exceeds it. Hardcoded as `SUPPRESSION_WARN_THRESHOLD` in `crates/backtest/src/simulation.rs`. |
 | `backtest_require_known_expiry_default` | `true` | Strict-mode flag for the `max_hours_to_expiry` filter. `true` (default after #137 Sub-PR 3, gated on PR #154 stage 6f raising trade-set schedule coverage to 99.64%) — when both schedule and resolution are absent for a market, the BUY signal fails closed (suppressed). `false` (rollback / legacy) — both-absent allows the trade through. The fallback chain (schedule → resolution → flag) was unified in PR #139; pre-#139 the NULL-schedule path short-circuited to allow regardless of resolution. Set via `PE_BACKTEST_REQUIRE_KNOWN_EXPIRY`. |

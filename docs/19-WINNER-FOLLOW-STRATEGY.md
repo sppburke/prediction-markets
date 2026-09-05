@@ -291,9 +291,13 @@ The service completes and validates the mandatory Supabase hot snapshot before a
 There is no configuration-outage producer posture: production applies the reviewed
 `per_trade_cap=unlimited` together with the mandatory impact cap, or boot fails closed.
 
-Clamp formula: `max_contracts = floor(bankroll × cap_bps / 10_000 / price)`. When `max_contracts == 0` (bankroll < price), the strategy returns `NoEdge`.
+The strategy returns its configured fixed quantity or monetary allocation without applying a book or
+notional clamp. The venue planner alone evaluates signed principal plus reserve against the resolved
+per-trade, impact, account, and free-collateral bounds. A fixed Contract request that exceeds one of
+those bounds is declined as `CapExceeded`; it is never silently reduced.
 
-The risk engine retains `PerTradeSizeExceeded` as a defense-in-depth gate. Under normal flow the clamp prevents it from firing; it fires only on a programming error (e.g. `clamp_contracts_to_cap` bypassed).
+The risk engine retains `PerTradeSizeExceeded` as an independent proposal gate. The proposal supplied
+to it is derived from the exact sized plan rather than from a preliminary strategy-side notional.
 
 Backtest override: `PE_BACKTEST_PER_TRADE_CAP=unlimited` (or `bps:N` / `mode_default`). Canonical defaults: `per_trade_cap_default` and `per_trade_cap_unlimited_resolved_bps` in `_GLOSSARY.md`.
 
@@ -308,12 +312,14 @@ Contract { contracts } → minimum shares = exactly N
 ```
 
 All modes share one signed ask ladder and compact CLOB fee schedule. Its worst accepted tick is the
-signed price; signed principal and minimum shares are exact six-decimal amounts. The fee is computed
-once at that price and truncated to five decimals. Kelly uses the resulting all-in price after
-slippage. Dollar mode derives conservative principal from its monetary budget; Contract and Kelly
-derive principal from signed shares. Every monetary cap bounds principal plus the conservative fee
-reserve. Quantity below the venue minimum, unusable depth, stale evidence, or an invalid all-in price
-is a typed rejection with no fallback or sizing loop.
+signed price; signed principal is exact collateral and minimum shares use tick scale plus two share
+decimals. The fee is computed once for the final aggregate quantity at that price and truncated to
+five decimals. Kelly first derives a candidate from the one-share all-in cost, recomputes the
+aggregate all-in cost for that candidate, resizes once, and takes the smaller size. Dollar mode
+derives conservative principal from its monetary budget; Contract passes exactly its configured
+shares. Every monetary cap bounds principal plus the conservative fee reserve. Quantity below the
+venue minimum, unusable depth, stale evidence, or an invalid all-in price is a typed rejection with
+no fallback or fixed-point loop.
 
 **When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 
@@ -392,7 +398,7 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 |---|---|---|---|---|
 | A | Hold-to-resolution | `(market, outcome)` not already held | the coherent exact financial snapshot, rebuilt before producers | The cohort wallets sell winners early; dropping every later signal on a held contract (including the leader's own exits) reproduces copy-and-hold. Prepared/Final authority, exact positions, and causal Resolution Finals establish durable state. |
 | B | BUY-only first-ever entry | `signal.leader_side == Buy` **and** `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | wallet-second bucket commit + durable `entry_gate_results` / `wallet_market_history_v2`; `CopyEntryGate` is the rebuilt in-memory projection | The cohort was selected on first-ever BUYs. Drops every SELL, `Add`/`Trim`/`Exit`/`Flip`, and re-entry. Equal-second candidates are decided together from immutable pre-bucket state: two candidates in one market are all `ambiguous_first_entry_same_second`; one candidate consumes history even when a later gate rejects it (#544). |
-| C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | `orchestrator.rs::check_resolution_horizon` | Too far out locks capital for months; too soon (< 60 s) cannot be filled and held (`docs/29` copy floor). Resolution time from `MarketEndCache` (Gamma). Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). One lookup serves both bounds. |
+| C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | admission's recorded CLOB-long `scheduled_end_unix` | Too far out locks capital for months; too soon (< 60 s) cannot be filled and held (`docs/29` copy floor). The same admission read supplies the horizon and economic evidence; the dashboard market-end cache is not consulted by this path. Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). |
 | D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Paper and ordinary live use the same signed principal, minimum shares, fee schedule, and all-in price. Gamma mid is liveness/mark evidence only. The upper boundary skips and the lower boundary fills. |
 
 **Copy-latency budget (both provenances).** In websocket-primary mode the orchestrator applies `copy_latency_budget_secs` (`_GLOSSARY.md`) to every observation — REST poll or activity websocket — before gate B and again immediately before dispatch staging: an observation older than the budget is admitted for seen/leader bookkeeping with a typed no-copy disposition and stages no copy (#530/#546).
@@ -410,15 +416,17 @@ audit evidence and the no-chase ceiling; it cannot substitute for current-book e
 
 ## Strategy-level trade gates
 
-These five gates live in `crates/strategy-winner-follow/src/evaluate.rs` and fire in both backtest and production. They are checked before the risk engine is called. A gate returning `Err(WinnerFollowError::*)` means `evaluate_risk()` is never reached for that signal.
+The strategy evaluator owns flip, mode, zero-allocation, and risk decisions. The venue planner owns
+book, minimum, and cap decisions. A gate returning `Err(WinnerFollowError::*)` means the evaluator
+does not emit an intent; a planner `CapExceeded` is mapped by the caller to its typed decline audit.
 
 | # | Gate | Condition | Source | `WinnerFollowError` | Rationale |
 |---|---|---|---|---|---|
 | 1 | Flip not approved | `signal.action == Flip && !config.flip_human_approved` | `evaluate.rs:62–64` | `FlipNotApproved` | Position flips (exit + re-enter opposite side) are high-risk and default-deny. The flag prevents automated flip copying until an operator approves it via the audit-logged Supabase admin panel (`service_config`, #398 Decision #2). |
 | 2 | Shadow mode | `effective_mode == Shadow` | `evaluate.rs:70–72` | `ShadowMode` | Shadow is record-only; no order is emitted. Returned as `Err` (not a hard failure) so callers can distinguish "intentionally suppressed" from "legitimately blocked". |
-| 3 | All-in price invalid | the shared economic owner cannot construct `Price((principal + fee) / minimum_shares × (1 + slippage_rate))` | economic preparation | `NoEdge` | Exact fee and slippage leave no valid payoff geometry. |
-| 4 | Kelly sizes to zero | `size_contracts` at the all-in price returns zero | shared sizing owner | `NoEdge` | The valid signal is unsizeable at the chosen Kelly fraction. |
-| 5 | Budget or venue minimum | principal plus reserve exceeds a monetary cap, or exact shares are below the market minimum | shared ladder/sizing owner | typed sizing decline | No whole-share fallback is permitted; fractional signed quantities are retained exactly. |
+| 3 | Zero strategy allocation | Dollar truncation or Kelly sizing returns zero | `evaluate.rs` | `NoEdge` | The evaluator emits no zero-sized intent. Contract passes its configured nonzero `N` unchanged. |
+| 4 | Invalid aggregate all-in price | the venue sizing chain cannot construct `Price((principal + fee) / minimum_shares × (1 + slippage_rate))` | shared ladder/sizing owner | typed sizing decline | Exact aggregate fee and slippage leave no valid payoff geometry. |
+| 5 | Budget, book, or venue minimum | principal plus reserve exceeds a monetary cap, depth is insufficient, or exact shares are below the market minimum | shared ladder/sizing owner | typed sizing decline | No whole-share fallback is permitted; Contract is declined rather than clamped. |
 
 Gates 1–5 fire in order. Gate 6 onward is the risk-engine (`evaluate_risk`), which returns `RiskDecision::Blocked(reason)` → `Err(WinnerFollowError::Blocked(reason))`. See the risk-block taxonomy below for the ordinary risk-engine block reasons.
 Every strategy refusal is stored as the isomorphic `WinnerFollowDeclineAudit`; display text is not
@@ -429,8 +437,9 @@ strategy decline.
 
 ```
 simulation.rs gates (backtest only, lines 457-518)
-  → strategy-level gates 1-5 (evaluate.rs, both backtest and production)
-      → risk-engine evaluate_risk() → 10 RiskBlock variants (production and backtest)
+  → shared venue sizing/book gates
+      → strategy flip/mode/allocation gate
+          → risk-engine evaluate_risk() → 9 ordinary RiskBlock variants
 ```
 
 ## Risk-block taxonomy and halt scope

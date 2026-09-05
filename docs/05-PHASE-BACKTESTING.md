@@ -57,6 +57,12 @@ Implement conservative fill models:
 
 Reports must label which fill model was used.
 
+Polymarket BUYs also use the venue-owned exponent-one fee function with the backtest-only modeled
+rate in `_GLOSSARY.md`. Kelly sizing uses the same deterministic aggregate-fee convergence chain as
+the venue planner. Every open position retains aggregate principal, fee, and all-in debit; resolution,
+SELL, and mark-to-market accounting never reconstruct aggregate cost by multiplying a rounded
+per-share average.
+
 ## Property and concurrency testing
 
 Use `proptest` for timing, rounding, tie rules, benchmark averages, weather windows, compatibility classes, price conversion, and risk limits.

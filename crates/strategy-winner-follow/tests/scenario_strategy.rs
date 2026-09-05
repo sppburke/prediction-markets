@@ -49,14 +49,6 @@ fn p_high() -> Probability {
     Probability::new(dec!(0.70)).expect("0.70 is valid")
 }
 
-/// Moderate win rate yielding ~205 Kelly contracts on $10k (82 bps notional) — strong edge
-/// but stays under all concentration caps (funder-inherited 100, market 200, operator 300 bps)
-/// so Unlimited-cap scenarios don't hit risk-gate blocks.
-/// c = price × (1 + fee_rate + slippage_rate) = 0.40 × 1.05 = 0.42.
-fn p_moderate() -> Probability {
-    Probability::new(dec!(0.44)).expect("0.44 is valid")
-}
-
 fn make_signal(wallet_byte: u8, action: LeaderAction) -> LeaderSignal {
     LeaderSignal {
         leader: TraderId(wallet(wallet_byte)),
@@ -211,91 +203,6 @@ fn scenario_flip_approved_passes_gate() {
     assert!(
         !matches!(result, Err(WinnerFollowError::FlipNotApproved)),
         "approved Flip must pass the gate; got {result:?}"
-    );
-}
-
-// ─── scenario 8: bps cap clamps contracts ────────────────────────────────────
-
-/// With a 25-bps cap and bankroll=$10_000:
-/// cap_usd = $10_000 × 25/10_000 = $25.00 (25 bps = 0.25% of bankroll);
-/// max_contracts = floor($25.00 / $0.40) = floor(62.5) = 62.
-/// Kelly at p=0.44 gives ~205 contracts → clamped to 62.
-///
-/// PASS: `intent.contracts.0 == 62` (Kelly would have sized ~205 without cap).
-#[test]
-fn scenario_clamp_bps_cap_limits_contracts() {
-    let signal = make_signal(0x08, LeaderAction::Entry);
-    let config = WinnerFollowConfig {
-        per_trade_cap: PerTradeCap::Bps(25),
-        ..WinnerFollowConfig::default()
-    };
-    let strategy = WinnerFollowStrategy::new(config);
-
-    let result = strategy.evaluate(
-        &signal,
-        p_moderate(), // p=0.44: Kelly ~205 contracts, clamped to 62 at 25 bps
-        clean_snapshot(),
-        dec!(10_000),
-        ExecutionMode::LiveTiny,
-    );
-
-    let intent = result.expect("strong edge should produce an order");
-    // cap_usd = 10_000 × 25 / 10_000 = $25.00; max_contracts = floor(25.00 / 0.40) = 62
-    assert_eq!(
-        intent.contracts.0, 62,
-        "25-bps cap on $10k bankroll at price $0.40 must yield exactly 62 contracts"
-    );
-    assert!(
-        intent.contracts.0 <= 62,
-        "contracts must not exceed cap; got {}",
-        intent.contracts.0
-    );
-}
-
-// ─── scenario 9: unlimited cap yields larger order than bps cap ───────────────
-
-/// With `Unlimited` cap (10_000 bps = full bankroll), contracts are no longer
-/// constrained by the 25-bps default. The capped result is 62 contracts (25 bps
-/// on $10k at $0.40); the unlimited result must exceed that.
-///
-/// PASS: `unlimited > capped` (i.e. `unlimited > 62`).
-#[test]
-fn scenario_unlimited_cap_yields_more_contracts_than_bps_cap() {
-    let signal = make_signal(0x09, LeaderAction::Entry);
-    let config_capped = WinnerFollowConfig {
-        per_trade_cap: PerTradeCap::Bps(25),
-        ..WinnerFollowConfig::default()
-    };
-    let config_unlimited = WinnerFollowConfig {
-        per_trade_cap: PerTradeCap::Unlimited,
-        ..WinnerFollowConfig::default()
-    };
-    let capped = WinnerFollowStrategy::new(config_capped)
-        .evaluate(
-            &signal,
-            p_moderate(),
-            clean_snapshot(),
-            dec!(10_000),
-            ExecutionMode::LiveTiny,
-        )
-        .expect("capped order")
-        .contracts
-        .0;
-    let unlimited = WinnerFollowStrategy::new(config_unlimited)
-        .evaluate(
-            &signal,
-            p_moderate(),
-            clean_snapshot(),
-            dec!(10_000),
-            ExecutionMode::LiveTiny,
-        )
-        .expect("unlimited order")
-        .contracts
-        .0;
-
-    assert!(
-        unlimited > capped,
-        "unlimited cap must yield more contracts than 25-bps cap; unlimited={unlimited}, capped={capped}"
     );
 }
 

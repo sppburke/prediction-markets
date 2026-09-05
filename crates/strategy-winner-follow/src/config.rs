@@ -53,13 +53,11 @@ pub enum SizingMode {
     /// Fractional-Kelly sizing (the full `c` / `p` / bankroll math). Default.
     #[default]
     Kelly,
-    /// Fixed USD notional: `floor(usd / current_price)` contracts. A zero result is rejected;
-    /// this bypasses only the Kelly
-    /// fraction + price-derived math; the per-trade cap, price-impact book cap, and risk gate still
-    /// apply. The migration target for the legacy `flat_usd_per_trade`.
+    /// Fixed USD allocation: `floor(usd / all_in_price)` contracts. A zero result is rejected;
+    /// the venue planner subsequently enforces the book, collateral, and monetary caps.
     Dollar { usd: Decimal },
-    /// Fixed contract count, then clamped by the per-trade cap, price-impact book cap, and risk
-    /// gate.
+    /// Fixed contract count passed through unchanged. The venue planner rejects, rather than
+    /// shrinks, a request that exceeds any book, collateral, or monetary cap.
     Contract { contracts: u64 },
 }
 

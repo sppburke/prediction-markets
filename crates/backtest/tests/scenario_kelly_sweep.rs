@@ -205,8 +205,6 @@ fn override_changes_sizing_vs_default() {
             clean_risk_snapshot(),
             bankroll,
             ExecutionMode::Paper,
-            None,
-            None,
         )
         .expect("default strategy should approve");
 
@@ -218,8 +216,6 @@ fn override_changes_sizing_vs_default() {
             clean_risk_snapshot(),
             bankroll,
             ExecutionMode::Paper,
-            None,
-            None,
         )
         .expect("override strategy should approve");
 
@@ -301,8 +297,6 @@ fn higher_fraction_yields_more_contracts() {
                 clean_risk_snapshot(),
                 bankroll,
                 ExecutionMode::Paper,
-                None,
-                None,
             )
             .unwrap_or_else(|e| panic!("evaluate failed for fraction {frac}: {e}"));
         counts.push(intent.contracts.0);

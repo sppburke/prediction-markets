@@ -40,9 +40,9 @@ cargo build --release -p pe-bootstrap
   rebuild.
   Symptom to recognize: `sqlite: unable to open database file` from a stage whose cache
   path is demonstrably writable.
-- **Market resolutions (no RPC).** The resolution pipeline is CLOB → Gamma:
-  the Polymarket CLOB `/markets?closed=true` listing is the sole resolution
-  source (#369; key-free), with Gamma supplying open-market schedules/liquidity.
+- **Market resolutions (no RPC).** The Polymarket CLOB `/markets?closed=true`
+  listing is the sole payout-resolution source (#369; key-free). Gamma supplies
+  schedules, event mappings, liquidity, and mark-price inputs, never payouts.
   No Polygon RPC / Alchemy provider is required.
 - **Supabase + Python.** `.env` must carry `SUPABASE_URL` + `SUPABASE_SECRET_KEY`
   (the push reads them). `rank_and_push.sh` selects its own interpreter so the documented
@@ -51,8 +51,8 @@ cargo build --release -p pe-bootstrap
   not silently use the system `python3`. Install `scripts/requirements.txt` into one of those
   repository environments. Before taking the PID lock, creating a run directory, or refreshing
   the cache, the wrapper imports its required modules and exits with remediation instructions if
-  the environment is incomplete. DuckDB remains optional under `engine=auto` (SQLite fallback)
-  and is mandatory under `engine=duck`.
+  the environment is incomplete. Schema one retains `engine=auto` with its SQLite fallback;
+  schema two requires the verified Parquet/DuckDB path and rejects SQLite.
 
 ---
 
@@ -85,12 +85,12 @@ not new discovery.)
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap backfill
 
-# 2. Refresh condition→event + fee mappings (needed by the ranker's
+# 2. Refresh condition→event mappings (needed by the ranker's
 #    distinct-events eligibility gate; backfill does not cover this).
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap events
 
-# 3. (Optional) Run the full CLOB resolution re-walk + Gamma auxiliaries explicitly.
+# 3. (Optional) Run the full CLOB resolution re-walk explicitly.
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 \
   ./target/release/pe-bootstrap resolutions
@@ -122,7 +122,7 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 > - **The 403 gate is the literal `Python-urllib/*` default User-Agent, not "missing browser UA".**
 >   `&closed=true` returned 200 for a *headerless* request (a bare `reqwest::Client`, = the shipped
 >   Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and 403
->   **only** for `Python-urllib/3.11`. So `pe-bootstrap`'s CLOB closed walk and the paper-pnl
+>   **only** for `Python-urllib/3.11`. So `pe-bootstrap`'s CLOB closed walk and the service CLOB
 >   resolution poller (both UA-less) do **not** 403; transport was healthy during the 2026-06-24
 >   through 2026-08-21 cursor-wedge incident, while repeat resolution ingestion was not. The proven
 >   scripts' "browser UA required (else 403)" note is correct only because `urllib` auto-injects the
@@ -133,7 +133,7 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 >   no longer lists, not truncation). Comma-separated joining returns 0 — repeat-key is mandatory.
 >   Observed cap ≥ 100; default `gamma_batch_size` stays 50 (`_GLOSSARY.md`).
 > - This unblocks a shared batched Gamma client (~60× the per-ID ~20 req/s) across `pe-bootstrap`,
->   `pe-service`, and `pe-paper-pnl` — including the *open* passes, which the stale
+>   `pe-service` and bootstrap metadata paths — including the *open* passes, which the stale
 >   `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" comment wrongly excludes.
 
 **Exit codes** (a vocabulary — each `pe-bootstrap` subcommand emits a subset):
@@ -155,8 +155,8 @@ sqlite3 data/wallet_cache.db "
 ```
 
 `newest_trade` should be within the last day or two. If `resolved_mkts` is low
-relative to the markets your wallets traded, re-run step 3 (the CLOB → Gamma
-resolution pipeline — no RPC required, #369/#372).
+relative to the markets your wallets traded, re-run step 3 (the CLOB resolution
+walk — no RPC required, #369/#372).
 
 > **Backfill before pushing (issue #350 WS3).** The Supabase upload
 > (`scripts/push_ranking_to_supabase.py`, invoked by `scripts/rank_and_push.sh`)

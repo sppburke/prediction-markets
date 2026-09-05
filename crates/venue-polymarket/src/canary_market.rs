@@ -5,9 +5,14 @@ use pe_core_types::{
 };
 use polymarket_client_sdk_v2::clob::types::response::ClobMarketInfoResponse;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
-use crate::fee::{CompactFeeSchedule, FeeScheduleError, parse_compact_fee_schedule};
+use std::collections::BTreeMap;
+
+use crate::fee::{
+    CompactFeeSchedule, FeeScheduleError, parse_compact_fee_schedule, parse_decimal_lexeme,
+};
 
 /// Economics-bearing projection of the compact `/clob-markets/{condition}` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +35,7 @@ pub struct ClobMarketEvidence {
     pub raw_clob_market_hash: blake3::Hash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AskLevel {
     pub price: Price,
     pub shares: ShareAmount,
@@ -47,7 +52,7 @@ pub struct CanaryBookSnapshot {
     pub raw_hash: blake3::Hash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutableLadder {
     pub used_asks: Vec<AskLevel>,
     pub best_ask: Price,
@@ -109,6 +114,20 @@ pub fn parse_compact_market(
     // Classify from the raw wire bytes before deserializing the shared DTO so an explicit
     // `null` base fee cannot collapse into the same `Option::None` as an absent field.
     let fee_schedule = parse_compact_fee_schedule(short_raw)?;
+    let raw_fields: BTreeMap<String, Box<RawValue>> = serde_json::from_slice(short_raw)
+        .map_err(|error| CanaryMarketError::Json(error.to_string()))?;
+    let minimum_order_size = raw_fields
+        .get("mos")
+        .ok_or(CanaryMarketError::MarketRules)
+        .and_then(|raw| parse_decimal_lexeme(raw).map_err(|_| CanaryMarketError::MarketRules))
+        .and_then(|value| {
+            ShareAmount::from_decimal_exact(value).map_err(|_| CanaryMarketError::MarketRules)
+        })?;
+    let minimum_tick_size = raw_fields
+        .get("mts")
+        .ok_or(CanaryMarketError::MarketRules)
+        .and_then(|raw| parse_decimal_lexeme(raw).map_err(|_| CanaryMarketError::MarketRules))
+        .and_then(|value| Price::new(value).map_err(|_| CanaryMarketError::MarketRules))?;
     let short: ClobMarketInfoResponse = serde_json::from_slice(short_raw)
         .map_err(|error| CanaryMarketError::Json(error.to_string()))?;
     let condition_id = PolymarketConditionId(short.condition_id.to_string());
@@ -126,10 +145,6 @@ pub fn parse_compact_market(
     if &condition_id != expected_condition || &token_ids != expected_tokens {
         return Err(CanaryMarketError::IdentityMismatch);
     }
-    let minimum_order_size = ShareAmount::from_decimal_exact(short.min_order_size)
-        .map_err(|_| CanaryMarketError::MarketRules)?;
-    let minimum_tick_size =
-        Price::new(short.min_tick_size.as_decimal()).map_err(|_| CanaryMarketError::MarketRules)?;
     if minimum_order_size == ShareAmount::ZERO || minimum_tick_size == Price::ZERO {
         return Err(CanaryMarketError::MarketRules);
     }
@@ -315,7 +330,9 @@ pub fn executable_ladder(
         | crate::ladder::LadderError::InsufficientDepth
         | crate::ladder::LadderError::NothingAffordable
         | crate::ladder::LadderError::BelowMinimum
-        | crate::ladder::LadderError::CapExceeded => CanaryMarketError::InsufficientDepth,
+        | crate::ladder::LadderError::CapExceeded
+        | crate::ladder::LadderError::NoEdge
+        | crate::ladder::LadderError::KellySizing => CanaryMarketError::InsufficientDepth,
     })?;
     Ok(ExecutableLadder {
         used_asks: plan.used_asks,
@@ -400,6 +417,10 @@ mod tests {
                 maximum_collateral: CollateralAmount::from_decimal_exact(dec!(0.55)).unwrap(),
             }
         );
+        assert_eq!(
+            serde_json::to_vec(&ladder).unwrap(),
+            br#"{"used_asks":[{"price":"0.10","shares":2000000},{"price":"0.11","shares":3000000}],"best_ask":"0.10","limit_price":"0.11","shares":5000000,"maximum_collateral":550000}"#
+        );
     }
 
     #[test]
@@ -454,6 +475,23 @@ mod tests {
         );
         assert_eq!(parsed.minimum_order_size.to_decimal(), dec!(5));
         assert_eq!(parsed.minimum_tick_size.0, dec!(0.01));
+    }
+
+    #[test]
+    fn compact_rules_preserve_exact_raw_numeric_lexemes() {
+        let (condition, tokens) = compact_identity();
+        let raw = format!(
+            r#"{{"c":"{CONDITION}","t":[{{"t":"11","o":"Yes"}},{{"t":"22","o":"No"}}],"mts":"1e-2","mos":"5.000001","nr":false,"fd":{{"r":"1e-7","e":1,"to":true}}}}"#
+        );
+        let parsed = parse_compact_market(raw.as_bytes(), &condition, &tokens).unwrap();
+        assert_eq!(parsed.minimum_order_size.to_decimal(), dec!(5.000001));
+        assert_eq!(parsed.minimum_tick_size.0, dec!(0.01));
+        assert_eq!(
+            parsed.fee_schedule,
+            CompactFeeSchedule::Taker {
+                rate: dec!(0.0000001)
+            }
+        );
     }
 
     #[test]
