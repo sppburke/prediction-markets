@@ -23,7 +23,6 @@ use pe_execution_core::{
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
-use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
 use pe_venue_polymarket::{
     CustodyKind, LadderError, RedemptionTransport, RelayerApiKeyCredentials, RelayerCredentials,
@@ -742,9 +741,8 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
         total_copy_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        onchain_source_status: SourceStatus::Healthy,
-        copy_latency_p95_ms: 0,
-        trading_mode: TradingMode::LiveTiny,
+        absolute_pnl_bps: BasisPoints(0),
+        copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(0),
         per_trade_cap_bps: 0,
         concentration_caps: None,

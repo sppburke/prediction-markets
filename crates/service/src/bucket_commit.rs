@@ -7,9 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use pe_copy_signal_engine::{
-    IncomingTrade, PositionState, SignalConfig, TradeProvenance, classify_leader_action,
-};
+use pe_copy_signal_engine::{IncomingTrade, PositionState, SignalConfig, TradeProvenance};
 use pe_core_types::{
     LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, Probability, ProbabilityPpm,
     ReconstructionQuality, ShareAmount, Side, SourceTradeId, WalletAddress,
@@ -22,7 +20,7 @@ use pe_paper_state::{
 };
 use pe_position_ledger::{
     AppliedEffect, LedgerEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation,
-    PositionLedger, WalletFenceCause,
+    PositionLedger, SecondVerdict, TradeDecision, WalletFenceCause, classify_complete_second,
 };
 use pe_source_polymarket_public::ActivityAggregate;
 use rust_decimal::Decimal;
@@ -644,9 +642,29 @@ impl BucketCommitEngine {
                 None
             }
         });
-        match order_independent_validity(&self.ledger, wallet, &mutations) {
-            Ok(true) => {}
-            Ok(false) => {
+        let history_complete = context
+            .history_status
+            .as_ref()
+            .filter(|status| status.wallet == wallet)
+            .map_or_else(
+                || self.complete_history.contains(&wallet),
+                |status| status.complete,
+            );
+        let (applied, trade_decisions, first_entries) = match classify_complete_second(
+            &self.ledger,
+            wallet,
+            &mutations,
+            context.reconstruction_quality,
+            &context.signal_config,
+            history_complete,
+            &|market_id| self.entry_gate.has_market(&wallet, market_id),
+        ) {
+            Ok(SecondVerdict::OrderIndependent {
+                applied,
+                decisions,
+                first_entries,
+            }) => (applied, decisions, first_entries),
+            Ok(SecondVerdict::OrderDependent { .. }) => {
                 let trigger = mutations
                     .iter()
                     .find(|mutation| {
@@ -677,91 +695,21 @@ impl BucketCommitEngine {
                     context,
                 );
             }
-        }
-
-        let pre_snapshot = self.ledger.position(&wallet).cloned();
-        let mut candidate = self.ledger.clone();
-        let applied = match candidate.apply_all_or_none(&mutations) {
-            Ok(applied) => applied,
-            Err(error) => {
-                return self.commit_fence(
-                    &aggregates,
-                    wallet,
-                    source_epoch,
-                    error.fence_cause(),
-                    mutation_error_id(&error),
-                    context,
-                );
-            }
         };
 
-        let mut trade_decisions = Vec::new();
-        let mut touched_count: BTreeMap<String, usize> = BTreeMap::new();
-        for mutation in &mutations {
-            for key in mutation.touched_keys() {
-                let encoded = encode_key(&key);
-                let count = touched_count.entry(encoded).or_default();
-                *count = count.saturating_add(1);
-            }
-        }
-        for mutation in &mutations {
-            let LedgerEffect::Trade {
-                market_id,
-                outcome_id,
-                side,
-                amount,
-                price,
-            } = mutation.effect.effective()
-            else {
-                continue;
-            };
-            let trade = IncomingTrade {
+        let mut candidate = self.ledger.clone();
+        if let Err(error) = candidate.apply_all_or_none(&mutations) {
+            return self.commit_fence(
+                &aggregates,
                 wallet,
-                market_id: market_id.clone(),
-                outcome_id: *outcome_id,
-                side: *side,
-                price: *price,
-                contracts: *amount,
-                observed_at: mutation.source_time.0,
-                received_at: mutation.source_time.0,
-                source_trade_id: mutation.source_trade_id.clone(),
-                transaction_hash: Some(mutation.transaction_hash.clone()),
-                provenance: context
-                    .observation_provenance
-                    .get(&mutation.source_trade_id)
-                    .copied()
-                    .unwrap_or(TradeProvenance::RestPoll),
-            };
-            let action = classify_leader_action(
-                &trade,
-                pre_snapshot.as_ref(),
-                context.reconstruction_quality,
-                &context.signal_config,
+                source_epoch,
+                error.fence_cause(),
+                mutation_error_id(&error),
+                context,
             );
-            let key = MarketOutcomeId::new(market_id.clone(), *outcome_id);
-            trade_decisions.push(TradeDecision {
-                source_trade_id: mutation.source_trade_id.clone(),
-                market_id: market_id.clone(),
-                side: *side,
-                action,
-                action_order_dependent: touched_count
-                    .get(&encode_key(&key))
-                    .copied()
-                    .unwrap_or_default()
-                    > 1,
-            });
         }
-
-        let history_complete = context
-            .history_status
-            .as_ref()
-            .filter(|status| status.wallet == wallet)
-            .map_or_else(
-                || self.complete_history.contains(&wallet),
-                |status| status.complete,
-            );
         let (gate_results, history_effects, gate_outcomes) =
-            self.derive_gate_results(wallet, source_epoch, history_complete, &trade_decisions);
+            Self::derive_gate_results(wallet, source_epoch, &trade_decisions, &first_entries);
 
         let mut pending = Vec::new();
         let mut dispositions = BTreeMap::new();
@@ -1125,71 +1073,33 @@ impl BucketCommitEngine {
     }
 
     fn derive_gate_results(
-        &self,
         wallet: WalletAddress,
         source_epoch: i64,
-        history_complete: bool,
         decisions: &[TradeDecision],
+        first_entries: &[(MarketId, SourceTradeId)],
     ) -> (
         Vec<EntryGateResultRecord>,
         Vec<MarketHistoryRecord>,
         BTreeMap<String, String>,
     ) {
-        let mut candidates: BTreeMap<String, Vec<&TradeDecision>> = BTreeMap::new();
-        for decision in decisions {
-            if decision.side == Side::Buy && decision.action == LeaderAction::Entry {
-                candidates
-                    .entry(decision.market_id.to_string())
-                    .or_default()
-                    .push(decision);
-            }
-        }
-        let mut outcomes = BTreeMap::new();
-        let mut history = Vec::new();
-        for (market_string, market_candidates) in &candidates {
-            let market_id = MarketId(pe_core_types::VenueMarketId(market_string.clone()));
-            if self.entry_gate.has_market(&wallet, &market_id) {
-                for decision in market_candidates {
-                    outcomes.insert(
-                        decision.source_trade_id.0.clone(),
-                        "not_first_entry".to_owned(),
-                    );
-                }
-                continue;
-            }
-            let first_id = market_candidates
-                .iter()
-                .map(|decision| decision.source_trade_id.clone())
-                .min_by(|left, right| left.0.cmp(&right.0));
-            if let Some(first_id) = first_id {
-                history.push(MarketHistoryRecord {
-                    wallet,
-                    market_id: market_id.clone(),
-                    first_epoch: source_epoch,
-                    source_trade_id: first_id,
-                });
-            }
-            let outcome = if !history_complete {
-                "wallet_history_incomplete"
-            } else if market_candidates.len() >= 2 {
-                "ambiguous_first_entry_same_second"
-            } else {
-                "admitted"
-            };
-            for decision in market_candidates {
-                outcomes.insert(decision.source_trade_id.0.clone(), outcome.to_owned());
-            }
-        }
-
-        for decision in decisions {
-            outcomes
-                .entry(decision.source_trade_id.0.clone())
-                .or_insert_with(|| match (decision.side, decision.action) {
-                    (Side::Sell, _) => "not_buy".to_owned(),
-                    (_, LeaderAction::Entry) => "not_first_entry".to_owned(),
-                    _ => "not_an_entry".to_owned(),
-                });
-        }
+        let outcomes = decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision.source_trade_id.0.clone(),
+                    decision.entry.as_str().to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let history = first_entries
+            .iter()
+            .map(|(market_id, source_trade_id)| MarketHistoryRecord {
+                wallet,
+                market_id: market_id.clone(),
+                first_epoch: source_epoch,
+                source_trade_id: source_trade_id.clone(),
+            })
+            .collect::<Vec<_>>();
         let gate_results = decisions
             .iter()
             .map(|decision| EntryGateResultRecord {
@@ -1197,10 +1107,7 @@ impl BucketCommitEngine {
                 wallet,
                 market_id: decision.market_id.clone(),
                 source_epoch,
-                result: outcomes
-                    .get(&decision.source_trade_id.0)
-                    .cloned()
-                    .unwrap_or_else(|| "not_an_entry".to_owned()),
+                result: decision.entry.as_str().to_owned(),
                 history_consumed: history
                     .iter()
                     .any(|effect| effect.source_trade_id == decision.source_trade_id),
@@ -1400,9 +1307,27 @@ impl BucketCommitEngine {
             .cloned()
             .collect();
         let mut candidate = self.ledger.clone();
-        let applied_outcomes = match order_independent_validity(&self.ledger, wallet, &known) {
-            Ok(true) => candidate.apply_all_or_none(&known).ok(),
-            Ok(false) | Err(_) => None,
+        let history_complete = context
+            .history_status
+            .as_ref()
+            .filter(|status| status.wallet == wallet)
+            .map_or_else(
+                || self.complete_history.contains(&wallet),
+                |status| status.complete,
+            );
+        let applied_outcomes = match classify_complete_second(
+            &self.ledger,
+            wallet,
+            &known,
+            context.reconstruction_quality,
+            &context.signal_config,
+            history_complete,
+            &|market_id| self.entry_gate.has_market(&wallet, market_id),
+        ) {
+            Ok(SecondVerdict::OrderIndependent { applied, .. }) => {
+                candidate.apply_all_or_none(&known).ok().map(|_| applied)
+            }
+            Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => None,
         };
         let applied = applied_outcomes.is_some();
         let applied_by_id = known
@@ -1487,15 +1412,6 @@ impl BucketCommitEngine {
             already_committed: false,
         })
     }
-}
-
-#[derive(Debug)]
-struct TradeDecision {
-    source_trade_id: SourceTradeId,
-    market_id: MarketId,
-    side: Side,
-    action: LeaderAction,
-    action_order_dependent: bool,
 }
 
 fn activity_record(
@@ -1596,102 +1512,4 @@ fn touched_leader_rows(
             }
         })
         .collect()
-}
-
-fn order_independent_validity(
-    ledger: &PositionLedger,
-    wallet: WalletAddress,
-    mutations: &[LedgerMutation],
-) -> Result<bool, LedgerError> {
-    for component in mutation_components(mutations) {
-        if component.len() > 4 || !all_component_orders_match(ledger, wallet, &component)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn mutation_components(mutations: &[LedgerMutation]) -> Vec<Vec<&LedgerMutation>> {
-    let mut assigned = vec![false; mutations.len()];
-    let mut components = Vec::new();
-    for seed in 0..mutations.len() {
-        if assigned[seed] {
-            continue;
-        }
-        assigned[seed] = true;
-        let mut component = vec![&mutations[seed]];
-        let mut keys = mutations[seed]
-            .touched_keys()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        loop {
-            let mut changed = false;
-            for (index, mutation) in mutations.iter().enumerate() {
-                if assigned[index] {
-                    continue;
-                }
-                let touched = mutation.touched_keys();
-                if touched.iter().any(|key| keys.contains(key)) {
-                    assigned[index] = true;
-                    keys.extend(touched);
-                    component.push(mutation);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        components.push(component);
-    }
-    components
-}
-
-fn all_component_orders_match(
-    ledger: &PositionLedger,
-    wallet: WalletAddress,
-    component: &[&LedgerMutation],
-) -> Result<bool, LedgerError> {
-    let mut sequences = Vec::new();
-    let mut remaining = component.to_vec();
-    enumerate_mutation_orders(&mut remaining, &mut Vec::new(), &mut sequences);
-    let mut expected = None;
-    for sequence in sequences {
-        let (candidate, applied) = match ledger.simulate_all_or_none(&sequence) {
-            Ok(result) => result,
-            Err(error) if component.len() == 1 => return Err(error),
-            Err(_) => return Ok(false),
-        };
-        let residuals = applied
-            .into_iter()
-            .map(|outcome| outcome.clamped_residual)
-            .collect::<Vec<_>>();
-        let result = (candidate.position(&wallet).cloned(), residuals);
-        if expected
-            .as_ref()
-            .is_some_and(|expected| expected != &result)
-        {
-            return Ok(false);
-        }
-        expected = Some(result);
-    }
-    Ok(true)
-}
-
-fn enumerate_mutation_orders(
-    remaining: &mut Vec<&LedgerMutation>,
-    current: &mut Vec<LedgerMutation>,
-    sequences: &mut Vec<Vec<LedgerMutation>>,
-) {
-    if remaining.is_empty() {
-        sequences.push(current.clone());
-        return;
-    }
-    for index in 0..remaining.len() {
-        let mutation = remaining.remove(index);
-        current.push(mutation.clone());
-        enumerate_mutation_orders(remaining, current, sequences);
-        current.pop();
-        remaining.insert(index, mutation);
-    }
 }

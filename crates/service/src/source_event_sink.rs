@@ -16,8 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pe_core_types::EventSeq;
-use pe_event_log::{EnvelopeIn, LogError, Writer};
+use pe_event_log::{AppendReceipt, EnvelopeIn, LogError, Writer};
 
 /// Single-owner handle for the source event log. Owned by the ingest task; no
 /// channel or command/ack layer — append-before-deliver is enforced by call
@@ -68,7 +67,7 @@ impl SourceEventSink {
     /// Durably append one source event (append + sync). Writer-reported
     /// durability uncertainty discards that poisoned instance until
     /// [`Self::try_reopen`] succeeds.
-    pub fn append_durable(&mut self, envelope: EnvelopeIn) -> Result<EventSeq, LogError> {
+    pub fn append_durable(&mut self, envelope: EnvelopeIn) -> Result<AppendReceipt, LogError> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_append) {
             self.writer = None;
@@ -81,9 +80,7 @@ impl SourceEventSink {
                 "source event sink poisoned",
             )));
         };
-        let result = writer
-            .append(envelope)
-            .and_then(|seq| writer.sync().map(|()| seq));
+        let result = writer.append_synced(envelope);
         if writer.poisoned().is_some() {
             // Partial frame bytes may be on disk. Drop the poisoned instance (releasing the
             // lock); a new writer repairs only a proven incomplete EOF and resynchronizes.
@@ -150,14 +147,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.log");
         let mut sink = SourceEventSink::open(&path).unwrap();
-        let seq = sink.append_durable(envelope(br#"{"a":1}"#)).unwrap();
-        assert_eq!(seq.0, 0);
+        let receipt = sink.append_durable(envelope(br#"{"a":1}"#)).unwrap();
+        assert_eq!(receipt.sequence.0, 0);
         assert!(!sink.poisoned());
         drop(sink);
         // Reopen verifies the chain and continues the sequence.
         let mut sink = SourceEventSink::open(&path).unwrap();
-        let seq = sink.append_durable(envelope(br#"{"b":2}"#)).unwrap();
-        assert_eq!(seq.0, 1, "reopen must continue the verified chain");
+        let receipt = sink.append_durable(envelope(br#"{"b":2}"#)).unwrap();
+        assert_eq!(
+            receipt.sequence.0, 1,
+            "reopen must continue the verified chain"
+        );
     }
 
     #[test]

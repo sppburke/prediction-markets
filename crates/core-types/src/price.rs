@@ -273,6 +273,28 @@ impl BasisPoints {
         Self(n)
     }
 
+    /// Convert an exact ratio to basis points, rounding toward negative infinity.
+    ///
+    /// `denominator <= 0`, overflowing arithmetic, or a result outside `i32`
+    /// returns [`Error::OutOfRange`].
+    pub fn from_ratio_floor(numerator: Decimal, denominator: Decimal) -> Result<Self, Error> {
+        if denominator <= Decimal::ZERO {
+            return Err(Error::OutOfRange {
+                field: "BasisPoints",
+            });
+        }
+        let scaled = numerator
+            .checked_div(denominator)
+            .and_then(|ratio| ratio.checked_mul(Decimal::from(10_000i32)))
+            .ok_or(Error::OutOfRange {
+                field: "BasisPoints",
+            })?
+            .floor();
+        scaled.to_i32().map(Self).ok_or(Error::OutOfRange {
+            field: "BasisPoints",
+        })
+    }
+
     pub fn from_f64_rounding(v: f64, _policy: RoundingPolicy) -> Result<Self, Error> {
         if !v.is_finite() {
             return Err(Error::ConvError {
@@ -315,5 +337,69 @@ impl KellyFraction {
 
     pub fn from_f64_rounding(v: f64, policy: RoundingPolicy) -> Result<Self, Error> {
         Self::new(decimal_from_f64(v, policy)?)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    /// PASS: a negative fractional basis point floors toward negative infinity.
+    #[test]
+    fn basis_points_ratio_floor_rounds_negative_values_down() {
+        assert_eq!(
+            BasisPoints::from_ratio_floor(dec!(-0.00015), Decimal::ONE).unwrap(),
+            BasisPoints(-2)
+        );
+    }
+
+    /// PASS: zero and both exact `i32` boundaries convert without loss.
+    #[test]
+    fn basis_points_ratio_floor_accepts_zero_and_exact_i32_boundaries() {
+        assert_eq!(
+            BasisPoints::from_ratio_floor(Decimal::ZERO, Decimal::ONE).unwrap(),
+            BasisPoints::ZERO
+        );
+        for expected in [i32::MIN, i32::MAX] {
+            let numerator = Decimal::from(expected) / Decimal::from(10_000i32);
+            assert_eq!(
+                BasisPoints::from_ratio_floor(numerator, Decimal::ONE).unwrap(),
+                BasisPoints(expected)
+            );
+        }
+    }
+
+    /// PASS: zero and negative denominators return the frozen out-of-range error.
+    #[test]
+    fn basis_points_ratio_floor_rejects_nonpositive_denominator() {
+        for denominator in [Decimal::ZERO, Decimal::NEGATIVE_ONE] {
+            assert_eq!(
+                BasisPoints::from_ratio_floor(Decimal::ONE, denominator),
+                Err(Error::OutOfRange {
+                    field: "BasisPoints"
+                })
+            );
+        }
+    }
+
+    /// PASS: Decimal arithmetic overflow and a result above `i32::MAX` fail closed.
+    #[test]
+    fn basis_points_ratio_floor_rejects_arithmetic_and_i32_overflow() {
+        assert_eq!(
+            BasisPoints::from_ratio_floor(Decimal::MAX, dec!(0.1)),
+            Err(Error::OutOfRange {
+                field: "BasisPoints"
+            })
+        );
+        let above_i32 = Decimal::from(i64::from(i32::MAX) + 1) / Decimal::from(10_000i32);
+        assert_eq!(
+            BasisPoints::from_ratio_floor(above_i32, Decimal::ONE),
+            Err(Error::OutOfRange {
+                field: "BasisPoints"
+            })
+        );
     }
 }

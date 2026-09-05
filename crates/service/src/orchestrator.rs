@@ -22,8 +22,7 @@ use pe_paper_state::{
     FillRecord, FillRow, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence,
 };
 use pe_position_ledger::PositionLedger;
-use pe_risk_engine::{RiskSnapshot, TradingMode};
-use pe_source_core::SourceStatus;
+use pe_risk_engine::RiskSnapshot;
 use pe_source_polymarket_public::PageFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, FillSource, PaperExecutionError, PaperExecutor, PaperFill, SizingMode,
@@ -2653,7 +2652,7 @@ fn prefix_vwap(used_asks: &[AskLevel], contracts: u64) -> Option<Price> {
 
 // ── Stub risk snapshot ────────────────────────────────────────────────────────
 
-/// Build a zeroed [`RiskSnapshot`] with LiveTiny mode.
+/// Build a zeroed [`RiskSnapshot`].
 ///
 /// All exposure and PnL fields are zero; no anti-gaming flags; source healthy.
 /// Phase 0B stub — real exposure tracking is a separate later issue.
@@ -2663,8 +2662,7 @@ fn prefix_vwap(used_asks: &[AskLevel], contracts: u64) -> Option<Price> {
 /// drawdown/latency kill switches stay armed — they are inert here only because the
 /// PnL/latency inputs are zeroed by this stub.
 ///
-/// `evaluate()` overwrites `trading_mode` and `proposed_trade_bps` before calling
-/// the risk gate, so their initial values here are overridden.
+/// `evaluate()` overwrites `proposed_trade_bps` before calling the risk gate.
 fn zeroed_risk_snapshot() -> RiskSnapshot {
     use pe_core_types::BasisPoints;
     RiskSnapshot {
@@ -2674,12 +2672,11 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
         total_copy_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        onchain_source_status: SourceStatus::Healthy,
-        copy_latency_p95_ms: 0,
-        trading_mode: TradingMode::LiveTiny, // overridden by evaluate()
-        proposed_trade_bps: BasisPoints(0),  // overridden by evaluate()
-        per_trade_cap_bps: 0,                // overridden by evaluate()
-        concentration_caps: None,            // un-enforced by owner decision (#508)
+        absolute_pnl_bps: BasisPoints(0),
+        copy_latency_kill_switch_active: false,
+        proposed_trade_bps: BasisPoints(0), // overridden by evaluate()
+        per_trade_cap_bps: 0,               // overridden by evaluate()
+        concentration_caps: None,           // un-enforced by owner decision (#508)
     }
 }
 
