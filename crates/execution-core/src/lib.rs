@@ -12,6 +12,7 @@
 pub mod canary;
 pub mod canary_actor;
 pub mod dispatcher;
+pub mod economic;
 pub mod error;
 pub mod live_executor;
 pub mod live_journal;
@@ -31,6 +32,10 @@ pub use canary_actor::{
     RawReconciliation,
 };
 pub use dispatcher::{DispatchResult, ExecutionDispatcher};
+pub use economic::{
+    BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit, MarketSelection,
+    ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
+};
 pub use error::ExecutionError;
 pub use live_executor::{
     FrozenLiveTarget, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutor,
@@ -42,17 +47,19 @@ pub use live_executor::{
     PreparedLiveOrder,
 };
 pub use live_journal::{
-    CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit, LiveAccountReadFailure,
-    LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
-    LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode, LiveExecutedAmounts,
-    LiveFeeEvidenceAudit, LiveFillProjectionIdentity, LiveJournal, LiveJournalError,
+    AccountPortfolioMarkedAudit, AdmissionReceipts, CanonicalPositionAudit,
+    CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit, LegacyV1Payload,
+    LiveAccountReadFailure, LiveAccountStateAudit, LiveAdmissionArtifactAudit,
+    LiveAdmissionEvaluationAudit, LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode,
+    LiveExecutedAmounts, LiveFillProjectionIdentity, LiveJournal, LiveJournalError,
     LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveMarketEvidenceAudit,
     LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
     LiveOrderPostAudit, LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure,
     LiveOrderPreparedAudit, LiveOrderReconciliationAudit, LiveOrderRejectKind,
-    LiveReconciliationSource, RedemptionAttemptIdentity, RedemptionCustodyAudit,
+    LiveReconciliationSource, MarkKind, MarkPrice, MatchedLogIdentity, OrderFillFinalizedAudit,
+    RedemptionAttemptIdentity, RedemptionCustodyAudit, RedemptionCustodyReconciledAudit,
     RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
-    RedemptionRequestedAudit, RedemptionTransactionAudit, replay_account,
+    RedemptionRequestedAudit, RedemptionTransactionAudit, ResolutionFinalizedAudit, replay_account,
 };
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,

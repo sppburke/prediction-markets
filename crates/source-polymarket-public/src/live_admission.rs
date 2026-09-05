@@ -2,13 +2,15 @@
 //!
 //! This generalizes the isolated canary checks without changing them. Unlike canary admission,
 //! NegRisk markets are admitted and `neg_risk` is carried into order preparation. Gamma and CLOB
-//! fee flags/rates are retained verbatim as audit evidence but do not gate admission: live fee and
-//! slippage economics remain owned by the existing `polymarket_fee_rate` / `slippage_rate` config.
+//! legacy fee flags/rates remain available during the #545 transition. The scheduled end is an
+//! explicit source-owned evidence field parsed from the CLOB long-market row.
 
 use pe_core_types::{PolymarketConditionId, PolymarketTokenId, Price, ShareAmount};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::clob_resolution::parse_clob_end_date;
 
 pub const LIVE_MARKET_SCHEMA_VERSION: u32 = 1;
 pub const LIVE_MARKET_PARSER_VERSION: u32 = 1;
@@ -30,6 +32,7 @@ pub struct LiveMarketEvidence {
     pub neg_risk: bool,
     pub minimum_tick_size: Price,
     pub minimum_order_size: ShareAmount,
+    pub scheduled_end_unix: Option<i64>,
     pub fee_evidence: LiveFeeEvidence,
     pub raw_gamma_market_hash: blake3::Hash,
     pub raw_clob_market_hash: blake3::Hash,
@@ -108,6 +111,7 @@ struct GammaMarket {
 #[derive(Deserialize)]
 struct ClobMarket {
     condition_id: String,
+    end_date_iso: Option<String>,
     active: Option<bool>,
     closed: Option<bool>,
     accepting_orders: Option<bool>,
@@ -215,12 +219,14 @@ pub fn validate_live_market(
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| LiveMarketError::MissingMapping)?;
+    let scheduled_end_unix = clob.end_date_iso.as_deref().and_then(parse_clob_end_date);
     Ok(LiveMarketEvidence {
         condition_id: expected_condition.clone(),
         ordered_outcome_token_ids,
         neg_risk: gamma_neg_risk,
         minimum_tick_size: gamma_tick,
         minimum_order_size: gamma_minimum,
+        scheduled_end_unix,
         fee_evidence: LiveFeeEvidence {
             gamma_fees_enabled: gamma.fees_enabled,
             gamma_fee_schedule: gamma.fee_schedule,
@@ -332,6 +338,7 @@ mod tests {
     fn clob(neg_risk: bool) -> Value {
         json!({
             "condition_id": "0xc",
+            "end_date_iso": "2026-08-11T12:00:00Z",
             "active": true,
             "closed": false,
             "accepting_orders": true,
@@ -365,6 +372,7 @@ mod tests {
         assert!(evidence.neg_risk);
         assert_eq!(evidence.ordered_outcome_token_ids[0].0, "11");
         assert_eq!(evidence.ordered_outcome_token_ids[1].0, "22");
+        assert_eq!(evidence.scheduled_end_unix, Some(1_786_449_600));
     }
 
     #[test]

@@ -201,8 +201,13 @@ pub fn reconstruct_redemption_attempts(
             | LiveJournalPayload::OrderPrepared(_)
             | LiveJournalPayload::OrderPosted(_)
             | LiveJournalPayload::OrderReconciled(_)
+            | LiveJournalPayload::OrderFillFinalized(_)
+            | LiveJournalPayload::ResolutionFinalized(_)
+            | LiveJournalPayload::RedemptionCustodyReconciled(_)
+            | LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::CredentialBindingMismatch { .. }
-            | LiveJournalPayload::ModeTransitionApplied(_) => {}
+            | LiveJournalPayload::ModeTransitionApplied(_)
+            | LiveJournalPayload::LegacyV1(_) => {}
         }
     }
     attempts

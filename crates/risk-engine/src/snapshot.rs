@@ -49,7 +49,7 @@ impl ConcentrationCaps {
 ///
 /// All exposure values are in basis points of current bankroll.
 /// Positive values = open exposure. Negative PnL values = losses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskSnapshot {
     // ── Current exposure (bps of bankroll) ──────────────────────────────────
     /// Existing open exposure to this specific leader.

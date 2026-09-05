@@ -1,13 +1,16 @@
 //! Pure replay and validation for post-boundary `decision_pending` evidence.
 
 use pe_core_types::{EventSeq, Price, Side, SourceTradeId};
+use pe_event_log::AppendReceipt;
 use pe_paper_state::{DecisionPendingRow, DecisionPendingState};
+use pe_strategy_winner_follow::{WinnerFollowDeclineAudit, WinnerFollowError};
 use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
 
 use crate::bucket_commit::{DecisionContinuationError, DecisionContinuationV2};
 
 pub const POST_BOUNDARY_EVIDENCE_VERSION: u16 = 2;
+pub const TERMINAL_EVIDENCE_VERSION: u16 = 3;
 const EVIDENCE_OWNERS: [&str; 2] = ["source_log", "paper_log"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +96,10 @@ pub struct TerminalDispositionEvidence {
     pub reason: String,
     pub fill: Option<RecordedFillEvidence>,
     pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decline: Option<WinnerFollowDeclineAudit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_receipt: Option<AppendReceipt>,
 }
 
 impl TerminalDispositionEvidence {
@@ -102,6 +109,8 @@ impl TerminalDispositionEvidence {
             reason: reason.to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -111,6 +120,8 @@ impl TerminalDispositionEvidence {
             reason: reason.to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -120,6 +131,8 @@ impl TerminalDispositionEvidence {
             reason: "market_settled".to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -129,6 +142,8 @@ impl TerminalDispositionEvidence {
             reason: "live_targets_staged".to_owned(),
             fill: None,
             dispatch_id: Some(dispatch_id),
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -154,6 +169,30 @@ impl TerminalDispositionEvidence {
                 event_seq: event_seq.0,
             }),
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
+        }
+    }
+
+    pub fn declined(error: &WinnerFollowError) -> Self {
+        Self {
+            disposition: "no_fill".to_owned(),
+            reason: format!("paper_reject:{error}"),
+            fill: None,
+            dispatch_id: None,
+            decline: Some(WinnerFollowDeclineAudit::from(error)),
+            final_receipt: None,
+        }
+    }
+
+    pub fn final_fill(final_receipt: AppendReceipt) -> Self {
+        Self {
+            disposition: "fill".to_owned(),
+            reason: "paper_fill_committed".to_owned(),
+            fill: None,
+            dispatch_id: None,
+            decline: None,
+            final_receipt: Some(final_receipt),
         }
     }
 }
@@ -677,6 +716,47 @@ mod tests {
             replayed.post_boundary.body.authority.outcome,
             "settled_refusal"
         );
+    }
+
+    #[test]
+    fn terminal_v3_keeps_v2_readable_and_records_typed_outcomes() {
+        let legacy: TerminalDispositionEvidence = serde_json::from_value(json!({
+            "disposition": "no_fill",
+            "reason": "legacy",
+            "fill": null,
+            "dispatch_id": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.decline, None);
+        assert_eq!(legacy.final_receipt, None);
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("decline")
+        );
+
+        let declined = TerminalDispositionEvidence::declined(
+            &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+        );
+        assert_eq!(declined.disposition, "no_fill");
+        assert_eq!(
+            declined.reason,
+            "paper_reject:no edge: Kelly sizing produced zero contracts"
+        );
+        assert_eq!(
+            declined.decline,
+            Some(pe_strategy_winner_follow::WinnerFollowDeclineAudit::NoEdge)
+        );
+
+        let receipt = AppendReceipt {
+            sequence: EventSeq(11),
+            this_hash: blake3::Hash::from_bytes([11; 32]),
+        };
+        let final_fill = TerminalDispositionEvidence::final_fill(receipt);
+        assert_eq!(final_fill.final_receipt, Some(receipt));
+        assert_eq!(TERMINAL_EVIDENCE_VERSION, 3);
     }
 
     #[test]
