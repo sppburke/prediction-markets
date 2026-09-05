@@ -216,6 +216,17 @@ impl KnockoutReason {
     }
 }
 
+impl From<KnockoutReason> for crate::paper_recovery::MembershipReason {
+    fn from(reason: KnockoutReason) -> Self {
+        match reason {
+            KnockoutReason::Inactivity => Self::KnockoutInactivity,
+            KnockoutReason::InactivityHardCap => Self::KnockoutInactivityHardCap,
+            KnockoutReason::Underperformance => Self::KnockoutUnderperformance,
+            KnockoutReason::RankerRotation => Self::RankerRotation,
+        }
+    }
+}
+
 /// A decided eviction, carrying the audit fields for its lifecycle row.
 #[derive(Debug, Clone)]
 pub struct Eviction {

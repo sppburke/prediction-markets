@@ -171,6 +171,45 @@ async fn main() -> Result<()> {
     if env::args().any(|a| a == "--rollback-paper-v1") {
         return run_rollback_paper_v1();
     }
+    if args.iter().any(|argument| argument == "--qualify") {
+        let options = pe_service::qualification::QualifyOptions {
+            paper_log: PathBuf::from(required_arg_value(&args, "--paper-log")?),
+            source_log: PathBuf::from(required_arg_value(&args, "--source-log")?),
+            paper_state: PathBuf::from(required_arg_value(&args, "--paper-state")?),
+            seal_hash: required_arg_value(&args, "--seal-hash")?,
+            output: PathBuf::from(required_arg_value(&args, "--output")?),
+        };
+        let (verdict, report_hash) = pe_service::qualification::run_qualify(&options)
+            .context("run network-free sealed qualification")?;
+        println!("verdict={verdict:?} report_blake3={report_hash}");
+        return Ok(());
+    }
+    if let Some(raw_command) = optional_arg_value(&args, "--financial-era") {
+        let command = match raw_command.as_str() {
+            "prepare" => pe_service::qualification::FinancialEraCommand::Prepare,
+            "start" => pe_service::qualification::FinancialEraCommand::Start,
+            "rollback-check" => pe_service::qualification::FinancialEraCommand::RollbackCheck,
+            value => anyhow::bail!(
+                "--financial-era must be prepare, start, or rollback-check; got {value}"
+            ),
+        };
+        let manifest = PathBuf::from(required_arg_value(&args, "--activation-manifest")?);
+        let config_path = args
+            .first()
+            .filter(|argument| !argument.starts_with("--"))
+            .map(PathBuf::from);
+        let offline_config = service_config::load(config_path.as_deref()).with_context(|| {
+            config_path.as_ref().map_or_else(
+                || "load financial-era config from environment".to_owned(),
+                |path| format!("load financial-era config from {}", path.display()),
+            )
+        })?;
+        let result =
+            pe_service::qualification::run_financial_era(command, &manifest, &offline_config)
+                .context("run network-free financial-era command")?;
+        println!("{result}");
+        return Ok(());
+    }
 
     let cfg = load_config()?;
 
@@ -1527,6 +1566,24 @@ fn load_config() -> Result<ServiceConfig> {
         Some(p) => format!("loading config from {}", p.display()),
         None => "loading config from environment".to_owned(),
     })
+}
+
+fn optional_arg_value(args: &[String], name: &str) -> Option<String> {
+    let with_equals = format!("{name}=");
+    args.iter().enumerate().find_map(|(index, argument)| {
+        argument
+            .strip_prefix(&with_equals)
+            .map(str::to_owned)
+            .or_else(|| {
+                (argument == name)
+                    .then(|| args.get(index.saturating_add(1)).cloned())
+                    .flatten()
+            })
+    })
+}
+
+fn required_arg_value(args: &[String], name: &str) -> Result<String> {
+    optional_arg_value(args, name).with_context(|| format!("{name} requires a value"))
 }
 
 /// Periodically fetch Gamma resolutions for all open positions and credit the bankroll.

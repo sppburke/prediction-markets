@@ -35,6 +35,7 @@ pub mod paper_api;
 pub mod paper_migration;
 pub mod paper_recovery;
 pub mod position_seeder;
+pub mod qualification;
 pub mod runtime_config;
 pub mod snapshot_worker;
 pub mod source_event_sink;

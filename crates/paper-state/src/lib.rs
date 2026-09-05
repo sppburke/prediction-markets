@@ -35,8 +35,11 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
+};
 use rust_decimal::Decimal;
+use serde::Serialize;
 
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
@@ -134,6 +137,29 @@ pub enum PaperStateError {
     /// A terminal continuation was replayed with a different terminal transition.
     #[error("paper-state decision_pending terminal transition conflict for {0}")]
     DecisionPendingConflict(String),
+    /// A seal requested an immutable evidence row that is absent.
+    #[error("qualification seal evidence is missing {table} for {source_trade_id}")]
+    SealEvidenceMissing {
+        table: &'static str,
+        source_trade_id: String,
+    },
+    /// A source-keyed seal row does not bind the requested immutable revision.
+    #[error(
+        "qualification seal evidence revision mismatch for {source_trade_id}: requested {requested}, stored {stored}"
+    )]
+    SealEvidenceRevisionMismatch {
+        source_trade_id: String,
+        requested: String,
+        stored: String,
+    },
+    /// A seal key appeared more than once in the ordered source selection.
+    #[error(
+        "qualification seal evidence contains duplicate key {source_trade_id}/{semantic_revision}"
+    )]
+    DuplicateSealEvidenceKey {
+        source_trade_id: String,
+        semantic_revision: String,
+    },
     /// The one-time legacy history input was not a valid sidecar.
     #[error("legacy wallet history import is invalid: {0}")]
     InvalidLegacyHistory(String),
@@ -307,6 +333,83 @@ pub struct DecisionPendingRow {
 pub enum DecisionPendingState {
     Open,
     Terminal,
+}
+
+const SEAL_DECISION_EVIDENCE_DOMAIN: &str = "prediction-edge/seal-decision-evidence";
+const SEAL_DECISION_EVIDENCE_VERSION: u16 = 1;
+
+#[derive(Serialize)]
+struct SealDecisionEvidenceDocument {
+    domain: &'static str,
+    version: u16,
+    rows: Vec<SealDecisionEvidenceRow>,
+}
+
+#[derive(Serialize)]
+struct SealDecisionEvidenceRow {
+    source_trade_id: String,
+    semantic_revision: String,
+    activity_group: SealActivityGroup,
+    activity_group_revision: SealActivityGroupRevision,
+    entry_gate_result: SealEntryGateResult,
+    no_copy_disposition: Option<SealNoCopyDisposition>,
+    terminal_decision: SealTerminalDecision,
+}
+
+#[derive(Serialize)]
+struct SealActivityGroup {
+    transaction_hash: String,
+    wallet_hex: String,
+    source_epoch: i64,
+    activity_type: String,
+    disposition: String,
+    proof_json: String,
+}
+
+#[derive(Serialize)]
+struct SealActivityGroupRevision {
+    transaction_hash: String,
+    disposition: String,
+    proof_json: String,
+    recorded_at_unix: i64,
+}
+
+#[derive(Serialize)]
+struct SealEntryGateResult {
+    wallet_hex: String,
+    market_id: String,
+    source_epoch: i64,
+    result: String,
+    history_consumed: i64,
+}
+
+#[derive(Serialize)]
+struct SealNoCopyDisposition {
+    provenance: String,
+    age_secs: i64,
+    reason: String,
+    recorded_at_unix: i64,
+}
+
+#[derive(Serialize)]
+struct SealTerminalDecision {
+    wallet_hex: String,
+    source_epoch: i64,
+    frozen_inputs_json: String,
+    post_commit_inputs_json: String,
+    terminal_disposition: String,
+    updated_at_unix: i64,
+}
+
+struct SelectedSealTerminal {
+    semantic_revision: String,
+    wallet_hex: String,
+    source_epoch: i64,
+    frozen_inputs_json: String,
+    post_commit_inputs_json: String,
+    state: String,
+    terminal_disposition: Option<String>,
+    updated_at_unix: i64,
 }
 
 /// Caller-rendered versioned evidence attached to a terminal pending-decision
@@ -553,6 +656,26 @@ impl PaperStateDb {
             }
         }
 
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Open an existing database without DDL, migration, or write permission.
+    ///
+    /// Qualification verification uses this entry point so merely producing a report cannot
+    /// create a database, advance a projection, or modify a schema (#545).
+    pub fn open_read_only(path: &Path) -> Result<Self, PaperStateError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "query_only", true)?;
+        let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found != SCHEMA_VERSION {
+            return Err(PaperStateError::SchemaVersionMismatch {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1650,6 +1773,219 @@ impl PaperStateDb {
             });
         }
         Ok(history)
+    }
+
+    /// Select the immutable decision evidence named by an ordered source-prefix replay.
+    ///
+    /// The complete selection occurs in one read transaction. Source-keyed projections are
+    /// accepted only when both the immutable base group and terminal continuation bind the
+    /// requested semantic revision. The returned version-one document is compact JSON with one
+    /// trailing line feed; callers hash these exact bytes for `QualificationSealed` (#545).
+    pub fn seal_decision_evidence(
+        &self,
+        keys: &[(SourceTradeId, String)],
+    ) -> Result<Vec<u8>, PaperStateError> {
+        let mut unique = BTreeSet::new();
+        for (source_trade_id, semantic_revision) in keys {
+            if !unique.insert((source_trade_id.0.clone(), semantic_revision.clone())) {
+                return Err(PaperStateError::DuplicateSealEvidenceKey {
+                    source_trade_id: source_trade_id.0.clone(),
+                    semantic_revision: semantic_revision.clone(),
+                });
+            }
+        }
+
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut evidence_rows = Vec::with_capacity(keys.len());
+        for (source_trade_id, requested_revision) in keys {
+            let group: Option<(String, String, i64, String, String, String, String)> = tx
+                .query_row(
+                    "SELECT transaction_hash, wallet_hex, source_epoch, semantic_revision, \
+                            activity_type, disposition, proof_json \
+                     FROM activity_groups WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                group_transaction_hash,
+                group_wallet,
+                group_epoch,
+                group_revision,
+                activity_type,
+                group_disposition,
+                group_proof,
+            )) = group
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "activity_groups",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+            if group_revision != *requested_revision {
+                return Err(PaperStateError::SealEvidenceRevisionMismatch {
+                    source_trade_id: source_trade_id.0.clone(),
+                    requested: requested_revision.clone(),
+                    stored: group_revision,
+                });
+            }
+
+            let revision: Option<(String, String, String, i64)> = tx
+                .query_row(
+                    "SELECT transaction_hash, disposition, proof_json, recorded_at_unix \
+                     FROM activity_group_revisions \
+                     WHERE source_trade_id = ?1 AND semantic_revision = ?2",
+                    params![source_trade_id.0, requested_revision],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((revision_transaction_hash, revision_disposition, revision_proof, recorded)) =
+                revision
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "activity_group_revisions",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+
+            let gate: Option<(String, String, i64, String, i64)> = tx
+                .query_row(
+                    "SELECT wallet_hex, market_id, source_epoch, result, history_consumed \
+                     FROM entry_gate_results WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((gate_wallet, market_id, gate_epoch, gate_result, history_consumed)) = gate
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "entry_gate_results",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+
+            let no_copy = tx
+                .query_row(
+                    "SELECT provenance, age_secs, reason, recorded_at_unix \
+                     FROM no_copy_dispositions WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok(SealNoCopyDisposition {
+                            provenance: row.get(0)?,
+                            age_secs: row.get(1)?,
+                            reason: row.get(2)?,
+                            recorded_at_unix: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+
+            let terminal: Option<SelectedSealTerminal> = tx
+                .query_row(
+                    "SELECT semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, \
+                            post_commit_inputs_json, state, terminal_disposition, updated_at_unix \
+                     FROM decision_pending WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok(SelectedSealTerminal {
+                            semantic_revision: row.get(0)?,
+                            wallet_hex: row.get(1)?,
+                            source_epoch: row.get(2)?,
+                            frozen_inputs_json: row.get(3)?,
+                            post_commit_inputs_json: row.get(4)?,
+                            state: row.get(5)?,
+                            terminal_disposition: row.get(6)?,
+                            updated_at_unix: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(terminal) = terminal else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "decision_pending",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+            if terminal.semantic_revision != *requested_revision {
+                return Err(PaperStateError::SealEvidenceRevisionMismatch {
+                    source_trade_id: source_trade_id.0.clone(),
+                    requested: requested_revision.clone(),
+                    stored: terminal.semantic_revision,
+                });
+            }
+            let Some(terminal_disposition) = terminal
+                .terminal_disposition
+                .filter(|_| terminal.state == "terminal")
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "terminal decision_pending",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+
+            evidence_rows.push(SealDecisionEvidenceRow {
+                source_trade_id: source_trade_id.0.clone(),
+                semantic_revision: requested_revision.clone(),
+                activity_group: SealActivityGroup {
+                    transaction_hash: group_transaction_hash,
+                    wallet_hex: group_wallet,
+                    source_epoch: group_epoch,
+                    activity_type,
+                    disposition: group_disposition,
+                    proof_json: group_proof,
+                },
+                activity_group_revision: SealActivityGroupRevision {
+                    transaction_hash: revision_transaction_hash,
+                    disposition: revision_disposition,
+                    proof_json: revision_proof,
+                    recorded_at_unix: recorded,
+                },
+                entry_gate_result: SealEntryGateResult {
+                    wallet_hex: gate_wallet,
+                    market_id,
+                    source_epoch: gate_epoch,
+                    result: gate_result,
+                    history_consumed,
+                },
+                no_copy_disposition: no_copy,
+                terminal_decision: SealTerminalDecision {
+                    wallet_hex: terminal.wallet_hex,
+                    source_epoch: terminal.source_epoch,
+                    frozen_inputs_json: terminal.frozen_inputs_json,
+                    post_commit_inputs_json: terminal.post_commit_inputs_json,
+                    terminal_disposition,
+                    updated_at_unix: terminal.updated_at_unix,
+                },
+            });
+        }
+        let document = SealDecisionEvidenceDocument {
+            domain: SEAL_DECISION_EVIDENCE_DOMAIN,
+            version: SEAL_DECISION_EVIDENCE_VERSION,
+            rows: evidence_rows,
+        };
+        let mut bytes = serde_json::to_vec(&document)?;
+        bytes.push(b'\n');
+        tx.commit()?;
+        Ok(bytes)
     }
 
     /// Whether one bucket-applied delivery still owns an open continuation.
@@ -5218,5 +5554,93 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    fn insert_seal_fixture(db: &PaperStateDb, pending_revision: &str) {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO activity_groups \
+             (source_trade_id, transaction_hash, wallet_hex, source_epoch, semantic_revision, \
+              activity_type, disposition, proof_json) \
+             VALUES ('g2:seal', '0xtx', '0x1111111111111111111111111111111111111111', \
+                     1700, 'rev-1', 'trade', 'admitted', '{\"proof\":1}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO activity_group_revisions \
+             (source_trade_id, semantic_revision, transaction_hash, disposition, proof_json, \
+              recorded_at_unix) \
+             VALUES ('g2:seal', 'rev-1', '0xtx', 'admitted', '{\"proof\":1}', 1701)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entry_gate_results \
+             (source_trade_id, wallet_hex, market_id, source_epoch, result, history_consumed) \
+             VALUES ('g2:seal', '0x1111111111111111111111111111111111111111', \
+                     'market-1', 1700, 'admitted', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO decision_pending \
+             (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, \
+              post_commit_inputs_json, state, terminal_disposition, updated_at_unix) \
+             VALUES ('g2:seal', ?1, '0x1111111111111111111111111111111111111111', \
+                     1700, '{\"frozen\":1}', '{\"terminal\":1}', 'terminal', 'no_fill', 1702)",
+            params![pending_revision],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn seal_decision_evidence_has_golden_canonical_bytes() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let bytes = db
+            .seal_decision_evidence(&[(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())])
+            .unwrap();
+        let expected = concat!(
+            "{\"domain\":\"prediction-edge/seal-decision-evidence\",\"version\":1,\"rows\":[",
+            "{\"source_trade_id\":\"g2:seal\",\"semantic_revision\":\"rev-1\",",
+            "\"activity_group\":{\"transaction_hash\":\"0xtx\",",
+            "\"wallet_hex\":\"0x1111111111111111111111111111111111111111\",",
+            "\"source_epoch\":1700,\"activity_type\":\"trade\",",
+            "\"disposition\":\"admitted\",\"proof_json\":\"{\\\"proof\\\":1}\"},",
+            "\"activity_group_revision\":{\"transaction_hash\":\"0xtx\",",
+            "\"disposition\":\"admitted\",\"proof_json\":\"{\\\"proof\\\":1}\",",
+            "\"recorded_at_unix\":1701},",
+            "\"entry_gate_result\":{",
+            "\"wallet_hex\":\"0x1111111111111111111111111111111111111111\",",
+            "\"market_id\":\"market-1\",\"source_epoch\":1700,",
+            "\"result\":\"admitted\",\"history_consumed\":1},",
+            "\"no_copy_disposition\":null,",
+            "\"terminal_decision\":{",
+            "\"wallet_hex\":\"0x1111111111111111111111111111111111111111\",",
+            "\"source_epoch\":1700,\"frozen_inputs_json\":\"{\\\"frozen\\\":1}\",",
+            "\"post_commit_inputs_json\":\"{\\\"terminal\\\":1}\",",
+            "\"terminal_disposition\":\"no_fill\",\"updated_at_unix\":1702}}]}\n"
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        assert_eq!(
+            blake3::hash(&bytes).to_hex().to_string(),
+            "38933c59ce4721b57f99aeb2137b2f72a44e61ccf140944c3859894ec193ca47"
+        );
+    }
+
+    #[test]
+    fn seal_decision_evidence_rejects_revision_mismatch_and_duplicate_keys() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "different");
+        let key = (SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned());
+        assert!(matches!(
+            db.seal_decision_evidence(std::slice::from_ref(&key)),
+            Err(PaperStateError::SealEvidenceRevisionMismatch { .. })
+        ));
+        assert!(matches!(
+            db.seal_decision_evidence(&[key.clone(), key]),
+            Err(PaperStateError::DuplicateSealEvidenceKey { .. })
+        ));
     }
 }

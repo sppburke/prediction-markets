@@ -32,7 +32,10 @@ End-to-end target from `leader_trade_observed_at` (gateway receive) to `follower
 | p95 | ≤ 2.0 s |
 | p99 | ≤ 3.0 s |
 
-If running p95 over the prior hour exceeds budget by 50 % for two consecutive 5-minute windows, the **copy-latency kill switch** (see `19-WINNER-FOLLOW-STRATEGY.md`) blocks new entries until p95 returns under budget.
+For each paper or live-account owner, compute nearest-rank p95 from samples completed in the prior
+clock hour. Two consecutive available hourly values above 3,000 ms engage that owner's
+**copy-latency kill switch**; while active, an available value at or below 2,000 ms releases it.
+A missing hour holds an active switch and breaks the consecutive pair for an inactive switch.
 
 > **Two latency metrics, deliberately distinct (#530).** The budget above measures
 > `gateway receive → venue ack` (the service's internal span). The ranker's latency
@@ -384,10 +387,10 @@ Campaign financial limits and eligibility are canonical in
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe schema-v2 paper-state SQLite mirror. In addition to financial/replay tables, v2 durably owns reconciled activity groups and revisions, first-entry history/results/completeness, `decision_pending`, monotonic wallet fences, position validations, and machine-owned migration metadata. |
-| `paper_fill_haircut_bps` | 500 | BUY-side paper fill haircut (fee + slippage), basis points. Recorded fill `= min(limit·(1 + bps/10_000), 0.999)`. Mirrors the sizing cost `c` in `evaluate` |
-| `paper_fill_slippage_bps` | 100 | SELL-side paper fill slippage (no taker fee), basis points. Recorded fill `= max(limit·(1 − bps/10_000), 0.001)`. Retained for generic executor/replay compatibility; production Winner-Follow rejects SELLs before fill-price resolution. |
-| `fill_mode` | `clob_best_ask` | Hot runtime paper fill-price mode (#486/#544). Every admitted BUY first requires the mandatory price-impact book plan. `clob_best_ask` uses that one usable ladder's exact VWAP as the paper fill basis; `leader_haircut` uses the boot-owned `paper_fill_haircut_bps` only after the book gate succeeds. There is no unusable-book haircut fallback. |
+| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror. Schema three stores quantities, principal, and fees as exact decimal strings and binds each financial mutation to its prepared sequence and `QualificationStarted` identity. It also durably owns reconciled activity revisions, first-entry evidence, terminal `decision_pending`, monotonic wallet fences, position validations, and machine-owned migration metadata. |
+| `paper_fill_haircut_bps` | 500 | Legacy pre-financial-era paper compatibility input. Corrected Winner-Follow economics do not read it. |
+| `paper_fill_slippage_bps` | 100 | Legacy pre-financial-era paper compatibility input. Corrected Winner-Follow economics use the shared signed ladder and configured proportional slippage instead. |
+| `fill_mode` | `clob_best_ask` | Required and ignored only under the pre-Start 17-name compatibility contract. It is rejected as unknown after `QualificationStarted`; corrected economics have one signed-ladder fill path. |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
 | `gamma_resolution_poll_interval_secs` | 120 | Seconds between Gamma resolution poll rounds in the live service. 2-minute cadence (issue #343) keeps the settled-markets set and "just resolved" wins within ≤2 min of actual resolution; the poll is gated to markets with open unsettled positions and rate-limited (50 ms min-interval), so the frequency increase is bounded by the open-position set, not the full universe |
 | `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market resolves further than this many seconds into the future. 0 disables the upper bound. Guards against locking capital in months-long markets (issue #290). **172_800 since the 2026-07-03 run28 cutover** — the copy-time twin of `ranker_ttr_hours` (48 h ≈ 72 h on paired weekly P&L, `docs/33` §5; was 259_200/72 h). Paired with `min_resolution_horizon_secs` — one resolution lookup serves both. NOTE: the live `service_config` row must be PATCHed at deploy (`on conflict do nothing` never updates an already-seeded row). |
@@ -408,10 +411,15 @@ executing the continuation. A changed semantic revision, unprovable activity, in
 or ledger arithmetic failure creates a monotonic `wallet_fences` row. Fenced wallets are removed
 from effective membership/projection and cannot copy; there is no delete owner for a fence.
 
-### Hot runtime configuration (`service_config`, issue #544)
+### Hot runtime configuration (`service_config`, issues #544 and #545)
 
-The service accepts one complete snapshot containing exactly these 17 keys; every key is
-mandatory exactly once except `kelly_fraction_override`, which may be absent:
+The service derives its configuration era once from the verified paper log. Before
+`QualificationStarted`, it accepts the legacy complete 17-name snapshot; `fill_mode` and
+`polymarket_fee_rate` remain required but do not drive corrected economics. After Start it accepts
+the 15 economic names formed by removing those two. In either era every era-owned key is mandatory
+exactly once except `kelly_fraction_override`, which may be absent. A separate optional
+`risk_halt_release_hash` row is incident control and is excluded from the economic configuration
+hash.
 
 `active_watchlist_size`, `mode`, `max_fill_price`, `min_fill_price`,
 `min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `fill_mode`,
@@ -420,11 +428,12 @@ mandatory exactly once except `kelly_fraction_override`, which may be absent:
 `kelly_fraction_override`, `per_trade_cap`, `slippage_rate`, `sizing_mode`,
 `sizing_dollar_usd`, and `sizing_contracts`.
 
-Missing, duplicate, unknown, malformed, or cross-field-inconsistent rows reject the whole
-proposal and retain the whole last-good snapshot. The one canonical applied identity is a BLAKE3
-hash of the values actually applied; a pending watchlist-capacity transition continues to hash
-the old applied capacity. Rejected raw rows and their typed error are status evidence, not a
-second revision.
+Missing, duplicate, unknown, malformed, cross-era, or cross-field-inconsistent rows reject the
+whole proposal and retain the whole last-good snapshot. The one canonical applied identity is a
+BLAKE3 hash of that era's values actually applied; a pending watchlist-capacity transition
+continues to hash the old applied capacity. Before a changed economic hash or capacity publishes,
+the orchestrator synchronizes an insufficient-evidence qualification seal. Rejected raw rows and
+their typed error are status evidence, not a second revision.
 
 The guarded operator migration removes these database rows while preserving the corresponding
 restart-owned `ServiceConfig` TOML/environment contracts where they still exist:
@@ -441,7 +450,7 @@ the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` bef
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `max_fill_price` | `0.85` | Hot decimal value. Skip a BUY copy whose resolved fill basis is `>=` this (catastrophic payoff geometry near $1). In `clob_best_ask` mode the basis is the mandatory ladder VWAP; `leader_haircut` uses the boot-owned haircut only after that ladder passes. `0` disables this band edge, not the mandatory book gate. Mirrors the issue-#142 backtest `max_signal_price` cap. |
+| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be below this ceiling after the no-chase and price-impact ceilings. `0` disables this band edge, not the mandatory book gate. |
 | `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Skip a BUY copy whose resolved fill basis is `<` this so selection and deployment share the entry band. The boundary itself fills (strict `<` skip). `0` disables this band edge, not the mandatory book gate. |
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
@@ -565,8 +574,8 @@ call count.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `polymarket_fee_rate` | 0.04 | Polymarket BUY taker fee rate applied in the fee model: `fee_per_share = price × rate` (flat taker fee on notional). Added to `c` to obtain net cost. March 2026 schedule. |
-| `slippage_rate` | 0.01 | Expected proportional fill slippage for BUY orders; `slippage_per_share = price × rate`. Added to `c` alongside the taker fee. Backtest fill is `price × (1 + rate)`; SELL fill is `price × (1 − rate)`. Canonical default: 100 bps. |
+| `polymarket_fee_rate` | 0.04 | Legacy pre-Start compatibility row, required and ignored in the 17-name era and absent in the 15-name financial era. The compact CLOB market response is the sole runtime fee schedule authority. |
+| `slippage_rate` | 0.01 | Expected proportional BUY slippage applied once to the all-in per-share cost after signed principal and the compact-schedule fee. Canonical default: 100 bps. |
 
 ### Service health (`HealthState`)
 
@@ -639,7 +648,9 @@ Written to the rolling full-stream files derived from `jsonl_log_path` (default 
 
 | `kind` | Extra fields | Description |
 |---|---|---|
-| `paper_fill` | `idempotency_key`, `market`, `side`, `contracts`, `fill_price` | A paper-mode simulated fill |
+| `paper_financial_prepared` / `paper_financial_final` | Prepared authority, exact economic record, synchronized receipt, canonical result | The two-frame paper financial protocol. A Final alone proves a completed fill or resolution. Legacy `paper_fill` frames remain readable only before `QualificationStarted`. |
+| `membership_changed` | reason, removed/added wallets, capacity, ranking batch, structural evidence | A synchronized structural membership snapshot. Score-only refresh is unjournaled; durable wallet fences are applied independently and monotonically. |
+| `portfolio_mark` / `qualification_sealed` | mark evidence or sealed-prefix/digest evidence | Qualification observation and immutable seal records. An insufficient-evidence outcome is a seal reason, not another command or state. |
 
 ### Logging conventions (issue #184)
 
@@ -717,32 +728,32 @@ Two flags are first-class:
 
 Both are read by `risk-engine` as part of its pure inputs. As of issue #398 (Decision #2) they are **admin-mutable at runtime** via the Supabase `service_config` table (the single-email-gated admin panel), default-deny, with each edit audit-logged in `service_config.updated_by`/`updated_at` and applied on the next ≤30s config poll. This reverses the prior "signed config change only" rule. `kelly_fraction_above_default_human_approved` is re-checked against the mode ceiling on every poll in `runtime_config::parse_config`, so an above-ceiling override without the flag is cleared rather than applied.
 
-### Promotion criteria — quantified
+### Paper-to-live-tiny qualification — quantified
 
-A leader/strategy promotes from one mode to the next only when ALL of:
+The one sealed observed paper system is eligible for a single manual promotion review only when
+ALL of:
 
 | Comparison | Threshold |
 |---|---|
 | Walk-forward LCB_5pct of follower daily log-growth (after costs) | > 0 |
-| Paper-vs-backtest two-sample KS p-value on daily PnL | ≥ 0.10 |
-| Paper-vs-backtest mean-PnL z-score | abs(z) ≤ 2.0 |
-| Paper-mode observation length | ≥ 30 calendar days AND ≥ 90 closed copied trades |
-| Realized fill rate vs simulated | within 15 % absolute |
-| Observed copy delay p95 | ≤ p95 in production-latency-budget table above |
-| Demotion incidents in window | 0 (a demotion resets the clock) |
+| Exact replay through the recorded seal | Pass with complete evidence |
+| Nonnegative peak-to-trough paper drawdown | strictly less than 0.10 |
+| Observation after the current anchor | ≥ 30 complete UTC days AND ≥ 90 closed copied trades |
+| Paper copy delay | nearest-rank p95 ≤ 2,000 ms |
+| Manual approval | one review after a `Pass` report |
 
-Live-tiny → promoted requires the same gates over a fresh 30-day window with live-tiny capital.
+Quiet days count. The initial partial day does not. An underperformance or inactivity membership
+demotion moves the anchor to the next valid mark and resets the promotion growth, drawdown, close,
+delay, and no-demotion vectors. Normal ranker rotation, capacity change, and score refresh do not.
+There is no extension, interim look, second window, or automatic promotion.
 
 ### Demotion criteria
 
-A leader is demoted (mode steps down: promoted → live-tiny → paper → off) when ANY of:
-
-- live copied PnL underperforms simulation by ≥ 2 standard errors over a 14-day window;
-- p95 copy delay drifts > 1.5× the production budget for two consecutive hourly windows;
-- reconstruction quality drops by ≥ 20 points (out of 100);
-- profit concentration (max single-market %) increases above the eligibility threshold;
-- trader becomes inactive (no trades for ≥ 14 days);
-- copied exits become unreliable (≥ 3 missed/late exits in 30 d).
+Qualification consumes the typed structural membership reasons. Only
+`knockout_underperformance`, `knockout_inactivity`, and `knockout_inactivity_hard_cap` are
+demotion anchors. Risk halts remain owner- and cause-scoped controls; they are not inferred as
+membership demotions. The maintenance statistics and thresholds remain owned by their existing
+configuration and implementation, rather than being redefined by the qualification report.
 
 ### "Very liquid market" threshold (when market orders are permitted)
 
@@ -763,14 +774,12 @@ Otherwise the engine submits limit orders.
 | Polymarket Data API (poll) | 1.5× polling interval | 4× polling interval |
 | Resolver source (NWS final, BLS release, etc.) | per-source SLA in `12-SOURCE-CATALOG.md` | per-source |
 
-### Backtest-vs-paper "close behavior" definition
+### Qualification close behavior
 
-"Behavior is close to simulation" means BOTH:
-
-- KS p-value ≥ 0.10 on daily-PnL distributions;
-- abs(z) ≤ 2.0 on mean-PnL difference, where the standard error is computed by stationary bootstrap with 1_000 resamples.
-
-This applies anywhere the docs say "matches", "close to", or "drift acceptable".
+A closed copy is one unique successful Fill Final after the current qualification anchor whose
+exposure has a causal Resolution Final by the seal. Open positions and missing or noncausal
+resolutions are not samples. Backtest-versus-paper distribution comparisons, resampling, interim
+looks, extensions, and second windows are not promotion inputs.
 
 ### Bootstrap defaults (`pe-bootstrap`)
 
