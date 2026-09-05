@@ -45,8 +45,8 @@ pub struct LivePositionRow {
     pub account_id: String,
     pub market_id: String,
     pub outcome_id: i64,
-    pub long_contracts: i64,
-    pub short_contracts: i64,
+    pub long_contracts: Decimal,
+    pub short_contracts: Decimal,
     pub cost_basis: Decimal,
 }
 
@@ -182,7 +182,11 @@ fn upsert_preference(table: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::upsert_preference;
+    #![allow(clippy::unwrap_used)]
+
+    use rust_decimal_macros::dec;
+
+    use super::{LivePositionRow, upsert_preference};
 
     #[test]
     fn immutable_fills_ignore_duplicates_while_mutable_tables_merge() {
@@ -198,5 +202,21 @@ mod tests {
             upsert_preference("live_account_state"),
             "resolution=merge-duplicates"
         );
+    }
+
+    /// PASS: fractional live quantities serialize as exact PostgREST numeric values.
+    #[test]
+    fn live_position_serialization_preserves_fractional_quantities() {
+        let row = LivePositionRow {
+            account_id: "account".to_owned(),
+            market_id: "market".to_owned(),
+            outcome_id: 1,
+            long_contracts: dec!(3.125001),
+            short_contracts: dec!(0.000001),
+            cost_basis: dec!(2.5),
+        };
+        let value = serde_json::to_value(row).unwrap();
+        assert_eq!(value["long_contracts"], serde_json::json!("3.125001"));
+        assert_eq!(value["short_contracts"], serde_json::json!("0.000001"));
     }
 }

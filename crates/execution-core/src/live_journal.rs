@@ -378,7 +378,7 @@ pub enum LiveOrderAmbiguityKind {
     ReconciliationPending,
 }
 
-/// Venue-reported executed collateral and whole-share amounts from a successful order POST.
+/// Venue-reported executed collateral and quantity from a successful order POST.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveExecutedAmounts {
@@ -391,8 +391,10 @@ pub struct LiveExecutedAmounts {
 pub enum LiveJournalOrderOutcome {
     Matched {
         venue_order_id: String,
-        /// `None` is retained only for order-hash reconciliation results whose trade amounts
-        /// were not captured. Such matches are terminal for submission but not projectable.
+        /// Every matching nonzero transaction hash retained by authenticated reconciliation.
+        #[serde(default)]
+        transaction_hashes: Vec<String>,
+        /// Legacy authenticated/post amounts remain audit-only; finalized logs own economics.
         #[serde(default)]
         executed: Option<LiveExecutedAmounts>,
     },
@@ -406,6 +408,12 @@ pub enum LiveJournalOrderOutcome {
     Ambiguous {
         kind: LiveOrderAmbiguityKind,
     },
+    FinalityPending {
+        reason: String,
+    },
+    FinalityConflict {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +421,7 @@ pub enum LiveJournalOrderOutcome {
 pub enum LiveReconciliationSource {
     PostResponse,
     OrderHashLookupAndCancel,
+    PolygonFinality,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

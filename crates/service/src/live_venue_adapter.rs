@@ -8,6 +8,7 @@
 //! freshness window; the independently fetched executable ladder keeps its stricter two-second
 //! venue-owned bound.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -54,6 +55,196 @@ const MARKET_REQUEST_TIMEOUT_SECS: u64 = 10;
 const RECONCILIATION_TIMEOUT_SECS: u64 = 30;
 const CLOB_LONG_MARKET_SOURCE_ID: &str = "polymarket.clob.markets";
 const CLOB_COMPACT_MARKET_SOURCE_ID: &str = "polymarket.clob.compact-market";
+const POLYGON_RECEIPT_RPC_SCHEMA_VERSION: u16 = 1;
+const POLYGON_RECEIPT_RPC_PARSER_VERSION: u16 = 1;
+
+/// Single-attempt, key-free Polygon JSON-RPC transport using the service's bounded HTTP client.
+#[derive(Clone)]
+pub struct PolygonReceiptRpc {
+    http: reqwest::Client,
+    url: String,
+}
+
+/// Narrow read-only seam used by the existing recovery pass and deterministic receipt fixtures.
+pub trait PolygonReceiptReader: Send + Sync {
+    fn chain_id(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>>;
+    fn transaction_receipt<'a>(
+        &'a self,
+        transaction_hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + 'a>>;
+    fn finalized_block(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>>;
+    fn block_by_number(
+        &self,
+        number: u64,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>>;
+}
+
+impl PolygonReceiptRpc {
+    #[must_use]
+    pub fn new(http: reqwest::Client, url: impl Into<String>) -> Self {
+        Self {
+            http,
+            url: url.into(),
+        }
+    }
+
+    pub async fn chain_id(&self) -> RawHttpAttempt {
+        self.call("polygon-chain-id", "eth_chainId", serde_json::json!([]))
+            .await
+    }
+
+    pub async fn transaction_receipt(&self, transaction_hash: &str) -> RawHttpAttempt {
+        self.call(
+            "polygon-transaction-receipt",
+            "eth_getTransactionReceipt",
+            serde_json::json!([transaction_hash]),
+        )
+        .await
+    }
+
+    pub async fn finalized_block(&self) -> RawHttpAttempt {
+        self.call(
+            "polygon-finalized-block",
+            "eth_getBlockByNumber",
+            serde_json::json!(["finalized", false]),
+        )
+        .await
+    }
+
+    pub async fn block_by_number(&self, number: u64) -> RawHttpAttempt {
+        self.call(
+            "polygon-canonical-block",
+            "eth_getBlockByNumber",
+            serde_json::json!([format!("0x{number:x}"), false]),
+        )
+        .await
+    }
+
+    async fn call(&self, endpoint_kind: &str, method: &str, params: Value) -> RawHttpAttempt {
+        let observed_at = OffsetDateTime::now_utc();
+        let ordered_query = vec![
+            ("rpc_method".to_owned(), method.to_owned()),
+            ("rpc_params".to_owned(), params.to_string()),
+        ];
+        let response = match self
+            .http
+            .post(&self.url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return RawHttpAttempt::TransportFailure(RawTransportFailure {
+                    source_id: "polygon-receipt-rpc".to_owned(),
+                    endpoint_kind: endpoint_kind.to_owned(),
+                    method: "POST".to_owned(),
+                    path: self.url.clone(),
+                    ordered_query,
+                    attempt_ordinal: 1,
+                    observed_at,
+                    received_at: OffsetDateTime::now_utc(),
+                    error_class: classify_reqwest_error(&error),
+                    schema_version: POLYGON_RECEIPT_RPC_SCHEMA_VERSION,
+                    parser_version: POLYGON_RECEIPT_RPC_PARSER_VERSION,
+                    adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                });
+            }
+        };
+        let status = response.status().as_u16();
+        let mut headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        headers.sort();
+        let body = match response.bytes().await {
+            Ok(body) => body.to_vec(),
+            Err(_) => {
+                return RawHttpAttempt::TransportFailure(RawTransportFailure {
+                    source_id: "polygon-receipt-rpc".to_owned(),
+                    endpoint_kind: endpoint_kind.to_owned(),
+                    method: "POST".to_owned(),
+                    path: self.url.clone(),
+                    ordered_query,
+                    attempt_ordinal: 1,
+                    observed_at,
+                    received_at: OffsetDateTime::now_utc(),
+                    error_class: TransportErrorClass::BodyRead,
+                    schema_version: POLYGON_RECEIPT_RPC_SCHEMA_VERSION,
+                    parser_version: POLYGON_RECEIPT_RPC_PARSER_VERSION,
+                    adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                });
+            }
+        };
+        RawHttpAttempt::Response(RawHttpResponse {
+            source_id: "polygon-receipt-rpc".to_owned(),
+            endpoint_kind: endpoint_kind.to_owned(),
+            method: "POST".to_owned(),
+            path: self.url.clone(),
+            ordered_query,
+            status,
+            headers,
+            body,
+            attempt_ordinal: 1,
+            source_at: None,
+            observed_at,
+            received_at: OffsetDateTime::now_utc(),
+            schema_version: POLYGON_RECEIPT_RPC_SCHEMA_VERSION,
+            parser_version: POLYGON_RECEIPT_RPC_PARSER_VERSION,
+            adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+        })
+    }
+}
+
+impl PolygonReceiptReader for PolygonReceiptRpc {
+    fn chain_id(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+        Box::pin(PolygonReceiptRpc::chain_id(self))
+    }
+
+    fn transaction_receipt<'a>(
+        &'a self,
+        transaction_hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + 'a>> {
+        Box::pin(PolygonReceiptRpc::transaction_receipt(
+            self,
+            transaction_hash,
+        ))
+    }
+
+    fn finalized_block(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+        Box::pin(PolygonReceiptRpc::finalized_block(self))
+    }
+
+    fn block_by_number(
+        &self,
+        number: u64,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+        Box::pin(PolygonReceiptRpc::block_by_number(self, number))
+    }
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> TransportErrorClass {
+    if error.is_timeout() {
+        TransportErrorClass::Timeout
+    } else if error.is_connect() {
+        TransportErrorClass::Connect
+    } else if error.is_builder() {
+        TransportErrorClass::RequestBuild
+    } else {
+        TransportErrorClass::Other
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveVenueAdapterError {
@@ -274,6 +465,7 @@ fn classify_order_post_response(
                 making_amount: parsed.making_amount,
                 taking_amount: parsed.taking_amount,
             },
+            transaction_hashes: post_transaction_hashes(response)?,
         });
     }
     if parsed.definitive && parsed.order_id.trim().is_empty() {
@@ -288,18 +480,59 @@ fn classify_order_post_response(
     })
 }
 
+fn post_transaction_hashes(response: &RawHttpResponse) -> Result<Vec<String>, LivePostParseError> {
+    let value: Value =
+        serde_json::from_slice(&response.body).map_err(|_| LivePostParseError::InvalidResponse)?;
+    let hashes = value
+        .get("transactionHashes")
+        .or_else(|| value.get("transaction_hashes"));
+    let Some(hashes) = hashes else {
+        return Ok(Vec::new());
+    };
+    let hashes = hashes
+        .as_array()
+        .ok_or(LivePostParseError::InvalidResponse)?;
+    let mut canonical = BTreeSet::new();
+    for value in hashes {
+        let raw = value.as_str().ok_or(LivePostParseError::InvalidResponse)?;
+        if raw.trim().is_empty()
+            || raw
+                .trim_start_matches("0x")
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            continue;
+        }
+        let hash =
+            canonical_nonzero_transaction_hash(raw).ok_or(LivePostParseError::InvalidResponse)?;
+        canonical.insert(hash);
+    }
+    Ok(canonical.into_iter().collect())
+}
+
 enum ReconciliationClassification {
-    Matched(String),
+    Matched {
+        venue_order_id: String,
+        transaction_hashes: Vec<String>,
+    },
     Killed(Option<String>),
     Rejected(Option<String>),
-    Cancel { order_id: String },
+    Cancel {
+        order_id: String,
+    },
     Ambiguous,
 }
 
 impl ReconciliationClassification {
     fn into_venue_outcome(self) -> LiveVenueReconciledOutcome {
         match self {
-            Self::Matched(venue_order_id) => LiveVenueReconciledOutcome::Matched { venue_order_id },
+            Self::Matched {
+                venue_order_id,
+                transaction_hashes,
+            } => LiveVenueReconciledOutcome::Matched {
+                venue_order_id,
+                transaction_hashes,
+            },
             Self::Killed(venue_order_id) => LiveVenueReconciledOutcome::Killed { venue_order_id },
             Self::Rejected(venue_order_id) => {
                 LiveVenueReconciledOutcome::Rejected { venue_order_id }
@@ -315,28 +548,58 @@ fn classify_reconciliation(
     evidence: &[RawEvidence],
     order_hash: &str,
 ) -> Result<ReconciliationClassification, ()> {
-    let matching_trade = evidence.iter().find_map(|item| match item {
-        RawEvidence::HttpResponse(response) if response.endpoint_kind == "trades-page" => {
-            response_json(response)
-                .ok()
-                .and_then(|value| page_rows(&value).ok().map(|rows| rows.to_vec()))
-                .and_then(|rows| {
-                    rows.into_iter()
-                        .find(|trade| trade_matches_order(trade, order_hash))
-                })
-        }
-        RawEvidence::HttpResponse(_)
-        | RawEvidence::HttpTransportFailure(_)
-        | RawEvidence::Artifact(_) => None,
-    });
-    if let Some(trade) = matching_trade {
-        let venue_order_id = trade
-            .get("taker_order_id")
-            .or_else(|| trade.get("takerOrderId"))
-            .and_then(Value::as_str)
+    let matching_trades = evidence
+        .iter()
+        .flat_map(|item| match item {
+            RawEvidence::HttpResponse(response) if response.endpoint_kind == "trades-page" => {
+                response_json(response)
+                    .ok()
+                    .and_then(|value| page_rows(&value).ok().map(|rows| rows.to_vec()))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|trade| trade_matches_order(trade, order_hash))
+                    .collect::<Vec<_>>()
+            }
+            RawEvidence::HttpResponse(_)
+            | RawEvidence::HttpTransportFailure(_)
+            | RawEvidence::Artifact(_) => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if !matching_trades.is_empty() {
+        let venue_order_id = matching_trades
+            .iter()
+            .find_map(|trade| {
+                trade
+                    .get("taker_order_id")
+                    .or_else(|| trade.get("takerOrderId"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            })
             .unwrap_or(order_hash)
             .to_owned();
-        return Ok(ReconciliationClassification::Matched(venue_order_id));
+        let mut transaction_hashes = BTreeSet::new();
+        for trade in &matching_trades {
+            let Some(raw) = trade
+                .get("transaction_hash")
+                .or_else(|| trade.get("transactionHash"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if raw.trim().is_empty()
+                || raw
+                    .trim_start_matches("0x")
+                    .bytes()
+                    .all(|byte| byte == b'0')
+            {
+                continue;
+            }
+            transaction_hashes.insert(canonical_nonzero_transaction_hash(raw).ok_or(())?);
+        }
+        return Ok(ReconciliationClassification::Matched {
+            venue_order_id,
+            transaction_hashes: transaction_hashes.into_iter().collect(),
+        });
     }
 
     let exact = evidence.iter().find_map(|item| match item {
@@ -366,7 +629,10 @@ fn classify_reconciliation(
         .unwrap_or_default()
         .to_ascii_uppercase();
     if matches!(status.as_str(), "MATCHED" | "FILLED") {
-        return Ok(ReconciliationClassification::Matched(order_id));
+        return Ok(ReconciliationClassification::Matched {
+            venue_order_id: order_id,
+            transaction_hashes: Vec::new(),
+        });
     }
     if matches!(
         status.as_str(),
@@ -381,6 +647,17 @@ fn classify_reconciliation(
         return Ok(ReconciliationClassification::Cancel { order_id });
     }
     Ok(ReconciliationClassification::Ambiguous)
+}
+
+fn canonical_nonzero_transaction_hash(value: &str) -> Option<String> {
+    let digits = value.strip_prefix("0x")?;
+    if digits.len() != 64
+        || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || digits.bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some(format!("0x{}", digits.to_ascii_lowercase()))
 }
 
 fn parse_account_state(
@@ -971,6 +1248,7 @@ mod tests {
         }
     }
 
+    /// PASS: post evidence retains exact fractional improved quantity for audit-only use.
     #[test]
     fn matched_post_classification_retains_fractional_price_improvement_amounts() {
         let response = post_response(json!({
@@ -991,6 +1269,7 @@ mod tests {
                     making_amount: dec!(4.05),
                     taking_amount: dec!(10.125),
                 },
+                transaction_hashes: Vec::new(),
             }
         );
     }
@@ -1010,6 +1289,47 @@ mod tests {
         assert_eq!(
             classify_order_post_response(&response),
             Err(LivePostParseError::InvalidResponse)
+        );
+    }
+
+    /// PASS: authenticated reconciliation preserves every distinct matching nonzero hash.
+    #[test]
+    fn reconciliation_retains_every_matching_transaction_hash() {
+        let order_hash = format!("0x{}", "aa".repeat(32));
+        let first = format!("0x{}", "11".repeat(32));
+        let second = format!("0x{}", "22".repeat(32));
+        let response = RawHttpResponse {
+            endpoint_kind: "trades-page".to_owned(),
+            body: serde_json::to_vec(&json!({"data":[
+                {"taker_order_id": order_hash, "transaction_hash": second},
+                {"taker_order_id": order_hash, "transaction_hash": first},
+                {"taker_order_id": order_hash, "transaction_hash": second},
+                {"taker_order_id": order_hash, "transaction_hash": format!("0x{}", "00".repeat(32))},
+                {"taker_order_id": "other", "transaction_hash": format!("0x{}", "33".repeat(32))}
+            ]}))
+            .unwrap(),
+            ..post_response(json!({}))
+        };
+        let result = classify_reconciliation(
+            &[RawEvidence::HttpResponse(response)],
+            &format!("0x{}", "aa".repeat(32)),
+        )
+        .unwrap();
+        let transaction_hashes = match result {
+            ReconciliationClassification::Matched {
+                transaction_hashes, ..
+            } => Some(transaction_hashes),
+            ReconciliationClassification::Killed(_)
+            | ReconciliationClassification::Rejected(_)
+            | ReconciliationClassification::Cancel { .. }
+            | ReconciliationClassification::Ambiguous => None,
+        };
+        assert_eq!(
+            transaction_hashes,
+            Some(vec![
+                format!("0x{}", "11".repeat(32)),
+                format!("0x{}", "22".repeat(32))
+            ])
         );
     }
 }

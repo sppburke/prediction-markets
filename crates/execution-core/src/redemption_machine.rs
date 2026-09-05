@@ -196,6 +196,33 @@ pub fn reconstruct_redemption_attempts(
                     },
                 );
             }
+            LiveJournalPayload::RedemptionCustodyReconciled(audit) => {
+                let Some(prior) = attempts.get(&audit.identity) else {
+                    continue;
+                };
+                let RedemptionAttemptState::ConfirmedAwaitingBalance {
+                    attempt_count,
+                    transaction_id,
+                    transaction_hash,
+                    ..
+                } = &prior.state
+                else {
+                    continue;
+                };
+                attempts.insert(
+                    audit.identity.clone(),
+                    RedemptionAttempt {
+                        identity: audit.identity.clone(),
+                        state: RedemptionAttemptState::Complete {
+                            attempt_count: *attempt_count,
+                            transaction_id: transaction_id.clone(),
+                            transaction_hash: transaction_hash.clone(),
+                            reconciled_at: event.timestamp,
+                            remaining_redeemable: CollateralAmount::ZERO,
+                        },
+                    },
+                );
+            }
             LiveJournalPayload::AdmissionEvaluated(_)
             | LiveJournalPayload::OrderPreparationFailed(_)
             | LiveJournalPayload::OrderPrepared(_)
@@ -203,7 +230,6 @@ pub fn reconstruct_redemption_attempts(
             | LiveJournalPayload::OrderReconciled(_)
             | LiveJournalPayload::OrderFillFinalized(_)
             | LiveJournalPayload::ResolutionFinalized(_)
-            | LiveJournalPayload::RedemptionCustodyReconciled(_)
             | LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::CredentialBindingMismatch { .. }
             | LiveJournalPayload::ModeTransitionApplied(_)
@@ -1438,6 +1464,85 @@ mod tests {
         ));
         assert_eq!(transport.submissions.load(Ordering::SeqCst), 1);
         assert_eq!(status.reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// PASS: the durable custody fact advances a confirmed attempt exactly once during replay.
+    #[test]
+    fn custody_reconciliation_completes_once_on_replay() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let original = attempt(RedemptionAttemptState::default());
+        journal
+            .append(
+                original.identity.account_id.clone(),
+                now(),
+                LiveJournalPayload::RedemptionTransactionIdentified(Box::new(
+                    RedemptionTransactionAudit {
+                        identity: original.identity.clone(),
+                        attempt_count: 1,
+                        transaction_id: "tx-1".to_owned(),
+                        submit_body_hash: "body".to_owned(),
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                )),
+            )
+            .unwrap();
+        journal
+            .append(
+                original.identity.account_id.clone(),
+                now(),
+                LiveJournalPayload::RedemptionReceiptTransition(Box::new(RedemptionReceiptAudit {
+                    identity: original.identity.clone(),
+                    attempt_count: 1,
+                    transaction_id: "tx-1".to_owned(),
+                    transaction_hash: Some("0xreceipt".to_owned()),
+                    status: RedemptionReceiptStatusAudit::Confirmed,
+                    evidence: Vec::new(),
+                    evidence_hashes: Vec::new(),
+                })),
+            )
+            .unwrap();
+        journal
+            .append(
+                original.identity.account_id.clone(),
+                now() + Duration::seconds(1),
+                LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+                    crate::live_journal::RedemptionCustodyReconciledAudit {
+                        identity: original.identity.clone(),
+                        account_state: crate::live_journal::LiveAccountStateAudit {
+                            observed_at: now() + Duration::seconds(1),
+                            closed_only: false,
+                            geoblocked: false,
+                            selected_spender: "spender".to_owned(),
+                            collateral_balance: CollateralAmount::from_atomic(1_000_000),
+                            allowance: CollateralAmount::from_atomic(1_000_000),
+                            reconciled_free_collateral: CollateralAmount::from_atomic(1_000_000),
+                            schema_version: 1,
+                            parser_version: 1,
+                            evidence: Vec::new(),
+                            evidence_hashes: Vec::new(),
+                        },
+                        venue_positions: Vec::new(),
+                        venue_position_receipts: Vec::new(),
+                    },
+                )),
+            )
+            .unwrap();
+        let events = replay_account(&path, &original.identity.account_id).unwrap();
+        let attempts = reconstruct_redemption_attempts(&events);
+        assert!(matches!(
+            attempts.get(&original.identity).map(|attempt| &attempt.state),
+            Some(RedemptionAttemptState::Complete {
+                transaction_id,
+                transaction_hash,
+                remaining_redeemable,
+                ..
+            }) if transaction_id == "tx-1"
+                && transaction_hash == "0xreceipt"
+                && *remaining_redeemable == CollateralAmount::ZERO
+        ));
     }
 
     #[tokio::test]

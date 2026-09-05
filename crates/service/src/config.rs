@@ -301,6 +301,11 @@ pub struct ServiceConfig {
     /// Polymarket CLOB REST API base URL. Set via `PE_POLYMARKET_CLOB_BASE_URL`.
     #[serde(default = "default_clob_base_url")]
     pub polymarket_clob_base_url: String,
+
+    /// Key-free Polygon JSON-RPC endpoint used only for ordinary-live receipt finality.
+    /// Set via `PE_POLYGON_RECEIPT_RPC_URL`.
+    #[serde(default = "default_polygon_receipt_rpc_url")]
+    pub polygon_receipt_rpc_url: String,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -433,6 +438,10 @@ fn default_clob_base_url() -> String {
     "https://clob.polymarket.com".to_string()
 }
 
+fn default_polygon_receipt_rpc_url() -> String {
+    "https://polygon.publicnode.com".to_string()
+}
+
 fn default_gamma_base_url() -> String {
     "https://gamma-api.polymarket.com".to_string()
 }
@@ -492,6 +501,7 @@ impl Default for ServiceConfig {
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),
             polymarket_clob_base_url: default_clob_base_url(),
+            polygon_receipt_rpc_url: default_polygon_receipt_rpc_url(),
         }
     }
 }
@@ -561,6 +571,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "mode",
         "strategy",
         "polymarket_clob_base_url",
+        "polygon_receipt_rpc_url",
     ]);
     let cfg: ServiceConfig = fig.merge(env).extract()?;
     // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
@@ -603,6 +614,10 @@ mod tests {
         assert_eq!(cfg.status_interval_secs, 30);
         assert_eq!(cfg.log_retention_days, 7);
         assert_eq!(cfg.polymarket_channel_capacity, 256);
+        assert_eq!(
+            cfg.polygon_receipt_rpc_url,
+            "https://polygon.publicnode.com"
+        );
         assert_eq!(cfg.trade_poll_interval_secs, 30);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");

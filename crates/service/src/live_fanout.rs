@@ -1,6 +1,6 @@
 //! Strictly sequential ordinary-live dispatch consumer (#508 Decision 10).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -10,31 +10,35 @@ use age::x25519::Identity;
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     AccountId, BasisPoints, CollateralAmount, EventSeq, KellyFraction, PolymarketConditionId,
-    Price, Probability, Side,
+    Price, Probability, RawHttpAttempt, ShareAmount, Side,
 };
 use pe_event_log::AppendReceipt;
 use pe_execution_core::{
-    BalanceAudit, CredentialBindingIdentity, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
-    FrozenLiveTarget, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveAdmissionRefusal,
-    LiveControlMode, LiveExecutedAmounts, LiveExecutor, LiveFillProjectionIdentity, LiveJournal,
+    BalanceAudit, CanonicalPositionAudit, CredentialBindingIdentity, ECONOMIC_PREPARED_VERSION,
+    EconomicPrepared, FeeAudit, FrozenLiveTarget, LadderPlanAudit, LiveAdmissionArtifactAudit,
+    LiveAdmissionRefusal, LiveControlMode, LiveExecutor, LiveFillProjectionIdentity, LiveJournal,
     LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot,
     LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
     LiveOrderOutcome, LiveOrderReconciliationAudit, LiveOrderVenue, LivePrepareResult,
-    LiveReconciliationSource, LiveVenueReconciledOutcome, MarketSelection, RedemptionAttempt,
-    RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionEvent, RedemptionPassInput,
-    RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit, advance,
-    reconstruct_redemption_attempts, redemption_posture, replay_account, run_redemption_pass,
+    LiveReconciliationSource, LiveVenueReconciledOutcome, MarkKind, MarketSelection,
+    MatchedLogIdentity, OrderFillFinalizedAudit, RedemptionAttempt, RedemptionAttemptIdentity,
+    RedemptionAttemptState, RedemptionPassInput, RiskAudit, RiskDecisionAudit, SizingAudit,
+    SizingModeAudit, reconstruct_redemption_attempts, redemption_posture, replay_account,
+    run_redemption_pass,
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
+use pe_source_polymarket_public::BinaryPayoutVector;
 use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
 use pe_venue_polymarket::{
-    CustodyKind, LadderError, RedemptionTransport, RelayerApiKeyCredentials, RelayerCredentials,
-    RelayerPollPolicy, build_redemption_call, fee_reserve, plan_budget_buy,
-    sign_deposit_wallet_redemption, taker_fee,
+    CustodyKind, DecodedOrderFill, LadderError, MatchedReceipt, ReceiptError, RedemptionTransport,
+    RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy, build_redemption_call,
+    canonical_block_matches, decode_order_fills, fee_reserve, fee_within_reserve,
+    parse_chain_id_response, parse_finalized_block_response, parse_receipt_response,
+    plan_budget_buy, sign_deposit_wallet_redemption, taker_fee,
 };
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
@@ -52,7 +56,8 @@ use crate::live_projections::{
     LiveAccountStateRow, LiveFillRow, LivePositionRow, LiveProjectionWriter,
 };
 use crate::live_venue_adapter::{
-    LiveAdmissionBuilder, LiveRedemptionAdapter, LiveVenueAdapterError, PolymarketLiveVenue,
+    LiveAdmissionBuilder, LiveRedemptionAdapter, LiveVenueAdapterError, PolygonReceiptReader,
+    PolymarketLiveVenue,
 };
 use crate::live_watchlist::LiveWatchlist;
 use crate::runtime_config::LiveRuntimeConfig;
@@ -115,14 +120,6 @@ struct FanoutState {
     last_redemption_unix: Option<i64>,
     last_projection_unix: Option<i64>,
     last_prune_unix: Option<i64>,
-    account_state_inputs: HashMap<String, AccountStateInputs>,
-}
-
-#[derive(Default)]
-struct AccountStateInputs {
-    free_collateral: Option<Decimal>,
-    unredeemed_value: Option<Decimal>,
-    last_reconciled_at: Option<String>,
 }
 
 /// Start the first-boot arming fence, then drive mode, redemption, retention, and ordered fan-out.
@@ -176,7 +173,6 @@ pub async fn run_live_fanout_until(
         last_redemption_unix: None,
         last_projection_unix: None,
         last_prune_unix: None,
-        account_state_inputs: HashMap::new(),
     };
     reconcile_projections(&mut state, OffsetDateTime::now_utc()).await;
     state.last_projection_unix = Some(OffsetDateTime::now_utc().unix_timestamp());
@@ -311,6 +307,386 @@ enum FanoutError {
     Journal(#[from] pe_execution_core::LiveJournalError),
     #[error("live executor: {0}")]
     Executor(#[from] pe_execution_core::LiveExecutorError),
+}
+
+/// One authenticated matched order awaiting Polygon finality.
+#[derive(Debug, Clone)]
+pub struct PendingOrderFinality {
+    pub prepared_journal_seq: u64,
+    pub prepared: Box<pe_execution_core::LiveOrderPreparedAudit>,
+    pub transaction_hashes: Vec<String>,
+}
+
+/// Exact result of one no-retry finality batch. Pending/conflict evidence is journaled through the
+/// existing `OrderReconciled` record; a finalized value is appended before terminalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderFinalityDisposition {
+    Finalized(Box<OrderFillFinalizedAudit>),
+    Pending {
+        reason: String,
+        evidence: Vec<RawHttpAttempt>,
+    },
+    Conflict {
+        reason: String,
+        evidence: Vec<RawHttpAttempt>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderFinalityResult {
+    pub identity: LiveOrderIdentity,
+    pub order_hash: String,
+    pub disposition: OrderFinalityDisposition,
+}
+
+/// Post-append target action. Conflict keeps the reservation and freezes this target; finalized
+/// is the only variant that permits terminalization, release, and projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalityJournalEffect {
+    Pending,
+    Conflict,
+    Finalized,
+}
+
+struct ReceiptObservation {
+    attempt: RawHttpAttempt,
+    parsed: Result<Option<MatchedReceipt>, ReceiptError>,
+}
+
+struct BlockObservation {
+    attempt: RawHttpAttempt,
+    block: Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>,
+}
+
+/// Execute one bounded recovery pass: one chain read, one read per distinct transaction, one
+/// finalized-head read, and one canonical block read per distinct lower receipt height.
+pub async fn collect_order_finality(
+    rpc: &dyn PolygonReceiptReader,
+    orders: Vec<PendingOrderFinality>,
+) -> Vec<OrderFinalityResult> {
+    if orders.is_empty() {
+        return Vec::new();
+    }
+
+    let chain_attempt = rpc.chain_id().await;
+    let chain_id = response_body(&chain_attempt)
+        .and_then(|body| parse_chain_id_response(body).map_err(|_| ()))
+        .ok();
+
+    let hashes = orders
+        .iter()
+        .flat_map(|order| order.transaction_hashes.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut receipts = BTreeMap::new();
+    for hash in hashes {
+        let attempt = rpc.transaction_receipt(&hash).await;
+        let parsed = response_body(&attempt)
+            .map_err(|_| ReceiptError::MalformedRpc)
+            .and_then(|body| parse_receipt_response(body, &hash));
+        receipts.insert(hash, ReceiptObservation { attempt, parsed });
+    }
+
+    let head_attempt = rpc.finalized_block().await;
+    let head = response_body(&head_attempt)
+        .map_err(|_| ReceiptError::MalformedRpc)
+        .and_then(parse_finalized_block_response);
+    let mut lower_heights = BTreeSet::new();
+    if let Ok(head) = &head {
+        for observation in receipts.values() {
+            if let Ok(Some(receipt)) = &observation.parsed
+                && receipt.block_number < head.number
+            {
+                lower_heights.insert(receipt.block_number);
+            }
+        }
+    }
+    let mut blocks = BTreeMap::new();
+    for height in lower_heights {
+        let attempt = rpc.block_by_number(height).await;
+        let expected_hash = receipts
+            .values()
+            .find_map(|observation| match &observation.parsed {
+                Ok(Some(receipt)) if receipt.block_number == height => {
+                    Some(receipt.block_hash.as_str())
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => None,
+            });
+        let block = match (response_body(&attempt), expected_hash) {
+            (Ok(body), Some(hash)) => canonical_block_matches(body, height, hash),
+            (Ok(_), None) | (Err(_), _) => Err(ReceiptError::MalformedRpc),
+        };
+        blocks.insert(height, BlockObservation { attempt, block });
+    }
+
+    orders
+        .into_iter()
+        .map(|order| {
+            classify_order_finality(
+                order,
+                chain_id,
+                &chain_attempt,
+                &head_attempt,
+                &head,
+                &receipts,
+                &blocks,
+            )
+        })
+        .collect()
+}
+
+fn classify_order_finality(
+    order: PendingOrderFinality,
+    chain_id: Option<u64>,
+    chain_attempt: &RawHttpAttempt,
+    head_attempt: &RawHttpAttempt,
+    head: &Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>,
+    receipts: &BTreeMap<String, ReceiptObservation>,
+    blocks: &BTreeMap<u64, BlockObservation>,
+) -> OrderFinalityResult {
+    let identity = order.prepared.identity.clone();
+    let order_hash = order.prepared.prepared.order_hash.clone();
+    let all_evidence = || {
+        std::iter::once(chain_attempt.clone())
+            .chain(receipts.values().map(|item| item.attempt.clone()))
+            .chain(std::iter::once(head_attempt.clone()))
+            .chain(blocks.values().map(|item| item.attempt.clone()))
+            .collect::<Vec<_>>()
+    };
+    let pending = |reason: String| OrderFinalityResult {
+        identity: identity.clone(),
+        order_hash: order_hash.clone(),
+        disposition: OrderFinalityDisposition::Pending {
+            reason,
+            evidence: all_evidence(),
+        },
+    };
+    let conflict = |reason: String| OrderFinalityResult {
+        identity: identity.clone(),
+        order_hash: order_hash.clone(),
+        disposition: OrderFinalityDisposition::Conflict {
+            reason,
+            evidence: all_evidence(),
+        },
+    };
+
+    if chain_id != Some(pe_venue_polymarket::FINALIZED_CHAIN_ID) {
+        return pending("polygon chain identity unavailable or not 137".to_owned());
+    }
+    let Ok(head) = head else {
+        return pending("polygon finalized head unavailable".to_owned());
+    };
+    if order.transaction_hashes.is_empty() {
+        return pending("authenticated match has no nonzero transaction hash yet".to_owned());
+    }
+
+    let mut fills = BTreeMap::<(String, u64), DecodedOrderFill>::new();
+    let mut receipt_evidence = vec![chain_attempt.clone()];
+    let mut block_evidence = vec![head_attempt.clone()];
+    let mut has_unfinalized = false;
+    for hash in &order.transaction_hashes {
+        let Some(observation) = receipts.get(hash) else {
+            return conflict(format!(
+                "receipt request missing for authenticated transaction {hash}"
+            ));
+        };
+        receipt_evidence.push(observation.attempt.clone());
+        let receipt = match &observation.parsed {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                has_unfinalized = true;
+                continue;
+            }
+            Err(error) if finality_evidence_unavailable(error) => {
+                return pending(format!("transaction receipt unavailable: {error}"));
+            }
+            Err(error) => return conflict(format!("transaction receipt conflict: {error}")),
+        };
+        if receipt.block_number > head.number {
+            has_unfinalized = true;
+            continue;
+        }
+        if receipt.block_number == head.number {
+            if receipt.block_hash != head.hash {
+                return conflict("receipt block hash conflicts with finalized head".to_owned());
+            }
+        } else {
+            let Some(block) = blocks.get(&receipt.block_number) else {
+                return conflict("canonical lower block evidence is missing".to_owned());
+            };
+            block_evidence.push(block.attempt.clone());
+            match &block.block {
+                Ok(canonical) if canonical.hash == receipt.block_hash => {}
+                Ok(_) => return conflict("receipt block hash is not canonical".to_owned()),
+                Err(error) if finality_evidence_unavailable(error) => {
+                    return pending(format!("canonical block unavailable: {error}"));
+                }
+                Err(error) => return conflict(format!("canonical block conflict: {error}")),
+            }
+        }
+        let decoded = match decode_order_fills(receipt, &order.prepared.prepared) {
+            Ok(decoded) => decoded,
+            Err(error) => return conflict(format!("OrderFilled conflict: {error}")),
+        };
+        for fill in decoded {
+            let key = (fill.transaction_hash.clone(), fill.log_index);
+            match fills.get(&key) {
+                Some(existing) if existing == &fill => {}
+                Some(_) => {
+                    return conflict(
+                        "OrderFilled log identity was reused with different content".to_owned(),
+                    );
+                }
+                None => {
+                    fills.insert(key, fill);
+                }
+            }
+        }
+    }
+    if has_unfinalized {
+        return pending("one or more authenticated transactions are not finalized".to_owned());
+    }
+    if fills.is_empty() {
+        return conflict("finalized receipts contain zero matching OrderFilled logs".to_owned());
+    }
+
+    let aggregates = fills.values().try_fold(
+        (
+            CollateralAmount::ZERO,
+            ShareAmount::ZERO,
+            CollateralAmount::ZERO,
+        ),
+        |(principal, quantity, fee), fill| {
+            Some((
+                principal.checked_add(fill.principal).ok()?,
+                quantity.checked_add(fill.quantity).ok()?,
+                fee.checked_add(fill.fee).ok()?,
+            ))
+        },
+    );
+    let Some((principal, quantity, fee)) = aggregates else {
+        return conflict("finalized fill aggregation overflow".to_owned());
+    };
+    if order.prepared.economic.sizing.principal != order.prepared.prepared.maker_collateral
+        || order.prepared.economic.ladder.minimum_shares != order.prepared.prepared.taker_shares
+    {
+        return conflict("prepared economics disagree with the signed order".to_owned());
+    }
+    let expected_principal = order.prepared.prepared.maker_collateral;
+    if principal < expected_principal {
+        return pending("finalized principal remains below the signed principal".to_owned());
+    }
+    if principal > expected_principal {
+        return conflict("finalized principal exceeds the signed principal".to_owned());
+    }
+    if quantity < order.prepared.economic.ladder.minimum_shares {
+        return conflict(
+            "full-principal finalized quantity is below the signed minimum".to_owned(),
+        );
+    }
+    if !fee_within_reserve(fee, order.prepared.economic.fee.reserve) {
+        return conflict("finalized fee exceeds the prepared reserve".to_owned());
+    }
+
+    let matched_logs = fills
+        .into_keys()
+        .map(|(transaction_hash, log_index)| MatchedLogIdentity {
+            transaction_hash,
+            log_index,
+        })
+        .collect();
+    OrderFinalityResult {
+        identity: identity.clone(),
+        order_hash,
+        disposition: OrderFinalityDisposition::Finalized(Box::new(OrderFillFinalizedAudit {
+            identity,
+            prepared_journal_seq: order.prepared_journal_seq,
+            principal,
+            quantity,
+            fee,
+            matched_logs,
+            chain_id: pe_venue_polymarket::FINALIZED_CHAIN_ID,
+            finalized_head: head.number,
+            receipts: receipt_evidence,
+            blocks: block_evidence,
+        })),
+    }
+}
+
+fn finality_evidence_unavailable(error: &ReceiptError) -> bool {
+    matches!(
+        error,
+        ReceiptError::MalformedRpc
+            | ReceiptError::RpcError
+            | ReceiptError::MissingResult
+            | ReceiptError::UnsupportedFinalizedTag
+    )
+}
+
+fn response_body(attempt: &RawHttpAttempt) -> Result<&[u8], ()> {
+    match attempt {
+        RawHttpAttempt::Response(response) if (200..300).contains(&response.status) => {
+            Ok(&response.body)
+        }
+        RawHttpAttempt::Response(_) | RawHttpAttempt::TransportFailure(_) => Err(()),
+    }
+}
+
+/// Synchronize one finality result without changing the SQLite target. The caller may terminalize
+/// and project only after this returns [`FinalityJournalEffect::Finalized`].
+pub fn append_order_finality_result(
+    journal: &LiveJournal,
+    account_id: AccountId,
+    now: OffsetDateTime,
+    result: OrderFinalityResult,
+) -> Result<FinalityJournalEffect, pe_execution_core::LiveJournalError> {
+    let (payload, effect) = match result.disposition {
+        OrderFinalityDisposition::Finalized(finalized) => (
+            LiveJournalPayload::OrderFillFinalized(finalized),
+            FinalityJournalEffect::Finalized,
+        ),
+        OrderFinalityDisposition::Pending { reason, evidence } => {
+            let evidence_hashes = evidence
+                .iter()
+                .map(|attempt| {
+                    serde_json::to_vec(&("prediction-edge/live-http-attempt/v1", attempt))
+                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                    identity: result.identity,
+                    order_hash: result.order_hash,
+                    source: LiveReconciliationSource::PolygonFinality,
+                    outcome: LiveJournalOrderOutcome::FinalityPending { reason },
+                    evidence,
+                    evidence_hashes,
+                })),
+                FinalityJournalEffect::Pending,
+            )
+        }
+        OrderFinalityDisposition::Conflict { reason, evidence } => {
+            let evidence_hashes = evidence
+                .iter()
+                .map(|attempt| {
+                    serde_json::to_vec(&("prediction-edge/live-http-attempt/v1", attempt))
+                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                    identity: result.identity,
+                    order_hash: result.order_hash,
+                    source: LiveReconciliationSource::PolygonFinality,
+                    outcome: LiveJournalOrderOutcome::FinalityConflict { reason },
+                    evidence,
+                    evidence_hashes,
+                })),
+                FinalityJournalEffect::Conflict,
+            )
+        }
+    };
+    journal.append(account_id, now, payload)?;
+    Ok(effect)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -546,6 +922,11 @@ async fn process_target(
         Ok(account_state) => account_state,
         Err(_) => return Ok(PassControl::StopSeed),
     };
+    if live_financial_posture(state, account, account_state.collateral_balance, false)
+        != CheckOutcome::Pass
+    {
+        return Ok(PassControl::StopSeed);
+    }
     let book = match state.config.book_fetcher.fetch_book(&token_id.0).await {
         Ok(book) => book,
         Err(error) => {
@@ -690,7 +1071,6 @@ async fn process_target(
             }
             let transition = outcome_transition(&outcome);
             persist_outcome(state, target, &outcome, now)?;
-            capture_account_state_row(state, account, &account_state, now);
             Ok(if transition.freeze {
                 PassControl::FreezePass
             } else {
@@ -710,7 +1090,6 @@ async fn process_target(
             let outcome = executor.submit(prepared, now).await?;
             let transition = outcome_transition(&outcome);
             persist_outcome(state, target, &outcome, now)?;
-            capture_account_state_row(state, account, &account_state, now);
             if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
                 reconcile_account_projection(state, account, now).await;
             }
@@ -1053,188 +1432,292 @@ fn ladder_terminal_reason(error: &LadderError) -> &'static str {
     }
 }
 
-fn capture_account_state_row(
-    state: &mut FanoutState,
-    account: &AccountContext,
-    account_state: &pe_execution_core::LiveVenueAccountState,
-    now: OffsetDateTime,
-) {
-    let inputs = state
-        .account_state_inputs
-        .entry(account.account_id.as_str().to_owned())
-        .or_default();
-    inputs.free_collateral = Some(account_state.reconciled_free_collateral.to_decimal());
-    inputs.last_reconciled_at = now
-        .format(&time::format_description::well_known::Rfc3339)
-        .ok();
-}
-
-async fn capture_account_state(
-    state: &mut FanoutState,
-    account: &AccountContext,
-    venue: &PolymarketLiveVenue,
-    neg_risk: bool,
-    now: OffsetDateTime,
-) {
-    if let Ok(account_state) = venue.read_balance_and_allowance(neg_risk).await {
-        capture_account_state_row(state, account, &account_state, now);
-    }
-}
-
 #[derive(Default)]
-struct ProjectionDerivation {
-    fills: Vec<LiveFillRow>,
-    positions: Vec<LivePositionRow>,
-    reserved: Decimal,
-    latest_free_collateral: Option<Decimal>,
-    latest_reconciled_at: Option<String>,
+pub(crate) struct ProjectionDerivation {
+    pub(crate) fills: Vec<LiveFillRow>,
+    pub(crate) positions: Vec<LivePositionRow>,
+    pub(crate) custody_positions: Vec<CanonicalPositionAudit>,
+    pub(crate) reserved: Decimal,
+    pub(crate) economic_cash: Option<Decimal>,
+    pub(crate) receivable: Decimal,
+    pub(crate) latest_free_collateral: Option<Decimal>,
+    pub(crate) latest_reconciled_at: Option<String>,
 }
 
-fn executed_fill_price(executed: &LiveExecutedAmounts) -> Option<Decimal> {
-    if executed.making_amount <= Decimal::ZERO
-        || executed.taking_amount <= Decimal::ZERO
-        || executed.taking_amount.fract() != Decimal::ZERO
-    {
-        return None;
-    }
-    let price = executed.making_amount.checked_div(executed.taking_amount)?;
-    Price::new(price).ok().map(|value| value.0)
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProjectionReducerError {
+    #[error("a second Baseline mark exists in the same account era")]
+    DuplicateBaseline,
+    #[error("Baseline must bind empty venue inventory and exact zero-position equity")]
+    InvalidBaseline,
+    #[error("duplicate prepared/finalized identity conflicts with prior journal content")]
+    IdentityConflict,
+    #[error("OrderFillFinalized has no matching prepared record")]
+    MissingPrepared,
+    #[error("OrderFillFinalized prepared sequence is wrong")]
+    PreparedSequenceMismatch,
+    #[error("OrderFillFinalized violates its prepared order economics or identity")]
+    InvalidFinalizedFill,
+    #[error("OrderFillFinalized appeared after its condition was finalized")]
+    FillAfterResolution,
+    #[error("a ResolutionFinalized condition still has a nonterminal prepared order")]
+    ResolutionWithPendingOrder,
+    #[error("canonical payout vector is invalid")]
+    InvalidPayout,
+    #[error("finalized financial arithmetic overflowed")]
+    Arithmetic,
+    #[error("finalized fill is missing its journal-owned projection identity")]
+    MissingProjectionIdentity,
+    #[error("finalized principal/quantity does not form a valid fill price")]
+    InvalidFillPrice,
+    #[error("custody venue inventory disagrees with journal-derived inventory")]
+    CustodyInventoryMismatch,
+    #[error("authenticated collateral disagrees with economic cash and receivable")]
+    CashMismatch,
+    #[error("portfolio mark prices are missing, duplicated, or inconsistent")]
+    InvalidMarkPrices,
+    #[error("portfolio mark equity disagrees with finalized economics")]
+    InvalidMarkEquity,
+    #[error("a Daily portfolio mark repeats a cutoff in the same account era")]
+    DuplicateDailyMark,
 }
 
-fn derive_projection_rows(
-    paper_state: &PaperStateDb,
+pub(crate) fn derive_projection_rows(
     account_id: &AccountId,
     events: &[LiveJournalEvent],
-) -> Result<ProjectionDerivation, FanoutError> {
-    let mut fills = HashMap::<String, (LiveFillRow, Decimal)>::new();
-    let mut reservations = HashMap::<String, Decimal>::new();
-    let mut redeemed_conditions = HashSet::<String>::new();
+) -> Result<ProjectionDerivation, ProjectionReducerError> {
+    let mut baseline_seen = false;
+    let mut economic_cash = None;
+    let mut fills = BTreeMap::<String, (OrderFillFinalizedAudit, LiveFillRow)>::new();
+    let mut prepared_orders =
+        BTreeMap::<String, (u64, Box<pe_execution_core::LiveOrderPreparedAudit>, bool)>::new();
+    let mut reservations = BTreeMap::<String, Decimal>::new();
+    let mut resolutions = BTreeMap::<String, pe_execution_core::ResolutionFinalizedAudit>::new();
+    let mut receivable_by_condition = BTreeMap::<String, CollateralAmount>::new();
     let mut latest_free_collateral = None;
     let mut latest_reconciled_at = None;
+    let mut daily_marks = BTreeMap::new();
 
     for event in events {
-        match &event.payload {
-            LiveJournalPayload::AdmissionEvaluated(audit) => {
-                if let Some(account_state) = audit.account_state.as_ref() {
-                    latest_free_collateral =
-                        Some(account_state.reconciled_free_collateral.to_decimal());
-                    latest_reconciled_at = account_state
-                        .observed_at
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .ok();
-                }
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &event.payload
+            && mark.kind == MarkKind::Baseline
+        {
+            if baseline_seen {
+                return Err(ProjectionReducerError::DuplicateBaseline);
             }
-            LiveJournalPayload::OrderPrepared(prepared) => {
-                reservations.insert(
-                    prepared.identity.idempotency_key.clone(),
-                    prepared.economic.balance.worst_case_debit.to_decimal(),
-                );
+            if !mark.venue_positions.is_empty()
+                || !mark.prices.is_empty()
+                || mark.equity == CollateralAmount::ZERO
+                || mark.equity != mark.account_state.collateral_balance
+            {
+                return Err(ProjectionReducerError::InvalidBaseline);
+            }
+            baseline_seen = true;
+            economic_cash = Some(mark.equity.to_decimal());
+            latest_free_collateral = Some(mark.account_state.collateral_balance.to_decimal());
+            latest_reconciled_at = format_observed_at(mark.account_state.observed_at);
+            continue;
+        }
+        if !baseline_seen {
+            // Everything before the first synchronized Baseline is retained audit only.
+            continue;
+        }
+        match &event.payload {
+            LiveJournalPayload::OrderPrepared(order) => {
+                let key = order.identity.idempotency_key.clone();
+                if let Some((existing_seq, existing, _)) = prepared_orders.get(&key) {
+                    if *existing_seq != event.seq || existing.as_ref() != order.as_ref() {
+                        return Err(ProjectionReducerError::IdentityConflict);
+                    }
+                } else {
+                    reservations.insert(
+                        key.clone(),
+                        order.economic.balance.worst_case_debit.to_decimal(),
+                    );
+                    prepared_orders.insert(key, (event.seq, order.clone(), false));
+                }
             }
             LiveJournalPayload::OrderReconciled(reconciled) => {
-                if !matches!(
+                if matches!(
                     reconciled.outcome,
-                    LiveJournalOrderOutcome::Ambiguous { .. }
+                    LiveJournalOrderOutcome::Killed { .. }
+                        | LiveJournalOrderOutcome::Rejected { .. }
                 ) {
                     reservations.remove(&reconciled.identity.idempotency_key);
+                    if let Some((_, _, terminal)) =
+                        prepared_orders.get_mut(&reconciled.identity.idempotency_key)
+                    {
+                        *terminal = true;
+                    }
                 }
-                let LiveJournalOrderOutcome::Matched {
-                    executed: Some(executed),
-                    ..
-                } = &reconciled.outcome
+            }
+            LiveJournalPayload::OrderFillFinalized(finalized) => {
+                let key = finalized.identity.idempotency_key.clone();
+                let Some((prepared_seq, prepared_audit, terminal)) = prepared_orders.get_mut(&key)
                 else {
-                    if matches!(
-                        reconciled.outcome,
-                        LiveJournalOrderOutcome::Matched { executed: None, .. }
-                    ) {
-                        error!(
-                            account_id = %account_id,
-                            dispatch_id = %reconciled.identity.dispatch_id,
-                            "matched live order lacks executed amounts; fill projection remains pending"
-                        );
-                    }
-                    continue;
+                    return Err(ProjectionReducerError::MissingPrepared);
                 };
-                let Some(fill_price) = executed_fill_price(executed) else {
-                    error!(
-                        account_id = %account_id,
-                        dispatch_id = %reconciled.identity.dispatch_id,
-                        "matched live order has invalid executed amounts; fill projection remains pending"
-                    );
-                    continue;
-                };
-                let projection = if let Some(projection) =
-                    reconciled.identity.fill_projection.as_deref()
+                if *prepared_seq != finalized.prepared_journal_seq {
+                    return Err(ProjectionReducerError::PreparedSequenceMismatch);
+                }
+                let unique_logs = finalized
+                    .matched_logs
+                    .iter()
+                    .map(|log| (&log.transaction_hash, log.log_index))
+                    .collect::<BTreeSet<_>>();
+                let logs_are_sorted = finalized.matched_logs.windows(2).all(|pair| {
+                    (&pair[0].transaction_hash, pair[0].log_index)
+                        < (&pair[1].transaction_hash, pair[1].log_index)
+                });
+                if finalized.identity != prepared_audit.identity
+                    || (*terminal && !fills.contains_key(&key))
+                    || finalized.chain_id != pe_venue_polymarket::FINALIZED_CHAIN_ID
+                    || finalized.principal != prepared_audit.economic.sizing.principal
+                    || finalized.principal != prepared_audit.prepared.maker_collateral
+                    || prepared_audit.economic.ladder.minimum_shares
+                        != prepared_audit.prepared.taker_shares
+                    || finalized.quantity < prepared_audit.economic.ladder.minimum_shares
+                    || !fee_within_reserve(finalized.fee, prepared_audit.economic.fee.reserve)
+                    || finalized.matched_logs.is_empty()
+                    || unique_logs.len() != finalized.matched_logs.len()
+                    || !logs_are_sorted
                 {
-                    projection.clone()
-                } else {
-                    let Some(seed) = paper_state.dispatch_seed(&reconciled.identity.dispatch_id)?
-                    else {
-                        error!(
-                            account_id = %account_id,
-                            dispatch_id = %reconciled.identity.dispatch_id,
-                            "matched live order has neither journaled nor frozen dispatch metadata; fill projection remains pending"
-                        );
-                        continue;
-                    };
-                    let signal = match parse_frozen_signal(&seed) {
-                        Ok(signal) => signal,
-                        Err(error) => {
-                            error!(
-                                account_id = %account_id,
-                                dispatch_id = %reconciled.identity.dispatch_id,
-                                error = %error,
-                                "matched live order frozen signal is invalid; fill projection remains pending"
-                            );
-                            continue;
-                        }
-                    };
-                    LiveFillProjectionIdentity {
-                        leader_wallet: signal.leader.to_string(),
-                        source_trade_id: Some(seed.source_trade_id),
-                        market_id: signal.market_id.to_string(),
-                        outcome_id: i64::from(signal.outcome_id.0),
-                        side: "buy".to_owned(),
+                    return Err(ProjectionReducerError::InvalidFinalizedFill);
+                }
+                if resolutions.contains_key(&prepared_audit.prepared.condition_id.0) {
+                    return Err(ProjectionReducerError::FillAfterResolution);
+                }
+                let projection = finalized
+                    .identity
+                    .fill_projection
+                    .as_deref()
+                    .ok_or(ProjectionReducerError::MissingProjectionIdentity)?;
+                let fill_price = finalized
+                    .principal
+                    .to_decimal()
+                    .checked_div(finalized.quantity.to_decimal())
+                    .and_then(|price| Price::new(price).ok())
+                    .ok_or(ProjectionReducerError::InvalidFillPrice)?
+                    .0;
+                let event_seq =
+                    i64::try_from(event.seq).map_err(|_| ProjectionReducerError::Arithmetic)?;
+                let row = LiveFillRow {
+                    account_id: account_id.as_str().to_owned(),
+                    idempotency_key: key.clone(),
+                    leader_wallet: projection.leader_wallet.clone(),
+                    source_trade_id: projection.source_trade_id.clone(),
+                    market_id: projection.market_id.clone(),
+                    outcome_id: projection.outcome_id,
+                    side: projection.side.clone(),
+                    contracts: finalized.quantity.to_decimal(),
+                    fill_price,
+                    entry_unix: Some(event.timestamp.unix_timestamp()),
+                    event_seq,
+                };
+                if let Some((existing, existing_row)) = fills.get(&key) {
+                    if !same_finalized_fill(existing, finalized)
+                        || existing_row.idempotency_key != row.idempotency_key
+                    {
+                        return Err(ProjectionReducerError::IdentityConflict);
                     }
-                };
-                let Ok(event_seq) = i64::try_from(event.seq) else {
-                    error!(
-                        account_id = %account_id,
-                        dispatch_id = %reconciled.identity.dispatch_id,
-                        "matched live order event sequence overflow; fill projection remains pending"
-                    );
                     continue;
-                };
-                fills
-                    .entry(reconciled.identity.idempotency_key.clone())
-                    .or_insert_with(|| {
-                        (
-                            LiveFillRow {
-                                account_id: account_id.as_str().to_owned(),
-                                idempotency_key: reconciled.identity.idempotency_key.clone(),
-                                leader_wallet: projection.leader_wallet,
-                                source_trade_id: projection.source_trade_id,
-                                market_id: projection.market_id,
-                                outcome_id: projection.outcome_id,
-                                side: projection.side,
-                                contracts: executed.taking_amount,
-                                fill_price,
-                                entry_unix: Some(event.timestamp.unix_timestamp()),
-                                event_seq,
-                            },
-                            executed.making_amount,
-                        )
-                    });
+                }
+                let debit = finalized
+                    .principal
+                    .to_decimal()
+                    .checked_add(finalized.fee.to_decimal())
+                    .ok_or(ProjectionReducerError::Arithmetic)?;
+                economic_cash = Some(
+                    economic_cash
+                        .ok_or(ProjectionReducerError::InvalidBaseline)?
+                        .checked_sub(debit)
+                        .ok_or(ProjectionReducerError::Arithmetic)?,
+                );
+                reservations.remove(&key);
+                *terminal = true;
+                fills.insert(key, (finalized.as_ref().clone(), row));
             }
-            LiveJournalPayload::RedemptionReceiptTransition(receipt)
-                if receipt.status == pe_execution_core::RedemptionReceiptStatusAudit::Confirmed =>
-            {
-                redeemed_conditions.insert(receipt.identity.condition_id.0.clone());
+            LiveJournalPayload::ResolutionFinalized(resolution) => {
+                let payout = BinaryPayoutVector::from_canonical_json(
+                    &resolution.payout_by_outcome_index_json,
+                )
+                .map_err(|_| ProjectionReducerError::InvalidPayout)?;
+                let condition = resolution.condition_id.0.clone();
+                if let Some(existing) = resolutions.get(&condition) {
+                    if existing != resolution.as_ref() {
+                        return Err(ProjectionReducerError::IdentityConflict);
+                    }
+                    continue;
+                }
+                if prepared_orders.values().any(|(_, order, terminal)| {
+                    order.prepared.condition_id.0 == condition && !*terminal
+                }) {
+                    return Err(ProjectionReducerError::ResolutionWithPendingOrder);
+                }
+                let credit = resolution_credit(&condition, &payout, &prepared_orders, &fills)?;
+                economic_cash = Some(
+                    economic_cash
+                        .ok_or(ProjectionReducerError::InvalidBaseline)?
+                        .checked_add(credit.to_decimal())
+                        .ok_or(ProjectionReducerError::Arithmetic)?,
+                );
+                if credit != CollateralAmount::ZERO {
+                    receivable_by_condition.insert(condition.clone(), credit);
+                }
+                resolutions.insert(condition, resolution.as_ref().clone());
             }
-            LiveJournalPayload::OrderPreparationFailed(_)
+            LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
+                let condition = custody.identity.condition_id.0.clone();
+                if !resolutions.contains_key(&condition) {
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
+                receivable_by_condition.remove(&condition);
+                let expected = derive_custody_positions(
+                    &prepared_orders,
+                    &fills,
+                    &resolutions,
+                    &receivable_by_condition,
+                )?;
+                if canonical_positions(&custody.venue_positions)? != expected {
+                    return Err(ProjectionReducerError::CustodyInventoryMismatch);
+                }
+                let receivable = sum_receivable(&receivable_by_condition)?;
+                require_cash_reconciliation(
+                    custody.account_state.collateral_balance,
+                    economic_cash.ok_or(ProjectionReducerError::InvalidBaseline)?,
+                    receivable,
+                )?;
+                latest_free_collateral =
+                    Some(custody.account_state.collateral_balance.to_decimal());
+                latest_reconciled_at = format_observed_at(custody.account_state.observed_at);
+            }
+            LiveJournalPayload::AccountPortfolioMarked(mark) if mark.kind == MarkKind::Daily => {
+                if daily_marks.insert(mark.cutoff_unix, mark.equity).is_some() {
+                    return Err(ProjectionReducerError::DuplicateDailyMark);
+                }
+                let expected = derive_custody_positions(
+                    &prepared_orders,
+                    &fills,
+                    &resolutions,
+                    &receivable_by_condition,
+                )?;
+                if canonical_positions(&mark.venue_positions)? != expected {
+                    return Err(ProjectionReducerError::CustodyInventoryMismatch);
+                }
+                let receivable = sum_receivable(&receivable_by_condition)?;
+                let cash = economic_cash.ok_or(ProjectionReducerError::InvalidBaseline)?;
+                require_cash_reconciliation(
+                    mark.account_state.collateral_balance,
+                    cash,
+                    receivable,
+                )?;
+                require_mark_equity(mark, cash, &prepared_orders, &fills, &resolutions)?;
+                latest_free_collateral = Some(mark.account_state.collateral_balance.to_decimal());
+                latest_reconciled_at = format_observed_at(mark.account_state.observed_at);
+            }
+            LiveJournalPayload::AdmissionEvaluated(_)
+            | LiveJournalPayload::OrderPreparationFailed(_)
             | LiveJournalPayload::OrderPosted(_)
-            | LiveJournalPayload::OrderFillFinalized(_)
-            | LiveJournalPayload::ResolutionFinalized(_)
-            | LiveJournalPayload::RedemptionCustodyReconciled(_)
             | LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::RedemptionRequested(_)
             | LiveJournalPayload::RedemptionTransactionIdentified(_)
@@ -1245,29 +1728,32 @@ fn derive_projection_rows(
         }
     }
 
-    let mut position_totals = HashMap::<(String, i64), (i64, Decimal)>::new();
-    for (row, collateral) in fills.values() {
-        let Some(contracts) = row.contracts.to_i64() else {
-            error!(
-                account_id = %account_id,
-                idempotency_key = %row.idempotency_key,
-                "matched live order contracts overflow position projection"
-            );
-            continue;
+    let mut position_totals = BTreeMap::<(String, i64), (Decimal, Decimal)>::new();
+    for (key, (finalized, row)) in &fills {
+        let Some((_, order, _)) = prepared_orders.get(key) else {
+            return Err(ProjectionReducerError::MissingPrepared);
         };
+        if resolutions.contains_key(&order.prepared.condition_id.0) {
+            continue;
+        }
         let total = position_totals
             .entry((row.market_id.clone(), row.outcome_id))
-            .or_insert((0, Decimal::ZERO));
-        total.0 = total.0.saturating_add(contracts);
-        total.1 += *collateral;
-    }
-    for ((market_id, _), total) in &mut position_totals {
-        if redeemed_conditions.contains(market_id) {
-            *total = (0, Decimal::ZERO);
-        }
+            .or_insert((Decimal::ZERO, Decimal::ZERO));
+        total.0 = total
+            .0
+            .checked_add(row.contracts)
+            .ok_or(ProjectionReducerError::Arithmetic)?;
+        total.1 = total
+            .1
+            .checked_add(finalized.principal.to_decimal())
+            .and_then(|value| value.checked_add(finalized.fee.to_decimal()))
+            .ok_or(ProjectionReducerError::Arithmetic)?;
     }
 
-    let mut fill_rows = fills.into_values().map(|(row, _)| row).collect::<Vec<_>>();
+    let mut fill_rows = fills
+        .values()
+        .map(|(_, row)| row.clone())
+        .collect::<Vec<_>>();
     fill_rows.sort_by(|left, right| left.idempotency_key.cmp(&right.idempotency_key));
     let mut positions = position_totals
         .into_iter()
@@ -1277,7 +1763,7 @@ fn derive_projection_rows(
                 market_id,
                 outcome_id,
                 long_contracts,
-                short_contracts: 0,
+                short_contracts: Decimal::ZERO,
                 cost_basis,
             },
         )
@@ -1286,13 +1772,250 @@ fn derive_projection_rows(
         (&left.market_id, left.outcome_id).cmp(&(&right.market_id, right.outcome_id))
     });
 
+    let custody_positions = derive_custody_positions(
+        &prepared_orders,
+        &fills,
+        &resolutions,
+        &receivable_by_condition,
+    )?;
+    let receivable = sum_receivable(&receivable_by_condition)?.to_decimal();
+    let reserved = reservations
+        .values()
+        .try_fold(Decimal::ZERO, |total, value| {
+            total
+                .checked_add(*value)
+                .ok_or(ProjectionReducerError::Arithmetic)
+        })?;
     Ok(ProjectionDerivation {
         fills: fill_rows,
         positions,
-        reserved: reservations.into_values().sum(),
+        custody_positions,
+        reserved,
+        economic_cash,
+        receivable,
         latest_free_collateral,
         latest_reconciled_at,
     })
+}
+
+type PreparedOrders = BTreeMap<String, (u64, Box<pe_execution_core::LiveOrderPreparedAudit>, bool)>;
+type FinalizedFills = BTreeMap<String, (OrderFillFinalizedAudit, LiveFillRow)>;
+
+fn same_finalized_fill(left: &OrderFillFinalizedAudit, right: &OrderFillFinalizedAudit) -> bool {
+    left.identity == right.identity
+        && left.prepared_journal_seq == right.prepared_journal_seq
+        && left.principal == right.principal
+        && left.quantity == right.quantity
+        && left.fee == right.fee
+        && left.matched_logs == right.matched_logs
+        && left.chain_id == right.chain_id
+        && response_bodies(&left.receipts) == response_bodies(&right.receipts)
+}
+
+fn response_bodies(attempts: &[RawHttpAttempt]) -> Vec<(String, Vec<u8>)> {
+    attempts
+        .iter()
+        .filter_map(|attempt| match attempt {
+            RawHttpAttempt::Response(response) => {
+                Some((response.endpoint_kind.clone(), response.body.clone()))
+            }
+            RawHttpAttempt::TransportFailure(_) => None,
+        })
+        .collect()
+}
+
+fn resolution_credit(
+    condition: &str,
+    payout: &BinaryPayoutVector,
+    prepared: &PreparedOrders,
+    fills: &FinalizedFills,
+) -> Result<CollateralAmount, ProjectionReducerError> {
+    let mut atomic_by_outcome = [0_u64; 2];
+    for (key, (fill, _)) in fills {
+        let Some((_, order, _)) = prepared.get(key) else {
+            return Err(ProjectionReducerError::MissingPrepared);
+        };
+        if order.prepared.condition_id.0 != condition {
+            continue;
+        }
+        let outcome = usize::from(order.prepared.outcome_id.0);
+        let Some(total) = atomic_by_outcome.get_mut(outcome) else {
+            return Err(ProjectionReducerError::IdentityConflict);
+        };
+        *total = total
+            .checked_add(fill.quantity.atomic())
+            .ok_or(ProjectionReducerError::Arithmetic)?;
+    }
+    let credit_atomic = atomic_by_outcome
+        .into_iter()
+        .zip(payout.decimals())
+        .try_fold(0_u64, |total, (shares, payout)| {
+            let component = Decimal::from(shares)
+                .checked_mul(*payout)
+                .ok_or(ProjectionReducerError::Arithmetic)?
+                .round_dp_with_strategy(0, RoundingStrategy::ToNegativeInfinity)
+                .to_u64()
+                .ok_or(ProjectionReducerError::Arithmetic)?;
+            total
+                .checked_add(component)
+                .ok_or(ProjectionReducerError::Arithmetic)
+        })?;
+    Ok(CollateralAmount::from_atomic(credit_atomic))
+}
+
+fn derive_custody_positions(
+    prepared: &PreparedOrders,
+    fills: &FinalizedFills,
+    resolutions: &BTreeMap<String, pe_execution_core::ResolutionFinalizedAudit>,
+    receivable: &BTreeMap<String, CollateralAmount>,
+) -> Result<Vec<CanonicalPositionAudit>, ProjectionReducerError> {
+    let mut positions = BTreeMap::<String, CanonicalPositionAudit>::new();
+    for (key, (fill, _)) in fills {
+        let Some((_, order, _)) = prepared.get(key) else {
+            return Err(ProjectionReducerError::MissingPrepared);
+        };
+        let condition = &order.prepared.condition_id.0;
+        let resolved = resolutions.contains_key(condition);
+        if resolved && !receivable.contains_key(condition) {
+            continue;
+        }
+        let token = order.prepared.token_id.0.clone();
+        let position = positions.entry(token).or_insert(CanonicalPositionAudit {
+            condition_id: order.prepared.condition_id.clone(),
+            outcome_index: u8::try_from(order.prepared.outcome_id.0)
+                .map_err(|_| ProjectionReducerError::IdentityConflict)?,
+            token_id: order.prepared.token_id.clone(),
+            size: ShareAmount::ZERO,
+            redeemable: resolved,
+        });
+        if position.condition_id != order.prepared.condition_id
+            || position.outcome_index
+                != u8::try_from(order.prepared.outcome_id.0)
+                    .map_err(|_| ProjectionReducerError::IdentityConflict)?
+            || position.redeemable != resolved
+        {
+            return Err(ProjectionReducerError::IdentityConflict);
+        }
+        position.size = position
+            .size
+            .checked_add(fill.quantity)
+            .map_err(|_| ProjectionReducerError::Arithmetic)?;
+    }
+    Ok(positions.into_values().collect())
+}
+
+fn canonical_positions(
+    positions: &[CanonicalPositionAudit],
+) -> Result<Vec<CanonicalPositionAudit>, ProjectionReducerError> {
+    let mut canonical = positions.to_vec();
+    if canonical
+        .iter()
+        .any(|position| position.size == ShareAmount::ZERO)
+    {
+        return Err(ProjectionReducerError::CustodyInventoryMismatch);
+    }
+    canonical.sort_by(|left, right| left.token_id.0.cmp(&right.token_id.0));
+    if canonical
+        .windows(2)
+        .any(|pair| pair[0].token_id == pair[1].token_id)
+    {
+        return Err(ProjectionReducerError::CustodyInventoryMismatch);
+    }
+    Ok(canonical)
+}
+
+fn sum_receivable(
+    receivable: &BTreeMap<String, CollateralAmount>,
+) -> Result<CollateralAmount, ProjectionReducerError> {
+    receivable
+        .values()
+        .try_fold(CollateralAmount::ZERO, |total, value| {
+            total
+                .checked_add(*value)
+                .map_err(|_| ProjectionReducerError::Arithmetic)
+        })
+}
+
+fn require_cash_reconciliation(
+    authenticated: CollateralAmount,
+    economic_cash: Decimal,
+    receivable: CollateralAmount,
+) -> Result<(), ProjectionReducerError> {
+    let accounted = authenticated
+        .to_decimal()
+        .checked_add(receivable.to_decimal())
+        .ok_or(ProjectionReducerError::Arithmetic)?;
+    if accounted != economic_cash {
+        return Err(ProjectionReducerError::CashMismatch);
+    }
+    Ok(())
+}
+
+fn require_mark_equity(
+    mark: &pe_execution_core::AccountPortfolioMarkedAudit,
+    economic_cash: Decimal,
+    prepared: &PreparedOrders,
+    fills: &FinalizedFills,
+    resolutions: &BTreeMap<String, pe_execution_core::ResolutionFinalizedAudit>,
+) -> Result<(), ProjectionReducerError> {
+    let mut quantities = BTreeMap::<(String, u8), ShareAmount>::new();
+    for (key, (fill, _)) in fills {
+        let Some((_, order, _)) = prepared.get(key) else {
+            return Err(ProjectionReducerError::MissingPrepared);
+        };
+        if resolutions.contains_key(&order.prepared.condition_id.0) {
+            continue;
+        }
+        let outcome = u8::try_from(order.prepared.outcome_id.0)
+            .map_err(|_| ProjectionReducerError::IdentityConflict)?;
+        let quantity = quantities
+            .entry((order.prepared.condition_id.0.clone(), outcome))
+            .or_insert(ShareAmount::ZERO);
+        *quantity = quantity
+            .checked_add(fill.quantity)
+            .map_err(|_| ProjectionReducerError::Arithmetic)?;
+    }
+    let mut prices = BTreeMap::new();
+    for price in &mark.prices {
+        if prices
+            .insert(
+                (price.condition_id.0.clone(), price.outcome_index),
+                price.price,
+            )
+            .is_some()
+        {
+            return Err(ProjectionReducerError::InvalidMarkPrices);
+        }
+    }
+    if quantities.len() != prices.len() || quantities.keys().any(|key| !prices.contains_key(key)) {
+        return Err(ProjectionReducerError::InvalidMarkPrices);
+    }
+    let equity = quantities
+        .iter()
+        .try_fold(economic_cash, |total, (key, quantity)| {
+            let price = prices
+                .get(key)
+                .ok_or(ProjectionReducerError::InvalidMarkPrices)?;
+            quantity
+                .to_decimal()
+                .checked_mul(price.0)
+                .and_then(|value| total.checked_add(value))
+                .ok_or(ProjectionReducerError::Arithmetic)
+        })?
+        .round_dp_with_strategy(6, RoundingStrategy::ToNegativeInfinity);
+    if CollateralAmount::from_decimal_exact(equity)
+        .map_err(|_| ProjectionReducerError::Arithmetic)?
+        != mark.equity
+    {
+        return Err(ProjectionReducerError::InvalidMarkEquity);
+    }
+    Ok(())
+}
+
+fn format_observed_at(observed_at: OffsetDateTime) -> Option<String> {
+    observed_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 async fn reconcile_account_projection(
@@ -1307,11 +2030,7 @@ async fn reconcile_account_projection(
             return;
         }
     };
-    let derived = match derive_projection_rows(
-        state.config.paper_state.as_ref(),
-        &account.account_id,
-        &events,
-    ) {
+    let derived = match derive_projection_rows(&account.account_id, &events) {
         Ok(derived) => derived,
         Err(error) => {
             error!(account_id = %account.account_id, error = %error, "live projection derivation failed");
@@ -1334,12 +2053,8 @@ async fn reconcile_account_projection(
         .closures
         .reason(account.account_id.as_str())
         .map(str::to_owned);
-    let Some(row) = compose_account_state_row(
-        account.account_id.as_str(),
-        state.account_state_inputs.get(account.account_id.as_str()),
-        &derived,
-        closed_reason,
-    ) else {
+    let Some(row) = compose_account_state_row(account.account_id.as_str(), &derived, closed_reason)
+    else {
         return;
     };
     if let Err(error) = state.config.projection.upsert_account_state(&row).await {
@@ -1349,19 +2064,14 @@ async fn reconcile_account_projection(
 
 fn compose_account_state_row(
     account_id: &str,
-    inputs: Option<&AccountStateInputs>,
     derived: &ProjectionDerivation,
     admission_closed_reason: Option<String>,
 ) -> Option<LiveAccountStateRow> {
-    let free_collateral = inputs
-        .and_then(|inputs| inputs.free_collateral)
-        .or(derived.latest_free_collateral);
-    let last_reconciled_at = inputs
-        .and_then(|inputs| inputs.last_reconciled_at.clone())
-        .or_else(|| derived.latest_reconciled_at.clone());
-    let unredeemed_value = inputs.and_then(|inputs| inputs.unredeemed_value);
+    let free_collateral = derived.latest_free_collateral;
+    let last_reconciled_at = derived.latest_reconciled_at.clone();
+    let unredeemed_value = derived.receivable;
     if free_collateral.is_none()
-        && unredeemed_value.is_none()
+        && unredeemed_value == Decimal::ZERO
         && derived.reserved == Decimal::ZERO
         && admission_closed_reason.is_none()
     {
@@ -1371,7 +2081,7 @@ fn compose_account_state_row(
         account_id: account_id.to_owned(),
         free_collateral: free_collateral.unwrap_or(Decimal::ZERO),
         reserved: derived.reserved,
-        unredeemed_value: unredeemed_value.unwrap_or(Decimal::ZERO),
+        unredeemed_value,
         last_reconciled_at,
         admission_closed_reason,
     })
@@ -1385,8 +2095,10 @@ async fn reconcile_projections(state: &mut FanoutState, now: OffsetDateTime) {
 }
 
 struct RecoveredPrepared {
-    identity: LiveOrderIdentity,
-    order_hash: String,
+    journal_seq: u64,
+    audit: Box<pe_execution_core::LiveOrderPreparedAudit>,
+    transaction_hashes: BTreeSet<String>,
+    finalized: bool,
 }
 
 fn recovered_prepared(
@@ -1396,21 +2108,54 @@ fn recovered_prepared(
     let account_id = AccountId::new(&target.account_id)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
     let events = replay_account(&state.config.journal_path, &account_id)?;
-    let prepared = events
-        .into_iter()
-        .rev()
-        .find_map(|event| match event.payload {
+    let mut recovered = None;
+    for event in events {
+        match event.payload {
+            LiveJournalPayload::OrderPrepared(prepared)
+                if prepared.identity.dispatch_id == target.dispatch_id && recovered.is_some() =>
+            {
+                return Err(FanoutError::Signal(
+                    "duplicate prepared record for one dispatch target".to_owned(),
+                ));
+            }
             LiveJournalPayload::OrderPrepared(prepared)
                 if prepared.identity.dispatch_id == target.dispatch_id =>
             {
-                Some(RecoveredPrepared {
-                    identity: prepared.identity.clone(),
-                    order_hash: prepared.prepared.order_hash.clone(),
-                })
+                recovered = Some(RecoveredPrepared {
+                    journal_seq: event.seq,
+                    audit: prepared,
+                    transaction_hashes: BTreeSet::new(),
+                    finalized: false,
+                });
             }
-            _ => None,
-        });
-    Ok(prepared)
+            LiveJournalPayload::OrderReconciled(reconciled)
+                if reconciled.identity.dispatch_id == target.dispatch_id =>
+            {
+                if let LiveJournalOrderOutcome::Matched {
+                    transaction_hashes, ..
+                } = reconciled.outcome
+                    && let Some(recovered) = recovered.as_mut()
+                {
+                    recovered.transaction_hashes.extend(transaction_hashes);
+                }
+            }
+            LiveJournalPayload::OrderFillFinalized(finalized)
+                if finalized.identity.dispatch_id == target.dispatch_id =>
+            {
+                if let Some(recovered) = recovered.as_mut() {
+                    if finalized.prepared_journal_seq != recovered.journal_seq {
+                        return Err(FanoutError::Signal(
+                            "finalized fill references the wrong prepared journal sequence"
+                                .to_owned(),
+                        ));
+                    }
+                    recovered.finalized = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(recovered)
 }
 
 /// Reconcile one `submitted`/`ambiguous` target (#514 classify-first). Runs before — and
@@ -1426,6 +2171,13 @@ async fn recover_in_flight_target(
     context: Option<&AccountContext>,
     now: OffsetDateTime,
 ) -> Result<PassControl, FanoutError> {
+    if recovered_prepared(state, target)?.is_some_and(|prepared| prepared.finalized) {
+        terminalize(state, target, "filled", now)?;
+        if let Some(account) = context {
+            reconcile_account_projection(state, account, now).await;
+        }
+        return Ok(PassControl::Continue);
+    }
     let credentials = match credentials_for_target(state, target).await {
         CredentialLoad::Ready(credentials) => credentials,
         CredentialLoad::Changed => {
@@ -1453,11 +2205,10 @@ async fn recover_in_flight_target(
     let outcome = recover_target(state, target, &venue, now).await?;
     let transition = outcome_transition(&outcome);
     persist_outcome(state, target, &outcome, now)?;
-    if let Some(account) = context {
-        capture_account_state(state, account, &venue, false, now).await;
-        if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
-            reconcile_account_projection(state, account, now).await;
-        }
+    if let Some(account) = context
+        && matches!(outcome, LiveOrderOutcome::Matched { .. })
+    {
+        reconcile_account_projection(state, account, now).await;
     }
     Ok(if transition.freeze {
         PassControl::FreezePass
@@ -1479,31 +2230,46 @@ async fn recover_target(
             reconcile_first: true,
         });
     };
+    let identity = prepared.audit.identity.clone();
+    let order_hash = prepared.audit.prepared.order_hash.clone();
     let account_id = AccountId::new(&target.account_id)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let reconciliation = venue
-        .reconcile_and_cancel_by_order_hash(&prepared.order_hash)
-        .await;
+    let reconciliation = venue.reconcile_and_cancel_by_order_hash(&order_hash).await;
     let (journal_outcome, outcome, evidence) = match reconciliation {
         Ok(reconciliation) => match reconciliation.outcome {
-            LiveVenueReconciledOutcome::Matched { venue_order_id } => (
-                LiveJournalOrderOutcome::Matched {
-                    venue_order_id: venue_order_id.clone(),
-                    executed: None,
-                },
-                LiveOrderOutcome::Matched {
-                    order_hash: prepared.order_hash.clone(),
-                    venue_order_id,
-                    executed: None,
-                },
-                reconciliation.evidence,
-            ),
+            LiveVenueReconciledOutcome::Matched {
+                venue_order_id,
+                transaction_hashes,
+            } => {
+                let transaction_hashes = prepared
+                    .transaction_hashes
+                    .iter()
+                    .cloned()
+                    .chain(transaction_hashes)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                (
+                    LiveJournalOrderOutcome::Matched {
+                        venue_order_id: venue_order_id.clone(),
+                        transaction_hashes: transaction_hashes.clone(),
+                        executed: None,
+                    },
+                    LiveOrderOutcome::Matched {
+                        order_hash: order_hash.clone(),
+                        venue_order_id,
+                        transaction_hashes,
+                        executed: None,
+                    },
+                    reconciliation.evidence,
+                )
+            }
             LiveVenueReconciledOutcome::Killed { venue_order_id } => (
                 LiveJournalOrderOutcome::Killed {
                     venue_order_id: venue_order_id.clone(),
                 },
                 LiveOrderOutcome::Killed {
-                    order_hash: prepared.order_hash.clone(),
+                    order_hash: order_hash.clone(),
                     venue_order_id,
                 },
                 reconciliation.evidence,
@@ -1514,7 +2280,7 @@ async fn recover_target(
                     kind: pe_execution_core::LiveOrderRejectKind::VenueRejected,
                 },
                 LiveOrderOutcome::Rejected {
-                    order_hash: Some(prepared.order_hash.clone()),
+                    order_hash: Some(order_hash.clone()),
                     venue_order_id,
                     kind: pe_execution_core::LiveOrderRejectKind::VenueRejected,
                 },
@@ -1523,7 +2289,7 @@ async fn recover_target(
             LiveVenueReconciledOutcome::Ambiguous { kind } => (
                 LiveJournalOrderOutcome::Ambiguous { kind },
                 LiveOrderOutcome::Ambiguous {
-                    order_hash: prepared.order_hash.clone(),
+                    order_hash: order_hash.clone(),
                     kind,
                     reconcile_first: true,
                 },
@@ -1535,7 +2301,7 @@ async fn recover_target(
                 kind: LiveOrderAmbiguityKind::ReconciliationUnavailable,
             },
             LiveOrderOutcome::Ambiguous {
-                order_hash: prepared.order_hash.clone(),
+                order_hash: order_hash.clone(),
                 kind: LiveOrderAmbiguityKind::ReconciliationUnavailable,
                 reconcile_first: true,
             },
@@ -1550,8 +2316,8 @@ async fn recover_target(
         account_id,
         now,
         LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
-            identity: prepared.identity,
-            order_hash: prepared.order_hash,
+            identity,
+            order_hash,
             source: LiveReconciliationSource::OrderHashLookupAndCancel,
             outcome: journal_outcome,
             evidence,
@@ -1934,7 +2700,7 @@ fn mode_transition_reason(reason: &str) -> LiveModeTransitionReason {
 async fn mode_probe(
     state: &mut FanoutState,
     account: &AccountContext,
-    now: OffsetDateTime,
+    _now: OffsetDateTime,
 ) -> (CheckOutcome, StaticProbe) {
     let unavailable = StaticProbe {
         account: CheckOutcome::Transient("account query unavailable"),
@@ -2039,20 +2805,12 @@ async fn mode_probe(
         }
     };
     let balance = standard.collateral_balance.min(neg_risk.collateral_balance);
-    let inputs = state
-        .account_state_inputs
-        .entry(account.account_id.as_str().to_owned())
-        .or_default();
-    inputs.free_collateral = Some(balance.to_decimal());
-    inputs.last_reconciled_at = now
-        .format(&time::format_description::well_known::Rfc3339)
-        .ok();
     let posture = arming_posture(
         sizing,
         balance,
         runtime.per_trade_cap.resolve_bps(TradingMode::LiveTiny),
     );
-    let balance_outcome = if posture == CollateralAmount::ZERO
+    let mut balance_outcome = if posture == CollateralAmount::ZERO
         || standard.collateral_balance < posture
         || neg_risk.collateral_balance < posture
         || standard.allowance < posture
@@ -2062,6 +2820,14 @@ async fn mode_probe(
     } else {
         CheckOutcome::Pass
     };
+    if balance_outcome == CheckOutcome::Pass {
+        balance_outcome = live_financial_posture(
+            state,
+            account,
+            balance,
+            account.effective_live_mode != "live_tiny",
+        );
+    }
     (
         CheckOutcome::Pass,
         StaticProbe {
@@ -2070,6 +2836,43 @@ async fn mode_probe(
             balance: balance_outcome,
         },
     )
+}
+
+fn live_financial_posture(
+    state: &FanoutState,
+    account: &AccountContext,
+    authenticated_cash: CollateralAmount,
+    require_empty_inventory: bool,
+) -> CheckOutcome {
+    let events = match replay_account(&state.config.journal_path, &account.account_id) {
+        Ok(events) => events,
+        Err(_) => return CheckOutcome::Transient("live journal unavailable"),
+    };
+    let derived = match derive_projection_rows(&account.account_id, &events) {
+        Ok(derived) => derived,
+        Err(_) => return CheckOutcome::PersistentFail("live financial journal conflicts"),
+    };
+    let Some(economic_cash) = derived.economic_cash else {
+        return CheckOutcome::Transient("portfolio Baseline unavailable");
+    };
+    if derived.reserved != Decimal::ZERO {
+        return CheckOutcome::Transient("prior live order awaits terminal finality");
+    }
+    if require_empty_inventory && !derived.custody_positions.is_empty() {
+        return CheckOutcome::PersistentFail(
+            "managed inventory is nonempty before Baseline arming",
+        );
+    }
+    let Some(accounted_cash) = authenticated_cash
+        .to_decimal()
+        .checked_add(derived.receivable)
+    else {
+        return CheckOutcome::PersistentFail("live cash accounting overflow");
+    };
+    if accounted_cash != economic_cash {
+        return CheckOutcome::PersistentFail("authenticated cash drift");
+    }
+    CheckOutcome::Pass
 }
 
 fn arming_posture(sizing: SizingMode, balance: CollateralAmount, cap_bps: i32) -> CollateralAmount {
@@ -2099,16 +2902,40 @@ struct RedeemablePositionRow {
 /// officially documented Deposit Wallet EIP-712 batch path.
 async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
     let snapshot = state.config.live_accounts.snapshot();
-    let armed = snapshot.armed_targets();
-    let armed_ids = armed
+    let account_ids = snapshot
+        .accounts
         .iter()
         .map(|account| account.account_id.as_str().to_owned())
         .collect::<HashSet<_>>();
     state
         .closures
         .redemption
-        .retain(|account, _| armed_ids.contains(account));
-    for account in armed {
+        .retain(|account, _| account_ids.contains(account));
+    for account in &snapshot.accounts {
+        let events = match replay_account(&state.config.journal_path, &account.account_id) {
+            Ok(events) => events,
+            Err(error) => {
+                error!(account_id = %account.account_id, error = %error, "redemption journal replay failed; attempt frozen");
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    "redemption journal unavailable; attempt frozen".to_owned(),
+                );
+                continue;
+            }
+        };
+        let mut attempts = reconstruct_redemption_attempts(&events);
+        let incomplete_attempt = attempts
+            .values()
+            .any(|attempt| !matches!(attempt.state, RedemptionAttemptState::Complete { .. }));
+        let has_receivable = derive_projection_rows(&account.account_id, &events)
+            .is_ok_and(|derived| derived.receivable != Decimal::ZERO);
+        if !account.is_armed() && !incomplete_attempt && !has_receivable {
+            state
+                .closures
+                .redemption
+                .remove(account.account_id.as_str());
+            continue;
+        }
         let target = DispatchTargetRow {
             dispatch_id: "redemption-probe".to_owned(),
             account_id: account.account_id.as_str().to_owned(),
@@ -2145,18 +2972,6 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         };
-        let events = match replay_account(&state.config.journal_path, &account.account_id) {
-            Ok(events) => events,
-            Err(error) => {
-                error!(account_id = %account.account_id, error = %error, "redemption journal replay failed; attempt frozen");
-                state.closures.redemption.insert(
-                    account.account_id.as_str().to_owned(),
-                    "redemption journal unavailable; attempt frozen".to_owned(),
-                );
-                continue;
-            }
-        };
-        let mut attempts = reconstruct_redemption_attempts(&events);
         let positions = match fetch_redeemable_positions(state, &venue.deposit_wallet()).await {
             Ok(positions) => positions,
             Err(reason) => {
@@ -2167,11 +2982,6 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         };
-        let unredeemed = positions
-            .iter()
-            .map(|position| position.size.max(Decimal::ZERO))
-            .sum::<Decimal>();
-        capture_redemption_state(state, account, unredeemed, now);
         if positions.is_empty() && attempts.is_empty() {
             state
                 .closures
@@ -2261,7 +3071,7 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
             )
             .await;
             let closure_reason = match result {
-                Ok(result) => redemption_closure_reason(result.attempt, redeemable, now),
+                Ok(result) => redemption_closure_reason(result.attempt),
                 Err(error) => Some(format!("redemption driver failed: {error}")),
             };
             set_redemption_closure(state, account, closure_reason);
@@ -2364,7 +3174,7 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
         )
         .await
         {
-            Ok(result) => redemption_closure_reason(result.attempt, redeemable, now),
+            Ok(result) => redemption_closure_reason(result.attempt),
             Err(error) => Some(format!("redemption driver failed: {error}")),
         };
         set_redemption_closure(state, account, closure_reason);
@@ -2404,26 +3214,7 @@ fn redeemable_for_attempt(
         })
 }
 
-fn redemption_closure_reason(
-    mut attempt: RedemptionAttempt,
-    redeemable: CollateralAmount,
-    now: OffsetDateTime,
-) -> Option<String> {
-    if matches!(
-        attempt.state,
-        RedemptionAttemptState::ConfirmedAwaitingBalance { .. }
-    ) && redeemable == CollateralAmount::ZERO
-    {
-        let (state, _) = advance(
-            attempt.state,
-            RedemptionEvent::BalanceReconciled {
-                reconciled_at: now,
-                credited_collateral: CollateralAmount::ZERO,
-                remaining_redeemable: CollateralAmount::ZERO,
-            },
-        );
-        attempt.state = state;
-    }
+fn redemption_closure_reason(attempt: RedemptionAttempt) -> Option<String> {
     if matches!(
         attempt.state,
         RedemptionAttemptState::SubmissionReserved { .. }
@@ -2531,22 +3322,6 @@ async fn fetch_redeemable_positions_from(
     Err("pagination bound reached")
 }
 
-fn capture_redemption_state(
-    state: &mut FanoutState,
-    account: &AccountContext,
-    unredeemed: Decimal,
-    now: OffsetDateTime,
-) {
-    let inputs = state
-        .account_state_inputs
-        .entry(account.account_id.as_str().to_owned())
-        .or_default();
-    inputs.unredeemed_value = Some(unredeemed);
-    inputs.last_reconciled_at = now
-        .format(&time::format_description::well_known::Rfc3339)
-        .ok();
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -2586,6 +3361,7 @@ mod tests {
         let matched = LiveOrderOutcome::Matched {
             order_hash: "hash".to_owned(),
             venue_order_id: "id".to_owned(),
+            transaction_hashes: Vec::new(),
             executed: None,
         };
         let killed = LiveOrderOutcome::Killed {
@@ -2602,11 +3378,11 @@ mod tests {
             kind: LiveOrderAmbiguityKind::Timeout,
             reconcile_first: true,
         };
-        for (outcome, reason) in [
-            (matched, "filled"),
-            (killed, "killed"),
-            (rejected, "rejected"),
-        ] {
+        let transition = outcome_transition(&matched);
+        assert_eq!(transition.state, "submitted");
+        assert_eq!(transition.reason, None);
+        assert!(!transition.freeze);
+        for (outcome, reason) in [(killed, "killed"), (rejected, "rejected")] {
             let transition = outcome_transition(&outcome);
             assert_eq!(transition.state, "terminal");
             assert_eq!(transition.reason, Some(reason));
@@ -2925,10 +3701,8 @@ mod tests {
                 source: LiveReconciliationSource::PostResponse,
                 outcome: LiveJournalOrderOutcome::Matched {
                     venue_order_id: "venue-order".to_owned(),
-                    executed: Some(LiveExecutedAmounts {
-                        making_amount: dec!(4.00),
-                        taking_amount: dec!(10),
-                    }),
+                    transaction_hashes: Vec::new(),
+                    executed: None,
                 },
                 evidence: Vec::new(),
                 evidence_hashes: Vec::new(),
@@ -2963,88 +3737,866 @@ mod tests {
         assert!(serde_json::from_value::<RedeemablePositionRow>(missing).is_err());
     }
 
+    /// PASS: records preceding Baseline remain audit-only and create no managed state.
     #[test]
-    fn journal_projection_reconcile_heals_dropped_write_and_deduplicates_dispatch() {
-        let (_dir, db) = db();
+    fn pre_baseline_records_are_audit_only() {
         let account_id = AccountId::new("account").unwrap();
         let dispatch_id = "dispatch-projection";
         let events = vec![
             matched_projection_event(&account_id, dispatch_id, 7),
             matched_projection_event(&account_id, dispatch_id, 8),
         ];
-        let rows = derive_projection_rows(&db, &account_id, &events).unwrap();
-        assert_eq!(rows.fills.len(), 1, "duplicate dispatch converges");
-        assert_eq!(rows.fills[0].contracts, dec!(10));
-        assert_eq!(
-            rows.fills[0].fill_price,
-            dec!(0.40),
-            "executed price improvement must replace the 0.50 plan quote"
-        );
-        assert_eq!(rows.fills[0].event_seq, 7);
-        assert_eq!(rows.positions.len(), 1);
-        assert_eq!(rows.positions[0].long_contracts, 10);
-        assert_eq!(rows.positions[0].cost_basis, dec!(4.00));
+        let rows = derive_projection_rows(&account_id, &events).unwrap();
+        assert!(rows.fills.is_empty());
+        assert!(rows.positions.is_empty());
+        assert!(rows.economic_cash.is_none());
     }
 
-    #[test]
-    fn confirmed_redemption_receipt_zeroes_the_derived_position() {
-        let (_dir, db) = db();
-        let account_id = AccountId::new("account").unwrap();
-        let dispatch_id = "dispatch-redeemed";
-        let signal = projection_signal();
-        let condition_id = signal.market_id.0.0.clone();
-        let receipt = LiveJournalEvent {
+    fn baseline_event(account_id: &AccountId, seq: u64) -> LiveJournalEvent {
+        let cash = CollateralAmount::from_atomic(10_000_000);
+        LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 8,
-            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
-            payload: LiveJournalPayload::RedemptionReceiptTransition(Box::new(
-                pe_execution_core::RedemptionReceiptAudit {
-                    identity: RedemptionAttemptIdentity {
-                        account_id: account_id.clone(),
-                        condition_id: PolymarketConditionId(condition_id),
-                        adapter: NEGRISK_COLLATERAL_ADAPTER.to_owned(),
-                        custody_wallet: "0x1111111111111111111111111111111111111111".to_owned(),
+            seq,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            payload: LiveJournalPayload::AccountPortfolioMarked(Box::new(
+                pe_execution_core::AccountPortfolioMarkedAudit {
+                    kind: MarkKind::Baseline,
+                    cutoff_unix: 0,
+                    account_state: pe_execution_core::LiveAccountStateAudit {
+                        observed_at: OffsetDateTime::UNIX_EPOCH,
+                        closed_only: false,
+                        geoblocked: false,
+                        selected_spender: "spender".to_owned(),
+                        collateral_balance: cash,
+                        allowance: cash,
+                        reconciled_free_collateral: cash,
+                        schema_version: 1,
+                        parser_version: 1,
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
                     },
-                    attempt_count: 1,
-                    transaction_id: "tx".to_owned(),
-                    transaction_hash: Some("0xreceipt".to_owned()),
-                    status: pe_execution_core::RedemptionReceiptStatusAudit::Confirmed,
-                    evidence: Vec::new(),
-                    evidence_hashes: Vec::new(),
+                    venue_positions: Vec::new(),
+                    venue_position_receipts: Vec::new(),
+                    prices: Vec::new(),
+                    equity: cash,
                 },
             )),
-        };
-        let rows = derive_projection_rows(
-            &db,
-            &account_id,
-            &[
-                matched_projection_event(&account_id, dispatch_id, 7),
-                receipt,
-            ],
-        )
-        .unwrap();
-        assert_eq!(rows.positions[0].long_contracts, 0);
-        assert_eq!(rows.positions[0].cost_basis, Decimal::ZERO);
+        }
     }
 
-    #[test]
-    fn single_account_state_writer_composes_dispatch_and_redemption_inputs() {
-        let inputs = AccountStateInputs {
-            free_collateral: Some(dec!(12.50)),
-            unredeemed_value: Some(dec!(3)),
-            last_reconciled_at: Some("2026-08-11T12:00:00Z".to_owned()),
+    fn finality_prepared() -> Box<pe_execution_core::LiveOrderPreparedAudit> {
+        let identity = projection_identity("dispatch-finality");
+        let condition_id = PolymarketConditionId(format!("0x{}", "77".repeat(32)));
+        let token_id = pe_core_types::PolymarketTokenId("123".to_owned());
+        let receipt = AppendReceipt {
+            sequence: EventSeq(1),
+            this_hash: blake3::Hash::from_bytes([1; 32]),
         };
+        let market = pe_execution_core::LiveMarketEvidenceAudit {
+            condition_id: condition_id.clone(),
+            ordered_outcome_token_ids: [
+                token_id.clone(),
+                pe_core_types::PolymarketTokenId("124".to_owned()),
+            ],
+            neg_risk: false,
+            minimum_tick_size: Price(dec!(0.01)),
+            minimum_order_size: ShareAmount::from_atomic(1_000_000),
+            observed_at_unix: 0,
+            schema_version: 1,
+            parser_version: 1,
+            freshness_window_secs: 60,
+        };
+        let admission = LiveAdmissionArtifactAudit {
+            market,
+            settlement: pe_resolver_card::VenueSettlementRecord {
+                schema_version: pe_resolver_card::VENUE_SETTLEMENT_SCHEMA_VERSION,
+                condition_id: condition_id.clone(),
+                status: pe_resolver_card::VenueResolutionStatus::Unresolved,
+                raw_evidence_hash: "settlement".to_owned(),
+                source_timestamp_unix: None,
+                observed_at_unix: 0,
+                parser_version: 1,
+                freshness_window_secs: 60,
+            },
+            fee_schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
+            scheduled_end_unix: None,
+            receipts: pe_execution_core::AdmissionReceipts {
+                gamma: receipt,
+                clob_long: receipt,
+                clob_compact: receipt,
+            },
+        };
+        let ladder = LadderPlanAudit {
+            used_asks: Vec::new(),
+            best_ask: Price(dec!(0.80)),
+            limit_price: Price(dec!(0.80)),
+            minimum_shares: ShareAmount::from_atomic(3_125_000),
+            principal: CollateralAmount::from_atomic(2_500_000),
+        };
+        let cash = CollateralAmount::from_atomic(10_000_000);
+        let economic = EconomicPrepared {
+            version: ECONOMIC_PREPARED_VERSION,
+            market: MarketSelection {
+                condition_id: condition_id.clone(),
+                outcome_index: 0,
+                token_id: token_id.clone(),
+                side: Side::Buy,
+                market_id: condition_id.0.clone(),
+            },
+            admission,
+            ladder,
+            book_receipt: receipt,
+            observation: None,
+            sizing: SizingAudit {
+                mode: SizingModeAudit::Contract { contracts: 3 },
+                budget: cash,
+                principal: CollateralAmount::from_atomic(2_500_000),
+                minimum_shares: ShareAmount::from_atomic(3_125_000),
+                expected_shares: ShareAmount::from_atomic(3_125_000),
+                expected_vwap: Price(dec!(0.80)),
+                all_in_price: Price(dec!(0.80)),
+                slippage_rate: Decimal::ZERO,
+            },
+            fee: FeeAudit {
+                schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
+                expected_fee: CollateralAmount::ZERO,
+                reserve: CollateralAmount::from_atomic(120),
+            },
+            risk: RiskAudit {
+                snapshot: zeroed_risk_snapshot(),
+                decision: RiskDecisionAudit::Approved,
+            },
+            balance: BalanceAudit {
+                cash_before: cash,
+                worst_case_debit: CollateralAmount::from_atomic(2_500_120),
+                price_impact_cap_bps: 100,
+                chase_ceiling: Price(dec!(0.80)),
+                band_floor: Price(dec!(0.01)),
+                band_ceiling_exclusive: Price(dec!(0.99)),
+            },
+            applied_configuration_hash: identity.config_hash.clone(),
+        };
+        Box::new(pe_execution_core::LiveOrderPreparedAudit {
+            identity,
+            frozen_binding: CredentialBindingIdentity {
+                version: 1,
+                key_id: "key".to_owned(),
+            },
+            economic,
+            account_state: pe_execution_core::LiveAccountStateAudit {
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+                closed_only: false,
+                geoblocked: false,
+                selected_spender: "spender".to_owned(),
+                collateral_balance: cash,
+                allowance: cash,
+                reconciled_free_collateral: cash,
+                schema_version: 1,
+                parser_version: 1,
+                evidence: Vec::new(),
+                evidence_hashes: Vec::new(),
+            },
+            prepared: pe_venue_polymarket::PreparedPolymarketBuy {
+                condition_id,
+                outcome_id: OutcomeId(0),
+                token_id,
+                maker: "0x1111111111111111111111111111111111111111".to_owned(),
+                signer: "0x1111111111111111111111111111111111111111".to_owned(),
+                funder: "0x1111111111111111111111111111111111111111".to_owned(),
+                verifying_contract: pe_venue_polymarket::CTF_EXCHANGE_V2.to_string(),
+                spender: pe_venue_polymarket::CTF_EXCHANGE_V2.to_string(),
+                exchange_domain_version: 2,
+                neg_risk: false,
+                side: "BUY".to_owned(),
+                salt: "1".to_owned(),
+                timestamp_ms: 1,
+                expiration: "0".to_owned(),
+                maker_collateral: CollateralAmount::from_atomic(2_500_000),
+                taker_shares: ShareAmount::from_atomic(3_125_000),
+                limit_price: Price(dec!(0.80)),
+                minimum_tick_size: Price(dec!(0.01)),
+                signature_type: 3,
+                order_type: "FOK".to_owned(),
+                post_only: false,
+                defer_exec: false,
+                metadata: format!("0x{}", "00".repeat(32)),
+                builder: format!("0x{}", "00".repeat(32)),
+                order_hash: format!("0x{}", "22".repeat(32)),
+                post_body_hash: "post".to_owned(),
+                sdk_version: "test".to_owned(),
+                sdk_archive_sha256: "test".to_owned(),
+                metadata_hashes: Vec::new(),
+                worst_case_debit: CollateralAmount::from_atomic(2_500_120),
+            },
+        })
+    }
+
+    struct FakePolygonRpc {
+        calls: Mutex<Vec<(String, Option<u64>)>>,
+        finalized_head: u64,
+        receipt: Vec<u8>,
+        receipts_by_hash: BTreeMap<String, Vec<u8>>,
+        canonical_hash_byte: &'static str,
+    }
+
+    impl FakePolygonRpc {
+        fn new(finalized_head: u64) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                finalized_head,
+                receipt: include_bytes!(
+                    "../../venue-polymarket/tests/fixtures/receipts/standard_v2.json"
+                )
+                .to_vec(),
+                receipts_by_hash: BTreeMap::new(),
+                canonical_hash_byte: "aa",
+            }
+        }
+
+        fn with_receipt(mut self, receipt: Vec<u8>) -> Self {
+            self.receipt = receipt;
+            self
+        }
+
+        fn with_canonical_hash(mut self, byte: &'static str) -> Self {
+            self.canonical_hash_byte = byte;
+            self
+        }
+
+        fn with_transaction_receipts(
+            mut self,
+            receipts: impl IntoIterator<Item = (String, Vec<u8>)>,
+        ) -> Self {
+            self.receipts_by_hash.extend(receipts);
+            self
+        }
+
+        fn response(endpoint_kind: &str, body: Vec<u8>) -> RawHttpAttempt {
+            RawHttpAttempt::Response(pe_core_types::RawHttpResponse {
+                source_id: "fixture".to_owned(),
+                endpoint_kind: endpoint_kind.to_owned(),
+                method: "POST".to_owned(),
+                path: "fixture://polygon".to_owned(),
+                ordered_query: Vec::new(),
+                status: 200,
+                headers: Vec::new(),
+                body,
+                attempt_ordinal: 1,
+                source_at: None,
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+                received_at: OffsetDateTime::UNIX_EPOCH,
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: "fixture".to_owned(),
+            })
+        }
+
+        fn call_count(&self, method: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(candidate, _)| candidate == method)
+                .count()
+        }
+    }
+
+    impl PolygonReceiptReader for FakePolygonRpc {
+        fn chain_id(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("eth_chainId".to_owned(), None));
+            Box::pin(async {
+                Self::response(
+                    "polygon-chain-id",
+                    br#"{"jsonrpc":"2.0","id":1,"result":"0x89"}"#.to_vec(),
+                )
+            })
+        }
+
+        fn transaction_receipt<'a>(
+            &'a self,
+            transaction_hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + 'a>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("eth_getTransactionReceipt".to_owned(), None));
+            let receipt = self
+                .receipts_by_hash
+                .get(transaction_hash)
+                .cloned()
+                .unwrap_or_else(|| self.receipt.clone());
+            Box::pin(async move { Self::response("polygon-transaction-receipt", receipt) })
+        }
+
+        fn finalized_block(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("eth_getBlockByNumber.finalized".to_owned(), None));
+            let number = self.finalized_head;
+            Box::pin(async move {
+                let hash = if number == 100 { "aa" } else { "bb" };
+                Self::response(
+                    "polygon-finalized-block",
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc":"2.0","id":1,"result":{
+                            "number":format!("0x{number:x}"),
+                            "hash":format!("0x{}", hash.repeat(32))
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+        }
+
+        fn block_by_number(
+            &self,
+            number: u64,
+        ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("eth_getBlockByNumber.canonical".to_owned(), Some(number)));
+            let hash = self.canonical_hash_byte;
+            Box::pin(async move {
+                Self::response(
+                    "polygon-canonical-block",
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc":"2.0","id":1,"result":{
+                            "number":format!("0x{number:x}"),
+                            "hash":format!("0x{}", hash.repeat(32))
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+        }
+    }
+
+    /// PASS: one pass reads each distinct receipt and lower block once, without a range query.
+    #[tokio::test]
+    async fn finality_batch_deduplicates_receipts_and_block_reads() {
+        let rpc = FakePolygonRpc::new(101);
+        let order = PendingOrderFinality {
+            prepared_journal_seq: 9,
+            prepared: finality_prepared(),
+            transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+        };
+        let results = collect_order_finality(&rpc, vec![order.clone(), order]).await;
+        assert_eq!(results.len(), 2);
+        let finalized = results
+            .iter()
+            .filter_map(|result| match &result.disposition {
+                OrderFinalityDisposition::Finalized(finalized) => Some(finalized),
+                OrderFinalityDisposition::Pending { .. }
+                | OrderFinalityDisposition::Conflict { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finalized.len(),
+            2,
+            "finality results were not complete: {results:?}"
+        );
+        for finalized in finalized {
+            assert_eq!(
+                finalized.principal,
+                CollateralAmount::from_atomic(2_500_000)
+            );
+            assert_eq!(finalized.quantity, ShareAmount::from_atomic(3_125_000));
+            assert_eq!(finalized.fee, CollateralAmount::from_atomic(120));
+        }
+        assert_eq!(rpc.call_count("eth_chainId"), 1);
+        assert_eq!(rpc.call_count("eth_getTransactionReceipt"), 1);
+        assert_eq!(rpc.call_count("eth_getBlockByNumber.finalized"), 1);
+        assert_eq!(rpc.call_count("eth_getBlockByNumber.canonical"), 1);
+        assert_eq!(rpc.call_count("eth_getLogs"), 0);
+    }
+
+    fn receipt_for_transaction(
+        transaction_hash: &str,
+        log_index: u64,
+        principal: u64,
+        quantity: u64,
+        fee: u64,
+    ) -> Vec<u8> {
+        let mut receipt: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../venue-polymarket/tests/fixtures/receipts/standard_v2.json"
+        ))
+        .unwrap();
+        receipt["result"]["transactionHash"] = serde_json::json!(transaction_hash);
+        receipt["result"]["logs"][0]["transactionHash"] = serde_json::json!(transaction_hash);
+        receipt["result"]["logs"][0]["logIndex"] = serde_json::json!(format!("0x{log_index:x}"));
+        let data = receipt["result"]["logs"][0]["data"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("0x")
+            .unwrap();
+        let mut words = data
+            .as_bytes()
+            .chunks_exact(64)
+            .map(|word| std::str::from_utf8(word).unwrap().to_owned())
+            .collect::<Vec<_>>();
+        for (index, value) in [(2, principal), (3, quantity), (4, fee)] {
+            *words.get_mut(index).unwrap() = format!("{value:064x}");
+        }
+        receipt["result"]["logs"][0]["data"] = serde_json::json!(format!("0x{}", words.concat()));
+        serde_json::to_vec(&receipt).unwrap()
+    }
+
+    /// PASS: distinct authenticated transactions aggregate exactly and each receipt is read once.
+    #[tokio::test]
+    async fn finality_aggregates_multiple_transactions() {
+        let first = format!("0x{}", "11".repeat(32));
+        let second = format!("0x{}", "22".repeat(32));
+        let rpc = FakePolygonRpc::new(101).with_transaction_receipts([
+            (
+                first.clone(),
+                receipt_for_transaction(&first, 7, 1_000_000, 1_250_000, 50),
+            ),
+            (
+                second.clone(),
+                receipt_for_transaction(&second, 8, 1_500_000, 1_875_000, 70),
+            ),
+        ]);
+        let mut results = collect_order_finality(
+            &rpc,
+            vec![PendingOrderFinality {
+                prepared_journal_seq: 9,
+                prepared: finality_prepared(),
+                transaction_hashes: vec![second.clone(), first, second],
+            }],
+        )
+        .await;
+        let result = results.pop().unwrap();
+        let finalized = match result.disposition {
+            OrderFinalityDisposition::Finalized(finalized) => Some(finalized),
+            OrderFinalityDisposition::Pending { .. }
+            | OrderFinalityDisposition::Conflict { .. } => None,
+        };
+        assert!(finalized.is_some_and(|finalized| {
+            finalized.principal == CollateralAmount::from_atomic(2_500_000)
+                && finalized.quantity == ShareAmount::from_atomic(3_125_000)
+                && finalized.fee == CollateralAmount::from_atomic(120)
+                && finalized.matched_logs.len() == 2
+        }));
+        assert_eq!(rpc.call_count("eth_getTransactionReceipt"), 2);
+        assert_eq!(rpc.call_count("eth_getBlockByNumber.canonical"), 1);
+    }
+
+    /// PASS: a receipt at the head reuses that head; an above-head receipt stays pending.
+    #[tokio::test]
+    async fn finality_equal_and_above_head_issue_no_canonical_block_read() {
+        let order = PendingOrderFinality {
+            prepared_journal_seq: 9,
+            prepared: finality_prepared(),
+            transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+        };
+        let equal = FakePolygonRpc::new(100);
+        let equal_result = collect_order_finality(&equal, vec![order.clone()]).await;
+        assert!(
+            matches!(
+                equal_result.first().map(|result| &result.disposition),
+                Some(OrderFinalityDisposition::Finalized(_))
+            ),
+            "{equal_result:?}"
+        );
+        assert_eq!(equal.call_count("eth_getBlockByNumber.canonical"), 0);
+
+        let above = FakePolygonRpc::new(99);
+        let above_result = collect_order_finality(&above, vec![order]).await;
+        assert!(matches!(
+            above_result.first().map(|result| &result.disposition),
+            Some(OrderFinalityDisposition::Pending { .. })
+        ));
+        assert_eq!(above.call_count("eth_getBlockByNumber.canonical"), 0);
+    }
+
+    /// PASS: pending, conflict, and finalized Polygon decisions synchronize through frozen facts.
+    #[tokio::test]
+    async fn finality_results_append_before_terminalization() {
+        let account_id = AccountId::new("account").unwrap();
+        let order = PendingOrderFinality {
+            prepared_journal_seq: 9,
+            prepared: finality_prepared(),
+            transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+        };
+        let mut pending =
+            collect_order_finality(&FakePolygonRpc::new(99), vec![order.clone()]).await;
+        let mut conflict = collect_order_finality(
+            &FakePolygonRpc::new(101).with_canonical_hash("cc"),
+            vec![order.clone()],
+        )
+        .await;
+        let mut finalized = collect_order_finality(&FakePolygonRpc::new(101), vec![order]).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        assert_eq!(
+            append_order_finality_result(
+                &journal,
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                pending.pop().unwrap(),
+            )
+            .unwrap(),
+            FinalityJournalEffect::Pending
+        );
+        assert_eq!(
+            append_order_finality_result(
+                &journal,
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                conflict.pop().unwrap(),
+            )
+            .unwrap(),
+            FinalityJournalEffect::Conflict
+        );
+        assert_eq!(
+            append_order_finality_result(
+                &journal,
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                finalized.pop().unwrap(),
+            )
+            .unwrap(),
+            FinalityJournalEffect::Finalized
+        );
+        let events = replay_account(&path, &account_id).unwrap();
+        assert!(matches!(
+            events.first().map(|event| &event.payload),
+            Some(LiveJournalPayload::OrderReconciled(reconciled))
+                if reconciled.source == LiveReconciliationSource::PolygonFinality
+                    && matches!(
+                        reconciled.outcome,
+                        LiveJournalOrderOutcome::FinalityPending { .. }
+                    )
+        ));
+        assert!(matches!(
+            events.get(1).map(|event| &event.payload),
+            Some(LiveJournalPayload::OrderReconciled(reconciled))
+                if matches!(
+                    reconciled.outcome,
+                    LiveJournalOrderOutcome::FinalityConflict { .. }
+                )
+        ));
+        assert!(matches!(
+            events.get(2).map(|event| &event.payload),
+            Some(LiveJournalPayload::OrderFillFinalized(_))
+        ));
+    }
+
+    fn receipt_with_word(index: usize, value: u64) -> Vec<u8> {
+        let mut receipt: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../venue-polymarket/tests/fixtures/receipts/standard_v2.json"
+        ))
+        .unwrap();
+        let data = receipt["result"]["logs"][0]["data"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("0x")
+            .unwrap();
+        let mut words = data
+            .as_bytes()
+            .chunks_exact(64)
+            .map(|word| std::str::from_utf8(word).unwrap().to_owned())
+            .collect::<Vec<_>>();
+        *words.get_mut(index).unwrap() = format!("{value:064x}");
+        receipt["result"]["logs"][0]["data"] = serde_json::json!(format!("0x{}", words.concat()));
+        serde_json::to_vec(&receipt).unwrap()
+    }
+
+    async fn one_finality_disposition(rpc: &FakePolygonRpc) -> OrderFinalityDisposition {
+        collect_order_finality(
+            rpc,
+            vec![PendingOrderFinality {
+                prepared_journal_seq: 9,
+                prepared: finality_prepared(),
+                transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+            }],
+        )
+        .await
+        .pop()
+        .unwrap()
+        .disposition
+    }
+
+    /// PASS: principal/quantity/fee, duplicate-log, zero-match, and canonicality edges classify exactly.
+    #[tokio::test]
+    async fn finality_economic_and_identity_edges_fail_closed() {
+        assert!(matches!(
+            one_finality_disposition(&FakePolygonRpc::new(101).with_receipt(b"not-json".to_vec()))
+                .await,
+            OrderFinalityDisposition::Pending { .. }
+        ));
+        assert!(matches!(
+            one_finality_disposition(
+                &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_499_999))
+            )
+            .await,
+            OrderFinalityDisposition::Pending { .. }
+        ));
+        for (word, value) in [(2, 2_500_001), (3, 3_124_999), (4, 130)] {
+            assert!(matches!(
+                one_finality_disposition(
+                    &FakePolygonRpc::new(101).with_receipt(receipt_with_word(word, value))
+                )
+                .await,
+                OrderFinalityDisposition::Conflict { .. }
+            ));
+        }
+        let first = format!("0x{}", "11".repeat(32));
+        let second = format!("0x{}", "22".repeat(32));
+        let overflow = FakePolygonRpc::new(101).with_transaction_receipts([
+            (
+                first.clone(),
+                receipt_for_transaction(&first, 7, u64::MAX, 1, 0),
+            ),
+            (
+                second.clone(),
+                receipt_for_transaction(&second, 8, u64::MAX, 1, 0),
+            ),
+        ]);
+        let overflow_result = collect_order_finality(
+            &overflow,
+            vec![PendingOrderFinality {
+                prepared_journal_seq: 9,
+                prepared: finality_prepared(),
+                transaction_hashes: vec![first, second],
+            }],
+        )
+        .await;
+        assert!(matches!(
+            overflow_result.first().map(|result| &result.disposition),
+            Some(OrderFinalityDisposition::Conflict { .. })
+        ));
+
+        let mut duplicate: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../venue-polymarket/tests/fixtures/receipts/standard_v2.json"
+        ))
+        .unwrap();
+        let log = duplicate["result"]["logs"][0].clone();
+        duplicate["result"]["logs"]
+            .as_array_mut()
+            .unwrap()
+            .push(log);
+        assert!(matches!(
+            one_finality_disposition(
+                &FakePolygonRpc::new(101).with_receipt(serde_json::to_vec(&duplicate).unwrap())
+            )
+            .await,
+            OrderFinalityDisposition::Finalized(_)
+        ));
+
+        let mut conflicting = duplicate;
+        conflicting["result"]["logs"][1]["topics"][3] =
+            serde_json::json!(format!("0x{}", "44".repeat(32)));
+        assert!(matches!(
+            one_finality_disposition(
+                &FakePolygonRpc::new(101).with_receipt(serde_json::to_vec(&conflicting).unwrap())
+            )
+            .await,
+            OrderFinalityDisposition::Conflict { .. }
+        ));
+
+        let mut unrelated: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../venue-polymarket/tests/fixtures/receipts/standard_v2.json"
+        ))
+        .unwrap();
+        unrelated["result"]["logs"][0]["topics"][1] =
+            serde_json::json!(format!("0x{}", "ff".repeat(32)));
+        assert!(matches!(
+            one_finality_disposition(
+                &FakePolygonRpc::new(101).with_receipt(serde_json::to_vec(&unrelated).unwrap())
+            )
+            .await,
+            OrderFinalityDisposition::Conflict { .. }
+        ));
+        assert!(matches!(
+            one_finality_disposition(&FakePolygonRpc::new(101).with_canonical_hash("cc")).await,
+            OrderFinalityDisposition::Conflict { .. }
+        ));
+    }
+
+    /// PASS: a second Baseline in one account era is a typed reducer conflict.
+    #[test]
+    fn second_baseline_in_the_same_era_conflicts() {
+        let account_id = AccountId::new("account").unwrap();
+        assert!(matches!(
+            derive_projection_rows(
+                &account_id,
+                &[
+                    baseline_event(&account_id, 0),
+                    baseline_event(&account_id, 1)
+                ]
+            ),
+            Err(ProjectionReducerError::DuplicateBaseline)
+        ));
+    }
+
+    /// PASS: a repeated Daily cutoff in one account era is a typed reducer conflict.
+    #[test]
+    fn duplicate_daily_cutoff_conflicts() {
+        let account_id = AccountId::new("account").unwrap();
+        let mut daily = baseline_event(&account_id, 2);
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut daily.payload {
+            mark.kind = MarkKind::Daily;
+            mark.cutoff_unix = 86_400;
+        }
+        let mut repeated = daily.clone();
+        repeated.seq = 3;
+        assert!(matches!(
+            derive_projection_rows(
+                &account_id,
+                &[baseline_event(&account_id, 1), daily, repeated]
+            ),
+            Err(ProjectionReducerError::DuplicateDailyMark)
+        ));
+    }
+
+    fn finalized_fill_event(
+        account_id: &AccountId,
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        seq: u64,
+        prepared_seq: u64,
+    ) -> LiveJournalEvent {
+        LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp: OffsetDateTime::from_unix_timestamp(10).unwrap(),
+            payload: LiveJournalPayload::OrderFillFinalized(Box::new(OrderFillFinalizedAudit {
+                identity: prepared.identity.clone(),
+                prepared_journal_seq: prepared_seq,
+                principal: CollateralAmount::from_atomic(2_500_000),
+                quantity: ShareAmount::from_atomic(3_125_000),
+                fee: CollateralAmount::from_atomic(120),
+                matched_logs: vec![MatchedLogIdentity {
+                    transaction_hash: format!("0x{}", "11".repeat(32)),
+                    log_index: 7,
+                }],
+                chain_id: 137,
+                finalized_head: 100,
+                receipts: Vec::new(),
+                blocks: Vec::new(),
+            })),
+        }
+    }
+
+    fn resolution_event(account_id: &AccountId, seq: u64) -> LiveJournalEvent {
+        LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp: OffsetDateTime::from_unix_timestamp(20).unwrap(),
+            payload: LiveJournalPayload::ResolutionFinalized(Box::new(
+                pe_execution_core::ResolutionFinalizedAudit {
+                    condition_id: PolymarketConditionId(format!("0x{}", "77".repeat(32))),
+                    payout_by_outcome_index_json: BinaryPayoutVector::winner(0)
+                        .unwrap()
+                        .canonical_json(),
+                    source_append_receipt: AppendReceipt {
+                        sequence: EventSeq(2),
+                        this_hash: blake3::Hash::from_bytes([2; 32]),
+                    },
+                },
+            )),
+        }
+    }
+
+    /// PASS: resolution changes economics once; custody reconciliation changes no equity.
+    #[test]
+    fn finalized_resolution_and_custody_replay_converge_once() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let mut repeated_fill = finalized_fill_event(&account_id, &prepared, 4, 2);
+        if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut repeated_fill.payload {
+            finalized.finalized_head = 101;
+        }
+        let mut events = vec![
+            baseline_event(&account_id, 1),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+            },
+            finalized_fill_event(&account_id, &prepared, 3, 2),
+        ];
+        let filled = derive_projection_rows(&account_id, &events).unwrap();
+        assert_eq!(filled.positions.len(), 1);
+        assert!(filled.positions.first().is_some_and(|position| {
+            position.long_contracts == dec!(3.125000)
+                && position.short_contracts == Decimal::ZERO
+                && position.cost_basis == dec!(2.500120)
+        }));
+        events.extend([
+            repeated_fill,
+            resolution_event(&account_id, 5),
+            resolution_event(&account_id, 6),
+        ]);
+        let resolved = derive_projection_rows(&account_id, &events).unwrap();
+        assert_eq!(resolved.economic_cash, Some(dec!(10.624880)));
+        assert_eq!(resolved.receivable, dec!(3.125000));
+        assert!(resolved.positions.is_empty());
+        assert_eq!(resolved.custody_positions.len(), 1);
+        assert!(
+            resolved
+                .custody_positions
+                .first()
+                .is_some_and(|position| position.redeemable)
+        );
+
+        let reconciled_cash = CollateralAmount::from_decimal_exact(dec!(10.624880)).unwrap();
+        events.push(LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 7,
+            timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
+            payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+                pe_execution_core::RedemptionCustodyReconciledAudit {
+                    identity: RedemptionAttemptIdentity {
+                        account_id: account_id.clone(),
+                        condition_id: PolymarketConditionId(format!("0x{}", "77".repeat(32))),
+                        adapter: "adapter".to_owned(),
+                        custody_wallet: "custody".to_owned(),
+                    },
+                    account_state: pe_execution_core::LiveAccountStateAudit {
+                        observed_at: OffsetDateTime::from_unix_timestamp(30).unwrap(),
+                        closed_only: false,
+                        geoblocked: false,
+                        selected_spender: "spender".to_owned(),
+                        collateral_balance: reconciled_cash,
+                        allowance: reconciled_cash,
+                        reconciled_free_collateral: reconciled_cash,
+                        schema_version: 1,
+                        parser_version: 1,
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                    venue_positions: Vec::new(),
+                    venue_position_receipts: Vec::new(),
+                },
+            )),
+        });
+        let custody = derive_projection_rows(&account_id, &events).unwrap();
+        assert_eq!(custody.economic_cash, resolved.economic_cash);
+        assert_eq!(custody.receivable, Decimal::ZERO);
+        assert!(custody.custody_positions.is_empty());
+    }
+
+    /// PASS: account-state projection is composed only from strict reducer outputs.
+    #[test]
+    fn single_account_state_writer_uses_only_reducer_inputs() {
         let derived = ProjectionDerivation {
             reserved: dec!(2.50),
+            receivable: dec!(3),
+            latest_free_collateral: Some(dec!(12.50)),
+            latest_reconciled_at: Some("2026-08-11T12:00:00Z".to_owned()),
             ..ProjectionDerivation::default()
         };
-        let row = compose_account_state_row(
-            "account",
-            Some(&inputs),
-            &derived,
-            Some("redemption pending".to_owned()),
-        )
-        .unwrap();
+        let row =
+            compose_account_state_row("account", &derived, Some("redemption pending".to_owned()))
+                .unwrap();
         assert_eq!(row.free_collateral, dec!(12.50));
         assert_eq!(row.reserved, dec!(2.50));
         assert_eq!(row.unredeemed_value, dec!(3));
@@ -3185,7 +4737,6 @@ mod tests {
             last_redemption_unix: None,
             last_projection_unix: None,
             last_prune_unix: None,
-            account_state_inputs: HashMap::new(),
         }
     }
 
@@ -3283,6 +4834,60 @@ mod tests {
             "submitted",
             "the in-flight order is retained non-terminally"
         );
+    }
+
+    /// PASS: a crash after the synchronized final fill terminalizes locally before credentials.
+    #[tokio::test]
+    async fn finalized_fill_recovery_terminalizes_without_external_reads() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        stage(&db, "dispatch-finality", 1, &["acct"]);
+        db.set_dispatch_target_state("dispatch-finality", "acct", "submitted", None, 5)
+            .unwrap();
+        let mut state = fanout_state(
+            &dir,
+            db.clone(),
+            LiveAccountsSnapshot::default(),
+            "http://127.0.0.1:9",
+            None,
+        );
+        let account_id = AccountId::new("acct").unwrap();
+        let prepared = finality_prepared();
+        let prepared_event = state
+            .config
+            .journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                LiveJournalPayload::OrderPrepared(prepared.clone()),
+            )
+            .unwrap();
+        let fill = finalized_fill_event(
+            &account_id,
+            &prepared,
+            prepared_event.seq + 1,
+            prepared_event.seq,
+        );
+        state
+            .config
+            .journal
+            .append(account_id, fill.timestamp, fill.payload)
+            .unwrap();
+        let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        let control = process_target(
+            &mut state,
+            &seed,
+            &target,
+            &projection_signal(),
+            OffsetDateTime::from_unix_timestamp(20).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(control, PassControl::Continue);
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        assert_eq!(target.state, "terminal");
+        assert_eq!(target.terminal_reason.as_deref(), Some("filled"));
     }
 
     #[tokio::test]
@@ -3419,13 +5024,15 @@ mod tests {
                     .await
                     .unwrap();
                 let outcome = match reconciliation.outcome {
-                    LiveVenueReconciledOutcome::Matched { venue_order_id } => {
-                        LiveOrderOutcome::Matched {
-                            order_hash: target.account_id.clone(),
-                            venue_order_id,
-                            executed: None,
-                        }
-                    }
+                    LiveVenueReconciledOutcome::Matched {
+                        venue_order_id,
+                        transaction_hashes,
+                    } => LiveOrderOutcome::Matched {
+                        order_hash: target.account_id.clone(),
+                        venue_order_id,
+                        transaction_hashes,
+                        executed: None,
+                    },
                     LiveVenueReconciledOutcome::Killed { venue_order_id } => {
                         LiveOrderOutcome::Killed {
                             order_hash: target.account_id.clone(),
