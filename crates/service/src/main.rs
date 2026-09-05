@@ -990,6 +990,29 @@ async fn main() -> Result<()> {
             }
         };
         let journal_path = live_journal_path(&cfg.event_log_path);
+        let era_live_prefix = if cfg.event_log_path.exists() {
+            paper_era(
+                scan_paper_log(&cfg.event_log_path)
+                    .context("verify paper era for the live-journal prefix")?,
+            )
+            .start
+            .map(|(_, start)| {
+                Ok::<_, anyhow::Error>(pe_event_log::LogTailBinding {
+                    path: journal_path.clone(),
+                    physical_tail: start.live_prefix.physical_tail,
+                    last_sequence: start.live_prefix.last_sequence,
+                    last_hash: blake3::Hash::from_hex(&start.live_prefix.last_hash)
+                        .context("decode QualificationStarted live-prefix hash")?,
+                })
+            })
+            .transpose()?
+        } else {
+            None
+        };
+        if let Some(prefix) = &era_live_prefix {
+            pe_event_log::Scanner::verify_prefix(prefix)
+                .context("verify QualificationStarted live-journal prefix")?;
+        }
         let journal = LiveJournal::open(&journal_path).with_context(|| {
             format!("open and validate live journal {}", journal_path.display())
         })?;
@@ -1003,6 +1026,11 @@ async fn main() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
+        let live_book_fetcher = Arc::new(
+            ReqwestClobBookFetcher::new(live_http_client.clone())
+                .with_base_url(cfg.polymarket_clob_base_url.clone())
+                .with_source_log(resolution_source_log.clone()),
+        );
         let fanout_config = pe_service::live_fanout::LiveFanoutConfig {
             paper_state: paper_state.clone(),
             live_accounts,
@@ -1011,9 +1039,15 @@ async fn main() -> Result<()> {
             identity,
             journal: Arc::new(journal),
             journal_path,
+            era_live_prefix,
             projection,
-            book_fetcher: book_fetcher.clone(),
+            book_fetcher: live_book_fetcher,
+            mid_price_cache: mid_price_cache
+                .clone()
+                .with_source_log(resolution_source_log.clone()),
+            source_log: resolution_source_log.clone(),
             http: live_http_client,
+            polygon_receipt_rpc_url: cfg.polygon_receipt_rpc_url.clone(),
             supabase_url: cfg.supabase_url.clone(),
             supabase_anon_key: cfg.supabase_anon_key.clone(),
             supabase_secret_key: cfg.supabase_secret_key.clone(),

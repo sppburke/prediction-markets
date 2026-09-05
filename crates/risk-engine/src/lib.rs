@@ -10,7 +10,7 @@ pub mod snapshot;
 pub use block::RiskBlock;
 pub use engine::{RiskDecision, evaluate_canary_risk, evaluate_risk, exposure_bps_ceil};
 pub use inputs::{
-    COPY_LATENCY_ENGAGE_MS, COPY_LATENCY_RELEASE_MS, EquityInputs, PnlBps, PnlWindow,
+    BinaryPayout, COPY_LATENCY_ENGAGE_MS, COPY_LATENCY_RELEASE_MS, EquityInputs, PnlBps, PnlWindow,
     ResolutionCreditError, aggregate_resolution_credit, current_equity, latency_switch,
     nearest_rank_p95, pnl_bps, realized_closes_7d, worst_owner,
 };

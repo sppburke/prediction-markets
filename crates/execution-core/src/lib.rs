@@ -33,8 +33,9 @@ pub use canary_actor::{
 };
 pub use dispatcher::{DispatchResult, ExecutionDispatcher};
 pub use economic::{
-    BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit, MarketSelection,
-    ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
+    BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicError, EconomicInputs, EconomicPrepared,
+    FeeAudit, MarketSelection, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit,
+    SizingModeAudit,
 };
 pub use error::ExecutionError;
 pub use live_executor::{
