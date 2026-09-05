@@ -303,11 +303,17 @@ Backtest override: `PE_BACKTEST_PER_TRADE_CAP=unlimited` (or `bps:N` / `mode_def
 
 ```text
 Kelly                  → fractional-Kelly (the full c/p/bankroll math)
-Dollar { usd }         → contracts = max(1, floor(usd / fill_price))      # flat path; fill_price = leader + haircut on the live copy path (#484)
-Contract { contracts } → contracts = exactly N
+Dollar { usd }         → principal = the conservative compact-fee budget principal
+Contract { contracts } → minimum shares = exactly N
 ```
 
-Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–5c–6 (per-trade cap, price-impact book cap `price_impact_cap_bps`, risk gate) remain active in all modes. The mandatory book cap (#398 WS2, reworked in #508/#544) `min`s paper size to the **budget-planned executable ask ladder**: one `/book` fetch per admitted signal feeds the shared band gate, the within-band whole-share quantity (`pe_venue_polymarket::plan_budget_buy`), and — in `clob_best_ask` paper mode — the exact ladder-VWAP fill basis, with the FOK limit at the worst accepted tick and `worst_case_debit = shares × limit`. An **unusable book fails CLOSED before staging every destination** (missing token / fetch error / timeout / stale / corrupt / empty ⇒ skip). A successful ladder whose in-band depth affords no paper whole share anchors the shared band gate at best ask, then produces a typed paper-only skip after any admissible live target was staged. Boot requires the full hot snapshot with this cap present; edits are valid `1..=10_000` bps (`0` rejects the whole proposal and retains the last-good snapshot). There is no compiled-zero or unusable-book haircut-fallback path. This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
+All modes share one signed ask ladder and compact CLOB fee schedule. Its worst accepted tick is the
+signed price; signed principal and minimum shares are exact six-decimal amounts. The fee is computed
+once at that price and truncated to five decimals. Kelly uses the resulting all-in price after
+slippage. Dollar mode derives conservative principal from its monetary budget; Contract and Kelly
+derive principal from signed shares. Every monetary cap bounds principal plus the conservative fee
+reserve. Quantity below the venue minimum, unusable depth, stale evidence, or an invalid all-in price
+is a typed rejection with no fallback or sizing loop.
 
 **When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 
@@ -384,10 +390,10 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 
 | # | Gate | Condition (copy iff …) | Source | Rationale |
 |---|---|---|---|---|
-| A | Hold-to-resolution | `(market, outcome)` not already held | `orchestrator.rs` `filled_positions` set, rebuilt before producers from installed schema-v2 paper state | The cohort wallets sell winners early; dropping every later signal on a held contract (including the leader's own exits) reproduces copy-and-hold, capturing the full move. Authoritative boot/migration and the position-validation bracket establish that durable state; no periodic position-reseed owner remains (#544). |
+| A | Hold-to-resolution | `(market, outcome)` not already held | the coherent exact financial snapshot, rebuilt before producers | The cohort wallets sell winners early; dropping every later signal on a held contract (including the leader's own exits) reproduces copy-and-hold. Prepared/Final authority, exact positions, and causal Resolution Finals establish durable state. |
 | B | BUY-only first-ever entry | `signal.leader_side == Buy` **and** `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | wallet-second bucket commit + durable `entry_gate_results` / `wallet_market_history_v2`; `CopyEntryGate` is the rebuilt in-memory projection | The cohort was selected on first-ever BUYs. Drops every SELL, `Add`/`Trim`/`Exit`/`Flip`, and re-entry. Equal-second candidates are decided together from immutable pre-bucket state: two candidates in one market are all `ambiguous_first_entry_same_second`; one candidate consumes history even when a later gate rejects it (#544). |
 | C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | `orchestrator.rs::check_resolution_horizon` | Too far out locks capital for months; too soon (< 60 s) cannot be filled and held (`docs/29` copy floor). Resolution time from `MarketEndCache` (Gamma). Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). One lookup serves both bounds. |
-| D | Fill-price band | a current mid exists for liveness, the mandatory book read is usable, and the resolved BUY fill basis is `≥ min_fill_price` and `< max_fill_price` | `orchestrator.rs::plan_impact_gate` plus its band block | One book read supplies the shared band evidence. Paper `clob_best_ask` uses exact planned ladder VWAP (or best ask for the zero-absorb shared decision); `leader_haircut` uses the boot-owned haircut only after the book succeeds. Gamma mid remains liveness/observability only. The upper boundary skips and the lower boundary fills. |
+| D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Paper and ordinary live use the same signed principal, minimum shares, fee schedule, and all-in price. Gamma mid is liveness/mark evidence only. The upper boundary skips and the lower boundary fills. |
 
 **Copy-latency budget (both provenances).** In websocket-primary mode the orchestrator applies `copy_latency_budget_secs` (`_GLOSSARY.md`) to every observation — REST poll or activity websocket — before gate B and again immediately before dispatch staging: an observation older than the budget is admitted for seen/leader bookkeeping with a typed no-copy disposition and stages no copy (#530/#546).
 
@@ -397,7 +403,10 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 
 A rejected copy-scope gate logs the typed reason and commits a no-fill (the leader ledger is still mirrored, matching the existing no-edge path). SELL-only and non-entry buckets do not consume history. Defaults for the remaining gate config keys (`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
 
-**Current fill-basis sizing (#339/#544).** Unlike backtest (`simulation.rs`, which sizes at the historical fill price), the copy path computes Kelly cost `c` and the flat-path contract count from the resolved copy-time basis, not the Gamma mid. Paper `clob_best_ask` uses the mandatory plan's exact ladder VWAP; `leader_haircut` uses its boot-owned haircut only after usable book evidence. The signal retains the leader execution as audit evidence, but it cannot substitute for the mandatory current-book decision.
+**Current economic sizing (#545).** Production and replay consume the same `EconomicPrepared` value:
+market/admission receipts, signed ladder, exact sizing, compact fee and reserve, risk decision,
+balance proof, applied configuration hash, and source observation. The signal's leader execution is
+audit evidence and the no-chase ceiling; it cannot substitute for current-book evidence.
 
 ## Strategy-level trade gates
 
@@ -407,11 +416,14 @@ These five gates live in `crates/strategy-winner-follow/src/evaluate.rs` and fir
 |---|---|---|---|---|---|
 | 1 | Flip not approved | `signal.action == Flip && !config.flip_human_approved` | `evaluate.rs:62–64` | `FlipNotApproved` | Position flips (exit + re-enter opposite side) are high-risk and default-deny. The flag prevents automated flip copying until an operator approves it via the audit-logged Supabase admin panel (`service_config`, #398 Decision #2). |
 | 2 | Shadow mode | `effective_mode == Shadow` | `evaluate.rs:70–72` | `ShadowMode` | Shadow is record-only; no order is emitted. Returned as `Err` (not a hard failure) so callers can distinguish "intentionally suppressed" from "legitimately blocked". |
-| 3 | Price invalid after fee | `Price::new(leader_price + fee_per_share)` fails | `evaluate.rs:104` | `NoEdge` | `c` (cost = leader price + taker fee) must be a valid `Price` in `(0, 1)`. If the leader traded at a price that after fees would round to ≥ $1.00 there is no upside — the trade has no edge. |
-| 4 | Kelly sizes to zero | `size_contracts(kelly_input) == 0` | `evaluate.rs:112–114` | `NoEdge` | Kelly sizing returned zero contracts — the bankroll is too small to buy even one contract at this price with the configured fraction. Not an error; the signal is valid but unsizeable. |
-| 5 | Cap-clamp to zero | `clamp_contracts_to_cap(...) == 0` | `evaluate.rs:124–126` | `NoEdge` | After applying the per-trade cap (basis points of bankroll), available bankroll is smaller than the price of a single contract. Fractional contracts are not supported; skip this trade. |
+| 3 | All-in price invalid | the shared economic owner cannot construct `Price((principal + fee) / minimum_shares × (1 + slippage_rate))` | economic preparation | `NoEdge` | Exact fee and slippage leave no valid payoff geometry. |
+| 4 | Kelly sizes to zero | `size_contracts` at the all-in price returns zero | shared sizing owner | `NoEdge` | The valid signal is unsizeable at the chosen Kelly fraction. |
+| 5 | Budget or venue minimum | principal plus reserve exceeds a monetary cap, or exact shares are below the market minimum | shared ladder/sizing owner | typed sizing decline | No whole-share fallback is permitted; fractional signed quantities are retained exactly. |
 
 Gates 1–5 fire in order. Gate 6 onward is the risk-engine (`evaluate_risk`), which returns `RiskDecision::Blocked(reason)` → `Err(WinnerFollowError::Blocked(reason))`. See the risk-block taxonomy below for the ordinary risk-engine block reasons.
+Every strategy refusal is stored as the isomorphic `WinnerFollowDeclineAudit`; display text is not
+the replay contract. Risk refusal remains `RiskDecision::Blocked(reason)` converted to the typed
+strategy decline.
 
 **Relationship between layers:**
 
@@ -510,10 +522,9 @@ refuses orders without demotion. A pending, ambiguous, or failed redemption is t
 exception: it closes that account's new-BUY admission until confirmation.
 
 Venue settlement is payoff authority (Decision 11). Ordinary live admission composes an automated
-`VenueSettlementRecord` from `resolver-card` with fresh live-admission market evidence: condition,
-outcome, and token identity must agree; NegRisk is admitted and carried; fee fields are recorded but
-do not gate. Missing, stale, ambiguous, or disagreeing evidence fails closed. Hand-installed full
-`ResolverCard`s remain canary-only.
+`VenueSettlementRecord` from resolver evidence with fresh market evidence: condition, outcome, and
+token identity must agree. The compact CLOB response is the sole runtime fee authority; Gamma fee
+fields never enter economics. Missing, stale, ambiguous, or disagreeing evidence fails closed.
 
 Resolved positions redeem automatically (Decision 12). NegRisk evidence selects the V2 collateral
 adapter, and custody kind selects the supported Relayer transport. Recovery reconciles before any
@@ -525,43 +536,49 @@ be durable, with frozen ordered account targets and credential bindings. The see
 `pending_paper -> ready` atomically with a typed paper outcome. That outcome records sequencing and
 recovery state only: paper fills and paper-only skips never gate an otherwise admitted live target.
 
-## Promotion ladder
-
-Winner-Follow has a single leader-follow promotion ladder.
-
-### Ordinary leader-follow
+## Paper-to-live-tiny qualification
 
 ```
 historical reconstruction
   -> walk-forward backtest passes (LCB_5pct > 0)
-  -> paper-copy ≥ 30 days, ≥ 90 closed trades, drift within `_GLOSSARY.md` "close behavior" definition
-  -> live-tiny (kelly = 0.25; size bounded by the price-impact cap since #508 — the 25 bps
-     per-trade cap is the retired ModeDefault resolution)
-  -> promoted (same kelly; the 100 bps ModeDefault resolution likewise retired) after another
-     30-day live-tiny window passes the gates
+  -> one corrected financial era records exact paper decisions and economics
+  -> the first eligible mark synchronizes QualificationSealed
+  -> network-free exact replay emits Pass, Fail, or InsufficientEvidence
+  -> one manual review after Pass may authorize live-tiny
 ```
 
-A demotion resets the promotion clock.
+The exact quantitative gate is owned by `_GLOSSARY.md`. The observation begins at the first valid
+post-Start mark. Underperformance or inactivity membership demotion moves the anchor to the next
+valid mark; rank rotation and capacity change do not. Paper continues after the seal. A changed
+financial semantic or canonical economic hash seals insufficient before publication. An unrelated
+build with identical semantics does not reset the era.
 
 ## Promotion and demotion criteria
 
-See `_GLOSSARY.md` for the quantified gates ("Promotion criteria — quantified" and "Demotion criteria").
+See `_GLOSSARY.md` for the quantified gate ("Paper-to-live-tiny qualification — quantified") and
+typed qualification-anchor semantics.
 
 ## Backtest acceptance
 
-Winner-Follow can go to live-tiny only when:
+Backtest acceptance remains useful before paper observation, but it is not a production promotion
+comparison. The production verifier requires:
 
-- ranking is walk-forward;
-- follower fills are conservative (see `05-PHASE-BACKTESTING.md`);
-- LCB_5pct of daily log-growth is positive after costs;
-- max drawdown is below the bankroll-tier limit;
-- paper-copy behavior is "close to simulation" (`_GLOSSARY.md` definition);
-- every copied/passed trade has a replayable decision record.
+- exact equality with recorded classification, ladder, fee, risk, accounting, marks, membership,
+  financial Finals, and the seal;
+- the sealed observed-paper growth, drawdown, close, duration, and latency gate from `_GLOSSARY.md`;
+- complete immutable decision evidence selected by `(source_trade_id, semantic_revision)`.
 
 ## Live monitoring
 
-Demote or disable a leader when any demotion criterion in `_GLOSSARY.md` triggers. Demotion is automatic; promotion requires the gates above plus a manual review.
+Typed maintenance demotions remain automatic. They reset qualification only for underperformance or
+inactivity reasons. Promotion remains manual and is possible only after a sealed `Pass` report.
 
 ## Watchlist refresh
 
-The followed-wallet set is refreshed from Supabase `latest_ranking` **filtered to the ranker's `survives` verdict** (#518 — the published batch is a pass/fail bench, and only survivors are Leaders), which the buy-and-hold ranker publishes via `scripts/rank_and_push.sh` (issue #370 — the sole ranking pipeline; TTR 48h since the 2026-07-03 run28 cutover, `ranker_ttr_hours`). `pe-service` reads `latest_ranking` on an interval (score-update-only); MEMBERSHIP is governed by `watchlist_membership_mode` (`_GLOSSARY.md`): `knockout` (legacy — the maintenance tick's knockout+backfill is the sole membership path) or `full_rerank` (each ranking-batch transition wholesale-replaces the live top-`active_watchlist_size` — the cutover production mode; the demotion gate remains the intra-cycle rail). `active_watchlist_size` is a Supabase `service_config` integer (default 100, valid `1..=200`) loaded at boot and hot-reloaded every 30 seconds. Every post-boot addition — a capacity grow, a full-rerank swap, or a knockout backfill — completes prior-market history and validates current positions through the five-step causal bracket in the shared serialized preparer before recording the validation and publishing the atomic membership swap (#542/#544); a failed validation publishes no additions (a grow or swap retains the last-known-good target and membership for retry; a knockout applies its decided evictions without backfill). A full-rerank transition reads the ranking rows pinned to the batch that triggered it. The supporting deployment needs one normal service restart, but later valid size edits do not. Run28 fixed `k=25` and did not sweep watchlist width: the earlier top-50 paper experiment and its superseding 100-wallet default are operator-directed choices, not run28-backed N choices. See `docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`.
+The followed-wallet set is refreshed from Supabase `latest_ranking`, filtered to the ranker's
+`survives` verdict. Score-only refresh stays on its existing locked path and never changes structural
+membership. Capacity, full-rerank, and knockout changes recheck their prepared evidence under the
+structural writer lock, synchronize one `MembershipChanged` record, then publish its exact snapshot.
+Boot replays the initial membership and later structural records before producers, then applies the
+separate monotonic wallet fences. `wallet_lifecycle_events` remains a best-effort projection, not an
+authority. No membership table or scheduler exists.

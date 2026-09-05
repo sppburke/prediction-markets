@@ -315,9 +315,14 @@ impl DecisionEvidenceAccumulator {
         authority: AuthorityEvidence,
         terminal: TerminalDispositionEvidence,
     ) -> Result<String, serde_json::Error> {
+        let version = if terminal.decline.is_some() || terminal.final_receipt.is_some() {
+            TERMINAL_EVIDENCE_VERSION
+        } else {
+            POST_BOUNDARY_EVIDENCE_VERSION
+        };
         serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(
             DecisionPostBoundaryEvidenceBody {
-                version: POST_BOUNDARY_EVIDENCE_VERSION,
+                version,
                 owners: EVIDENCE_OWNERS.into_iter().map(str::to_owned).collect(),
                 source_trade_id: self.source_trade_id.clone(),
                 applied_configuration_hash: self.applied_configuration_hash.clone(),
@@ -424,6 +429,8 @@ pub enum ReplayDecisionError {
     ContinuationBinding,
     #[error("authority outcome contradicts the terminal disposition")]
     AuthorityBinding,
+    #[error("version-three terminal evidence contradicts its disposition")]
+    TerminalEvidenceBinding,
     #[error("decision_pending row is not terminal")]
     OpenRow,
     #[error("frozen decision continuation: {0}")]
@@ -452,7 +459,10 @@ pub fn replay_decision_pending(
     let continuation = DecisionContinuationV2::from_durable(row)?;
     let post_boundary: DecisionPostBoundaryEvidence =
         serde_json::from_str(&row.post_commit_inputs_json)?;
-    if post_boundary.body.version != POST_BOUNDARY_EVIDENCE_VERSION {
+    if !matches!(
+        post_boundary.body.version,
+        POST_BOUNDARY_EVIDENCE_VERSION | TERMINAL_EVIDENCE_VERSION
+    ) {
         return Err(ReplayDecisionError::Version(post_boundary.body.version));
     }
     if post_boundary.body.owners
@@ -491,8 +501,28 @@ pub fn replay_decision_pending(
         return Err(ReplayDecisionError::ContinuationBinding);
     }
     let disposition = post_boundary.body.terminal.disposition.as_str();
-    match post_boundary.body.terminal.fill.as_ref() {
-        Some(fill) => {
+    let terminal = &post_boundary.body.terminal;
+    if post_boundary.body.version == TERMINAL_EVIDENCE_VERSION {
+        let is_typed_decline =
+            terminal.disposition == "no_fill" && terminal.reason.starts_with("paper_reject:");
+        if terminal.decline.is_some() != is_typed_decline
+            || terminal.final_receipt.is_some() != (terminal.disposition == "fill")
+            || terminal.fill.is_some()
+        {
+            return Err(ReplayDecisionError::TerminalEvidenceBinding);
+        }
+    }
+    if terminal.decline.is_some()
+        && (terminal.disposition != "no_fill"
+            || !terminal.reason.starts_with("paper_reject:")
+            || terminal.fill.is_some()
+            || terminal.final_receipt.is_some())
+    {
+        return Err(ReplayDecisionError::TerminalEvidenceBinding);
+    }
+    match (terminal.fill.as_ref(), terminal.final_receipt) {
+        (Some(_), Some(_)) => return Err(ReplayDecisionError::TerminalEvidenceBinding),
+        (Some(fill), None) => {
             if disposition != "fill" {
                 // Only a fill disposition may carry recorded fill evidence.
                 return Err(ReplayDecisionError::ContinuationBinding);
@@ -516,7 +546,12 @@ pub fn replay_decision_pending(
                 return Err(ReplayDecisionError::ContinuationBinding);
             }
         }
-        None => {
+        (None, Some(_)) => {
+            if disposition != "fill" {
+                return Err(ReplayDecisionError::TerminalEvidenceBinding);
+            }
+        }
+        (None, None) => {
             if disposition == "fill" {
                 return Err(ReplayDecisionError::AuthorityBinding);
             }
@@ -749,6 +784,16 @@ mod tests {
             declined.decline,
             Some(pe_strategy_winner_follow::WinnerFollowDeclineAudit::NoEdge)
         );
+        let declined_row = terminal_row(
+            "typed-decline",
+            AuthorityEvidence::not_read("strategy_declined"),
+            declined,
+        );
+        let replayed = replay_decision_pending(&declined_row).unwrap();
+        assert_eq!(
+            replayed.post_boundary.body.version,
+            TERMINAL_EVIDENCE_VERSION
+        );
 
         let receipt = AppendReceipt {
             sequence: EventSeq(11),
@@ -756,7 +801,38 @@ mod tests {
         };
         let final_fill = TerminalDispositionEvidence::final_fill(receipt);
         assert_eq!(final_fill.final_receipt, Some(receipt));
+        let fill_row = terminal_row(
+            "final-fill",
+            AuthorityEvidence::commit_fill_v2("applied", dec!(996)),
+            final_fill,
+        );
+        let replayed = replay_decision_pending(&fill_row).unwrap();
+        assert_eq!(
+            replayed.post_boundary.body.version,
+            TERMINAL_EVIDENCE_VERSION
+        );
         assert_eq!(TERMINAL_EVIDENCE_VERSION, 3);
+    }
+
+    #[test]
+    fn replay_rejects_v3_decline_or_final_receipt_contradictions() {
+        let mut row = terminal_row(
+            "bad-v3",
+            AuthorityEvidence::not_read("strategy_declined"),
+            TerminalDispositionEvidence::declined(
+                &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+            ),
+        );
+        let document: DecisionPostBoundaryEvidence =
+            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+        let mut body = document.body;
+        body.terminal.decline = None;
+        row.post_commit_inputs_json =
+            serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(body).unwrap()).unwrap();
+        assert!(matches!(
+            replay_decision_pending(&row),
+            Err(ReplayDecisionError::TerminalEvidenceBinding)
+        ));
     }
 
     #[test]

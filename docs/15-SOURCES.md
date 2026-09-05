@@ -132,8 +132,8 @@
 | https://docs.polymarket.com/v2-migration | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/overview | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/orders/create | 2026-08-11 | 2026-10-10 |
-| https://docs.polymarket.com/trading/fees | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/builders/fees | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/fees | 2026-09-05 | 2026-11-04 |
+| https://docs.polymarket.com/builders/fees | 2026-09-05 | 2026-11-04 |
 | https://docs.polymarket.com/trading/deposit-wallets | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/wallets-auth | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/trading/positions/manage | 2026-08-11 | 2026-10-10 |
@@ -156,12 +156,14 @@
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
 | https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-18 | 2026-09-16 |
-| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-07-18 | 2026-09-16 |
+| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-09-05 | 2026-11-04 |
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-03 | 2026-11-01 |
 | https://docs.polymarket.com/concepts/resolution | 2026-09-01 | 2026-10-31 |
+| https://docs.polygon.technology/pos/reference/rpc-endpoints | 2026-09-05 | 2026-12-04 |
+| https://docs.polygon.technology/pos/concepts/finality/finality | 2026-09-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
@@ -239,6 +241,17 @@ Treat as research inspiration; not a production decision input unless an authori
 
 ## Last research pass
 
+- 2026-09-05: Re-verified the corrected Winner-Follow fee and live-finality contracts for #545.
+  Compact CLOB `fd` is the sole runtime fee authority: accepted economics are taker-only,
+  exponent one, with one aggregate `shares × rate × price × (1 − price)` calculation truncated
+  once to five decimal collateral places. Gamma fee fields never classify or gate it. The signed
+  repository builder code is zero, so separately observed nonzero builder fees are unreachable.
+  Finalized `OrderFilled` logs, not authenticated trade settlement ratios, provide live principal,
+  exact fractional quantity, and fee. Polygon chain 137 finalized-height and canonical block-hash
+  evidence is required before a live Fill Final; pending or conflicting evidence remains a recorded
+  reconciliation outcome. Primary references are the Polymarket fee/compact-market documentation,
+  Polygon RPC/finality documentation, and CTF Exchange v2 source at commit `ccc0596`.
+
 - 2026-09-03: Re-verified `/positions` size precision for issue #557 against an incident wallet.
   The current-position size was `34.0795`; the same wallet's incident REDEEM activity size was
   `33.32222`, and all seven incident anchor balances used no more than four decimal places. This
@@ -292,10 +305,10 @@ Treat as research inspiration; not a production decision input unless an authori
   active/accepting, `neg_risk=false`, `seconds_delay=0`, matching two-token identity, minimum order
   size 5, and tick 0.01. Its compact CLOB response omitted `nr`, `fd`, and `itode` (and both base-fee
   fields), while the public book agreed on condition/token identity, `neg_risk=false`, minimum size,
-  and tick with nonempty string-valued bid/ask levels. This pass supports requesting documented
-  direct tags and retaining the existing independent fail-closed long-market, fee, delay, compact
-  metadata, and book checks; it does not establish authenticated account, geoblock, or closed-only
-  state.
+  and tick with nonempty string-valued bid/ask levels. This historical pass supports requesting
+  documented direct tags and independent market, delay, compact metadata, and book checks. Its
+  Gamma-assisted absent-fee inference was retired by #545; compact CLOB fee evidence now stands on
+  its own and fails closed when it cannot produce the accepted schedule.
 
 - 2026-07-17: Re-verified the production CLOB V2 migration/host, order/FOK behavior, fees,
   builder fees, deposit-wallet `POLY_1271` identity, authentication, standard V2 contracts,
@@ -303,8 +316,9 @@ Treat as research inspiration; not a production decision input unless an authori
   closed-only/balance/orders/trades reads, and Data positions. Current sampled
   `/clob-markets/{condition_id}` responses may omit `nr`, `fd`, and `itode`: the canary accepts an
   absent `nr` only when independent long-market and book evidence explicitly prove standard
-  `neg_risk == false`, accepts absent `fd` only when Gamma explicitly proves fees disabled and all
-  available CLOB base-fee fields are zero, and accepts absent `itode` only under the pinned SDK
+  `neg_risk == false`. Its former acceptance of absent `fd` using Gamma and base-fee fields is
+  historical and was retired by #545; corrected economics require the compact parser's own
+  accepted zero/taker schedule. The pass accepts absent `itode` only under the pinned SDK
   0.7.0/parser-version omission rule while the long-form market explicitly reports
   `seconds_delay == 0`. Any present `nr == true`, nonzero `fd`/base fee, `itode == true`, positive
   delay, source disagreement, or schema drift fails closed. Re-verify these observations before

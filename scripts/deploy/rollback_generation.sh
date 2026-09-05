@@ -102,26 +102,55 @@ else
 fi
 
 restored_counts_match() {
-  local answer
-  answer=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
-    "select case when not exists (
-        (select idempotency_key,leader_wallet,source_trade_id,market_id,outcome_id,side,contracts,fill_price,entry_unix,event_seq,inserted_at from paper_fills)
-        except all
-        (select idempotency_key,leader_wallet,source_trade_id,market_id,outcome_id,side,contracts,fill_price,entry_unix,event_seq,inserted_at from paper_fills_archive where activation_id='$activation_id'))
-      and not exists (
-        (select idempotency_key,leader_wallet,source_trade_id,market_id,outcome_id,side,contracts,fill_price,entry_unix,event_seq,inserted_at from paper_fills_archive where activation_id='$activation_id')
-        except all
-        (select idempotency_key,leader_wallet,source_trade_id,market_id,outcome_id,side,contracts,fill_price,entry_unix,event_seq,inserted_at from paper_fills))
-      and not exists ((select market_id,outcome_prices,credit_applied,settled_at_unix,inserted_at from settled_markets) except all (select market_id,outcome_prices,credit_applied,settled_at_unix,inserted_at from settled_markets_archive where activation_id='$activation_id'))
-      and not exists ((select market_id,outcome_prices,credit_applied,settled_at_unix,inserted_at from settled_markets_archive where activation_id='$activation_id') except all (select market_id,outcome_prices,credit_applied,settled_at_unix,inserted_at from settled_markets))
-      and not exists ((select market_id,outcome_id,long_contracts,short_contracts,updated_at from paper_positions) except all (select market_id,outcome_id,long_contracts,short_contracts,updated_at from paper_positions_archive where activation_id='$activation_id'))
-      and not exists ((select market_id,outcome_id,long_contracts,short_contracts,updated_at from paper_positions_archive where activation_id='$activation_id') except all (select market_id,outcome_id,long_contracts,short_contracts,updated_at from paper_positions))
-      and not exists ((select id,bankroll_str,updated_at from paper_bankroll) except all (select id,bankroll_str,updated_at from paper_bankroll_archive where activation_id='$activation_id'))
-      and not exists ((select id,bankroll_str,updated_at from paper_bankroll_archive where activation_id='$activation_id') except all (select id,bankroll_str,updated_at from paper_bankroll))
-      and not exists ((select idempotency_key,liquidity,volume,absorbable_usd_100bps,ask_levels_json,captured_at_unix,inserted_at from fill_market_snapshots) except all (select idempotency_key,liquidity,volume,absorbable_usd_100bps,ask_levels_json,captured_at_unix,inserted_at from fill_market_snapshots_archive where activation_id='$activation_id'))
-      and not exists ((select idempotency_key,liquidity,volume,absorbable_usd_100bps,ask_levels_json,captured_at_unix,inserted_at from fill_market_snapshots_archive where activation_id='$activation_id') except all (select idempotency_key,liquidity,volume,absorbable_usd_100bps,ask_levels_json,captured_at_unix,inserted_at from fill_market_snapshots))
-      then 'ok' else 'mismatch' end;")
-  [[ "$answer" == ok ]]
+  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -v activation_id="$activation_id" >/dev/null <<'SQL'
+select set_config('pe.activation_id', :'activation_id', false);
+do $$
+declare
+  activation text := current_setting('pe.activation_id');
+  t text;
+  arch text;
+  collist text;
+  missing_column text;
+  differs boolean;
+  tables constant text[] := array[
+    'paper_fills', 'settled_markets', 'paper_positions',
+    'paper_bankroll', 'fill_market_snapshots'
+  ];
+begin
+  foreach t in array tables loop
+    arch := t || '_archive';
+    select a.attname
+      into missing_column
+      from pg_attribute a
+     where a.attrelid = t::regclass and a.attnum > 0 and not a.attisdropped
+       and not exists (
+         select 1 from pg_attribute archived
+          where archived.attrelid = arch::regclass
+            and archived.attnum > 0 and not archived.attisdropped
+            and archived.attname = a.attname
+       )
+     order by a.attnum
+     limit 1;
+    if missing_column is not null then
+      raise exception 'archive % lacks live column %', arch, missing_column;
+    end if;
+    select string_agg(format('%I', a.attname), ', ' order by a.attnum)
+      into collist
+      from pg_attribute a
+     where a.attrelid = t::regclass and a.attnum > 0 and not a.attisdropped;
+    execute format(
+      'select exists ((select %1$s from %2$I) except all '
+      '(select %1$s from %3$I where activation_id = $1)) or exists '
+      '((select %1$s from %3$I where activation_id = $1) except all '
+      '(select %1$s from %2$I))',
+      collist, t, arch
+    ) into differs using activation;
+    if differs then
+      raise exception 'restored live rows differ from activation % archive for %', activation, t;
+    end if;
+  end loop;
+end $$;
+SQL
 }
 
 verify_old_running() {

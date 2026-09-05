@@ -245,6 +245,72 @@ old generation, and proves the unit active and enabled with the running executab
 binary before recording `rolled_back`. A forward rerun of that id is thereafter refused. Retain the
 manifest, generation, and pre-T0 archive for audit.
 
+## Issue #545 schema-two financial-era activation
+
+This route changes financial semantics inside the already-verified #557 generation. It does not
+create a generation, stage new state paths, invoke `seed_v1_empty.sh`, or replace
+`/home/sean/pe-activation.json`. The latter is read-only generation/activation identity;
+`/home/sean/pe-financial-era.json` (`kind: financial-era-v1`) is the sole financial-transition
+manifest.
+
+Before `QualificationStarted`, installed artifacts and the complete 17-name hot-configuration
+contract stay active. The two legacy compatibility rows remain required but are ignored by corrected
+economics. After Start, apply the reviewed migration to the 15 economic names; an optional
+`risk_halt_release_hash` is separate incident control. Do not apply post-Start changes early.
+
+Run the exact reviewed driver command on the production host:
+
+```bash
+SUPABASE_DB_URL=<session-pooler-url> \
+  scripts/paper_reset/activate_financial_era.sh \
+  --target-binary <reviewed-pe-service> \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  --paper-log <active-generation-paper.log> \
+  --source-log <active-generation-source_events.log> \
+  --live-journal <active-generation-live_journal.log> \
+  --paper-state <active-generation-paper_state.db> \
+  --fresh-bankroll <amount> \
+  --artifact-blake3 <hash> \
+  --hot-config-hash <expected-15-name-hash> \
+  --ranking-batch-id <id> \
+  --policy-hash <hash> \
+  --membership-json <canonical-membership-array.json> \
+  --membership-proofs-hash <hash>
+```
+
+The resumable forward order is `prepared → guarded → started → verified`. `prepared` is read-only:
+the staged binary scans all three logs and returns the exact Start payload and expected synchronized
+receipt before constructing any network client. `guarded` stops the service once, proves it inert,
+takes and verifies a complete SQLite online backup, records the remote census and log bounds, and
+requires no open decision, unmatched Prepared, or live order. It then calls
+`archive_paper_state.sql` directly, performs the offline local reset/Start, applies Start-bound SQL,
+adopts reviewed files, and starts the service once.
+
+`started → verified` consumes the first invocation-fresh healthy proof of Start identity, fresh
+financial state, source/replay continuity, and ranking/membership. It has no soak, dwell, repeated
+sample, site approval, or wait loop. Resume the same command after interruption; each durable
+boundary is rechecked.
+
+Before a complete Start, `--rollback-before-start` records `rolling_back`, validates the manifest,
+backup, census, old installed hashes, and log bounds, restores the activation-stamped remote archive
+and complete SQLite backup once, restarts the old process only if necessary, and records
+`rolled_back`. A scanned complete Start forces roll-forward even when the shell manifest is stale.
+At or after Start, rollback is forbidden: preserve the append-only era and recover with a compatible
+reader.
+
+The offline qualification command is separate from activation and constructs no network client:
+
+```bash
+pe-service --qualify \
+  --paper-log <paper.log> --source-log <source_events.log> \
+  --paper-state <paper_state.db> --seal-hash <qualification-seal-hash> \
+  --output <qualification-report.json>
+```
+
+It emits canonical compact JSON plus one trailing newline and reports its BLAKE3 hash. Only a sealed
+`Pass` under `_GLOSSARY.md` permits the one subsequent manual paper-to-live-tiny review.
+
 ## Facts
 
 | item | value |

@@ -1,7 +1,10 @@
 # 05 — Phase Backtesting
 
 > See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
-> See [`_GLOSSARY.md`](_GLOSSARY.md) for the "close to simulation" definition (KS p-value, mean-PnL z-score) and configuration defaults, including `kelly_p_prior_alpha_default`, `kelly_p_prior_beta_default`, and `kelly_p_k_per_market_default` (Bayesian shrinkage on leader win-rate `p` with N_eff scaling; set via `PE_BACKTEST_KELLY_P_PRIOR_ALPHA` / `PE_BACKTEST_KELLY_P_PRIOR_BETA` / `PE_BACKTEST_KELLY_P_K_PER_MARKET`).
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for configuration defaults, including
+> `kelly_p_prior_alpha_default`, `kelly_p_prior_beta_default`, and
+> `kelly_p_k_per_market_default`. Backtests remain research and regression evidence; the production
+> promotion contract is the sealed observed-paper gate, not a paper-versus-simulator comparison.
 
 ## Objective
 
@@ -98,7 +101,7 @@ pub struct WinnerFollowReport {
     pub copy_delay_p95_ms: u32,
     pub copy_delay_p99_ms: u32,
     pub edge_decay_by_delay_bps: BTreeMap<DelayBucket, i32>,
-    pub fill_rate_simulated_vs_realized: (ProbabilityPpm, ProbabilityPpm),
+    pub fill_rate_simulated: ProbabilityPpm,
 
     // Hold and concentration
     pub hold_p50_seconds: u32,
@@ -110,9 +113,6 @@ pub struct WinnerFollowReport {
     pub leader_churn_rate_per_day: Decimal,
     pub demotion_count_by_cause: BTreeMap<DemotionCause, u32>,
 
-    // Promotion-relevant
-    pub paper_vs_backtest_ks_pvalue: Decimal,
-    pub paper_vs_backtest_mean_z: Decimal,
 }
 ```
 
@@ -215,7 +215,9 @@ Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A
 2. **Ranking replay:** at each historical time `t`, rank candidates using only data available before `t`.
 3. **Follower replay:** copy eligible trades after simulated latency and with book-aware fill assumptions.
 4. **Portfolio replay:** apply Kelly sizing, caps, correlated exposure limits, exits, and drawdown stops (caps in `19-`).
-5. **Live-vs-backtest drift replay:** compare paper/live outcomes against simulated expectations using the "close to simulation" definition in `_GLOSSARY.md`.
+5. **Production-parity replay:** verify that recorded inputs produce the same classification,
+   economics, risk decisions, fills, marks, and settlement arithmetic as production. This is a
+   correctness check, not a comparative promotion sample.
 
 ### Bias controls
 

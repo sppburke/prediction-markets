@@ -6,6 +6,11 @@ the five Supabase paper tables under one `activation_id`, and switch the service
 generation-qualified paths. The activation and rollback commands are in
 [`35-PE-SERVICE-DEPLOY-RUNBOOK.md`](35-PE-SERVICE-DEPLOY-RUNBOOK.md).
 
+This historical generation procedure is distinct from the schema-two financial-era transition in
+issue #545. The latter preserves the active generation, database, all three framed logs, decisions,
+anchors, and fences; it resets only financial rows and appends `QualificationStarted`. Never invoke
+`seed_v1_empty.sh` for a financial-era transition.
+
 ## Authority and invariants
 
 Paper state spans Supabase, the local SQLite main, `paper.log`, `live_journal.log`, and
@@ -99,8 +104,9 @@ terminal output or manually advance it.
 Use `scripts/deploy/rollback_generation.sh --activation-id <id>`; do not hand-copy rows. The driver
 records `rolling_back`, validates every archived config/environment/binary source against its manifest
 hash before changing the database or installed files, disables and stops any non-adoptable running
-service before touching the database, and restores exactly the five archive-table row sets stamped with that id using explicit
-column lists in one transaction. It verifies the restored counts, refreshes the materialized view,
+service before touching the database, and restores exactly the five archive-table row sets stamped
+with that id using catalog-ordered live columns in one transaction. It verifies exact restored row
+equality, refreshes the materialized view,
 restores the hash-bound old config/environment/binary, starts the old generation, and records
 `rolled_back`.
 
@@ -119,3 +125,24 @@ The v1-to-v2 migration phases remain machine-owned: `boundary_recorded`,
 any v2 append or active-state commit, the migration's dedicated `--rollback-paper-v1` path can preserve
 the failed side and restore its immutable v1 input. After either boundary it refuses; resume with the
 same v2-compatible binary. Do not move bound logs or edit the migration record.
+
+## Schema-two financial era (#545)
+
+Use the separate route documented in docs/35 when correcting economics inside an already-active
+schema-two generation. Its authority is `/home/sean/pe-financial-era.json` with kind
+`financial-era-v1`; `/home/sean/pe-activation.json` remains the read-only #557 generation identity.
+Forward states are `prepared → guarded → started → verified`; rollback uses `rolling_back →
+rolled_back` only before a complete Start.
+
+`prepare` scans the paper, source, and live logs and constructs the exact Start payload/receipt
+without mutation. `guarded` stops the service once, proves it inert, records a complete SQLite
+online backup and remote census, verifies the log bounds and absence of open financial work, and
+then runs the existing catalog-derived Supabase archive/reset transaction. The staged service
+performs the local financial reset and synchronized Start offline. Only after Start may the driver
+apply Start-bound schema/config changes, adopt reviewed artifacts, and start the service once.
+
+A complete Start always forces roll-forward, even if the shell manifest lags. Before Start, the
+driver may restore only the activation-stamped remote archive and complete local backup after
+revalidating identities and unchanged nonfinancial/log bounds. After Start, preserve the era and
+append-only logs and repair with a compatible reader; never truncate Start or restore the old
+financial prefix.
