@@ -4,9 +4,7 @@ use pe_core_types::BasisPoints;
 use pe_risk_engine::{
     ConcentrationCaps, RiskBlock, RiskSnapshot,
     engine::{RiskDecision, evaluate_risk},
-    snapshot::TradingMode,
 };
-use pe_source_core::SourceStatus;
 
 fn base_snapshot() -> RiskSnapshot {
     RiskSnapshot {
@@ -16,9 +14,8 @@ fn base_snapshot() -> RiskSnapshot {
         total_copy_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        onchain_source_status: SourceStatus::Healthy,
-        copy_latency_p95_ms: 100,
-        trading_mode: TradingMode::LiveTiny,
+        absolute_pnl_bps: BasisPoints(0),
+        copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
@@ -43,11 +40,11 @@ fn scenario_2_intraday_halt_at_minus_200() {
     );
 }
 
-/// Scenario 3: Kill switch fires at -1000 bps
+/// Scenario 3: Kill switch fires at -1000 bps of absolute PnL.
 #[test]
 fn scenario_3_kill_switch_at_minus_1000() {
     let mut s = base_snapshot();
-    s.intraday_pnl_bps = BasisPoints(-1_000);
+    s.absolute_pnl_bps = BasisPoints(-1_000);
     assert_eq!(
         evaluate_risk(&s),
         RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
@@ -71,15 +68,12 @@ fn scenario_5_per_trade_cap_defense_in_depth() {
     );
 }
 
-/// Scenario 6: Cap is read from snapshot — Promoted mode with cap=100, proposed=99 → Approved.
-///
-/// Confirms the engine reads `per_trade_cap_bps` from the snapshot, not from `trading_mode`.
+/// Scenario 6: Cap is read from snapshot — cap=100, proposed=99 → Approved.
 ///
 /// PASS: `Approved` when `proposed_trade_bps = 99 ≤ per_trade_cap_bps = 100`.
 #[test]
 fn scenario_6_snapshot_cap_field_controls_gate() {
     let mut s = base_snapshot();
-    s.trading_mode = TradingMode::Promoted;
     s.per_trade_cap_bps = 100;
     s.proposed_trade_bps = BasisPoints(99);
     assert_eq!(evaluate_risk(&s), RiskDecision::Approved);

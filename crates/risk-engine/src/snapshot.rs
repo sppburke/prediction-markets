@@ -1,12 +1,8 @@
 use pe_core_types::{BasisPoints, CanaryOrigin, CollateralAmount};
-use pe_source_core::SourceStatus;
 use serde::{Deserialize, Serialize};
 
 /// Whether the trade is in live-tiny or promoted mode.
 ///
-/// After the configurable-cap change (`PerTradeCap`), `trading_mode` is no longer used by any
-/// gate check in `evaluate_risk` — the cap is carried in `per_trade_cap_bps`. The field is
-/// retained in `RiskSnapshot` for logging and tracing only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingMode {
@@ -71,18 +67,14 @@ pub struct RiskSnapshot {
     /// Rolling 7-day realized PnL.
     pub rolling_7d_pnl_bps: BasisPoints,
 
-    // ── Flags and status ────────────────────────────────────────────────────
-    /// Health of the on-chain Polygon data source.
-    pub onchain_source_status: SourceStatus,
+    /// Absolute realized + unrealized PnL from the owning qualification baseline.
+    pub absolute_pnl_bps: BasisPoints,
 
-    // ── Latency ─────────────────────────────────────────────────────────────
-    /// Observed p95 copy latency in milliseconds (trailing measurement).
-    pub copy_latency_p95_ms: u64,
+    // ── Kill-switch state ───────────────────────────────────────────────────
+    /// Whether the service-owned copy-latency state machine has activated its kill switch.
+    pub copy_latency_kill_switch_active: bool,
 
     // ── Proposed trade ──────────────────────────────────────────────────────
-    /// Whether this trade is in live-tiny or promoted mode. Retained for logging only;
-    /// not read by any gate check in `evaluate_risk` after the configurable-cap change.
-    pub trading_mode: TradingMode,
     /// Size of the proposed trade as basis points of bankroll.
     /// Populated by `WinnerFollowStrategy::evaluate` after clamping to `per_trade_cap_bps`.
     pub proposed_trade_bps: BasisPoints,

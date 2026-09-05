@@ -37,7 +37,7 @@ use pe_event_log::Writer;
 use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
-use pe_risk_engine::{ConcentrationCaps, RiskSnapshot, snapshot::TradingMode};
+use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
 use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
@@ -46,7 +46,6 @@ use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::runtime_config::FillMode;
-use pe_source_core::SourceStatus;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -140,8 +139,8 @@ fn empty_mid_cache() -> MidPriceCache<FixtureFetcher> {
 }
 
 /// A risk snapshot with no exposure, healthy source, and headroom under every cap,
-/// so the risk gate approves. `proposed_trade_bps`/`per_trade_cap_bps`/`trading_mode`
-/// are overwritten by `evaluate()` before the gate runs.
+/// so the risk gate approves. `proposed_trade_bps`/`per_trade_cap_bps` are overwritten
+/// by `evaluate()` before the gate runs.
 fn clean_snapshot() -> RiskSnapshot {
     RiskSnapshot {
         leader_exposure_bps: BasisPoints(0),
@@ -150,9 +149,8 @@ fn clean_snapshot() -> RiskSnapshot {
         total_copy_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        onchain_source_status: SourceStatus::Healthy,
-        copy_latency_p95_ms: 500,
-        trading_mode: TradingMode::LiveTiny,
+        absolute_pnl_bps: BasisPoints(0),
+        copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),

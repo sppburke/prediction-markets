@@ -12,10 +12,68 @@ pub use pe_core_types::CanaryOrigin;
 pub use snapshot::{CanaryRiskSnapshot, ConcentrationCaps, RiskSnapshot, TradingMode};
 
 use pe_core_types::{BasisPoints, CollateralAmount};
+use serde::{Deserialize, Serialize};
 
 pub const CANARY_PER_TRADE_CAP_BPS: BasisPoints = BasisPoints(50);
 pub const CANARY_MAX_ORDER_DEBIT: CollateralAmount = CollateralAmount::from_atomic(1_000_000);
 pub const CANARY_MAX_ALLOWANCE: CollateralAmount = CollateralAmount::from_atomic(8_000_000);
+
+/// Canonical `docs/19` absolute-loss kill-switch threshold.
+pub const KILL_SWITCH_DRAWDOWN_BPS: i32 = -1_000;
+pub const INTRADAY_STOP_BPS: i32 = -200;
+pub const ROLLING_7D_STOP_BPS: i32 = -600;
+
+/// Durable reason a risk owner entered or left a halt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskHaltCause {
+    IntradayDrawdown,
+    Rolling7dDrawdown,
+    AbsoluteLoss,
+    CopyLatency,
+}
+
+/// Exact equity-path arithmetic failures.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RiskMathError {
+    #[error("equity path is empty")]
+    Empty,
+    #[error("equity value is not positive")]
+    NonPositive,
+    #[error("exact arithmetic overflow")]
+    Overflow,
+}
+
+/// Nonnegative peak-to-trough drawdown as a fraction of the running peak, over an
+/// ordered equity path (exact [`Decimal`]).
+pub fn max_drawdown_fraction(equity: &[Decimal]) -> Result<Decimal, RiskMathError> {
+    let Some(&first) = equity.first() else {
+        return Err(RiskMathError::Empty);
+    };
+    if first <= Decimal::ZERO {
+        return Err(RiskMathError::NonPositive);
+    }
+
+    let mut peak = first;
+    let mut max_drawdown = Decimal::ZERO;
+    for &value in equity.iter().skip(1) {
+        if value <= Decimal::ZERO {
+            return Err(RiskMathError::NonPositive);
+        }
+        if value > peak {
+            peak = value;
+            continue;
+        }
+        let drawdown = peak
+            .checked_sub(value)
+            .and_then(|loss| loss.checked_div(peak))
+            .ok_or(RiskMathError::Overflow)?;
+        if drawdown > max_drawdown {
+            max_drawdown = drawdown;
+        }
+    }
+    Ok(max_drawdown)
+}
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
@@ -263,5 +321,54 @@ mod canary_tests {
         snapshot.origin = CanaryOrigin::OperatorProbe;
         snapshot.leader_exposure_bps = None;
         assert_eq!(evaluate_canary_risk(&snapshot), RiskDecision::Approved);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod drawdown_tests {
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    /// PASS: a monotonically increasing positive path has zero drawdown.
+    #[test]
+    fn monotone_increase_has_zero_drawdown() {
+        assert_eq!(
+            max_drawdown_fraction(&[dec!(100), dec!(110), dec!(120)]).unwrap(),
+            Decimal::ZERO
+        );
+    }
+
+    /// PASS: one drop is returned as an exact fraction of the running peak.
+    #[test]
+    fn single_drop_is_measured_from_running_peak() {
+        assert_eq!(
+            max_drawdown_fraction(&[dec!(100), dec!(80)]).unwrap(),
+            dec!(0.2)
+        );
+    }
+
+    /// PASS: recovery establishes a new peak used by the subsequent deeper drop.
+    #[test]
+    fn recovery_then_deeper_drop_uses_new_peak() {
+        assert_eq!(
+            max_drawdown_fraction(&[dec!(100), dec!(90), dec!(120), dec!(84)]).unwrap(),
+            dec!(0.3)
+        );
+    }
+
+    /// PASS: empty and nonpositive equity paths return their typed errors.
+    #[test]
+    fn empty_and_nonpositive_paths_fail_closed() {
+        assert_eq!(max_drawdown_fraction(&[]), Err(RiskMathError::Empty));
+        assert_eq!(
+            max_drawdown_fraction(&[dec!(100), Decimal::ZERO]),
+            Err(RiskMathError::NonPositive)
+        );
+        assert_eq!(
+            max_drawdown_fraction(&[dec!(-1)]),
+            Err(RiskMathError::NonPositive)
+        );
     }
 }

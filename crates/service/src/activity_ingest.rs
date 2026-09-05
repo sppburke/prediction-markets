@@ -48,10 +48,8 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pe_copy_signal_engine::TradeProvenance;
-use pe_core_types::{
-    EventSeq, ReceivedAt, SourceId, SourceTimestamp, SourceTradeId, WalletAddress,
-};
-use pe_event_log::{ContentType, EnvelopeIn};
+use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, SourceTradeId, WalletAddress};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS,
     ACTIVITY_WS_READER_COUNT, ActivityWsError, ActivityWsStream, ReconnectBackoff, WireFrame,
@@ -92,7 +90,7 @@ pub struct SourceLogHandle {
 
 struct SourceLogRequest {
     envelope: EnvelopeIn,
-    appended: oneshot::Sender<EventSeq>,
+    appended: oneshot::Sender<AppendReceipt>,
 }
 
 pub struct SourceLogReceiver {
@@ -113,7 +111,10 @@ impl SourceLogHandle {
     }
 
     /// Record one source page and wait for its durable append acknowledgement.
-    pub async fn append(&self, envelope: EnvelopeIn) -> Result<EventSeq, SourceLogHandleError> {
+    pub async fn append(
+        &self,
+        envelope: EnvelopeIn,
+    ) -> Result<AppendReceipt, SourceLogHandleError> {
         let (appended, acknowledgement) = oneshot::channel();
         self.tx
             .send(SourceLogRequest { envelope, appended })
@@ -689,7 +690,7 @@ impl Coordinator {
         envelope: EnvelopeIn,
         label: &SourceTradeId,
         slot: Option<usize>,
-    ) -> Result<EventSeq, Shutdown> {
+    ) -> Result<AppendReceipt, Shutdown> {
         match self.sink.append_durable(duplicate_envelope(&envelope)) {
             Ok(seq) => return Ok(seq),
             Err(error) => {
@@ -1000,7 +1001,10 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
-        assert_eq!(appending.await.unwrap().unwrap(), EventSeq(1));
+        assert_eq!(
+            appending.await.unwrap().unwrap().sequence,
+            pe_core_types::EventSeq(1)
+        );
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(
             trigger_rx.try_recv().unwrap().source_trade_id,

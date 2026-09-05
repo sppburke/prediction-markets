@@ -1,9 +1,8 @@
-use pe_source_core::SourceStatus;
-
 use pe_core_types::{BasisPoints, CollateralAmount};
 
 use crate::{
-    CANARY_MAX_ALLOWANCE, CANARY_MAX_ORDER_DEBIT, CANARY_PER_TRADE_CAP_BPS,
+    CANARY_MAX_ALLOWANCE, CANARY_MAX_ORDER_DEBIT, CANARY_PER_TRADE_CAP_BPS, INTRADAY_STOP_BPS,
+    KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS,
     block::RiskBlock,
     snapshot::{CanaryRiskSnapshot, RiskSnapshot},
 };
@@ -19,41 +18,36 @@ pub enum RiskDecision {
 /// Evaluate whether a proposed trade passes all risk gates.
 ///
 /// Checks are applied in priority order: kill switches first, drawdown stops,
-/// latency, source health, then the per-trade size cap and pure-wallet
+/// latency, then the per-trade size cap and pure-wallet
 /// concentration caps last. (Operator/funder/cluster/anti-gaming gates were
 /// removed in the wallet-isolation purge, #326.)
 pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
     // 1. Absolute kill switch (strategy-wide; manual review required to resume)
-    if s.intraday_pnl_bps.0 <= -1_000 {
+    if s.absolute_pnl_bps.0 <= KILL_SWITCH_DRAWDOWN_BPS {
         return RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown);
     }
 
     // 2. Intraday drawdown stop (-200 bps)
-    if s.intraday_pnl_bps.0 <= -200 {
+    if s.intraday_pnl_bps.0 <= INTRADAY_STOP_BPS {
         return RiskDecision::Blocked(RiskBlock::IntradayDrawdownStop);
     }
 
     // 3. Rolling 7-day drawdown stop (-600 bps)
-    if s.rolling_7d_pnl_bps.0 <= -600 {
+    if s.rolling_7d_pnl_bps.0 <= ROLLING_7D_STOP_BPS {
         return RiskDecision::Blocked(RiskBlock::Rolling7dDrawdownStop);
     }
 
-    // 4. Copy latency kill switch: fire when p95 > 1.5× the 2000 ms budget = 3000 ms
-    if s.copy_latency_p95_ms > 3_000 {
+    // 4. Copy latency kill switch state is derived by its service-owned state machine.
+    if s.copy_latency_kill_switch_active {
         return RiskDecision::Blocked(RiskBlock::CopyLatencyKillSwitch);
     }
 
-    // 5. On-chain source health
-    if s.onchain_source_status != SourceStatus::Healthy {
-        return RiskDecision::Blocked(RiskBlock::OnchainSourceUnhealthy);
-    }
-
-    // 6. Per-trade size cap (defense-in-depth; clamp_contracts_to_cap normally prevents this)
+    // 5. Per-trade size cap (defense-in-depth; clamp_contracts_to_cap normally prevents this)
     if s.proposed_trade_bps.0 > s.per_trade_cap_bps {
         return RiskDecision::Blocked(RiskBlock::PerTradeSizeExceeded);
     }
 
-    // 7. Concentration caps (add proposed trade to existing exposure). Enforced only when the
+    // 6. Concentration caps (add proposed trade to existing exposure). Enforced only when the
     //    snapshot carries caps: `None` = un-enforced by owner decision (#508 Phase A; the
     //    production copy path). Backtest and tests keep `ConcentrationCaps::CANONICAL`.
     if let Some(caps) = s.concentration_caps {
@@ -150,10 +144,8 @@ pub fn evaluate_canary_risk(s: &CanaryRiskSnapshot) -> RiskDecision {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use pe_core_types::BasisPoints;
-    use pe_source_core::SourceStatus;
 
     use super::*;
-    use crate::snapshot::TradingMode;
 
     pub(super) fn clean_snapshot() -> RiskSnapshot {
         RiskSnapshot {
@@ -163,9 +155,8 @@ mod tests {
             total_copy_exposure_bps: BasisPoints(0),
             intraday_pnl_bps: BasisPoints(0),
             rolling_7d_pnl_bps: BasisPoints(0),
-            onchain_source_status: SourceStatus::Healthy,
-            copy_latency_p95_ms: 100,
-            trading_mode: TradingMode::LiveTiny,
+            absolute_pnl_bps: BasisPoints(0),
+            copy_latency_kill_switch_active: false,
             proposed_trade_bps: BasisPoints(10),
             per_trade_cap_bps: 25,
             concentration_caps: Some(crate::ConcentrationCaps::CANONICAL),
@@ -193,7 +184,7 @@ mod tests {
         s.concentration_caps = None;
         assert_eq!(evaluate_risk(&s), RiskDecision::Approved);
         // Drawdown/latency kill switches still fire with non-zero inputs regardless.
-        s.intraday_pnl_bps = BasisPoints(-1_000);
+        s.absolute_pnl_bps = BasisPoints(-1_000);
         assert_eq!(
             evaluate_risk(&s),
             RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
@@ -203,7 +194,7 @@ mod tests {
     #[test]
     fn kill_switch_at_minus_1000() {
         let mut s = clean_snapshot();
-        s.intraday_pnl_bps = BasisPoints(-1_000);
+        s.absolute_pnl_bps = BasisPoints(-1_000);
         assert_eq!(
             evaluate_risk(&s),
             RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
@@ -213,12 +204,8 @@ mod tests {
     #[test]
     fn kill_switch_at_minus_999_is_not_kill_switch() {
         let mut s = clean_snapshot();
-        s.intraday_pnl_bps = BasisPoints(-999);
-        // Should hit IntradayDrawdownStop instead
-        assert_eq!(
-            evaluate_risk(&s),
-            RiskDecision::Blocked(RiskBlock::IntradayDrawdownStop)
-        );
+        s.absolute_pnl_bps = BasisPoints(-999);
+        assert_eq!(evaluate_risk(&s), RiskDecision::Approved);
     }
 
     #[test]
@@ -256,9 +243,9 @@ mod tests {
     }
 
     #[test]
-    fn copy_latency_kill_switch_at_3001_ms() {
+    fn active_copy_latency_kill_switch_blocks() {
         let mut s = clean_snapshot();
-        s.copy_latency_p95_ms = 3_001;
+        s.copy_latency_kill_switch_active = true;
         assert_eq!(
             evaluate_risk(&s),
             RiskDecision::Blocked(RiskBlock::CopyLatencyKillSwitch)
@@ -266,9 +253,8 @@ mod tests {
     }
 
     #[test]
-    fn copy_latency_at_3000_ms_is_approved() {
-        let mut s = clean_snapshot();
-        s.copy_latency_p95_ms = 3_000;
+    fn inactive_copy_latency_kill_switch_is_approved() {
+        let s = clean_snapshot();
         assert_eq!(evaluate_risk(&s), RiskDecision::Approved);
     }
 }
@@ -287,10 +273,10 @@ mod proptests {
     proptest! {
         #[test]
         fn kill_switch_always_fires_at_minus_1000_bps(
-            intraday_pnl in -10_000_i32..=-1_000_i32
+            absolute_pnl in -10_000_i32..=-1_000_i32
         ) {
             let mut s = clean_snapshot();
-            s.intraday_pnl_bps = BasisPoints(intraday_pnl);
+            s.absolute_pnl_bps = BasisPoints(absolute_pnl);
             let decision = evaluate_risk(&s);
             prop_assert_eq!(decision, RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown));
         }

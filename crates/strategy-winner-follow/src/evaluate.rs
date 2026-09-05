@@ -307,7 +307,6 @@ impl WinnerFollowStrategy {
         }
 
         // 6. Risk gate. Exposure bps on `notional_price` (the real per-share cost).
-        snapshot.trading_mode = trading_mode;
         snapshot.proposed_trade_bps = proposed_trade_bps(clamped, notional_price.0, bankroll);
         snapshot.per_trade_cap_bps = cap_bps;
 

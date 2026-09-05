@@ -586,7 +586,7 @@ fn append_legacy_input_and_select_roll_forward(
             })
             .context("append and synchronize captured legacy history")?;
         ensure!(
-            appended == sequence,
+            appended.sequence == sequence,
             "legacy-history migration append used an unexpected sequence"
         );
         drop(sink);

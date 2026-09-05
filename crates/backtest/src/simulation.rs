@@ -18,9 +18,7 @@ use pe_core_types::{
     ReconstructionQuality, ShareAmount, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_risk_engine::clamp_contracts_to_liquidity;
-use pe_risk_engine::snapshot::TradingMode;
 use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
-use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::ledger::TraderLedger;
 use pe_trader_index::snapshot::RawTrade;
@@ -1401,9 +1399,8 @@ fn build_risk_snapshot(ctx: &RiskContext<'_>) -> RiskSnapshot {
         total_copy_exposure_bps: BasisPoints(ctx.exposure.total),
         intraday_pnl_bps: BasisPoints(ctx.intraday_bps),
         rolling_7d_pnl_bps: BasisPoints(ctx.rolling_7d_bps),
-        onchain_source_status: SourceStatus::Healthy,
-        copy_latency_p95_ms: 0,
-        trading_mode: TradingMode::LiveTiny,
+        absolute_pnl_bps: BasisPoints(0),
+        copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(ctx.proposed_bps),
         per_trade_cap_bps: 0, // evaluate() overwrites with resolved cap from WinnerFollowConfig
         // Backtest keeps concentration enforcement at the docs/19 canonical ladder (#508).

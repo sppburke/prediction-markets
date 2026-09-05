@@ -31,8 +31,7 @@ use pe_core_types::{
     ProbabilityPpm, ShareAmount, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
     VenueMarketId, WalletAddress,
 };
-use pe_risk_engine::{ConcentrationCaps, RiskSnapshot, TradingMode};
-use pe_source_core::SourceStatus;
+use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
 use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rayon::prelude::*;
@@ -171,9 +170,8 @@ fn clean_risk_snapshot() -> RiskSnapshot {
         total_copy_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        onchain_source_status: SourceStatus::Healthy,
-        copy_latency_p95_ms: 500,
-        trading_mode: TradingMode::LiveTiny,
+        absolute_pnl_bps: BasisPoints(0),
+        copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(0),
         per_trade_cap_bps: 25,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
