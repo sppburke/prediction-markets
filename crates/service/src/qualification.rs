@@ -17,10 +17,13 @@ use pe_event_log::{
 };
 use pe_execution_core::EconomicPrepared;
 use pe_paper_state::{DecisionPendingState, PaperStateDb};
-use pe_risk_engine::{KILL_SWITCH_DRAWDOWN_BPS, RiskDecision, evaluate_risk};
+use pe_risk_engine::{
+    BinaryPayout, KILL_SWITCH_DRAWDOWN_BPS, RiskDecision, aggregate_resolution_credit,
+    evaluate_risk,
+};
+use pe_source_polymarket_public::BinaryPayoutVector;
 use pe_trader_index::score::lcb_5pct_decimal;
 use pe_venue_polymarket::taker_fee;
-use rust_decimal::prelude::ToPrimitive as _;
 use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -1011,46 +1014,33 @@ fn resolution_credit(
     condition_id: &str,
     payout_json: &str,
 ) -> Result<CollateralAmount, QualificationError> {
-    let payouts: Vec<Decimal> = serde_json::from_str(payout_json).map_err(|error| {
+    let payouts = BinaryPayoutVector::from_canonical_json(payout_json).map_err(|error| {
         QualificationError::InsufficientEvidence(format!("resolution payout decode: {error}"))
     })?;
-    let mut by_outcome = BTreeMap::<u8, u64>::new();
+    let decimals = payouts.decimals();
+    let payout = BinaryPayout::new(decimals[0], decimals[1]).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!("resolution payout vector: {error}"))
+    })?;
+    let mut by_outcome = BTreeMap::<u16, ShareAmount>::new();
     for position in positions
         .iter()
         .filter(|position| position.condition_id == condition_id)
     {
-        let entry = by_outcome.entry(position.outcome_index).or_default();
-        *entry = entry.checked_add(position.shares_atomic).ok_or_else(|| {
-            QualificationError::InsufficientEvidence("resolution quantity overflow".to_owned())
-        })?;
-    }
-    let mut credit_atomic = 0u64;
-    for (outcome_index, shares_atomic) in by_outcome {
-        let payout = payouts
-            .get(usize::from(outcome_index))
-            .copied()
-            .ok_or_else(|| {
-                QualificationError::InsufficientEvidence(
-                    "resolution payout omits an open outcome".to_owned(),
-                )
+        let outcome = u16::from(position.outcome_index);
+        let entry = by_outcome.entry(outcome).or_insert(ShareAmount::ZERO);
+        *entry = entry
+            .checked_add(ShareAmount::from_atomic(position.shares_atomic))
+            .map_err(|_| {
+                QualificationError::InsufficientEvidence("resolution quantity overflow".to_owned())
             })?;
-        if payout < Decimal::ZERO || payout > Decimal::ONE {
-            return insufficient("resolution payout is outside [0,1]");
-        }
-        let outcome_credit = Decimal::from(shares_atomic)
-            .checked_mul(payout)
-            .map(|value| value.floor())
-            .and_then(|value| value.to_u64())
-            .ok_or_else(|| {
-                QualificationError::InsufficientEvidence(
-                    "resolution credit arithmetic overflow".to_owned(),
-                )
-            })?;
-        credit_atomic = credit_atomic.checked_add(outcome_credit).ok_or_else(|| {
-            QualificationError::InsufficientEvidence("resolution credit overflow".to_owned())
-        })?;
     }
-    Ok(CollateralAmount::from_atomic(credit_atomic))
+    aggregate_resolution_credit(&by_outcome.into_iter().collect::<Vec<_>>(), &payout).map_err(
+        |error| {
+            QualificationError::InsufficientEvidence(format!(
+                "resolution credit arithmetic: {error}"
+            ))
+        },
+    )
 }
 
 fn verify_mark(
@@ -1486,15 +1476,7 @@ fn start_financial_era(manifest: &FinancialEraManifest) -> Result<String, Qualif
     if !state.open_decision_pending()?.is_empty() {
         return insufficient("financial-era start found an open decision");
     }
-    if state.fills_count()? != 0
-        || state.settled_count()? != 0
-        || !state.list_fill_snapshots()?.is_empty()
-    {
-        return insufficient(
-            "local financial tables are nonempty; integration requires the schema-v3 atomic reset owner",
-        );
-    }
-    state.replace_authoritative_state(manifest.fresh_bankroll.to_decimal(), &[])?;
+    state.reset_financial_era(preparation.expected_receipt, manifest.fresh_bankroll)?;
     let expected = LogTailBinding {
         path: current.path,
         physical_tail: current.physical_tail,

@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::health::SharedHealth;
 use crate::runtime_config::{
-    AppliedWatchlistCapacity, ConfigRow, LiveRuntimeConfig, RuntimeConfigStatus,
+    AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RuntimeConfigStatus,
     WatchlistCapacityEpoch, parse_config,
 };
 use crate::supabase_reader::{SupabaseError, auth_token};
@@ -280,6 +280,7 @@ pub async fn poll_once<F: ConfigFetcher>(
     fetcher: &F,
     capacity_requests: &CapacityRequestHandle,
     clob_creds_present: bool,
+    era: ConfigEra,
 ) {
     let rows =
         match fetch_with_timeout(fetcher, Duration::from_secs(CONFIG_FETCH_TIMEOUT_SECS)).await {
@@ -302,7 +303,12 @@ pub async fn poll_once<F: ConfigFetcher>(
         warn!(?warning, "risk halt release row ignored");
     }
     let applied = live.snapshot();
-    let parsed = match parse_config(&partitioned.economic_rows, &applied, clob_creds_present) {
+    let parsed = match parse_config(
+        &partitioned.economic_rows,
+        &applied,
+        clob_creds_present,
+        era,
+    ) {
         Ok(parsed) => parsed,
         Err(error) => {
             warn!(%error, "service_config snapshot rejected; keeping whole last-good config");
@@ -412,6 +418,7 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     mut capacity_results: mpsc::Receiver<CapacityApplyResult>,
     interval_secs: u64,
     clob_creds_present: bool,
+    era: ConfigEra,
     health: Option<SharedHealth>,
 ) -> Result<(), ConfigPollError> {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
@@ -422,7 +429,14 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                poll_once(&live, &status, &fetcher, &capacity_requests, clob_creds_present).await;
+                poll_once(
+                    &live,
+                    &status,
+                    &fetcher,
+                    &capacity_requests,
+                    clob_creds_present,
+                    era,
+                ).await;
                 publish_generation_health(health.as_ref(), &capacity_requests, &applied_capacity);
             }
             result = capacity_results.recv() => {
@@ -571,8 +585,20 @@ mod tests {
                 .iter()
                 .all(|row| row.key != RISK_HALT_RELEASE_HASH_KEY)
         );
-        let without = parse_config(&rows[..rows.len() - 1], &boot(), false).unwrap();
-        let partitioned_config = parse_config(&partitioned.economic_rows, &boot(), false).unwrap();
+        let without = parse_config(
+            &rows[..rows.len() - 1],
+            &boot(),
+            false,
+            ConfigEra::Financial15,
+        )
+        .unwrap();
+        let partitioned_config = parse_config(
+            &partitioned.economic_rows,
+            &boot(),
+            false,
+            ConfigEra::Financial15,
+        )
+        .unwrap();
         assert_eq!(
             without.canonical_hash(),
             partitioned_config.canonical_hash()
@@ -619,7 +645,15 @@ mod tests {
             let partitioned = partition_risk_halt_release_hash(&rows);
             assert_eq!(partitioned.warning, expected_warning);
             assert!(partitioned.risk_halt_release_hash.is_none());
-            assert!(parse_config(&partitioned.economic_rows, &boot(), false).is_ok());
+            assert!(
+                parse_config(
+                    &partitioned.economic_rows,
+                    &boot(),
+                    false,
+                    ConfigEra::Financial15,
+                )
+                .is_ok()
+            );
         }
     }
 
@@ -640,6 +674,7 @@ mod tests {
             &OkFetcher(rows_with("max_fill_price", "0.50")),
             &requests,
             false,
+            ConfigEra::Financial15,
         )
         .await;
         assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
@@ -652,7 +687,15 @@ mod tests {
         let status = RuntimeConfigStatus::new(&live.snapshot());
         let (requests, _rx) = request_channel(100);
         let before = live.snapshot().max_fill_price;
-        poll_once(&live, &status, &ErrFetcher, &requests, false).await;
+        poll_once(
+            &live,
+            &status,
+            &ErrFetcher,
+            &requests,
+            false,
+            ConfigEra::Financial15,
+        )
+        .await;
         assert_eq!(live.snapshot().max_fill_price, before);
         assert_eq!(requests.current().target, 100);
     }
@@ -675,6 +718,7 @@ mod tests {
             }),
             &requests,
             false,
+            ConfigEra::Financial15,
         )
         .await;
         let snapshot = live.snapshot();
@@ -695,6 +739,7 @@ mod tests {
             &OkFetcher(rows_with("active_watchlist_size", "150")),
             &requests,
             false,
+            ConfigEra::Financial15,
         )
         .await;
         poll_once(
@@ -703,6 +748,7 @@ mod tests {
             &OkFetcher(rows_with("active_watchlist_size", "invalid")),
             &requests,
             false,
+            ConfigEra::Financial15,
         )
         .await;
         assert_eq!(requests.current().target, 150);
@@ -757,6 +803,7 @@ mod tests {
                 result_rx,
                 3_600,
                 false,
+                ConfigEra::Financial15,
                 None,
             )
             .await,
@@ -874,6 +921,7 @@ mod tests {
             results_rx,
             3_600,
             false,
+            ConfigEra::Financial15,
             None,
         ));
 

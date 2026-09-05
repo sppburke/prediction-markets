@@ -55,7 +55,6 @@ use pe_core_types::{
     VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
-use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
@@ -69,7 +68,6 @@ use pe_service::live_accounts::{
     AccountRow, CredentialMetaRow, LiveAccounts, LiveAccountsSnapshot,
 };
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
 use pe_service::paper_recovery::build_leader_ledger;
@@ -80,7 +78,7 @@ use pe_source_polymarket_public::{
     ActivityWsPeer, FixtureFetcher, parse_activity_frame, parse_activity_trade_observation,
 };
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -191,10 +189,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-fn make_dispatcher(dir: &Path) -> ExecutionDispatcher {
-    let paper_writer = Writer::open(dir.join("paper.log")).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    ExecutionDispatcher::paper_only(paper_executor)
+fn make_writer(dir: &Path) -> Writer {
+    Writer::open(dir.join("paper.log")).unwrap()
 }
 
 fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
@@ -356,20 +352,16 @@ fn build_orchestrator(
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: pe_service::runtime_config::FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: opts.live_accounts,
         },
         WinnerFollowStrategy::new(flat_fill_config()),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state,
         leader_ledger,
         health,
-        MarketEndCache::new(String::new()),
         mid_price_cache,
         dead_reseed_rx(),
         None,
@@ -1840,6 +1832,8 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         applied_configuration_hash: applied_configuration.canonical_hash(),
         applied_configuration,
         decision_inputs: serde_json::json!({"source_window":"complete"}),
+        observed_source_receipt: None,
+        page_occurrences: Vec::new(),
     };
     paper_state
         .commit_activity_bucket(&ActivityBucketCommit {

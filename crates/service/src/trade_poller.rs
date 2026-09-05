@@ -7,7 +7,7 @@
 //! A websocket observation remains an obligation, derived from the source log
 //! on restart, until its group has a durable terminal/apply record.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -47,6 +47,7 @@ use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome, anchor
 
 /// Source id stamped on every fixed-end activity page before it is parsed.
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
+pub const DAILY_BOUNDARY_SOURCE_ID: &str = "pe-service.boundary";
 /// Best-effort cadence for refreshing venue-authoritative position anchors.
 pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -114,6 +115,7 @@ struct BucketIdentities {
 pub struct ReconciliationObligations {
     by_wallet: HashMap<WalletAddress, BTreeMap<i64, BTreeMap<String, Obligation>>>,
     boundary: Option<PendingBoundary>,
+    last_boundary_cutoff: Option<i64>,
 }
 
 /// The sole source-ordered daily boundary waiting for qualifying activity acknowledgements.
@@ -170,6 +172,15 @@ impl ReconciliationObligations {
         }
         self.boundary = Some(boundary);
         true
+    }
+
+    pub fn set_boundary_anchor(&mut self, cutoff_unix: i64) {
+        self.last_boundary_cutoff = Some(cutoff_unix);
+    }
+
+    #[must_use]
+    pub fn boundary_anchor(&self) -> Option<i64> {
+        self.last_boundary_cutoff
     }
 
     /// The oldest pending boundary, if any.
@@ -295,6 +306,83 @@ pub enum ObligationRebuildError {
     Activity(#[from] pe_source_polymarket_public::ActivityParseError),
     #[error("paper-state: {0}")]
     PaperState(#[from] pe_paper_state::PaperStateError),
+    #[error("paper-log boundary replay: {0}")]
+    PaperLog(String),
+    #[error("invalid daily-boundary source frame: {0}")]
+    Boundary(String),
+}
+
+/// Recover the oldest unacknowledged source boundary and the Start/latest-mark anchor.
+pub fn recover_daily_boundary(
+    source_log_path: &Path,
+    paper_log_path: &Path,
+    obligations: &mut ReconciliationObligations,
+) -> Result<(), ObligationRebuildError> {
+    let frames = crate::paper_recovery::scan_paper_log(paper_log_path)
+        .map_err(|error| ObligationRebuildError::PaperLog(error.to_string()))?;
+    let era = crate::paper_recovery::paper_era(frames);
+    let Some((_, start)) = era.start.as_ref() else {
+        return Ok(());
+    };
+    let start_unix = era
+        .frames
+        .iter()
+        .find_map(|frame| match &frame.frame {
+            crate::paper_recovery::PaperLogFrame::Record(
+                crate::paper_recovery::PaperLogRecord::QualificationStarted(candidate),
+            ) if candidate.as_ref() == start => {
+                Some(frame.envelope.received_at.0.unix_timestamp())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| ObligationRebuildError::Boundary("Start envelope is absent".to_owned()))?;
+    let anchor = era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            crate::paper_recovery::PaperLogFrame::Record(
+                crate::paper_recovery::PaperLogRecord::PortfolioMark(mark),
+            ) => Some(mark.cutoff_unix),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(start_unix);
+    obligations.set_boundary_anchor(anchor);
+
+    let mut recovered = Vec::new();
+    for item in Reader::replay(source_log_path)? {
+        let (_sequence, envelope) = item?;
+        if envelope.source_id.0 != DAILY_BOUNDARY_SOURCE_ID {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_slice(&envelope.payload)
+            .map_err(|error| ObligationRebuildError::Boundary(error.to_string()))?;
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("daily_boundary") {
+            return Err(ObligationRebuildError::Boundary(
+                "boundary source id carries an unexpected kind".to_owned(),
+            ));
+        }
+        let cutoff_unix = value
+            .get("cutoff_unix")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                ObligationRebuildError::Boundary("boundary cutoff is absent".to_owned())
+            })?;
+        if cutoff_unix > anchor {
+            recovered.push(PendingBoundary {
+                cutoff_unix,
+                receipt: AppendReceipt {
+                    sequence: envelope.seq,
+                    this_hash: envelope.this_hash,
+                },
+            });
+        }
+    }
+    recovered.sort_by_key(|boundary| (boundary.cutoff_unix, boundary.receipt.sequence));
+    if let Some(boundary) = recovered.first().copied() {
+        obligations.install_boundary(boundary);
+    }
+    Ok(())
 }
 
 /// Rebuild unresolved websocket obligations before any producer starts.
@@ -352,8 +440,6 @@ enum ReconciliationError {
     Json(#[from] serde_json::Error),
     #[error("activity page receipts do not match the complete read")]
     PageReceiptMismatch,
-    #[error("source receive time is outside the supported millisecond range")]
-    ReceiveTimeRange,
 }
 
 impl ReconciliationError {
@@ -402,6 +488,8 @@ pub enum TradePollerOwnerError {
     ZeroPollInterval,
     #[error("position anchor refresh failed: {0}")]
     AnchorRefresh(String),
+    #[error("daily boundary owner failed: {0}")]
+    DailyBoundary(String),
 }
 
 impl TradePoller {
@@ -497,6 +585,7 @@ impl TradePoller {
     }
 
     async fn poll_round(&mut self) -> Result<(), TradePollerOwnerError> {
+        self.install_next_boundary().await?;
         let snapshot = self.live_watchlist.snapshot();
         let mut live_wallets: Vec<WalletAddress> =
             snapshot.entries.iter().map(|entry| entry.wallet).collect();
@@ -539,6 +628,87 @@ impl TradePoller {
             }
         }
         self.refresh_one_wallet(&live_wallets).await?;
+        self.publish_ready_boundary().await?;
+        Ok(())
+    }
+
+    async fn install_next_boundary(&mut self) -> Result<(), TradePollerOwnerError> {
+        if self.obligations.pending_boundary().is_some() {
+            return Ok(());
+        }
+        let Some(anchor) = self.obligations.boundary_anchor() else {
+            return Ok(());
+        };
+        let Some(cutoff_unix) = completed_midnight_cutoffs_after(
+            anchor,
+            (self.now)().unix_timestamp(),
+        )
+        .map_err(|error| TradePollerOwnerError::DailyBoundary(error.to_string()))?
+        .into_iter()
+        .next()
+        else {
+            return Ok(());
+        };
+        let now = (self.now)();
+        let receipt = self
+            .source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(DAILY_BOUNDARY_SOURCE_ID.to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&serde_json::json!({
+                    "kind": "daily_boundary",
+                    "cutoff_unix": cutoff_unix,
+                }))
+                .map_err(|error| TradePollerOwnerError::DailyBoundary(error.to_string()))?,
+            })
+            .await
+            .map_err(|error| TradePollerOwnerError::DailyBoundary(error.to_string()))?;
+        self.obligations.install_boundary(PendingBoundary {
+            cutoff_unix,
+            receipt,
+        });
+        Ok(())
+    }
+
+    async fn publish_ready_boundary(&mut self) -> Result<(), TradePollerOwnerError> {
+        let Some(boundary) = self.obligations.take_ready_boundary() else {
+            return Ok(());
+        };
+        let (acknowledged, received) = oneshot::channel();
+        if self
+            .control_tx
+            .send(OrchestratorControl::DailyBoundary {
+                cutoff_unix: boundary.cutoff_unix,
+                boundary_receipt: boundary.receipt,
+                acknowledged,
+            })
+            .await
+            .is_err()
+        {
+            self.obligations.install_boundary(boundary);
+            return Err(TradePollerOwnerError::DailyBoundary(
+                "orchestrator control channel closed".to_owned(),
+            ));
+        }
+        match received.await {
+            Ok(Ok(())) => self
+                .obligations
+                .set_boundary_anchor(boundary.cutoff_unix),
+            Ok(Err(error)) => {
+                self.obligations.install_boundary(boundary);
+                return Err(TradePollerOwnerError::DailyBoundary(error));
+            }
+            Err(_) => {
+                self.obligations.install_boundary(boundary);
+                return Err(TradePollerOwnerError::DailyBoundary(
+                    "daily boundary acknowledgement closed".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -629,8 +799,7 @@ impl TradePoller {
             }
             Err(error) => return Err(error.into()),
         };
-        let (page_occurrences, mut receipt_received_at_unix_ms) =
-            recording.join_occurrences(&activity.pages)?;
+        let page_occurrences = recording.join_occurrences(&activity.pages)?;
         let buckets = activity.buckets()?;
         if let Some(latest_activity) = buckets
             .iter()
@@ -678,7 +847,6 @@ impl TradePoller {
                 copy_eligible,
                 &activity.pages,
                 &page_occurrences,
-                &mut receipt_received_at_unix_ms,
                 &bucket,
                 identities,
             )?;
@@ -707,24 +875,21 @@ impl TradePoller {
         copy_eligible: bool,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
         page_occurrences: &[PageOccurrence],
-        receipt_received_at_unix_ms: &mut BTreeMap<String, i64>,
         bucket: &[ActivityAggregate],
         identities: BucketIdentities,
     ) -> Result<BucketDecisionContext, ReconciliationError> {
         let now = (self.now)();
         let mut observation_provenance = HashMap::new();
         let mut no_copy_dispositions = HashMap::new();
-        let mut observed_source_receipts = BTreeMap::<String, AppendReceipt>::new();
+        let mut observed_source_receipts = HashMap::<SourceTradeId, AppendReceipt>::new();
         for aggregate in bucket {
             let group = aggregate.group_id.key().clone();
             let observation = self.obligations.observation(&wallet, source_epoch, &group);
             let provenance = observation
                 .map(|_| TradeProvenance::ActivityWs)
                 .unwrap_or(TradeProvenance::RestPoll);
-            if let Some((receipt, received_at)) = observation {
-                observed_source_receipts.insert(group.0.clone(), receipt);
-                receipt_received_at_unix_ms
-                    .insert(receipt.sequence.0.to_string(), unix_millis(received_at)?);
+            if let Some((receipt, _received_at)) = observation {
+                observed_source_receipts.insert(group.clone(), receipt);
             }
             observation_provenance.insert(group.clone(), provenance);
             if aggregate.group_id.components().activity_type == ActivityType::Trade
@@ -759,10 +924,9 @@ impl TradePoller {
             decision_inputs_json: serde_json::to_string(&serde_json::json!({
                 "fixed_end": fixed_end,
                 "pages": pages,
-                "page_occurrences": page_occurrences,
-                "observed_source_receipts": observed_source_receipts,
-                "receipt_received_at_unix_ms": receipt_received_at_unix_ms,
             }))?,
+            page_occurrences: page_occurrences.to_vec(),
+            observed_source_receipts,
             reconstruction_quality,
             signal_config: self.signal_config.clone(),
             copy_eligible,
@@ -915,45 +1079,53 @@ struct RecordingFetcher {
     occurrences: Arc<Mutex<Vec<RecordedPageOccurrence>>>,
 }
 
-struct RecordedPageOccurrence {
-    page: PageOccurrence,
-    received_at_unix_ms: i64,
-}
+struct RecordedPageOccurrence(PageOccurrence);
 
-fn unix_millis(value: OffsetDateTime) -> Result<i64, ReconciliationError> {
-    i64::try_from(value.unix_timestamp_nanos().div_euclid(1_000_000))
-        .map_err(|_| ReconciliationError::ReceiveTimeRange)
+fn join_recorded_occurrences(
+    occurrences: &[RecordedPageOccurrence],
+    pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
+) -> Result<Vec<PageOccurrence>, ReconciliationError> {
+    if occurrences.len() != pages.len() {
+        return Err(ReconciliationError::PageReceiptMismatch);
+    }
+    let mut receipt_queues = BTreeMap::<(String, String), VecDeque<usize>>::new();
+    for (index, occurrence) in occurrences.iter().enumerate() {
+        receipt_queues
+            .entry((
+                occurrence.0.request_url.clone(),
+                occurrence.0.raw_hash.clone(),
+            ))
+            .or_default()
+            .push_back(index);
+    }
+    for evidence in pages {
+        let key = (evidence.request_url.clone(), evidence.raw_page_hash.clone());
+        let Some(queue) = receipt_queues.get_mut(&key) else {
+            return Err(ReconciliationError::PageReceiptMismatch);
+        };
+        if queue.pop_front().is_none() {
+            return Err(ReconciliationError::PageReceiptMismatch);
+        }
+    }
+    if receipt_queues.values().any(|queue| !queue.is_empty()) {
+        return Err(ReconciliationError::PageReceiptMismatch);
+    }
+    Ok(occurrences
+        .iter()
+        .map(|occurrence| occurrence.0.clone())
+        .collect())
 }
 
 impl RecordingFetcher {
     fn join_occurrences(
         &self,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
-    ) -> Result<(Vec<PageOccurrence>, BTreeMap<String, i64>), ReconciliationError> {
+    ) -> Result<Vec<PageOccurrence>, ReconciliationError> {
         let occurrences = self
             .occurrences
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if occurrences.len() != pages.len()
-            || occurrences.iter().zip(pages).any(|(occurrence, evidence)| {
-                occurrence.page.request_url != evidence.request_url
-                    || occurrence.page.raw_hash != evidence.raw_page_hash
-            })
-        {
-            return Err(ReconciliationError::PageReceiptMismatch);
-        }
-        let mut times = BTreeMap::new();
-        let pages = occurrences
-            .iter()
-            .map(|occurrence| {
-                times.insert(
-                    occurrence.page.receipt.sequence.0.to_string(),
-                    occurrence.received_at_unix_ms,
-                );
-                occurrence.page.clone()
-            })
-            .collect();
-        Ok((pages, times))
+        join_recorded_occurrences(&occurrences, pages)
     }
 }
 
@@ -982,23 +1154,14 @@ impl ReconciliationFetcher for RecordingFetcher {
                     }
                 },
             )?;
-            let received_at_unix_ms = i64::try_from(
-                received_at.unix_timestamp_nanos().div_euclid(1_000_000),
-            )
-            .map_err(|_| SourceError::Fatal {
-                message: "source receive time exceeds i64 milliseconds".to_owned(),
-            })?;
             self.occurrences
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(RecordedPageOccurrence {
-                    page: PageOccurrence {
-                        request_url: url.to_owned(),
-                        raw_hash: blake3::hash(&payload).to_hex().to_string(),
-                        receipt,
-                    },
-                    received_at_unix_ms,
-                });
+                .push(RecordedPageOccurrence(PageOccurrence {
+                    request_url: url.to_owned(),
+                    raw_hash: blake3::hash(&payload).to_hex().to_string(),
+                    receipt,
+                }));
             Ok(payload)
         })
     }
@@ -1008,6 +1171,68 @@ impl ReconciliationFetcher for RecordingFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn recorded(sequence: u64, url: &str, hash: &str) -> RecordedPageOccurrence {
+        RecordedPageOccurrence(PageOccurrence {
+            request_url: url.to_owned(),
+            raw_hash: hash.to_owned(),
+            receipt: AppendReceipt {
+                sequence: pe_core_types::EventSeq(sequence),
+                this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap_or(0); 32]),
+            },
+        })
+    }
+
+    fn evidence(
+        url: &str,
+        hash: &str,
+        end: i64,
+    ) -> pe_source_polymarket_public::ReconciliationPageEvidence {
+        pe_source_polymarket_public::ReconciliationPageEvidence {
+            request_url: url.to_owned(),
+            bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                start: Some(end - 1),
+                end,
+            }),
+            partition: None,
+            offset: 0,
+            row_count: 0,
+            canonical_page_hash: format!("canonical-{end}"),
+            raw_page_hash: hash.to_owned(),
+            received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+        }
+    }
+
+    /// PASS: logically sorted saturated pages join by multiplicity while receipt output retains
+    /// acquisition order, including repeated identical request/hash pairs.
+    #[test]
+    fn page_receipts_join_as_a_fifo_multiset() {
+        let acquired = vec![
+            recorded(1, "parent", "p"),
+            recorded(2, "child", "same"),
+            recorded(3, "child", "same"),
+        ];
+        let logical = vec![
+            evidence("child", "same", 1),
+            evidence("child", "same", 2),
+            evidence("parent", "p", 3),
+        ];
+        let joined = join_recorded_occurrences(&acquired, &logical).unwrap();
+        assert_eq!(
+            joined
+                .iter()
+                .map(|page| page.receipt.sequence.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let missing = vec![evidence("child", "same", 1), evidence("parent", "p", 2)];
+        assert!(matches!(
+            join_recorded_occurrences(&acquired, &missing),
+            Err(ReconciliationError::PageReceiptMismatch)
+        ));
+    }
 
     #[test]
     fn refresh_selection_alternates_due_classes_and_falls_through() {

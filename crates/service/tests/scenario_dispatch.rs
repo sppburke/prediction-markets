@@ -23,12 +23,11 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ProbabilityPpm, ReconstructionQuality,
-    Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, TraderId, VenueId, VenueMarketId,
-    WalletAddress,
+    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ProbabilityPpm, ReceivedAt,
+    ReconstructionQuality, Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, TraderId,
+    VenueId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{Reader, Writer};
-use pe_execution_core::ExecutionDispatcher;
+use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
 use pe_paper_state::{
     DispatchSeedRecord, DispatchTargetSeed, PaperStateDb, WalletHistoryStatusRecord,
 };
@@ -42,14 +41,14 @@ use pe_service::live_accounts::{
     AccountRow, CredentialMetaRow, LiveAccounts, LiveAccountsSnapshot,
 };
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, RuntimeConfig};
+use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
+use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, PaperFill, PerTradeCap, SizingMode, WinnerFollowConfig,
-    WinnerFollowStrategy, build_idempotency_key,
+    ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    build_idempotency_key,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_core::OrderIntent;
@@ -142,10 +141,8 @@ fn mid_cache_for(market: &str, price: &str) -> MidPriceCache<FixtureFetcher> {
     )
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
-    let writer = Writer::open(dir.path().join("paper.log")).unwrap();
-    let executor = PaperExecutor::new(writer, SourceId("test.paper".into()), 500, 100);
-    ExecutionDispatcher::paper_only(executor)
+fn make_writer(dir: &TempDir) -> Writer {
+    Writer::open(dir.path().join("paper.log")).unwrap()
 }
 
 fn open_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
@@ -162,7 +159,7 @@ fn open_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
     state
 }
 
-fn paper_log_fills(dir: &TempDir) -> Vec<PaperFill> {
+fn paper_log_fills(dir: &TempDir) -> Vec<LegacyPaperFill> {
     let path = dir.path().join("paper.log");
     if !path.exists() {
         return Vec::new();
@@ -185,7 +182,6 @@ fn base_snapshot() -> RuntimeConfig {
     rc.min_resolution_horizon_secs = 0;
     rc.max_fill_price = dec!(0.90);
     rc.min_fill_price = Decimal::ZERO;
-    rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
 
@@ -286,20 +282,16 @@ async fn run_trade(
             min_resolution_horizon_secs: 0,
             max_fill_price: dec!(0.90),
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(runtime)),
             live_accounts: accounts,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state,
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for(&market, mid_price),
         mpsc::channel(1).1,
         None,
@@ -346,7 +338,7 @@ fn normalized_paper_log_bytes(dir: &TempDir) -> Vec<u8> {
     let mut normalized = Vec::new();
     for frame in Reader::replay(path).unwrap() {
         let (seq, envelope) = frame.unwrap();
-        let mut fill: PaperFill = serde_json::from_slice(&envelope.payload).unwrap();
+        let mut fill: LegacyPaperFill = serde_json::from_slice(&envelope.payload).unwrap();
         fill.simulated_at = SourceTimestamp(OffsetDateTime::UNIX_EPOCH);
         normalized.extend(
             serde_json::to_vec(&serde_json::json!({
@@ -626,7 +618,6 @@ async fn scenario_dispatch_shared_band_rejection_creates_no_aggregate() {
     let dispatch_id = dispatch_id_for(&trade);
     let mut runtime = base_snapshot();
     runtime.max_fill_price = dec!(0.50);
-    runtime.fill_mode = FillMode::ClobBestAsk;
     let books = HashMap::from([(format!("{MARKET}-0"), book(&[(dec!(0.60), dec!(100))]))]);
     run_trade(
         &dir,
@@ -700,7 +691,7 @@ async fn scenario_dispatch_zero_live_targets_preserve_phase_a_baseline() {
     println!("PASS: zero live targets preserve the Phase-A one-fill paper baseline");
 }
 
-/// PASS: boot recovery finds a durable `PaperFill` whose idempotency key matches a pending seed
+/// PASS: boot recovery finds a durable `LegacyPaperFill` whose idempotency key matches a pending seed
 /// and flips exactly that seed to `ready/fill`. FAIL: the seed remains pending or is finalized as
 /// a no-fill.
 #[tokio::test]
@@ -712,14 +703,24 @@ async fn scenario_dispatch_boot_resume_flips_seed_from_durable_fill() {
         .stage_dispatch_seed(&staged_seed(dispatch_id, "{}".to_string(), "recover-fill"))
         .unwrap();
     let log_path = dir.path().join("paper.log");
-    let writer = Writer::open(&log_path).unwrap();
-    let mut executor = PaperExecutor::new(writer, SourceId("test.paper".into()), 0, 0);
-    executor
-        .execute(
-            &recovery_intent(dispatch_id),
-            SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
-            None,
-        )
+    let mut writer = Writer::open(&log_path).unwrap();
+    let timestamp = SourceTimestamp(OffsetDateTime::UNIX_EPOCH);
+    let fill = LegacyPaperFill {
+        intent: recovery_intent(dispatch_id),
+        simulated_fill_price: Price::new(dec!(0.50)).unwrap(),
+        simulated_at: timestamp.clone(),
+        fill_source: LegacyFillSource::LeaderHaircut,
+    };
+    writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("test.paper".into()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: timestamp.clone(),
+            received_at: ReceivedAt(timestamp.0),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&fill).unwrap(),
+        })
         .unwrap();
 
     // #511: dispatch recovery is disposition-aware and runs AFTER fill accounting heals

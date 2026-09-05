@@ -29,7 +29,6 @@ use pe_core_types::{
     VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
-use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
@@ -42,18 +41,17 @@ use pe_service::decision_replay::replay_decision_pending;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::orchestrator_control::OrchestratorControl;
-use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, RuntimeConfig};
+use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
+use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
 use pe_source_polymarket_public::{
     ActivityAggregate, ActivityParseContext, ActivityTransport, FixtureFetcher,
     parse_activity_response,
 };
 use pe_strategy_winner_follow::{
-    ExecutionMode, FillSource, PaperExecutor, PaperFill, PerTradeCap, SizingMode,
-    WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -167,6 +165,8 @@ fn install_pending(
         applied_configuration_hash: applied_configuration.canonical_hash(),
         applied_configuration,
         decision_inputs: serde_json::json!({"fixed_end": source_epoch + 10, "pages": 1}),
+        observed_source_receipt: None,
+        page_occurrences: Vec::new(),
     };
     paper_state
         .commit_activity_bucket(&ActivityBucketCommit {
@@ -256,10 +256,8 @@ fn pending_aggregate(market_id: &str, source_epoch: i64) -> ActivityAggregate {
     aggregates.remove(0)
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
-    let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    ExecutionDispatcher::paper_only(paper_executor)
+fn make_writer(dir: &TempDir) -> Writer {
+    Writer::open(dir.path().join("paper.log")).unwrap()
 }
 
 fn paper_fill_count(dir: &TempDir) -> usize {
@@ -280,7 +278,6 @@ fn flat_snapshot(max_fill_price: Decimal) -> RuntimeConfig {
     rc.min_resolution_horizon_secs = 0;
     rc.max_fill_price = max_fill_price;
     // #486: pin the pre-feature haircut basis so these gate scenarios stay on the ×1.05 fill.
-    rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
 
@@ -318,9 +315,6 @@ async fn run_with(
             min_resolution_horizon_secs: 0,
             max_fill_price: boot_max_fill,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig,
@@ -331,11 +325,10 @@ async fn run_with(
             sizing_mode: SizingMode::Dollar { usd: dec!(100) },
             ..WinnerFollowConfig::default()
         }),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for(HEX, mid_price),
         mpsc::channel(1).1,
         None,
@@ -448,20 +441,16 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
             min_resolution_horizon_secs: 0,
             max_fill_price: dec!(0.50),
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(config_b.clone())),
             live_accounts: None,
         },
         WinnerFollowStrategy::new(config_b.winner_follow_config()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         paper_state.clone(),
         leader_ledger,
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for_markets(&[(FROZEN_MARKET, "0.60"), (FRESH_MARKET, "0.60")]),
         mpsc::channel(1).1,
         None,
@@ -582,20 +571,16 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
             min_resolution_horizon_secs: 0,
             max_fill_price: dec!(0.90),
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(live_config),
             live_accounts: None,
         },
         WinnerFollowStrategy::new(config_b.winner_follow_config()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for_markets(&[(FROZEN_MARKET, "0.60"), (FRESH_MARKET, "0.60")]),
         control_rx,
         None,
@@ -617,6 +602,8 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
                     "pages": 1,
                 })
                 .to_string(),
+                page_occurrences: Vec::new(),
+                observed_source_receipts: HashMap::new(),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                 signal_config: SignalConfig::default(),
                 copy_eligible: true,
@@ -686,7 +673,6 @@ fn gate_snapshot(cap_bps: i32) -> RuntimeConfig {
     rc.max_fill_price = dec!(0.90);
     // #486: the price-impact scenarios assert the ×1.05 haircut basis (floor(100/(0.50×1.05))=190),
     // so pin leader_haircut — the best-ask basis would reprice the fallback to ×1.01.
-    rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
 
@@ -737,20 +723,16 @@ async fn run_gate_with(
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: rc.price_impact_cap_bps,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(rc)),
             live_accounts: None,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for(GATE_COND, "0.50"),
         mpsc::channel(1).1,
         None,
@@ -822,13 +804,13 @@ async fn price_impact_stale_book_skips_trade() {
 }
 
 /// First recorded paper fill: (contracts, simulated price, provenance) from the event log.
-fn first_paper_fill_full(dir: &TempDir) -> Option<(u64, Decimal, FillSource)> {
+fn first_paper_fill_full(dir: &TempDir) -> Option<(u64, Decimal, LegacyFillSource)> {
     let path = dir.path().join("paper.log");
     if !path.exists() {
         return None;
     }
     let (_seq, env) = Reader::replay(&path).unwrap().next()?.unwrap();
-    let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+    let fill: LegacyPaperFill = serde_json::from_slice(&env.payload).unwrap();
     Some((
         fill.intent.contracts.0,
         fill.simulated_fill_price.0,
@@ -853,7 +835,6 @@ async fn price_impact_ladder_vwap_fill_with_clob_best_ask() {
         ]),
     )]);
     let mut rc = gate_snapshot(100);
-    rc.fill_mode = FillMode::ClobBestAsk; // the production fill mode (#486)
     let (fills, contracts) = run_gate_with(&dir, books, rc).await;
     assert_eq!(fills, 1);
     assert_eq!(
@@ -867,6 +848,6 @@ async fn price_impact_ladder_vwap_fill_with_clob_best_ask() {
         dec!(99.99) / dec!(199),
         "recorded fill == exact ladder VWAP (multi-level, not best-ask)"
     );
-    assert_eq!(source, FillSource::ClobBestAsk);
+    assert_eq!(source, LegacyFillSource::ClobBestAsk);
     println!("PASS: gate-on clob_best_ask fill = 199 contracts at exact ladder VWAP (#508)");
 }

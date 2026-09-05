@@ -3002,6 +3002,78 @@ impl PaperStateDb {
 
     // ── #545 exact financial protocol ──────────────────────────────────────
 
+    /// Atomically begin the financial era with an empty exact paper book.
+    ///
+    /// Only the five financial tables and their replay-version metadata are reset. Source
+    /// decisions, leader state, fences, anchors, dispatch evidence, and every append-only log
+    /// remain untouched. An equal retry is idempotent only when the reset is already complete;
+    /// a different Start is always a conflict.
+    pub fn reset_financial_era(
+        &self,
+        start: AppendReceipt,
+        starting_bankroll: CollateralAmount,
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if let Some(stored) = tx_financial_start(&tx)? {
+            if stored != start {
+                return Err(PaperStateError::FinancialStartConflict);
+            }
+            let cash = tx_read_bankroll(&tx)?;
+            let empty = tx.query_row(
+                "SELECT (SELECT COUNT(*) FROM fills) + \
+                        (SELECT COUNT(*) FROM positions) + \
+                        (SELECT COUNT(*) FROM settled_markets) + \
+                        (SELECT COUNT(*) FROM fill_market_snapshots)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? == 0;
+            if empty
+                && cash == starting_bankroll.to_decimal()
+                && tx_financial_last_prepared(&tx)?.is_none()
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(PaperStateError::FinancialConflict(
+                "financial-era reset retry differs from stored state".to_owned(),
+            ));
+        }
+
+        tx.execute("DELETE FROM fill_market_snapshots", [])?;
+        tx.execute("DELETE FROM fills", [])?;
+        tx.execute("DELETE FROM positions", [])?;
+        tx.execute("DELETE FROM settled_markets", [])?;
+        tx.execute("DELETE FROM bankroll", [])?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4, ?5)",
+            params![
+                META_LAST_APPLIED_EVENT_SEQ,
+                META_LAST_SUPABASE_APPLIED_EVENT_SEQ,
+                META_FINANCIAL_START_SEQ,
+                META_FINANCIAL_START_HASH,
+                META_FINANCIAL_LAST_PREPARED_SEQ,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2)",
+            params![BANKROLL_ROW_ID, starting_bankroll.to_decimal().to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            params![META_FINANCIAL_START_SEQ, to_i64(start.sequence.0)?],
+        )?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            params![
+                META_FINANCIAL_START_HASH,
+                start.this_hash.to_hex().to_string()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Install the one QualificationStarted receipt in local metadata. An equal retry is
     /// idempotent; a later distinct Start is a conflict and can never reset the book.
     pub fn seed_financial_start(&self, start: AppendReceipt) -> Result<(), PaperStateError> {
@@ -3607,8 +3679,8 @@ impl PaperStateDb {
     /// Legacy-mode settle (#511): compute the credit **inside** the settle transaction
     /// from freshly-read positions, closing the read-then-settle TOCTOU (a fill
     /// committing between an outside read and the settle could never be credited).
-    /// `credit_fn` is pure (e.g. `PnlLedger::resolution_credit`); it sees the market's
-    /// positions as of this transaction. Returns `(credit_applied, bankroll)`;
+    /// `credit_fn` is pure; it sees the market's positions as of this transaction.
+    /// Returns `(credit_applied, bankroll)`;
     /// `(0, bankroll)` when the market was already settled.
     pub fn settle_and_credit_from_positions<F>(
         &self,
@@ -3618,7 +3690,7 @@ impl PaperStateDb {
         credit_fn: F,
     ) -> Result<(Decimal, Decimal), PaperStateError>
     where
-        F: FnOnce(&[PaperPositionRow]) -> Decimal,
+        F: FnOnce(&[PaperPositionRow]) -> Result<Decimal, PaperStateError>,
     {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -3628,7 +3700,7 @@ impl PaperStateDb {
             return Ok((Decimal::ZERO, bankroll));
         }
         let positions = tx_positions_for_market(&tx, market_id)?;
-        let credit = credit_fn(&positions);
+        let credit = credit_fn(&positions)?;
         tx.execute(
             "INSERT INTO settled_markets \
                 (market_id, outcome_prices, credit_applied, settled_at_unix) \
@@ -6540,6 +6612,56 @@ mod tests {
         ));
         assert!(matches!(
             db.seed_financial_start(append_receipt(3, 3)),
+            Err(PaperStateError::FinancialStartConflict)
+        ));
+    }
+
+    #[test]
+    fn financial_era_reset_is_atomic_idempotent_and_preserves_nonfinancial_state() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(25)).unwrap();
+        let wallet = wallet();
+        db.set_cursor(&wallet, 77).unwrap();
+        db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet,
+            complete: true,
+            proof_json: "{\"proof\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+        let legacy = FillRecord {
+            idempotency_key: "legacy".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            contracts: 2,
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+        };
+        db.commit_fill(
+            &SourceTradeId("legacy-source".to_owned()),
+            &leader(2, 0),
+            &legacy,
+            EventSeq(4),
+        )
+        .unwrap();
+
+        let start = append_receipt(10, 7);
+        let bankroll = CollateralAmount::from_decimal_exact(dec!(100)).unwrap();
+        db.reset_financial_era(start, bankroll).unwrap();
+        db.reset_financial_era(start, bankroll).unwrap();
+
+        let snapshot = db.financial_snapshot(1_000).unwrap();
+        assert_eq!(snapshot.cash, dec!(100));
+        assert!(snapshot.positions.is_empty());
+        assert!(snapshot.fills_for_open_and_7d.is_empty());
+        assert!(snapshot.settlements_7d.is_empty());
+        assert_eq!(snapshot.start, Some((start.sequence, start.this_hash)));
+        assert_eq!(snapshot.last_prepared_seq, None);
+        assert_eq!(db.cursor(&wallet).unwrap(), Some(77));
+        assert!(db.wallet_history_complete(&wallet).unwrap());
+
+        assert!(matches!(
+            db.reset_financial_era(append_receipt(11, 8), bankroll),
             Err(PaperStateError::FinancialStartConflict)
         ));
     }

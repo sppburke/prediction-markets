@@ -3882,7 +3882,6 @@ dependencies = [
  "blake3",
  "pe-copy-signal-engine",
  "pe-core-types",
- "pe-event-log",
  "pe-kelly-sizer",
  "pe-risk-engine",
  "pe-source-core",
@@ -3892,7 +3891,6 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "time",
 ]

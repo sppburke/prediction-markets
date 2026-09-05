@@ -8,18 +8,15 @@
 
 use std::sync::Arc;
 
-#[cfg(not(test))]
 use pe_core_types::PolymarketConditionId;
 use pe_core_types::WalletAddress;
-#[cfg(not(test))]
 use pe_event_log::AppendReceipt;
-#[cfg(not(test))]
 use pe_risk_engine::RiskHaltCause;
 use pe_source_polymarket_public::ActivityAggregate;
+use pe_trader_index::WatchlistEntry;
 use tokio::sync::oneshot;
 
 use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
-#[cfg(not(test))]
 use crate::paper_recovery::{HaltState, MembershipChange, RiskHaltOwner};
 use crate::position_seeder::AnchorInstall;
 
@@ -61,7 +58,6 @@ pub enum OrchestratorControl {
     },
     /// CLOB resolution evidence was durably appended by the caller. The orchestrator
     /// serializes its Prepared/authority/local/Final financial transition.
-    #[cfg(not(test))]
     ResolutionCandidate {
         condition: PolymarketConditionId,
         payout_by_outcome_index_json: String,
@@ -69,13 +65,12 @@ pub enum OrchestratorControl {
         acknowledged: oneshot::Sender<Result<(), String>>,
     },
     /// Publish one structural membership transition after its paper record synchronizes.
-    #[cfg(not(test))]
     PublishMembership {
         change: MembershipChange,
+        replacements: Vec<WatchlistEntry>,
         acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
     },
     /// Append one risk-cause edge before acknowledging it to the producer.
-    #[cfg(not(test))]
     RiskHaltChange {
         owner: RiskHaltOwner,
         cause: RiskHaltCause,
@@ -84,14 +79,12 @@ pub enum OrchestratorControl {
         acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
     },
     /// Daily mark producer handoff. Lane D owns mark construction semantics.
-    #[cfg(not(test))]
     DailyBoundary {
         cutoff_unix: i64,
         boundary_receipt: AppendReceipt,
         acknowledged: oneshot::Sender<Result<(), String>>,
     },
     /// Qualification seal producer handoff. Lane F owns the verifier semantics.
-    #[cfg(not(test))]
     SealCheck {
         proposed_hash: String,
         acknowledged: oneshot::Sender<Result<(), String>>,

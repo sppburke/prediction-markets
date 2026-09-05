@@ -405,7 +405,6 @@ pub(crate) fn ladder_plan_blake3(plan: &LadderPlan) -> String {
         "best_ask": plan.best_ask.0.normalize().to_string(),
         "limit_price": plan.limit_price.0.normalize().to_string(),
         "shares_atomic": plan.shares.atomic(),
-        "estimated_ladder_spend_atomic": plan.estimated_ladder_spend.atomic(),
         "worst_case_debit_atomic": plan.worst_case_debit.atomic(),
     });
     blake3::hash(body.to_string().as_bytes())
@@ -635,6 +634,8 @@ mod tests {
             applied_configuration_hash: applied_configuration.canonical_hash(),
             applied_configuration,
             decision_inputs: json!({"fixed_end": 1_700_000_010_i64, "pages": 1}),
+            observed_source_receipt: None,
+            page_occurrences: Vec::new(),
         }
     }
 

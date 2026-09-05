@@ -1,9 +1,5 @@
 //! `pe-execution-core` — auditable execution primitives for the prediction-edge system.
 //!
-//! The existing dispatcher continues to route ordinary `OrderIntent` values as before:
-//! - `Shadow` / `Paper` → `PaperExecutor` (from `pe-strategy-winner-follow`)
-//! - `LiveTiny` / `Promoted` → fail closed
-//!
 //! The isolated canary actor remains unchanged. The ordinary-live modules expose a separate
 //! two-phase executor, account-tagged journal, and redemption state machine for service wiring.
 
@@ -11,9 +7,7 @@
 
 pub mod canary;
 pub mod canary_actor;
-pub mod dispatcher;
 pub mod economic;
-pub mod error;
 pub mod live_executor;
 pub mod live_journal;
 pub mod redemption_machine;
@@ -31,12 +25,11 @@ pub use canary_actor::{
     CanaryActor, CanaryActorError, CanaryActorHandle, CanaryReconciler, CanarySubmitter,
     RawReconciliation,
 };
-pub use dispatcher::{DispatchResult, ExecutionDispatcher};
 pub use economic::{
-    BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit, MarketSelection,
-    ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
+    BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicError, EconomicInputs, EconomicPrepared,
+    FeeAudit, MarketSelection, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit,
+    SizingModeAudit,
 };
-pub use error::ExecutionError;
 pub use live_executor::{
     FrozenLiveTarget, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutor,
     LiveExecutorError, LiveModeSnapshot, LiveOrderOutcome, LiveOrderRequest, LiveOrderVenue,

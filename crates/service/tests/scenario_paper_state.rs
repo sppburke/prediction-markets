@@ -25,25 +25,25 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality,
-    Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, VenueMarketId, WalletAddress,
+    BasisPoints, ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, ReceivedAt,
+    ReconstructionQuality, Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId,
+    VenueMarketId, WalletAddress,
 };
-use pe_event_log::{Reader, Writer};
-use pe_execution_core::ExecutionDispatcher;
+use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
-use pe_service::runtime_config::FillMode;
+use pe_service::paper_recovery::{
+    LegacyFillSource, LegacyPaperFill, build_leader_ledger, reconcile_paper_state,
+};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_core::OrderIntent;
@@ -111,10 +111,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
-    let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    ExecutionDispatcher::paper_only(paper_executor)
+fn make_writer(dir: &TempDir) -> Writer {
+    Writer::open(dir.path().join("paper.log")).unwrap()
 }
 
 fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
@@ -206,22 +204,18 @@ async fn run_trades(
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
             // #486: pin the pre-feature haircut basis so this existing assertion stays byte-
             // identical (no /book fetch; leader × 1.05).
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(strategy_cfg),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state,
         leader_ledger,
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_price_cache,
         dead_reseed_rx(),
         None,
@@ -233,7 +227,7 @@ async fn run_trades(
     orch.run(std::future::pending::<()>()).await;
 }
 
-/// Count `PaperFill` frames in the paper event log (each fill is one frame).
+/// Count `LegacyPaperFill` frames in the paper event log (each fill is one frame).
 fn paper_fill_count(dir: &TempDir) -> usize {
     let path = dir.path().join("paper.log");
     if !path.exists() {
@@ -284,7 +278,7 @@ async fn ac1_duplicate_trade_fills_and_ingests_once() {
     )
     .await;
 
-    assert_eq!(paper_fill_count(&dir), 1, "exactly one PaperFill");
+    assert_eq!(paper_fill_count(&dir), 1, "exactly one LegacyPaperFill");
     assert_eq!(
         leader_long(&paper_state),
         whole_shares(100),
@@ -415,14 +409,24 @@ async fn ac5_crash_between_log_and_sqlite_reconciles() {
     // Simulate the crash: a fill is written + synced to the event log, but the
     // paper-state commit never runs (last_applied stays 0).
     {
-        let writer = Writer::open(&log_path).unwrap();
-        let mut executor = PaperExecutor::new(writer, SourceId("test.paper".into()), 0, 0);
-        let (_fill, _seq) = executor
-            .execute(
-                &fill_intent(),
-                SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
-                None,
-            )
+        let mut writer = Writer::open(&log_path).unwrap();
+        let timestamp = SourceTimestamp(OffsetDateTime::UNIX_EPOCH);
+        let fill = LegacyPaperFill {
+            intent: fill_intent(),
+            simulated_fill_price: Price::new(dec!(0.50)).unwrap(),
+            simulated_at: timestamp.clone(),
+            fill_source: LegacyFillSource::LeaderHaircut,
+        };
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("test.paper".into()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: timestamp.clone(),
+                received_at: ReceivedAt(timestamp.0),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&fill).unwrap(),
+            })
             .unwrap();
     }
     assert_eq!(

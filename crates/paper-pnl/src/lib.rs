@@ -5,13 +5,11 @@
 //! - [`valuation`] — Pure [`value_portfolio`]: realized/unrealized split + per-trade marks.
 //! - [`dashboard`] — [`PortfolioSnapshot`] / [`TradeView`] types for the JSON endpoints.
 
-pub mod aggregate;
 pub mod dashboard;
 pub mod pnl;
 pub mod resolution;
 pub mod valuation;
 
-pub use aggregate::{ResolutionMathError, ResolutionPosition, aggregate_resolution_credit};
 pub use dashboard::{PortfolioSnapshot, TradeView};
 pub use pnl::{PnlError, PnlLedger};
 pub use resolution::{ResolutionStore, ResolutionStoreError, SettlementInfo};

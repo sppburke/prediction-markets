@@ -4,23 +4,166 @@
 //! exact `pe-paper-state::FinancialSnapshot` interface lands. These reducers are the independent
 //! log side of that composition and are usable at boot before producers start.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use pe_core_types::{EventSeq, Price};
-use pe_event_log::AppendReceipt;
-use pe_risk_engine::{RiskHaltCause, latency_switch, nearest_rank_p95};
-use pe_source_polymarket_public::ClassifiedPricesHistory;
+use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, RawHttpAttempt, SourceId};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader};
+use pe_paper_state::FinancialSnapshot;
+use pe_risk_engine::{
+    EquityInputs, PnlWindow, RiskHaltCause, RiskMathError, RiskSnapshot, current_equity,
+    latency_switch, nearest_rank_p95, pnl_bps,
+};
+use pe_source_core::SourceError;
+use pe_source_polymarket_public::{
+    ClassifiedPricesHistory, ClobPricesHistoryClient, FixtureFetcher, HttpRequestContext,
+    ReqwestFetcher,
+};
 use pe_strategy_winner_follow::RiskInputsUnavailable;
 use rust_decimal::Decimal;
 
 use crate::paper_recovery::{
     FinancialPayload, FinancialResult, HaltState, PaperEra, PaperLogFrame, PaperLogRecord,
-    RiskHaltOwner,
+    RiskHaltOwner, oldest_unmatched_prepared,
 };
+use crate::activity_ingest::SourceLogHandle;
 
 const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_HISTORICAL_MARK_AGE_SECS: i64 = 120;
+const CLOB_HISTORY_SOURCE_ID: &str = "pe-service.clob-prices-history";
+const CLOB_HISTORY_ENDPOINT_KIND: &str = "clob-prices-history";
+
+/// One shared-client historical mark reader. Every transport-successful attempt is synchronized
+/// into the source log before its bytes/status enter the existing classifier.
+pub struct BoundaryMarkFetcher {
+    base_url: String,
+    fetcher: ReqwestFetcher,
+    source_log: SourceLogHandle,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BoundaryMarkError {
+    #[error("historical mark transport is retryable: {0}")]
+    Retryable(String),
+    #[error("source-log coordinator closed")]
+    SourceLogClosed,
+    #[error("historical mark classification failed: {0}")]
+    Classification(String),
+    #[error("historical mark evidence is invalid: {0}")]
+    Invalid(RiskInputsUnavailable),
+}
+
+impl BoundaryMarkFetcher {
+    #[must_use]
+    pub fn new(
+        client: reqwest::Client,
+        base_url: impl Into<String>,
+        source_log: SourceLogHandle,
+    ) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            fetcher: ReqwestFetcher::new(client).with_min_interval_ms(10),
+            source_log,
+        }
+    }
+
+    pub async fn fetch(
+        &self,
+        token_id: &str,
+        cutoff_unix: i64,
+    ) -> Result<HistoricalMarkPrice, BoundaryMarkError> {
+        let start_unix = cutoff_unix.saturating_sub(MAX_HISTORICAL_MARK_AGE_SECS);
+        let url = format!(
+            "{}/prices-history?market={token_id}&startTs={start_unix}&endTs={cutoff_unix}&fidelity=1",
+            self.base_url
+        );
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&attempts);
+        let fetched = self
+            .fetcher
+            .fetch_page_observed(
+                &url,
+                HttpRequestContext {
+                    source_id: CLOB_HISTORY_SOURCE_ID,
+                    endpoint_kind: CLOB_HISTORY_ENDPOINT_KIND,
+                },
+                move |attempt| {
+                    observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(attempt);
+                    Ok(())
+                },
+            )
+            .await;
+        let attempts = std::mem::take(
+            &mut *attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut responses = Vec::new();
+        for attempt in attempts {
+            let RawHttpAttempt::Response(response) = attempt else {
+                continue;
+            };
+            let receipt = self
+                .source_log
+                .append(EnvelopeIn {
+                    source_id: SourceId(response.source_id.clone()),
+                    schema_version: u32::from(response.schema_version),
+                    parser_version: u32::from(response.parser_version),
+                    observed_at: pe_core_types::SourceTimestamp(response.observed_at),
+                    received_at: pe_core_types::ReceivedAt(response.received_at),
+                    content_type: ContentType::Json,
+                    payload: response.body.clone(),
+                })
+                .await
+                .map_err(|_| BoundaryMarkError::SourceLogClosed)?;
+            responses.push((response, receipt));
+        }
+
+        let (body, classified) = match fetched {
+            Ok(body) => {
+                let map = HashMap::from([(url.clone(), body.clone())]);
+                let classified = ClobPricesHistoryClient::new(
+                    self.base_url.clone(),
+                    FixtureFetcher::new(map),
+                )
+                .with_fidelity_minutes(1)
+                .fetch_prices_history_classified(token_id, start_unix, cutoff_unix)
+                .await
+                .map_err(|error| BoundaryMarkError::Classification(error.to_string()))?
+                .outcome;
+                (body, classified)
+            }
+            Err(SourceError::Fatal { message }) => {
+                let response = responses.last().ok_or_else(|| {
+                    BoundaryMarkError::Classification(
+                        "fatal response was not captured before classification".to_owned(),
+                    )
+                })?;
+                (
+                    response.0.body.clone(),
+                    ClassifiedPricesHistory::Rejected { message },
+                )
+            }
+            Err(error) => return Err(BoundaryMarkError::Retryable(error.to_string())),
+        };
+        let receipt = responses
+            .iter()
+            .rev()
+            .find(|(response, _)| response.body == body)
+            .map(|(_, receipt)| *receipt)
+            .ok_or_else(|| {
+                BoundaryMarkError::Classification(
+                    "classified body has no synchronized source receipt".to_owned(),
+                )
+            })?;
+        historical_mark_price(&classified, cutoff_unix, receipt).map_err(BoundaryMarkError::Invalid)
+    }
+}
 
 /// Strict historical price selected for a causal paper/live daily mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,44 +335,112 @@ pub fn audited_halt_release(
     })
 }
 
-/// Prove there is exactly one Final for every Prepared and that the transactional projection's
-/// last Prepared matches the log's latest completed Prepared.
-pub fn validate_financial_snapshot_sequence(
-    era: &PaperEra,
-    snapshot_last_prepared: Option<EventSeq>,
-) -> Result<Option<EventSeq>, RiskInputsUnavailable> {
-    let mut prepared = BTreeMap::new();
-    let mut completed = BTreeMap::<EventSeq, usize>::new();
-    for frame in &era.frames {
-        match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { .. }) => {
-                prepared.insert(frame.receipt.sequence, frame.receipt.this_hash);
-            }
+/// Latest completed Prepared from the scanner-validated financial protocol. The shared scanner is
+/// the state-machine owner; risk builds no second reducer.
+#[must_use]
+pub fn latest_completed_prepared(era: &PaperEra) -> Option<EventSeq> {
+    era.frames
+        .iter()
+        .rev()
+        .find_map(|frame| match &frame.frame {
             PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
                 prepared_receipt, ..
-            }) => {
-                if prepared.get(&prepared_receipt.sequence) != Some(&prepared_receipt.this_hash) {
-                    return Err(RiskInputsUnavailable::UnmatchedPrepared);
-                }
-                let count = completed.entry(prepared_receipt.sequence).or_default();
-                *count = count
-                    .checked_add(1)
-                    .ok_or(RiskInputsUnavailable::Overflow)?;
-            }
-            _ => {}
-        }
-    }
-    if prepared
-        .keys()
-        .any(|sequence| completed.get(sequence).copied() != Some(1))
-    {
+            }) => Some(prepared_receipt.sequence),
+            _ => None,
+        })
+}
+
+/// Compose exact paper PnL/latency into the existing proposal snapshot. Exposure, proposal, and cap
+/// fields are preserved from `base`; zeroed proposal facts are never manufactured here.
+pub fn build_paper_risk_snapshot(
+    base: &RiskSnapshot,
+    snapshot: &FinancialSnapshot,
+    era: &PaperEra,
+    current_prices: &HashMap<(MarketId, OutcomeId), Price>,
+    source_log_path: &Path,
+    now_unix: i64,
+    latency_was_active: bool,
+) -> Result<RiskSnapshot, RiskInputsUnavailable> {
+    let Some((start_receipt, start)) = &era.start else {
+        return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
+    };
+    if oldest_unmatched_prepared(era).is_some() {
         return Err(RiskInputsUnavailable::UnmatchedPrepared);
     }
-    let latest = completed.last_key_value().map(|(sequence, _)| *sequence);
-    if latest != snapshot_last_prepared {
+    if snapshot.start != Some((start_receipt.sequence, start_receipt.this_hash))
+        || snapshot.last_prepared_seq != latest_completed_prepared(era)
+    {
         return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
     }
-    Ok(latest)
+
+    let mut valued_positions = Vec::with_capacity(snapshot.positions.len());
+    for position in &snapshot.positions {
+        let quantity = position
+            .long
+            .checked_sub(position.short)
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if quantity == pe_core_types::ShareAmount::ZERO {
+            continue;
+        }
+        let price = current_prices
+            .get(&(position.market_id.clone(), position.outcome_id))
+            .copied()
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        valued_positions.push((quantity, price));
+    }
+    let equity = current_equity(&EquityInputs {
+        cash: snapshot.cash,
+        positions: &valued_positions,
+    })
+    .map_err(risk_math_error)?;
+    let realized_closes_7d =
+        snapshot
+            .settlements_7d
+            .iter()
+            .try_fold(Decimal::ZERO, |total, settlement| {
+                let costs = snapshot
+                    .fills_for_open_and_7d
+                    .iter()
+                    .filter(|fill| fill.market_id == settlement.market_id)
+                    .try_fold(Decimal::ZERO, |cost, fill| {
+                        fill.principal
+                            .checked_add(fill.fee)
+                            .ok()
+                            .and_then(|debit| cost.checked_add(debit.to_decimal()))
+                            .ok_or(RiskInputsUnavailable::Overflow)
+                    })?;
+                settlement
+                    .credit_applied
+                    .checked_sub(costs)
+                    .and_then(|close| total.checked_add(close))
+                    .ok_or(RiskInputsUnavailable::Overflow)
+            })?;
+    let pnl = pnl_bps(
+        equity,
+        &PnlWindow {
+            starting_bankroll: start.starting_bankroll.to_decimal(),
+            preceding_mark_equity: preceding_midnight_equity(era, now_unix)?,
+            realized_closes_7d,
+        },
+    )
+    .map_err(risk_math_error)?;
+    let latency = paper_latency_samples(era, source_log_path, now_unix)?;
+
+    let mut composed = base.clone();
+    composed.intraday_pnl_bps = pnl.intraday;
+    composed.rolling_7d_pnl_bps = pnl.rolling_7d;
+    composed.absolute_pnl_bps = pnl.absolute;
+    composed.copy_latency_kill_switch_active = latency.switch_active(latency_was_active);
+    Ok(composed)
+}
+
+fn risk_math_error(error: RiskMathError) -> RiskInputsUnavailable {
+    match error {
+        RiskMathError::NonPositive | RiskMathError::Empty => {
+            RiskInputsUnavailable::BaselineNonPositive
+        }
+        RiskMathError::Overflow => RiskInputsUnavailable::Overflow,
+    }
 }
 
 /// Resolve the immediately preceding required UTC-midnight equity. Before the first completed
@@ -282,7 +493,7 @@ pub fn preceding_midnight_equity(
     if recorded_unix < required_cutoff
         || recorded_unix > now_unix
         || mark.invalid.is_some()
-        || mark.equity <= Decimal::ZERO
+        || mark.equity < Decimal::ZERO
     {
         return Err(RiskInputsUnavailable::MarkInvalid);
     }
@@ -316,6 +527,7 @@ impl LatencySamples {
 /// observation timestamp. Completion belongs to the hour containing the Final endpoint.
 pub fn paper_latency_samples(
     era: &PaperEra,
+    source_log_path: &Path,
     now_unix: i64,
 ) -> Result<LatencySamples, RiskInputsUnavailable> {
     let latest_end = now_unix
@@ -328,7 +540,7 @@ pub fn paper_latency_samples(
     let previous_start = latest_start
         .checked_sub(SECONDS_PER_HOUR)
         .ok_or(RiskInputsUnavailable::Overflow)?;
-    let all_samples = paper_latency_endpoint_samples(era)?;
+    let all_samples = paper_latency_endpoint_samples(era, source_log_path)?;
     Ok(LatencySamples {
         previous: latency_hour(&all_samples, previous_start)?,
         latest: latency_hour(&all_samples, latest_start)?,
@@ -357,6 +569,7 @@ fn latency_hour(
 
 fn paper_latency_endpoint_samples(
     era: &PaperEra,
+    source_log_path: &Path,
 ) -> Result<Vec<(i64, u64)>, RiskInputsUnavailable> {
     let prepared = era
         .frames
@@ -396,13 +609,38 @@ fn paper_latency_endpoint_samples(
             .checked_div(1_000_000)
             .and_then(|value| i64::try_from(value).ok())
             .ok_or(RiskInputsUnavailable::Overflow)?;
+        let observed_ms =
+            source_receipt_received_millis(source_log_path, observation.source_receipt)?;
         let latency_ms = final_ms
-            .checked_sub(observation.observed_unix_ms)
+            .checked_sub(observed_ms)
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(RiskInputsUnavailable::Overflow)?;
         samples.push((final_unix, latency_ms));
     }
     Ok(samples)
+}
+
+fn source_receipt_received_millis(
+    source_log_path: &Path,
+    receipt: AppendReceipt,
+) -> Result<i64, RiskInputsUnavailable> {
+    for item in Reader::replay(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)? {
+        let (_sequence, envelope) = item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        if envelope.seq != receipt.sequence {
+            continue;
+        }
+        if envelope.this_hash != receipt.this_hash {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        return envelope
+            .received_at
+            .0
+            .unix_timestamp_nanos()
+            .checked_div(1_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(RiskInputsUnavailable::Overflow);
+    }
+    Err(RiskInputsUnavailable::PriceMissing)
 }
 
 #[cfg(test)]
@@ -580,6 +818,13 @@ mod tests {
         assert_eq!(
             preceding_midnight_equity(&invalid, 86_500),
             Err(RiskInputsUnavailable::MarkInvalid)
+        );
+
+        let total_loss = era_with_marks(vec![mark(2, 86_400, Decimal::ZERO, None)]);
+        assert_eq!(
+            preceding_midnight_equity(&total_loss, 86_500).unwrap(),
+            Some(Decimal::ZERO),
+            "a valid 100% loss remains an exact -10,000 bps baseline"
         );
     }
 

@@ -31,19 +31,40 @@ pub fn current_equity(inputs: &EquityInputs<'_>) -> Result<Decimal, RiskMathErro
 /// Failures while deriving the exact collateral credit for one resolution.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolutionCreditError {
-    #[error("resolution payout is missing outcome {outcome_index}")]
-    MissingOutcome { outcome_index: u16 },
-    #[error("resolution payout for outcome {outcome_index} is outside [0, 1]")]
-    InvalidPayout { outcome_index: u16 },
+    #[error("binary resolution payout vector must contain two values in [0, 1] summing to 1")]
+    InvalidPayoutVector,
+    #[error("resolution outcome index {outcome_index} is not binary")]
+    InvalidOutcome { outcome_index: u16 },
     #[error("resolution credit arithmetic overflow")]
     Overflow,
+}
+
+/// Complete, conservation-checked payout vector for a binary market.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryPayout([Decimal; 2]);
+
+impl BinaryPayout {
+    pub fn new(outcome_0: Decimal, outcome_1: Decimal) -> Result<Self, ResolutionCreditError> {
+        if !(Decimal::ZERO..=Decimal::ONE).contains(&outcome_0)
+            || !(Decimal::ZERO..=Decimal::ONE).contains(&outcome_1)
+            || outcome_0.checked_add(outcome_1) != Some(Decimal::ONE)
+        {
+            return Err(ResolutionCreditError::InvalidPayoutVector);
+        }
+        Ok(Self([outcome_0, outcome_1]))
+    }
+
+    #[must_use]
+    pub fn get(&self, outcome: u16) -> Option<Decimal> {
+        self.0.get(usize::from(outcome)).copied()
+    }
 }
 
 /// Aggregate exact shares by outcome, multiply once, floor once to collateral atomic units,
 /// then checked-sum the outcome credits.
 pub fn aggregate_resolution_credit(
     positions: &[(u16, ShareAmount)],
-    payout_by_outcome: &BTreeMap<u16, Decimal>,
+    payout: &BinaryPayout,
 ) -> Result<CollateralAmount, ResolutionCreditError> {
     let shares_by_outcome = positions.iter().try_fold(
         BTreeMap::<u16, u64>::new(),
@@ -60,13 +81,9 @@ pub fn aggregate_resolution_credit(
     shares_by_outcome.into_iter().try_fold(
         CollateralAmount::ZERO,
         |credit, (outcome_index, shares)| {
-            let payout = payout_by_outcome
-                .get(&outcome_index)
-                .copied()
-                .ok_or(ResolutionCreditError::MissingOutcome { outcome_index })?;
-            if !(Decimal::ZERO..=Decimal::ONE).contains(&payout) {
-                return Err(ResolutionCreditError::InvalidPayout { outcome_index });
-            }
+            let payout = payout
+                .get(outcome_index)
+                .ok_or(ResolutionCreditError::InvalidOutcome { outcome_index })?;
             // One share atomic unit pays one collateral atomic unit at payout 1. Multiplying
             // atomic shares directly therefore leaves the result in collateral atomic units.
             let outcome_atomic = Decimal::from(shares)
@@ -222,7 +239,7 @@ mod tests {
             (0, ShareAmount::from_atomic(1)),
             (0, ShareAmount::from_atomic(1)),
         ];
-        let payouts = BTreeMap::from([(0, dec!(0.5))]);
+        let payouts = BinaryPayout::new(dec!(0.5), dec!(0.5)).unwrap();
         assert_eq!(
             aggregate_resolution_credit(&positions, &payouts).unwrap(),
             CollateralAmount::from_atomic(1)
@@ -233,32 +250,41 @@ mod tests {
     #[test]
     fn losing_resolution_credits_zero() {
         let positions = [(1, ShareAmount::from_decimal_exact(dec!(8.125)).unwrap())];
-        let payouts = BTreeMap::from([(1, Decimal::ZERO)]);
+        let payouts = BinaryPayout::new(Decimal::ONE, Decimal::ZERO).unwrap();
         assert_eq!(
             aggregate_resolution_credit(&positions, &payouts).unwrap(),
             CollateralAmount::ZERO
         );
     }
 
-    /// PASS: missing or invalid payouts and aggregate-share overflow fail closed.
+    /// PASS: incomplete/nonconserving vectors, extra outcomes, and overflow fail closed.
     #[test]
     fn resolution_credit_rejects_invalid_evidence_and_overflow() {
-        let one = [(7, ShareAmount::from_atomic(1))];
         assert_eq!(
-            aggregate_resolution_credit(&one, &BTreeMap::new()),
-            Err(ResolutionCreditError::MissingOutcome { outcome_index: 7 })
+            BinaryPayout::new(dec!(0.6), dec!(0.6)),
+            Err(ResolutionCreditError::InvalidPayoutVector)
         );
         assert_eq!(
-            aggregate_resolution_credit(&one, &BTreeMap::from([(7, dec!(1.000001))])),
-            Err(ResolutionCreditError::InvalidPayout { outcome_index: 7 })
+            BinaryPayout::new(Decimal::ONE, dec!(-0.1)),
+            Err(ResolutionCreditError::InvalidPayoutVector)
+        );
+        let payout = BinaryPayout::new(Decimal::ONE, Decimal::ZERO).unwrap();
+        let extra = [(2, ShareAmount::from_atomic(1))];
+        assert_eq!(
+            aggregate_resolution_credit(&extra, &payout),
+            Err(ResolutionCreditError::InvalidOutcome { outcome_index: 2 })
         );
         let overflowing = [
-            (7, ShareAmount::from_atomic(u64::MAX)),
-            (7, ShareAmount::from_atomic(1)),
+            (0, ShareAmount::from_atomic(u64::MAX)),
+            (0, ShareAmount::from_atomic(1)),
         ];
         assert_eq!(
-            aggregate_resolution_credit(&overflowing, &BTreeMap::from([(7, Decimal::ONE)])),
+            aggregate_resolution_credit(&overflowing, &payout),
             Err(ResolutionCreditError::Overflow)
+        );
+        assert_eq!(
+            aggregate_resolution_credit(&[], &payout),
+            Ok(CollateralAmount::ZERO)
         );
     }
 

@@ -342,6 +342,7 @@ fn poller_harness(
                     }
                     let _ = acknowledged.send(result);
                 }
+                _ => {}
             }
         }
     });
@@ -436,6 +437,7 @@ async fn refresh_outcome_for_install_rejection(
                 OrchestratorControl::InstallAnchors { acknowledged, .. } => {
                     let _ = acknowledged.send(Err(rejection.take().unwrap()));
                 }
+                _ => {}
             }
         }
     });

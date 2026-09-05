@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
-use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+use pe_core_types::{
+    PolymarketConditionId, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress,
+};
 use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
-use pe_execution_core::{ExecutionDispatcher, LiveJournal};
+use pe_execution_core::LiveJournal;
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
 use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::BucketCommitEngine;
@@ -29,13 +31,14 @@ use pe_source_polymarket_public::{
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
     GAMMA_BATCH_SIZE, PageFetcher, ReconciliationFetcher, ReqwestFetcher, parse_clob_market,
 };
-use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
+use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use pe_paper_pnl::{PnlLedger, ResolutionStore};
+use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::config_poller::{
     CONFIG_POLL_INTERVAL_SECS, SupabaseConfigFetcher, capacity_request_channel,
@@ -44,12 +47,12 @@ use pe_service::config_poller::{
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::{LiveWatchlist, projection_dirty_channel};
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::runtime_config::{
-    AppliedWatchlistCapacity, LiveRuntimeConfig, RuntimeConfigStatus, load_initial_runtime_config,
+    AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, RuntimeConfigStatus,
+    load_initial_runtime_config,
 };
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
@@ -65,7 +68,7 @@ use pe_service::supervisor::{
     TaskName, TaskResult, TaskSupervisor, cancel_at, cancel_result_at,
 };
 use pe_service::trade_poller::{
-    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
+    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations, recover_daily_boundary,
 };
 use pe_service::watchlist_admission::{AdmissionPreparer, anchor_refresh_due};
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
@@ -291,8 +294,13 @@ async fn main() -> Result<()> {
     )
     .await
     .context("required initial service_config fetch")?;
+    let config_era = if financial_start.is_some() {
+        ConfigEra::Financial15
+    } else {
+        ConfigEra::Legacy17
+    };
     let initial_runtime_config =
-        load_initial_runtime_config(&initial_config_rows, &cfg, clob_creds_present)
+        load_initial_runtime_config(&initial_config_rows, &cfg, clob_creds_present, config_era)
             .context("validate required initial service_config snapshot")?;
     let mode = parse_mode(&initial_runtime_config.mode)?;
     let max_fill_price = initial_runtime_config.max_fill_price;
@@ -573,6 +581,7 @@ async fn main() -> Result<()> {
     let (source_log, source_rx) =
         pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
     let resolution_source_log = source_log.clone();
+    let orchestrator_source_log = source_log.clone();
     asset_identity.activate_runtime(source_log.clone()).await;
     drop(boot_source_log);
 
@@ -694,15 +703,6 @@ async fn main() -> Result<()> {
         pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
             .context("resume active-era dispatch seeds after financial recovery")?;
     }
-    let paper_executor = PaperExecutor::new(
-        paper_writer,
-        SourceId("pe-service.paper".into()),
-        cfg.paper_fill_haircut_bps,
-        cfg.paper_fill_slippage_bps,
-    );
-
-    let dispatcher = ExecutionDispatcher::paper_only(paper_executor);
-
     let health = new_shared_health_with_ws(
         false,
         cfg.polymarket_activity_ws_enabled,
@@ -748,8 +748,17 @@ async fn main() -> Result<()> {
     // Rebuild durable reader obligations before either source producer starts.
     // The existing source log plus aggregate records are sufficient, so #544
     // adds no second database or obligation table.
-    let obligations = rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
+    let mut obligations =
+        rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
         .context("rebuild durable activity reconciliation obligations")?;
+    if financial_start.is_some() {
+        recover_daily_boundary(
+            &cfg.source_event_log_path,
+            &cfg.event_log_path,
+            &mut obligations,
+        )
+        .context("recover causal daily boundary")?;
+    }
     info!(
         obligations = obligations.len(),
         "activity obligations rebuilt"
@@ -843,9 +852,9 @@ async fn main() -> Result<()> {
     });
 
     // Orchestrator.
-    let market_end_cache = MarketEndCache::new(cfg.gamma_base_url.clone());
     // Mid-price cache for marking open dashboard positions to market (own rate gate).
-    let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone());
+    let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone())
+        .with_source_log(orchestrator_source_log.clone());
 
     // Supabase analytics sink (issue #343): best-effort dual-write of fills + settlements.
     // Spawned only when enabled and a Supabase URL is configured; otherwise `None` (no-op).
@@ -900,7 +909,23 @@ async fn main() -> Result<()> {
         .context("build bounded CLOB book HTTP client")?;
     let book_fetcher = Arc::new(
         ReqwestClobBookFetcher::new(book_http_client)
+            .with_source_log(orchestrator_source_log.clone())
             .with_base_url(cfg.polymarket_clob_base_url.clone()),
+    );
+    let admission_http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("build bounded market-admission HTTP client")?;
+    let boundary_mark_fetcher = Arc::new(pe_service::risk_inputs::BoundaryMarkFetcher::new(
+        admission_http_client.clone(),
+        cfg.polymarket_clob_base_url.clone(),
+        orchestrator_source_log.clone(),
+    ));
+    let admission_builder = pe_service::live_venue_adapter::LiveAdmissionBuilder::new(
+        admission_http_client,
+        cfg.gamma_base_url.clone(),
+        cfg.polymarket_clob_base_url.clone(),
+        orchestrator_source_log,
     );
 
     let snapshot_handle = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
@@ -1056,20 +1081,16 @@ async fn main() -> Result<()> {
             watchlist_writer_lock: Some(watchlist_writer_lock.clone()),
             max_fill_price,
             min_fill_price,
-            paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
-            paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
-            fill_mode: initial_runtime_config.fill_mode,
             price_impact_cap_bps: initial_runtime_config.price_impact_cap_bps,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
             live_accounts: live_accounts.clone(),
         },
         WinnerFollowStrategy::new(initial_runtime_config.winner_follow_config()),
-        dispatcher,
+        paper_writer,
         paper_state.clone(),
         leader_ledger,
         health.clone(),
-        market_end_cache.clone(),
         mid_price_cache.clone(),
         control_rx,
         sink_handle.clone(),
@@ -1082,7 +1103,10 @@ async fn main() -> Result<()> {
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),
             cfg.source_event_log_path.clone(),
-        );
+            admission_builder,
+            boundary_mark_fetcher,
+        )
+        .context("configure active financial protocol")?;
     }
     orch.resume_pending_before_producers()
         .await
@@ -1106,7 +1130,7 @@ async fn main() -> Result<()> {
         let resolution_poller = run_financial_resolution_poller(
             paper_state.clone(),
             cfg.polymarket_clob_base_url.clone(),
-            cfg.gamma_resolution_poll_interval_secs,
+            cfg.clob_resolution_poll_interval_secs,
             resolution_source_log,
             control_tx.clone(),
             shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
@@ -1118,7 +1142,7 @@ async fn main() -> Result<()> {
         let resolution_poller = run_resolution_poller(
             paper_state.clone(),
             cfg.polymarket_clob_base_url.clone(),
-            cfg.gamma_resolution_poll_interval_secs,
+            cfg.clob_resolution_poll_interval_secs,
             resolution_source_log,
             sink_handle.clone(),
             supabase_state,
@@ -1244,6 +1268,7 @@ async fn main() -> Result<()> {
             capacity_result_rx,
             CONFIG_POLL_INTERVAL_SECS,
             clob_creds_present,
+            config_era,
             Some(health.clone()),
         );
         supervisor.spawn(
@@ -1919,6 +1944,15 @@ async fn tick_resolution(
             // Legacy (#511): settle + credit in ONE SQLite transaction, the credit
             // computed inside it from freshly-read positions — a fill committing between
             // an outside read and the settle can no longer be silently uncredited.
+            let binary_payout = match outcome_prices {
+                [outcome_0, outcome_1] => BinaryPayout::new(*outcome_0, *outcome_1)
+                    .context("validate binary resolution payout")?,
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "resolution payout must contain exactly two outcomes"
+                    ));
+                }
+            };
             let (applied_credit, _bankroll) = paper_state
                 .settle_and_credit_from_positions(
                     &market_id,
@@ -1930,7 +1964,34 @@ async fn tick_resolution(
                     )
                     .context("encode outcome prices")?,
                     now_unix,
-                    |positions| PnlLedger::resolution_credit(positions, outcome_prices),
+                    |positions| {
+                        let mut resolution_positions = Vec::with_capacity(positions.len());
+                        for position in positions {
+                            let net_contracts = position
+                                .long_contracts
+                                .checked_sub(position.short_contracts)
+                                .ok_or_else(|| {
+                                    pe_paper_state::PaperStateError::Internal(format!(
+                                        "resolution position {}:{} is net short",
+                                        position.market_id, position.outcome_id.0
+                                    ))
+                                })?;
+                            let net_shares =
+                                ShareAmount::from_whole(net_contracts).map_err(|error| {
+                                    pe_paper_state::PaperStateError::Internal(format!(
+                                        "resolution position quantity: {error}"
+                                    ))
+                                })?;
+                            resolution_positions.push((position.outcome_id.0, net_shares));
+                        }
+                        aggregate_resolution_credit(&resolution_positions, &binary_payout)
+                            .map(|credit| credit.to_decimal())
+                            .map_err(|error| {
+                                pe_paper_state::PaperStateError::Internal(format!(
+                                    "resolution credit arithmetic: {error}"
+                                ))
+                            })
+                    },
                 )
                 .context("settle and credit")?;
             credit = applied_credit;

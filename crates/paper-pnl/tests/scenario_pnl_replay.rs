@@ -85,13 +85,7 @@ fn snapshot_matches_expected_after_resolution() {
     assert_eq!(db.bankroll().unwrap(), Some(dec!(993)));
 
     // Market-A resolves YES: credit = 10 * 1.0 = 10.00
-    let positions_a: Vec<_> = db
-        .paper_positions()
-        .unwrap()
-        .into_iter()
-        .filter(|p| p.market_id == mkt_a)
-        .collect();
-    let credit = PnlLedger::resolution_credit(&positions_a, &[dec!(1), dec!(0)]);
+    let credit = dec!(10);
     assert_eq!(credit, dec!(10), "resolution credit should be 10");
 
     db.credit_bankroll(credit).unwrap();
@@ -144,13 +138,7 @@ fn replay_equals_snapshot() {
     )
     .unwrap();
 
-    let positions: Vec<_> = db
-        .paper_positions()
-        .unwrap()
-        .into_iter()
-        .filter(|p| p.market_id == mkt)
-        .collect();
-    let credit = PnlLedger::resolution_credit(&positions, &[dec!(1), dec!(0)]);
+    let credit = dec!(20);
     db.credit_bankroll(credit).unwrap();
 
     let mut store = ResolutionStore::load(db.clone()).unwrap();

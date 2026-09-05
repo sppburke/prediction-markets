@@ -74,7 +74,7 @@ pub const REMOVED_CONFIG_KEYS: [&str; 22] = [
     "demotion_cb_alpha",
     "demotion_min_trades",
     "demotion_pnl_window_secs",
-    "gamma_resolution_poll_interval_secs",
+    "clob_resolution_poll_interval_secs",
     "inactivity_hard_cap_secs",
     "inactivity_threshold_secs",
     "log_retention_days",
@@ -355,7 +355,7 @@ pub fn parse_config(
         }
     }
     for key in era_keys {
-        if key != "kelly_fraction_override" && !map.contains_key(key) {
+        if *key != "kelly_fraction_override" && !map.contains_key(key) {
             return Err(ConfigSnapshotError::MissingKey {
                 key: (*key).to_owned(),
             });
@@ -1126,8 +1126,8 @@ mod tests {
 
     #[test]
     fn legacy_fallback_fill_source_still_deserializes() {
-        let source: pe_strategy_winner_follow::FillSource =
+        let source: crate::paper_recovery::LegacyFillSource =
             serde_json::from_str("\"Fallback\"").unwrap();
-        assert_eq!(source, pe_strategy_winner_follow::FillSource::Fallback);
+        assert_eq!(source, crate::paper_recovery::LegacyFillSource::Fallback);
     }
 }

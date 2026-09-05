@@ -34,20 +34,20 @@ use std::collections::HashMap;
 type SettledEntry = (Decimal, Vec<Decimal>, i64);
 use std::sync::Mutex;
 
-use pe_core_types::{ContractQty, SourceId, SourceTimestamp, StrategyId};
+use pe_core_types::{ContractQty, ReceivedAt, SourceId, SourceTimestamp, StrategyId};
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::Writer;
+use pe_event_log::{ContentType, EnvelopeIn, Writer};
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
+use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
 use pe_service::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 use pe_service::supabase_state::{
     AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, ResolutionV2Outcome, SupabaseBootTrait,
     SupabaseStateError, SupabaseStateTrait, apply_resolution_authoritative,
     commit_fill_authoritative, resolve_event_frames, supabase_authoritative_boot,
 };
-use pe_strategy_winner_follow::PaperExecutor;
 use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -78,7 +78,7 @@ fn leader() -> LeaderPositionRow {
 }
 
 /// A `(FillRecord, SupabaseFillRow)` pair for the same fill — the orchestrator builds both
-/// from one `PaperFill`, so the test does too.
+/// from one `LegacyPaperFill`, so the test does too.
 fn fill_pair(
     key: &str,
     side: Side,
@@ -332,12 +332,11 @@ impl SupabaseBootTrait for FakeSupabaseState {
     }
 }
 
-/// Append `wf|`-keyed fill frames to a fresh event log via the real `PaperExecutor`
-/// (dense seqs from 0), returning the log path. Frames only — no local commits.
+/// Append legacy `wf|`-keyed fill frames to a fresh event log (dense seqs from 0), returning the
+/// log path. Frames only — no local commits.
 fn write_frames(dir: &TempDir, fills: &[(u64, Side, u64, Decimal)]) -> std::path::PathBuf {
     let log_path = dir.path().join("paper.log");
-    let writer = Writer::open(&log_path).unwrap();
-    let mut executor = PaperExecutor::new(writer, SourceId("test".into()), 0, 0);
+    let mut writer = Writer::open(&log_path).unwrap();
     let ts = SourceTimestamp(OffsetDateTime::UNIX_EPOCH);
     for (key_seq, side, contracts, price) in fills {
         let intent = OrderIntent {
@@ -350,7 +349,23 @@ fn write_frames(dir: &TempDir, fills: &[(u64, Side, u64, Decimal)]) -> std::path
             validity_seconds: 30,
             idempotency_key: wf_key(*key_seq),
         };
-        executor.execute(&intent, ts.clone(), None).unwrap();
+        let fill = LegacyPaperFill {
+            simulated_fill_price: intent.limit_price,
+            intent,
+            simulated_at: ts.clone(),
+            fill_source: LegacyFillSource::LeaderHaircut,
+        };
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("test".into()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: ts.clone(),
+                received_at: ReceivedAt(ts.0),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&fill).unwrap(),
+            })
+            .unwrap();
     }
     log_path
 }

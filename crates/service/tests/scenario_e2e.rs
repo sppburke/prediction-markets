@@ -34,7 +34,6 @@ use pe_core_types::{
     WalletAddress,
 };
 use pe_event_log::Writer;
-use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
@@ -42,13 +41,11 @@ use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::runtime_config::FillMode;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -101,12 +98,10 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
     }
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
+fn make_writer(dir: &TempDir) -> Writer {
     let paper_path = dir.path().join("paper.log");
     let paper_writer = Writer::open(&paper_path).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-
-    ExecutionDispatcher::paper_only(paper_executor)
+    paper_writer
 }
 
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
@@ -189,21 +184,17 @@ async fn scenario_e2e_clean_exit() {
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
             // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         empty_mid_cache(),
         dead_reseed_rx(),
         None,
@@ -262,21 +253,17 @@ async fn scenario_graceful_shutdown() {
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
             // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         empty_mid_cache(),
         dead_reseed_rx(),
         None,

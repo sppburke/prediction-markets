@@ -1,9 +1,8 @@
 //! Startup recovery for the paper trader: reconcile the SQLite mirror against the
 //! event log, and rehydrate the in-memory leader `PositionLedger` from the mirror.
 //!
-//! Lives in the service tier (not in `paper-state`) because both steps need the
-//! `PaperFill` / `PositionSnapshot` types from the strategy and signal crates, which
-//! `paper-state` deliberately does not depend on.
+//! Lives in the service tier (not in `paper-state`) because both steps need the private legacy
+//! fill decoder and `PositionSnapshot`; `paper-state` deliberately depends on neither.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -22,7 +21,7 @@ use pe_position_ledger::{
     AppliedEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation, PositionLedger,
 };
 use pe_risk_engine::RiskHaltCause;
-use pe_strategy_winner_follow::PaperFill;
+use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +35,27 @@ use crate::supabase_sink::supabase_fill_from;
 
 pub const PAPER_LOG_SCHEMA_VERSION_V2: u32 = 2;
 pub const PAPER_LOG_SCHEMA_VERSION: u32 = PAPER_LOG_SCHEMA_VERSION_V2;
+
+/// Schema-one price provenance retained only by the service's legacy decoder.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LegacyFillSource {
+    ClobBestAsk,
+    Fallback,
+    #[default]
+    LeaderHaircut,
+}
+
+/// Schema-one payload retained only for compatibility reads before the financial era.
+#[doc(hidden)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyPaperFill {
+    pub intent: OrderIntent,
+    pub simulated_fill_price: Price,
+    pub simulated_at: SourceTimestamp,
+    #[serde(default)]
+    pub fill_source: LegacyFillSource,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
@@ -295,7 +315,7 @@ pub enum SealReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum PaperLogFrame {
-    LegacyFill(PaperFill),
+    LegacyFill(LegacyPaperFill),
     Record(PaperLogRecord),
 }
 
@@ -552,7 +572,6 @@ mod paper_log_tests {
         VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
     };
     use pe_risk_engine::RiskSnapshot;
-    use pe_strategy_winner_follow::FillSource;
     use pe_venue_core::OrderIntent;
     use pe_venue_polymarket::CompactFeeSchedule;
     use rust_decimal_macros::dec;
@@ -745,8 +764,8 @@ mod paper_log_tests {
         }
     }
 
-    fn legacy_fill() -> PaperFill {
-        PaperFill {
+    fn legacy_fill() -> LegacyPaperFill {
+        LegacyPaperFill {
             intent: OrderIntent {
                 strategy_id: StrategyId("winner-follow".to_owned()),
                 market_id: MarketId(VenueMarketId("market".to_owned())),
@@ -759,7 +778,7 @@ mod paper_log_tests {
             },
             simulated_fill_price: Price::new(dec!(0.5)).unwrap(),
             simulated_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
-            fill_source: FillSource::LeaderHaircut,
+            fill_source: LegacyFillSource::LeaderHaircut,
         }
     }
 

@@ -30,7 +30,6 @@ use pe_core_types::{
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
-use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::clob_book::{
@@ -39,15 +38,13 @@ use pe_service::clob_book::{
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::runtime_config::FillMode;
+use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
 use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, FillSource, PaperExecutor, PaperFill, PerTradeCap, SizingMode,
-    WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -136,10 +133,8 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
-    let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    ExecutionDispatcher::paper_only(paper_executor)
+fn make_writer(dir: &TempDir) -> Writer {
+    Writer::open(dir.path().join("paper.log")).unwrap()
 }
 
 fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
@@ -161,7 +156,7 @@ fn first_paper_fill(dir: &TempDir) -> Option<(u64, Decimal)> {
         return None;
     }
     let (_seq, env) = Reader::replay(&path).unwrap().next()?.unwrap();
-    let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+    let fill: LegacyPaperFill = serde_json::from_slice(&env.payload).unwrap();
     Some((fill.intent.contracts.0, fill.simulated_fill_price.0))
 }
 
@@ -175,7 +170,7 @@ fn paper_fill_sides(dir: &TempDir) -> Vec<Side> {
         .unwrap()
         .map(|frame| {
             let (_seq, env) = frame.unwrap();
-            let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+            let fill: LegacyPaperFill = serde_json::from_slice(&env.payload).unwrap();
             fill.intent.side
         })
         .collect()
@@ -266,24 +261,17 @@ async fn run_gate_capped(
             min_resolution_horizon_secs: 0,
             max_fill_price,
             min_fill_price,
-            // Match the dispatcher's PaperExecutor haircut/slippage so sizing (fill_basis
-            // = leader × 1.05) equals the recorded fill.
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            // #486: pin the pre-feature haircut basis (no /book fetch) so these existing gate
-            // scenarios stay on the ×1.05 fill; the best-ask path is exercised separately below.
-            fill_mode: FillMode::LeaderHaircut,
+            // Preserve the historical gate fixture's sizing basis.
             price_impact_cap_bps: 100,
             entry_gate_config: gate_config,
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(flat_fill_config()),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state,
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_price_cache,
         dead_reseed_rx(),
         None,
@@ -586,13 +574,13 @@ fn mid_cache_with_tokens(hex: &str, price: &str) -> MidPriceCache<FixtureFetcher
 /// The FIRST paper fill's `(contracts, price, fill_source)`, replayed from the log — the
 /// event-log round-trip that also exercises AC7(i) (a `Some`-recorded fill reconstructs its
 /// exact stored price + provenance on replay).
-fn first_paper_fill_full(dir: &TempDir) -> Option<(u64, Decimal, FillSource)> {
+fn first_paper_fill_full(dir: &TempDir) -> Option<(u64, Decimal, LegacyFillSource)> {
     let path = dir.path().join("paper.log");
     if !path.exists() {
         return None;
     }
     let (_seq, env) = Reader::replay(&path).unwrap().next()?.unwrap();
-    let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+    let fill: LegacyPaperFill = serde_json::from_slice(&env.payload).unwrap();
     Some((
         fill.intent.contracts.0,
         fill.simulated_fill_price.0,
@@ -618,18 +606,17 @@ fn bestask_trade(id: &str, side: Side, leader_price: Decimal) -> IncomingTrade {
     }
 }
 
-/// Feed one trade through a paper-mode orchestrator in `fill_mode`, wired with `book_fetcher`
-/// and a `max_fill_price` cap (`ZERO` disables). Returns the paper-fill count and the first fill
+/// Feed one trade through a paper-mode orchestrator wired with `book_fetcher` and a
+/// `max_fill_price` cap (`ZERO` disables). Returns the paper-fill count and the first fill
 /// `(contracts, price, fill_source)`.
 #[allow(clippy::too_many_arguments)]
 async fn run_bestask<B: ClobBookFetcher + 'static>(
     dir: &TempDir,
-    fill_mode: FillMode,
     side: Side,
     leader_price: Decimal,
     max_fill_price: Decimal,
     book_fetcher: Arc<B>,
-) -> (usize, Option<(u64, Decimal, FillSource)>) {
+) -> (usize, Option<(u64, Decimal, LegacyFillSource)>) {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
     paper_state
@@ -661,20 +648,16 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
             min_resolution_horizon_secs: 0,
             max_fill_price,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode,
             price_impact_cap_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(flat_fill_config()),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_with_tokens(BA_HEX, "0.60"),
         dead_reseed_rx(),
         None,
@@ -702,7 +685,6 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
     )]);
     let (fills, first) = run_bestask(
         &dir,
-        FillMode::ClobBestAsk,
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
@@ -717,7 +699,7 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
         "recorded fill == best-ask (dust 0.50 skipped)"
     );
     assert_eq!(contracts, 181, "sized off the ask: floor(100/0.55)");
-    assert_eq!(source, FillSource::ClobBestAsk);
+    assert_eq!(source, LegacyFillSource::ClobBestAsk);
     println!("PASS: AC1/AC7(i) — best-ask BUY fills at 0.55 (181 ct, ClobBestAsk), replay-stable");
 }
 
@@ -728,7 +710,6 @@ async fn best_ask_unusable_book_fails_closed_without_fallback() {
     let dir_empty = TempDir::new().unwrap();
     let (fills, first) = run_bestask(
         &dir_empty,
-        FillMode::ClobBestAsk,
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
@@ -744,7 +725,6 @@ async fn best_ask_unusable_book_fails_closed_without_fallback() {
     let dir_err = TempDir::new().unwrap();
     let (fills, first) = run_bestask(
         &dir_err,
-        FillMode::ClobBestAsk,
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
@@ -768,7 +748,6 @@ async fn mandatory_cap_uses_exactly_one_book_request_and_fails_closed() {
     let error_dir = TempDir::new().unwrap();
     let (error_fills, _) = run_bestask(
         &error_dir,
-        FillMode::ClobBestAsk,
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
@@ -788,7 +767,6 @@ async fn mandatory_cap_uses_exactly_one_book_request_and_fails_closed() {
     let stale_dir = TempDir::new().unwrap();
     let (stale_fills, _) = run_bestask(
         &stale_dir,
-        FillMode::ClobBestAsk,
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
@@ -808,7 +786,6 @@ async fn band_gate_rejects_on_ask_above_cap() {
     let books = HashMap::from([(BA_TOKEN.to_string(), book(&[(dec!(0.86), dec!(10))]))]);
     let (fills, _) = run_bestask(
         &dir,
-        FillMode::ClobBestAsk,
         Side::Buy,
         dec!(0.80), // leader in-band (< 0.85)
         dec!(0.85),
@@ -827,7 +804,6 @@ async fn sell_entry_is_rejected_before_best_ask_fetch() {
     let dir = TempDir::new().unwrap();
     let (fills, first) = run_bestask(
         &dir,
-        FillMode::ClobBestAsk,
         Side::Sell,
         dec!(0.50),
         Decimal::ZERO,
@@ -849,7 +825,6 @@ async fn leader_haircut_mode_records_haircut_fill() {
     let books = HashMap::from([(BA_TOKEN.to_string(), book(&[(dec!(0.50), dec!(1000))]))]);
     let (fills, first) = run_bestask(
         &dir,
-        FillMode::LeaderHaircut,
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
@@ -863,7 +838,7 @@ async fn leader_haircut_mode_records_haircut_fill() {
         contracts, 190,
         "sized off the haircut basis: floor(100/0.525)"
     );
-    assert_eq!(source, FillSource::LeaderHaircut);
+    assert_eq!(source, LegacyFillSource::LeaderHaircut);
     println!("PASS: AC5 — leader_haircut mode records the 0.525 haircut fill (LeaderHaircut)");
 }
 
@@ -880,8 +855,8 @@ impl ClobBookFetcher for PanicBookFetcher {
 
 /// A dispatcher whose LiveTiny path completes cleanly with a filled fixture order (AC6 asserts the
 /// BOOK fetcher is untouched, not the order path).
-fn make_live_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
-    make_dispatcher(dir)
+fn make_live_writer(dir: &TempDir) -> Writer {
+    make_writer(dir)
 }
 
 /// AC6 (HARD GATE): an ordinary live mode never reaches the `/book` or a POST path. The dispatcher
@@ -912,22 +887,18 @@ async fn live_mode_never_fetches_book_ac6() {
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
             // clob_best_ask is set deliberately: the mode gate — not the fill mode — must suppress
             // the fetch in a live mode.
-            fill_mode: FillMode::ClobBestAsk,
             price_impact_cap_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(flat_fill_config()),
-        make_live_dispatcher(&dir),
+        make_live_writer(&dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_with_tokens(BA_HEX, "0.60"),
         dead_reseed_rx(),
         None,

@@ -969,7 +969,6 @@ fn validate_ladder(
         || plan.limit_price == Price::ZERO
         || plan.best_ask > plan.limit_price
         || plan.limit_price.0 % minimum_tick_size.0 != Decimal::ZERO
-        || plan.estimated_ladder_spend > plan.worst_case_debit
     {
         return Err(LiveAdmissionRefusal::LadderInvalid);
     }
@@ -991,14 +990,12 @@ fn validate_ladder(
             .ok_or(LiveAdmissionRefusal::LadderInvalid)?;
         previous = Some(ask.price);
     }
-    let expected_spend = CollateralAmount::from_decimal_exact(spend)
-        .map_err(|_| LiveAdmissionRefusal::LadderInvalid)?;
-    let expected_worst =
-        CollateralAmount::from_decimal_exact(plan.shares.to_decimal() * plan.limit_price.0)
-            .map_err(|_| LiveAdmissionRefusal::LadderInvalid)?;
-    if shares != plan.shares
-        || expected_spend != plan.estimated_ladder_spend
-        || expected_worst != plan.worst_case_debit
+    let expected_spend = CollateralAmount::from_decimal_exact(
+        spend.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToNegativeInfinity),
+    )
+    .map_err(|_| LiveAdmissionRefusal::LadderInvalid)?;
+    if shares < plan.shares
+        || expected_spend > plan.worst_case_debit
         || plan.best_ask != plan.used_asks[0].price
         || plan.limit_price != plan.used_asks[plan.used_asks.len() - 1].price
     {
@@ -1041,7 +1038,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use pe_resolver_card::{VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus};
-    use pe_source_polymarket_public::{LiveFeeEvidence, LiveMarketEvidence};
+    use pe_source_polymarket_public::LiveMarketEvidence;
     use pe_venue_polymarket::AskLevel;
     use rust_decimal_macros::dec;
     use tempfile::tempdir;
@@ -1204,16 +1201,6 @@ mod tests {
             minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
             minimum_order_size: ShareAmount::from_atomic(5_000_000),
             scheduled_end_unix: None,
-            fee_evidence: LiveFeeEvidence {
-                gamma_fees_enabled: Some(serde_json::json!(false)),
-                gamma_fee_schedule: None,
-                gamma_maker_base_fee_bps: Some(serde_json::json!(0)),
-                gamma_taker_base_fee_bps: Some(serde_json::json!(0)),
-                clob_maker_base_fee_bps: Some(serde_json::json!(0)),
-                clob_taker_base_fee_bps: Some(serde_json::json!(0)),
-            },
-            raw_gamma_market_hash: blake3::hash(b"gamma"),
-            raw_clob_market_hash: blake3::hash(b"clob"),
             observed_at_unix: now().unix_timestamp(),
             schema_version: LIVE_MARKET_SCHEMA_VERSION,
             parser_version: LIVE_MARKET_PARSER_VERSION,
@@ -1242,7 +1229,6 @@ mod tests {
             best_ask: price,
             limit_price: price,
             shares,
-            estimated_ladder_spend: CollateralAmount::from_atomic(2_500_000),
             worst_case_debit: CollateralAmount::from_atomic(2_500_000),
         }
     }

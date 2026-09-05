@@ -7,12 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pe_core_types::WalletAddress;
+use pe_event_log::AppendReceipt;
 use pe_paper_state::{PaperStateDb, WalletCoverage};
+use pe_trader_index::WatchlistEntry;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
 use crate::bucket_commit::AnchorInstallError;
 use crate::orchestrator_control::OrchestratorControl;
+use crate::paper_recovery::MembershipChange;
 use crate::position_seeder::{
     AnchorInstall, CausalPositionError, CausalPositionValidator, is_deferred_causal_position_error,
 };
@@ -31,6 +34,8 @@ pub enum AdmissionError {
     AcknowledgementClosed,
     #[error("orchestrator admission preparation exceeded {0} seconds")]
     AcknowledgementTimeout(u64),
+    #[error("orchestrator rejected structural membership publication: {0}")]
+    PublicationRejected(String),
     #[error("causal current-position validation unavailable: {0}")]
     PositionValidation(#[source] CausalPositionError),
     #[error("orchestrator rejected the accepted position brackets: {0}")]
@@ -117,6 +122,28 @@ impl AdmissionPreparer {
 
         self.check_prerequisites(additions)?;
         self.prepare_locked(additions).await
+    }
+
+    /// Synchronize one structural membership record, then publish its exact replacement entries.
+    pub async fn publish_membership(
+        &self,
+        change: MembershipChange,
+        replacements: Vec<WatchlistEntry>,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        let (acknowledged, received) = oneshot::channel();
+        self.inner
+            .control_tx
+            .send(OrchestratorControl::PublishMembership {
+                change,
+                replacements,
+                acknowledged,
+            })
+            .await
+            .map_err(|_| AdmissionError::ControlClosed)?;
+        received
+            .await
+            .map_err(|_| AdmissionError::AcknowledgementClosed)?
+            .map_err(AdmissionError::PublicationRejected)
     }
 
     /// Re-anchor one due wallet under the shared bracket mutex.

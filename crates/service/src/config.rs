@@ -122,9 +122,9 @@ pub struct ServiceConfig {
     pub gamma_base_url: String,
 
     /// Seconds between Gamma resolution poll rounds.
-    /// See `docs/_GLOSSARY.md`: `gamma_resolution_poll_interval_secs`.
-    #[serde(default = "default_gamma_resolution_poll_interval_secs")]
-    pub gamma_resolution_poll_interval_secs: u64,
+    /// CLOB resolution discovery cadence in seconds.
+    #[serde(default = "default_clob_resolution_poll_interval_secs")]
+    pub clob_resolution_poll_interval_secs: u64,
 
     /// Drop entry signals whose market `endDate` is further than this many seconds
     /// into the future. Set to 0 to disable. Default: 172_800 (48 h) — the run28
@@ -446,7 +446,7 @@ fn default_gamma_base_url() -> String {
     "https://gamma-api.polymarket.com".to_string()
 }
 
-const fn default_gamma_resolution_poll_interval_secs() -> u64 {
+const fn default_clob_resolution_poll_interval_secs() -> u64 {
     // 2 minutes (issue #343 step 12): settled markets and "just resolved" wins lag
     // actual resolution by ≤2 min instead of ≤1 h. The poll is gated to markets with
     // open unsettled positions and rate-limited (50 ms min-interval), so the ~30×
@@ -475,7 +475,7 @@ impl Default for ServiceConfig {
             paper_state_db_path: default_paper_state_db_path(),
             legacy_wallet_history_path: default_legacy_wallet_history_path(),
             gamma_base_url: default_gamma_base_url(),
-            gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
+            clob_resolution_poll_interval_secs: default_clob_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
             min_resolution_horizon_secs: default_min_resolution_horizon_secs(),
             max_fill_price: default_max_fill_price(),
@@ -553,7 +553,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "paper_state_db_path",
         "legacy_wallet_history_path",
         "gamma_base_url",
-        "gamma_resolution_poll_interval_secs",
+        "clob_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
         "min_resolution_horizon_secs",
         "max_fill_price",

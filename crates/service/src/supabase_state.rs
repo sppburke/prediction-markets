@@ -27,11 +27,12 @@ use pe_core_types::{
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Writer};
 use pe_execution_core::EconomicPrepared;
-use pe_paper_pnl::{ResolutionPosition, ResolutionStore, aggregate_resolution_credit};
+use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{
     FillRecord, FillRow, FinancialFillRecord, LeaderPositionRow, PaperPositionRow, PaperStateDb,
     PaperStateError,
 };
+use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_source_polymarket_public::{
     BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
     ClobPayoutResolution, parse_clob_market,
@@ -1489,28 +1490,28 @@ pub(crate) fn apply_financial_result(
                         SupabaseStateError::Corrupt(format!("resolution payout vector: {error}"))
                     })?;
                 let snapshot = paper_state.financial_snapshot(canonical.settled_at_unix)?;
+                let decimals = payout.decimals();
+                let binary_payout =
+                    BinaryPayout::new(decimals[0], decimals[1]).map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("resolution payout vector: {error}"))
+                    })?;
                 let positions = snapshot
                     .positions
                     .into_iter()
                     .filter(|position| position.market_id == condition)
                     .map(|position| {
-                        let outcome_index = u8::try_from(position.outcome_id.0).map_err(|_| {
-                            SupabaseStateError::Corrupt(format!(
-                                "resolution outcome index {} is not binary",
-                                position.outcome_id.0
-                            ))
-                        })?;
-                        Ok(ResolutionPosition {
-                            outcome_index,
-                            net_shares: position
-                                .long
-                                .checked_sub(position.short)
-                                .unwrap_or(ShareAmount::ZERO),
-                        })
+                        let net_shares =
+                            position.long.checked_sub(position.short).map_err(|_| {
+                                SupabaseStateError::Corrupt(format!(
+                                    "resolution position {}:{} is net short",
+                                    position.market_id, position.outcome_id.0
+                                ))
+                            })?;
+                        Ok((position.outcome_id.0, net_shares))
                     })
                     .collect::<Result<Vec<_>, SupabaseStateError>>()?;
                 let derived =
-                    aggregate_resolution_credit(&positions, &payout).map_err(|error| {
+                    aggregate_resolution_credit(&positions, &binary_payout).map_err(|error| {
                         SupabaseStateError::Corrupt(format!("resolution arithmetic: {error}"))
                     })?;
                 if derived != canonical.credit {
