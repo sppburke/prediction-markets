@@ -760,15 +760,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         cutoff_unix: i64,
         boundary_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
-        let (paper_log_path, source_log_path) = self
-            .financial_log_paths
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "daily boundary is unavailable before QualificationStarted".to_owned())?;
-        let mark_fetcher = Arc::clone(self
-            .boundary_mark_fetcher
-            .as_ref()
-            .ok_or_else(|| "daily boundary historical-price reader is unavailable".to_owned())?);
+        let (paper_log_path, source_log_path) =
+            self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
+                "daily boundary is unavailable before QualificationStarted".to_owned()
+            })?;
+        let mark_fetcher =
+            Arc::clone(self.boundary_mark_fetcher.as_ref().ok_or_else(|| {
+                "daily boundary historical-price reader is unavailable".to_owned()
+            })?);
         let era = crate::paper_recovery::paper_era(
             crate::paper_recovery::scan_paper_log(&paper_log_path)
                 .map_err(|error| error.to_string())?,

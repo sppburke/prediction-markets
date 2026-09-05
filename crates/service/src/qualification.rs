@@ -876,10 +876,13 @@ fn source_observations(
     path: &Path,
     prefix: &TailBinding,
 ) -> Result<BTreeMap<u64, SourceObservation>, QualificationError> {
+    let Some(last_sequence) = prefix.last_sequence else {
+        return Ok(BTreeMap::new());
+    };
     let mut observations = BTreeMap::new();
     for item in Reader::replay(path)? {
         let (sequence, envelope) = item?;
-        if prefix.last_sequence.is_some_and(|last| sequence > last) {
+        if sequence > last_sequence {
             break;
         }
         let received_unix_ms = received_unix_ms(&envelope)?;
@@ -893,6 +896,13 @@ fn source_observations(
                 received_unix_ms,
             },
         );
+    }
+    let expected_hash = tail_hash(prefix)?;
+    if observations
+        .get(&last_sequence.0)
+        .is_none_or(|observation| observation.receipt.this_hash != expected_hash)
+    {
+        return insufficient("source observations do not reach the sealed sequence/hash prefix");
     }
     Ok(observations)
 }
@@ -1684,6 +1694,35 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.last(), Some(&b'\n'));
         assert!(!first.contains(&b'\r'));
+    }
+
+    #[test]
+    fn empty_source_prefix_exposes_no_later_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("source.log");
+        let mut writer = Writer::open(&source_log).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("test.source".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: br#"{"value":1}"#.to_vec(),
+            })
+            .unwrap();
+        let prefix = TailBinding {
+            physical_tail: 5,
+            last_sequence: None,
+            last_hash: "00".repeat(32),
+        };
+
+        assert!(
+            source_observations(&source_log, &prefix)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
