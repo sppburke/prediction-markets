@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
-use pe_core_types::{SourceId, WalletAddress};
-use pe_event_log::{Scanner, Writer};
+use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
 use pe_execution_core::{ExecutionDispatcher, LiveJournal};
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
 use pe_service::asset_identity::AssetIdentityResolver;
@@ -21,16 +21,21 @@ use pe_service::paper_migration::{
     record_activation_facts, rollback_version_one, validate_initial_configuration,
     validate_migration_authority,
 };
-use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
+use pe_service::paper_recovery::{
+    active_risk_halts, build_leader_ledger, paper_era, reconcile_paper_state, scan_paper_log,
+};
 use pe_service::position_seeder::CausalPositionValidator;
-use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, ReconciliationFetcher, ReqwestFetcher};
+use pe_source_polymarket_public::{
+    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
+    GAMMA_BATCH_SIZE, PageFetcher, ReconciliationFetcher, ReqwestFetcher, parse_clob_market,
+};
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
+use pe_paper_pnl::{PnlLedger, ResolutionStore};
 use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::config_poller::{
     CONFIG_POLL_INTERVAL_SECS, SupabaseConfigFetcher, capacity_request_channel,
@@ -52,8 +57,8 @@ use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
-    SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
-    supabase_authoritative_boot_observed,
+    SupabaseStateClient, apply_resolution_authoritative, reconcile_active_financial_frames,
+    supabase_authoritative_boot, supabase_authoritative_boot_observed,
 };
 use pe_service::supervisor::{
     SHUTDOWN_DEADLINE, ShutdownController, ShutdownPhase, TaskEvent, TaskExit, TaskFailure,
@@ -174,11 +179,45 @@ async fn main() -> Result<()> {
 
     let cfg = load_config()?;
 
+    // Derive the financial era exactly once, from the verified paper log, before constructing
+    // any HTTP client. A Start has no local-authority interpretation: credentials and the
+    // Start-bound Supabase protocol are mandatory for every subsequent boot.
+    let (financial_start, active_risk_halt_count) = if cfg.event_log_path.exists() {
+        let era = paper_era(
+            scan_paper_log(&cfg.event_log_path)
+                .context("verify paper log and derive financial era")?,
+        );
+        (
+            era.start.as_ref().map(|(receipt, _)| *receipt),
+            active_risk_halts(&era).len(),
+        )
+    } else {
+        (None, 0)
+    };
+    if financial_start.is_some() {
+        anyhow::ensure!(
+            cfg.supabase_authoritative,
+            "QualificationStarted requires PE_SUPABASE_AUTHORITATIVE=1; blind local replay is forbidden"
+        );
+        anyhow::ensure!(
+            !cfg.supabase_url.is_empty(),
+            "QualificationStarted requires PE_SUPABASE_URL"
+        );
+        anyhow::ensure!(
+            !cfg.supabase_secret_key.is_empty(),
+            "QualificationStarted requires the service-role PE_SUPABASE_SECRET_KEY"
+        );
+    }
+
     // Hold the rolling-log worker guards for the whole process; dropping them flushes the
     // non-blocking writers (losing buffered lines), so keep `log_guards` alive until exit.
     let log_guards =
         pe_service::logging::setup(&cfg.jsonl_log_path, "info", cfg.log_retention_days)?;
     info!("pe-service starting");
+    info!(
+        active_risk_halt_count,
+        "active paper risk causes rebuilt from the verified prefix"
+    );
 
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
@@ -320,7 +359,7 @@ async fn main() -> Result<()> {
     // below owns local application — every unresolved frame is decided by the authority
     // (`commit_fill_v2`), so a refused frame can never resurrect locally. The blind
     // replay would apply such frames unconditionally.
-    if !cfg.supabase_authoritative {
+    if !cfg.supabase_authoritative && financial_start.is_none() {
         let reconciled = reconcile_paper_state(&cfg.event_log_path, &paper_state)
             .context("reconcile paper-state from event log")?;
         if reconciled > 0 {
@@ -352,7 +391,15 @@ async fn main() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
-        if migration_boot.session.is_some() {
+        if let Some(start) = financial_start {
+            client
+                .seed_financial_start(start)
+                .await
+                .context("seed authoritative financial Start")?;
+            paper_state
+                .seed_financial_start(start)
+                .context("seed local financial Start")?;
+        } else if migration_boot.session.is_some() {
             supabase_authoritative_boot_observed(
                 &client,
                 &paper_state,
@@ -383,8 +430,10 @@ async fn main() -> Result<()> {
     // #508 Decision 10 (#511: AFTER frame dispositions exist in either mode): resume staged
     // dispatch aggregates — flip seeds whose fill frame reached a disposition, finalize
     // stuck seeds, leave redeliverable seeds pending. Never reconstructs targets.
-    pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
-        .context("resume dispatch seeds")?;
+    if financial_start.is_none() {
+        pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
+            .context("resume dispatch seeds")?;
+    }
 
     let bankroll = paper_state
         .bankroll()
@@ -484,6 +533,7 @@ async fn main() -> Result<()> {
     drop(boot_position_validator);
     let (source_log, source_rx) =
         pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
+    let resolution_source_log = source_log.clone();
     asset_identity.activate_runtime(source_log.clone()).await;
     drop(boot_source_log);
 
@@ -584,8 +634,27 @@ async fn main() -> Result<()> {
     info!(bankroll = %bankroll, "paper-state opened");
 
     // Paper event-log writer (opened after reconciliation reads the existing log).
-    let paper_writer = Writer::open(&cfg.event_log_path)
+    let mut paper_writer = Writer::open(&cfg.event_log_path)
         .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
+    if financial_start.is_some() {
+        let authority = supabase_state.as_ref().context(
+            "active financial era requires the authoritative client before paper writer boot",
+        )?;
+        let recovered = reconcile_active_financial_frames(
+            authority,
+            &paper_state,
+            &cfg.event_log_path,
+            &cfg.source_event_log_path,
+            &mut paper_writer,
+        )
+        .await
+        .context("recover active paper financial protocol")?;
+        if recovered > 0 {
+            info!(recovered, "completed unmatched paper Prepared records");
+        }
+        pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
+            .context("resume active-era dispatch seeds after financial recovery")?;
+    }
     let paper_executor = PaperExecutor::new(
         paper_writer,
         SourceId("pe-service.paper".into()),
@@ -612,9 +681,6 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
         .with_context(|| format!("bind {}", cfg.bind))?;
-
-    // Bounded channel per _GLOSSARY.md defaults.
-    let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
 
     // Seed the delivery cursor without mutating the ordered activity ledger. The positions API
     // is no longer an overwrite authority (#544).
@@ -939,7 +1005,6 @@ async fn main() -> Result<()> {
     }
 
     let mut orch = Orchestrator::new(
-        trade_rx,
         live_watchlist.clone(),
         OrchestratorConfig {
             bankroll,
@@ -974,6 +1039,12 @@ async fn main() -> Result<()> {
         book_fetcher,
     )
     .context("build orchestrator")?;
+    if financial_start.is_some() {
+        orch.configure_financial_log_paths(
+            cfg.event_log_path.clone(),
+            cfg.source_event_log_path.clone(),
+        );
+    }
     orch.resume_pending_before_producers()
         .await
         .context("resume decision_pending before source producers")?;
@@ -992,18 +1063,30 @@ async fn main() -> Result<()> {
     // is moved into the resolution task below; `None` when not in authoritative mode.
     let supabase_rpc_calls = supabase_state.as_ref().map(|c| c.call_counter());
 
-    // Resolution polling task: periodically fetch Gamma for closed markets. In authoritative
-    // mode (issue #397) it credits via the `apply_resolution` RPC; `sink_handle` is `None`,
-    // so the best-effort `send_resolution` nudge is suppressed.
-    let resolution_poller = run_resolution_poller(
-        paper_state.clone(),
-        cfg.gamma_base_url.clone(),
-        cfg.gamma_resolution_poll_interval_secs,
-        sink_handle.clone(),
-        supabase_state,
-        shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
-    );
-    supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
+    if financial_start.is_some() {
+        let resolution_poller = run_financial_resolution_poller(
+            paper_state.clone(),
+            cfg.polymarket_clob_base_url.clone(),
+            cfg.gamma_resolution_poll_interval_secs,
+            resolution_source_log,
+            control_tx.clone(),
+            shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
+        );
+        supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
+    } else {
+        // Pre-Start rehearsal uses the same CLOB resolver but retains the legacy local/remote
+        // mutation path. It cannot write a schema-two Prepared.
+        let resolution_poller = run_resolution_poller(
+            paper_state.clone(),
+            cfg.polymarket_clob_base_url.clone(),
+            cfg.gamma_resolution_poll_interval_secs,
+            resolution_source_log,
+            sink_handle.clone(),
+            supabase_state,
+            shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
+        );
+        supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
+    }
 
     // Live-watchlist refresh task (#339): poll Supabase on the configured interval and refresh
     // the scores of the live set (score-update-only, #350 WS1). Spawned only when configured.
@@ -1225,7 +1308,6 @@ async fn main() -> Result<()> {
     drop(producer_start_tx);
     drop(admission_preparer);
     drop(control_tx);
-    drop(trade_tx);
 
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
     shutdown_timed_out |=
@@ -1355,6 +1437,7 @@ fn build_identity() -> &'static str {
 /// The idempotency-key PK backstop and organic cursor re-warm cover the gaps on restart.
 fn run_rebuild_state() -> Result<()> {
     let cfg = load_config()?;
+    ensure_pre_start_paper_log(&cfg.event_log_path, "--rebuild-state")?;
     // #511: frame-only reconstruction cannot know authority dispositions (a refused or
     // ambiguously-failed frame would resurrect locally and diverge from Supabase).
     // Rebuild is a LEGACY-mode tool.
@@ -1444,6 +1527,7 @@ fn run_rollback_paper_v1() -> Result<()> {
 /// schema is applied and before flipping `PE_SUPABASE_AUTHORITATIVE`.
 async fn run_backfill_supabase() -> Result<()> {
     let cfg = load_config()?;
+    ensure_pre_start_paper_log(&cfg.event_log_path, "--backfill-supabase")?;
     anyhow::ensure!(
         !cfg.supabase_url.is_empty(),
         "--backfill-supabase requires PE_SUPABASE_URL"
@@ -1479,6 +1563,20 @@ async fn run_backfill_supabase() -> Result<()> {
     println!("  paper_fills HWM:            {}", counts.fills_hwm);
     println!("  supabase watermark (head):  {}", counts.watermark);
     std::process::exit(0);
+}
+
+fn ensure_pre_start_paper_log(path: &std::path::Path, operation: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let era = paper_era(
+        scan_paper_log(path).with_context(|| format!("verify paper log before {operation}"))?,
+    );
+    anyhow::ensure!(
+        era.start.is_none(),
+        "{operation} is refused after QualificationStarted; preserve the era and roll forward"
+    );
+    Ok(())
 }
 
 /// Print P&L report from the existing paper-state DB and exit.
@@ -1529,19 +1627,117 @@ fn load_config() -> Result<ServiceConfig> {
     })
 }
 
-/// Periodically fetch Gamma resolutions for all open positions and credit the bankroll.
+/// Poll the same CLOB per-condition evidence used by live resolution, append each successful
+/// response exactly once, and hand only resolved canonical vectors to the paper serializer.
+async fn run_financial_resolution_poller(
+    paper_state: Arc<PaperStateDb>,
+    clob_base_url: String,
+    poll_interval_secs: u64,
+    source_log: pe_service::activity_ingest::SourceLogHandle,
+    control: mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> TaskResult {
+    let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50);
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return Ok(TaskExit::CleanShutdown),
+            () = tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(1))) => {}
+        }
+        if let Err(error) = tick_financial_resolution(
+            &paper_state,
+            &clob_base_url,
+            &fetcher,
+            &source_log,
+            &control,
+        )
+        .await
+        {
+            warn!(error = %error, "financial resolution poll error");
+        }
+    }
+}
+
+async fn tick_financial_resolution(
+    paper_state: &PaperStateDb,
+    clob_base_url: &str,
+    fetcher: &ReqwestFetcher,
+    source_log: &pe_service::activity_ingest::SourceLogHandle,
+    control: &mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
+) -> Result<()> {
+    let now = OffsetDateTime::now_utc();
+    let snapshot = paper_state
+        .financial_snapshot(now.unix_timestamp())
+        .context("read financial resolution snapshot")?;
+    let conditions = snapshot
+        .positions
+        .into_iter()
+        .map(|position| position.market_id.0.0)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for condition in conditions.into_iter().map(PolymarketConditionId) {
+        let observed_at = OffsetDateTime::now_utc();
+        let url = format!(
+            "{}/markets/{}",
+            clob_base_url.trim_end_matches('/'),
+            condition.0
+        );
+        let body = fetcher
+            .fetch_page(&url)
+            .await
+            .with_context(|| format!("fetch CLOB resolution {}", condition.0))?;
+        let received_at = OffsetDateTime::now_utc();
+        let receipt = source_log
+            .append(EnvelopeIn {
+                source_id: SourceId("polymarket.clob.market".to_owned()),
+                schema_version: CLOB_RESOLUTION_SCHEMA_VERSION,
+                parser_version: CLOB_RESOLUTION_PARSER_VERSION,
+                observed_at: SourceTimestamp(observed_at),
+                received_at: ReceivedAt(received_at),
+                content_type: ContentType::Json,
+                payload: body.clone(),
+            })
+            .await
+            .context("append CLOB resolution response")?;
+        let parsed = parse_clob_market(&body).context("parse CLOB resolution response")?;
+        anyhow::ensure!(
+            parsed.condition_id.as_deref() == Some(condition.0.as_str()),
+            "CLOB resolution condition differs from request"
+        );
+        let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
+            continue;
+        };
+        let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
+        control
+            .send(
+                pe_service::orchestrator_control::OrchestratorControl::ResolutionCandidate {
+                    condition,
+                    payout_by_outcome_index_json: payout.canonical_json(),
+                    receipt,
+                    acknowledged,
+                },
+            )
+            .await
+            .context("send paper resolution candidate")?;
+        acknowledgement
+            .await
+            .context("paper resolution acknowledgement dropped")?
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// Periodically fetch CLOB resolutions for pre-Start rehearsal books.
 async fn run_resolution_poller(
     paper_state: Arc<PaperStateDb>,
-    gamma_base_url: String,
+    clob_base_url: String,
     poll_interval_secs: u64,
+    source_log: pe_service::activity_ingest::SourceLogHandle,
     sink: Option<SinkHandle>,
     supabase_state: Option<SupabaseStateClient>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> TaskResult {
-    let fetcher = GammaResolutionFetcher::new(
-        gamma_base_url,
-        ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50),
-    );
+    let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -1550,7 +1746,9 @@ async fn run_resolution_poller(
         }
         if let Err(error) = tick_resolution(
             &paper_state,
+            &clob_base_url,
             &fetcher,
+            &source_log,
             sink.as_ref(),
             supabase_state.as_ref(),
         )
@@ -1563,7 +1761,9 @@ async fn run_resolution_poller(
 
 async fn tick_resolution(
     paper_state: &Arc<PaperStateDb>,
-    fetcher: &GammaResolutionFetcher<ReqwestFetcher>,
+    clob_base_url: &str,
+    fetcher: &ReqwestFetcher,
+    source_log: &pe_service::activity_ingest::SourceLogHandle,
     sink: Option<&SinkHandle>,
     supabase_state: Option<&SupabaseStateClient>,
 ) -> Result<()> {
@@ -1575,9 +1775,10 @@ async fn tick_resolution(
     // Collect market IDs with open positions that have not been settled yet.
     let pending: Vec<pe_core_types::MarketId> = positions
         .iter()
-        .map(|p| p.market_id.clone())
-        .collect::<std::collections::HashSet<_>>()
+        .map(|position| position.market_id.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
+        .map(|market| pe_core_types::MarketId(pe_core_types::VenueMarketId(market)))
         .filter(|mid| !store.is_settled(mid))
         .collect();
 
@@ -1585,17 +1786,45 @@ async fn tick_resolution(
         return Ok(());
     }
 
-    let resolved = fetcher
-        .fetch_closed(&pending)
-        .await
-        .context("fetch resolutions")?;
-
-    let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-    let any_settled = !resolved.is_empty();
-    for res in resolved {
+    let mut any_settled = false;
+    for market_id in pending {
+        let condition = PolymarketConditionId(market_id.0.0.clone());
+        let observed_at = OffsetDateTime::now_utc();
+        let url = format!(
+            "{}/markets/{}",
+            clob_base_url.trim_end_matches('/'),
+            condition.0
+        );
+        let body = fetcher
+            .fetch_page(&url)
+            .await
+            .with_context(|| format!("fetch CLOB resolution {}", condition.0))?;
+        let received_at = OffsetDateTime::now_utc();
+        source_log
+            .append(EnvelopeIn {
+                source_id: SourceId("polymarket.clob.market".to_owned()),
+                schema_version: CLOB_RESOLUTION_SCHEMA_VERSION,
+                parser_version: CLOB_RESOLUTION_PARSER_VERSION,
+                observed_at: SourceTimestamp(observed_at),
+                received_at: ReceivedAt(received_at),
+                content_type: ContentType::Json,
+                payload: body.clone(),
+            })
+            .await
+            .context("append rehearsal CLOB resolution response")?;
+        let parsed = parse_clob_market(&body).context("parse rehearsal CLOB resolution")?;
+        anyhow::ensure!(
+            parsed.condition_id.as_deref() == Some(condition.0.as_str()),
+            "CLOB resolution condition differs from request"
+        );
+        let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
+            continue;
+        };
+        let outcome_prices = payout.decimals();
+        let now_unix = received_at.unix_timestamp();
         let market_positions: Vec<_> = positions
             .iter()
-            .filter(|p| p.market_id == res.market_id)
+            .filter(|p| p.market_id == market_id)
             .cloned()
             .collect();
         let credit;
@@ -1609,21 +1838,21 @@ async fn tick_resolution(
             match apply_resolution_authoritative(
                 sup,
                 &mut store,
-                &res.market_id,
-                &res.outcome_prices,
+                &market_id,
+                outcome_prices,
                 now_unix,
             )
             .await
             {
                 Ok(_bankroll) => {
                     credit = store
-                        .settled_credit(&res.market_id)
+                        .settled_credit(&market_id)
                         .unwrap_or(rust_decimal::Decimal::ZERO);
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        market = %res.market_id,
+                        market = %market_id,
                         "authoritative apply_resolution failed; leaving unsettled for next-tick retry"
                     );
                     continue;
@@ -1635,29 +1864,30 @@ async fn tick_resolution(
             // an outside read and the settle can no longer be silently uncredited.
             let (applied_credit, _bankroll) = paper_state
                 .settle_and_credit_from_positions(
-                    &res.market_id,
+                    &market_id,
                     &serde_json::to_string(
-                        &res.outcome_prices
+                        &outcome_prices
                             .iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>(),
                     )
                     .context("encode outcome prices")?,
                     now_unix,
-                    |positions| PnlLedger::resolution_credit(positions, &res.outcome_prices),
+                    |positions| PnlLedger::resolution_credit(positions, outcome_prices),
                 )
                 .context("settle and credit")?;
             credit = applied_credit;
             store
                 .note_settled(
-                    res.market_id.clone(),
-                    res.outcome_prices.clone(),
+                    market_id.clone(),
+                    outcome_prices.to_vec(),
                     applied_credit,
                     now_unix,
                 )
                 .context("note settled")?;
         }
-        tracing::info!(market = %res.market_id, %credit, "resolution applied");
+        any_settled = true;
+        tracing::info!(market = %market_id, %credit, "resolution applied");
     }
     // Nudge the Supabase sink once per tick to re-upsert the settled set (canonical JSON).
     if any_settled && let Some(sink) = sink {

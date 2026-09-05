@@ -8,11 +8,19 @@
 
 use std::sync::Arc;
 
+#[cfg(not(test))]
+use pe_core_types::PolymarketConditionId;
 use pe_core_types::WalletAddress;
+#[cfg(not(test))]
+use pe_event_log::AppendReceipt;
+#[cfg(not(test))]
+use pe_risk_engine::RiskHaltCause;
 use pe_source_polymarket_public::ActivityAggregate;
 use tokio::sync::oneshot;
 
 use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
+#[cfg(not(test))]
+use crate::paper_recovery::{HaltState, MembershipChange, RiskHaltOwner};
 use crate::position_seeder::AnchorInstall;
 
 /// Exact single-owner ledger capture used by the causal bracket.
@@ -50,5 +58,42 @@ pub enum OrchestratorControl {
         aggregates: Vec<ActivityAggregate>,
         context: Arc<BucketDecisionContext>,
         committed: oneshot::Sender<Result<BucketCommitResult, String>>,
+    },
+    /// CLOB resolution evidence was durably appended by the caller. The orchestrator
+    /// serializes its Prepared/authority/local/Final financial transition.
+    #[cfg(not(test))]
+    ResolutionCandidate {
+        condition: PolymarketConditionId,
+        payout_by_outcome_index_json: String,
+        receipt: AppendReceipt,
+        acknowledged: oneshot::Sender<Result<(), String>>,
+    },
+    /// Publish one structural membership transition after its paper record synchronizes.
+    #[cfg(not(test))]
+    PublishMembership {
+        change: MembershipChange,
+        acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
+    },
+    /// Append one risk-cause edge before acknowledging it to the producer.
+    #[cfg(not(test))]
+    RiskHaltChange {
+        owner: RiskHaltOwner,
+        cause: RiskHaltCause,
+        state: HaltState,
+        evidence: serde_json::Value,
+        acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
+    },
+    /// Daily mark producer handoff. Lane D owns mark construction semantics.
+    #[cfg(not(test))]
+    DailyBoundary {
+        cutoff_unix: i64,
+        boundary_receipt: AppendReceipt,
+        acknowledged: oneshot::Sender<Result<(), String>>,
+    },
+    /// Qualification seal producer handoff. Lane F owns the verifier semantics.
+    #[cfg(not(test))]
+    SealCheck {
+        proposed_hash: String,
+        acknowledged: oneshot::Sender<Result<(), String>>,
     },
 }

@@ -175,7 +175,7 @@ async fn scenario_e2e_clean_exit() {
     trade_tx.send(make_trade(wallet)).await.unwrap();
     drop(trade_tx);
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
@@ -248,7 +248,7 @@ async fn scenario_graceful_shutdown() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     shutdown_tx.send(()).unwrap();
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {

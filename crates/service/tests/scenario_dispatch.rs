@@ -272,7 +272,7 @@ async fn run_trade(
     trade_tx.send(trade).await.unwrap();
     drop(trade_tx);
 
-    let orchestrator = Orchestrator::new(
+    let orchestrator = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {

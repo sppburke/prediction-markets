@@ -5,7 +5,7 @@
 //! `PaperFill` / `PositionSnapshot` types from the strategy and signal crates, which
 //! `paper-state` deliberately does not depend on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -34,7 +34,8 @@ use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pendi
 use crate::position_seeder::ledger_capture;
 use crate::supabase_sink::supabase_fill_from;
 
-pub const PAPER_LOG_SCHEMA_VERSION: u32 = 2;
+pub const PAPER_LOG_SCHEMA_VERSION_V2: u32 = 2;
+pub const PAPER_LOG_SCHEMA_VERSION: u32 = PAPER_LOG_SCHEMA_VERSION_V2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
@@ -139,12 +140,36 @@ pub enum MembershipReason {
     KnockoutUnderperformance,
     RankerRotation,
     CapacityChange,
-    FenceRemoval,
-    ScoreRefresh,
     Initial,
 }
 
+/// Structural membership publication passed through the orchestrator writer lock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipChange {
+    pub reason: MembershipReason,
+    pub removed: Vec<WalletAddress>,
+    pub added: Vec<WalletAddress>,
+    pub capacity: usize,
+    pub ranking_batch_id: Option<i64>,
+    pub evidence: serde_json::Value,
+}
+
+impl MembershipChange {
+    #[must_use]
+    pub fn into_record(self) -> PaperLogRecord {
+        PaperLogRecord::MembershipChanged {
+            reason: self.reason,
+            removed: self.removed,
+            added: self.added,
+            capacity: self.capacity,
+            ranking_batch_id: self.ranking_batch_id,
+            evidence: self.evidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "account")]
 pub enum RiskHaltOwner {
     Paper,
@@ -156,6 +181,34 @@ pub enum RiskHaltOwner {
 pub enum HaltState {
     Engaged,
     Released,
+}
+
+/// Rebuild the active risk-cause set from the current financial era. SQLite metadata is
+/// deliberately not involved; the synchronized paper prefix remains the sole owner.
+#[must_use]
+pub fn active_risk_halts(era: &PaperEra) -> HashSet<(RiskHaltOwner, RiskHaltCause)> {
+    let mut active = HashSet::new();
+    for frame in &era.frames {
+        let PaperLogFrame::Record(PaperLogRecord::RiskHaltChanged {
+            owner,
+            cause,
+            state,
+            ..
+        }) = &frame.frame
+        else {
+            continue;
+        };
+        let key = (owner.clone(), *cause);
+        match state {
+            HaltState::Engaged => {
+                active.insert(key);
+            }
+            HaltState::Released => {
+                active.remove(&key);
+            }
+        }
+    }
+    active
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +319,8 @@ pub enum PaperLogScanError {
     },
     #[error("paper log contains distinct qualification starts")]
     ConflictingStart,
+    #[error("paper financial protocol is invalid at sequence {sequence}: {reason}")]
+    FinancialProtocol { sequence: u64, reason: String },
 }
 
 pub fn scan_paper_log(path: &Path) -> Result<Vec<ScannedPaperFrame>, PaperLogScanError> {
@@ -303,6 +358,7 @@ pub fn scan_paper_log(path: &Path) -> Result<Vec<ScannedPaperFrame>, PaperLogSca
         });
     }
     validate_qualification_starts(&frames)?;
+    validate_financial_pairs(&frames)?;
     Ok(frames)
 }
 
@@ -354,6 +410,106 @@ fn validate_qualification_starts(frames: &[ScannedPaperFrame]) -> Result<(), Pap
             None => start = Some(candidate),
             Some(established) if established == candidate.as_ref() => {}
             Some(_) => return Err(PaperLogScanError::ConflictingStart),
+        }
+    }
+    Ok(())
+}
+
+fn validate_financial_pairs(frames: &[ScannedPaperFrame]) -> Result<(), PaperLogScanError> {
+    let mut prepared = Vec::<(AppendReceipt, &FinancialPayload)>::new();
+    let mut finalized = Vec::<AppendReceipt>::new();
+    let mut unmatched = None::<AppendReceipt>;
+    let mut completed = None::<EventSeq>;
+    let mut active_start = None::<AppendReceipt>;
+    for frame in frames {
+        match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
+                if active_start.is_none() =>
+            {
+                // An equal Start payload can be observed again after an interrupted seeding
+                // attempt, but it does not establish a new era or reset financial ordering.
+                // `validate_qualification_starts` has already rejected a distinct payload.
+                active_start = Some(frame.receipt);
+                unmatched = None;
+                completed = None;
+            }
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_)) => {}
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                expected_authority,
+                payload,
+            }) => {
+                let Some(start) = active_start else {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "Prepared precedes QualificationStarted".to_owned(),
+                    });
+                };
+                if unmatched.is_some() {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "later Prepared overtakes an unmatched Prepared".to_owned(),
+                    });
+                }
+                if expected_authority.qualification_start_receipt != start
+                    || expected_authority.prior_completed_prepared_sequence != completed
+                {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "Prepared Start or predecessor differs from the verified prefix"
+                            .to_owned(),
+                    });
+                }
+                prepared.push((frame.receipt, payload));
+                unmatched = Some(frame.receipt);
+            }
+            PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                prepared_receipt,
+                result,
+            }) => {
+                let Some((_, payload)) = prepared
+                    .iter()
+                    .find(|(receipt, _)| receipt == prepared_receipt)
+                else {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "Final references no earlier Prepared receipt".to_owned(),
+                    });
+                };
+                if finalized.contains(prepared_receipt) {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "Prepared receipt has more than one Final".to_owned(),
+                    });
+                }
+                finalized.push(*prepared_receipt);
+                let kind_matches = matches!(
+                    (payload, result),
+                    (FinancialPayload::Fill { .. }, FinancialResult::Fill { .. })
+                        | (
+                            FinancialPayload::Resolution { .. },
+                            FinancialResult::Resolution { .. }
+                        )
+                );
+                let applied_sequence = match result {
+                    FinancialResult::Fill { canonical } => canonical.applied_prepared_seq,
+                    FinancialResult::Resolution { canonical } => canonical.applied_prepared_seq,
+                };
+                if !kind_matches || applied_sequence != prepared_receipt.sequence {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "Final kind or applied Prepared sequence differs".to_owned(),
+                    });
+                }
+                if unmatched != Some(*prepared_receipt) {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "Final does not complete the oldest unmatched Prepared".to_owned(),
+                    });
+                }
+                unmatched = None;
+                completed = Some(prepared_receipt.sequence);
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -548,10 +704,18 @@ mod paper_log_tests {
     }
 
     fn prepared(source_trade_id: &str) -> PaperLogRecord {
+        prepared_after(receipt(0), None, source_trade_id)
+    }
+
+    fn prepared_after(
+        start_receipt: AppendReceipt,
+        prior: Option<EventSeq>,
+        source_trade_id: &str,
+    ) -> PaperLogRecord {
         PaperLogRecord::FinancialPrepared {
             expected_authority: ExpectedAuthority {
-                qualification_start_receipt: receipt(0),
-                prior_completed_prepared_sequence: None,
+                qualification_start_receipt: start_receipt,
+                prior_completed_prepared_sequence: prior,
             },
             payload: FinancialPayload::Fill {
                 operation: PaperFillOperationIdentity {
@@ -700,8 +864,6 @@ mod paper_log_tests {
             MembershipReason::KnockoutUnderperformance,
             MembershipReason::RankerRotation,
             MembershipReason::CapacityChange,
-            MembershipReason::FenceRemoval,
-            MembershipReason::ScoreRefresh,
             MembershipReason::Initial,
         ] {
             let bytes = serde_json::to_vec(&reason).unwrap();
@@ -783,7 +945,7 @@ mod paper_log_tests {
         let dir = tempdir().unwrap();
         let zero_path = dir.path().join("zero.log");
         let mut zero = Writer::open(&zero_path).unwrap();
-        append(&mut zero, PAPER_LOG_SCHEMA_VERSION, &prepared("pre"));
+        append(&mut zero, 1, &legacy_fill());
         drop(zero);
         let zero = paper_era(scan_paper_log(&zero_path).unwrap());
         assert!(zero.start.is_none());
@@ -791,7 +953,7 @@ mod paper_log_tests {
 
         let one_path = dir.path().join("one.log");
         let mut one = Writer::open(&one_path).unwrap();
-        append(&mut one, PAPER_LOG_SCHEMA_VERSION, &prepared("audit-only"));
+        append(&mut one, 1, &legacy_fill());
         let first = append(
             &mut one,
             PAPER_LOG_SCHEMA_VERSION,
@@ -833,12 +995,16 @@ mod paper_log_tests {
 
         let one_path = dir.path().join("one-prepared.log");
         let mut writer = Writer::open(&one_path).unwrap();
-        append(
+        let start_receipt = append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
             &PaperLogRecord::QualificationStarted(Box::new(start("era"))),
         );
-        let only = append(&mut writer, PAPER_LOG_SCHEMA_VERSION, &prepared("only"));
+        let only = append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &prepared_after(start_receipt, None, "only"),
+        );
         drop(writer);
         let one = paper_era(scan_paper_log(&one_path).unwrap());
         assert_eq!(
@@ -848,23 +1014,39 @@ mod paper_log_tests {
 
         let two_path = dir.path().join("two-prepared.log");
         let mut writer = Writer::open(&two_path).unwrap();
-        append(
+        let start_receipt = append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
             &PaperLogRecord::QualificationStarted(Box::new(start("era"))),
         );
-        let first = append(&mut writer, PAPER_LOG_SCHEMA_VERSION, &prepared("first"));
-        append(&mut writer, PAPER_LOG_SCHEMA_VERSION, &prepared("second"));
-        drop(writer);
-        let era = paper_era(scan_paper_log(&two_path).unwrap());
-        assert_eq!(
-            oldest_unmatched_prepared(&era).map(|frame| frame.receipt),
-            Some(first)
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &prepared_after(start_receipt, None, "first"),
         );
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &prepared_after(start_receipt, None, "second"),
+        );
+        drop(writer);
+        assert!(matches!(
+            scan_paper_log(&two_path),
+            Err(PaperLogScanError::FinancialProtocol { .. })
+        ));
 
         let completed_path = dir.path().join("completed.log");
         let mut writer = Writer::open(&completed_path).unwrap();
-        let completed = append(&mut writer, PAPER_LOG_SCHEMA_VERSION, &prepared("done"));
+        let start_receipt = append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("completed"))),
+        );
+        let completed = append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &prepared_after(start_receipt, None, "done"),
+        );
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
@@ -873,6 +1055,46 @@ mod paper_log_tests {
         drop(writer);
         let completed = paper_era(scan_paper_log(&completed_path).unwrap());
         assert!(oldest_unmatched_prepared(&completed).is_none());
+    }
+
+    #[test]
+    fn active_risk_causes_rebuild_from_edges_after_start() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("risk.log");
+        let mut writer = Writer::open(&path).unwrap();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("risk"))),
+        );
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause: RiskHaltCause::AbsoluteLoss,
+                state: HaltState::Engaged,
+                evidence: serde_json::json!({"bound":"start"}),
+            },
+        );
+        let era = paper_era(scan_paper_log(&path).unwrap());
+        assert!(
+            active_risk_halts(&era).contains(&(RiskHaltOwner::Paper, RiskHaltCause::AbsoluteLoss))
+        );
+
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause: RiskHaltCause::AbsoluteLoss,
+                state: HaltState::Released,
+                evidence: serde_json::json!({"bound":"release"}),
+            },
+        );
+        drop(writer);
+        let era = paper_era(scan_paper_log(&path).unwrap());
+        assert!(active_risk_halts(&era).is_empty());
     }
 }
 
@@ -884,14 +1106,21 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
         return Ok(0);
     }
     let mut applied = 0usize;
-    let replay = Reader::replay(event_log_path)
-        .with_context(|| format!("open event log {}", event_log_path.display()))?;
+    let era = paper_era(
+        scan_paper_log(event_log_path)
+            .with_context(|| format!("scan paper log {}", event_log_path.display()))?,
+    );
+    anyhow::ensure!(
+        era.start.is_none(),
+        "blind local paper replay is forbidden after QualificationStarted"
+    );
     // `reconcile_fill` is itself idempotent (guards on `last_applied_event_seq` and the
     // `fills` PK), so every frame is offered to it; already-mirrored fills are skipped.
-    for frame in replay {
-        let (seq, envelope) = frame.context("read event-log frame")?;
-        let fill: PaperFill = serde_json::from_slice(&envelope.payload)
-            .with_context(|| format!("decode PaperFill at seq {}", seq.0))?;
+    for frame in era.frames {
+        let seq = frame.receipt.sequence;
+        let PaperLogFrame::LegacyFill(fill) = frame.frame else {
+            continue;
+        };
         let record = FillRecord {
             idempotency_key: fill.intent.idempotency_key.clone(),
             market_id: fill.intent.market_id.clone(),

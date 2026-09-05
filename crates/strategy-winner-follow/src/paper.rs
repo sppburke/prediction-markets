@@ -7,7 +7,7 @@
 use rust_decimal::Decimal;
 
 use pe_core_types::{EventSeq, Price, ReceivedAt, Side, SourceId, SourceTimestamp};
-use pe_event_log::{ContentType, EnvelopeIn, PoisonReason, Writer};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, PoisonReason, Writer};
 use pe_venue_core::OrderIntent;
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +104,29 @@ impl PaperExecutor {
     /// Typed durability state consumed by the service readiness/producer owner (#544).
     pub fn poisoned(&self) -> Option<&PoisonReason> {
         self.writer.poisoned()
+    }
+
+    /// Synchronize one caller-owned paper-log payload through this executor's sole writer.
+    ///
+    /// The service orchestrator owns the record schema and serialization. This narrow seam keeps
+    /// the pre-Start legacy executor and the post-Start financial protocol from opening competing
+    /// writers while the compatibility path is retired.
+    pub fn append_payload_synced(
+        &mut self,
+        schema_version: u32,
+        parser_version: u32,
+        observed_at: SourceTimestamp,
+        payload: Vec<u8>,
+    ) -> Result<AppendReceipt, PaperExecutionError> {
+        Ok(self.writer.append_synced(EnvelopeIn {
+            source_id: self.source_id.clone(),
+            schema_version,
+            parser_version,
+            observed_at: observed_at.clone(),
+            received_at: ReceivedAt(observed_at.0),
+            content_type: ContentType::Json,
+            payload,
+        })?)
     }
 
     /// Record a paper fill to the event-log, using `observed_fill_price` when the caller

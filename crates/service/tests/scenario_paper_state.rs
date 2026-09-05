@@ -192,7 +192,7 @@ async fn run_trades(
     }
     drop(trade_tx);
 
-    let orch = Orchestrator::new(
+    let orch = Orchestrator::new_with_trade_input(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
