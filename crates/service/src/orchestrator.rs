@@ -857,18 +857,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let mut attempt = WinnerFollowRiskInputEvidence {
             financial_prefix: None,
             price_receipts: Vec::new(),
-            source_tail: None,
             evaluated_at_unix_ms: i64::MAX,
             proposed_debit,
             per_trade_cap_bps,
         };
-        let (paper_log_path, source_log_path) =
-            self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
-                ActivePaperRiskFailure::new(
-                    RiskInputsUnavailable::SnapshotSequenceMismatch,
-                    &attempt,
-                )
-            })?;
+        let (paper_log_path, _) = self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
         let source_receipt_millis = self.source_receipt_millis.as_ref().ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
@@ -915,16 +910,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 ActivePaperRiskFailure::new(RiskInputsUnavailable::Overflow, &attempt)
             })?;
         attempt.evaluated_at_unix_ms = evaluated_at_unix_ms;
-        let source_tail = Scanner::verify(&source_log_path).map_err(|_| {
-            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
-        })?;
-        let source_tail_sequence = source_tail.last_sequence.ok_or_else(|| {
-            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
-        })?;
-        attempt.source_tail = Some(pe_event_log::AppendReceipt {
-            sequence: source_tail_sequence,
-            this_hash: source_tail.last_hash,
-        });
         let observed = price_attempt
             .result
             .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?;

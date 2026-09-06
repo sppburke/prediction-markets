@@ -19,10 +19,11 @@ use std::time::Duration;
 use pe_core_types::{MarketId, MarketOutcomeId, Price, ReceivedAt, SourceTimestamp};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_source_polymarket_public::{
-    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
-    GammaMarketsClient, MarketFilter, MetadataPageEvidence, PageFetcher, ReqwestFetcher,
+    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, MarketFilter, MetadataPageEvidence, PageFetcher,
+    ReqwestFetcher,
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -35,6 +36,67 @@ const TTL: Duration = Duration::from_secs(60);
 /// Min spacing between requests on this fetcher: 50 ms ⇒ ≤ 20 req/s. See `_GLOSSARY`.
 /// (Batch concurrency is the client's `GAMMA_CONCURRENCY`; this gate still bounds actual throughput.)
 const GAMMA_MIN_INTERVAL_MS: u64 = 50;
+/// Schema two binds the Gamma response or failure to the exact request that the strict price
+/// acquisition consulted. Other Gamma source producers retain the legacy raw-page schema one.
+pub(crate) const GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const GAMMA_PRICE_ATTEMPT_PARSER_VERSION: u32 = 1;
+
+/// Durable request/result observation for one page consulted by a strict price acquisition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub(crate) enum GammaPriceAttemptRecord {
+    Page {
+        evidence: MetadataPageEvidence,
+        payload: Vec<u8>,
+        /// False when the enclosing batched fetch failed and therefore published none of its
+        /// otherwise valid response rows into the cache.
+        usable: bool,
+    },
+    Failure {
+        request_url: String,
+        error: String,
+    },
+}
+
+/// Parsed identity of the canonical open-only condition request emitted by the Gamma client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GammaPriceRequest {
+    pub base_url: String,
+    pub condition_ids: Vec<String>,
+}
+
+/// Recover and validate the exact requested conditions from a durable strict-price page record.
+pub(crate) fn gamma_price_request(request_url: &str) -> Option<GammaPriceRequest> {
+    const LIMIT: &str = "500";
+    let (base_url, query) = request_url.split_once("/markets?")?;
+    if base_url.is_empty() {
+        return None;
+    }
+    let parts = query.split('&').collect::<Vec<_>>();
+    let (limit, conditions) = parts.split_last()?;
+    if *limit != format!("limit={LIMIT}") || conditions.is_empty() {
+        return None;
+    }
+    let condition_ids = conditions
+        .iter()
+        .map(|part| part.strip_prefix("condition_ids=").map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    if condition_ids.iter().any(String::is_empty) {
+        return None;
+    }
+    let rebuilt = format!(
+        "{base_url}/markets?{}&limit={LIMIT}",
+        condition_ids
+            .iter()
+            .map(|id| format!("condition_ids={id}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    );
+    (rebuilt == request_url).then_some(GammaPriceRequest {
+        base_url: base_url.to_owned(),
+        condition_ids,
+    })
+}
 
 /// Per-market Gamma liquidity metadata captured alongside the mids, for the
 /// fill-time market-snapshot rows of WS2 (issue #350). It rides on the same
@@ -65,12 +127,88 @@ struct CachedEntry {
     conflicting: bool,
 }
 
+#[derive(Default)]
+struct EnsuredEntries {
+    entries: HashMap<MarketId, CachedEntry>,
+    missing_receipts: Vec<AppendReceipt>,
+}
+
+#[derive(Default)]
+struct RecordedGammaPages {
+    page_receipts: HashMap<(String, String), AppendReceipt>,
+    failure_receipts: Vec<(String, AppendReceipt)>,
+}
+
 /// Strict current-price evidence used by financial risk inputs (#545).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MidPriceObservation {
     pub price: Price,
     pub receipt: AppendReceipt,
     pub observed_unix: i64,
+}
+
+/// Receipt-bound market row consumed by the shared strict runtime/replay classifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StrictPriceInput {
+    pub strict_mids: Option<Vec<Price>>,
+    pub observed_at_unix_nanos: i128,
+    pub receipt: AppendReceipt,
+    pub conflicting: bool,
+}
+
+/// Classify one consulted page timestamp against the strict evaluation clock.
+pub(crate) fn classify_strict_price_time(
+    observed_at_unix_nanos: i128,
+    evaluated_at_unix_nanos: i128,
+) -> Result<(), RiskInputsUnavailable> {
+    if observed_at_unix_nanos > evaluated_at_unix_nanos {
+        return Err(RiskInputsUnavailable::PriceFuture);
+    }
+    let age_nanos = evaluated_at_unix_nanos
+        .checked_sub(observed_at_unix_nanos)
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    if age_nanos >= i128::try_from(TTL.as_nanos()).map_err(|_| RiskInputsUnavailable::Overflow)? {
+        return Err(RiskInputsUnavailable::PriceStale);
+    }
+    Ok(())
+}
+
+/// Apply the strict cache classifier in requested-position order. Qualification reconstructs these
+/// inputs from only the recorded acquisition receipts and calls this same function.
+pub(crate) fn classify_strict_prices(
+    ids: &[MarketOutcomeId],
+    evaluated_at_unix_nanos: i128,
+    entries: &HashMap<MarketId, StrictPriceInput>,
+) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
+    let mut output = BTreeMap::new();
+    for id in ids {
+        let entry = entries
+            .get(id.market())
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        if entry.conflicting {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        classify_strict_price_time(entry.observed_at_unix_nanos, evaluated_at_unix_nanos)?;
+        let outcome = usize::from(id.outcome().0);
+        let price = entry
+            .strict_mids
+            .as_ref()
+            .and_then(|prices| prices.get(outcome))
+            .copied()
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        output.insert(
+            (id.market().to_string(), id.outcome().0),
+            MidPriceObservation {
+                price,
+                receipt: entry.receipt,
+                observed_unix: i64::try_from(
+                    entry.observed_at_unix_nanos.div_euclid(1_000_000_000),
+                )
+                .map_err(|_| RiskInputsUnavailable::Overflow)?,
+            },
+        );
+    }
+    Ok(output)
 }
 
 /// One strict price acquisition, including the evidence available when validation fails.
@@ -172,6 +310,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     pub async fn fetch_mids(&self, market_ids: &[MarketId]) -> HashMap<MarketId, Vec<Decimal>> {
         self.ensure_entries(market_ids, &*self.clock)
             .await
+            .entries
             .into_iter()
             .map(|(id, entry)| (id, entry.mids))
             .collect()
@@ -189,6 +328,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     ) -> HashMap<MarketId, MidMarketSnapshot> {
         self.ensure_entries(market_ids, &*self.clock)
             .await
+            .entries
             .into_iter()
             .map(|(id, entry)| (id, entry.snapshot))
             .collect()
@@ -221,58 +361,38 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         let mut markets = ids.iter().map(|id| id.market().clone()).collect::<Vec<_>>();
         markets.sort_by_key(ToString::to_string);
         markets.dedup();
-        let _ = self.ensure_entries(&markets, &clock).await;
+        let ensured = self.ensure_entries(&markets, &clock).await;
 
         // The response pages are durably appended by `ensure_entries` and stamped from the same
         // clock; the one risk clock is taken only after that await so a newly fetched observation
         // cannot be newer than its validator.
         let evaluated_at = clock();
         let map = self.inner.lock().await;
-        let mut price_receipts = ids
-            .iter()
-            .filter_map(|id| map.get(id.market()).and_then(|entry| entry.receipt))
-            .collect::<Vec<_>>();
+        let mut price_receipts = ensured.missing_receipts;
+        price_receipts.extend(
+            ids.iter()
+                .filter_map(|id| map.get(id.market()).and_then(|entry| entry.receipt)),
+        );
         price_receipts.sort_by_key(|receipt| receipt.sequence);
         price_receipts.dedup();
-        let result = (|| {
-            let mut output = BTreeMap::new();
-            for id in ids {
-                let entry = map
-                    .get(id.market())
-                    .ok_or(RiskInputsUnavailable::PriceMissing)?;
-                if entry.conflicting {
-                    return Err(RiskInputsUnavailable::PriceConflict);
-                }
-                if entry.observed_at > evaluated_at {
-                    return Err(RiskInputsUnavailable::PriceFuture);
-                }
-                if evaluated_at - entry.observed_at
-                    >= time::Duration::seconds(
-                        i64::try_from(TTL.as_secs())
-                            .map_err(|_| RiskInputsUnavailable::Overflow)?,
-                    )
-                {
-                    return Err(RiskInputsUnavailable::PriceStale);
-                }
-                let receipt = entry.receipt.ok_or(RiskInputsUnavailable::PriceMissing)?;
-                let outcome = usize::from(id.outcome().0);
-                let price = entry
-                    .strict_mids
-                    .as_ref()
-                    .and_then(|prices| prices.get(outcome))
-                    .copied()
-                    .ok_or(RiskInputsUnavailable::PriceMissing)?;
-                output.insert(
-                    (id.market().to_string(), id.outcome().0),
-                    MidPriceObservation {
-                        price,
+        let result = {
+            let mut entries = HashMap::new();
+            for (market, entry) in map.iter() {
+                let Some(receipt) = entry.receipt else {
+                    continue;
+                };
+                entries.insert(
+                    market.clone(),
+                    StrictPriceInput {
+                        strict_mids: entry.strict_mids.clone(),
+                        observed_at_unix_nanos: entry.observed_at.unix_timestamp_nanos(),
                         receipt,
-                        observed_unix: entry.observed_at.unix_timestamp(),
+                        conflicting: entry.conflicting,
                     },
                 );
             }
-            Ok(output)
-        })();
+            classify_strict_prices(ids, evaluated_at.unix_timestamp_nanos(), &entries)
+        };
         StrictMidPriceAttempt {
             evaluated_at,
             price_receipts,
@@ -295,11 +415,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     /// `outcomePrices` is omitted, so the caller marks its unrealized P&L null.
     /// `clock` stamps every page appended by this call, so observation time and any later
     /// freshness validation share one origin (wall clock in production, the injected clock in tests).
-    async fn ensure_entries<C>(
-        &self,
-        market_ids: &[MarketId],
-        clock: C,
-    ) -> HashMap<MarketId, CachedEntry>
+    async fn ensure_entries<C>(&self, market_ids: &[MarketId], clock: C) -> EnsuredEntries
     where
         C: Fn() -> OffsetDateTime,
     {
@@ -323,7 +439,10 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         }
 
         if stale.is_empty() {
-            return out;
+            return EnsuredEntries {
+                entries: out,
+                missing_receipts: Vec::new(),
+            };
         }
 
         // Open query (no `&closed=true`) → live mids in `outcomePrices`. The client batches and
@@ -336,21 +455,67 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         {
             Ok(fetched) => fetched,
             Err(error) => {
-                if self.record_pages(&error.pages, clock()).await.is_err() {
-                    warn!("mid-cache: source log closed while recording rejected Gamma pages");
-                }
+                let missing_receipts = self
+                    .record_pages(&error.pages, &error.failed_requests, false, clock())
+                    .await
+                    .map(|recorded| {
+                        let mut receipts = recorded.page_receipts.into_values().collect::<Vec<_>>();
+                        receipts.extend(
+                            recorded
+                                .failure_receipts
+                                .into_iter()
+                                .map(|(_, receipt)| receipt),
+                        );
+                        receipts
+                    })
+                    .unwrap_or_else(|()| {
+                        warn!("mid-cache: source log closed while recording rejected Gamma pages");
+                        Vec::new()
+                    });
                 warn!(error = %error, stale = stale.len(), "mid-cache: batch fetch error, omitting this tick");
-                return out;
+                return EnsuredEntries {
+                    entries: out,
+                    missing_receipts,
+                };
             }
         };
         let observed = clock();
-        let receipts = match self.record_pages(&fetched.pages, observed).await {
-            Ok(receipts) => receipts,
+        let recorded = match self
+            .record_pages(&fetched.pages, &fetched.failed_requests, true, observed)
+            .await
+        {
+            Ok(recorded) => recorded,
             Err(()) => {
                 warn!("mid-cache: source log closed, omitting unrecorded Gamma prices");
-                return out;
+                return EnsuredEntries {
+                    entries: out,
+                    missing_receipts: Vec::new(),
+                };
             }
         };
+        let mut missing_receipts = recorded
+            .failure_receipts
+            .iter()
+            .map(|(_, receipt)| *receipt)
+            .collect::<Vec<_>>();
+        for (evidence, _) in &fetched.pages {
+            let Some(request) = gamma_price_request(&evidence.request_url) else {
+                continue;
+            };
+            if request.condition_ids.iter().any(|condition_id| {
+                fetched.condition_page_hashes.get(condition_id) != Some(&evidence.raw_page_hash)
+                    || fetched
+                        .markets
+                        .markets
+                        .get(condition_id)
+                        .is_none_or(|market| market.outcome_prices.is_none())
+            }) && let Some(receipt) = recorded
+                .page_receipts
+                .get(&(evidence.request_url.clone(), evidence.raw_page_hash.clone()))
+            {
+                missing_receipts.push(*receipt);
+            }
+        }
         let conflicts = fetched
             .conflicting_condition_ids
             .into_iter()
@@ -380,41 +545,86 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                 receipt: fetched
                     .condition_page_hashes
                     .get(&id.to_string())
-                    .and_then(|hash| receipts.get(hash))
+                    .and_then(|hash| {
+                        fetched.pages.iter().find_map(|(evidence, _)| {
+                            (evidence.raw_page_hash == *hash
+                                && gamma_price_request(&evidence.request_url).is_some_and(
+                                    |request| request.condition_ids.contains(&id.to_string()),
+                                ))
+                            .then_some((evidence.request_url.clone(), hash.clone()))
+                        })
+                    })
+                    .and_then(|key| recorded.page_receipts.get(&key))
                     .copied(),
                 conflicting: conflicts.contains(&id.to_string()),
             };
             map.insert(id.clone(), entry.clone());
             out.insert(id, entry);
         }
-        out
+        EnsuredEntries {
+            entries: out,
+            missing_receipts,
+        }
     }
 
     async fn record_pages(
         &self,
         pages: &[(MetadataPageEvidence, Vec<u8>)],
+        failed_requests: &[(String, String)],
+        usable: bool,
         observed: OffsetDateTime,
-    ) -> Result<HashMap<String, AppendReceipt>, ()> {
+    ) -> Result<RecordedGammaPages, ()> {
         let Some(source_log) = &self.source_log else {
-            return Ok(HashMap::new());
+            return Ok(RecordedGammaPages::default());
         };
-        let mut receipts = HashMap::new();
+        let mut recorded = RecordedGammaPages::default();
         for (evidence, payload) in pages {
+            let payload = serde_json::to_vec(&GammaPriceAttemptRecord::Page {
+                evidence: evidence.clone(),
+                payload: payload.clone(),
+                usable,
+            })
+            .map_err(|_| ())?;
             let receipt = source_log
                 .append(EnvelopeIn {
                     source_id: pe_core_types::SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
-                    schema_version: GAMMA_MARKETS_SCHEMA_VERSION,
-                    parser_version: GAMMA_MARKETS_PARSER_VERSION,
+                    schema_version: GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+                    parser_version: GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
                     observed_at: SourceTimestamp(observed),
                     received_at: ReceivedAt(observed),
                     content_type: ContentType::Json,
-                    payload: payload.clone(),
+                    payload,
                 })
                 .await
                 .map_err(|_| ())?;
-            receipts.insert(evidence.raw_page_hash.clone(), receipt);
+            recorded.page_receipts.insert(
+                (evidence.request_url.clone(), evidence.raw_page_hash.clone()),
+                receipt,
+            );
         }
-        Ok(receipts)
+        for (request_url, error) in failed_requests {
+            let payload = serde_json::to_vec(&GammaPriceAttemptRecord::Failure {
+                request_url: request_url.clone(),
+                error: error.clone(),
+            })
+            .map_err(|_| ())?;
+            let receipt = source_log
+                .append(EnvelopeIn {
+                    source_id: pe_core_types::SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
+                    schema_version: GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+                    parser_version: GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+                    observed_at: SourceTimestamp(observed),
+                    received_at: ReceivedAt(observed),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .await
+                .map_err(|_| ())?;
+            recorded
+                .failure_receipts
+                .push((request_url.clone(), receipt));
+        }
+        Ok(recorded)
     }
 }
 
@@ -422,13 +632,32 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::activity_ingest::ActivityIngest;
     use crate::health::new_shared_health_with_ws;
     use crate::source_event_sink::SourceEventSink;
     use pe_core_types::{EventSeq, OutcomeId};
     use pe_source_polymarket_public::FixtureFetcher;
     use time::macros::datetime;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Barrier, mpsc};
+
+    struct OverlappingFetcher {
+        barrier: Arc<Barrier>,
+        calls: AtomicUsize,
+    }
+
+    impl PageFetcher for OverlappingFetcher {
+        async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.barrier.wait().await;
+            let price = if call == 0 { "0.4" } else { "0.6" };
+            Ok(format!(
+                r#"[{{"conditionId":"0xoverlap","outcomePrices":"[\"{price}\",\"0.5\"]"}}]"#
+            )
+            .into_bytes())
+        }
+    }
 
     fn mid(s: &str) -> MarketId {
         s.parse().unwrap()
@@ -667,6 +896,131 @@ mod tests {
         assert_eq!(failed.price_receipts.len(), 1);
         ingest.abort();
         let _ = ingest.await;
+    }
+
+    /// PASS: a process-local cache restart cannot inherit an earlier valid page; the failed new
+    /// request records its own request-bound receipt and that receipt alone proves PriceMissing.
+    #[tokio::test]
+    async fn strict_post_restart_failure_records_only_the_failed_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let mut first_response = HashMap::new();
+        first_response.insert(
+            url(BASE, "0xrestart"),
+            br#"[{"conditionId":"0xrestart","outcomePrices":"[\"0.62\",\"0.38\"]"}]"#.to_vec(),
+        );
+        let first =
+            MidPriceCache::with_fetcher(FixtureFetcher::new(first_response), BASE.to_owned())
+                .with_source_log(source_log.clone());
+        let prior = first
+            .fetch_mids_strict(&[outcome("0xrestart", 0)])
+            .await
+            .unwrap();
+        let prior_receipt = prior.get(&("0xrestart".to_owned(), 0)).unwrap().receipt;
+        drop(first);
+
+        let restarted =
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), BASE.to_owned())
+                .with_source_log(source_log);
+        let failed = restarted
+            .fetch_mids_strict_attempt(&[outcome("0xrestart", 0)])
+            .await;
+
+        assert_eq!(failed.result, Err(RiskInputsUnavailable::PriceMissing));
+        assert_eq!(failed.price_receipts.len(), 1);
+        assert_ne!(failed.price_receipts[0], prior_receipt);
+        drop(restarted);
+        ingest.abort();
+        let _ = ingest.await;
+        let entries = pe_event_log::Reader::replay(&source_path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let failed_envelope = entries
+            .iter()
+            .find(|(sequence, _)| *sequence == failed.price_receipts[0].sequence)
+            .map(|(_, envelope)| envelope)
+            .unwrap();
+        assert_eq!(
+            failed_envelope.schema_version,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            serde_json::from_slice::<GammaPriceAttemptRecord>(&failed_envelope.payload).unwrap(),
+            GammaPriceAttemptRecord::Failure {
+                request_url: url(BASE, "0xrestart"),
+                error: format!("no fixture for URL: {}", url(BASE, "0xrestart")),
+            }
+        );
+    }
+
+    /// PASS: overlapping cloned fetches may publish in either order, but each strict attempt binds
+    /// only the receipt of the cache row it actually classified.
+    #[tokio::test]
+    async fn overlapping_clones_bind_the_price_row_each_attempt_classified() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let cache = MidPriceCache::with_fetcher(
+            OverlappingFetcher {
+                barrier: Arc::new(Barrier::new(2)),
+                calls: AtomicUsize::new(0),
+            },
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log);
+        let left = cache.clone();
+        let right = cache.clone();
+        let left_ids = [outcome("0xoverlap", 0)];
+        let right_ids = [outcome("0xoverlap", 0)];
+        let (left_attempt, right_attempt) = tokio::join!(
+            left.fetch_mids_strict_attempt(&left_ids),
+            right.fetch_mids_strict_attempt(&right_ids),
+        );
+
+        for attempt in [left_attempt, right_attempt] {
+            let observation = attempt
+                .result
+                .unwrap()
+                .get(&("0xoverlap".to_owned(), 0))
+                .copied()
+                .unwrap();
+            assert_eq!(attempt.price_receipts, vec![observation.receipt]);
+        }
+        drop(left);
+        drop(right);
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
+        assert_eq!(
+            pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
