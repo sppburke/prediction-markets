@@ -1122,6 +1122,25 @@ async fn main() -> Result<()> {
     // passed as `None`; the mode machine then cannot arm, while the paper orchestrator remains
     // fully operational. The account-tagged journal is a mode-0600 sibling of the paper log.
     if let Some(live_accounts) = live_accounts.clone() {
+        let qualification = match optional_arg_value(&args, "--qualification-report") {
+            Some(path) => {
+                match pe_service::live_mode::load_qualification_facts(&PathBuf::from(&path)) {
+                    Ok(report) => Some(report),
+                    Err(error) => {
+                        tracing::warn!(
+                            path,
+                            error = %error,
+                            "qualification report unavailable; live arming disabled"
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("--qualification-report was not supplied; live arming disabled");
+                None
+            }
+        };
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
             Err(error) => {
@@ -1176,6 +1195,7 @@ async fn main() -> Result<()> {
             live_accounts,
             live_watchlist: live_watchlist.clone(),
             runtime_config: live_runtime_config.clone(),
+            qualification,
             identity,
             journal: Arc::new(journal),
             journal_path,

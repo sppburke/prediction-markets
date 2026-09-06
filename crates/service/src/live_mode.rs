@@ -6,27 +6,72 @@
 //! requires ALL of: a decryptable credential bundle whose embedded binding matches the
 //! row; venue account state not `closed_only`; not geoblocked; balance AND allowance
 //! for BOTH V2 exchange spenders (standard + NegRisk) covering at least the account's
-//! posture; and an audited operator promotion-review record POST-DATING the Phase-D
-//! executor's first boot (the arming fence — D1 provably ships dark) that is not
-//! superseded by a later revocation. `requested_live_mode` alone never authorizes live.
+//! posture; a current seal/config/semantic-bound `Pass` report; and an audited operator
+//! review carrying that same seal POST-DATING the Phase-D executor's first boot (the
+//! arming fence — D1 provably ships dark) that is not superseded by a later revocation.
+//! `requested_live_mode` alone never authorizes live.
 //!
 //! Armed-account semantics (Decision 8, explicit): persistent invalid conditions —
-//! credentials, promotion record, `closed_only` — DEMOTE the effective mode to `off`
+//! credentials, qualification/report review evidence, `closed_only` — DEMOTE to `off`
 //! with an audited reason; transient evidence failures (venue query errors) refuse
 //! orders without demoting; a pending/ambiguous/failed redemption closes that account's
 //! new-BUY admission WITHOUT demoting (the explicit non-demoting exception).
 
+use std::path::Path;
+
 use serde::Deserialize;
 use time::OffsetDateTime;
+
+use crate::qualification::{QualificationReport, QualificationVerdict};
 
 /// One arming-condition evaluation. `Transient` failures never demote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
     Pass,
-    /// Persistent invalidity (bad credentials, revoked promotion, closed_only).
+    /// Persistent invalidity (bad credentials, qualification/review evidence, closed_only).
     PersistentFail(&'static str),
     /// Transient evidence failure (query error/timeout) — refuse orders, keep mode.
     Transient(&'static str),
+}
+
+/// Promotion-relevant fields extracted from the canonical sealed qualification report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualificationFacts {
+    verdict: QualificationVerdict,
+    seal_hash: String,
+    economic_configuration_hash: Option<String>,
+    financial_semantic_version: Option<u32>,
+}
+
+impl QualificationFacts {
+    /// Retain only the report fields that ordinary-live mode admission compares with runtime truth.
+    #[must_use]
+    pub fn from_report(report: &QualificationReport) -> Self {
+        Self {
+            verdict: report.verdict,
+            seal_hash: report.evidence.seal_hash.clone(),
+            economic_configuration_hash: report.evidence.hot_config_hash.clone(),
+            financial_semantic_version: report.evidence.financial_semantic_version,
+        }
+    }
+}
+
+/// Loading a qualification report is boot evidence collection, never an arming fallback.
+#[derive(Debug, thiserror::Error)]
+pub enum QualificationReportLoadError {
+    #[error("read qualification report: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("decode qualification report: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// Load the canonical report emitted by `pe-service --qualify`.
+pub fn load_qualification_facts(
+    path: &Path,
+) -> Result<QualificationFacts, QualificationReportLoadError> {
+    let bytes = std::fs::read(path)?;
+    let report = serde_json::from_slice::<QualificationReport>(&bytes)?;
+    Ok(QualificationFacts::from_report(&report))
 }
 
 /// Venue-side arming probes, trait-injected so the machine is testable without network
@@ -49,22 +94,35 @@ pub trait ArmingProbe {
 pub struct PromotionFacts {
     /// Newest `promotion_reviewed` event time (Unix), if any.
     pub latest_review_unix: Option<i64>,
+    /// Seal hash carried by that exact newest review. `None` is a legacy, unbound review.
+    pub latest_review_seal_hash: Option<String>,
     /// Newest `promotion_review_revoked` event time (Unix), if any.
     pub latest_revocation_unix: Option<i64>,
 }
 
 impl PromotionFacts {
-    /// Decision-8 validity predicate (round 5): a promotion record is valid iff it
-    /// post-dates the arming fence and is not superseded by a later revocation. No
-    /// time-based expiry in v1.
-    #[must_use]
-    pub fn valid_after_fence(&self, fence_unix: i64) -> bool {
-        match self.latest_review_unix {
-            Some(review) if review > fence_unix => {
-                self.latest_revocation_unix.is_none_or(|rev| rev < review)
-            }
-            _ => false,
+    /// A review is valid iff it post-dates the fence, remains unrevoked, and names the current
+    /// qualification seal. A pre-binding legacy review is persistent invalid evidence.
+    fn outcome_after_fence(&self, fence_unix: i64, seal_hash: &str) -> CheckOutcome {
+        let Some(review) = self
+            .latest_review_unix
+            .filter(|review| *review > fence_unix)
+        else {
+            return CheckOutcome::PersistentFail("no valid post-fence promotion review");
+        };
+        if self
+            .latest_revocation_unix
+            .is_some_and(|revocation| revocation >= review)
+        {
+            return CheckOutcome::PersistentFail("promotion review was revoked");
         }
+        let Some(review_seal_hash) = self.latest_review_seal_hash.as_deref() else {
+            return CheckOutcome::PersistentFail("legacy promotion review has no seal binding");
+        };
+        if review_seal_hash != seal_hash {
+            return CheckOutcome::PersistentFail("promotion review seal binding mismatches report");
+        }
+        CheckOutcome::Pass
     }
 }
 
@@ -75,6 +133,14 @@ pub struct ModeInputs<'a, P: ArmingProbe> {
     pub enabled: bool,
     /// Credential bundle decrypt + binding validation result (persistent when invalid).
     pub credentials: CheckOutcome,
+    /// Canonical `--qualify` report loaded by the running service. Missing is fail-closed.
+    pub qualification: Option<QualificationFacts>,
+    /// Latest `QualificationSealed` append hash in the verified current paper era.
+    pub current_seal_hash: Option<&'a str>,
+    /// Canonical hash of the economic runtime configuration currently applied by the service.
+    pub economic_configuration_hash: &'a str,
+    /// Financial semantics compiled into the running service.
+    pub financial_semantic_version: u32,
     pub promotion: &'a PromotionFacts,
     /// The arming fence; `None` = the executor has never booted (nothing may arm).
     pub fence_unix: Option<i64>,
@@ -121,10 +187,12 @@ pub fn evaluate_mode<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> ModeDecision
         };
     }
 
-    // Promotion-record validity (persistent when invalid).
-    let promotion_ok = inputs
-        .fence_unix
-        .is_some_and(|fence| inputs.promotion.valid_after_fence(fence));
+    let qualification = qualification_outcome(inputs);
+    let promotion = match (inputs.fence_unix, inputs.current_seal_hash) {
+        (Some(fence), Some(seal_hash)) => inputs.promotion.outcome_after_fence(fence, seal_hash),
+        (None, _) => CheckOutcome::PersistentFail("live executor arming fence is missing"),
+        (_, None) => CheckOutcome::PersistentFail("current qualification seal is missing"),
+    };
 
     // Gather the condition set.
     let checks = [
@@ -134,14 +202,11 @@ pub fn evaluate_mode<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> ModeDecision
             /* persistent-capable */ true,
         ),
         (
-            "promotion_record",
-            if promotion_ok {
-                CheckOutcome::Pass
-            } else {
-                CheckOutcome::PersistentFail("no valid post-fence promotion record")
-            },
-            true,
+            "qualification_report",
+            qualification,
+            /* persistent-capable */ true,
         ),
+        ("promotion_review", promotion, true),
         ("account_state", inputs.probe.account_state(), true),
         ("geoblock", inputs.probe.geoblock(), false),
         (
@@ -196,11 +261,38 @@ pub fn evaluate_mode<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> ModeDecision
     }
 }
 
+fn qualification_outcome<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> CheckOutcome {
+    let Some(report) = inputs.qualification.as_ref() else {
+        return CheckOutcome::PersistentFail("qualification report is missing");
+    };
+    if report.verdict != QualificationVerdict::Pass {
+        return CheckOutcome::PersistentFail("qualification report verdict is not Pass");
+    }
+    let Some(current_seal_hash) = inputs.current_seal_hash else {
+        return CheckOutcome::PersistentFail("current qualification seal is missing");
+    };
+    if report.seal_hash != current_seal_hash {
+        return CheckOutcome::PersistentFail("qualification report seal mismatches current seal");
+    }
+    if report.economic_configuration_hash.as_deref() != Some(inputs.economic_configuration_hash) {
+        return CheckOutcome::PersistentFail(
+            "qualification report economic configuration mismatches runtime",
+        );
+    }
+    if report.financial_semantic_version != Some(inputs.financial_semantic_version) {
+        return CheckOutcome::PersistentFail(
+            "qualification report financial semantics mismatch runtime",
+        );
+    }
+    CheckOutcome::Pass
+}
+
 /// One `account_events` row shape the promotion reader needs (PostgREST select).
 #[derive(Debug, Deserialize)]
 pub struct PromotionEventRow {
     pub event_kind: String,
     pub created_at: String,
+    pub evidence_ref: Option<String>,
 }
 
 /// Fold `account_events` rows (any order) into [`PromotionFacts`].
@@ -216,10 +308,19 @@ pub fn promotion_facts_from_rows(rows: &[PromotionEventRow]) -> PromotionFacts {
         };
         let unix = t.unix_timestamp();
         match row.event_kind.as_str() {
-            "promotion_reviewed" => {
-                facts.latest_review_unix =
-                    Some(facts.latest_review_unix.map_or(unix, |c| c.max(unix)));
+            "promotion_reviewed"
+                if facts
+                    .latest_review_unix
+                    .is_none_or(|current| unix > current) =>
+            {
+                facts.latest_review_unix = Some(unix);
+                facts.latest_review_seal_hash = row
+                    .evidence_ref
+                    .as_deref()
+                    .filter(|value| valid_seal_hash(value))
+                    .map(str::to_owned);
             }
+            "promotion_reviewed" => {}
             "promotion_review_revoked" => {
                 facts.latest_revocation_unix =
                     Some(facts.latest_revocation_unix.map_or(unix, |c| c.max(unix)));
@@ -230,9 +331,23 @@ pub fn promotion_facts_from_rows(rows: &[PromotionEventRow]) -> PromotionFacts {
     facts
 }
 
+fn valid_seal_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SEAL_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_SEAL_HASH: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const ECONOMIC_CONFIGURATION_HASH: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
 
     struct FixtureProbe {
         account_state: CheckOutcome,
@@ -268,7 +383,17 @@ mod tests {
     fn reviewed(after_fence: bool) -> PromotionFacts {
         PromotionFacts {
             latest_review_unix: Some(if after_fence { 2_000 } else { 500 }),
+            latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
             latest_revocation_unix: None,
+        }
+    }
+
+    fn passing_qualification() -> QualificationFacts {
+        QualificationFacts {
+            verdict: QualificationVerdict::Pass,
+            seal_hash: SEAL_HASH.to_owned(),
+            economic_configuration_hash: Some(ECONOMIC_CONFIGURATION_HASH.to_owned()),
+            financial_semantic_version: Some(FINANCIAL_SEMANTIC_VERSION),
         }
     }
 
@@ -284,6 +409,10 @@ mod tests {
             effective_live_mode: effective,
             enabled: true,
             credentials: creds,
+            qualification: Some(passing_qualification()),
+            current_seal_hash: Some(SEAL_HASH),
+            economic_configuration_hash: ECONOMIC_CONFIGURATION_HASH,
+            financial_semantic_version: FINANCIAL_SEMANTIC_VERSION,
             promotion,
             fence_unix: Some(1_000),
             already_armed_count: 0,
@@ -325,7 +454,7 @@ mod tests {
             &probe,
         ));
         assert!(
-            matches!(d, ModeDecision::RefuseOrders { ref reason } if reason.contains("promotion_record")),
+            matches!(d, ModeDecision::RefuseOrders { ref reason } if reason.contains("promotion_review")),
             "{d:?}"
         );
         // No fence recorded at all (executor never booted) likewise refuses.
@@ -342,6 +471,7 @@ mod tests {
         let probe = all_pass();
         let promo = PromotionFacts {
             latest_review_unix: Some(2_000),
+            latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
             latest_revocation_unix: Some(3_000), // later revocation supersedes
         };
         let d = evaluate_mode(&inputs(
@@ -353,15 +483,19 @@ mod tests {
         ));
         assert!(
             matches!(d, ModeDecision::SetEffective { mode: "off", ref reason }
-                if reason.contains("promotion_record")),
+                if reason.contains("promotion_review")),
             "{d:?}"
         );
         // A re-review AFTER the revocation is valid again.
         let promo2 = PromotionFacts {
             latest_review_unix: Some(4_000),
+            latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
             latest_revocation_unix: Some(3_000),
         };
-        assert!(promo2.valid_after_fence(1_000));
+        assert_eq!(
+            promo2.outcome_after_fence(1_000, SEAL_HASH),
+            CheckOutcome::Pass
+        );
     }
 
     #[test]
@@ -517,18 +651,140 @@ mod tests {
             PromotionEventRow {
                 event_kind: "promotion_reviewed".into(),
                 created_at: "2026-08-11T00:00:00Z".into(),
+                evidence_ref: Some(SEAL_HASH.to_owned()),
             },
             PromotionEventRow {
                 event_kind: "promotion_review_revoked".into(),
                 created_at: "2026-08-11T01:00:00Z".into(),
+                evidence_ref: None,
             },
             PromotionEventRow {
                 event_kind: "account_created".into(),
                 created_at: "2026-08-10T00:00:00Z".into(),
+                evidence_ref: None,
             },
         ];
         let facts = promotion_facts_from_rows(&rows);
         assert!(facts.latest_review_unix.is_some());
+        assert_eq!(facts.latest_review_seal_hash.as_deref(), Some(SEAL_HASH));
         assert!(facts.latest_revocation_unix > facts.latest_review_unix);
+    }
+
+    #[test]
+    fn legacy_unbound_review_is_a_persistent_failure() {
+        let probe = all_pass();
+        let promotion = promotion_facts_from_rows(&[PromotionEventRow {
+            event_kind: "promotion_reviewed".to_owned(),
+            created_at: "2026-08-11T00:00:00Z".to_owned(),
+            evidence_ref: Some("legacy-report-reference".to_owned()),
+        }]);
+        assert!(matches!(
+            promotion.outcome_after_fence(1_000, SEAL_HASH),
+            CheckOutcome::PersistentFail(_)
+        ));
+        let decision = evaluate_mode(&inputs(
+            "live_tiny",
+            "off",
+            CheckOutcome::Pass,
+            &promotion,
+            &probe,
+        ));
+        assert!(
+            matches!(decision, ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("promotion_review") && reason.contains("legacy")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_review_seal_is_a_persistent_failure() {
+        let probe = all_pass();
+        let mut promotion = reviewed(true);
+        promotion.latest_review_seal_hash = Some(OTHER_SEAL_HASH.to_owned());
+        assert!(matches!(
+            promotion.outcome_after_fence(1_000, SEAL_HASH),
+            CheckOutcome::PersistentFail(_)
+        ));
+        let decision = evaluate_mode(&inputs(
+            "live_tiny",
+            "off",
+            CheckOutcome::Pass,
+            &promotion,
+            &probe,
+        ));
+        assert!(
+            matches!(decision, ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("promotion_review") && reason.contains("mismatches")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn missing_qualification_report_is_a_persistent_failure() {
+        let probe = all_pass();
+        let promotion = reviewed(true);
+        let mut missing = inputs("live_tiny", "off", CheckOutcome::Pass, &promotion, &probe);
+        missing.qualification = None;
+        assert!(matches!(
+            qualification_outcome(&missing),
+            CheckOutcome::PersistentFail(_)
+        ));
+        let decision = evaluate_mode(&missing);
+        assert!(
+            matches!(decision, ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("qualification_report") && reason.contains("missing")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn non_pass_qualification_report_is_a_persistent_failure() {
+        let probe = all_pass();
+        let promotion = reviewed(true);
+        let mut not_pass = inputs("live_tiny", "off", CheckOutcome::Pass, &promotion, &probe);
+        let mut report = passing_qualification();
+        report.verdict = QualificationVerdict::Fail;
+        not_pass.qualification = Some(report);
+        assert!(matches!(
+            qualification_outcome(&not_pass),
+            CheckOutcome::PersistentFail(_)
+        ));
+        assert!(matches!(
+            evaluate_mode(&not_pass),
+            ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("qualification_report") && reason.contains("not Pass")
+        ));
+    }
+
+    #[test]
+    fn mismatched_report_identity_is_a_persistent_failure() {
+        let probe = all_pass();
+        let promotion = reviewed(true);
+
+        let mut seal_mismatch = inputs("live_tiny", "off", CheckOutcome::Pass, &promotion, &probe);
+        seal_mismatch.current_seal_hash = Some(OTHER_SEAL_HASH);
+        assert!(matches!(
+            evaluate_mode(&seal_mismatch),
+            ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("qualification_report") && reason.contains("seal mismatches")
+        ));
+
+        let mut economics_mismatch =
+            inputs("live_tiny", "off", CheckOutcome::Pass, &promotion, &probe);
+        economics_mismatch.economic_configuration_hash = OTHER_SEAL_HASH;
+        assert!(matches!(
+            evaluate_mode(&economics_mismatch),
+            ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("qualification_report") && reason.contains("economic")
+        ));
+
+        let mut semantics_mismatch =
+            inputs("live_tiny", "off", CheckOutcome::Pass, &promotion, &probe);
+        semantics_mismatch.financial_semantic_version = FINANCIAL_SEMANTIC_VERSION + 1;
+        assert!(matches!(
+            evaluate_mode(&semantics_mismatch),
+            ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("qualification_report") && reason.contains("semantics")
+        ));
     }
 }

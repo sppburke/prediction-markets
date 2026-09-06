@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
@@ -59,7 +59,7 @@ use crate::live_credentials::{
 };
 use crate::live_mode::{
     ArmingProbe, CheckOutcome, ModeDecision, ModeInputs, PromotionEventRow, PromotionFacts,
-    evaluate_mode, promotion_facts_from_rows,
+    QualificationFacts, evaluate_mode, promotion_facts_from_rows,
 };
 use crate::live_projections::{
     LiveAccountStateRow, LiveFillRow, LivePositionRow, LiveProjectionWriter,
@@ -73,7 +73,8 @@ use crate::mark_prices::HistoricalMarkAdapter;
 use crate::mid_price_cache::{MidPriceCache, MidPriceObservation};
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
-    HaltState, RiskHaltOwner, active_risk_halts, paper_era, scan_paper_log,
+    FINANCIAL_SEMANTIC_VERSION, HaltState, PaperLogFrame, PaperLogRecord, RiskHaltOwner,
+    active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::supabase_reader::auth_token;
@@ -96,6 +97,8 @@ pub struct LiveFanoutConfig {
     pub live_accounts: LiveAccounts,
     pub live_watchlist: LiveWatchlist,
     pub runtime_config: LiveRuntimeConfig,
+    /// Canonical report emitted by `--qualify`, loaded once through the boot path.
+    pub qualification: Option<QualificationFacts>,
     pub identity: Option<Identity>,
     pub journal: Arc<LiveJournal>,
     pub journal_path: PathBuf,
@@ -3426,6 +3429,7 @@ struct AccountPromotionRow {
     account_id: String,
     event_kind: String,
     created_at: String,
+    evidence_ref: Option<String>,
 }
 
 async fn fetch_promotions(
@@ -3457,6 +3461,7 @@ async fn fetch_promotions(
             .push(PromotionEventRow {
                 event_kind: row.event_kind,
                 created_at: row.created_at,
+                evidence_ref: row.evidence_ref,
             });
     }
     Ok(grouped
@@ -3467,9 +3472,22 @@ async fn fetch_promotions(
 
 fn promotion_events_url(supabase_url: &str) -> String {
     format!(
-        "{}/rest/v1/account_events?select=account_id,event_kind,created_at&event_kind=in.(promotion_reviewed,promotion_review_revoked)&order=created_at.desc&limit=50",
+        "{}/rest/v1/account_events?select=account_id,event_kind,created_at,evidence_ref&event_kind=in.(promotion_reviewed,promotion_review_revoked)&order=created_at.desc&limit=50",
         supabase_url.trim_end_matches('/')
     )
+}
+
+fn current_qualification_seal_hash(
+    paper_log_path: &Path,
+) -> Result<Option<String>, crate::paper_recovery::PaperLogScanError> {
+    let era = paper_era(scan_paper_log(paper_log_path)?);
+    Ok(era.frames.iter().rev().find_map(|frame| {
+        matches!(
+            frame.frame,
+            PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+        )
+        .then(|| frame.receipt.this_hash.to_hex().to_string())
+    }))
 }
 
 struct StaticProbe {
@@ -3536,6 +3554,14 @@ async fn drive_modes(state: &mut FanoutState, now: OffsetDateTime) {
             return;
         }
     };
+    let current_seal_hash = match current_qualification_seal_hash(&state.config.paper_log_path) {
+        Ok(seal_hash) => seal_hash,
+        Err(error) => {
+            warn!(error = %error, "qualification seal read failed; qualification evidence invalid");
+            None
+        }
+    };
+    let economic_configuration_hash = state.config.runtime_config.snapshot().canonical_hash();
     let mut armed_count = snapshot
         .accounts
         .iter()
@@ -3555,6 +3581,10 @@ async fn drive_modes(state: &mut FanoutState, now: OffsetDateTime) {
             effective_live_mode: &account.effective_live_mode,
             enabled: account.enabled,
             credentials: credential_outcome,
+            qualification: state.config.qualification.clone(),
+            current_seal_hash: current_seal_hash.as_deref(),
+            economic_configuration_hash: &economic_configuration_hash,
+            financial_semantic_version: FINANCIAL_SEMANTIC_VERSION,
             promotion: &facts,
             fence_unix: fence,
             already_armed_count,
@@ -5159,6 +5189,7 @@ mod tests {
     #[test]
     fn promotion_events_read_is_latest_first_and_bounded() {
         let url = promotion_events_url("https://example.test/");
+        assert!(url.contains("created_at,evidence_ref"));
         assert!(url.contains("order=created_at.desc"));
         assert!(url.ends_with("limit=50"));
     }
@@ -7133,6 +7164,7 @@ mod tests {
                 runtime_config: LiveRuntimeConfig::new(RuntimeConfig::from_service_config(
                     &ServiceConfig::default(),
                 )),
+                qualification: None,
                 identity,
                 journal,
                 journal_path,
