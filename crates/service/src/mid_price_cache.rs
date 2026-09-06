@@ -861,41 +861,71 @@ mod tests {
         );
     }
 
-    /// PASS: a cold-cache Gamma response is recorded before the strict freshness clock is taken,
-    /// and a later strict failure retains the response receipt it consumed.
+    /// PASS: with a clock that advances on every read, both a cold cache and a stale seeded entry
+    /// refetch, stamp the page from the read taken after the response, and evaluate on a later
+    /// read — the observation is never newer than its validator and the new receipt is recorded.
     #[tokio::test]
-    async fn strict_cold_fetch_uses_post_response_clock() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("source.log");
-        let (source_log, source_rx) = SourceLogHandle::channel(4);
-        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
-        let ingest = tokio::spawn(
-            ActivityIngest::poll_only(
-                SourceEventSink::open(&source_path).unwrap(),
-                source_rx,
-                trigger_tx,
-                new_shared_health_with_ws(false, false, 90),
-            )
-            .run(),
-        );
-        let mut fx = HashMap::new();
-        fx.insert(
-            url(BASE, "0xcold"),
-            br#"[{"conditionId":"0xcold","outcomePrices":"[\"0.62\",\"0.38\"]"}]"#.to_vec(),
-        );
-        let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_owned())
-            .with_source_log(source_log);
+    async fn strict_cold_and_stale_fetches_evaluate_after_the_response() {
+        for stale_seed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(4);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let mut fx = HashMap::new();
+            fx.insert(
+                url(BASE, "0xcold"),
+                br#"[{"conditionId":"0xcold","outcomePrices":"[\"0.62\",\"0.38\"]"}]"#.to_vec(),
+            );
+            let base = datetime!(2026-09-05 12:00 UTC);
+            let ticks = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            let clock_ticks = Arc::clone(&ticks);
+            let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_owned())
+                .with_source_log(source_log)
+                .with_clock(Arc::new(move || {
+                    base + time::Duration::seconds(
+                        clock_ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                    )
+                }));
+            if stale_seed {
+                insert_strict_entry(
+                    &cache,
+                    "0xcold",
+                    Some(vec![
+                        Price::new(Decimal::new(5, 1)).unwrap(),
+                        Price::new(Decimal::new(5, 1)).unwrap(),
+                    ]),
+                    base - time::Duration::seconds(61),
+                    None,
+                    false,
+                )
+                .await;
+            }
 
-        let result = cache.fetch_mids_strict(&[outcome("0xcold", 0)]).await;
+            let attempt = cache
+                .fetch_mids_strict_attempt(&[outcome("0xcold", 0)])
+                .await;
 
-        assert!(result.is_ok(), "{result:?}");
-        let failed = cache
-            .fetch_mids_strict_attempt(&[outcome("0xcold", 2)])
-            .await;
-        assert_eq!(failed.result, Err(RiskInputsUnavailable::PriceMissing));
-        assert_eq!(failed.price_receipts.len(), 1);
-        ingest.abort();
-        let _ = ingest.await;
+            assert!(
+                attempt.result.is_ok(),
+                "stale_seed={stale_seed}: {:?}",
+                attempt.result
+            );
+            assert_eq!(attempt.price_receipts.len(), 1, "stale_seed={stale_seed}");
+            // Reads: the refetch decision, the post-response stamp, then the evaluation instant.
+            assert_eq!(attempt.evaluated_at, base + time::Duration::seconds(2));
+            assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 3);
+            ingest.abort();
+            let _ = ingest.await;
+        }
     }
 
     /// PASS: a process-local cache restart cannot inherit an earlier valid page; the failed new
