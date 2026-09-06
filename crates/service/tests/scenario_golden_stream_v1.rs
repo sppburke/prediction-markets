@@ -1123,9 +1123,7 @@ fn assert_decision_preimage_rejected(
                     .unwrap(),
                 1
             );
-            format!(
-                "parsed source trade {source_trade_id}/{semantic_revision} has no decision_pending row"
-            )
+            format!("source-log trade {source_trade_id} has no terminal decision_pending row")
         }
         PreimageMutation::Tamper => {
             let frozen: String = connection
