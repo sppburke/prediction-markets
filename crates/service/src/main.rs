@@ -1236,6 +1236,7 @@ async fn main() -> Result<()> {
             clob_base_url: cfg.polymarket_clob_base_url.clone(),
             data_base_url: cfg.polymarket_base_url.clone(),
             projection_reconcile_interval_secs: cfg.supabase_sink_reconcile_interval_secs,
+            shutdown: shutdown.clone(),
         };
         let fanout_health = health.clone();
         let fanout_shutdown = shutdown.subscribe();

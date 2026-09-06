@@ -179,6 +179,14 @@ pub struct LiveOrderIdentity {
     pub parser_version: u16,
 }
 
+impl LiveOrderIdentity {
+    /// Derive the sole ordinary-live idempotency key for one dispatch/account pair.
+    #[must_use]
+    pub fn idempotency_key_for(dispatch_id: &str, account_id: &AccountId) -> String {
+        format!("{dispatch_id}:{account_id}")
+    }
+}
+
 /// Requested/effective account mode recorded without importing service-owned control types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1739,7 +1747,7 @@ fn insert_open_order(
     order_hash: String,
     prepared: Option<Box<LiveOrderPreparedAudit>>,
 ) -> Result<(), LiveJournalError> {
-    let key = (account_id.clone(), identity.idempotency_key.clone());
+    let key = (account_id.clone(), identity.dispatch_id.clone());
     if orders.contains_key(&key) {
         return Err(LiveJournalError::OrderFactConflict);
     }
@@ -1761,6 +1769,23 @@ fn insert_open_order(
         },
     );
     Ok(())
+}
+
+/// Locate the first account-era Baseline. Consumers must validate the returned Baseline and reject
+/// any later duplicate; facts before it are audit-only and must not create recovery or projection
+/// state.
+#[must_use]
+pub fn first_account_baseline_index(
+    events: &[LiveJournalEvent],
+    account_id: &AccountId,
+) -> Option<usize> {
+    events.iter().position(|event| {
+        event.account_id == *account_id
+            && matches!(
+                &event.payload,
+                LiveJournalPayload::AccountPortfolioMarked(mark) if mark.kind == MarkKind::Baseline
+            )
+    })
 }
 
 /// Recover the verified journal without a service-tier admission verifier.
@@ -1829,9 +1854,32 @@ where
                 .is_none_or(|last_sequence| event.seq > last_sequence.0)
         });
     }
+    let account_ids = events
+        .iter()
+        .map(|event| event.account_id.clone())
+        .collect::<BTreeSet<_>>();
+    let baseline_sequences = account_ids
+        .iter()
+        .filter_map(|account_id| {
+            first_account_baseline_index(&events, account_id)
+                .map(|index| (account_id.clone(), events[index].seq))
+        })
+        .collect::<BTreeMap<_, _>>();
+    events.retain(|event| {
+        baseline_sequences
+            .get(&event.account_id)
+            .is_some_and(|baseline_seq| event.seq >= *baseline_seq)
+    });
     if verify_admissions {
+        let mut admission_keys = BTreeSet::new();
         for (event_index, event) in events.iter().enumerate() {
-            if matches!(event.payload, LiveJournalPayload::AdmissionEvaluated(_)) {
+            if let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload {
+                if !admission_keys.insert((
+                    event.account_id.clone(),
+                    admission.identity.dispatch_id.clone(),
+                )) {
+                    return Err(LiveJournalError::OrderFactConflict);
+                }
                 verify_admission(event, &events[..event_index])?;
             }
         }
@@ -1849,7 +1897,7 @@ where
             LiveJournalPayload::OrderPrepared(prepared) => {
                 let admission_key = (
                     event.account_id.clone(),
-                    prepared.identity.idempotency_key.clone(),
+                    prepared.identity.dispatch_id.clone(),
                 );
                 let (_, admission) = approved_admissions
                     .remove(&admission_key)
@@ -1889,7 +1937,7 @@ where
                 }
                 let key = (
                     event.account_id.clone(),
-                    admission.identity.idempotency_key.clone(),
+                    admission.identity.dispatch_id.clone(),
                 );
                 if !evaluated_admissions.insert(key.clone()) {
                     return Err(LiveJournalError::OrderFactConflict);
@@ -1908,7 +1956,7 @@ where
             LiveJournalPayload::OrderPreparationFailed(failed) => {
                 let key = (
                     event.account_id.clone(),
-                    failed.identity.idempotency_key.clone(),
+                    failed.identity.dispatch_id.clone(),
                 );
                 if let Some((_, admission)) = approved_admissions.remove(&key) {
                     if admission.identity != failed.identity {
@@ -1953,7 +2001,7 @@ where
                 }
             }
             LiveJournalPayload::OrderPosted(posted) => {
-                let key = (event.account_id, posted.identity.idempotency_key.clone());
+                let key = (event.account_id, posted.identity.dispatch_id.clone());
                 let order = orders
                     .get(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
@@ -1969,10 +2017,7 @@ where
                 }
             }
             LiveJournalPayload::OrderReconciled(reconciled) => {
-                let key = (
-                    event.account_id,
-                    reconciled.identity.idempotency_key.clone(),
-                );
+                let key = (event.account_id, reconciled.identity.dispatch_id.clone());
                 let order = orders
                     .get_mut(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
@@ -2036,7 +2081,7 @@ where
                 }
             }
             LiveJournalPayload::OrderFillFinalized(finalized) => {
-                let key = (event.account_id, finalized.identity.idempotency_key.clone());
+                let key = (event.account_id, finalized.identity.dispatch_id.clone());
                 let order = orders
                     .get_mut(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
@@ -2388,9 +2433,10 @@ mod tests {
     };
 
     fn identity(dispatch: &str) -> LiveOrderIdentity {
+        let account_id = AccountId::new("account").unwrap();
         LiveOrderIdentity {
             dispatch_id: dispatch.to_owned(),
-            idempotency_key: format!("key-{dispatch}"),
+            idempotency_key: LiveOrderIdentity::idempotency_key_for(dispatch, &account_id),
             quote_id: "quote".to_owned(),
             config_hash: "config".to_owned(),
             decision_hash: "decision".to_owned(),
@@ -2663,6 +2709,8 @@ mod tests {
 
     fn current_prepared(account_id: &AccountId, dispatch: &str) -> Box<LiveOrderPreparedAudit> {
         let mut prepared = prepared_with_empty_account_evidence(dispatch);
+        prepared.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for(dispatch, account_id);
         prepared.account_state = authenticated_account_state(
             account_id,
             &prepared.frozen_binding,
@@ -2809,7 +2857,9 @@ mod tests {
         let journal = LiveJournal::open(&path).unwrap();
         let account_id = AccountId::new("empty-evidence").unwrap();
         let at = datetime!(2026-08-11 12:00 UTC);
-        let prepared = prepared_with_empty_account_evidence("empty-evidence");
+        let mut prepared = prepared_with_empty_account_evidence("empty-evidence");
+        prepared.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for("empty-evidence", &account_id);
 
         append_admitted_prepared(&journal, &account_id, &prepared, at);
         drop(journal);
@@ -3170,6 +3220,120 @@ mod tests {
         ));
     }
 
+    /// PASS: recovery ignores every order/admission fact before the account's first Baseline.
+    #[test]
+    fn recovery_slices_all_pre_baseline_account_facts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("baseline-slice").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "pre-baseline");
+        journal
+            .append(account_id.clone(), at, approved_admission_for(&prepared))
+            .unwrap();
+        journal
+            .append(
+                account_id.clone(),
+                at,
+                LiveJournalPayload::OrderPrepared(prepared.clone()),
+            )
+            .unwrap();
+        journal
+            .append(
+                account_id.clone(),
+                at,
+                LiveJournalPayload::OrderPosted(Box::new(LiveOrderPostAudit {
+                    identity: prepared.identity.clone(),
+                    order_hash: prepared.prepared.order_hash.clone(),
+                    evidence: RawHttpAttempt::TransportFailure(
+                        pe_core_types::RawTransportFailure {
+                            source_id: "fixture".to_owned(),
+                            endpoint_kind: "post".to_owned(),
+                            method: "POST".to_owned(),
+                            path: "/order".to_owned(),
+                            ordered_query: Vec::new(),
+                            attempt_ordinal: 1,
+                            observed_at: at,
+                            received_at: at,
+                            error_class: pe_core_types::TransportErrorClass::Other,
+                            schema_version: 1,
+                            parser_version: 1,
+                            adapter_version: "fixture".to_owned(),
+                        },
+                    ),
+                    evidence_hash: "ignored-before-baseline".to_owned(),
+                })),
+            )
+            .unwrap();
+        journal
+            .append(
+                account_id.clone(),
+                at,
+                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                    identity: prepared.identity.clone(),
+                    order_hash: prepared.prepared.order_hash.clone(),
+                    source: LiveReconciliationSource::PostResponse,
+                    outcome: LiveJournalOrderOutcome::Rejected {
+                        venue_order_id: None,
+                        kind: LiveOrderRejectKind::VenueRejected,
+                    },
+                    evidence: Vec::new(),
+                    evidence_hashes: Vec::new(),
+                })),
+            )
+            .unwrap();
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
+        drop(journal);
+
+        let recovery = recovery_inventory(&path, None).unwrap();
+        assert_eq!(recovery.account_ids, vec![account_id]);
+        assert!(recovery.approved_admissions.is_empty());
+        assert!(recovery.open_orders.is_empty());
+        assert!(recovery.terminal_admissions.is_empty());
+    }
+
+    /// PASS: dispatch identity, not caller-provided idempotency text, deduplicates admissions.
+    #[test]
+    fn recovery_rejects_two_admissions_for_one_dispatch_with_different_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("duplicate-dispatch").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "same-dispatch");
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
+        let first = approved_admission_for(&prepared);
+        let mut second = first.clone();
+        let LiveJournalPayload::AdmissionEvaluated(admission) = &mut second else {
+            return;
+        };
+        admission.identity.idempotency_key = "different-nonempty-key".to_owned();
+        journal.append(account_id.clone(), at, first).unwrap();
+        assert_eq!(
+            recovery_inventory(&path, None)
+                .unwrap()
+                .approved_admissions
+                .len(),
+            1
+        );
+        journal.append(account_id, at, second).unwrap();
+        drop(journal);
+
+        assert!(matches!(
+            structural_recovery_inventory(&path, None),
+            Err(LiveJournalError::OrderFactConflict)
+        ));
+        assert!(matches!(
+            recovery_inventory(&path, None),
+            Err(LiveJournalError::OrderFactConflict)
+        ));
+    }
+
     #[test]
     fn recovery_inventory_rejects_a_fact_for_another_prepared_identity() {
         let dir = tempdir().unwrap();
@@ -3179,6 +3343,9 @@ mod tests {
         let at = datetime!(2026-08-11 12:00 UTC);
         let prepared = current_prepared(&account_id, "prepared");
         let wrong = current_prepared(&account_id, "wrong");
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
         journal
             .append(
                 account_id.clone(),
@@ -3607,15 +3774,8 @@ mod tests {
             LiveJournalPayload::RedemptionReceiptTransition(_)
         ));
         let recovery = recovery_inventory(&path, None).unwrap();
-        assert_eq!(recovery.open_orders.len(), 1);
-        assert_eq!(
-            recovery.open_orders[0].inventory,
-            OpenOrderInventoryEntry {
-                identity: identity("legacy-prepared"),
-                account_id,
-                prepared_journal_seq: 1,
-            }
-        );
+        assert!(recovery.open_orders.is_empty());
+        assert!(recovery.approved_admissions.is_empty());
     }
 
     #[test]
