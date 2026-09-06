@@ -3,6 +3,7 @@
 //! One service-owned instance serializes every account into one hash-chained stream. Per-account
 //! ledgers are projections of that stream, preserving the global sequence assigned at append time.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -651,6 +652,14 @@ pub struct LiveJournalEvent {
     pub payload: LiveJournalPayload,
 }
 
+/// One prepared ordinary-live order that has no matching terminal journal fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenOrderInventoryEntry {
+    pub identity: LiveOrderIdentity,
+    pub account_id: AccountId,
+    pub prepared_journal_seq: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LiveJournalError {
     #[error("live journal path is a symlink or is not mode 0600")]
@@ -665,6 +674,8 @@ pub enum LiveJournalError {
     UnexpectedEnvelope,
     #[error("live journal event sequence does not match its envelope")]
     SequenceMismatch,
+    #[error("live journal order facts do not form a strict Prepared-to-terminal sequence")]
+    OrderFactConflict,
     #[error("live journal mutex is poisoned")]
     Poisoned,
 }
@@ -783,6 +794,187 @@ pub fn replay_account(
     })
 }
 
+/// A journal fact whose identity must match an earlier `OrderPrepared` exactly.
+pub enum PreparedOrderFact<'a> {
+    Posted(&'a LiveOrderPostAudit),
+    Reconciled(&'a LiveOrderReconciliationAudit),
+    Finalized(&'a OrderFillFinalizedAudit),
+}
+
+/// Exact shared binding between an `OrderPrepared` record and every later order fact. The account
+/// envelope is checked by the caller before invoking this matcher.
+#[must_use]
+pub fn prepared_order_fact_matches(
+    prepared_seq: u64,
+    prepared_identity: &LiveOrderIdentity,
+    prepared_order_hash: &str,
+    fact: PreparedOrderFact<'_>,
+) -> bool {
+    match fact {
+        PreparedOrderFact::Posted(posted) => {
+            posted.identity == *prepared_identity && posted.order_hash == prepared_order_hash
+        }
+        PreparedOrderFact::Reconciled(reconciled) => {
+            let source_matches_outcome = matches!(
+                (&reconciled.source, &reconciled.outcome),
+                (
+                    LiveReconciliationSource::PostResponse
+                        | LiveReconciliationSource::OrderHashLookupAndCancel,
+                    LiveJournalOrderOutcome::Matched { .. }
+                        | LiveJournalOrderOutcome::Killed { .. }
+                        | LiveJournalOrderOutcome::Rejected { .. }
+                        | LiveJournalOrderOutcome::Ambiguous { .. }
+                ) | (
+                    LiveReconciliationSource::PolygonFinality,
+                    LiveJournalOrderOutcome::FinalityPending { .. }
+                        | LiveJournalOrderOutcome::FinalityConflict { .. }
+                )
+            );
+            reconciled.identity == *prepared_identity
+                && reconciled.order_hash == prepared_order_hash
+                && source_matches_outcome
+        }
+        PreparedOrderFact::Finalized(finalized) => {
+            finalized.identity == *prepared_identity
+                && finalized.prepared_journal_seq == prepared_seq
+        }
+    }
+}
+
+struct OpenOrderState {
+    entry: OpenOrderInventoryEntry,
+    order_hash: String,
+    terminal: bool,
+}
+
+fn insert_open_order(
+    orders: &mut BTreeMap<(AccountId, String), OpenOrderState>,
+    account_id: AccountId,
+    prepared_journal_seq: u64,
+    identity: LiveOrderIdentity,
+    order_hash: String,
+) -> Result<(), LiveJournalError> {
+    let key = (account_id.clone(), identity.idempotency_key.clone());
+    if orders.contains_key(&key) {
+        return Err(LiveJournalError::OrderFactConflict);
+    }
+    orders.insert(
+        key,
+        OpenOrderState {
+            entry: OpenOrderInventoryEntry {
+                identity,
+                account_id,
+                prepared_journal_seq,
+            },
+            order_hash,
+            terminal: false,
+        },
+    );
+    Ok(())
+}
+
+/// Replay the verified global journal once and return every Prepared order without a terminal fact.
+/// `Killed`, `Rejected`, and `OrderFillFinalized` are terminal; matched, ambiguous, pending, and
+/// conflicting-finality observations remain open for recovery.
+pub fn open_order_inventory(
+    path: impl AsRef<Path>,
+) -> Result<Vec<OpenOrderInventoryEntry>, LiveJournalError> {
+    let events = replay_all(path)?;
+    let mut orders = BTreeMap::<(AccountId, String), OpenOrderState>::new();
+    for event in events {
+        match event.payload {
+            LiveJournalPayload::OrderPrepared(prepared) => insert_open_order(
+                &mut orders,
+                event.account_id,
+                event.seq,
+                prepared.identity.clone(),
+                prepared.prepared.order_hash.clone(),
+            )?,
+            LiveJournalPayload::LegacyV1(raw) => {
+                if let Some((identity, order_hash)) = legacy_v1::prepared_order(&raw.0)? {
+                    insert_open_order(
+                        &mut orders,
+                        event.account_id,
+                        event.seq,
+                        identity,
+                        order_hash,
+                    )?;
+                }
+            }
+            LiveJournalPayload::OrderPosted(posted) => {
+                let key = (event.account_id, posted.identity.idempotency_key.clone());
+                let order = orders
+                    .get(&key)
+                    .ok_or(LiveJournalError::OrderFactConflict)?;
+                if !prepared_order_fact_matches(
+                    order.entry.prepared_journal_seq,
+                    &order.entry.identity,
+                    &order.order_hash,
+                    PreparedOrderFact::Posted(&posted),
+                ) {
+                    return Err(LiveJournalError::OrderFactConflict);
+                }
+            }
+            LiveJournalPayload::OrderReconciled(reconciled) => {
+                let key = (
+                    event.account_id,
+                    reconciled.identity.idempotency_key.clone(),
+                );
+                let order = orders
+                    .get_mut(&key)
+                    .ok_or(LiveJournalError::OrderFactConflict)?;
+                if !prepared_order_fact_matches(
+                    order.entry.prepared_journal_seq,
+                    &order.entry.identity,
+                    &order.order_hash,
+                    PreparedOrderFact::Reconciled(&reconciled),
+                ) {
+                    return Err(LiveJournalError::OrderFactConflict);
+                }
+                if matches!(
+                    reconciled.outcome,
+                    LiveJournalOrderOutcome::Killed { .. }
+                        | LiveJournalOrderOutcome::Rejected { .. }
+                ) {
+                    order.terminal = true;
+                }
+            }
+            LiveJournalPayload::OrderFillFinalized(finalized) => {
+                let key = (event.account_id, finalized.identity.idempotency_key.clone());
+                let order = orders
+                    .get_mut(&key)
+                    .ok_or(LiveJournalError::OrderFactConflict)?;
+                if !prepared_order_fact_matches(
+                    order.entry.prepared_journal_seq,
+                    &order.entry.identity,
+                    &order.order_hash,
+                    PreparedOrderFact::Finalized(&finalized),
+                ) {
+                    return Err(LiveJournalError::OrderFactConflict);
+                }
+                order.terminal = true;
+            }
+            LiveJournalPayload::AdmissionEvaluated(_)
+            | LiveJournalPayload::OrderPreparationFailed(_)
+            | LiveJournalPayload::RedemptionRequested(_)
+            | LiveJournalPayload::RedemptionTransactionIdentified(_)
+            | LiveJournalPayload::RedemptionReceiptTransition(_)
+            | LiveJournalPayload::ResolutionFinalized(_)
+            | LiveJournalPayload::RedemptionCustodyReconciled(_)
+            | LiveJournalPayload::AccountPortfolioMarked(_)
+            | LiveJournalPayload::CredentialBindingMismatch { .. }
+            | LiveJournalPayload::ModeTransitionApplied(_) => {}
+        }
+    }
+    let mut open = orders
+        .into_values()
+        .filter(|order| !order.terminal)
+        .map(|order| order.entry)
+        .collect::<Vec<_>>();
+    open.sort_by_key(|order| order.prepared_journal_seq);
+    Ok(open)
+}
+
 mod legacy_v1 {
     use super::*;
 
@@ -889,6 +1081,18 @@ mod legacy_v1 {
         pub payload: LiveJournalPayload,
     }
 
+    pub(super) fn prepared_order(
+        raw_event: &serde_json::Value,
+    ) -> Result<Option<(LiveOrderIdentity, String)>, serde_json::Error> {
+        let event = serde_json::from_value::<LiveJournalEvent>(raw_event.clone())?;
+        Ok(match event.payload {
+            LiveJournalPayload::OrderPrepared(prepared) => {
+                Some((prepared.identity, prepared.prepared.order_hash))
+            }
+            _ => None,
+        })
+    }
+
     pub(super) fn convert(
         event: LiveJournalEvent,
         raw_event: serde_json::Value,
@@ -979,10 +1183,17 @@ mod tests {
 
     use std::os::unix::fs::PermissionsExt as _;
 
+    use pe_core_types::{BasisPoints, EventSeq, Side};
+    use pe_event_log::AppendReceipt;
+    use pe_risk_engine::RiskSnapshot;
     use tempfile::tempdir;
     use time::macros::datetime;
 
     use super::*;
+    use crate::economic::{
+        BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit, MarketSelection,
+        RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
+    };
 
     fn identity(dispatch: &str) -> LiveOrderIdentity {
         LiveOrderIdentity {
@@ -996,6 +1207,318 @@ mod tests {
             schema_version: 1,
             parser_version: 1,
         }
+    }
+
+    fn current_prepared(dispatch: &str) -> Box<LiveOrderPreparedAudit> {
+        let identity = identity(dispatch);
+        let condition_id = PolymarketConditionId("condition".to_owned());
+        let token_id = PolymarketTokenId("yes".to_owned());
+        let price = Price::new(rust_decimal::Decimal::new(5, 1)).unwrap();
+        let shares = ShareAmount::from_whole(1).unwrap();
+        let principal =
+            CollateralAmount::from_decimal_exact(rust_decimal::Decimal::new(5, 1)).unwrap();
+        let receipt = AppendReceipt {
+            sequence: EventSeq(1),
+            this_hash: blake3::Hash::from_bytes([1; 32]),
+        };
+        let account_state = LiveAccountStateAudit {
+            observed_at: datetime!(2026-08-11 12:00 UTC),
+            closed_only: false,
+            geoblocked: false,
+            selected_spender: "exchange".to_owned(),
+            collateral_balance: CollateralAmount::from_whole(10).unwrap(),
+            allowance: CollateralAmount::from_whole(10).unwrap(),
+            reconciled_free_collateral: CollateralAmount::from_whole(10).unwrap(),
+            schema_version: 1,
+            parser_version: 1,
+            evidence: Vec::new(),
+            evidence_hashes: Vec::new(),
+        };
+        let prepared = PreparedPolymarketBuy {
+            condition_id: condition_id.clone(),
+            outcome_id: pe_core_types::OutcomeId(0),
+            token_id: token_id.clone(),
+            maker: "maker".to_owned(),
+            signer: "signer".to_owned(),
+            funder: "funder".to_owned(),
+            verifying_contract: "exchange".to_owned(),
+            spender: "exchange".to_owned(),
+            exchange_domain_version: 2,
+            neg_risk: false,
+            side: "BUY".to_owned(),
+            salt: "1".to_owned(),
+            timestamp_ms: 1,
+            expiration: "0".to_owned(),
+            maker_collateral: principal,
+            taker_shares: shares,
+            limit_price: price,
+            minimum_tick_size: Price::new(rust_decimal::Decimal::new(1, 2)).unwrap(),
+            signature_type: 1,
+            order_type: "FOK".to_owned(),
+            post_only: false,
+            defer_exec: false,
+            metadata: "metadata".to_owned(),
+            builder: "0".to_owned(),
+            order_hash: format!("order-{dispatch}"),
+            post_body_hash: "body".to_owned(),
+            sdk_version: "fixture".to_owned(),
+            sdk_archive_sha256: "fixture".to_owned(),
+            metadata_hashes: Vec::new(),
+            worst_case_debit: principal,
+        };
+        Box::new(LiveOrderPreparedAudit {
+            identity: identity.clone(),
+            frozen_binding: CredentialBindingIdentity {
+                version: 1,
+                key_id: "key".to_owned(),
+            },
+            economic: EconomicPrepared {
+                version: ECONOMIC_PREPARED_VERSION,
+                market: MarketSelection {
+                    condition_id: condition_id.clone(),
+                    outcome_index: 0,
+                    token_id: token_id.clone(),
+                    side: Side::Buy,
+                    market_id: condition_id.0.clone(),
+                },
+                admission: LiveAdmissionArtifactAudit {
+                    market: LiveMarketEvidenceAudit {
+                        condition_id: condition_id.clone(),
+                        ordered_outcome_token_ids: [
+                            token_id.clone(),
+                            PolymarketTokenId("no".to_owned()),
+                        ],
+                        neg_risk: false,
+                        minimum_tick_size: prepared.minimum_tick_size,
+                        minimum_order_size: shares,
+                        observed_at_unix: 0,
+                        schema_version: 1,
+                        parser_version: 1,
+                        freshness_window_secs: 60,
+                    },
+                    settlement: VenueSettlementRecord {
+                        schema_version: 1,
+                        condition_id,
+                        status: pe_resolver_card::VenueResolutionStatus::Unresolved,
+                        raw_evidence_hash: "settlement".to_owned(),
+                        source_timestamp_unix: None,
+                        observed_at_unix: 0,
+                        parser_version: 1,
+                        freshness_window_secs: 60,
+                    },
+                    fee_schedule: CompactFeeSchedule::Zero,
+                    scheduled_end_unix: None,
+                    receipts: AdmissionReceipts {
+                        gamma: receipt,
+                        clob_long: receipt,
+                        clob_compact: receipt,
+                    },
+                },
+                ladder: LadderPlanAudit {
+                    used_asks: vec![LadderAskAudit { price, shares }],
+                    best_ask: price,
+                    limit_price: price,
+                    minimum_shares: shares,
+                    principal,
+                },
+                book_receipt: receipt,
+                observation: None,
+                sizing: SizingAudit {
+                    mode: SizingModeAudit::Contract { contracts: 1 },
+                    budget: CollateralAmount::from_whole(10).unwrap(),
+                    principal,
+                    minimum_shares: shares,
+                    expected_shares: shares,
+                    expected_vwap: price,
+                    all_in_price: price,
+                    slippage_rate: rust_decimal::Decimal::ZERO,
+                },
+                fee: FeeAudit {
+                    schedule: CompactFeeSchedule::Zero,
+                    expected_fee: CollateralAmount::ZERO,
+                    reserve: CollateralAmount::ZERO,
+                },
+                risk: RiskAudit {
+                    snapshot: RiskSnapshot {
+                        leader_exposure_bps: BasisPoints::ZERO,
+                        market_exposure_bps: BasisPoints::ZERO,
+                        family_exposure_bps: BasisPoints::ZERO,
+                        total_copy_exposure_bps: BasisPoints::ZERO,
+                        intraday_pnl_bps: BasisPoints::ZERO,
+                        rolling_7d_pnl_bps: BasisPoints::ZERO,
+                        absolute_pnl_bps: BasisPoints::ZERO,
+                        copy_latency_kill_switch_active: false,
+                        proposed_trade_bps: BasisPoints::ZERO,
+                        per_trade_cap_bps: 100,
+                        concentration_caps: None,
+                    },
+                    decision: RiskDecisionAudit::Approved,
+                    price_receipts: Vec::new(),
+                    evaluated_at_unix_ms: 0,
+                },
+                balance: BalanceAudit {
+                    cash_before: CollateralAmount::from_whole(10).unwrap(),
+                    worst_case_debit: principal,
+                    price_impact_cap_bps: 100,
+                    chase_ceiling: price,
+                    band_floor: Price::ZERO,
+                    band_ceiling_exclusive: Price::ONE,
+                },
+                applied_configuration_hash: identity.config_hash.clone(),
+            },
+            account_state,
+            prepared,
+        })
+    }
+
+    #[test]
+    fn open_order_inventory_is_cross_account_and_terminal_fact_strict() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let open_account = AccountId::new("open").unwrap();
+        let killed_account = AccountId::new("killed").unwrap();
+        let finalized_account = AccountId::new("finalized").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let open = current_prepared("open");
+        let killed = current_prepared("killed");
+        let finalized = current_prepared("finalized");
+
+        journal
+            .append(
+                open_account.clone(),
+                at,
+                LiveJournalPayload::OrderPrepared(open.clone()),
+            )
+            .unwrap();
+        journal
+            .append(
+                killed_account.clone(),
+                at,
+                LiveJournalPayload::OrderPrepared(killed.clone()),
+            )
+            .unwrap();
+        journal
+            .append(
+                killed_account,
+                at,
+                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                    identity: killed.identity.clone(),
+                    order_hash: killed.prepared.order_hash.clone(),
+                    source: LiveReconciliationSource::OrderHashLookupAndCancel,
+                    outcome: LiveJournalOrderOutcome::Killed {
+                        venue_order_id: Some("venue-killed".to_owned()),
+                    },
+                    evidence: Vec::new(),
+                    evidence_hashes: Vec::new(),
+                })),
+            )
+            .unwrap();
+        journal
+            .append(
+                finalized_account.clone(),
+                at,
+                LiveJournalPayload::OrderPrepared(finalized.clone()),
+            )
+            .unwrap();
+        journal
+            .append(
+                finalized_account,
+                at,
+                LiveJournalPayload::OrderFillFinalized(Box::new(OrderFillFinalizedAudit {
+                    identity: finalized.identity.clone(),
+                    prepared_journal_seq: 3,
+                    principal: finalized.economic.sizing.principal,
+                    quantity: finalized.economic.sizing.minimum_shares,
+                    fee: CollateralAmount::ZERO,
+                    matched_logs: vec![MatchedLogIdentity {
+                        transaction_hash: format!("0x{}", "1".repeat(64)),
+                        log_index: 0,
+                    }],
+                    chain_id: pe_venue_polymarket::FINALIZED_CHAIN_ID,
+                    finalized_head: 1,
+                    receipts: Vec::new(),
+                    blocks: Vec::new(),
+                })),
+            )
+            .unwrap();
+        journal
+            .append(
+                open_account.clone(),
+                at,
+                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                    identity: open.identity.clone(),
+                    order_hash: open.prepared.order_hash.clone(),
+                    source: LiveReconciliationSource::PolygonFinality,
+                    outcome: LiveJournalOrderOutcome::FinalityPending {
+                        reason: "above finalized head".to_owned(),
+                    },
+                    evidence: Vec::new(),
+                    evidence_hashes: Vec::new(),
+                })),
+            )
+            .unwrap();
+        drop(journal);
+
+        assert_eq!(
+            open_order_inventory(&path).unwrap(),
+            vec![OpenOrderInventoryEntry {
+                identity: open.identity.clone(),
+                account_id: open_account,
+                prepared_journal_seq: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn open_order_inventory_rejects_a_fact_for_another_prepared_identity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("account").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared("prepared");
+        let wrong = current_prepared("wrong");
+        journal
+            .append(
+                account_id.clone(),
+                at,
+                LiveJournalPayload::OrderPrepared(prepared),
+            )
+            .unwrap();
+        journal
+            .append(
+                account_id,
+                at,
+                LiveJournalPayload::OrderPosted(Box::new(LiveOrderPostAudit {
+                    identity: wrong.identity.clone(),
+                    order_hash: wrong.prepared.order_hash.clone(),
+                    evidence: RawHttpAttempt::TransportFailure(
+                        pe_core_types::RawTransportFailure {
+                            source_id: "polymarket-clob-v2".to_owned(),
+                            endpoint_kind: "post".to_owned(),
+                            method: "POST".to_owned(),
+                            path: "/order".to_owned(),
+                            ordered_query: Vec::new(),
+                            attempt_ordinal: 1,
+                            observed_at: at,
+                            received_at: at,
+                            error_class: pe_core_types::TransportErrorClass::Other,
+                            schema_version: 1,
+                            parser_version: 1,
+                            adapter_version: "fixture".to_owned(),
+                        },
+                    ),
+                    evidence_hash: "evidence".to_owned(),
+                })),
+            )
+            .unwrap();
+        drop(journal);
+
+        assert!(matches!(
+            open_order_inventory(&path),
+            Err(LiveJournalError::OrderFactConflict)
+        ));
     }
 
     #[test]
@@ -1352,6 +1875,14 @@ mod tests {
             replayed[5].payload,
             LiveJournalPayload::RedemptionReceiptTransition(_)
         ));
+        assert_eq!(
+            open_order_inventory(&path).unwrap(),
+            vec![OpenOrderInventoryEntry {
+                identity: identity("legacy-prepared"),
+                account_id,
+                prepared_journal_seq: 1,
+            }]
+        );
     }
 
     #[test]

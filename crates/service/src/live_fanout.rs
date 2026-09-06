@@ -23,10 +23,10 @@ use pe_execution_core::{
     LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit, LiveModeTransitionReason,
     LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome, LiveOrderReconciliationAudit,
     LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveVenueReconciledOutcome,
-    MarkKind, MatchedLogIdentity, OrderFillFinalizedAudit, RedemptionAttempt,
+    MarkKind, MatchedLogIdentity, OrderFillFinalizedAudit, PreparedOrderFact, RedemptionAttempt,
     RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput, RiskAudit,
-    RiskDecisionAudit, SizingModeAudit, http_attempt_hashes, reconstruct_redemption_attempts,
-    redemption_posture, replay_account, run_redemption_pass,
+    RiskDecisionAudit, SizingModeAudit, http_attempt_hashes, prepared_order_fact_matches,
+    reconstruct_redemption_attempts, redemption_posture, replay_account, run_redemption_pass,
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
@@ -69,7 +69,7 @@ use crate::live_venue_adapter::{
     PolygonReceiptRpc, PolymarketLiveVenue,
 };
 use crate::live_watchlist::LiveWatchlist;
-use crate::mid_price_cache::MidPriceCache;
+use crate::mid_price_cache::{MidPriceCache, MidPriceObservation};
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::supabase_reader::auth_token;
 
@@ -1105,20 +1105,17 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
     };
-    let intent = match evaluate_live_candidate_at_price(
+    if let Err(error) = evaluate_live_candidate_at_price(
         &strategy,
         signal,
         best_ask,
         probability,
-        initial_risk.snapshot,
+        initial_risk.snapshot.clone(),
         account_state.reconciled_free_collateral.to_decimal(),
     ) {
-        Ok(intent) => intent,
-        Err(error) => {
-            terminalize(state, target, winner_follow_terminal_reason(&error), now)?;
-            return Ok(PassControl::Continue);
-        }
-    };
+        terminalize(state, target, winner_follow_terminal_reason(&error), now)?;
+        return Ok(PassControl::Continue);
+    }
     let minimum_price = parse_band_price(runtime.min_fill_price, Price::ZERO);
     let maximum_price = parse_band_price(runtime.max_fill_price, Price(Decimal::ONE));
     let (minimum_price, maximum_price) = match (minimum_price, maximum_price) {
@@ -1149,6 +1146,13 @@ async fn process_target(
     };
     let policy_cap = collateral_cap(account_state.reconciled_free_collateral, per_trade_cap_bps)
         .ok_or_else(|| FanoutError::Signal("live per-trade cap arithmetic failed".to_owned()))?;
+    let kelly_allocate = live_kelly_share_allocator(
+        &strategy,
+        signal,
+        probability,
+        &initial_risk.snapshot,
+        account_state.reconciled_free_collateral.to_decimal(),
+    );
     let requested_sizing = match strategy_config.sizing_mode {
         SizingMode::Dollar { usd } => {
             let budget = CollateralAmount::from_decimal_exact(
@@ -1159,7 +1163,8 @@ async fn process_target(
         }
         SizingMode::Contract { contracts } => BuySizing::Contract { contracts },
         SizingMode::Kelly => BuySizing::Kelly {
-            contracts: intent.contracts.0,
+            allocate: &kelly_allocate,
+            slippage_rate: strategy_config.slippage_rate,
         },
     };
     let sized = match plan_sized_buy(
@@ -1386,9 +1391,36 @@ fn evaluate_live_candidate_at_price(
         risk,
         bankroll,
         ExecutionMode::LiveTiny,
-        None,
-        Some(all_in_price),
     )
+}
+
+/// Sole live Kelly allocation adapter for the venue-owned convergence chain.
+fn live_kelly_share_allocator<'a>(
+    strategy: &'a WinnerFollowStrategy,
+    signal: &'a LeaderSignal,
+    probability: Probability,
+    risk: &'a RiskSnapshot,
+    bankroll: Decimal,
+) -> impl Fn(Price) -> Result<ShareAmount, LadderError> + 'a {
+    move |all_in_price| {
+        let intent = evaluate_live_candidate_at_price(
+            strategy,
+            signal,
+            all_in_price,
+            probability,
+            risk.clone(),
+            bankroll,
+        )
+        .map_err(|error| match error {
+            WinnerFollowError::NoEdge => LadderError::NoEdge,
+            WinnerFollowError::ShadowMode
+            | WinnerFollowError::FlipNotApproved
+            | WinnerFollowError::Blocked(_)
+            | WinnerFollowError::RiskInputsUnavailable(_)
+            | WinnerFollowError::KellySizing(_) => LadderError::KellySizing,
+        })?;
+        ShareAmount::from_whole(intent.contracts.0).map_err(|_| LadderError::KellySizing)
+    }
 }
 
 async fn live_risk_audit(
@@ -1424,6 +1456,7 @@ async fn live_risk_audit(
         })
         .collect::<Result<Vec<_>, RiskInputsUnavailable>>()?;
     let mids = state.config.mid_price_cache.fetch_mids_strict(&ids).await?;
+    let price_receipts = sorted_price_receipts(&mids)?;
     let marked_positions = derived
         .positions
         .iter()
@@ -1512,7 +1545,32 @@ async fn live_risk_audit(
         pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
         pe_risk_engine::RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
     };
-    Ok(RiskAudit { snapshot, decision })
+    let evaluated_at_unix_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| RiskInputsUnavailable::Overflow)?;
+    Ok(RiskAudit {
+        snapshot,
+        decision,
+        price_receipts,
+        evaluated_at_unix_ms,
+    })
+}
+
+fn sorted_price_receipts(
+    mids: &BTreeMap<(String, u16), MidPriceObservation>,
+) -> Result<Vec<AppendReceipt>, RiskInputsUnavailable> {
+    let mut receipts = mids
+        .values()
+        .map(|observation| observation.receipt)
+        .collect::<Vec<_>>();
+    receipts.sort_by_key(|receipt| receipt.sequence);
+    if receipts
+        .windows(2)
+        .any(|pair| pair[0].sequence == pair[1].sequence && pair[0] != pair[1])
+    {
+        return Err(RiskInputsUnavailable::PriceConflict);
+    }
+    receipts.dedup_by_key(|receipt| receipt.sequence);
+    Ok(receipts)
 }
 
 fn live_latency_switch(events: &[LiveJournalEvent], now: OffsetDateTime) -> bool {
@@ -1716,6 +1774,8 @@ fn ladder_terminal_reason(error: &LadderError) -> &'static str {
         LadderError::InsufficientDepth => "insufficient_live_depth",
         LadderError::BelowMinimum => "below_minimum_order",
         LadderError::CapExceeded => "cap_exceeded",
+        LadderError::NoEdge => "no_edge",
+        LadderError::KellySizing => "kelly_sizing_invalid",
         LadderError::Fee(_) => "fee_schedule_invalid",
         LadderError::Amount => "ladder_amount_invalid",
     }
@@ -1799,51 +1859,6 @@ pub(crate) enum ProjectionReducerError {
     InvalidDailyMark,
 }
 
-enum PreparedOrderFact<'a> {
-    Posted(&'a pe_execution_core::LiveOrderPostAudit),
-    Reconciled(&'a LiveOrderReconciliationAudit),
-    Finalized(&'a OrderFillFinalizedAudit),
-}
-
-/// Exact shared binding between an OrderPrepared record and every later order fact. The account
-/// envelope is checked by each caller before invoking this matcher.
-fn prepared_order_fact_matches(
-    prepared_seq: u64,
-    prepared: &pe_execution_core::LiveOrderPreparedAudit,
-    fact: PreparedOrderFact<'_>,
-) -> bool {
-    match fact {
-        PreparedOrderFact::Posted(posted) => {
-            posted.identity == prepared.identity
-                && posted.order_hash == prepared.prepared.order_hash
-        }
-        PreparedOrderFact::Reconciled(reconciled) => {
-            let source_matches_outcome = matches!(
-                (&reconciled.source, &reconciled.outcome),
-                (
-                    LiveReconciliationSource::PostResponse
-                        | LiveReconciliationSource::OrderHashLookupAndCancel,
-                    LiveJournalOrderOutcome::Matched { .. }
-                        | LiveJournalOrderOutcome::Killed { .. }
-                        | LiveJournalOrderOutcome::Rejected { .. }
-                        | LiveJournalOrderOutcome::Ambiguous { .. }
-                ) | (
-                    LiveReconciliationSource::PolygonFinality,
-                    LiveJournalOrderOutcome::FinalityPending { .. }
-                        | LiveJournalOrderOutcome::FinalityConflict { .. }
-                )
-            );
-            reconciled.identity == prepared.identity
-                && reconciled.order_hash == prepared.prepared.order_hash
-                && source_matches_outcome
-        }
-        PreparedOrderFact::Finalized(finalized) => {
-            finalized.identity == prepared.identity
-                && finalized.prepared_journal_seq == prepared_seq
-        }
-    }
-}
-
 pub(crate) fn derive_projection_rows(
     account_id: &AccountId,
     events: &[LiveJournalEvent],
@@ -1919,7 +1934,8 @@ pub(crate) fn derive_projection_rows(
                 };
                 if !prepared_order_fact_matches(
                     *prepared_seq,
-                    prepared,
+                    &prepared.identity,
+                    &prepared.prepared.order_hash,
                     PreparedOrderFact::Posted(posted),
                 ) {
                     return Err(ProjectionReducerError::IdentityConflict);
@@ -1933,7 +1949,8 @@ pub(crate) fn derive_projection_rows(
                 };
                 if !prepared_order_fact_matches(
                     *prepared_seq,
-                    prepared,
+                    &prepared.identity,
+                    &prepared.prepared.order_hash,
                     PreparedOrderFact::Reconciled(reconciled),
                 ) {
                     return Err(ProjectionReducerError::IdentityConflict);
@@ -1955,7 +1972,8 @@ pub(crate) fn derive_projection_rows(
                 };
                 if !prepared_order_fact_matches(
                     *prepared_seq,
-                    prepared_audit,
+                    &prepared_audit.identity,
+                    &prepared_audit.prepared.order_hash,
                     PreparedOrderFact::Finalized(finalized),
                 ) {
                     return Err(ProjectionReducerError::PreparedSequenceMismatch);
@@ -2625,7 +2643,8 @@ fn recovered_prepared(
                 };
                 if !prepared_order_fact_matches(
                     prepared.journal_seq,
-                    &prepared.audit,
+                    &prepared.audit.identity,
+                    &prepared.audit.prepared.order_hash,
                     PreparedOrderFact::Posted(&posted),
                 ) {
                     return Err(FanoutError::Signal(
@@ -2643,7 +2662,8 @@ fn recovered_prepared(
                 };
                 if !prepared_order_fact_matches(
                     prepared.journal_seq,
-                    &prepared.audit,
+                    &prepared.audit.identity,
+                    &prepared.audit.prepared.order_hash,
                     PreparedOrderFact::Reconciled(&reconciled),
                 ) {
                     return Err(FanoutError::Signal(
@@ -2667,7 +2687,8 @@ fn recovered_prepared(
                 };
                 if !prepared_order_fact_matches(
                     prepared.journal_seq,
-                    &prepared.audit,
+                    &prepared.audit.identity,
+                    &prepared.audit.prepared.order_hash,
                     PreparedOrderFact::Finalized(&finalized),
                 ) {
                     return Err(FanoutError::Signal(
@@ -4747,6 +4768,59 @@ mod tests {
         assert!(!live_latency_switch(&events, after_release_hour));
     }
 
+    /// PASS: live risk evidence is sequence-sorted, deduplicates one receipt shared by outcomes,
+    /// and fails closed when one sequence claims two hashes.
+    #[test]
+    fn live_risk_price_receipts_are_canonical() {
+        let receipt = |sequence, byte| AppendReceipt {
+            sequence: pe_core_types::EventSeq(sequence),
+            this_hash: blake3::Hash::from_bytes([byte; 32]),
+        };
+        let mut mids = BTreeMap::from([
+            (
+                ("market-b".to_owned(), 0),
+                MidPriceObservation {
+                    price: Price(Decimal::new(6, 1)),
+                    receipt: receipt(9, 9),
+                    observed_unix: 1,
+                },
+            ),
+            (
+                ("market-a".to_owned(), 0),
+                MidPriceObservation {
+                    price: Price(Decimal::new(4, 1)),
+                    receipt: receipt(3, 3),
+                    observed_unix: 1,
+                },
+            ),
+            (
+                ("market-a".to_owned(), 1),
+                MidPriceObservation {
+                    price: Price(Decimal::new(6, 1)),
+                    receipt: receipt(3, 3),
+                    observed_unix: 1,
+                },
+            ),
+        ]);
+        assert_eq!(
+            sorted_price_receipts(&mids).unwrap(),
+            vec![receipt(3, 3), receipt(9, 9)]
+        );
+
+        mids.insert(
+            ("market-b".to_owned(), 1),
+            MidPriceObservation {
+                price: Price(Decimal::new(4, 1)),
+                receipt: receipt(9, 8),
+                observed_unix: 1,
+            },
+        );
+        assert_eq!(
+            sorted_price_receipts(&mids),
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+    }
+
     fn settings(
         mode: Option<&str>,
         dollar: Option<&str>,
@@ -5202,6 +5276,8 @@ mod tests {
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,
+                price_receipts: vec![receipt],
+                evaluated_at_unix_ms: 0,
             },
             balance: BalanceAudit {
                 cash_before: cash,

@@ -75,6 +75,10 @@ pub enum RiskDecisionAudit {
 pub struct RiskAudit {
     pub snapshot: RiskSnapshot,
     pub decision: RiskDecisionAudit,
+    /// Source-log receipts of every current-price observation the snapshot consumed (sorted by sequence, deduplicated).
+    pub price_receipts: Vec<AppendReceipt>,
+    /// The clock the snapshot windows (intraday/rolling/latency hours) were evaluated at.
+    pub evaluated_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +327,8 @@ mod tests {
                 concentration_caps: None,
             },
             decision: RiskDecisionAudit::Approved,
+            price_receipts: vec![receipt(5)],
+            evaluated_at_unix_ms: 1_700_000_000_000,
         }
     }
 
@@ -403,5 +409,20 @@ mod tests {
             EconomicPrepared::compose(inputs),
             Err(EconomicError::MissingBookReceipt)
         ));
+    }
+
+    #[test]
+    fn risk_replay_inputs_are_bound_by_the_core_hash() {
+        let admission = admission();
+        let plan = plan();
+        let prepared = EconomicPrepared::compose(inputs(&admission, &plan)).unwrap();
+        let mut changed_receipt = prepared.clone();
+        changed_receipt.risk.price_receipts = vec![receipt(6)];
+        let mut changed_clock = prepared.clone();
+        changed_clock.risk.evaluated_at_unix_ms += 1;
+
+        let hash = prepared.core_hash().unwrap();
+        assert_ne!(changed_receipt.core_hash().unwrap(), hash);
+        assert_ne!(changed_clock.core_hash().unwrap(), hash);
     }
 }

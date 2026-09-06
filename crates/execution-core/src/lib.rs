@@ -49,11 +49,12 @@ pub use live_journal::{
     LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
     LiveOrderPostAudit, LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure,
     LiveOrderPreparedAudit, LiveOrderReconciliationAudit, LiveOrderRejectKind,
-    LiveReconciliationSource, MarkKind, MarkPrice, MatchedLogIdentity, OrderFillFinalizedAudit,
-    RedemptionAttemptIdentity, RedemptionCustodyAudit, RedemptionCustodyReconciledAudit,
-    RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
-    RedemptionRequestedAudit, RedemptionTransactionAudit, ResolutionFinalizedAudit,
-    http_attempt_hashes, replay_account,
+    LiveReconciliationSource, MarkKind, MarkPrice, MatchedLogIdentity, OpenOrderInventoryEntry,
+    OrderFillFinalizedAudit, PreparedOrderFact, RedemptionAttemptIdentity, RedemptionCustodyAudit,
+    RedemptionCustodyReconciledAudit, RedemptionReceiptAudit, RedemptionReceiptStatusAudit,
+    RedemptionRequestAudit, RedemptionRequestedAudit, RedemptionTransactionAudit,
+    ResolutionFinalizedAudit, http_attempt_hashes, open_order_inventory,
+    prepared_order_fact_matches, replay_account,
 };
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,
