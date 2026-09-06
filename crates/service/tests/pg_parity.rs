@@ -116,7 +116,8 @@ async fn sql_commit_fill(
 ) -> serde_json::Value {
     let row = client
         .query_one(
-            "select commit_fill_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)::text",
+            "select commit_fill_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::numeric,\
+             $12::text::numeric,$13::text::numeric,$14::text::numeric,$15)::text",
             &[
                 &START_SEQ,
                 &START_HASH,
