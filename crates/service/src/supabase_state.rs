@@ -1440,10 +1440,19 @@ pub(crate) fn apply_financial_result(
                 principal: request.principal,
                 fee: request.fee,
             };
+            let observation = economic.observation.as_ref().ok_or_else(|| {
+                SupabaseStateError::Corrupt(
+                    "fill Prepared has no causal source observation".to_owned(),
+                )
+            })?;
+            let causal_received_at_unix =
+                source_receipt_received_at(source_log_path, observation.source_receipt)?;
             paper_state.apply_financial_fill(
                 start,
                 expected.prior_completed_prepared_sequence,
                 prepared_receipt.sequence,
+                observation.source_receipt,
+                causal_received_at_unix,
                 &record,
                 canonical.bankroll,
             )?;
@@ -1590,6 +1599,32 @@ pub(crate) fn resolution_source_received_at(
     )))
 }
 
+fn source_receipt_received_at(
+    source_log_path: &std::path::Path,
+    receipt: AppendReceipt,
+) -> Result<i64, SupabaseStateError> {
+    let replay = Reader::replay(source_log_path).map_err(|error| {
+        SupabaseStateError::Corrupt(format!("open source log for fill evidence: {error}"))
+    })?;
+    for frame in replay {
+        let (sequence, envelope) = frame.map_err(|error| {
+            SupabaseStateError::Corrupt(format!("read source fill evidence: {error}"))
+        })?;
+        if sequence != receipt.sequence {
+            continue;
+        }
+        if envelope.this_hash != receipt.this_hash {
+            return Err(SupabaseStateError::Corrupt(
+                "fill source receipt hash differs from its envelope".to_owned(),
+            ));
+        }
+        return Ok(envelope.received_at.0.unix_timestamp());
+    }
+    Err(SupabaseStateError::Corrupt(
+        "fill source receipt is absent from the source log".to_owned(),
+    ))
+}
+
 // ── Boot: frame-walk then pull ──────────────────────────────────────────────────
 
 /// #511 unified boot frame-walk (replaces the #397/#510 fills-row catch-up): resolve every
@@ -1637,7 +1672,7 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
         if seq_i <= new_wm {
             continue;
         }
-        let PaperLogFrame::LegacyFill(fill) = frame.frame else {
+        let Some(fill) = frame.legacy_fill() else {
             paper_state.set_supabase_applied_event_seq(seq)?;
             new_wm = seq_i;
             continue;

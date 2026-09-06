@@ -95,10 +95,15 @@ pub fn resume_dispatch_seeds(
         active_era = era.start.is_some();
         let mut prepared_keys = HashMap::new();
         for frame in era.frames {
+            if let Some(fill) = frame.legacy_fill().filter(|_| !active_era) {
+                logged_keys.insert(
+                    fill.intent.idempotency_key.clone(),
+                    frame.receipt.sequence.0,
+                );
+                continue;
+            }
             match frame.frame {
-                PaperLogFrame::LegacyFill(fill) if !active_era => {
-                    logged_keys.insert(fill.intent.idempotency_key, frame.receipt.sequence.0);
-                }
+                PaperLogFrame::LegacyFill => {}
                 PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
                     payload:
                         FinancialPayload::Fill {

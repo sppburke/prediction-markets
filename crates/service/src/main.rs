@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
-use pe_core_types::{
-    PolymarketConditionId, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress,
-};
+use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
 use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
 use pe_execution_core::LiveJournal;
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
@@ -39,7 +37,6 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use pe_paper_pnl::{PnlLedger, ResolutionStore};
-use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::config_poller::{
     CONFIG_POLL_INTERVAL_SECS, QualificationSealHandle, RiskHaltReleaseHandle,
@@ -63,8 +60,8 @@ use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
-    SupabaseStateClient, apply_resolution_authoritative, reconcile_active_financial_frames,
-    supabase_authoritative_boot, supabase_authoritative_boot_observed,
+    SupabaseStateClient, reconcile_active_financial_frames, supabase_authoritative_boot,
+    supabase_authoritative_boot_observed,
 };
 use pe_service::supervisor::{
     SHUTDOWN_DEADLINE, ShutdownController, ShutdownPhase, TaskEvent, TaskExit, TaskFailure,
@@ -967,8 +964,8 @@ async fn main() -> Result<()> {
     // NOT spawned in authoritative mode (issue #397): the `commit_fill`/`apply_resolution`
     // RPCs are the sole writer of `paper_fills`/`settled_markets`, so a best-effort
     // `merge-duplicates` upsert from `run_sink` must not race them. With `sink_handle = None`
-    // the orchestrator's `send_fill` and `tick_resolution`'s `send_resolution` are suppressed
-    // automatically; the liquidity-snapshot worker (#350) keeps its own gate and stays alive.
+    // the active financial protocol remains the only paper-state writer; the liquidity-snapshot
+    // worker (#350) keeps its own gate and stays alive.
     let sink_handle =
         if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() && !cfg.supabase_authoritative
         {
@@ -1289,24 +1286,10 @@ async fn main() -> Result<()> {
         let resolution_poller = run_financial_resolution_poller(
             paper_state.clone(),
             cfg.polymarket_clob_base_url.clone(),
-            cfg.clob_resolution_poll_interval_secs,
+            cfg.gamma_resolution_poll_interval_secs,
             clob_resolution_fetcher.clone(),
             resolution_source_log,
             control_tx.clone(),
-            shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
-        );
-        supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
-    } else {
-        // Pre-Start rehearsal uses the same CLOB resolver but retains the legacy local/remote
-        // mutation path. It cannot write a schema-two Prepared.
-        let resolution_poller = run_resolution_poller(
-            paper_state.clone(),
-            cfg.polymarket_clob_base_url.clone(),
-            cfg.clob_resolution_poll_interval_secs,
-            clob_resolution_fetcher,
-            resolution_source_log,
-            sink_handle.clone(),
-            supabase_state,
             shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
         );
         supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
@@ -1990,217 +1973,6 @@ async fn resolve_financial_condition(
         .await
         .context("paper resolution acknowledgement dropped")?
         .map_err(anyhow::Error::msg)?;
-    Ok(())
-}
-
-/// Periodically fetch CLOB resolutions for pre-Start rehearsal books.
-async fn run_resolution_poller(
-    paper_state: Arc<PaperStateDb>,
-    clob_base_url: String,
-    poll_interval_secs: u64,
-    fetcher: Arc<ReqwestFetcher>,
-    source_log: pe_service::activity_ingest::SourceLogHandle,
-    sink: Option<SinkHandle>,
-    supabase_state: Option<SupabaseStateClient>,
-    shutdown: impl std::future::Future<Output = ()>,
-) -> TaskResult {
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            () = &mut shutdown => return Ok(TaskExit::CleanShutdown),
-            () = tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(1))) => {}
-        }
-        if let Err(error) = tick_resolution(
-            &paper_state,
-            &clob_base_url,
-            fetcher.as_ref(),
-            &source_log,
-            sink.as_ref(),
-            supabase_state.as_ref(),
-        )
-        .await
-        {
-            warn!(error = %error, "resolution poll error");
-        }
-    }
-}
-
-async fn tick_resolution(
-    paper_state: &Arc<PaperStateDb>,
-    clob_base_url: &str,
-    fetcher: &ReqwestFetcher,
-    source_log: &pe_service::activity_ingest::SourceLogHandle,
-    sink: Option<&SinkHandle>,
-    supabase_state: Option<&SupabaseStateClient>,
-) -> Result<()> {
-    let mut store =
-        ResolutionStore::load(Arc::clone(paper_state)).context("load resolution store")?;
-
-    let positions = paper_state.paper_positions().context("read positions")?;
-
-    // Collect market IDs with open positions that have not been settled yet.
-    let pending: Vec<pe_core_types::MarketId> = positions
-        .iter()
-        .map(|position| position.market_id.to_string())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|market| pe_core_types::MarketId(pe_core_types::VenueMarketId(market)))
-        .filter(|mid| !store.is_settled(mid))
-        .collect();
-
-    if pending.is_empty() {
-        return Ok(());
-    }
-
-    let mut any_settled = false;
-    for market_id in pending {
-        let condition = PolymarketConditionId(market_id.0.0.clone());
-        let outcome: Result<Option<Decimal>> = async {
-        let observed_at = OffsetDateTime::now_utc();
-        let url = format!(
-            "{}/markets/{}",
-            clob_base_url.trim_end_matches('/'),
-            condition.0
-        );
-        let body = fetcher
-            .fetch_page(&url)
-            .await
-            .with_context(|| format!("fetch CLOB resolution {}", condition.0))?;
-        let received_at = OffsetDateTime::now_utc();
-        source_log
-            .append(EnvelopeIn {
-                source_id: SourceId("polymarket.clob.market".to_owned()),
-                schema_version: CLOB_RESOLUTION_SCHEMA_VERSION,
-                parser_version: CLOB_RESOLUTION_PARSER_VERSION,
-                observed_at: SourceTimestamp(observed_at),
-                received_at: ReceivedAt(received_at),
-                content_type: ContentType::Json,
-                payload: body.clone(),
-            })
-            .await
-            .context("append rehearsal CLOB resolution response")?;
-        let parsed = parse_clob_market(&body).context("parse rehearsal CLOB resolution")?;
-        anyhow::ensure!(
-            parsed.condition_id.as_deref() == Some(condition.0.as_str()),
-            "CLOB resolution condition differs from request"
-        );
-        let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
-            return Ok(None);
-        };
-        let outcome_prices = payout.decimals();
-        let now_unix = received_at.unix_timestamp();
-        let market_positions: Vec<_> = positions
-            .iter()
-            .filter(|p| p.market_id == market_id)
-            .cloned()
-            .collect();
-        let credit;
-        if let Some(sup) = supabase_state {
-            // Authoritative (#397/#511): `apply_resolution_v2` FIRST — the credit is
-            // computed INSIDE the RPC from `paper_positions` under the bankroll lock
-            // (closing the read-then-resolve TOCTOU with fills), then mirrored to SQLite
-            // with the RETURNED canonical values. On RPC error, leave the market
-            // unsettled locally so the next tick retries (fail-closed).
-            let _ = &market_positions; // authoritative credit is server-computed (#511)
-            match apply_resolution_authoritative(
-                sup,
-                &mut store,
-                &market_id,
-                outcome_prices,
-                now_unix,
-            )
-            .await
-            {
-                Ok(_bankroll) => {
-                    credit = store
-                        .settled_credit(&market_id)
-                        .unwrap_or(rust_decimal::Decimal::ZERO);
-                }
-                Err(e) => {
-                    return Err(e).context(
-                        "authoritative apply_resolution failed; leaving unsettled for next-tick retry",
-                    );
-                }
-            }
-        } else {
-            // Legacy (#511): settle + credit in ONE SQLite transaction, the credit
-            // computed inside it from freshly-read positions — a fill committing between
-            // an outside read and the settle can no longer be silently uncredited.
-            let binary_payout = BinaryPayout::new(outcome_prices[0], outcome_prices[1])
-                .context("validate binary resolution payout")?;
-            let (applied_credit, _bankroll) = paper_state
-                .settle_and_credit_from_positions(
-                    &market_id,
-                    &serde_json::to_string(
-                        &outcome_prices
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    )
-                    .context("encode outcome prices")?,
-                    now_unix,
-                    |positions| {
-                        let mut resolution_positions = Vec::with_capacity(positions.len());
-                        for position in positions {
-                            let net_contracts = position
-                                .long_contracts
-                                .checked_sub(position.short_contracts)
-                                .ok_or_else(|| {
-                                    pe_paper_state::PaperStateError::Internal(format!(
-                                        "resolution position {}:{} is net short",
-                                        position.market_id, position.outcome_id.0
-                                    ))
-                                })?;
-                            let net_shares =
-                                ShareAmount::from_whole(net_contracts).map_err(|error| {
-                                    pe_paper_state::PaperStateError::Internal(format!(
-                                        "resolution position quantity: {error}"
-                                    ))
-                                })?;
-                            resolution_positions.push((position.outcome_id.0, net_shares));
-                        }
-                        aggregate_resolution_credit(&resolution_positions, &binary_payout)
-                            .map(|credit| credit.to_decimal())
-                            .map_err(|error| {
-                                pe_paper_state::PaperStateError::Internal(format!(
-                                    "resolution credit arithmetic: {error}"
-                                ))
-                            })
-                    },
-                )
-                .context("settle and credit")?;
-            credit = applied_credit;
-            store
-                .note_settled(
-                    market_id.clone(),
-                    outcome_prices.to_vec(),
-                    applied_credit,
-                    now_unix,
-                )
-                .context("note settled")?;
-        }
-        Ok(Some(credit))
-        }
-        .await;
-        match outcome {
-            Ok(Some(credit)) => {
-                any_settled = true;
-                tracing::info!(market = %market_id, %credit, "resolution applied");
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    condition = %condition.0,
-                    error = %error,
-                    "rehearsal resolution condition failed; continuing"
-                );
-            }
-        }
-    }
-    // Nudge the Supabase sink once per tick to re-upsert the settled set (canonical JSON).
-    if any_settled && let Some(sink) = sink {
-        sink.send_resolution();
-    }
     Ok(())
 }
 

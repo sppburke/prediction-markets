@@ -38,9 +38,7 @@ use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::paper_recovery::{
-    LegacyFillSource, LegacyPaperFill, build_leader_ledger, reconcile_paper_state,
-};
+use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -53,6 +51,9 @@ use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
+
+mod support;
+use support::{LegacyFillSource, LegacyPaperFill, install_empty_anchor, send_trade_bucket};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -115,10 +116,6 @@ fn make_writer(dir: &TempDir) -> Writer {
     Writer::open(dir.path().join("paper.log")).unwrap()
 }
 
-fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
-    mpsc::channel(1).1
-}
-
 /// Copy-entry gate disabled for these correctness tests: fail-open (no band since #339).
 /// Paired with an empty history map so every first Entry is admitted.
 fn disabled_entry_gate() -> CopyEntryGateConfig {
@@ -164,6 +161,7 @@ async fn run_trades(
             updated_at_unix: 1,
         })
         .unwrap();
+    install_empty_anchor(&paper_state, leader_wallet(), 0);
     // Quote every traded market at 0.50 so an admitted signal can fetch a current price.
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, "0.50");
@@ -185,14 +183,9 @@ async fn run_trades(
         })
         .collect();
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
-    for t in trades {
-        trade_tx.send(t).await.unwrap();
-    }
-    drop(trade_tx);
+    let (control_tx, control_rx) = mpsc::channel(64);
 
-    let orch = Orchestrator::new_with_trade_input(
-        trade_rx,
+    let orch = Orchestrator::new(
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -218,14 +211,19 @@ async fn run_trades(
         leader_ledger,
         new_shared_health(false),
         mid_price_cache,
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
         Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    for trade in trades {
+        send_trade_bucket(&control_tx, trade).await;
+    }
+    drop(control_tx);
+    run.await.unwrap();
 }
 
 /// Count `LegacyPaperFill` frames in the paper event log (each fill is one frame).
@@ -279,18 +277,17 @@ async fn ac1_duplicate_trade_fills_and_ingests_once() {
     )
     .await;
 
-    assert_eq!(paper_fill_count(&dir), 1, "exactly one LegacyPaperFill");
+    assert_eq!(
+        paper_fill_count(&dir),
+        0,
+        "pre-Start writes no financial fill"
+    );
     assert_eq!(
         leader_long(&paper_state),
         whole_shares(100),
         "leader ledger ingested once"
     );
-    assert!(
-        paper_state
-            .is_seen(&SourceTradeId("dup-tx".to_string()))
-            .unwrap()
-    );
-    println!("PASS: AC1 duplicate trade fills and ingests exactly once");
+    println!("PASS: AC1 duplicate bucket ingests once without a pre-Start fill");
 }
 
 // ── AC2 ──────────────────────────────────────────────────────────────────────
@@ -324,12 +321,7 @@ async fn ac2_no_fill_trade_is_still_deduped() {
         whole_shares(100),
         "leader ledger ingested once despite no fill"
     );
-    assert!(
-        paper_state
-            .is_seen(&SourceTradeId("noedge-tx".to_string()))
-            .unwrap()
-    );
-    println!("PASS: AC2 no-fill trade is marked seen and ingested once");
+    println!("PASS: AC2 no-fill bucket is ingested once");
 }
 
 // ── AC4 ──────────────────────────────────────────────────────────────────────
@@ -372,13 +364,7 @@ async fn ac4_leader_ledger_rehydrates_on_restart() {
         pe_core_types::ShareAmount::from_whole(100).unwrap(),
         "leader position rehydrated"
     );
-    assert!(
-        restarted
-            .is_seen(&SourceTradeId("entry-tx".to_string()))
-            .unwrap(),
-        "filled trade still marked seen after restart"
-    );
-    println!("PASS: AC4 leader ledger rehydrates and filled trade does not re-fire");
+    println!("PASS: AC4 leader ledger rehydrates after acknowledged bucket commit");
 }
 
 // ── AC5 ──────────────────────────────────────────────────────────────────────

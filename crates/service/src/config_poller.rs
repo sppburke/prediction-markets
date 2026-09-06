@@ -16,18 +16,17 @@ use tracing::{info, warn};
 
 use crate::health::SharedHealth;
 use crate::orchestrator_control::OrchestratorControl;
-use crate::paper_recovery::{HaltState, paper_era, scan_paper_log};
-use crate::risk_inputs::{audited_halt_release, paper_latency_samples, rebuild_active_risk_halts};
+use crate::paper_recovery::{HaltState, active_risk_halts, paper_era, scan_paper_log};
+use crate::risk_inputs::{audited_halt_release, paper_latency_samples};
 use crate::runtime_config::{
-    AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RuntimeConfigStatus,
-    WatchlistCapacityEpoch, parse_config,
+    AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RISK_HALT_RELEASE_HASH_KEY,
+    RuntimeConfigStatus, WatchlistCapacityEpoch, parse_config,
 };
 use crate::supabase_reader::{SupabaseError, auth_token};
 
 /// Seconds between `service_config` polls. Boot-frozen (the poll cadence cannot govern itself).
 /// Canonical default lives in `docs/_GLOSSARY.md`: `config_poll_interval_secs`.
 pub const CONFIG_POLL_INTERVAL_SECS: u64 = 30;
-pub const RISK_HALT_RELEASE_HASH_KEY: &str = "risk_halt_release_hash";
 
 /// Non-economic incident control separated from one fetched config proposal (#545).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,7 +218,7 @@ impl RiskHaltReleaseHandle {
     pub async fn apply(&self, release_hash: &str) -> Result<(), String> {
         let era =
             paper_era(scan_paper_log(&self.paper_log_path).map_err(|error| error.to_string())?);
-        let active = rebuild_active_risk_halts(&era);
+        let active = active_risk_halts(&era);
         let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
         let latest_latency_p95_ms = paper_latency_samples(&era, &self.source_log_path, now_unix)
             .map_err(|error| format!("derive release latency evidence: {error}"))?

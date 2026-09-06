@@ -4,7 +4,7 @@
 //! exact `pe-paper-state::FinancialSnapshot` interface lands. These reducers are the independent
 //! log side of that composition and are usable at boot before producers start.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +24,8 @@ use pe_strategy_winner_follow::RiskInputsUnavailable;
 use rust_decimal::Decimal;
 
 use crate::activity_ingest::SourceLogHandle;
+#[cfg(test)]
+use crate::paper_recovery::active_risk_halts;
 use crate::paper_recovery::{
     FinancialPayload, FinancialResult, HaltState, PaperEra, PaperLogFrame, PaperLogRecord,
     RiskHaltOwner, oldest_unmatched_prepared,
@@ -64,7 +66,9 @@ impl BoundaryMarkFetcher {
     ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            fetcher: ReqwestFetcher::new(client).with_min_interval_ms(10),
+            fetcher: ReqwestFetcher::new(client)
+                .with_min_interval_ms(10)
+                .with_max_retries(0),
             source_log,
         }
     }
@@ -216,66 +220,6 @@ pub fn historical_mark_price(
     })
 }
 
-/// Replay-derived active risk causes. The log remains the sole durable owner.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ActiveRiskHalts {
-    active: Vec<(RiskHaltOwner, RiskHaltCause)>,
-}
-
-impl ActiveRiskHalts {
-    #[must_use]
-    pub fn is_active(&self, owner: &RiskHaltOwner, cause: RiskHaltCause) -> bool {
-        self.active
-            .iter()
-            .any(|(candidate_owner, candidate_cause)| {
-                candidate_owner == owner && *candidate_cause == cause
-            })
-    }
-
-    #[must_use]
-    pub fn blocks_new_entries(&self) -> bool {
-        !self.active.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &(RiskHaltOwner, RiskHaltCause)> {
-        self.active.iter()
-    }
-
-    fn apply(&mut self, owner: &RiskHaltOwner, cause: RiskHaltCause, state: HaltState) {
-        let existing = self
-            .active
-            .iter()
-            .position(|(candidate_owner, candidate_cause)| {
-                candidate_owner == owner && *candidate_cause == cause
-            });
-        match (existing, state) {
-            (None, HaltState::Engaged) => self.active.push((owner.clone(), cause)),
-            (Some(index), HaltState::Released) => {
-                self.active.remove(index);
-            }
-            (None, HaltState::Released) | (Some(_), HaltState::Engaged) => {}
-        }
-    }
-}
-
-/// Rebuild the sole in-memory halt set from the active qualification era.
-#[must_use]
-pub fn rebuild_active_risk_halts(era: &PaperEra) -> ActiveRiskHalts {
-    let mut active = ActiveRiskHalts::default();
-    for frame in &era.frames {
-        if let PaperLogFrame::Record(PaperLogRecord::RiskHaltChanged {
-            owner,
-            cause,
-            state,
-            ..
-        }) = &frame.frame
-        {
-            active.apply(owner, *cause, *state);
-        }
-    }
-    active
-}
-
 /// A manual release target proven to be the currently active event named by the incident row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditedHaltRelease {
@@ -290,7 +234,7 @@ pub struct AuditedHaltRelease {
 #[must_use]
 pub fn audited_halt_release(
     era: &PaperEra,
-    active: &ActiveRiskHalts,
+    active: &HashSet<(RiskHaltOwner, RiskHaltCause)>,
     release_hash: &str,
     latest_latency_p95_ms: Option<u64>,
 ) -> Option<AuditedHaltRelease> {
@@ -310,7 +254,7 @@ pub fn audited_halt_release(
         if !matches!(
             cause,
             RiskHaltCause::AbsoluteLoss | RiskHaltCause::CopyLatency
-        ) || !active.is_active(owner, *cause)
+        ) || !active.contains(&(owner.clone(), *cause))
             || (*cause == RiskHaltCause::CopyLatency && latest_latency_p95_ms.is_some())
             || era.frames[index.saturating_add(1)..]
                 .iter()
@@ -346,6 +290,61 @@ pub fn latest_completed_prepared(era: &PaperEra) -> Option<EventSeq> {
             }) => Some(prepared_receipt.sequence),
             _ => None,
         })
+}
+
+/// Completed financial facts whose source observation is inside the boundary prefix and was
+/// received strictly before the cutoff. This is the shared causal filter for historical marks.
+pub fn completed_prepared_before_boundary(
+    era: &PaperEra,
+    source_log_path: &Path,
+    cutoff_unix: i64,
+    boundary_receipt: AppendReceipt,
+) -> Result<HashSet<EventSeq>, RiskInputsUnavailable> {
+    let cutoff_ms = cutoff_unix
+        .checked_mul(1_000)
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let prepared = era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { payload, .. }) => {
+                Some((frame.receipt.sequence, payload))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut completed = HashSet::new();
+    for frame in &era.frames {
+        let PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+            prepared_receipt, ..
+        }) = &frame.frame
+        else {
+            continue;
+        };
+        if frame.envelope.received_at.0.unix_timestamp() >= cutoff_unix {
+            continue;
+        }
+        let payload = prepared
+            .get(&prepared_receipt.sequence)
+            .ok_or(RiskInputsUnavailable::UnmatchedPrepared)?;
+        let source_receipt = match payload {
+            FinancialPayload::Fill { economic, .. } => economic
+                .observation
+                .as_ref()
+                .map(|observation| observation.source_receipt)
+                .ok_or(RiskInputsUnavailable::PriceMissing)?,
+            FinancialPayload::Resolution {
+                resolution_source_receipt,
+                ..
+            } => *resolution_source_receipt,
+        };
+        if source_receipt.sequence <= boundary_receipt.sequence
+            && source_receipt_received_millis(source_log_path, source_receipt)? < cutoff_ms
+        {
+            completed.insert(prepared_receipt.sequence);
+        }
+    }
+    Ok(completed)
 }
 
 /// Compose exact paper PnL/latency into the existing proposal snapshot. Exposure, proposal, and cap
@@ -682,6 +681,7 @@ mod tests {
             },
             receipt,
             frame: PaperLogFrame::Record(record),
+            legacy_fill: None,
         }
     }
 
@@ -954,10 +954,10 @@ mod tests {
                 ),
             ],
         };
-        let active = rebuild_active_risk_halts(&era);
-        assert!(active.blocks_new_entries());
-        assert!(active.is_active(&RiskHaltOwner::Paper, RiskHaltCause::AbsoluteLoss));
-        assert!(!active.is_active(&account(), RiskHaltCause::CopyLatency));
+        let active = active_risk_halts(&era);
+        assert!(!active.is_empty());
+        assert!(active.contains(&(RiskHaltOwner::Paper, RiskHaltCause::AbsoluteLoss)));
+        assert!(!active.contains(&(account(), RiskHaltCause::CopyLatency)));
     }
 
     /// PASS: only the latest still-active absolute/latency engagement can be manually released.
@@ -1005,7 +1005,7 @@ mod tests {
                 starved_latency.clone(),
             ],
         };
-        let active = rebuild_active_risk_halts(&era);
+        let active = active_risk_halts(&era);
         assert!(
             audited_halt_release(
                 &era,

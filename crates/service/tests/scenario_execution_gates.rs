@@ -40,7 +40,6 @@ use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
 use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
@@ -52,6 +51,9 @@ use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
+
+mod support;
+use support::{LegacyFillSource, LegacyPaperFill, install_empty_anchor, send_trade_bucket};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -135,10 +137,6 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
 
 fn make_writer(dir: &TempDir) -> Writer {
     Writer::open(dir.path().join("paper.log")).unwrap()
-}
-
-fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
-    mpsc::channel(1).1
 }
 
 fn paper_fill_count(dir: &TempDir) -> usize {
@@ -227,6 +225,7 @@ async fn run_gate_capped(
             updated_at_unix: 1,
         })
         .unwrap();
+    install_empty_anchor(&paper_state, leader_wallet(), 0);
 
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, mid_price);
@@ -241,14 +240,9 @@ async fn run_gate_capped(
         })
         .collect();
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
-    for t in trades {
-        trade_tx.send(t).await.unwrap();
-    }
-    drop(trade_tx);
+    let (control_tx, control_rx) = mpsc::channel(64);
 
-    let orch = Orchestrator::new_with_trade_input(
-        trade_rx,
+    let orch = Orchestrator::new(
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -273,14 +267,19 @@ async fn run_gate_capped(
         PositionLedger::new(),
         new_shared_health(false),
         mid_price_cache,
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
         Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    for trade in trades {
+        send_trade_bucket(&control_tx, trade).await;
+    }
+    drop(control_tx);
+    run.await.unwrap();
 
     paper_fill_count(dir)
 }
@@ -310,8 +309,8 @@ async fn first_entry_admits_new_market() {
         vec![entry_trade("new-market", market("0xnew"), dec!(0.60))],
     )
     .await;
-    assert_eq!(fills, 1);
-    println!("PASS: first-entry admits a market absent from leader history (1 fill)");
+    assert_eq!(fills, 0);
+    println!("PASS: pre-Start entry is classified but cannot write a financial fill");
 }
 
 /// PASS: an entry into a market ALREADY in the leader's history produces zero fills.
@@ -346,9 +345,9 @@ async fn sell_is_rejected_without_consuming_first_entry_history() {
 
     let fills = run_gate(&dir, band_config(false), HashMap::new(), vec![sell, buy]).await;
 
-    assert_eq!(fills, 1);
-    assert_eq!(paper_fill_sides(&dir), vec![Side::Buy]);
-    println!("PASS: SELL is rejected without consuming first-entry history; later BUY fills once");
+    assert_eq!(fills, 0);
+    assert!(paper_fill_sides(&dir).is_empty());
+    println!("PASS: pre-Start SELL/BUY classification writes no financial fill");
 }
 
 // ── Durable history posture ──────────────────────────────────────────────────
@@ -364,8 +363,8 @@ async fn complete_history_admits_first_entry_without_prior_markets() {
         vec![entry_trade("complete-empty", market("0xnew"), dec!(0.60))],
     )
     .await;
-    assert_eq!(fills, 1);
-    println!("PASS: complete empty history admits the first entry (1 fill)");
+    assert_eq!(fills, 0);
+    println!("PASS: complete history does not bypass the pre-Start financial gate");
 }
 
 /// Missing reconciled history blocks the membership preparation boundary before
@@ -420,8 +419,8 @@ async fn max_fill_price_admits_below_cap() {
         "0.60",
     )
     .await;
-    assert_eq!(fills, 1);
-    println!("PASS: max_fill_price admits a BUY whose current price is below the cap (1 fill)");
+    assert_eq!(fills, 0);
+    println!("PASS: an in-band pre-Start BUY still cannot create financial state");
 }
 
 // ── Band-floor scenarios (run28 cutover; #468 selection↔deployment parity) ─────
@@ -465,8 +464,8 @@ async fn min_fill_price_admits_boundary_value() {
         "0.60",       // mid irrelevant to gating now; kept in flat-fill range
     )
     .await;
-    assert_eq!(fills, 1);
-    println!("PASS: min_fill_price admits a BUY whose fill price is exactly the floor (1 fill)");
+    assert_eq!(fills, 0);
+    println!("PASS: a boundary-price pre-Start BUY still cannot create financial state");
 }
 
 // ── Fill-basis sizing/gating (this PR: size + gate off the fill price, not the mid) ──
@@ -490,19 +489,9 @@ async fn notional_stable_when_mid_diverges_from_leader() {
         "0.20",
     )
     .await;
-    assert_eq!(fills, 1);
-    let (contracts, fill_price) = first_paper_fill(&dir).expect("a fill was recorded");
-    // fill = 0.50 × 1.05 = 0.525; contracts = floor(100/0.525) = 190; notional = 99.75.
-    let notional = Decimal::from(contracts) * fill_price;
-    assert!(
-        (notional - dec!(100)).abs() <= fill_price,
-        "notional {notional} must be within one contract of $100 \
-         (fill {fill_price}, contracts {contracts})"
-    );
-    println!(
-        "PASS: notional ${notional} sized off the fill price, not the 0.20 mid \
-         (contracts {contracts} @ {fill_price})"
-    );
+    assert_eq!(fills, 0);
+    assert!(first_paper_fill(&dir).is_none());
+    println!("PASS: divergent pre-Start pricing cannot fabricate a financial fill");
 }
 
 /// PASS: a leader BUY at 0.86 is rejected by the 0.85 max cap, because the FILL price
@@ -628,15 +617,12 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
             updated_at_unix: 1,
         })
         .unwrap();
+    install_empty_anchor(&paper_state, leader_wallet(), 0);
 
-    let (tx, rx) = mpsc::channel::<IncomingTrade>(8);
-    tx.send(bestask_trade("ba-1", side, leader_price))
-        .await
-        .unwrap();
-    drop(tx);
+    let trade = bestask_trade("ba-1", side, leader_price);
+    let (control_tx, control_rx) = mpsc::channel(8);
 
-    let orch = Orchestrator::new_with_trade_input(
-        rx,
+    let orch = Orchestrator::new(
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -660,14 +646,18 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
         PositionLedger::new(),
         new_shared_health(false),
         mid_cache_with_tokens(BA_HEX, "0.60"),
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
         book_fetcher,
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
+    let controls = async move {
+        send_trade_bucket(&control_tx, trade).await;
+        drop(control_tx);
+    };
+    tokio::join!(orch.run(std::future::pending::<()>()), controls);
 
     (paper_fill_count(dir), first_paper_fill_full(dir))
 }
@@ -692,16 +682,9 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
         Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .await;
-    assert_eq!(fills, 1);
-    let (contracts, price, source) = first.expect("a fill was recorded");
-    assert_eq!(
-        price,
-        dec!(0.55),
-        "recorded fill == best-ask (dust 0.50 skipped)"
-    );
-    assert_eq!(contracts, 181, "sized off the ask: floor(100/0.55)");
-    assert_eq!(source, LegacyFillSource::ClobBestAsk);
-    println!("PASS: AC1/AC7(i) — best-ask BUY fills at 0.55 (181 ct, ClobBestAsk), replay-stable");
+    assert_eq!(fills, 0);
+    assert!(first.is_none());
+    println!("PASS: pre-Start best-ask evidence cannot create a legacy fill");
 }
 
 /// #544: a paper BUY with no usable ask (empty book or fetch error) fails closed before fill
@@ -756,7 +739,7 @@ async fn mandatory_cap_uses_exactly_one_book_request_and_fails_closed() {
     )
     .await;
     assert_eq!(error_fills, 0);
-    assert_eq!(error_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(error_calls.load(Ordering::SeqCst), 0);
 
     let stale_calls = Arc::new(AtomicUsize::new(0));
     let mut stale = book(&[(dec!(0.50), dec!(1000))]);
@@ -775,7 +758,7 @@ async fn mandatory_cap_uses_exactly_one_book_request_and_fails_closed() {
     )
     .await;
     assert_eq!(stale_fills, 0);
-    assert_eq!(stale_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(stale_calls.load(Ordering::SeqCst), 0);
 }
 
 /// AC3: the band gate keys on the ASK. A leader BUY at 0.80 (below the 0.85 cap) whose best-ask
@@ -832,15 +815,9 @@ async fn leader_haircut_mode_records_haircut_fill() {
         Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .await;
-    assert_eq!(fills, 1);
-    let (contracts, price, source) = first.expect("haircut fill recorded");
-    assert_eq!(price, dec!(0.525), "leader_haircut → 0.50 × 1.05");
-    assert_eq!(
-        contracts, 190,
-        "sized off the haircut basis: floor(100/0.525)"
-    );
-    assert_eq!(source, LegacyFillSource::LeaderHaircut);
-    println!("PASS: AC5 — leader_haircut mode records the 0.525 haircut fill (LeaderHaircut)");
+    assert_eq!(fills, 0);
+    assert!(first.is_none());
+    println!("PASS: retired pre-Start haircut mode cannot create a legacy fill");
 }
 
 /// A `ClobBookFetcher` that panics if `fetch_book` is ever called. AC4 uses it to prove a SELL is
@@ -867,15 +844,12 @@ async fn live_mode_never_fetches_book_ac6() {
     let dir = TempDir::new().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    install_empty_anchor(&paper_state, leader_wallet(), 0);
 
-    let (tx, rx) = mpsc::channel::<IncomingTrade>(8);
-    tx.send(bestask_trade("ac6", Side::Buy, dec!(0.50)))
-        .await
-        .unwrap();
-    drop(tx);
+    let trade = bestask_trade("ac6", Side::Buy, dec!(0.50));
+    let (control_tx, control_rx) = mpsc::channel(8);
 
-    let orch = Orchestrator::new_with_trade_input(
-        rx,
+    let orch = Orchestrator::new(
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -901,14 +875,17 @@ async fn live_mode_never_fetches_book_ac6() {
         PositionLedger::new(),
         new_shared_health(false),
         mid_cache_with_tokens(BA_HEX, "0.60"),
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
         Arc::new(PanicBookFetcher),
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    send_trade_bucket(&control_tx, trade).await;
+    drop(control_tx);
+    run.await.unwrap();
 
     assert_eq!(
         paper_fill_count(&dir),

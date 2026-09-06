@@ -88,7 +88,10 @@ CREATE TABLE IF NOT EXISTS fills (
     principal_str   TEXT    NOT NULL,
     fee_str         TEXT    NOT NULL,
     event_seq       INTEGER NOT NULL,
-    prepared_seq    INTEGER NOT NULL
+    prepared_seq    INTEGER NOT NULL,
+    source_receipt_seq INTEGER,
+    source_receipt_hash TEXT,
+    causal_received_at_unix INTEGER
 );
 
 -- Our own net paper positions per (market, outcome).

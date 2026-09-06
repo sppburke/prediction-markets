@@ -724,6 +724,27 @@ impl PaperStateDb {
                 conn.execute(alter, [])?;
             }
         }
+        for (column, alter) in [
+            (
+                "source_receipt_seq",
+                "ALTER TABLE fills ADD COLUMN source_receipt_seq INTEGER",
+            ),
+            (
+                "source_receipt_hash",
+                "ALTER TABLE fills ADD COLUMN source_receipt_hash TEXT",
+            ),
+            (
+                "causal_received_at_unix",
+                "ALTER TABLE fills ADD COLUMN causal_received_at_unix INTEGER",
+            ),
+        ] {
+            let has_column: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('fills') WHERE name = ?1")?
+                .exists(params![column])?;
+            if !has_column {
+                conn.execute(alter, [])?;
+            }
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -3162,11 +3183,14 @@ impl PaperStateDb {
     /// Apply one exact fill under the Start/predecessor protocol. `canonical_cash` is the
     /// authority response; the transaction independently derives principal+fee debit and
     /// refuses a mismatch before changing the projection.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_financial_fill(
         &self,
         start: AppendReceipt,
         expected_prior: Option<EventSeq>,
         prepared_seq: EventSeq,
+        source_receipt: AppendReceipt,
+        causal_received_at_unix: i64,
         fill: &FinancialFillRecord,
         canonical_cash: Decimal,
     ) -> Result<FinancialApplyOutcome, PaperStateError> {
@@ -3184,6 +3208,8 @@ impl PaperStateDb {
         if let Some(stored) = tx_financial_fill(&tx, &fill.idempotency_key)? {
             if stored.record != *fill
                 || stored.prepared_seq != prepared_seq
+                || stored.source_receipt != source_receipt
+                || stored.causal_received_at_unix != causal_received_at_unix
                 || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
                 || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
             {
@@ -3227,7 +3253,13 @@ impl PaperStateDb {
             ));
         }
 
-        tx_insert_financial_fill(&tx, fill, prepared_seq)?;
+        tx_insert_financial_fill(
+            &tx,
+            fill,
+            prepared_seq,
+            source_receipt,
+            causal_received_at_unix,
+        )?;
         tx_apply_financial_position(&tx, fill)?;
         tx_set_bankroll(&tx, derived_cash)?;
         tx_set_financial_last_prepared(&tx, prepared_seq)?;
@@ -3326,22 +3358,154 @@ impl PaperStateDb {
         Ok(FinancialApplyOutcome::Applied { cash: derived_cash })
     }
 
-    /// Coherent bounded financial view. Only open positions, settlements in
-    /// `(now-7d, now]`, and fills belonging to either set are returned.
-    pub fn financial_snapshot(&self, now_unix: i64) -> Result<FinancialSnapshot, PaperStateError> {
+    /// Reconstruct the coherent financial view at `cutoff_unix` from causal fill and resolution
+    /// facts. Current projection tables are never reused for historical cash or positions.
+    /// Only open positions at the cutoff, settlements in `(cutoff-7d, cutoff]`, and fills
+    /// belonging to either set are returned.
+    pub fn financial_snapshot(
+        &self,
+        cutoff_unix: i64,
+    ) -> Result<FinancialSnapshot, PaperStateError> {
+        self.financial_snapshot_inner(cutoff_unix, None)
+    }
+
+    /// Boundary form of [`Self::financial_snapshot`]. In addition to the cutoff clock, only facts
+    /// whose source receipt is within `source_bound` participate. The cutoff is exclusive because
+    /// a daily-boundary frame owns facts received strictly before midnight.
+    pub fn financial_snapshot_before_source_bound(
+        &self,
+        cutoff_unix: i64,
+        source_bound: EventSeq,
+        completed_prepared: &[EventSeq],
+    ) -> Result<FinancialSnapshot, PaperStateError> {
+        let inclusive = cutoff_unix
+            .checked_sub(1)
+            .ok_or_else(|| PaperStateError::Internal("snapshot cutoff underflow".to_owned()))?;
+        self.financial_snapshot_inner(inclusive, Some((source_bound, completed_prepared)))
+    }
+
+    fn financial_snapshot_inner(
+        &self,
+        cutoff_unix: i64,
+        boundary: Option<(EventSeq, &[EventSeq])>,
+    ) -> Result<FinancialSnapshot, PaperStateError> {
         const SEVEN_DAYS_SECS: i64 = 7 * 24 * 60 * 60;
-        let lower = now_unix
+        let lower = cutoff_unix
             .checked_sub(SEVEN_DAYS_SECS)
             .ok_or_else(|| PaperStateError::Internal("snapshot window underflow".to_owned()))?;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        let cash = tx_read_bankroll(&tx)?;
         let start = tx_financial_start(&tx)?.map(|value| (value.sequence, value.this_hash));
-        let last_prepared_seq = tx_financial_last_prepared(&tx)?;
+        let all_fills = read_causal_financial_fills(&tx, i64::MAX, None)?;
+        let all_settlements = read_causal_settlements(&tx, i64::MAX, None)?;
+        let mut starting_cash = tx_read_bankroll(&tx)?;
+        for fill in &all_fills {
+            starting_cash = starting_cash
+                .checked_add(fill.principal.to_decimal())
+                .and_then(|cash| cash.checked_add(fill.fee.to_decimal()))
+                .ok_or_else(|| PaperStateError::Internal("starting cash overflow".to_owned()))?;
+        }
+        for settlement in &all_settlements {
+            starting_cash = starting_cash
+                .checked_sub(settlement.credit_applied)
+                .ok_or_else(|| PaperStateError::Internal("starting cash overflow".to_owned()))?;
+        }
 
-        let positions = read_financial_positions(&tx, true)?;
-        let settlements_7d = read_settlements_window(&tx, lower, now_unix)?;
-        let fills_for_open_and_7d = read_financial_fills_window(&tx, lower, now_unix)?;
+        let source_bound = boundary.map(|(bound, _)| bound);
+        let completed =
+            boundary.map(|(_, sequences)| sequences.iter().copied().collect::<HashSet<_>>());
+        let fills = read_causal_financial_fills(&tx, cutoff_unix, source_bound)?
+            .into_iter()
+            .filter(|fill| {
+                completed
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&fill.prepared_seq))
+            })
+            .collect::<Vec<_>>();
+        let settlements = read_causal_settlements(&tx, cutoff_unix, source_bound)?
+            .into_iter()
+            .filter(|settlement| {
+                completed.as_ref().is_none_or(|set| {
+                    settlement
+                        .prepared_seq
+                        .is_some_and(|sequence| set.contains(&sequence))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut cash = starting_cash;
+        let mut position_map = HashMap::new();
+        for fill in &fills {
+            cash = cash
+                .checked_sub(fill.principal.to_decimal())
+                .and_then(|value| value.checked_sub(fill.fee.to_decimal()))
+                .ok_or_else(|| {
+                    PaperStateError::Internal("snapshot fill debit overflow".to_owned())
+                })?;
+            let entry = position_map
+                .entry((fill.market_id.clone(), fill.outcome_id))
+                .or_insert((ShareAmount::ZERO, ShareAmount::ZERO));
+            *entry = apply_exact_fill_to_net(entry.0, entry.1, fill.side, fill.quantity)?;
+        }
+        let settled_markets = settlements
+            .iter()
+            .map(|settlement| settlement.market_id.clone())
+            .collect::<HashSet<_>>();
+        for settlement in &settlements {
+            cash = cash.checked_add(settlement.credit_applied).ok_or_else(|| {
+                PaperStateError::Internal("snapshot settlement overflow".to_owned())
+            })?;
+        }
+        let mut positions = position_map
+            .into_iter()
+            .filter(|((market, _), (long, short))| {
+                !settled_markets.contains(market)
+                    && (*long != ShareAmount::ZERO || *short != ShareAmount::ZERO)
+            })
+            .map(
+                |((market_id, outcome_id), (long, short))| FinancialPositionRow {
+                    market_id,
+                    outcome_id,
+                    long,
+                    short,
+                },
+            )
+            .collect::<Vec<_>>();
+        positions.sort_by(|left, right| {
+            left.market_id
+                .to_string()
+                .cmp(&right.market_id.to_string())
+                .then(left.outcome_id.0.cmp(&right.outcome_id.0))
+        });
+        let open_markets = positions
+            .iter()
+            .map(|position| position.market_id.clone())
+            .collect::<HashSet<_>>();
+        let settlements_7d = settlements
+            .iter()
+            .filter(|settlement| settlement.settled_at_unix > lower)
+            .cloned()
+            .collect::<Vec<_>>();
+        let recent_settled_markets = settlements_7d
+            .iter()
+            .map(|settlement| settlement.market_id.clone())
+            .collect::<HashSet<_>>();
+        let fills_for_open_and_7d = fills
+            .iter()
+            .filter(|fill| {
+                open_markets.contains(&fill.market_id)
+                    || recent_settled_markets.contains(&fill.market_id)
+            })
+            .map(|fill| fill.row.clone())
+            .collect::<Vec<_>>();
+        let last_prepared_seq = fills
+            .iter()
+            .map(|fill| fill.prepared_seq)
+            .chain(
+                settlements
+                    .iter()
+                    .filter_map(|settlement| settlement.prepared_seq),
+            )
+            .max_by_key(|sequence| sequence.0);
         tx.commit()?;
         Ok(FinancialSnapshot {
             cash,
@@ -4497,6 +4661,8 @@ fn tx_set_financial_last_prepared(
 struct StoredFinancialFill {
     record: FinancialFillRecord,
     prepared_seq: EventSeq,
+    source_receipt: AppendReceipt,
+    causal_received_at_unix: i64,
 }
 
 fn tx_financial_fill(
@@ -4506,7 +4672,8 @@ fn tx_financial_fill(
     let row = conn
         .query_row(
             "SELECT market_id, outcome_id, side, quantity_str, fill_price_str, \
-                    principal_str, fee_str, prepared_seq \
+                    principal_str, fee_str, prepared_seq, source_receipt_seq, \
+                    source_receipt_hash, causal_received_at_unix \
              FROM fills WHERE idempotency_key = ?1",
             params![idempotency_key],
             |row| {
@@ -4519,12 +4686,27 @@ fn tx_financial_fill(
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(market, outcome, side, quantity, price, principal, fee, prepared_seq)| {
+        |(
+            market,
+            outcome,
+            side,
+            quantity,
+            price,
+            principal,
+            fee,
+            prepared_seq,
+            source_sequence,
+            source_hash,
+            causal_received_at_unix,
+        )| {
             Ok(StoredFinancialFill {
                 record: FinancialFillRecord {
                     idempotency_key: idempotency_key.to_owned(),
@@ -4539,6 +4721,13 @@ fn tx_financial_fill(
                     fee: parse_collateral_amount(&fee)?,
                 },
                 prepared_seq: EventSeq(parse_u64(prepared_seq)?),
+                source_receipt: AppendReceipt {
+                    sequence: EventSeq(parse_u64(source_sequence)?),
+                    this_hash: blake3::Hash::from_hex(&source_hash).map_err(|_| {
+                        PaperStateError::Corrupt("bad fill source receipt hash".to_owned())
+                    })?,
+                },
+                causal_received_at_unix,
             })
         },
     )
@@ -4549,14 +4738,17 @@ fn tx_insert_financial_fill(
     tx: &Transaction<'_>,
     fill: &FinancialFillRecord,
     prepared_seq: EventSeq,
+    source_receipt: AppendReceipt,
+    causal_received_at_unix: i64,
 ) -> Result<(), PaperStateError> {
     const ATOMIC_SCALE: u64 = 1_000_000;
     let legacy_whole = fill.quantity.atomic() / ATOMIC_SCALE;
     tx.execute(
         "INSERT INTO fills \
             (idempotency_key, market_id, outcome_id, side, contracts, quantity_str, \
-             fill_price_str, principal_str, fee_str, event_seq, prepared_seq) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+             fill_price_str, principal_str, fee_str, event_seq, prepared_seq, \
+             source_receipt_seq, source_receipt_hash, causal_received_at_unix) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13)",
         params![
             fill.idempotency_key,
             fill.market_id.to_string(),
@@ -4568,6 +4760,9 @@ fn tx_insert_financial_fill(
             fill.principal.to_decimal().to_string(),
             fill.fee.to_decimal().to_string(),
             to_i64(prepared_seq.0)?,
+            to_i64(source_receipt.sequence.0)?,
+            source_receipt.this_hash.to_hex().to_string(),
+            causal_received_at_unix,
         ],
     )?;
     Ok(())
@@ -4631,6 +4826,7 @@ fn tx_apply_financial_position(
     Ok(())
 }
 
+#[cfg(test)]
 fn read_financial_positions(
     conn: &Connection,
     open_only: bool,
@@ -4666,6 +4862,7 @@ fn read_financial_positions(
     Ok(result)
 }
 
+#[cfg(test)]
 fn read_settlements_window(
     conn: &Connection,
     lower: i64,
@@ -4702,6 +4899,135 @@ fn read_settlements_window(
     Ok(result)
 }
 
+#[derive(Clone)]
+struct CausalFinancialFill {
+    row: FinancialFillRow,
+}
+
+impl std::ops::Deref for CausalFinancialFill {
+    type Target = FinancialFillRow;
+
+    fn deref(&self) -> &Self::Target {
+        &self.row
+    }
+}
+
+fn read_causal_financial_fills(
+    conn: &Connection,
+    upper_inclusive: i64,
+    source_bound: Option<EventSeq>,
+) -> Result<Vec<CausalFinancialFill>, PaperStateError> {
+    let bound = source_bound
+        .map(|sequence| to_i64(sequence.0))
+        .transpose()?;
+    let mut statement = conn.prepare(
+        "SELECT idempotency_key, market_id, outcome_id, side, quantity_str, fill_price_str, \
+                principal_str, fee_str, prepared_seq, source_receipt_seq, source_receipt_hash, \
+                causal_received_at_unix \
+         FROM fills \
+         WHERE causal_received_at_unix <= ?1 \
+           AND (?2 IS NULL OR source_receipt_seq <= ?2) \
+         ORDER BY prepared_seq, idempotency_key",
+    )?;
+    let rows = statement.query_map(params![upper_inclusive, bound], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (
+            key,
+            market,
+            outcome,
+            side,
+            quantity,
+            price,
+            principal,
+            fee,
+            prepared,
+            source_sequence,
+            source_hash,
+            _causal_received_at_unix,
+        ) = row?;
+        let _source_receipt = AppendReceipt {
+            sequence: EventSeq(parse_u64(source_sequence)?),
+            this_hash: blake3::Hash::from_hex(&source_hash)
+                .map_err(|_| PaperStateError::Corrupt("bad fill source receipt hash".to_owned()))?,
+        };
+        result.push(CausalFinancialFill {
+            row: FinancialFillRow {
+                idempotency_key: key,
+                market_id: MarketId(VenueMarketId(market)),
+                outcome_id: OutcomeId(parse_u16(outcome)?),
+                side: parse_side(&side)?,
+                quantity: parse_share_amount(&quantity)?,
+                fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
+                    PaperStateError::Corrupt(format!("financial fill price: {error}"))
+                })?,
+                principal: parse_collateral_amount(&principal)?,
+                fee: parse_collateral_amount(&fee)?,
+                prepared_seq: EventSeq(parse_u64(prepared)?),
+            },
+        });
+    }
+    Ok(result)
+}
+
+fn read_causal_settlements(
+    conn: &Connection,
+    upper_inclusive: i64,
+    source_bound: Option<EventSeq>,
+) -> Result<Vec<SettledMarketRow>, PaperStateError> {
+    let bound = source_bound
+        .map(|sequence| to_i64(sequence.0))
+        .transpose()?;
+    let mut statement = conn.prepare(
+        "SELECT market_id, outcome_prices, credit_applied, settled_at_unix, \
+                prepared_seq, source_receipt_seq \
+         FROM settled_markets \
+         WHERE settled_at_unix <= ?1 \
+           AND source_receipt_seq IS NOT NULL \
+           AND (?2 IS NULL OR source_receipt_seq <= ?2) \
+         ORDER BY prepared_seq, market_id",
+    )?;
+    let rows = statement.query_map(params![upper_inclusive, bound], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (market, payout, credit, settled_at_unix, prepared, source) = row?;
+        result.push(SettledMarketRow {
+            market_id: MarketId(VenueMarketId(market)),
+            outcome_prices_json: payout,
+            credit_applied: parse_decimal(&credit)?,
+            settled_at_unix,
+            prepared_seq: prepared.map(parse_u64).transpose()?.map(EventSeq),
+            source_receipt_seq: source.map(parse_u64).transpose()?.map(EventSeq),
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
 fn read_financial_fills_window(
     conn: &Connection,
     lower: i64,
@@ -4779,6 +5105,13 @@ fn migrate_v2_financial_columns(conn: &mut Connection) -> Result<(), PaperStateE
         ("fills", "principal_str", "principal_str TEXT"),
         ("fills", "fee_str", "fee_str TEXT"),
         ("fills", "prepared_seq", "prepared_seq INTEGER"),
+        ("fills", "source_receipt_seq", "source_receipt_seq INTEGER"),
+        ("fills", "source_receipt_hash", "source_receipt_hash TEXT"),
+        (
+            "fills",
+            "causal_received_at_unix",
+            "causal_received_at_unix INTEGER",
+        ),
         ("positions", "long_str", "long_str TEXT"),
         ("positions", "short_str", "short_str TEXT"),
         ("settled_markets", "prepared_seq", "prepared_seq INTEGER"),
@@ -4874,6 +5207,35 @@ fn apply_fill_to_net(long: u64, short: u64, side: Side, qty: u64) -> (u64, u64) 
         Side::Sell => {
             let trimmed = long.min(qty);
             (long - trimmed, short.saturating_add(qty - trimmed))
+        }
+    }
+}
+
+fn apply_exact_fill_to_net(
+    long: ShareAmount,
+    short: ShareAmount,
+    side: Side,
+    quantity: ShareAmount,
+) -> Result<(ShareAmount, ShareAmount), PaperStateError> {
+    match side {
+        Side::Buy => {
+            let covered = short.atomic().min(quantity.atomic());
+            let uncovered = ShareAmount::from_atomic(quantity.atomic() - covered);
+            Ok((
+                long.checked_add(uncovered)
+                    .map_err(|error| PaperStateError::Internal(error.to_string()))?,
+                ShareAmount::from_atomic(short.atomic() - covered),
+            ))
+        }
+        Side::Sell => {
+            let trimmed = long.atomic().min(quantity.atomic());
+            let uncovered = ShareAmount::from_atomic(quantity.atomic() - trimmed);
+            Ok((
+                ShareAmount::from_atomic(long.atomic() - trimmed),
+                short
+                    .checked_add(uncovered)
+                    .map_err(|error| PaperStateError::Internal(error.to_string()))?,
+            ))
         }
     }
 }
@@ -6597,16 +6959,33 @@ mod tests {
             principal: CollateralAmount::from_decimal_exact(dec!(0.666667)).unwrap(),
             fee: CollateralAmount::from_decimal_exact(dec!(0.000010)).unwrap(),
         };
+        let fill_source = append_receipt(20, 3);
         assert_eq!(
-            db.apply_financial_fill(start, None, EventSeq(11), &fill, dec!(9.333323))
-                .unwrap(),
+            db.apply_financial_fill(
+                start,
+                None,
+                EventSeq(11),
+                fill_source,
+                100,
+                &fill,
+                dec!(9.333323),
+            )
+            .unwrap(),
             FinancialApplyOutcome::Applied {
                 cash: dec!(9.333323)
             }
         );
         assert!(matches!(
-            db.apply_financial_fill(start, None, EventSeq(11), &fill, dec!(9.333323))
-                .unwrap(),
+            db.apply_financial_fill(
+                start,
+                None,
+                EventSeq(11),
+                fill_source,
+                100,
+                &fill,
+                dec!(9.333323),
+            )
+            .unwrap(),
             FinancialApplyOutcome::Existing { .. }
         ));
 
@@ -6652,6 +7031,87 @@ mod tests {
         assert_eq!(settled.fills_for_open_and_7d.len(), 1);
     }
 
+    /// PASS: a historical snapshot includes only exact financial facts received before its
+    /// cutoff and inside its source prefix, reconstructing cash and positions from the Start.
+    /// FAIL: current cash/positions or a later fill/resolution leaks into the old boundary.
+    #[test]
+    fn financial_snapshot_reconstructs_the_causal_cutoff() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(10)).unwrap();
+        let start = append_receipt(10, 1);
+        db.seed_financial_start(start).unwrap();
+        let first = FinancialFillRecord {
+            idempotency_key: "first".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(2).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        db.apply_financial_fill(
+            start,
+            None,
+            EventSeq(11),
+            append_receipt(20, 2),
+            100,
+            &first,
+            dec!(9),
+        )
+        .unwrap();
+        let later_market = MarketId(VenueMarketId("later-market".to_owned()));
+        let later = FinancialFillRecord {
+            idempotency_key: "later".to_owned(),
+            market_id: later_market.clone(),
+            outcome_id: OutcomeId(1),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(4).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(2)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        db.apply_financial_fill(
+            start,
+            Some(EventSeq(11)),
+            EventSeq(12),
+            // Its source observation is before the boundary, but its Final is not in the
+            // boundary-completed Prepared set supplied below.
+            append_receipt(30, 3),
+            150,
+            &later,
+            dec!(7),
+        )
+        .unwrap();
+        db.apply_financial_resolution(
+            start,
+            Some(EventSeq(12)),
+            EventSeq(13),
+            &market(),
+            "[\"1\",\"0\"]",
+            append_receipt(60, 4),
+            400,
+            CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+            dec!(8),
+        )
+        .unwrap();
+
+        let historical = db
+            .financial_snapshot_before_source_bound(250, EventSeq(40), &[EventSeq(11)])
+            .unwrap();
+        assert_eq!(historical.cash, dec!(9));
+        assert_eq!(historical.last_prepared_seq, Some(EventSeq(11)));
+        assert_eq!(historical.positions.len(), 1);
+        assert_eq!(historical.positions[0].market_id, market());
+        assert_eq!(historical.positions[0].long.to_decimal(), dec!(2));
+
+        let current = db.financial_snapshot(500).unwrap();
+        assert_eq!(current.cash, dec!(8));
+        assert_eq!(current.last_prepared_seq, Some(EventSeq(13)));
+        assert_eq!(current.positions.len(), 1);
+        assert_eq!(current.positions[0].market_id, later_market);
+    }
+
     /// PASS: a resolution committed on a second connection while a snapshot read transaction is
     /// open cannot expose new cash/version together with old positions (or the inverse).
     /// FAIL: any field read through the snapshot helpers crosses the transaction boundary.
@@ -6673,8 +7133,17 @@ mod tests {
             principal: CollateralAmount::from_decimal_exact(dec!(0.5)).unwrap(),
             fee: CollateralAmount::ZERO,
         };
+        let fill_source = append_receipt(20, 3);
         reader
-            .apply_financial_fill(start, None, EventSeq(11), &fill, dec!(9.5))
+            .apply_financial_fill(
+                start,
+                None,
+                EventSeq(11),
+                fill_source,
+                100,
+                &fill,
+                dec!(9.5),
+            )
             .unwrap();
         let writer = PaperStateDb::open(&path).unwrap();
 
@@ -6755,19 +7224,51 @@ mod tests {
             fee: CollateralAmount::ZERO,
         };
         assert!(matches!(
-            db.apply_financial_fill(start, Some(EventSeq(99)), EventSeq(2), &fill, dec!(9.5)),
+            db.apply_financial_fill(
+                start,
+                Some(EventSeq(99)),
+                EventSeq(2),
+                append_receipt(20, 3),
+                100,
+                &fill,
+                dec!(9.5),
+            ),
             Err(PaperStateError::FinancialConflict(_))
         ));
-        db.apply_financial_fill(start, None, EventSeq(2), &fill, dec!(9.5))
-            .unwrap();
+        db.apply_financial_fill(
+            start,
+            None,
+            EventSeq(2),
+            append_receipt(20, 3),
+            100,
+            &fill,
+            dec!(9.5),
+        )
+        .unwrap();
         assert!(matches!(
-            db.apply_financial_fill(start, Some(EventSeq(1)), EventSeq(2), &fill, dec!(9.5)),
+            db.apply_financial_fill(
+                start,
+                Some(EventSeq(1)),
+                EventSeq(2),
+                append_receipt(20, 3),
+                100,
+                &fill,
+                dec!(9.5),
+            ),
             Err(PaperStateError::FinancialConflict(_))
         ));
         let mut changed = fill;
         changed.fee = CollateralAmount::from_decimal_exact(dec!(0.000001)).unwrap();
         assert!(matches!(
-            db.apply_financial_fill(start, None, EventSeq(2), &changed, dec!(9.5)),
+            db.apply_financial_fill(
+                start,
+                None,
+                EventSeq(2),
+                append_receipt(20, 3),
+                100,
+                &changed,
+                dec!(9.5),
+            ),
             Err(PaperStateError::FinancialConflict(_))
         ));
         assert!(matches!(

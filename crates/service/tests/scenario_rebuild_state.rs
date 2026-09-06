@@ -15,12 +15,15 @@ use pe_core_types::{
 };
 use pe_event_log::{ContentType, EnvelopeIn, Writer};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
-use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill, reconcile_paper_state};
+use pe_service::paper_recovery::reconcile_paper_state;
 use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
+
+mod support;
+use support::{LegacyFillSource, LegacyPaperFill};
 
 fn market() -> MarketId {
     MarketId(VenueMarketId("0xmarket".to_string()))

@@ -54,6 +54,9 @@ use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+mod support;
+use support::send_trade_bucket;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn wallet_a() -> WalletAddress {
@@ -100,8 +103,7 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
 
 fn make_writer(dir: &TempDir) -> Writer {
     let paper_path = dir.path().join("paper.log");
-    let paper_writer = Writer::open(&paper_path).unwrap();
-    paper_writer
+    Writer::open(&paper_path).unwrap()
 }
 
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
@@ -115,10 +117,6 @@ fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
         })
         .unwrap();
     state
-}
-
-fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
-    mpsc::channel(1).1
 }
 
 /// Copy-entry gate disabled for lifecycle tests: fail-open (no band since #339).
@@ -164,14 +162,9 @@ async fn scenario_e2e_clean_exit() {
     let dir = TempDir::new().unwrap();
     let wallet = wallet_a();
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(16);
+    let (control_tx, control_rx) = mpsc::channel(16);
 
-    // Send one trade then close the channel so the orchestrator exits cleanly.
-    trade_tx.send(make_trade(wallet)).await.unwrap();
-    drop(trade_tx);
-
-    let orch = Orchestrator::new_with_trade_input(
-        trade_rx,
+    let orch = Orchestrator::new(
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -196,7 +189,7 @@ async fn scenario_e2e_clean_exit() {
         PositionLedger::new(),
         new_shared_health(false),
         empty_mid_cache(),
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
@@ -204,8 +197,10 @@ async fn scenario_e2e_clean_exit() {
     )
     .unwrap();
 
-    // Runs until both channels are closed (shutdown future never resolves).
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    send_trade_bucket(&control_tx, make_trade(wallet)).await;
+    drop(control_tx);
+    run.await.unwrap();
 
     // Assert paper.log was created (executor initialised) and orchestrator exited cleanly.
     let log_path = dir.path().join("paper.log");
@@ -228,19 +223,10 @@ async fn scenario_graceful_shutdown() {
     let dir = TempDir::new().unwrap();
     let wallet = wallet_a();
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(16);
-
-    // Pre-fill channel with 2 trades before the orchestrator starts.
-    trade_tx.send(make_trade(wallet)).await.unwrap();
-    trade_tx.send(make_trade(wallet)).await.unwrap();
-    // Senders deliberately kept alive — simulates producers still running at shutdown.
-
-    // Shutdown resolves immediately.
+    let (control_tx, control_rx) = mpsc::channel(16);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    shutdown_tx.send(()).unwrap();
 
-    let orch = Orchestrator::new_with_trade_input(
-        trade_rx,
+    let orch = Orchestrator::new(
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -265,7 +251,7 @@ async fn scenario_graceful_shutdown() {
         PositionLedger::new(),
         new_shared_health(false),
         empty_mid_cache(),
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
@@ -273,10 +259,14 @@ async fn scenario_graceful_shutdown() {
     )
     .unwrap();
 
-    orch.run(async {
+    let run = tokio::spawn(orch.run_coordinated(async {
         shutdown_rx.await.ok();
-    })
-    .await;
+    }));
+    send_trade_bucket(&control_tx, make_trade(wallet)).await;
+    send_trade_bucket(&control_tx, make_trade(wallet)).await;
+    shutdown_tx.send(()).unwrap();
+    drop(control_tx);
+    run.await.unwrap().unwrap();
 
     // Executor was initialised; orchestrator exited cleanly without hanging.
     let log_path = dir.path().join("paper.log");
@@ -285,8 +275,6 @@ async fn scenario_graceful_shutdown() {
         len >= 5,
         "paper.log should have at least the 5-byte header; got {len} bytes"
     );
-
-    drop(trade_tx);
 }
 
 // ── Scenario 3: normal_leader_follow_order_intent_equivalence ─────────────────

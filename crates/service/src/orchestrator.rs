@@ -24,9 +24,7 @@ use pe_risk_engine::{EquityInputs, RiskSnapshot, TradingMode, current_equity};
 use pe_source_polymarket_public::PageFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
-use pe_venue_polymarket::{
-    BuySizing, CompactFeeSchedule, LadderError, LadderPlan, ladder_is_stale, plan_sized_buy,
-};
+use pe_venue_polymarket::{BuySizing, LadderError, LadderPlan, ladder_is_stale, plan_sized_buy};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
@@ -237,7 +235,6 @@ pub struct ScenarioHooks {
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     /// Scenario-only compatibility input. Production activity enters exclusively through the
     /// acknowledged complete-bucket control path.
-    trade_rx: Option<mpsc::Receiver<IncomingTrade>>,
     bucket_engine: BucketCommitEngine,
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
@@ -294,6 +291,9 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     /// remains the owner; this queue only preserves its causal boot order.
     pending_boot: VecDeque<IncomingTrade>,
     pending_continuations: HashMap<SourceTradeId, DecisionContinuationV2>,
+    /// True only while replaying continuations that were open at process boot. Newly committed
+    /// buckets still pass the current source-health gate before their financial disposition.
+    resuming_boot: bool,
     financial_log_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     qualification_start: Option<pe_event_log::AppendReceipt>,
     admission_builder: Option<crate::live_venue_adapter::LiveAdmissionBuilder>,
@@ -302,6 +302,34 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
         crate::paper_recovery::RiskHaltOwner,
         pe_risk_engine::RiskHaltCause,
     )>,
+}
+
+fn apply_global_risk_halts(
+    active: &HashSet<(
+        crate::paper_recovery::RiskHaltOwner,
+        pe_risk_engine::RiskHaltCause,
+    )>,
+    snapshot: &mut RiskSnapshot,
+) {
+    use pe_risk_engine::{
+        INTRADAY_STOP_BPS, KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS, RiskHaltCause,
+    };
+    for (_, cause) in active {
+        match cause {
+            RiskHaltCause::AbsoluteLoss => {
+                snapshot.absolute_pnl_bps.0 =
+                    snapshot.absolute_pnl_bps.0.min(KILL_SWITCH_DRAWDOWN_BPS);
+            }
+            RiskHaltCause::IntradayDrawdown => {
+                snapshot.intraday_pnl_bps.0 = snapshot.intraday_pnl_bps.0.min(INTRADAY_STOP_BPS);
+            }
+            RiskHaltCause::Rolling7dDrawdown => {
+                snapshot.rolling_7d_pnl_bps.0 =
+                    snapshot.rolling_7d_pnl_bps.0.min(ROLLING_7D_STOP_BPS);
+            }
+            RiskHaltCause::CopyLatency => snapshot.copy_latency_kill_switch_active = true,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -332,6 +360,89 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 payload,
             })
             .map_err(|error| error.to_string())
+    }
+
+    fn apply_risk_halt_transition(
+        &mut self,
+        owner: crate::paper_recovery::RiskHaltOwner,
+        cause: pe_risk_engine::RiskHaltCause,
+        state: crate::paper_recovery::HaltState,
+        evidence: serde_json::Value,
+    ) -> Result<pe_event_log::AppendReceipt, String> {
+        let key = (owner.clone(), cause);
+        let receipt = self.append_paper_record(&PaperLogRecord::RiskHaltChanged {
+            owner,
+            cause,
+            state,
+            evidence,
+        })?;
+        match state {
+            crate::paper_recovery::HaltState::Engaged => {
+                self.active_risk_halts.insert(key);
+            }
+            crate::paper_recovery::HaltState::Released => {
+                self.active_risk_halts.remove(&key);
+            }
+        }
+        Ok(receipt)
+    }
+
+    fn synchronize_paper_risk_halts(
+        &mut self,
+        snapshot: &RiskSnapshot,
+        evaluated_at_unix_ms: i64,
+    ) -> Result<(), String> {
+        use crate::paper_recovery::{HaltState, RiskHaltOwner};
+        use pe_risk_engine::{
+            INTRADAY_STOP_BPS, KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS, RiskHaltCause,
+        };
+
+        let owner = RiskHaltOwner::Paper;
+        for (cause, desired, manual_release_only) in [
+            (
+                RiskHaltCause::AbsoluteLoss,
+                snapshot.absolute_pnl_bps.0 <= KILL_SWITCH_DRAWDOWN_BPS,
+                true,
+            ),
+            (
+                RiskHaltCause::IntradayDrawdown,
+                snapshot.intraday_pnl_bps.0 <= INTRADAY_STOP_BPS,
+                false,
+            ),
+            (
+                RiskHaltCause::Rolling7dDrawdown,
+                snapshot.rolling_7d_pnl_bps.0 <= ROLLING_7D_STOP_BPS,
+                false,
+            ),
+            (
+                RiskHaltCause::CopyLatency,
+                snapshot.copy_latency_kill_switch_active,
+                false,
+            ),
+        ] {
+            let active = self.active_risk_halts.contains(&(owner.clone(), cause));
+            let state = match (active, desired, manual_release_only) {
+                (false, true, _) => Some(HaltState::Engaged),
+                (true, false, false) => Some(HaltState::Released),
+                _ => None,
+            };
+            if let Some(state) = state {
+                self.apply_risk_halt_transition(
+                    owner.clone(),
+                    cause,
+                    state,
+                    serde_json::json!({
+                        "evaluated_at_unix_ms": evaluated_at_unix_ms,
+                        "snapshot": snapshot,
+                    }),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_global_halts_to_snapshot(&self, snapshot: &mut RiskSnapshot) {
+        apply_global_risk_halts(&self.active_risk_halts, snapshot);
     }
 
     fn qualification_seal_reason(
@@ -449,12 +560,44 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         self.seal_qualification(reason, OffsetDateTime::now_utc().unix_timestamp())
     }
 
+    /// Converge the verified oldest paper Prepared before any successor financial control.
+    /// The shared recovery routine owns frozen-request reconstruction and appends at most the
+    /// missing Final; no control-specific cursor or retry state is maintained here.
+    async fn reconcile_oldest_financial_prepared(&mut self) -> Result<(), String> {
+        let (paper_log_path, source_log_path) = self
+            .financial_log_paths
+            .clone()
+            .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
+        let authority = self
+            .supabase_state
+            .clone()
+            .ok_or_else(|| "active financial era has no authority client".to_owned())?;
+        reconcile_active_financial_frames(
+            &authority,
+            &self.paper_state,
+            &paper_log_path,
+            &source_log_path,
+            &mut self.paper_writer,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let era = crate::paper_recovery::paper_era(
+            crate::paper_recovery::scan_paper_log(&paper_log_path)
+                .map_err(|error| error.to_string())?,
+        );
+        if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
+            return Err("oldest paper Prepared remains unmatched after redrive".to_owned());
+        }
+        Ok(())
+    }
+
     async fn apply_resolution_candidate(
         &mut self,
         condition: pe_core_types::PolymarketConditionId,
         payout_by_outcome_index_json: String,
         source_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
+        self.reconcile_oldest_financial_prepared().await?;
         let (paper_log_path, source_log_path) = self
             .financial_log_paths
             .clone()
@@ -468,9 +611,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             crate::paper_recovery::scan_paper_log(&paper_log_path)
                 .map_err(|error| error.to_string())?,
         );
-        if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
-            return Err("oldest paper Prepared is unmatched".to_owned());
-        }
         let completed = era
             .frames
             .iter()
@@ -564,6 +704,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 economic.market.outcome_index
             ));
         }
+        self.reconcile_oldest_financial_prepared().await?;
+
         let (paper_log_path, source_log_path) = self
             .financial_log_paths
             .clone()
@@ -572,15 +714,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .supabase_state
             .clone()
             .ok_or_else(|| "active financial era has no authority client".to_owned())?;
-        reconcile_active_financial_frames(
-            &authority,
-            &self.paper_state,
-            &paper_log_path,
-            &source_log_path,
-            &mut self.paper_writer,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
 
         let era = crate::paper_recovery::paper_era(
             crate::paper_recovery::scan_paper_log(&paper_log_path)
@@ -669,7 +802,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
     /// Build the paper owner's coherent risk snapshot from the active financial prefix.
     async fn active_paper_risk_snapshot(
-        &self,
+        &mut self,
         signal: &LeaderSignal,
         proposed_debit: CollateralAmount,
         per_trade_cap_bps: i32,
@@ -817,7 +950,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             crate::paper_recovery::RiskHaltOwner::Paper,
             pe_risk_engine::RiskHaltCause::CopyLatency,
         ));
-        let snapshot = crate::risk_inputs::build_paper_risk_snapshot(
+        let mut snapshot = crate::risk_inputs::build_paper_risk_snapshot(
             &base,
             &snapshot,
             &era,
@@ -826,6 +959,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             now,
             latency_was_active,
         )?;
+        self.synchronize_paper_risk_halts(&snapshot, evaluated_at_unix_ms)
+            .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+        self.apply_global_halts_to_snapshot(&mut snapshot);
         let decision = match pe_risk_engine::evaluate_risk(&snapshot) {
             pe_risk_engine::RiskDecision::Approved => {
                 pe_execution_core::RiskDecisionAudit::Approved
@@ -937,6 +1073,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         cutoff_unix: i64,
         boundary_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
+        self.reconcile_oldest_financial_prepared().await?;
         let (paper_log_path, source_log_path) =
             self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
                 "daily boundary is unavailable before QualificationStarted".to_owned()
@@ -949,28 +1086,27 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             crate::paper_recovery::scan_paper_log(&paper_log_path)
                 .map_err(|error| error.to_string())?,
         );
-        if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
-            return Err("daily boundary waits for the oldest unmatched Prepared".to_owned());
-        }
+        let completed = crate::risk_inputs::completed_prepared_before_boundary(
+            &era,
+            &source_log_path,
+            cutoff_unix,
+            boundary_receipt,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut completed_sequences = completed.iter().copied().collect::<Vec<_>>();
+        completed_sequences.sort_by_key(|sequence| sequence.0);
         let snapshot = self
             .paper_state
-            .financial_snapshot(cutoff_unix)
+            .financial_snapshot_before_source_bound(
+                cutoff_unix,
+                boundary_receipt.sequence,
+                &completed_sequences,
+            )
             .map_err(|error| error.to_string())?;
-        if snapshot.last_prepared_seq != crate::risk_inputs::latest_completed_prepared(&era) {
+        let expected_last = completed.iter().copied().max_by_key(|sequence| sequence.0);
+        if snapshot.last_prepared_seq != expected_last {
             return Err("daily boundary financial prefix differs from local projection".to_owned());
         }
-
-        let completed = era
-            .frames
-            .iter()
-            .filter_map(|frame| match &frame.frame {
-                crate::paper_recovery::PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
-                    prepared_receipt,
-                    ..
-                }) => Some(prepared_receipt.sequence),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
         let token_by_position = era
             .frames
             .iter()
@@ -1199,23 +1335,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 evidence,
                 acknowledged,
             } => {
-                let key = (owner.clone(), cause);
-                let result = self.append_paper_record(&PaperLogRecord::RiskHaltChanged {
-                    owner,
-                    cause,
-                    state,
-                    evidence,
-                });
-                if result.is_ok() {
-                    match state {
-                        crate::paper_recovery::HaltState::Engaged => {
-                            self.active_risk_halts.insert(key);
-                        }
-                        crate::paper_recovery::HaltState::Released => {
-                            self.active_risk_halts.remove(&key);
-                        }
-                    }
-                }
+                let result = self.apply_risk_halt_transition(owner, cause, state, evidence);
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::DailyBoundary {
@@ -1231,8 +1351,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 proposed_financial_semantic_version,
                 acknowledged,
             } => {
-                let result = self
-                    .apply_seal_check(&proposed_economic_hash, proposed_financial_semantic_version);
+                let result = match self.reconcile_oldest_financial_prepared().await {
+                    Ok(()) => self.apply_seal_check(
+                        &proposed_economic_hash,
+                        proposed_financial_semantic_version,
+                    ),
+                    Err(error) => Err(error),
+                };
                 let _ = acknowledged.send(result);
             }
         }
@@ -1257,45 +1382,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         book_fetcher: Arc<B>,
     ) -> Result<Self, anyhow::Error> {
         Self::new_inner(
-            None,
-            live_watchlist,
-            config,
-            strategy,
-            paper_writer,
-            paper_state,
-            leader_ledger,
-            health,
-            mid_price_cache,
-            control_rx,
-            _sink,
-            snapshot_sink,
-            supabase_state,
-            book_fetcher,
-        )
-    }
-
-    /// Deterministic compatibility seam for existing scenarios. Production has no direct trade
-    /// sender or receiver and cannot call this constructor without the `scenario` feature.
-    #[cfg(feature = "scenario")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_trade_input(
-        trade_rx: mpsc::Receiver<IncomingTrade>,
-        live_watchlist: LiveWatchlist,
-        config: OrchestratorConfig,
-        strategy: WinnerFollowStrategy,
-        paper_writer: Writer,
-        paper_state: Arc<PaperStateDb>,
-        leader_ledger: PositionLedger,
-        health: SharedHealth,
-        mid_price_cache: MidPriceCache<F>,
-        control_rx: mpsc::Receiver<OrchestratorControl>,
-        _sink: Option<SinkHandle>,
-        snapshot_sink: Option<SnapshotHandle>,
-        supabase_state: Option<SupabaseStateClient>,
-        book_fetcher: Arc<B>,
-    ) -> Result<Self, anyhow::Error> {
-        Self::new_inner(
-            Some(trade_rx),
             live_watchlist,
             config,
             strategy,
@@ -1314,7 +1400,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
-        trade_rx: Option<mpsc::Receiver<IncomingTrade>>,
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
@@ -1392,7 +1477,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             pending_boot.push_back(trade);
         }
         Ok(Self {
-            trade_rx,
             bucket_engine,
             live_watchlist,
             signal_config: config.signal_config,
@@ -1424,6 +1508,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             watchlist_writer_lock: config.watchlist_writer_lock,
             pending_boot,
             pending_continuations,
+            resuming_boot: false,
             financial_log_paths: None,
             qualification_start: None,
             admission_builder: None,
@@ -1511,14 +1596,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     pub async fn resume_pending_before_producers(&mut self) -> Result<(), anyhow::Error> {
         // Production boot recovery runs before either producer receiver is polled.
         // `handle_trade` detects the durable pending owner and skips ledger/gate/history.
+        self.resuming_boot = true;
         while let Some(trade) = self.pending_boot.pop_front() {
             self.handle_trade(trade).await;
             if self.intake_stopped {
+                self.resuming_boot = false;
                 return Err(anyhow::anyhow!(
                     "paper durability became uncertain while resuming decision_pending"
                 ));
             }
         }
+        self.resuming_boot = false;
         Ok(())
     }
 
@@ -1528,47 +1616,21 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             error!(%error, "decision_pending boot recovery failed");
             return;
         }
-        let mut trades_done = self.trade_rx.is_none();
         let mut control_done = false;
         loop {
-            if trades_done && control_done {
+            if control_done {
                 break;
             }
 
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    let mut drained = Vec::new();
-                    if let Some(receiver) = self.trade_rx.as_mut() {
-                        while let Ok(trade) = receiver.try_recv() {
-                            drained.push(trade);
-                        }
-                    }
-                    for trade in drained {
-                        self.handle_trade(trade).await;
-                    }
                     break;
                 }
                 result = self.control_rx.recv(), if !control_done => {
                     match result {
                         Some(message) => self.apply_control_message(message).await,
                         None => control_done = true,
-                    }
-                }
-                result = async {
-                    match self.trade_rx.as_mut() {
-                        Some(receiver) => receiver.recv().await,
-                        None => std::future::pending::<Option<IncomingTrade>>().await,
-                    }
-                }, if !trades_done => {
-                    match result {
-                        Some(trade) => {
-                            self.handle_trade(trade).await;
-                            if self.intake_stopped {
-                                trades_done = true;
-                            }
-                        },
-                        None => trades_done = true,
                     }
                 }
             }
@@ -1587,13 +1649,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .await
             .map_err(|error| OrchestratorRunError::PendingRecovery(error.to_string()))?;
         let mut draining = false;
-        let mut trades_done = self.trade_rx.is_none();
         let mut control_done = false;
         loop {
             if self.intake_stopped {
                 return Err(OrchestratorRunError::PaperDurabilityUncertain);
             }
-            if draining && trades_done && control_done {
+            if draining && control_done {
                 return Ok(());
             }
 
@@ -1606,20 +1667,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         None if draining => control_done = true,
                         None => return Err(OrchestratorRunError::PrematureInputClosure {
                             channel: "orchestrator_control",
-                        }),
-                    }
-                }
-                result = async {
-                    match self.trade_rx.as_mut() {
-                        Some(receiver) => receiver.recv().await,
-                        None => std::future::pending::<Option<IncomingTrade>>().await,
-                    }
-                }, if !trades_done => {
-                    match result {
-                        Some(trade) => self.handle_trade(trade).await,
-                        None if draining => trades_done = true,
-                        None => return Err(OrchestratorRunError::PrematureInputClosure {
-                            channel: "trade_input",
                         }),
                     }
                 }
@@ -1643,7 +1690,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         signal: &LeaderSignal,
         probability: Probability,
         sizing_bankroll: Decimal,
-        admission: Option<&pe_execution_core::LiveAdmissionArtifact>,
+        admission: &pe_execution_core::LiveAdmissionArtifact,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
         let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
             reason: "impact gate cap invalid",
@@ -1656,29 +1703,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             )),
             checked_at_unix_ms: None,
         })?;
-        let fallback_token = if admission.is_none() {
-            let snapshots = self
-                .mid_price_cache
-                .fetch_snapshots(std::slice::from_ref(&signal.market_id))
-                .await;
-            snapshots.get(&signal.market_id).and_then(|snapshot| {
-                snapshot
-                    .clob_token_ids
-                    .get(usize::from(signal.outcome_id.0))
-                    .cloned()
-            })
-        } else {
-            None
-        };
         let token_id = admission
-            .and_then(|artifact| {
-                artifact
-                    .market
-                    .ordered_outcome_token_ids
-                    .get(usize::from(signal.outcome_id.0))
-                    .map(ToString::to_string)
-            })
-            .or(fallback_token);
+            .market
+            .ordered_outcome_token_ids
+            .get(usize::from(signal.outcome_id.0))
+            .map(ToString::to_string);
         let Some(token_id) = token_id else {
             return Err(GatePlanFailure {
                 reason: "price-impact book unusable: missing CLOB token (fail closed)",
@@ -1882,14 +1911,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 )),
                 checked_at_unix_ms: Some(checked_at_unix_ms),
             })?;
-        let schedule = admission.map_or(CompactFeeSchedule::Zero, |value| value.fee_schedule);
-        let minimum_order_size = admission.map_or(ShareAmount::from_atomic(1_000_000), |value| {
-            value.market.minimum_order_size
-        });
-        let minimum_tick_size = admission.map_or_else(
-            || Price::new(Decimal::new(1, 4)).unwrap_or(Price::ZERO),
-            |value| value.market.minimum_tick_size,
-        );
+        let schedule = admission.fee_schedule;
+        let minimum_order_size = admission.market.minimum_order_size;
+        let minimum_tick_size = admission.market.minimum_tick_size;
         match plan_sized_buy(
             &ladder,
             schedule,
@@ -2170,7 +2194,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // source unhealthy). A blocked trade is refused BEFORE any state write -
         // it stays unseen, so the held cursor / firehose backstop redelivers it
         // exactly once when a source recovers.
-        let admission_blocked = pending.is_none() && {
+        let admission_blocked = !self.resuming_boot && {
             let h = self
                 .health
                 .lock()
@@ -2427,6 +2451,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
         }
 
+        // Classification and durable no-copy evidence remain available during rehearsal, but no
+        // financial decision may be composed or mutated before the verified Start owns its exact
+        // admission, risk, authority, and configuration evidence.
+        if self.qualification_start.is_none() {
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                "financial_era_not_started",
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
+            return;
+        }
+
         // One admission read owns market mapping, venue rules, fees, and scheduled end for both
         // paper and live. Its three raw responses are already synchronized in the source log.
         let condition_id = pe_core_types::PolymarketConditionId(signal.market_id.to_string());
@@ -2435,7 +2476,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .build(&condition_id, OffsetDateTime::now_utc())
                 .await
             {
-                Ok(admission) => Some(admission),
+                Ok(admission) => admission,
                 Err(error) => {
                     info!(%error, market = %signal.market_id, "market admission failed closed");
                     self.no_fill_or_rollback(
@@ -2451,20 +2492,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     return;
                 }
             },
-            None if self.qualification_start.is_some() => {
+            None => {
                 error!(market = %signal.market_id, "active financial era has no admission builder");
                 self.intake_stopped = true;
                 return;
             }
-            None => None,
         };
 
         // Resolution-horizon gate uses the scheduled end already carried by admission; no second
         // Gamma request or dashboard cache participates in economics.
         if self.max_resolution_horizon_secs > 0 || self.min_resolution_horizon_secs > 0 {
-            let resolution_unix = admission
-                .as_ref()
-                .and_then(|artifact| artifact.market.scheduled_end_unix);
+            let resolution_unix = admission.market.scheduled_end_unix;
             if let Some(evidence) = decision_evidence.as_mut() {
                 evidence.record_market_end(MarketEndEvidence {
                     market_id: signal.market_id.to_string(),
@@ -2578,7 +2616,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
         let sizing_bankroll = match pending.as_ref() {
             Some(continuation) => continuation.frozen_basis.bankroll,
-            None if self.qualification_start.is_some() => match self
+            None => match self
                 .paper_state
                 .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
             {
@@ -2589,10 +2627,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     return;
                 }
             },
-            None => self.bankroll,
         };
         let gate_evidence = match self
-            .plan_impact_gate(&signal, p, sizing_bankroll, admission.as_ref())
+            .plan_impact_gate(&signal, p, sizing_bankroll, &admission)
             .await
         {
             Ok(outcome) => outcome,
@@ -2824,22 +2861,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             self.intake_stopped = true;
             return;
         };
-        let Some(admission) = admission.as_ref() else {
-            let decline = pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable(
-                pe_strategy_winner_follow::RiskInputsUnavailable::SnapshotSequenceMismatch,
-            );
-            self.no_fill_or_rollback(
-                &trade,
-                &leader_row,
-                dispatch_id.as_deref(),
-                &format!("paper_reject:{decline}"),
-                &rb,
-                Some(&signal.market_id),
-                decision_evidence.as_ref(),
-            )
-            .await;
-            return;
-        };
         let Some(book_receipt) = book_receipt else {
             error!(trade = %trade.source_trade_id, "active fill book is not source-log bound");
             self.intake_stopped = true;
@@ -2877,13 +2898,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 return;
             }
         };
-        let applied_configuration_hash = applied_runtime
-            .as_ref()
-            .map(runtime_config::RuntimeConfig::canonical_hash)
-            .unwrap_or_else(|| "pre_start_boot_configuration".to_owned());
+        let Some(applied_runtime) = applied_runtime.as_ref() else {
+            error!(trade = %trade.source_trade_id, "active fill has no runtime configuration evidence");
+            self.intake_stopped = true;
+            return;
+        };
+        let applied_configuration_hash = applied_runtime.canonical_hash();
         let economic = match self.compose_active_paper_economic(
             &signal,
-            admission,
+            &admission,
             plan,
             book_receipt,
             continuation,
@@ -3273,9 +3296,53 @@ fn check_resolution_horizon(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::check_resolution_horizon;
+    use std::collections::HashSet;
+
+    use pe_core_types::{AccountId, BasisPoints};
+    use pe_risk_engine::{
+        ConcentrationCaps, RiskBlock, RiskDecision, RiskHaltCause, RiskSnapshot, evaluate_risk,
+    };
+
+    use crate::paper_recovery::RiskHaltOwner;
+
+    use super::{apply_global_risk_halts, check_resolution_horizon};
 
     const NOW: i64 = 1_700_000_000;
+
+    fn healthy_risk_snapshot() -> RiskSnapshot {
+        RiskSnapshot {
+            leader_exposure_bps: BasisPoints(0),
+            market_exposure_bps: BasisPoints(0),
+            family_exposure_bps: BasisPoints(0),
+            total_copy_exposure_bps: BasisPoints(0),
+            intraday_pnl_bps: BasisPoints(0),
+            rolling_7d_pnl_bps: BasisPoints(0),
+            absolute_pnl_bps: BasisPoints(0),
+            copy_latency_kill_switch_active: false,
+            proposed_trade_bps: BasisPoints(1),
+            per_trade_cap_bps: 25,
+            concentration_caps: Some(ConcentrationCaps::CANONICAL),
+        }
+    }
+
+    /// PASS: a halt owned by a live account blocks the paper snapshot through the global set.
+    /// FAIL: paper evaluates only its locally derived risk state and approves the entry.
+    #[test]
+    fn live_owner_halt_gates_paper_risk() {
+        let account = AccountId::new("live-a").unwrap();
+        let active = HashSet::from([(
+            RiskHaltOwner::LiveAccount(account),
+            RiskHaltCause::AbsoluteLoss,
+        )]);
+        let mut snapshot = healthy_risk_snapshot();
+
+        apply_global_risk_halts(&active, &mut snapshot);
+
+        assert_eq!(
+            evaluate_risk(&snapshot),
+            RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
+        );
+    }
 
     #[test]
     fn unknown_resolution_fails_closed() {

@@ -121,10 +121,10 @@ pub struct ServiceConfig {
     #[serde(default = "default_gamma_base_url")]
     pub gamma_base_url: String,
 
-    /// Seconds between Gamma resolution poll rounds.
-    /// CLOB resolution discovery cadence in seconds.
-    #[serde(default = "default_clob_resolution_poll_interval_secs")]
-    pub clob_resolution_poll_interval_secs: u64,
+    /// CLOB resolution-discovery cadence in seconds. The public field and `PE_*` environment
+    /// key retain their deployed legacy name; Gamma is not a payout source.
+    #[serde(default = "default_gamma_resolution_poll_interval_secs")]
+    pub gamma_resolution_poll_interval_secs: u64,
 
     /// Drop entry signals whose market `endDate` is further than this many seconds
     /// into the future. Set to 0 to disable. Default: 172_800 (48 h) — the run28
@@ -215,13 +215,11 @@ pub struct ServiceConfig {
     pub supabase_sink_reconcile_interval_secs: u64,
 
     // ── Supabase authoritative paper-state (issue #397) ───────────────────────
-    /// Make Supabase the authoritative system of record for paper-state (issue #397).
-    /// When `true`: a paper fill writes the `commit_fill` RPC first (fail-closed — on error
-    /// the fill is parked and the frozen record retries via v2 — #511), then
-    /// mirrors to SQLite; resolutions go through the `apply_resolution` RPC; boot does a
-    /// catch-up-then-pull against Supabase; and the best-effort `run_sink` is NOT spawned
-    /// (the RPCs are the sole writer of `paper_fills`/`settled_markets`). When `false`
-    /// (default) SQLite stays authoritative and the existing best-effort sink runs.
+    /// Make Supabase the active financial-era authority (issue #545). After a verified Start,
+    /// every fill/resolution uses the Prepared → authority → exact local projection → Final
+    /// protocol and an unmatched Prepared is reconciled before successor financial work.
+    /// Before Start, financial entry and resolution fail closed. The best-effort analytics sink
+    /// is never an active-era financial writer.
     /// Requires the service-role `supabase_secret_key`. Off by default; set explicitly in
     /// `.env`. `PE_SUPABASE_AUTHORITATIVE`. See `docs/_GLOSSARY.md`: `supabase_authoritative`.
     #[serde(default)]
@@ -446,7 +444,7 @@ fn default_gamma_base_url() -> String {
     "https://gamma-api.polymarket.com".to_string()
 }
 
-const fn default_clob_resolution_poll_interval_secs() -> u64 {
+const fn default_gamma_resolution_poll_interval_secs() -> u64 {
     // 2 minutes (issue #343 step 12): settled markets and "just resolved" wins lag
     // actual resolution by ≤2 min instead of ≤1 h. The poll is gated to markets with
     // open unsettled positions and rate-limited (50 ms min-interval), so the ~30×
@@ -475,7 +473,7 @@ impl Default for ServiceConfig {
             paper_state_db_path: default_paper_state_db_path(),
             legacy_wallet_history_path: default_legacy_wallet_history_path(),
             gamma_base_url: default_gamma_base_url(),
-            clob_resolution_poll_interval_secs: default_clob_resolution_poll_interval_secs(),
+            gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
             min_resolution_horizon_secs: default_min_resolution_horizon_secs(),
             max_fill_price: default_max_fill_price(),
@@ -553,7 +551,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "paper_state_db_path",
         "legacy_wallet_history_path",
         "gamma_base_url",
-        "clob_resolution_poll_interval_secs",
+        "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
         "min_resolution_horizon_secs",
         "max_fill_price",

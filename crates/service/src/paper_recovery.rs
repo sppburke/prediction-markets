@@ -39,9 +39,8 @@ pub const PAPER_LOG_SCHEMA_VERSION: u32 = PAPER_LOG_SCHEMA_VERSION_V2;
 pub const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
 
 /// Schema-one price provenance retained only by the service's legacy decoder.
-#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum LegacyFillSource {
+pub(crate) enum LegacyFillSource {
     ClobBestAsk,
     Fallback,
     #[default]
@@ -49,9 +48,8 @@ pub enum LegacyFillSource {
 }
 
 /// Schema-one payload retained only for compatibility reads before the financial era.
-#[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegacyPaperFill {
+pub(crate) struct LegacyPaperFill {
     pub intent: OrderIntent,
     pub simulated_fill_price: Price,
     pub simulated_at: SourceTimestamp,
@@ -378,7 +376,7 @@ pub enum SealReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum PaperLogFrame {
-    LegacyFill(LegacyPaperFill),
+    LegacyFill,
     Record(PaperLogRecord),
 }
 
@@ -387,6 +385,13 @@ pub struct ScannedPaperFrame {
     pub envelope: EventEnvelope,
     pub receipt: AppendReceipt,
     pub frame: PaperLogFrame,
+    pub(crate) legacy_fill: Option<LegacyPaperFill>,
+}
+
+impl ScannedPaperFrame {
+    pub(crate) fn legacy_fill(&self) -> Option<&LegacyPaperFill> {
+        self.legacy_fill.as_ref()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -410,15 +415,15 @@ pub fn scan_paper_log(path: &Path) -> Result<Vec<ScannedPaperFrame>, PaperLogSca
     let mut frames = Vec::new();
     for item in Reader::replay(path)? {
         let (sequence, envelope) = item?;
-        let frame = match envelope.schema_version {
+        let (frame, legacy_fill) = match envelope.schema_version {
             1 => serde_json::from_slice(&envelope.payload)
-                .map(PaperLogFrame::LegacyFill)
+                .map(|fill| (PaperLogFrame::LegacyFill, Some(fill)))
                 .map_err(|source| PaperLogScanError::Decode {
                     sequence: sequence.0,
                     source,
                 })?,
             PAPER_LOG_SCHEMA_VERSION => serde_json::from_slice(&envelope.payload)
-                .map(PaperLogFrame::Record)
+                .map(|record| (PaperLogFrame::Record(record), None))
                 .map_err(|source| PaperLogScanError::Decode {
                     sequence: sequence.0,
                     source,
@@ -438,6 +443,7 @@ pub fn scan_paper_log(path: &Path) -> Result<Vec<ScannedPaperFrame>, PaperLogSca
             envelope,
             receipt,
             frame,
+            legacy_fill,
         });
     }
     validate_qualification_starts(&frames)?;
@@ -1012,7 +1018,8 @@ mod paper_log_tests {
 
         let frames = scan_paper_log(&path).unwrap();
         assert_eq!(frames.len(), 2);
-        assert!(matches!(frames[0].frame, PaperLogFrame::LegacyFill(_)));
+        assert!(matches!(frames[0].frame, PaperLogFrame::LegacyFill));
+        assert!(frames[0].legacy_fill().is_some());
         assert!(matches!(frames[1].frame, PaperLogFrame::Record(_)));
         assert_eq!(frames[0].receipt.sequence, EventSeq(0));
         assert_eq!(frames[1].receipt.sequence, EventSeq(1));
@@ -1239,7 +1246,7 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
     // `fills` PK), so every frame is offered to it; already-mirrored fills are skipped.
     for frame in era.frames {
         let seq = frame.receipt.sequence;
-        let PaperLogFrame::LegacyFill(fill) = frame.frame else {
+        let Some(fill) = frame.legacy_fill() else {
             continue;
         };
         let record = FillRecord {

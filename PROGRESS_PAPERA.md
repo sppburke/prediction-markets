@@ -61,3 +61,54 @@ ROUND 3 2026-09-06T00:56Z — C12: ENVIRONMENT BLOCKED as requested. The exact `
 ROUND 3 2026-09-06T01:06Z — C8: PARTIAL. Added and passed the transactional concurrent financial-snapshot test: a second SQLite connection commits a resolution between the snapshot transaction's scalar and collection reads, and the reader proves it observes the complete pre-commit state before the public snapshot observes the complete post-commit state. The requested `golden_stream_v1`, runtime/offline equality, fill crash matrix, and changed-field conflict matrix remain absent; they depend on the PAPERB-owned exact verifier/preimage replay that still forces `InsufficientEvidence`.
 ROUND 3 2026-09-06T01:06Z — RC14/RB7-paper: PARTIAL. Existing changed-predecessor coverage plus the new concurrent snapshot proof pass. The HTTP paper contract, terminal `decision_pending` Final-receipt path, full resolution identity matrix, legacy live-journal, and cross-paper/live planner/finality scenarios were not safely completed in this interruption slice; the live-journal and live-finalized halves are outside PAPERA ownership.
 ROUND 3 2026-09-06T01:07Z — final verification/summary: DONE. `cargo check --workspace --all-targets --all-features`, service-lib and paper-state clippy with warnings denied, all 63 paper-state tests, service/paper-state doc tests, locked metadata, formatting, and `git diff --check` pass. Seal order, membership replay, all 16 maintenance scenarios, and the concurrent snapshot proof pass. The capacity HTTP fixture and all seven PostgreSQL parity cases are environment-blocked before exercising code by sandbox `EPERM`. Exact residuals and ownership blockers are recorded in `INTEGRATION_SUMMARY_PAPERA3.md`.
+ROUND 4 2026-09-06T01:09Z — STARTED. Clean worktree confirmed. Reading the round-3 handoff and canonical repository contracts, then addressing A4-1 through A4-11 in the mandated order. No implementation edit is in progress at this checkpoint.
+ROUND 4 2026-09-06T01:16Z — A4-1 DONE. `evaluate_risk` now uses checked concentration addition and treats overflow as the owning concentration block. Added leader/market/family/total one-over-cap and `i32::MAX + 1` boundary tests; focused nextest: 5 passed.
+ROUND 4 2026-09-06T01:18Z — A4-2 implementation DONE. One `reconcile_oldest_financial_prepared` owner now runs before active fills, resolutions, daily boundaries, and seal controls; each refuses to proceed if redrive leaves an unmatched Prepared. Same-process seam-matrix coverage still needs verification/addition after the remaining protocol deletions compile.
+## Round 4 checkpoint — 2026-09-06 01:29 UTC
+
+- A4-3 causal paper snapshots implemented: exact fill source receipt/time are persisted and
+  `financial_snapshot(cutoff)` reconstructs bankroll, positions, settlements, and completed
+  Prepared sequence from facts at that cutoff. Boundary handling additionally enforces the source
+  prefix and strict receive-time bound. Focused paper-state snapshot tests pass (2/2).
+- A4-4 paper halt integration implemented: the paper-recovery active set is the sole reducer,
+  paper risk edges append synchronously, global paper/live causes gate paper entry, and incident
+  releases flow through the same acknowledged edge. Duplicate reducer/key deleted. Focused risk
+  input and paper-log tests pass (15/15).
+- A4-5 verified: the poller already awaits SealCheck before config publication/capacity; focused
+  poller tests pass (13/13), including failed-seal retention.
+- A4-6 public compatibility restored: `gamma_resolution_poll_interval_secs` and
+  `PE_GAMMA_RESOLUTION_POLL_INTERVAL_SECS` remain the deployed field/key while their description
+  names the CLOB resolution cadence.
+- A4-8 advanced: pre-Start financial entry/resolution now fails closed, fabricated admission/risk/
+  configuration fallbacks and the legacy resolution writer are deleted, and schema-one DTOs are
+  private decoder details with independent test-wire fixtures.
+- A4-9: LIVE3's shared `mark_prices.rs` is absent on this tree. The one paper mark call remains
+  behind `BoundaryMarkFetcher`, now explicitly zero-retry, for primary adaptation.
+- Combined `cargo check -p pe-service --all-targets --features scenario` passes.
+## Round 4 checkpoint — 2026-09-06 01:58 UTC
+
+- A4-1 complete: concentration addition is checked and fails closed; all four dimension boundaries and overflow paths are covered.
+- A4-2 wired: the canonical oldest-unmatched redrive runs before fills, resolutions, daily boundaries, and seal checks. Existing resolution redrive convergence is green; the full four-seam same-process fault matrix remains a final integration test gap.
+- A4-3 complete in the paper owner: exact fill facts retain source receipt/time, historical snapshots replay cash/positions from the Start baseline, and boundary snapshots additionally require a source-prefix-bound Prepared/Final completion before the cutoff.
+- A4-4 complete in PAPERA scope: paper emits/awaits synchronized halt edges, gates against the replayed global owner/cause set, and config incident releases flow through that transition once. The duplicate risk-input halt reducer and key constant are deleted.
+- A4-5 verified: SealCheck is awaited before config/capacity publication and failure retains last-good state.
+- A4-6 complete: the deployed `gamma_resolution_poll_interval_secs` field/env key is restored while its description and consumer identify the CLOB cadence.
+- A4-7 complete: the orchestrator direct-trade receiver/constructors/branches are deleted; service scenarios use acknowledged `CommitActivityBucket` controls and canonical group identities.
+- A4-8 complete in PAPERA scope: pre-Start classification ends with a typed financial-era refusal before admission/economics; no fabricated fee/risk/config inputs, legacy writer, parked timer, or legacy resolution timer remains. Legacy schema-one DTOs are crate-private reader details and test fixtures are independent.
+- A4-9 partial by frozen seam: LIVE3's `mark_prices.rs` is absent in this tree. The sole paper call site remains behind `risk_inputs::BoundaryMarkFetcher`, now explicitly zero-retry, for primary adaptation.
+- A4-10 blocked by ownership: deleting the public diagnostic enum requires simultaneous edits to LIVE-owned `live_fanout.rs`, which still constructs it. PAPERA did not modify the forbidden live file or leave the service uncompilable.
+- PostgreSQL parity was attempted at the mandated URL; all seven tests were blocked at connect with sandbox `PermissionDenied` before SQL execution.
+
+## Round 4 final checkpoint — 2026-09-06 02:16 UTC
+
+- Focused Round 4 verification is green: 143/143 risk-engine, paper-state, and paper-pnl
+  tests; 13/13 config-poller tests; 19/19 activity-websocket tests; 35/35 migrated
+  orchestrator scenarios; 19/19 rebuild/Supabase scenarios; 8/8 paper-log tests; and the
+  unmatched-resolution redrive scenario.
+- The 551-test service run completed with 517 passes. Thirty-three failures are sandbox-denied
+  loopback fixtures; the remaining unchanged position-bracket fixture independently fails because
+  it supplies three activity responses while the current validator requests a fourth.
+- Clean clippy is blocked only by a `panic!` in the forbidden LIVE-owned `live_fanout.rs` test.
+  Rerunning the exact changed-crate clippy command with only `clippy::panic` allowed passes.
+- Targeted doc tests, formatting, locked metadata, and `git diff --check` pass. The required Round 4
+  handoff is recorded in `INTEGRATION_SUMMARY_PAPERA4.md`.

@@ -53,21 +53,32 @@ pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
     if let Some(caps) = s.concentration_caps {
         let proposed = s.proposed_trade_bps.0;
 
-        if s.leader_exposure_bps.0 + proposed > caps.max_leader_bps {
+        if exceeds_concentration_cap(s.leader_exposure_bps.0, proposed, caps.max_leader_bps) {
             return RiskDecision::Blocked(RiskBlock::LeaderConcentrationExceeded);
         }
-        if s.market_exposure_bps.0 + proposed > caps.max_market_bps {
+        if exceeds_concentration_cap(s.market_exposure_bps.0, proposed, caps.max_market_bps) {
             return RiskDecision::Blocked(RiskBlock::MarketConcentrationExceeded);
         }
-        if s.family_exposure_bps.0 + proposed > caps.max_family_bps {
+        if exceeds_concentration_cap(s.family_exposure_bps.0, proposed, caps.max_family_bps) {
             return RiskDecision::Blocked(RiskBlock::FamilyConcentrationExceeded);
         }
-        if s.total_copy_exposure_bps.0 + proposed > caps.max_total_copy_bps {
+        if exceeds_concentration_cap(
+            s.total_copy_exposure_bps.0,
+            proposed,
+            caps.max_total_copy_bps,
+        ) {
             return RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded);
         }
     }
 
     RiskDecision::Approved
+}
+
+const fn exceeds_concentration_cap(existing: i32, proposed: i32, cap: i32) -> bool {
+    match existing.checked_add(proposed) {
+        Some(total) => total > cap,
+        None => true,
+    }
 }
 
 /// Convert an exact positive amount to bankroll basis points, rounding outward.
@@ -188,6 +199,70 @@ mod tests {
         assert_eq!(
             evaluate_risk(&s),
             RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
+        );
+    }
+
+    #[test]
+    fn leader_concentration_blocks_at_one_over_and_on_overflow() {
+        let mut s = clean_snapshot();
+        s.proposed_trade_bps = BasisPoints(1);
+        s.leader_exposure_bps = BasisPoints(300);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::LeaderConcentrationExceeded)
+        );
+        s.leader_exposure_bps = BasisPoints(i32::MAX);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::LeaderConcentrationExceeded)
+        );
+    }
+
+    #[test]
+    fn market_concentration_blocks_at_one_over_and_on_overflow() {
+        let mut s = clean_snapshot();
+        s.proposed_trade_bps = BasisPoints(1);
+        s.market_exposure_bps = BasisPoints(200);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::MarketConcentrationExceeded)
+        );
+        s.market_exposure_bps = BasisPoints(i32::MAX);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::MarketConcentrationExceeded)
+        );
+    }
+
+    #[test]
+    fn family_concentration_blocks_at_one_over_and_on_overflow() {
+        let mut s = clean_snapshot();
+        s.proposed_trade_bps = BasisPoints(1);
+        s.family_exposure_bps = BasisPoints(800);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::FamilyConcentrationExceeded)
+        );
+        s.family_exposure_bps = BasisPoints(i32::MAX);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::FamilyConcentrationExceeded)
+        );
+    }
+
+    #[test]
+    fn total_concentration_blocks_at_one_over_and_on_overflow() {
+        let mut s = clean_snapshot();
+        s.proposed_trade_bps = BasisPoints(1);
+        s.total_copy_exposure_bps = BasisPoints(2_500);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded)
+        );
+        s.total_copy_exposure_bps = BasisPoints(i32::MAX);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded)
         );
     }
 

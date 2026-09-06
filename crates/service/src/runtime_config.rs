@@ -74,7 +74,7 @@ pub const REMOVED_CONFIG_KEYS: [&str; 22] = [
     "demotion_cb_alpha",
     "demotion_min_trades",
     "demotion_pnl_window_secs",
-    "clob_resolution_poll_interval_secs",
+    "gamma_resolution_poll_interval_secs",
     "inactivity_hard_cap_secs",
     "inactivity_threshold_secs",
     "log_retention_days",
@@ -98,7 +98,7 @@ pub const MIN_ACTIVE_WATCHLIST_SIZE: usize = 1;
 pub const MAX_ACTIVE_WATCHLIST_SIZE: usize = 200;
 pub const MIN_PRICE_IMPACT_CAP_BPS: i32 = 1;
 pub const MAX_PRICE_IMPACT_CAP_BPS: i32 = 10_000;
-const RISK_HALT_RELEASE_HASH_KEY: &str = "risk_halt_release_hash";
+pub const RISK_HALT_RELEASE_HASH_KEY: &str = "risk_halt_release_hash";
 
 /// The membership cap that has actually been published to the live watchlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1122,12 +1122,5 @@ mod tests {
         assert_eq!(snapshot.applied_hash, before);
         assert_eq!(snapshot.rejected.as_ref().unwrap().error, error);
         assert_eq!(snapshot.rejected.as_ref().unwrap().rows, rejected);
-    }
-
-    #[test]
-    fn legacy_fallback_fill_source_still_deserializes() {
-        let source: crate::paper_recovery::LegacyFillSource =
-            serde_json::from_str("\"Fallback\"").unwrap();
-        assert_eq!(source, crate::paper_recovery::LegacyFillSource::Fallback);
     }
 }

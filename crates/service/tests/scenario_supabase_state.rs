@@ -41,7 +41,6 @@ use pe_core_types::{
 use pe_event_log::{ContentType, EnvelopeIn, Writer};
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
-use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
 use pe_service::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 use pe_service::supabase_state::{
     AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, PreparedFillRequest,
@@ -55,6 +54,9 @@ use rust_decimal_macros::dec;
 use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
+
+mod support;
+use support::{LegacyFillSource, LegacyPaperFill};
 
 fn wallet_hex() -> &'static str {
     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
