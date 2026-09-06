@@ -337,7 +337,7 @@ impl PolymarketLiveVenue {
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
         let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
         let request_descriptor_hashes =
-            bind_account_read_responses(&evidence, &self.account_binding).map_err(|()| {
+            bind_account_read_attempts(&evidence, &self.account_binding).map_err(|()| {
                 account_read_error(
                     LiveAccountReadFailure::Protocol,
                     evidence.clone(),
@@ -362,7 +362,7 @@ impl PolymarketLiveVenue {
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
         let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
         let request_descriptor_hashes =
-            bind_account_read_responses(&evidence, &self.account_binding).map_err(|()| {
+            bind_account_read_attempts(&evidence, &self.account_binding).map_err(|()| {
                 account_read_error(
                     LiveAccountReadFailure::Protocol,
                     evidence.clone(),
@@ -392,24 +392,21 @@ impl PolymarketLiveVenue {
     }
 }
 
-fn bind_account_read_responses(
+fn bind_account_read_attempts(
     evidence: &[RawEvidence],
     binding: &LiveAccountBindingAudit,
 ) -> Result<Vec<String>, ()> {
     evidence
         .iter()
         .filter_map(|item| match item {
-            RawEvidence::HttpResponse(response) => Some(response),
-            RawEvidence::HttpTransportFailure(_) | RawEvidence::Artifact(_) => None,
+            RawEvidence::HttpResponse(response) => Some(RawHttpAttempt::Response(response.clone())),
+            RawEvidence::HttpTransportFailure(failure) => {
+                Some(RawHttpAttempt::TransportFailure(failure.clone()))
+            }
+            RawEvidence::Artifact(_) => None,
         })
-        .map(|response| {
-            let descriptor = binding.request_descriptor(
-                response.method.clone(),
-                response.path.clone(),
-                response.endpoint_kind.clone(),
-                0,
-                response.ordered_query.clone(),
-            );
+        .map(|attempt| {
+            let descriptor = binding.request_descriptor_for_attempt(&attempt);
             request_descriptor_hash(&descriptor).map_err(|_| ())
         })
         .collect()
@@ -1645,7 +1642,7 @@ mod tests {
             ),
         ];
 
-        let descriptor_hashes = bind_account_read_responses(&evidence, &binding).unwrap();
+        let descriptor_hashes = bind_account_read_attempts(&evidence, &binding).unwrap();
         let headers = evidence
             .iter()
             .find_map(|item| match item {
@@ -1664,6 +1661,44 @@ mod tests {
             state.collateral_balance,
             CollateralAmount::from_atomic(1_000_000)
         );
+    }
+
+    /// PASS: descriptor generation binds every account attempt one-for-one, including a
+    /// transport failure that has no HTTP response bytes.
+    #[test]
+    fn account_transport_failure_gets_account_bound_request_descriptor() {
+        let account_id = AccountId::new("account").unwrap();
+        let binding = LiveAccountBindingAudit::new(
+            account_id,
+            pe_execution_core::CredentialBindingIdentity {
+                version: 1,
+                key_id: "key".to_owned(),
+            },
+            WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap(),
+            blake3::hash(b"credential").to_hex().to_string(),
+        );
+        let failure = RawTransportFailure {
+            source_id: "polymarket-clob-v2".to_owned(),
+            endpoint_kind: "closed-only".to_owned(),
+            method: "GET".to_owned(),
+            path: "/auth/ban-status/closed-only".to_owned(),
+            ordered_query: Vec::new(),
+            attempt_ordinal: 1,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            error_class: TransportErrorClass::Connect,
+            schema_version: 1,
+            parser_version: 1,
+            adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+        };
+        let evidence = vec![RawEvidence::HttpTransportFailure(failure.clone())];
+        let hashes = bind_account_read_attempts(&evidence, &binding).unwrap();
+        let expected = request_descriptor_hash(
+            &binding.request_descriptor_for_attempt(&RawHttpAttempt::TransportFailure(failure)),
+        )
+        .unwrap();
+
+        assert_eq!(hashes, vec![expected]);
     }
 
     /// PASS: post evidence retains exact fractional improved quantity for audit-only use.

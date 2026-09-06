@@ -16,6 +16,9 @@ use pe_core_types::{
     SourceId, SourceTimestamp, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
+use pe_execution_core::live_executor::{
+    LiveAdmissionAccountEvidence, LiveAdmissionClassificationInput, classify_live_admission,
+};
 use pe_execution_core::live_journal::{
     LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
     PolygonFinalityClassification, SanitizedHttpRequestDescriptor, classify_polygon_finality,
@@ -1825,6 +1828,8 @@ pub(crate) struct ProjectionDerivation {
     pub(crate) baseline_cutoff_unix: Option<i64>,
     pub(crate) daily_marks: BTreeMap<i64, CollateralAmount>,
     pub(crate) realized_closes: Vec<(i64, Decimal)>,
+    pub(crate) validated_prepared_sequences: BTreeSet<u64>,
+    pub(crate) pending_approved_admission_keys: BTreeSet<String>,
     open_exposures: Vec<LiveOpenExposure>,
     receivable_by_condition: BTreeMap<String, CollateralAmount>,
 }
@@ -1844,6 +1849,8 @@ pub(crate) enum ProjectionReducerError {
     InvalidBaseline,
     #[error("retained authenticated-account evidence is missing, malformed, or inconsistent")]
     InvalidAccountEvidence,
+    #[error("OrderPrepared has no single matching replay-approved admission")]
+    MissingApprovedAdmission,
     #[error("retained complete-position evidence is missing, malformed, or inconsistent")]
     InvalidPositionEvidence,
     #[error("retained historical-price evidence is missing, malformed, or inconsistent")]
@@ -1910,6 +1917,9 @@ pub(crate) fn derive_projection_rows_with_sources(
     let mut fills = BTreeMap::<String, (OrderFillFinalizedAudit, LiveFillRow)>::new();
     let mut prepared_orders =
         BTreeMap::<String, (u64, Box<pe_execution_core::LiveOrderPreparedAudit>, bool)>::new();
+    let mut evaluated_admissions = BTreeSet::<String>::new();
+    let mut approved_admissions =
+        BTreeMap::<String, Box<pe_execution_core::LiveAdmissionEvaluationAudit>>::new();
     let mut reservations = BTreeMap::<String, Decimal>::new();
     let mut resolutions = BTreeMap::<String, pe_execution_core::ResolutionFinalizedAudit>::new();
     let mut receivable_by_condition = BTreeMap::<String, CollateralAmount>::new();
@@ -1980,11 +1990,17 @@ pub(crate) fn derive_projection_rows_with_sources(
         }
         match &event.payload {
             LiveJournalPayload::OrderPrepared(order) => {
-                let binding = current_account_binding
-                    .as_ref()
-                    .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-                verify_prepared_account_evidence(order, binding)?;
                 let key = order.identity.idempotency_key.clone();
+                let admission = approved_admissions
+                    .remove(&key)
+                    .ok_or(ProjectionReducerError::MissingApprovedAdmission)?;
+                if admission.identity != order.identity
+                    || admission.frozen_binding != order.frozen_binding
+                    || admission.economic != order.economic
+                    || admission.account_state.as_ref() != Some(&order.account_state)
+                {
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
                 if let Some((existing_seq, existing, _)) = prepared_orders.get(&key) {
                     if *existing_seq != event.seq || existing.as_ref() != order.as_ref() {
                         return Err(ProjectionReducerError::IdentityConflict);
@@ -2001,7 +2017,23 @@ pub(crate) fn derive_projection_rows_with_sources(
                 let binding = current_account_binding
                     .as_ref()
                     .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-                verify_admission_account_evidence(admission, binding)?;
+                verify_admission_account_evidence(admission, binding, event.timestamp)?;
+                let key = admission.identity.idempotency_key.clone();
+                if !evaluated_admissions.insert(key.clone()) {
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
+                if admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved {
+                    approved_admissions.insert(key, admission.clone());
+                }
+            }
+            LiveJournalPayload::OrderPreparationFailed(failed) => {
+                let key = &failed.identity.idempotency_key;
+                let admission = approved_admissions
+                    .remove(key)
+                    .ok_or(ProjectionReducerError::MissingApprovedAdmission)?;
+                if admission.identity != failed.identity {
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
             }
             LiveJournalPayload::OrderPosted(posted) => {
                 let Some((prepared_seq, prepared, _)) =
@@ -2402,8 +2434,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                     &bounded.custody_positions,
                 )?;
             }
-            LiveJournalPayload::OrderPreparationFailed(_)
-            | LiveJournalPayload::AccountPortfolioMarked(_)
+            LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::RedemptionRequested(_)
             | LiveJournalPayload::RedemptionTransactionIdentified(_)
             | LiveJournalPayload::RedemptionReceiptTransition(_)
@@ -2506,6 +2537,11 @@ pub(crate) fn derive_projection_rows_with_sources(
         baseline_cutoff_unix,
         daily_marks,
         realized_closes,
+        validated_prepared_sequences: prepared_orders
+            .values()
+            .map(|(sequence, _, _)| *sequence)
+            .collect(),
+        pending_approved_admission_keys: approved_admissions.keys().cloned().collect(),
         open_exposures,
         receivable_by_condition,
     })
@@ -2542,26 +2578,13 @@ fn verify_account_attempts(
     if !binding.is_valid_for(&binding.account_id) {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
-    let mut retained_descriptors = request_descriptor_hashes.iter();
-    for attempt in evidence {
-        let RawHttpAttempt::Response(response) = attempt else {
-            continue;
-        };
-        let descriptor = binding.request_descriptor(
-            response.method.clone(),
-            response.path.clone(),
-            response.endpoint_kind.clone(),
-            0,
-            response.ordered_query.clone(),
-        );
-        let retained_descriptor_hash = retained_descriptors
-            .next()
-            .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
+    if evidence.len() != request_descriptor_hashes.len() {
+        return Err(ProjectionReducerError::InvalidAccountEvidence);
+    }
+    for (attempt, retained_descriptor_hash) in evidence.iter().zip(request_descriptor_hashes) {
+        let descriptor = binding.request_descriptor_for_attempt(attempt);
         verify_http_response_request(&descriptor, retained_descriptor_hash)
             .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    }
-    if retained_descriptors.next().is_some() {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
     let expected_hashes = http_attempt_hashes(evidence)
         .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
@@ -2598,60 +2621,94 @@ pub(crate) fn verify_account_state(
 pub(crate) fn verify_admission_account_evidence(
     admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
     binding: &LiveAccountBindingAudit,
+    evaluated_at: OffsetDateTime,
 ) -> Result<(), ProjectionReducerError> {
-    let account_read_failed = matches!(
-        admission.verdict,
-        pe_execution_core::LiveAdmissionVerdict::Refused(
-            LiveAdmissionRefusal::AccountStateUnavailable(_)
-        )
-    );
     let has_failure_evidence = !admission.account_read_failure_evidence.is_empty()
         || !admission
             .account_read_failure_request_descriptor_hashes
             .is_empty()
         || !admission.account_read_failure_evidence_hashes.is_empty();
-    let needs_binding = admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved
-        || admission.account_state.is_some()
-        || account_read_failed
-        || has_failure_evidence;
-    if !needs_binding {
+    let classify = |account| {
+        classify_live_admission(LiveAdmissionClassificationInput {
+            evaluated_at,
+            requested_mode: admission.requested_mode,
+            effective_mode: admission.effective_mode,
+            frozen_binding: &admission.frozen_binding,
+            current_binding: &admission.current_binding,
+            identity: &admission.identity,
+            condition_id: &admission.economic.market.condition_id,
+            outcome_id: OutcomeId(u16::from(admission.economic.market.outcome_index)),
+            token_id: &admission.economic.market.token_id,
+            admission: &admission.economic.admission,
+            ladder: &admission.economic.ladder,
+            economic: &admission.economic,
+            account,
+        })
+    };
+    if let Ok(expected) = classify(LiveAdmissionAccountEvidence::NotRead) {
+        if admission.account_state.is_some()
+            || has_failure_evidence
+            || admission.verdict != expected
+        {
+            return Err(ProjectionReducerError::InvalidAccountEvidence);
+        }
         return Ok(());
     }
+
     if !binding.is_valid_for_frozen_credential(&binding.account_id, &admission.frozen_binding)
         || admission.current_binding != binding.credential
+        || (admission.account_state.is_some() == has_failure_evidence)
     {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
-    if let Some(account_state) = &admission.account_state {
-        verify_account_state(account_state, binding)?;
+    let selected_spender = if admission.economic.admission.market.neg_risk {
+        pe_venue_polymarket::CanaryV2Client::negrisk_spender()
+    } else {
+        pe_venue_polymarket::CanaryV2Client::standard_spender()
     }
-    if has_failure_evidence {
+    .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+    let account = if let Some(account_state) = &admission.account_state {
+        verify_account_attempts(
+            &account_state.evidence,
+            &account_state.request_descriptor_hashes,
+            &account_state.evidence_hashes,
+            binding,
+        )?;
+        let expected = classify_account_responses(
+            account_state.evidence.clone(),
+            selected_spender,
+            account_state.request_descriptor_hashes.clone(),
+        )
+        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?
+        .audit()
+        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+        if *account_state != expected {
+            return Err(ProjectionReducerError::InvalidAccountEvidence);
+        }
+        LiveAdmissionAccountEvidence::State(account_state)
+    } else {
         verify_account_attempts(
             &admission.account_read_failure_evidence,
             &admission.account_read_failure_request_descriptor_hashes,
             &admission.account_read_failure_evidence_hashes,
             binding,
         )?;
-    }
-    if (admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved
-        && admission.account_state.is_none())
-        || (account_read_failed
-            && (admission.account_state.is_some()
-                || admission.account_read_failure_evidence.is_empty()))
-    {
+        let failure = classify_account_responses(
+            admission.account_read_failure_evidence.clone(),
+            selected_spender,
+            admission
+                .account_read_failure_request_descriptor_hashes
+                .clone(),
+        )
+        .err()
+        .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
+        LiveAdmissionAccountEvidence::ReadFailure(failure.kind)
+    };
+    let expected = classify(account).map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+    if admission.verdict != expected {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
     Ok(())
-}
-
-pub(crate) fn verify_prepared_account_evidence(
-    prepared: &pe_execution_core::LiveOrderPreparedAudit,
-    binding: &LiveAccountBindingAudit,
-) -> Result<(), ProjectionReducerError> {
-    if !binding.is_valid_for_frozen_credential(&binding.account_id, &prepared.frozen_binding) {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    }
-    verify_account_state(&prepared.account_state, binding)
 }
 
 fn verify_account_binding(
@@ -6493,19 +6550,9 @@ mod tests {
     ) -> Vec<String> {
         evidence
             .iter()
-            .filter_map(|attempt| match attempt {
-                RawHttpAttempt::Response(response) => Some(response),
-                RawHttpAttempt::TransportFailure(_) => None,
-            })
-            .map(|response| {
+            .map(|attempt| {
                 pe_execution_core::live_journal::request_descriptor_hash(
-                    &binding.request_descriptor(
-                        response.method.clone(),
-                        response.path.clone(),
-                        response.endpoint_kind.clone(),
-                        0,
-                        response.ordered_query.clone(),
-                    ),
+                    &binding.request_descriptor_for_attempt(attempt),
                 )
                 .unwrap()
             })
@@ -6932,6 +6979,35 @@ mod tests {
         })
     }
 
+    fn approved_admission_event(
+        account_id: &AccountId,
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        seq: u64,
+        timestamp: OffsetDateTime,
+    ) -> LiveJournalEvent {
+        LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp,
+            payload: LiveJournalPayload::AdmissionEvaluated(approved_admission(prepared)),
+        }
+    }
+
+    fn append_approved_admission(
+        journal: &LiveJournal,
+        account_id: &AccountId,
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        timestamp: OffsetDateTime,
+    ) {
+        journal
+            .append(
+                account_id.clone(),
+                timestamp,
+                LiveJournalPayload::AdmissionEvaluated(approved_admission(prepared)),
+            )
+            .unwrap();
+    }
+
     fn finality_matched(
         prepared: &pe_execution_core::LiveOrderPreparedAudit,
         transaction_hash: String,
@@ -6960,15 +7036,16 @@ mod tests {
         wrong_identity.quote_id = "different-quote".to_owned();
         let events = vec![
             baseline_event(&account_id, 1),
+            approved_admission_event(&account_id, &prepared, 2, OffsetDateTime::UNIX_EPOCH),
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 2,
+                seq: 3,
                 timestamp: OffsetDateTime::UNIX_EPOCH,
                 payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 3,
+                seq: 4,
                 timestamp: OffsetDateTime::UNIX_EPOCH,
                 payload: LiveJournalPayload::OrderReconciled(Box::new(
                     LiveOrderReconciliationAudit {
@@ -6990,7 +7067,7 @@ mod tests {
         ));
 
         let mut wrong_pair = events;
-        if let LiveJournalPayload::OrderReconciled(reconciled) = &mut wrong_pair[2].payload {
+        if let LiveJournalPayload::OrderReconciled(reconciled) = &mut wrong_pair[3].payload {
             reconciled.identity = prepared.identity.clone();
             reconciled.source = LiveReconciliationSource::PolygonFinality;
         }
@@ -7024,16 +7101,22 @@ mod tests {
         };
         let prefix = vec![
             baseline_event(&account_id, 1),
+            approved_admission_event(
+                &account_id,
+                &prepared,
+                2,
+                OffsetDateTime::from_unix_timestamp(2).unwrap(),
+            ),
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 2,
-                timestamp: OffsetDateTime::from_unix_timestamp(2).unwrap(),
+                seq: 3,
+                timestamp: OffsetDateTime::from_unix_timestamp(3).unwrap(),
                 payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
-            event(3, terminal.clone()),
+            event(4, terminal.clone()),
         ];
         let mut duplicate = prefix.clone();
-        duplicate.push(event(4, terminal.clone()));
+        duplicate.push(event(5, terminal.clone()));
         let replayed = derive_with_baseline_evidence(&account_id, &duplicate, &[]).unwrap();
         assert_eq!(replayed.reserved, Decimal::ZERO);
 
@@ -7045,7 +7128,7 @@ mod tests {
             executed: None,
         };
         let mut contradictory = prefix;
-        contradictory.push(event(4, changed));
+        contradictory.push(event(5, changed));
         assert!(matches!(
             derive_with_baseline_evidence(&account_id, &contradictory, &[]),
             Err(ProjectionReducerError::IdentityConflict)
@@ -7331,6 +7414,7 @@ mod tests {
                 .append(account_id.clone(), baseline.timestamp, baseline.payload)
                 .unwrap();
             let prepared = finality_prepared();
+            append_approved_admission(&journal, &account_id, &prepared, OffsetDateTime::UNIX_EPOCH);
             let prepared_event = journal
                 .append(
                     account_id.clone(),
@@ -7616,6 +7700,7 @@ mod tests {
                 .append(account_id.clone(), baseline.timestamp, baseline.payload)
                 .unwrap();
             let prepared = finality_prepared();
+            append_approved_admission(&journal, &account_id, &prepared, OffsetDateTime::UNIX_EPOCH);
             let prepared_event = journal
                 .append(
                     account_id.clone(),
@@ -7713,7 +7798,7 @@ mod tests {
     async fn finality_conflict_freezes_recovery_and_rejects_clean_retry() {
         let account_id = AccountId::new("account").unwrap();
         let order = PendingOrderFinality {
-            prepared_journal_seq: 0,
+            prepared_journal_seq: 2,
             prepared: finality_prepared(),
             transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
             immutable_receipts: BTreeMap::new(),
@@ -7729,14 +7814,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live.log");
         let journal = LiveJournal::open(&path).unwrap();
+        let prepared = finality_prepared();
+        let baseline = baseline_event(&account_id, 0);
+        journal
+            .append(account_id.clone(), baseline.timestamp, baseline.payload)
+            .unwrap();
+        append_approved_admission(&journal, &account_id, &prepared, OffsetDateTime::UNIX_EPOCH);
         journal
             .append(
                 account_id.clone(),
                 OffsetDateTime::UNIX_EPOCH,
-                LiveJournalPayload::OrderPrepared(finality_prepared()),
+                LiveJournalPayload::OrderPrepared(prepared.clone()),
             )
             .unwrap();
-        let matched_prepared = finality_prepared();
+        let matched_prepared = prepared.clone();
         let matched = LiveOrderReconciliationAudit {
             identity: matched_prepared.identity.clone(),
             order_hash: matched_prepared.prepared.order_hash.clone(),
@@ -7779,8 +7870,8 @@ mod tests {
         let frozen = recovery_inventory(&path).unwrap();
         assert!(frozen.open_orders.is_empty());
         let retained = replay_account(&path, &account_id).unwrap();
-        let pending_payload = retained[2].payload.clone();
-        let conflict_payload = retained[3].payload.clone();
+        let pending_payload = retained[4].payload.clone();
+        let conflict_payload = retained[5].payload.clone();
         assert_eq!(
             append_order_finality_result(
                 &journal,
@@ -7796,34 +7887,39 @@ mod tests {
             Err(pe_execution_core::LiveJournalError::OrderFactConflict)
         ));
 
-        let prepared = finality_prepared();
         let reducer_events = vec![
             baseline_event(&account_id, 1),
+            approved_admission_event(
+                &account_id,
+                &prepared,
+                2,
+                OffsetDateTime::from_unix_timestamp(5).unwrap(),
+            ),
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 2,
+                seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                 payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 3,
+                seq: 4,
                 timestamp: OffsetDateTime::from_unix_timestamp(6).unwrap(),
                 payload: LiveJournalPayload::OrderReconciled(Box::new(matched)),
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 4,
+                seq: 5,
                 timestamp: OffsetDateTime::from_unix_timestamp(8).unwrap(),
                 payload: pending_payload,
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 5,
+                seq: 6,
                 timestamp: OffsetDateTime::from_unix_timestamp(9).unwrap(),
                 payload: conflict_payload,
             },
-            finalized_fill_event(&account_id, &prepared, 6, 2),
+            finalized_fill_event(&account_id, &prepared, 7, 3),
         ];
         let frozen_projection =
             derive_with_baseline_evidence(&account_id, &reducer_events[..5], &[]).unwrap();
@@ -7893,6 +7989,7 @@ mod tests {
         journal
             .append(account_id.clone(), baseline.timestamp, baseline.payload)
             .unwrap();
+        append_approved_admission(&journal, &account_id, &prepared, OffsetDateTime::UNIX_EPOCH);
         let prepared_event = journal
             .append(
                 account_id.clone(),
@@ -8008,15 +8105,16 @@ mod tests {
         let prefix = || {
             vec![
                 baseline_event(&account_id, 0),
+                approved_admission_event(&account_id, &prepared, 1, OffsetDateTime::UNIX_EPOCH),
                 LiveJournalEvent {
                     account_id: account_id.clone(),
-                    seq: 1,
+                    seq: 2,
                     timestamp: OffsetDateTime::UNIX_EPOCH,
                     payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
                 },
                 LiveJournalEvent {
                     account_id: account_id.clone(),
-                    seq: 2,
+                    seq: 3,
                     timestamp: OffsetDateTime::UNIX_EPOCH,
                     payload: LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
                         &prepared,
@@ -8027,7 +8125,7 @@ mod tests {
         };
 
         let mut malformed = prefix();
-        let mut malformed_final = finalized_fill_event(&account_id, &prepared, 3, 1);
+        let mut malformed_final = finalized_fill_event(&account_id, &prepared, 4, 2);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut malformed_final.payload {
             finalized.receipts.clear();
             finalized.blocks.clear();
@@ -8035,7 +8133,7 @@ mod tests {
         malformed.push(malformed_final);
 
         let mut economic = prefix();
-        let mut economic_final = finalized_fill_event(&account_id, &prepared, 3, 1);
+        let mut economic_final = finalized_fill_event(&account_id, &prepared, 4, 2);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut economic_final.payload {
             finalized.principal = CollateralAmount::from_atomic(2_500_001);
             let RawHttpAttempt::Response(response) = finalized.receipts.get_mut(1).unwrap() else {
@@ -8048,7 +8146,7 @@ mod tests {
         let pending_result = collect_order_finality(
             &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_499_999)),
             vec![PendingOrderFinality {
-                prepared_journal_seq: 1,
+                prepared_journal_seq: 2,
                 prepared: prepared.clone(),
                 transaction_hashes: vec![transaction_hash.clone()],
                 immutable_receipts: BTreeMap::new(),
@@ -8064,7 +8162,7 @@ mod tests {
         let mut contradicts_pending = prefix();
         contradicts_pending.push(LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 3,
+            seq: 4,
             timestamp: OffsetDateTime::UNIX_EPOCH,
             payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
                 identity: prepared.identity.clone(),
@@ -8075,7 +8173,7 @@ mod tests {
                 evidence,
             })),
         });
-        contradicts_pending.push(finalized_fill_event(&account_id, &prepared, 4, 1));
+        contradicts_pending.push(finalized_fill_event(&account_id, &prepared, 5, 2));
 
         for (case, events) in [
             ("malformed", malformed),
@@ -8329,7 +8427,6 @@ mod tests {
         let account_a = AccountId::new("account").unwrap();
         let account_b = AccountId::new("account-b").unwrap();
         let wallet = "0x1111111111111111111111111111111111111111";
-        let binding_a = account_binding_fixture(&account_a, wallet);
         let binding_b = account_binding_fixture(&account_b, wallet);
         let prepared = finality_prepared();
         let event = |seq, payload| LiveJournalEvent {
@@ -8340,19 +8437,6 @@ mod tests {
         };
 
         let valid_admission = approved_admission(&prepared);
-        crate::qualification::verify_qualification_admission_account(
-            &account_a,
-            Some(&binding_a),
-            &valid_admission,
-        )
-        .unwrap();
-        crate::qualification::verify_qualification_prepared_account(
-            &account_a,
-            Some(&binding_a),
-            &prepared.frozen_binding,
-            &prepared.account_state,
-        )
-        .unwrap();
         let valid = vec![
             baseline_event(&account_a, 1),
             event(2, LiveJournalPayload::AdmissionEvaluated(valid_admission)),
@@ -8368,23 +8452,6 @@ mod tests {
         let mut substituted_prepared = prepared.clone();
         substituted_prepared.account_state = account_b_state.clone();
         let substituted_admission = approved_admission(&substituted_prepared);
-        assert!(
-            crate::qualification::verify_qualification_admission_account(
-                &account_a,
-                Some(&binding_a),
-                &substituted_admission,
-            )
-            .is_err()
-        );
-        assert!(
-            crate::qualification::verify_qualification_prepared_account(
-                &account_a,
-                Some(&binding_a),
-                &substituted_prepared.frozen_binding,
-                &substituted_prepared.account_state,
-            )
-            .is_err()
-        );
         let substituted = vec![
             baseline_event(&account_a, 1),
             event(
@@ -8408,7 +8475,7 @@ mod tests {
         }
         assert!(matches!(
             derive_with_baseline_evidence(&account_a, &prepared_only_substitution, &[]),
-            Err(ProjectionReducerError::InvalidAccountEvidence)
+            Err(ProjectionReducerError::IdentityConflict)
         ));
 
         let mut credential_substitution = valid.clone();
@@ -8417,14 +8484,6 @@ mod tests {
         {
             admission.frozen_binding.version = 2;
             admission.current_binding.version = 2;
-            assert!(
-                crate::qualification::verify_qualification_admission_account(
-                    &account_a,
-                    Some(&binding_a),
-                    admission,
-                )
-                .is_err()
-            );
         }
         assert!(matches!(
             derive_with_baseline_evidence(&account_a, &credential_substitution, &[]),
@@ -8436,23 +8495,6 @@ mod tests {
             && let Some(account_state) = &mut admission.account_state
         {
             account_state.request_descriptor_hashes[0] = "rewritten".to_owned();
-            assert!(
-                crate::qualification::verify_qualification_prepared_account(
-                    &account_a,
-                    Some(&binding_a),
-                    &admission.frozen_binding,
-                    account_state,
-                )
-                .is_err()
-            );
-            assert!(
-                crate::qualification::verify_qualification_admission_account(
-                    &account_a,
-                    Some(&binding_a),
-                    admission,
-                )
-                .is_err()
-            );
         }
         assert!(matches!(
             derive_with_baseline_evidence(&account_a, &descriptor_tamper, &[]),
@@ -8475,13 +8517,10 @@ mod tests {
             baseline_event(&account_a, 1),
             event(2, LiveJournalPayload::AdmissionEvaluated(refused.clone())),
         ];
-        crate::qualification::verify_qualification_admission_account(
-            &account_a,
-            Some(&binding_a),
-            &refused,
-        )
-        .unwrap();
-        assert!(derive_with_baseline_evidence(&account_a, &refused_events, &[]).is_ok());
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_a, &refused_events, &[]),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
 
         let mut refused_substitution = refused.clone();
         refused_substitution.account_read_failure_evidence =
@@ -8490,14 +8529,6 @@ mod tests {
             vec![account_b_state.request_descriptor_hashes[0].clone()];
         refused_substitution.account_read_failure_evidence_hashes =
             http_attempt_hashes(&refused_substitution.account_read_failure_evidence).unwrap();
-        assert!(
-            crate::qualification::verify_qualification_admission_account(
-                &account_a,
-                Some(&binding_a),
-                &refused_substitution,
-            )
-            .is_err()
-        );
         let refused_substituted_events = vec![
             baseline_event(&account_a, 1),
             event(
@@ -8511,14 +8542,6 @@ mod tests {
         ));
 
         refused.account_read_failure_request_descriptor_hashes[0] = "rewritten".to_owned();
-        assert!(
-            crate::qualification::verify_qualification_admission_account(
-                &account_a,
-                Some(&binding_a),
-                &refused,
-            )
-            .is_err()
-        );
         let refused_tamper = vec![
             baseline_event(&account_a, 1),
             event(2, LiveJournalPayload::AdmissionEvaluated(refused)),
@@ -8526,6 +8549,249 @@ mod tests {
         assert!(matches!(
             derive_with_baseline_evidence(&account_a, &refused_tamper, &[]),
             Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+    }
+
+    /// PASS: a failed account request consumes exactly one descriptor bound to the active
+    /// Baseline; an otherwise identical account-B descriptor and a tampered descriptor fail.
+    #[test]
+    fn transport_failure_descriptor_rejects_cross_account_substitution_and_tamper() {
+        let account_a = AccountId::new("account").unwrap();
+        let account_b = AccountId::new("account-b").unwrap();
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let binding_a = account_binding_fixture(&account_a, wallet);
+        let binding_b = account_binding_fixture(&account_b, wallet);
+        let prepared = finality_prepared();
+        let failure = pe_core_types::RawTransportFailure {
+            source_id: "polymarket-clob-v2".to_owned(),
+            endpoint_kind: "closed-only".to_owned(),
+            method: "GET".to_owned(),
+            path: "/auth/ban-status/closed-only".to_owned(),
+            ordered_query: Vec::new(),
+            attempt_ordinal: 1,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            error_class: pe_core_types::TransportErrorClass::Connect,
+            schema_version: 1,
+            parser_version: 1,
+            adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+        };
+        let attempt = RawHttpAttempt::TransportFailure(failure);
+        let mut refusal = approved_admission(&prepared);
+        refusal.account_state = None;
+        refusal.account_read_failure_evidence = vec![attempt.clone()];
+        refusal.account_read_failure_evidence_hashes =
+            http_attempt_hashes(&refusal.account_read_failure_evidence).unwrap();
+        refusal.verdict = pe_execution_core::LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountStateUnavailable(
+                pe_execution_core::LiveAccountReadFailure::Transport,
+            ),
+        );
+        let event = |audit| LiveJournalEvent {
+            account_id: account_a.clone(),
+            seq: 2,
+            timestamp: OffsetDateTime::from_unix_timestamp(2).unwrap(),
+            payload: LiveJournalPayload::AdmissionEvaluated(audit),
+        };
+
+        refusal.account_read_failure_request_descriptor_hashes = vec![
+            pe_execution_core::live_journal::request_descriptor_hash(
+                &binding_a.request_descriptor_for_attempt(&attempt),
+            )
+            .unwrap(),
+        ];
+        assert!(
+            derive_with_baseline_evidence(
+                &account_a,
+                &[baseline_event(&account_a, 1), event(refusal.clone())],
+                &[],
+            )
+            .is_ok()
+        );
+
+        let mut substituted = refusal.clone();
+        substituted.account_read_failure_request_descriptor_hashes = vec![
+            pe_execution_core::live_journal::request_descriptor_hash(
+                &binding_b.request_descriptor_for_attempt(&attempt),
+            )
+            .unwrap(),
+        ];
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_a,
+                &[baseline_event(&account_a, 1), event(substituted)],
+                &[],
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        refusal.account_read_failure_request_descriptor_hashes[0] = "rewritten".to_owned();
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_a,
+                &[baseline_event(&account_a, 1), event(refusal)],
+                &[],
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+    }
+
+    /// PASS: strict reduction derives the ordered admission verdict and consumes one matching
+    /// approval before Prepared; authentic underfunding, relabeling, reason/bound tampering, and
+    /// a missing admission all fail closed while the unchanged fixture passes.
+    #[test]
+    fn strict_reducer_replays_ordered_admission_before_prepared() {
+        let account_id = AccountId::new("account").unwrap();
+        let binding =
+            account_binding_fixture(&account_id, "0x1111111111111111111111111111111111111111");
+        let prepared = finality_prepared();
+        let event = |seq, payload| LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp: OffsetDateTime::from_unix_timestamp(i64::try_from(seq).unwrap()).unwrap(),
+            payload,
+        };
+        let stream = |admission, prepared| {
+            vec![
+                baseline_event(&account_id, 1),
+                event(2, LiveJournalPayload::AdmissionEvaluated(admission)),
+                event(3, LiveJournalPayload::OrderPrepared(prepared)),
+            ]
+        };
+        assert!(
+            derive_with_baseline_evidence(
+                &account_id,
+                &stream(approved_admission(&prepared), prepared.clone()),
+                &[],
+            )
+            .is_ok()
+        );
+
+        let underfunded_state = account_state_fixture_for_binding(
+            CollateralAmount::from_atomic(1),
+            OffsetDateTime::UNIX_EPOCH,
+            &binding,
+        );
+        let mut underfunded_prepared = prepared.clone();
+        underfunded_prepared.account_state = underfunded_state;
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_id,
+                &stream(
+                    approved_admission(&underfunded_prepared),
+                    underfunded_prepared.clone(),
+                ),
+                &[],
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut relabeled = approved_admission(&prepared);
+        let account_state = relabeled.account_state.take().unwrap();
+        relabeled.account_read_failure_evidence = account_state.evidence;
+        relabeled.account_read_failure_request_descriptor_hashes =
+            account_state.request_descriptor_hashes;
+        relabeled.account_read_failure_evidence_hashes =
+            http_attempt_hashes(&relabeled.account_read_failure_evidence).unwrap();
+        relabeled.verdict = pe_execution_core::LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountStateUnavailable(
+                pe_execution_core::LiveAccountReadFailure::Authentication,
+            ),
+        );
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_id,
+                &[
+                    baseline_event(&account_id, 1),
+                    event(2, LiveJournalPayload::AdmissionEvaluated(relabeled))
+                ],
+                &[],
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut valid_authentication_failure = approved_admission(&prepared);
+        let mut failed_account = valid_authentication_failure.account_state.take().unwrap();
+        let response = failed_account
+            .evidence
+            .iter_mut()
+            .find_map(|attempt| match attempt {
+                RawHttpAttempt::Response(response) if response.endpoint_kind == "geoblock" => {
+                    Some(response)
+                }
+                RawHttpAttempt::Response(_) | RawHttpAttempt::TransportFailure(_) => None,
+            })
+            .unwrap();
+        response.status = 401;
+        valid_authentication_failure.account_read_failure_evidence = failed_account.evidence;
+        valid_authentication_failure.account_read_failure_request_descriptor_hashes =
+            failed_account.request_descriptor_hashes;
+        valid_authentication_failure.account_read_failure_evidence_hashes =
+            http_attempt_hashes(&valid_authentication_failure.account_read_failure_evidence)
+                .unwrap();
+        valid_authentication_failure.verdict = pe_execution_core::LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountStateUnavailable(
+                pe_execution_core::LiveAccountReadFailure::Authentication,
+            ),
+        );
+        assert!(
+            derive_with_baseline_evidence(
+                &account_id,
+                &[
+                    baseline_event(&account_id, 1),
+                    event(
+                        2,
+                        LiveJournalPayload::AdmissionEvaluated(valid_authentication_failure),
+                    ),
+                ],
+                &[],
+            )
+            .is_ok()
+        );
+
+        let mut wrong_reason = approved_admission(&underfunded_prepared);
+        wrong_reason.verdict = pe_execution_core::LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::InsufficientBalance {
+                required: CollateralAmount::from_atomic(1),
+                available: CollateralAmount::from_atomic(1),
+            },
+        );
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_id,
+                &[
+                    baseline_event(&account_id, 1),
+                    event(2, LiveJournalPayload::AdmissionEvaluated(wrong_reason))
+                ],
+                &[],
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut wrong_bound_prepared = prepared.clone();
+        wrong_bound_prepared.economic.balance.worst_case_debit = CollateralAmount::from_atomic(1);
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_id,
+                &stream(
+                    approved_admission(&wrong_bound_prepared),
+                    wrong_bound_prepared,
+                ),
+                &[],
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_id,
+                &[
+                    baseline_event(&account_id, 1),
+                    event(2, LiveJournalPayload::OrderPrepared(prepared)),
+                ],
+                &[],
+            ),
+            Err(ProjectionReducerError::MissingApprovedAdmission)
         ));
     }
 
@@ -8836,14 +9102,14 @@ mod tests {
     fn live_resolution_half_payout_and_loser_are_exact() {
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let mut half_fill = finalized_fill_event(&account_id, &prepared, 3, 2);
+        let mut half_fill = finalized_fill_event(&account_id, &prepared, 4, 3);
         if let LiveJournalPayload::OrderFillFinalized(fill) = &mut half_fill.payload {
             fill.quantity = ShareAmount::from_atomic(3_125_001);
             if let Some(RawHttpAttempt::Response(response)) = fill.receipts.get_mut(1) {
                 response.body = receipt_with_word(3, 3_125_001);
             }
         }
-        let mut half_resolution = resolution_event(&account_id, 4);
+        let mut half_resolution = resolution_event(&account_id, 5);
         if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut half_resolution.payload {
             resolution.payout_by_outcome_index_json =
                 BinaryPayoutVector::fifty_fifty().canonical_json();
@@ -8853,9 +9119,15 @@ mod tests {
             &account_id,
             &[
                 baseline_event(&account_id, 1),
+                approved_admission_event(
+                    &account_id,
+                    &prepared,
+                    2,
+                    OffsetDateTime::from_unix_timestamp(5).unwrap(),
+                ),
                 LiveJournalEvent {
                     account_id: account_id.clone(),
-                    seq: 2,
+                    seq: 3,
                     timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                     payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
                 },
@@ -8868,7 +9140,7 @@ mod tests {
         assert_eq!(half.receivable, dec!(1.562500));
         assert_eq!(half.economic_cash, Some(dec!(9.062380)));
 
-        let mut losing_resolution = resolution_event(&account_id, 4);
+        let mut losing_resolution = resolution_event(&account_id, 5);
         if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut losing_resolution.payload
         {
             resolution.payout_by_outcome_index_json =
@@ -8879,13 +9151,19 @@ mod tests {
             &account_id,
             &[
                 baseline_event(&account_id, 1),
+                approved_admission_event(
+                    &account_id,
+                    &prepared,
+                    2,
+                    OffsetDateTime::from_unix_timestamp(5).unwrap(),
+                ),
                 LiveJournalEvent {
                     account_id: account_id.clone(),
-                    seq: 2,
+                    seq: 3,
                     timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                     payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
                 },
-                finalized_fill_event(&account_id, &prepared, 3, 2),
+                finalized_fill_event(&account_id, &prepared, 4, 3),
                 losing_resolution,
             ],
             &[losing_source],
@@ -8906,11 +9184,11 @@ mod tests {
         let daily_at = OffsetDateTime::from_unix_timestamp(86_402).unwrap();
         let (position_evidence, position_sources) =
             empty_position_evidence(120, daily_at, &binding);
-        let mut fill = finalized_fill_event(&account_id, &prepared, 3, 2);
+        let mut fill = finalized_fill_event(&account_id, &prepared, 4, 3);
         fill.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
         let daily = LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 4,
+            seq: 5,
             timestamp: daily_at,
             payload: LiveJournalPayload::AccountPortfolioMarked(Box::new(
                 pe_execution_core::AccountPortfolioMarkedAudit {
@@ -8932,9 +9210,15 @@ mod tests {
         };
         let events = vec![
             baseline_event(&account_id, 1),
+            approved_admission_event(
+                &account_id,
+                &prepared,
+                2,
+                OffsetDateTime::from_unix_timestamp(5).unwrap(),
+            ),
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 2,
+                seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(86_401).unwrap(),
                 payload: LiveJournalPayload::OrderPrepared(prepared),
             },
@@ -8953,7 +9237,7 @@ mod tests {
     fn daily_mark_replays_the_cutoff_bounded_financial_view() {
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let mut resolution = resolution_event(&account_id, 4);
+        let mut resolution = resolution_event(&account_id, 5);
         resolution.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
         let source = resolution_source_envelope(&resolution);
         let account_binding =
@@ -8983,7 +9267,7 @@ mod tests {
         let cash = CollateralAmount::from_decimal_exact(dec!(7.499880)).unwrap();
         let daily = LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 5,
+            seq: 6,
             timestamp: OffsetDateTime::from_unix_timestamp(86_402).unwrap(),
             payload: LiveJournalPayload::AccountPortfolioMarked(Box::new(
                 pe_execution_core::AccountPortfolioMarkedAudit {
@@ -9017,13 +9301,19 @@ mod tests {
         };
         let events = vec![
             baseline_event(&account_id, 1),
+            approved_admission_event(
+                &account_id,
+                &prepared,
+                2,
+                OffsetDateTime::from_unix_timestamp(5).unwrap(),
+            ),
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 2,
+                seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                 payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
-            finalized_fill_event(&account_id, &prepared, 3, 2),
+            finalized_fill_event(&account_id, &prepared, 4, 3),
             resolution,
             daily,
         ];
@@ -9126,16 +9416,22 @@ mod tests {
     fn finalized_resolution_and_custody_replay_converge_once() {
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let repeated_fill = finalized_fill_event(&account_id, &prepared, 4, 2);
+        let repeated_fill = finalized_fill_event(&account_id, &prepared, 5, 3);
         let mut events = vec![
             baseline_event(&account_id, 1),
+            approved_admission_event(
+                &account_id,
+                &prepared,
+                2,
+                OffsetDateTime::from_unix_timestamp(5).unwrap(),
+            ),
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 2,
+                seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                 payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
-            finalized_fill_event(&account_id, &prepared, 3, 2),
+            finalized_fill_event(&account_id, &prepared, 4, 3),
         ];
         let filled = derive_with_baseline_evidence(&account_id, &events, &[]).unwrap();
         assert_eq!(filled.positions.len(), 1);
@@ -9152,7 +9448,7 @@ mod tests {
         conflicting_events.push(conflicting_fill);
         assert!(derive_with_baseline_evidence(&account_id, &conflicting_events, &[]).is_err());
 
-        let mut invented_fill = finalized_fill_event(&account_id, &prepared, 4, 2);
+        let mut invented_fill = finalized_fill_event(&account_id, &prepared, 5, 3);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut invented_fill.payload {
             finalized.receipts.clear();
             finalized.blocks.clear();
@@ -9164,12 +9460,12 @@ mod tests {
             Err(ProjectionReducerError::InvalidFinalityEvidence)
         ));
 
-        let first_resolution = resolution_event(&account_id, 5);
+        let first_resolution = resolution_event(&account_id, 6);
         let resolution_source = resolution_source_envelope(&first_resolution);
         events.extend([
             repeated_fill,
             first_resolution,
-            resolution_event(&account_id, 6),
+            resolution_event(&account_id, 7),
         ]);
         let resolved = derive_with_baseline_evidence(
             &account_id,
@@ -9621,7 +9917,22 @@ mod tests {
             None,
         );
         let account_id = AccountId::new("acct").unwrap();
-        let prepared = finality_prepared();
+        let mut prepared = finality_prepared();
+        let baseline = baseline_event(&account_id, 0);
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &baseline.payload {
+            prepared.account_state = mark.account_state.clone();
+        }
+        state
+            .config
+            .journal
+            .append(account_id.clone(), baseline.timestamp, baseline.payload)
+            .unwrap();
+        append_approved_admission(
+            state.config.journal.as_ref(),
+            &account_id,
+            &prepared,
+            OffsetDateTime::UNIX_EPOCH,
+        );
         let prepared_event = state
             .config
             .journal

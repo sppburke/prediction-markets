@@ -16,13 +16,13 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use crate::live_journal::{
-    AdmissionReceipts, CredentialBindingIdentity, LiveAccountReadFailure, LiveAccountStateAudit,
-    LiveAdmissionEvaluationAudit, LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode,
-    LiveExecutedAmounts, LiveJournal, LiveJournalError, LiveJournalOrderOutcome,
-    LiveJournalPayload, LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderPostAudit,
-    LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure, LiveOrderPreparedAudit,
-    LiveOrderReconciliationAudit, LiveOrderRejectKind, LiveReconciliationSource, http_attempt_hash,
-    http_attempt_hashes,
+    AdmissionReceipts, CredentialBindingIdentity, LadderPlanAudit, LiveAccountReadFailure,
+    LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
+    LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode, LiveExecutedAmounts, LiveJournal,
+    LiveJournalError, LiveJournalOrderOutcome, LiveJournalPayload, LiveOrderAmbiguityKind,
+    LiveOrderIdentity, LiveOrderPostAudit, LiveOrderPreparationFailedAudit,
+    LiveOrderPreparationFailure, LiveOrderPreparedAudit, LiveOrderReconciliationAudit,
+    LiveOrderRejectKind, LiveReconciliationSource, http_attempt_hash, http_attempt_hashes,
 };
 
 /// Frozen per-target account and credential identity supplied by the dispatch aggregate.
@@ -38,6 +38,39 @@ pub struct LiveModeSnapshot {
     pub requested: LiveControlMode,
     pub effective: LiveControlMode,
 }
+
+/// Account-read input to the pure ordered live-admission classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveAdmissionAccountEvidence<'a> {
+    /// The ordered pre-I/O gates are being evaluated before an account read is attempted.
+    NotRead,
+    /// A complete authenticated account state was reconstructed from retained evidence.
+    State(&'a LiveAccountStateAudit),
+    /// Retained evidence deterministically classified as this account-read failure.
+    ReadFailure(LiveAccountReadFailure),
+}
+
+/// All immutable inputs to the one ordered live-admission classifier.
+pub struct LiveAdmissionClassificationInput<'a> {
+    pub evaluated_at: OffsetDateTime,
+    pub requested_mode: LiveControlMode,
+    pub effective_mode: LiveControlMode,
+    pub frozen_binding: &'a CredentialBindingIdentity,
+    pub current_binding: &'a CredentialBindingIdentity,
+    pub identity: &'a LiveOrderIdentity,
+    pub condition_id: &'a PolymarketConditionId,
+    pub outcome_id: OutcomeId,
+    pub token_id: &'a PolymarketTokenId,
+    pub admission: &'a LiveAdmissionArtifactAudit,
+    pub ladder: &'a LadderPlanAudit,
+    pub economic: &'a crate::economic::EconomicPrepared,
+    pub account: LiveAdmissionAccountEvidence<'a>,
+}
+
+/// Signals that the ordered pre-I/O gates passed and the classifier requires account evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("live admission requires authenticated account evidence")]
+pub struct LiveAdmissionNeedsAccountState;
 
 impl LiveModeSnapshot {
     #[must_use]
@@ -120,7 +153,7 @@ pub struct LiveVenueAccountState {
     pub schema_version: u16,
     pub parser_version: u16,
     pub evidence: Vec<RawHttpAttempt>,
-    /// Descriptor hashes in response order; transport failures have no response descriptor entry.
+    /// Descriptor hashes in exact attempt order, including transport failures.
     pub request_descriptor_hashes: Vec<String>,
 }
 
@@ -148,7 +181,7 @@ impl LiveVenueAccountState {
 pub struct LiveVenueAccountReadError {
     pub kind: LiveAccountReadFailure,
     pub evidence: Vec<RawHttpAttempt>,
-    /// Descriptor hashes in response order for responses retained by the failed read.
+    /// Descriptor hashes in exact attempt order for attempts retained by the failed read.
     pub request_descriptor_hashes: Vec<String>,
 }
 
@@ -374,56 +407,54 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         now: OffsetDateTime,
     ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError> {
         let economic = request.economic.clone();
-
-        // The per-account kill is local and therefore precedes any authenticated venue I/O.
-        if !request.mode.is_armed() {
-            return self.refuse(
-                &request,
-                now,
-                economic,
-                None,
-                Vec::new(),
-                Vec::new(),
-                LiveAdmissionRefusal::ModeNotArmed,
-            );
-        }
-
-        // Ordered admission check 1: exact credential binding.
-        if request.target.credential_binding != request.current_credential_binding {
-            self.journal.append(
-                request.target.account_id.clone(),
-                now,
-                LiveJournalPayload::CredentialBindingMismatch {
-                    frozen: request.target.credential_binding.clone(),
-                    current: request.current_credential_binding.clone(),
-                },
-            )?;
-            return self.refuse(
-                &request,
-                now,
-                economic,
-                None,
-                Vec::new(),
-                Vec::new(),
-                LiveAdmissionRefusal::CredentialVersionChanged,
-            );
-        }
-
-        // Ordered admission check 2: both artifact halves and the frozen quote/ladder.
-        let required = match validate_artifact_and_ladder(&request, now) {
-            Ok(required) => required,
-            Err(reason) => {
-                return self.refuse(
-                    &request,
-                    now,
-                    economic,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    reason,
-                );
-            }
+        let admission = LiveAdmissionArtifactAudit::new(
+            &request.admission.market,
+            &request.admission.settlement,
+            request.admission.fee_schedule,
+            request.admission.receipts,
+        );
+        let ladder = LadderPlanAudit::new(&request.ladder);
+        let classify = |account| {
+            classify_live_admission(LiveAdmissionClassificationInput {
+                evaluated_at: now,
+                requested_mode: request.mode.requested,
+                effective_mode: request.mode.effective,
+                frozen_binding: &request.target.credential_binding,
+                current_binding: &request.current_credential_binding,
+                identity: &request.identity,
+                condition_id: &request.condition_id,
+                outcome_id: request.outcome_id,
+                token_id: &request.token_id,
+                admission: &admission,
+                ladder: &ladder,
+                economic: &economic,
+                account,
+            })
         };
+
+        if let Ok(LiveAdmissionVerdict::Refused(reason)) =
+            classify(LiveAdmissionAccountEvidence::NotRead)
+        {
+            if reason == LiveAdmissionRefusal::CredentialVersionChanged {
+                self.journal.append(
+                    request.target.account_id.clone(),
+                    now,
+                    LiveJournalPayload::CredentialBindingMismatch {
+                        frozen: request.target.credential_binding.clone(),
+                        current: request.current_credential_binding.clone(),
+                    },
+                )?;
+            }
+            return self.refuse(
+                &request,
+                now,
+                economic,
+                None,
+                Vec::new(),
+                Vec::new(),
+                reason,
+            );
+        }
 
         let account = match self
             .venue
@@ -432,6 +463,25 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         {
             Ok(account) => account,
             Err(error) => {
+                let verdict = classify(LiveAdmissionAccountEvidence::ReadFailure(error.kind))
+                    .unwrap_or(LiveAdmissionVerdict::Refused(
+                        LiveAdmissionRefusal::AccountStateUnavailable(
+                            LiveAccountReadFailure::Protocol,
+                        ),
+                    ));
+                let LiveAdmissionVerdict::Refused(reason) = verdict else {
+                    return self.refuse(
+                        &request,
+                        now,
+                        economic,
+                        None,
+                        error.evidence,
+                        error.request_descriptor_hashes,
+                        LiveAdmissionRefusal::AccountStateUnavailable(
+                            LiveAccountReadFailure::Protocol,
+                        ),
+                    );
+                };
                 return self.refuse(
                     &request,
                     now,
@@ -439,14 +489,17 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     None,
                     error.evidence,
                     error.request_descriptor_hashes,
-                    LiveAdmissionRefusal::AccountStateUnavailable(error.kind),
+                    reason,
                 );
             }
         };
         let account_audit = account.audit()?;
-
-        // Ordered checks 3 and 4: account state, then same-egress geoblock.
-        if account.closed_only {
+        let verdict = classify(LiveAdmissionAccountEvidence::State(&account_audit)).unwrap_or(
+            LiveAdmissionVerdict::Refused(LiveAdmissionRefusal::AccountStateUnavailable(
+                LiveAccountReadFailure::Protocol,
+            )),
+        );
+        if let LiveAdmissionVerdict::Refused(reason) = verdict {
             return self.refuse(
                 &request,
                 now,
@@ -454,64 +507,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 Some(account_audit),
                 Vec::new(),
                 Vec::new(),
-                LiveAdmissionRefusal::AccountClosedOnly,
-            );
-        }
-        if account.geoblocked {
-            return self.refuse(
-                &request,
-                now,
-                economic,
-                Some(account_audit),
-                Vec::new(),
-                Vec::new(),
-                LiveAdmissionRefusal::Geoblocked,
-            );
-        }
-
-        // Ordered check 5: balance and selected-spender allowance.
-        if account.collateral_balance < required {
-            return self.refuse(
-                &request,
-                now,
-                economic,
-                Some(account_audit),
-                Vec::new(),
-                Vec::new(),
-                LiveAdmissionRefusal::InsufficientBalance {
-                    required,
-                    available: account.collateral_balance,
-                },
-            );
-        }
-        if account.allowance < required {
-            return self.refuse(
-                &request,
-                now,
-                economic,
-                Some(account_audit),
-                Vec::new(),
-                Vec::new(),
-                LiveAdmissionRefusal::InsufficientAllowance {
-                    required,
-                    available: account.allowance,
-                },
-            );
-        }
-
-        // Ordered check 6: reconciled free collateral is a distinct bound.
-        if account.reconciled_free_collateral < required {
-            return self.refuse(
-                &request,
-                now,
-                economic,
-                Some(account_audit),
-                Vec::new(),
-                Vec::new(),
-                LiveAdmissionRefusal::WorstCaseDebitExceedsFreeCollateral {
-                    required,
-                    available: account.reconciled_free_collateral,
-                },
+                reason,
             );
         }
 
@@ -930,11 +926,94 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
     }
 }
 
+/// Re-execute the production admission gates in their runtime order without I/O.
+///
+/// Calling with [`LiveAdmissionAccountEvidence::NotRead`] evaluates every gate that must precede
+/// authenticated venue I/O. A successful pre-I/O pass returns
+/// [`LiveAdmissionNeedsAccountState`]; callers then supply the retained, independently verified
+/// account result to derive the final durable verdict.
+pub fn classify_live_admission(
+    input: LiveAdmissionClassificationInput<'_>,
+) -> Result<LiveAdmissionVerdict, LiveAdmissionNeedsAccountState> {
+    // The per-account kill is local and therefore precedes authenticated venue I/O.
+    if !matches!(input.requested_mode, LiveControlMode::LiveTiny)
+        || !matches!(input.effective_mode, LiveControlMode::LiveTiny)
+    {
+        return Ok(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::ModeNotArmed,
+        ));
+    }
+
+    // Ordered admission check 1: exact credential binding.
+    if input.frozen_binding != input.current_binding {
+        return Ok(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::CredentialVersionChanged,
+        ));
+    }
+
+    // Ordered admission check 2: both artifact halves and the frozen quote/ladder.
+    let required = match validate_artifact_and_ladder(&input) {
+        Ok(required) => required,
+        Err(reason) => return Ok(LiveAdmissionVerdict::Refused(reason)),
+    };
+
+    let account = match input.account {
+        LiveAdmissionAccountEvidence::NotRead => return Err(LiveAdmissionNeedsAccountState),
+        LiveAdmissionAccountEvidence::ReadFailure(kind) => {
+            return Ok(LiveAdmissionVerdict::Refused(
+                LiveAdmissionRefusal::AccountStateUnavailable(kind),
+            ));
+        }
+        LiveAdmissionAccountEvidence::State(account) => account,
+    };
+
+    // Ordered checks 3 and 4: account state, then same-egress geoblock.
+    if account.closed_only {
+        return Ok(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountClosedOnly,
+        ));
+    }
+    if account.geoblocked {
+        return Ok(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::Geoblocked,
+        ));
+    }
+
+    // Ordered check 5: balance and selected-spender allowance.
+    if account.collateral_balance < required {
+        return Ok(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::InsufficientBalance {
+                required,
+                available: account.collateral_balance,
+            },
+        ));
+    }
+    if account.allowance < required {
+        return Ok(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::InsufficientAllowance {
+                required,
+                available: account.allowance,
+            },
+        ));
+    }
+
+    // Ordered check 6: reconciled free collateral is a distinct bound.
+    if account.reconciled_free_collateral < required {
+        return Ok(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::WorstCaseDebitExceedsFreeCollateral {
+                required,
+                available: account.reconciled_free_collateral,
+            },
+        ));
+    }
+
+    Ok(LiveAdmissionVerdict::Approved)
+}
+
 fn validate_artifact_and_ladder(
-    request: &LiveOrderRequest,
-    now: OffsetDateTime,
+    input: &LiveAdmissionClassificationInput<'_>,
 ) -> Result<CollateralAmount, LiveAdmissionRefusal> {
-    let market = &request.admission.market;
+    let market = &input.admission.market;
     if market.schema_version != LIVE_MARKET_SCHEMA_VERSION
         || market.parser_version != LIVE_MARKET_PARSER_VERSION
         || market.minimum_tick_size == Price::ZERO
@@ -942,18 +1021,29 @@ fn validate_artifact_and_ladder(
     {
         return Err(LiveAdmissionRefusal::MarketEvidenceInvalid);
     }
-    market
-        .validate_fresh(now.unix_timestamp())
-        .map_err(|error| match error {
-            LiveMarketError::Stale | LiveMarketError::FutureObservation => {
-                LiveAdmissionRefusal::MarketEvidenceStale
-            }
-            _ => LiveAdmissionRefusal::MarketEvidenceInvalid,
-        })?;
-    request
+    LiveMarketEvidence {
+        condition_id: market.condition_id.clone(),
+        ordered_outcome_token_ids: market.ordered_outcome_token_ids.clone(),
+        neg_risk: market.neg_risk,
+        minimum_tick_size: market.minimum_tick_size,
+        minimum_order_size: market.minimum_order_size,
+        scheduled_end_unix: input.admission.scheduled_end_unix,
+        observed_at_unix: market.observed_at_unix,
+        schema_version: market.schema_version,
+        parser_version: market.parser_version,
+        freshness_window_secs: market.freshness_window_secs,
+    }
+    .validate_fresh(input.evaluated_at.unix_timestamp())
+    .map_err(|error| match error {
+        LiveMarketError::Stale | LiveMarketError::FutureObservation => {
+            LiveAdmissionRefusal::MarketEvidenceStale
+        }
+        _ => LiveAdmissionRefusal::MarketEvidenceInvalid,
+    })?;
+    input
         .admission
         .settlement
-        .validate_fresh_for_entry(now)
+        .validate_fresh_for_entry(input.evaluated_at)
         .map_err(|error| match error {
             VenueSettlementError::Stale | VenueSettlementError::Schema(_) => {
                 LiveAdmissionRefusal::SettlementEvidenceStale
@@ -962,50 +1052,54 @@ fn validate_artifact_and_ladder(
             VenueSettlementError::Ambiguous => LiveAdmissionRefusal::SettlementAmbiguous,
         })?;
 
-    let outcome_index = usize::from(request.outcome_id.0);
-    if request.identity.dispatch_id.trim().is_empty()
-        || request.identity.idempotency_key.trim().is_empty()
-        || request.identity.quote_id.trim().is_empty()
-        || request.identity.config_hash.trim().is_empty()
-        || request.identity.decision_hash.trim().is_empty()
-        || request.identity.evidence_hashes.is_empty()
-        || request.identity.schema_version == 0
-        || request.identity.parser_version == 0
-        || request.economic.market.condition_id != request.condition_id
-        || u16::from(request.economic.market.outcome_index) != request.outcome_id.0
-        || request.economic.market.token_id != request.token_id
-        || request.economic.market.side != pe_core_types::Side::Buy
-        || market.condition_id != request.condition_id
-        || request.admission.settlement.condition_id != request.condition_id
+    let outcome_index = usize::from(input.outcome_id.0);
+    if input.identity.dispatch_id.trim().is_empty()
+        || input.identity.idempotency_key.trim().is_empty()
+        || input.identity.quote_id.trim().is_empty()
+        || input.identity.config_hash.trim().is_empty()
+        || input.identity.decision_hash.trim().is_empty()
+        || input.identity.evidence_hashes.is_empty()
+        || input.identity.schema_version == 0
+        || input.identity.parser_version == 0
+        || input.admission != &input.economic.admission
+        || input.economic.market.condition_id != *input.condition_id
+        || u16::from(input.economic.market.outcome_index) != input.outcome_id.0
+        || input.economic.market.token_id != *input.token_id
+        || input.economic.market.side != pe_core_types::Side::Buy
+        || market.condition_id != *input.condition_id
+        || input.admission.settlement.condition_id != *input.condition_id
         || market
             .ordered_outcome_token_ids
             .get(outcome_index)
-            .is_none_or(|token| token != &request.token_id)
+            .is_none_or(|token| token != input.token_id)
     {
         return Err(LiveAdmissionRefusal::ArtifactIdentityMismatch);
     }
     validate_ladder(
-        &request.ladder,
+        input.ladder,
         market.minimum_tick_size,
         market.minimum_order_size,
     )?;
-    let required = request
+    if input.ladder != &input.economic.ladder {
+        return Err(LiveAdmissionRefusal::ArtifactIdentityMismatch);
+    }
+    let required = input
         .economic
         .worst_case_all_in_debit()
         .map_err(|_| LiveAdmissionRefusal::LadderInvalid)?;
-    if request.economic.balance.worst_case_debit != required {
+    if input.economic.balance.worst_case_debit != required {
         return Err(LiveAdmissionRefusal::LadderInvalid);
     }
     Ok(required)
 }
 
 fn validate_ladder(
-    plan: &LadderPlan,
+    plan: &LadderPlanAudit,
     minimum_tick_size: Price,
     minimum_order_size: ShareAmount,
 ) -> Result<(), LiveAdmissionRefusal> {
     if plan.used_asks.is_empty()
-        || plan.shares < minimum_order_size
+        || plan.minimum_shares < minimum_order_size
         || plan.best_ask == Price::ZERO
         || plan.limit_price == Price::ZERO
         || plan.best_ask > plan.limit_price
@@ -1035,8 +1129,8 @@ fn validate_ladder(
         spend.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToNegativeInfinity),
     )
     .map_err(|_| LiveAdmissionRefusal::LadderInvalid)?;
-    if shares < plan.shares
-        || expected_spend > plan.worst_case_debit
+    if shares < plan.minimum_shares
+        || expected_spend > plan.principal
         || plan.best_ask != plan.used_asks[0].price
         || plan.limit_price != plan.used_asks[plan.used_asks.len() - 1].price
     {
@@ -1745,7 +1839,7 @@ mod tests {
         };
         assert!(
             validate_ladder(
-                &plan,
+                &LadderPlanAudit::new(&plan),
                 Price::new(dec!(0.01)).unwrap(),
                 ShareAmount::from_whole(1).unwrap(),
             )
