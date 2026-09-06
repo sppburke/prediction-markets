@@ -66,9 +66,36 @@ sha256_file() {
 # Keep the credential-bearing libpq URL out of argv and /proc/<pid>/cmdline. PGDATABASE accepts
 # either a database name or a PostgreSQL connection URI, so the existing SUPABASE_DB_URL contract
 # remains unchanged while every caller supplies only non-secret psql options on the command line.
+# libpq does not expand a connection URL placed in PGDATABASE (verified against PostgreSQL 16:
+# it dials the local socket instead). Split the URL into the libpq environment variables so
+# the credentials never appear in a process argument list and the connection still works.
+pg_url_env() {
+  python3 -c '
+import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+if p.scheme not in ("postgres", "postgresql"):
+    raise SystemExit("database URL must use the postgres scheme")
+q = dict(u.parse_qsl(p.query))
+pairs = [("PGHOST", p.hostname or ""), ("PGPORT", str(p.port) if p.port else ""),
+         ("PGUSER", u.unquote(p.username or "")), ("PGPASSWORD", u.unquote(p.password or "")),
+         ("PGDATABASE", u.unquote(p.path.lstrip("/")) or "postgres"), ("PGSSLMODE", q.get("sslmode", ""))]
+for key, value in pairs:
+    if value:
+        print(f"{key}={value}")
+' "$1"
+}
+
+psql_url() {
+  local url=$1; shift
+  local -a pgenv=()
+  mapfile -t pgenv < <(pg_url_env "$url")
+  (( ${#pgenv[@]} > 0 )) || die "database URL yielded no connection parameters"
+  env "${pgenv[@]}" psql "$@"
+}
+
 psql_service_db() {
   : "${SUPABASE_DB_URL:?SUPABASE_DB_URL is required}"
-  PGDATABASE="$SUPABASE_DB_URL" psql "$@"
+  psql_url "$SUPABASE_DB_URL" "$@"
 }
 
 manifest_get() {

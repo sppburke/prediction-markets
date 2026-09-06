@@ -2,6 +2,8 @@
 # Read-only preview or deliberate manual execution of the activation-stamped Supabase reset.
 
 set -euo pipefail
+# shellcheck source=../deploy/generation_common.sh
+source "$(cd "$(dirname "$0")/../deploy" && pwd)/generation_common.sh"
 cd "$(dirname "$0")/../.."
 
 usage() {
@@ -34,7 +36,7 @@ fi
 command -v psql >/dev/null || { echo "FATAL: psql not installed" >&2; exit 1; }
 
 echo "live paper-state rows before activation $activation_id:"
-PGDATABASE="$SUPABASE_DB_URL" psql -v ON_ERROR_STOP=1 -At <<'SQL'
+psql_service_db -v ON_ERROR_STOP=1 -At <<'SQL'
 select 'paper_fills=' || count(*) from paper_fills
 union all select 'settled_markets=' || count(*) from settled_markets
 union all select 'paper_positions=' || count(*) from paper_positions
@@ -56,12 +58,12 @@ fi
 read -r -p "Type the activation id '$activation_id' to archive and reset Supabase: " confirm
 [[ "$confirm" == "$activation_id" ]] || { echo "aborted (no mutation)"; exit 1; }
 
-PGDATABASE="$SUPABASE_DB_URL" psql -v ON_ERROR_STOP=1 \
+psql_service_db -v ON_ERROR_STOP=1 \
   -v activation_id="$activation_id" -v bankroll="$bankroll" \
   -f scripts/paper_reset/archive_paper_state.sql
 
 echo "post-reset paper-state rows:"
-PGDATABASE="$SUPABASE_DB_URL" psql -v ON_ERROR_STOP=1 -At -v activation_id="$activation_id" <<'SQL'
+psql_service_db -v ON_ERROR_STOP=1 -At -v activation_id="$activation_id" <<'SQL'
 select 'paper_fills=' || count(*) from paper_fills
 union all select 'settled_markets=' || count(*) from settled_markets
 union all select 'paper_positions=' || count(*) from paper_positions
