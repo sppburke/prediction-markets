@@ -3,6 +3,27 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// Canonical, secret-free identity of one account-scoped HTTP request.
+///
+/// The ordered query is retained exactly as sent. `partition` names the logical page family
+/// (for example `redeemable=false`), while `offset` is kept separately so an empty page still
+/// proves which slice of which custody account was requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedHttpRequestDescriptor {
+    pub account_id: String,
+    pub credential_fingerprint: String,
+    pub custody_wallet: String,
+    pub method: String,
+    pub path: String,
+    pub partition: String,
+    pub offset: u64,
+    pub ordered_query: Vec<(String, String)>,
+}
+
+/// Reserved sanitized response-header name carrying the canonical request-descriptor hash.
+pub const REQUEST_DESCRIPTOR_HASH_HEADER: &str = "x-pe-request-descriptor-blake3";
+
 /// Normalized transport failure classes shared by source, venue, and execution boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]

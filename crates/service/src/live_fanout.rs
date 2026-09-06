@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use age::x25519::Identity;
 use pe_copy_signal_engine::LeaderSignal;
+use pe_core_types::http_evidence::SanitizedHttpRequestDescriptor;
 use pe_core_types::{
     AccountId, CollateralAmount, KellyFraction, MarketId, MarketOutcomeId, OutcomeId,
     PolymarketConditionId, Price, Probability, RawHttpAttempt, ReceivedAt, ShareAmount, Side,
@@ -18,6 +19,7 @@ use pe_core_types::{
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
 use pe_execution_core::live_journal::{
     LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
+    verify_http_response_request, verify_polygon_reconciliation,
 };
 use pe_execution_core::{
     CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
@@ -51,7 +53,7 @@ use pe_venue_polymarket::{
     plan_sized_buy, sign_deposit_wallet_redemption,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
@@ -92,6 +94,7 @@ const REDEMPTION_RETRY_SECS: i64 = 30;
 /// Ordinary redemption inventory/status reconcile cadence (Decision 12).
 const REDEMPTION_RECONCILE_CADENCE_SECS: i64 = 300;
 const COMPLETE_POSITIONS_SOURCE_ID: &str = "polymarket.data.complete-positions";
+const COMPLETE_POSITIONS_SCHEMA_VERSION: u32 = 2;
 // verified 2026-08-11 from the official four-minute Deposit Wallet batch example:
 // https://github.com/Polymarket/builder-relayer-client#execute-deposit-wallet-batch
 const DEPOSIT_WALLET_REDEMPTION_DEADLINE_SECS: u64 = 4 * 60;
@@ -2044,6 +2047,9 @@ pub(crate) fn derive_projection_rows_with_sources(
         pe_execution_core::RedemptionCustodyReconciledAudit,
     >::new();
     let mut polygon_finality = BTreeMap::<String, PolygonFinalityAuditState>::new();
+    let mut terminal_reconciliations = BTreeMap::<String, Box<LiveOrderReconciliationAudit>>::new();
+    let mut matched_transaction_hashes = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut current_account_binding = None::<LiveAccountBindingAudit>;
 
     for (event_index, event) in events.iter().enumerate() {
         if event.account_id != *account_id {
@@ -2056,10 +2062,11 @@ pub(crate) fn derive_projection_rows_with_sources(
                 return Err(ProjectionReducerError::DuplicateBaseline);
             }
             verify_account_binding(&mark.account_binding, account_id)?;
-            verify_account_state(&mark.account_state)?;
+            verify_account_state(&mark.account_state, &mark.account_binding)?;
             let raw_positions = replay_position_evidence(
                 &mark.venue_position_evidence,
                 source_envelopes,
+                &mark.account_binding,
                 events[..event_index]
                     .iter()
                     .filter_map(|prior| match &prior.payload {
@@ -2085,6 +2092,7 @@ pub(crate) fn derive_projection_rows_with_sources(
             baseline_equity = Some(mark.equity);
             baseline_cutoff_unix = Some(mark.cutoff_unix);
             economic_cash = Some(mark.equity.to_decimal());
+            current_account_binding = Some(mark.account_binding.clone());
             latest_free_collateral = Some(mark.account_state.collateral_balance.to_decimal());
             latest_reconciled_at = format_observed_at(mark.account_state.observed_at);
             continue;
@@ -2124,11 +2132,19 @@ pub(crate) fn derive_projection_rows_with_sources(
                 }
             }
             LiveJournalPayload::OrderReconciled(reconciled) => {
-                let Some((prepared_seq, prepared, terminal)) =
-                    prepared_orders.get_mut(&reconciled.identity.idempotency_key)
-                else {
+                let key = reconciled.identity.idempotency_key.clone();
+                let Some((prepared_seq, prepared, terminal)) = prepared_orders.get_mut(&key) else {
                     return Err(ProjectionReducerError::MissingPrepared);
                 };
+                if *terminal {
+                    if terminal_reconciliations
+                        .get(&key)
+                        .is_some_and(|prior| prior.as_ref() == reconciled.as_ref())
+                    {
+                        continue;
+                    }
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
                 if !prepared_order_fact_matches(
                     *prepared_seq,
                     &prepared.identity,
@@ -2137,15 +2153,24 @@ pub(crate) fn derive_projection_rows_with_sources(
                 ) {
                     return Err(ProjectionReducerError::IdentityConflict);
                 }
+                if let LiveJournalOrderOutcome::Matched {
+                    transaction_hashes, ..
+                } = &reconciled.outcome
+                {
+                    matched_transaction_hashes
+                        .entry(key.clone())
+                        .or_default()
+                        .extend(transaction_hashes.iter().cloned());
+                }
                 if reconciled.source == LiveReconciliationSource::PolygonFinality {
-                    let evidence_hashes = http_attempt_hashes(&reconciled.evidence)
-                        .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?;
-                    if evidence_hashes != reconciled.evidence_hashes {
-                        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                    }
-                    let state = polygon_finality
-                        .entry(reconciled.identity.idempotency_key.clone())
-                        .or_default();
+                    let transaction_hashes = matched_transaction_hashes
+                        .get(&key)
+                        .map(|hashes| hashes.iter().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let immutable =
+                        verify_polygon_reconciliation(prepared, &transaction_hashes, reconciled)
+                            .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?;
+                    let state = polygon_finality.entry(key.clone()).or_default();
                     match &reconciled.outcome {
                         LiveJournalOrderOutcome::FinalityPending { .. } => {
                             if matches!(
@@ -2155,10 +2180,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                                 return Err(ProjectionReducerError::FinalityObservationConflict);
                             }
                             state.phase = PolygonFinalityPhase::Pending;
-                            merge_immutable_receipts(
-                                &mut state.immutable_receipts,
-                                immutable_polygon_receipts(&reconciled.evidence)?,
-                            )?;
+                            merge_immutable_receipts(&mut state.immutable_receipts, immutable)?;
                         }
                         LiveJournalOrderOutcome::FinalityConflict { .. } => {
                             if matches!(
@@ -2179,6 +2201,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                 ) {
                     reservations.remove(&reconciled.identity.idempotency_key);
                     *terminal = true;
+                    terminal_reconciliations.insert(key, reconciled.clone());
                 }
             }
             LiveJournalPayload::OrderFillFinalized(finalized) => {
@@ -2347,11 +2370,15 @@ pub(crate) fn derive_projection_rows_with_sources(
                 if !resolutions.contains_key(&condition) {
                     return Err(ProjectionReducerError::IdentityConflict);
                 }
-                verify_account_state(&custody.account_state)?;
+                let binding = current_account_binding
+                    .as_ref()
+                    .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
+                verify_account_state(&custody.account_state, binding)?;
                 let raw_positions = replay_position_receipts_legacy(
                     &custody.venue_position_receipts,
                     source_envelopes,
                     &custody.identity.custody_wallet,
+                    binding,
                     prepared_orders
                         .values()
                         .map(|(_, prepared, _)| prepared.as_ref()),
@@ -2394,7 +2421,10 @@ pub(crate) fn derive_projection_rows_with_sources(
                     return Err(ProjectionReducerError::InvalidDailyMark);
                 }
                 verify_account_binding(&mark.account_binding, account_id)?;
-                verify_account_state(&mark.account_state)?;
+                if current_account_binding.as_ref() != Some(&mark.account_binding) {
+                    return Err(ProjectionReducerError::InvalidAccountEvidence);
+                }
+                verify_account_state(&mark.account_state, &mark.account_binding)?;
                 if mark.venue_position_evidence.requested_wallet
                     != mark.account_binding.custody_wallet
                 {
@@ -2403,6 +2433,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                 let raw_positions = replay_position_evidence(
                     &mark.venue_position_evidence,
                     source_envelopes,
+                    &mark.account_binding,
                     events[..event_index]
                         .iter()
                         .filter_map(|prior| match &prior.payload {
@@ -2415,6 +2446,20 @@ pub(crate) fn derive_projection_rows_with_sources(
                 {
                     return Err(ProjectionReducerError::CustodyInventoryMismatch);
                 }
+                let current_expected = derive_custody_positions(
+                    &prepared_orders,
+                    &fills,
+                    &resolutions,
+                    &receivable_by_condition,
+                )?;
+                if canonical_positions(&mark.venue_positions)? != current_expected {
+                    return Err(ProjectionReducerError::CustodyInventoryMismatch);
+                }
+                require_cash_reconciliation(
+                    mark.account_state.collateral_balance,
+                    economic_cash.ok_or(ProjectionReducerError::InvalidBaseline)?,
+                    sum_receivable(&receivable_by_condition)?,
+                )?;
                 let bounded_events = events[..event_index]
                     .iter()
                     .filter(|prior| prior.timestamp.unix_timestamp() < mark.cutoff_unix)
@@ -2603,7 +2648,25 @@ fn same_finalized_fill(left: &OrderFillFinalizedAudit, right: &OrderFillFinalize
 
 fn verify_account_state(
     account: &pe_execution_core::LiveAccountStateAudit,
+    binding: &LiveAccountBindingAudit,
 ) -> Result<(), ProjectionReducerError> {
+    if !binding.is_valid_for(&binding.account_id) {
+        return Err(ProjectionReducerError::InvalidAccountEvidence);
+    }
+    for attempt in &account.evidence {
+        let RawHttpAttempt::Response(response) = attempt else {
+            continue;
+        };
+        let descriptor = binding.request_descriptor(
+            response.method.clone(),
+            response.path.clone(),
+            response.endpoint_kind.clone(),
+            0,
+            response.ordered_query.clone(),
+        );
+        verify_http_response_request(response, &descriptor)
+            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+    }
     let evidence_hashes = http_attempt_hashes(&account.evidence)
         .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     if evidence_hashes != account.evidence_hashes {
@@ -2636,6 +2699,13 @@ struct RetainedPositionPage {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedPositionResponse {
+    request: SanitizedHttpRequestDescriptor,
+    body: Vec<u8>,
+}
+
 struct RetainedPositionFetcher {
     pages: Mutex<VecDeque<RetainedPositionPage>>,
 }
@@ -2665,7 +2735,12 @@ impl ReconciliationFetcher for RetainedPositionFetcher {
 }
 
 fn position_request_identity(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url).ok()?;
+    let parsed = reqwest::Url::parse(url).ok().or_else(|| {
+        reqwest::Url::parse("https://offline.invalid")
+            .ok()?
+            .join(url)
+            .ok()
+    })?;
     let mut identity = parsed.path().to_owned();
     if let Some(query) = parsed.query() {
         identity.push('?');
@@ -2674,9 +2749,73 @@ fn position_request_identity(url: &str) -> Option<String> {
     Some(identity)
 }
 
+fn position_request_descriptor(
+    binding: &LiveAccountBindingAudit,
+    url: &str,
+) -> Option<SanitizedHttpRequestDescriptor> {
+    let parsed = reqwest::Url::parse(url).ok().or_else(|| {
+        reqwest::Url::parse("https://offline.invalid")
+            .ok()?
+            .join(url)
+            .ok()
+    })?;
+    let ordered_query = parsed
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let exactly_one = |name: &str| {
+        let mut values = ordered_query
+            .iter()
+            .filter(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.as_str());
+        let value = values.next()?;
+        values.next().is_none().then_some(value)
+    };
+    let redeemable = exactly_one("redeemable")?;
+    if !matches!(redeemable, "true" | "false") {
+        return None;
+    }
+    let offset = exactly_one("offset")?.parse::<u64>().ok()?;
+    Some(binding.request_descriptor(
+        "GET",
+        parsed.path(),
+        format!("redeemable={redeemable}"),
+        offset,
+        ordered_query,
+    ))
+}
+
+fn position_descriptor_identity(descriptor: &SanitizedHttpRequestDescriptor) -> Option<String> {
+    let mut url = reqwest::Url::parse("https://offline.invalid").ok()?;
+    url.set_path(&descriptor.path);
+    {
+        let mut query = url.query_pairs_mut();
+        for (name, value) in &descriptor.ordered_query {
+            query.append_pair(name, value);
+        }
+    }
+    position_request_identity(url.as_str())
+}
+
+fn retained_position_response(
+    receipt: &AppendReceipt,
+    source_envelopes: &[EventEnvelope],
+) -> Result<RetainedPositionResponse, ProjectionReducerError> {
+    let payload = retained_source_payload(
+        receipt,
+        source_envelopes,
+        COMPLETE_POSITIONS_SOURCE_ID,
+        COMPLETE_POSITIONS_SCHEMA_VERSION,
+        1,
+        RetainedSourceKind::Position,
+    )?;
+    serde_json::from_slice(payload).map_err(|_| ProjectionReducerError::InvalidPositionEvidence)
+}
+
 fn replay_position_evidence<'a>(
     evidence: &LivePositionEvidenceAudit,
     source_envelopes: &[EventEnvelope],
+    binding: &LiveAccountBindingAudit,
     prepared_orders: impl Iterator<Item = &'a pe_execution_core::LiveOrderPreparedAudit>,
 ) -> Result<Vec<CanonicalPositionAudit>, ProjectionReducerError> {
     if evidence.pages.is_empty()
@@ -2691,18 +2830,17 @@ fn replay_position_evidence<'a>(
         .pages
         .iter()
         .map(|page| {
-            let body = retained_source_payload(
-                &page.receipt,
-                source_envelopes,
-                COMPLETE_POSITIONS_SOURCE_ID,
-                1,
-                1,
-                RetainedSourceKind::Position,
-            )
-            .map(<[u8]>::to_vec)?;
+            let retained = retained_position_response(&page.receipt, source_envelopes)?;
+            let expected = position_request_descriptor(binding, &page.request_identity)
+                .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
+            if retained.request != expected
+                || retained.request.custody_wallet != evidence.requested_wallet
+            {
+                return Err(ProjectionReducerError::InvalidPositionEvidence);
+            }
             Ok(RetainedPositionPage {
                 request_identity: page.request_identity.clone(),
-                body,
+                body: retained.body,
             })
         })
         .collect::<Result<VecDeque<_>, ProjectionReducerError>>()?;
@@ -2771,31 +2909,11 @@ fn replay_position_evidence<'a>(
         .collect()
 }
 
-struct LegacyRetainedPositionFetcher {
-    pages: Mutex<VecDeque<Vec<u8>>>,
-}
-
-impl ReconciliationFetcher for LegacyRetainedPositionFetcher {
-    fn fetch<'a>(
-        &'a self,
-        _url: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.pages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front()
-                .ok_or_else(|| SourceError::Fatal {
-                    message: "retained complete-position receipt is missing".to_owned(),
-                })
-        })
-    }
-}
-
 fn replay_position_receipts_legacy<'a>(
     receipts: &[AppendReceipt],
     source_envelopes: &[EventEnvelope],
     requested_wallet: &str,
+    binding: &LiveAccountBindingAudit,
     prepared_orders: impl Iterator<Item = &'a pe_execution_core::LiveOrderPreparedAudit>,
 ) -> Result<Vec<CanonicalPositionAudit>, ProjectionReducerError> {
     if receipts.is_empty()
@@ -2808,15 +2926,18 @@ fn replay_position_receipts_legacy<'a>(
     let pages = receipts
         .iter()
         .map(|receipt| {
-            retained_source_payload(
-                receipt,
-                source_envelopes,
-                COMPLETE_POSITIONS_SOURCE_ID,
-                1,
-                1,
-                RetainedSourceKind::Position,
-            )
-            .map(<[u8]>::to_vec)
+            let retained = retained_position_response(receipt, source_envelopes)?;
+            let request_identity = position_descriptor_identity(&retained.request)
+                .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
+            let expected = position_request_descriptor(binding, &request_identity)
+                .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
+            if retained.request != expected || retained.request.custody_wallet != requested_wallet {
+                return Err(ProjectionReducerError::InvalidPositionEvidence);
+            }
+            Ok(RetainedPositionPage {
+                request_identity,
+                body: retained.body,
+            })
         })
         .collect::<Result<VecDeque<_>, _>>()?;
     let requested_wallet = WalletAddress::from_hex(requested_wallet)
@@ -2843,7 +2964,7 @@ fn replay_position_receipts_legacy<'a>(
                 .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
         }
     }
-    let fetcher = LegacyRetainedPositionFetcher {
+    let fetcher = RetainedPositionFetcher {
         pages: Mutex::new(pages),
     };
     let complete = futures::executor::block_on(fetch_complete_positions(
@@ -2988,108 +3109,6 @@ fn merge_immutable_receipts(
         }
     }
     Ok(())
-}
-
-fn immutable_polygon_receipts(
-    evidence: &[RawHttpAttempt],
-) -> Result<BTreeMap<String, MatchedReceipt>, ProjectionReducerError> {
-    let mut receipts = BTreeMap::new();
-    let mut chain = None;
-    let mut head = None;
-    let mut canonical_blocks = BTreeMap::new();
-    for attempt in evidence {
-        let RawHttpAttempt::Response(response) = attempt else {
-            continue;
-        };
-        if !(200..300).contains(&response.status) {
-            continue;
-        }
-        let response = strict_polygon_response(attempt)?;
-        match response.endpoint_kind.as_str() {
-            "polygon-chain-id" => {
-                require_rpc_request(response, "eth_chainId", &serde_json::json!([]))?;
-                if let Ok(chain_id) = parse_chain_id_response(&response.body)
-                    && chain.replace(chain_id).is_some()
-                {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            "polygon-transaction-receipt" => {
-                let params = rpc_params(response)?;
-                let hash = params
-                    .as_array()
-                    .filter(|items| items.len() == 1)
-                    .and_then(|items| items.first())
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or(ProjectionReducerError::InvalidFinalityEvidence)?;
-                require_rpc_request(
-                    response,
-                    "eth_getTransactionReceipt",
-                    &serde_json::json!([hash]),
-                )?;
-                if let Ok(Some(receipt)) = parse_receipt_response(&response.body, hash)
-                    && receipts.insert(hash.to_owned(), receipt).is_some()
-                {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            "polygon-finalized-block" => {
-                require_rpc_request(
-                    response,
-                    "eth_getBlockByNumber",
-                    &serde_json::json!(["finalized", false]),
-                )?;
-                if let Ok(block) = parse_finalized_block_response(&response.body)
-                    && head.replace(block).is_some()
-                {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            "polygon-canonical-block" => {
-                let params = rpc_params(response)?;
-                let number = params
-                    .as_array()
-                    .filter(|items| {
-                        items.len() == 2 && items.get(1) == Some(&serde_json::Value::Bool(false))
-                    })
-                    .and_then(|items| items.first())
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|raw| raw.strip_prefix("0x"))
-                    .and_then(|raw| u64::from_str_radix(raw, 16).ok())
-                    .ok_or(ProjectionReducerError::InvalidFinalityEvidence)?;
-                require_rpc_request(
-                    response,
-                    "eth_getBlockByNumber",
-                    &serde_json::json!([format!("0x{number:x}"), false]),
-                )?;
-                if canonical_blocks.insert(number, response).is_some() {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            _ => return Err(ProjectionReducerError::InvalidFinalityEvidence),
-        }
-    }
-    let Some(head) = head else {
-        return Ok(BTreeMap::new());
-    };
-    if chain != Some(pe_venue_polymarket::FINALIZED_CHAIN_ID) {
-        return Ok(BTreeMap::new());
-    }
-    receipts.retain(|_, receipt| {
-        if receipt.block_number > head.number {
-            return false;
-        }
-        if receipt.block_number == head.number {
-            return receipt.block_hash == head.hash;
-        }
-        canonical_blocks
-            .get(&receipt.block_number)
-            .is_some_and(|response| {
-                canonical_block_matches(&response.body, receipt.block_number, &receipt.block_hash)
-                    .is_ok()
-            })
-    });
-    Ok(receipts)
 }
 
 fn verify_finalized_evidence(
@@ -4583,10 +4602,12 @@ async fn ensure_live_portfolio_marks(
         Ok(events) => events,
         Err(_) => return CheckOutcome::Transient("live journal unavailable"),
     };
-    let inventory = match fetch_complete_venue_inventory(state, custody_wallet, &events).await {
-        Ok(inventory) => inventory,
-        Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
-    };
+    let inventory =
+        match fetch_complete_venue_inventory(state, custody_wallet, account_binding, &events).await
+        {
+            Ok(inventory) => inventory,
+            Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
+        };
     let expected_credential = account
         .credential_binding
         .as_ref()
@@ -5164,17 +5185,23 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         };
-        let inventory =
-            match fetch_complete_venue_inventory(state, &venue.deposit_wallet(), &events).await {
-                Ok(inventory) => inventory,
-                Err(reason) => {
-                    state.closures.redemption.insert(
-                        account.account_id.as_str().to_owned(),
-                        format!("redemption inventory unavailable: {reason}"),
-                    );
-                    continue;
-                }
-            };
+        let inventory = match fetch_complete_venue_inventory(
+            state,
+            &venue.deposit_wallet(),
+            venue.account_binding(),
+            &events,
+        )
+        .await
+        {
+            Ok(inventory) => inventory,
+            Err(reason) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption inventory unavailable: {reason}"),
+                );
+                continue;
+            }
+        };
         let positions = inventory.redeemable.clone();
         match append_ready_redemption_custody(
             state,
@@ -5606,6 +5633,7 @@ struct RecordedPositionPage {
 struct LivePositionFetcher {
     http: reqwest::Client,
     source_log: SourceLogHandle,
+    account_binding: LiveAccountBindingAudit,
     pages: Mutex<Vec<RecordedPositionPage>>,
 }
 
@@ -5615,6 +5643,12 @@ impl ReconciliationFetcher for LivePositionFetcher {
         url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async move {
+            let request =
+                position_request_descriptor(&self.account_binding, url).ok_or_else(|| {
+                    SourceError::Fatal {
+                        message: "complete-position request descriptor is invalid".to_owned(),
+                    }
+                })?;
             let observed_at = OffsetDateTime::now_utc();
             let response =
                 self.http
@@ -5633,16 +5667,23 @@ impl ReconciliationFetcher for LivePositionFetcher {
                 })?
                 .to_vec();
             let received_at = OffsetDateTime::now_utc();
+            let payload = serde_json::to_vec(&RetainedPositionResponse {
+                request,
+                body: body.clone(),
+            })
+            .map_err(|error| SourceError::Fatal {
+                message: error.to_string(),
+            })?;
             let receipt = self
                 .source_log
                 .append(EnvelopeIn {
                     source_id: SourceId(COMPLETE_POSITIONS_SOURCE_ID.to_owned()),
-                    schema_version: 1,
+                    schema_version: COMPLETE_POSITIONS_SCHEMA_VERSION,
                     parser_version: 1,
                     observed_at: SourceTimestamp(observed_at),
                     received_at: ReceivedAt(received_at),
                     content_type: ContentType::Json,
-                    payload: body.clone(),
+                    payload,
                 })
                 .await
                 .map_err(|error| SourceError::Fatal {
@@ -5681,10 +5722,14 @@ struct CompleteVenueInventory {
 async fn fetch_complete_venue_inventory(
     state: &FanoutState,
     wallet: &str,
+    account_binding: &LiveAccountBindingAudit,
     events: &[LiveJournalEvent],
 ) -> Result<CompleteVenueInventory, &'static str> {
     let wallet = WalletAddress::from_hex(wallet).map_err(|_| "invalid custody wallet")?;
     let requested_wallet = wallet.to_string();
+    if requested_wallet != account_binding.custody_wallet {
+        return Err("custody wallet does not match account request binding");
+    }
     let mut mapping = ActivityAssetMapping::from_rows(&[]);
     for event in events {
         if let LiveJournalPayload::OrderPrepared(prepared) = &event.payload {
@@ -5709,6 +5754,7 @@ async fn fetch_complete_venue_inventory(
     let fetcher = LivePositionFetcher {
         http: state.config.http.clone(),
         source_log: state.config.source_log.clone(),
+        account_binding: account_binding.clone(),
         pages: Mutex::new(Vec::new()),
     };
     let complete =
@@ -6601,13 +6647,24 @@ mod tests {
         cash: CollateralAmount,
         observed_at: OffsetDateTime,
     ) -> pe_execution_core::LiveAccountStateAudit {
+        let account_id = AccountId::new("account").unwrap();
+        let binding =
+            account_binding_fixture(&account_id, "0x1111111111111111111111111111111111111111");
+        account_state_fixture_for_binding(cash, observed_at, &binding)
+    }
+
+    fn account_state_fixture_for_binding(
+        cash: CollateralAmount,
+        observed_at: OffsetDateTime,
+        binding: &LiveAccountBindingAudit,
+    ) -> pe_execution_core::LiveAccountStateAudit {
         let spender = pe_venue_polymarket::CanaryV2Client::standard_spender().unwrap();
         let negrisk_spender = pe_venue_polymarket::CanaryV2Client::negrisk_spender().unwrap();
         let response = |endpoint_kind: &str,
                         path: &str,
                         ordered_query: Vec<(String, String)>,
                         body: Vec<u8>| {
-            RawHttpAttempt::Response(pe_core_types::RawHttpResponse {
+            let mut response = pe_core_types::RawHttpResponse {
                 source_id: "polymarket-clob-v2".to_owned(),
                 endpoint_kind: endpoint_kind.to_owned(),
                 method: "GET".to_owned(),
@@ -6623,7 +6680,20 @@ mod tests {
                 schema_version: 1,
                 parser_version: 1,
                 adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
-            })
+            };
+            let descriptor = binding.request_descriptor(
+                response.method.clone(),
+                response.path.clone(),
+                response.endpoint_kind.clone(),
+                0,
+                response.ordered_query.clone(),
+            );
+            pe_execution_core::live_journal::bind_http_response_to_request(
+                &mut response,
+                &descriptor,
+            )
+            .unwrap();
+            RawHttpAttempt::Response(response)
         };
         let evidence = vec![
             response(
@@ -6750,7 +6820,12 @@ mod tests {
                     let state = classified.unwrap();
                     assert_eq!(state.allowance, expected_allowance);
                     let audit = state.audit().unwrap();
-                    verify_account_state(&audit).unwrap();
+                    let account_id = AccountId::new("account").unwrap();
+                    let binding = account_binding_fixture(
+                        &account_id,
+                        "0x1111111111111111111111111111111111111111",
+                    );
+                    verify_account_state(&audit, &binding).unwrap();
                 } else {
                     assert_eq!(
                         classified.unwrap_err().kind,
@@ -6782,26 +6857,47 @@ mod tests {
         }
     }
 
+    fn account_binding_fixture(
+        account_id: &AccountId,
+        custody_wallet: &str,
+    ) -> LiveAccountBindingAudit {
+        LiveAccountBindingAudit::new(
+            account_id.clone(),
+            CredentialBindingIdentity {
+                version: 1,
+                key_id: "key".to_owned(),
+            },
+            WalletAddress::from_hex(custody_wallet).unwrap(),
+            blake3::hash(account_id.as_str().as_bytes())
+                .to_hex()
+                .to_string(),
+        )
+    }
+
     fn empty_position_evidence(
         first_sequence: u64,
         received_at: OffsetDateTime,
+        binding: &LiveAccountBindingAudit,
     ) -> (LivePositionEvidenceAudit, Vec<EventEnvelope>) {
-        let requested_wallet = "0x1111111111111111111111111111111111111111".to_owned();
+        position_evidence(
+            first_sequence,
+            received_at,
+            binding,
+            [b"[]".to_vec(), b"[]".to_vec()],
+        )
+    }
+
+    fn position_evidence(
+        first_sequence: u64,
+        received_at: OffsetDateTime,
+        binding: &LiveAccountBindingAudit,
+        partition_bodies: [Vec<u8>; 2],
+    ) -> (LivePositionEvidenceAudit, Vec<EventEnvelope>) {
+        let requested_wallet = binding.custody_wallet.clone();
         let receipts = vec![
             fixture_receipt(first_sequence),
             fixture_receipt(first_sequence.checked_add(1).unwrap()),
         ];
-        let sources = receipts
-            .iter()
-            .map(|receipt| {
-                source_envelope(
-                    *receipt,
-                    COMPLETE_POSITIONS_SOURCE_ID,
-                    b"[]".to_vec(),
-                    received_at,
-                )
-            })
-            .collect();
         let pages = [false, true]
             .into_iter()
             .zip(receipts)
@@ -6810,6 +6906,23 @@ mod tests {
                     "/positions?user={requested_wallet}&sizeThreshold=0&includeArchived=true&limit=500&sortBy=TOKENS&sortDirection=ASC&redeemable={redeemable}&offset=0"
                 ),
                 receipt,
+            })
+            .collect::<Vec<_>>();
+        let sources = pages
+            .iter()
+            .zip(partition_bodies)
+            .map(|(page, body)| {
+                let request = position_request_descriptor(binding, &page.request_identity).unwrap();
+                let payload =
+                    serde_json::to_vec(&RetainedPositionResponse { request, body }).unwrap();
+                let mut envelope = source_envelope(
+                    page.receipt,
+                    COMPLETE_POSITIONS_SOURCE_ID,
+                    payload,
+                    received_at,
+                );
+                envelope.schema_version = COMPLETE_POSITIONS_SCHEMA_VERSION;
+                envelope
             })
             .collect();
         (
@@ -6821,8 +6934,10 @@ mod tests {
         )
     }
 
-    fn baseline_sources() -> Vec<EventEnvelope> {
-        empty_position_evidence(100, OffsetDateTime::UNIX_EPOCH).1
+    fn baseline_sources(account_id: &AccountId) -> Vec<EventEnvelope> {
+        let binding =
+            account_binding_fixture(account_id, "0x1111111111111111111111111111111111111111");
+        empty_position_evidence(100, OffsetDateTime::UNIX_EPOCH, &binding).1
     }
 
     fn derive_with_baseline_evidence(
@@ -6830,25 +6945,17 @@ mod tests {
         events: &[LiveJournalEvent],
         additional_sources: &[EventEnvelope],
     ) -> Result<ProjectionDerivation, ProjectionReducerError> {
-        let mut sources = baseline_sources();
+        let mut sources = baseline_sources(account_id);
         sources.extend_from_slice(additional_sources);
         derive_projection_rows_with_sources(account_id, events, &sources)
     }
 
     fn baseline_event(account_id: &AccountId, seq: u64) -> LiveJournalEvent {
         let cash = CollateralAmount::from_atomic(10_000_000);
-        let (venue_position_evidence, _) = empty_position_evidence(100, OffsetDateTime::UNIX_EPOCH);
-        let account_binding = LiveAccountBindingAudit::new(
-            account_id.clone(),
-            CredentialBindingIdentity {
-                version: 1,
-                key_id: "key".to_owned(),
-            },
-            WalletAddress::from_hex(&venue_position_evidence.requested_wallet).unwrap(),
-            blake3::hash(account_id.as_str().as_bytes())
-                .to_hex()
-                .to_string(),
-        );
+        let account_binding =
+            account_binding_fixture(account_id, "0x1111111111111111111111111111111111111111");
+        let (venue_position_evidence, _) =
+            empty_position_evidence(100, OffsetDateTime::UNIX_EPOCH, &account_binding);
         LiveJournalEvent {
             account_id: account_id.clone(),
             seq,
@@ -6857,8 +6964,12 @@ mod tests {
                 pe_execution_core::AccountPortfolioMarkedAudit {
                     kind: MarkKind::Baseline,
                     cutoff_unix: 0,
-                    account_binding,
-                    account_state: account_state_fixture(cash, OffsetDateTime::UNIX_EPOCH),
+                    account_binding: account_binding.clone(),
+                    account_state: account_state_fixture_for_binding(
+                        cash,
+                        OffsetDateTime::UNIX_EPOCH,
+                        &account_binding,
+                    ),
                     venue_positions: Vec::new(),
                     venue_position_evidence,
                     marked_positions: Vec::new(),
@@ -7087,6 +7198,58 @@ mod tests {
         ));
     }
 
+    /// PASS: an exact terminal reconciliation retry is idempotent, while any later changed fact
+    /// (including Matched) makes the strict reducer reject the journal.
+    #[test]
+    fn terminal_reconciliation_retries_are_complete_fact_exact() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let terminal = LiveOrderReconciliationAudit {
+            identity: prepared.identity.clone(),
+            order_hash: prepared.prepared.order_hash.clone(),
+            source: LiveReconciliationSource::OrderHashLookupAndCancel,
+            outcome: LiveJournalOrderOutcome::Killed {
+                venue_order_id: Some("venue-order".to_owned()),
+            },
+            evidence: Vec::new(),
+            evidence_hashes: Vec::new(),
+        };
+        let event = |seq, audit: LiveOrderReconciliationAudit| LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp: OffsetDateTime::from_unix_timestamp(i64::try_from(seq).unwrap()).unwrap(),
+            payload: LiveJournalPayload::OrderReconciled(Box::new(audit)),
+        };
+        let prefix = vec![
+            baseline_event(&account_id, 1),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: OffsetDateTime::from_unix_timestamp(2).unwrap(),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+            },
+            event(3, terminal.clone()),
+        ];
+        let mut duplicate = prefix.clone();
+        duplicate.push(event(4, terminal.clone()));
+        let replayed = derive_with_baseline_evidence(&account_id, &duplicate, &[]).unwrap();
+        assert_eq!(replayed.reserved, Decimal::ZERO);
+
+        let mut changed = terminal;
+        changed.source = LiveReconciliationSource::PostResponse;
+        changed.outcome = LiveJournalOrderOutcome::Matched {
+            venue_order_id: "venue-order".to_owned(),
+            transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+            executed: None,
+        };
+        let mut contradictory = prefix;
+        contradictory.push(event(4, changed));
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_id, &contradictory, &[]),
+            Err(ProjectionReducerError::IdentityConflict)
+        ));
+    }
+
     struct FakePolygonRpc {
         calls: Mutex<Vec<(String, Option<u64>)>>,
         finalized_head: u64,
@@ -7127,13 +7290,21 @@ mod tests {
             self
         }
 
-        fn response(endpoint_kind: &str, body: Vec<u8>) -> RawHttpAttempt {
+        fn response(
+            endpoint_kind: &str,
+            rpc_method: &str,
+            rpc_params: serde_json::Value,
+            body: Vec<u8>,
+        ) -> RawHttpAttempt {
             RawHttpAttempt::Response(pe_core_types::RawHttpResponse {
-                source_id: "fixture".to_owned(),
+                source_id: "polygon-receipt-rpc".to_owned(),
                 endpoint_kind: endpoint_kind.to_owned(),
                 method: "POST".to_owned(),
                 path: "fixture://polygon".to_owned(),
-                ordered_query: Vec::new(),
+                ordered_query: vec![
+                    ("rpc_method".to_owned(), rpc_method.to_owned()),
+                    ("rpc_params".to_owned(), rpc_params.to_string()),
+                ],
                 status: 200,
                 headers: Vec::new(),
                 body,
@@ -7166,6 +7337,8 @@ mod tests {
             Box::pin(async {
                 Self::response(
                     "polygon-chain-id",
+                    "eth_chainId",
+                    serde_json::json!([]),
                     br#"{"jsonrpc":"2.0","id":1,"result":"0x89"}"#.to_vec(),
                 )
             })
@@ -7184,7 +7357,15 @@ mod tests {
                 .get(transaction_hash)
                 .cloned()
                 .unwrap_or_else(|| self.receipt.clone());
-            Box::pin(async move { Self::response("polygon-transaction-receipt", receipt) })
+            let transaction_hash = transaction_hash.to_owned();
+            Box::pin(async move {
+                Self::response(
+                    "polygon-transaction-receipt",
+                    "eth_getTransactionReceipt",
+                    serde_json::json!([transaction_hash]),
+                    receipt,
+                )
+            })
         }
 
         fn finalized_block(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
@@ -7197,6 +7378,8 @@ mod tests {
                 let hash = if number == 100 { "aa" } else { "bb" };
                 Self::response(
                     "polygon-finalized-block",
+                    "eth_getBlockByNumber",
+                    serde_json::json!(["finalized", false]),
                     serde_json::to_vec(&serde_json::json!({
                         "jsonrpc":"2.0","id":1,"result":{
                             "number":format!("0x{number:x}"),
@@ -7220,6 +7403,8 @@ mod tests {
             Box::pin(async move {
                 Self::response(
                     "polygon-canonical-block",
+                    "eth_getBlockByNumber",
+                    serde_json::json!([format!("0x{number:x}"), false]),
                     serde_json::to_vec(&serde_json::json!({
                         "jsonrpc":"2.0","id":1,"result":{
                             "number":format!("0x{number:x}"),
@@ -7473,6 +7658,26 @@ mod tests {
                 LiveJournalPayload::OrderPrepared(finality_prepared()),
             )
             .unwrap();
+        let matched_prepared = finality_prepared();
+        let matched = LiveOrderReconciliationAudit {
+            identity: matched_prepared.identity.clone(),
+            order_hash: matched_prepared.prepared.order_hash.clone(),
+            source: LiveReconciliationSource::PostResponse,
+            outcome: LiveJournalOrderOutcome::Matched {
+                venue_order_id: "venue-order".to_owned(),
+                transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+                executed: None,
+            },
+            evidence: Vec::new(),
+            evidence_hashes: Vec::new(),
+        };
+        journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                LiveJournalPayload::OrderReconciled(Box::new(matched.clone())),
+            )
+            .unwrap();
         assert_eq!(
             append_order_finality_result(
                 &journal,
@@ -7495,6 +7700,9 @@ mod tests {
         );
         let frozen = recovery_inventory(&path).unwrap();
         assert!(frozen.open_orders.is_empty());
+        let retained = replay_account(&path, &account_id).unwrap();
+        let pending_payload = retained[2].payload.clone();
+        let conflict_payload = retained[3].payload.clone();
         assert_eq!(
             append_order_finality_result(
                 &journal,
@@ -7511,9 +7719,42 @@ mod tests {
         ));
 
         let prepared = finality_prepared();
-        let conflict_event = LiveJournalEvent {
+        let reducer_events = vec![
+            baseline_event(&account_id, 1),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 3,
+                timestamp: OffsetDateTime::from_unix_timestamp(6).unwrap(),
+                payload: LiveJournalPayload::OrderReconciled(Box::new(matched)),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 4,
+                timestamp: OffsetDateTime::from_unix_timestamp(8).unwrap(),
+                payload: pending_payload,
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 5,
+                timestamp: OffsetDateTime::from_unix_timestamp(9).unwrap(),
+                payload: conflict_payload,
+            },
+            finalized_fill_event(&account_id, &prepared, 6, 2),
+        ];
+        let frozen_projection =
+            derive_with_baseline_evidence(&account_id, &reducer_events[..5], &[]).unwrap();
+        assert_eq!(frozen_projection.reserved, dec!(2.500120));
+
+        let mut evidence_free = reducer_events[..3].to_vec();
+        evidence_free.push(LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 3,
+            seq: 4,
             timestamp: OffsetDateTime::from_unix_timestamp(9).unwrap(),
             payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
                 identity: prepared.identity.clone(),
@@ -7525,21 +7766,35 @@ mod tests {
                 evidence: Vec::new(),
                 evidence_hashes: Vec::new(),
             })),
-        };
-        let reducer_events = vec![
-            baseline_event(&account_id, 1),
-            LiveJournalEvent {
-                account_id: account_id.clone(),
-                seq: 2,
-                timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
-            },
-            conflict_event,
-            finalized_fill_event(&account_id, &prepared, 4, 2),
-        ];
-        let frozen_projection =
-            derive_with_baseline_evidence(&account_id, &reducer_events[..3], &[]).unwrap();
-        assert_eq!(frozen_projection.reserved, dec!(2.500120));
+        });
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_id, &evidence_free, &[]),
+            Err(ProjectionReducerError::InvalidFinalityEvidence)
+        ));
+
+        for endpoint_kind in ["polygon-transaction-receipt", "polygon-finalized-block"] {
+            let mut malformed = reducer_events[..5].to_vec();
+            if let LiveJournalPayload::OrderReconciled(conflict) = &mut malformed[4].payload {
+                let response = conflict
+                    .evidence
+                    .iter_mut()
+                    .find_map(|attempt| match attempt {
+                        RawHttpAttempt::Response(response)
+                            if response.endpoint_kind == endpoint_kind =>
+                        {
+                            Some(response)
+                        }
+                        RawHttpAttempt::Response(_) | RawHttpAttempt::TransportFailure(_) => None,
+                    })
+                    .unwrap();
+                response.body = b"not-json".to_vec();
+                conflict.evidence_hashes = http_attempt_hashes(&conflict.evidence).unwrap();
+            }
+            assert!(matches!(
+                derive_with_baseline_evidence(&account_id, &malformed, &[]),
+                Err(ProjectionReducerError::InvalidFinalityEvidence)
+            ));
+        }
         assert!(matches!(
             derive_with_baseline_evidence(&account_id, &reducer_events, &[]),
             Err(ProjectionReducerError::FinalityConflictFrozen)
@@ -7548,27 +7803,51 @@ mod tests {
 
     /// PASS: a Final cannot rewrite a transaction/log observation that an earlier Pending proved
     /// immutable at the finalized head, even when the rewritten Final is internally self-consistent.
-    #[test]
-    fn finality_pending_freezes_immutable_polygon_observations() {
+    #[tokio::test]
+    async fn finality_pending_freezes_immutable_polygon_observations() {
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let original_final = finalized_fill_event(&account_id, &prepared, 4, 2);
-        let LiveJournalPayload::OrderFillFinalized(original) = &original_final.payload else {
+        let first_hash = format!("0x{}", "11".repeat(32));
+        let second_hash = format!("0x{}", "22".repeat(32));
+        let rpc = FakePolygonRpc::new(101).with_transaction_receipts([
+            (
+                first_hash.clone(),
+                include_bytes!("../../venue-polymarket/tests/fixtures/receipts/standard_v2.json")
+                    .to_vec(),
+            ),
+            (
+                second_hash.clone(),
+                br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec(),
+            ),
+        ]);
+        let pending_result = collect_order_finality(
+            &rpc,
+            vec![PendingOrderFinality {
+                prepared_journal_seq: 2,
+                prepared: prepared.clone(),
+                transaction_hashes: vec![first_hash.clone(), second_hash.clone()],
+            }],
+        )
+        .await
+        .pop()
+        .unwrap();
+        let OrderFinalityDisposition::Pending {
+            reason,
+            evidence: pending_evidence,
+        } = pending_result.disposition
+        else {
             unreachable!();
         };
-        let mut pending_evidence = original.receipts.clone();
-        pending_evidence.extend(original.blocks.clone());
+        let original_final = finalized_fill_event(&account_id, &prepared, 5, 2);
         let pending = LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 3,
+            seq: 4,
             timestamp: OffsetDateTime::from_unix_timestamp(9).unwrap(),
             payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
                 identity: prepared.identity.clone(),
                 order_hash: prepared.prepared.order_hash.clone(),
                 source: LiveReconciliationSource::PolygonFinality,
-                outcome: LiveJournalOrderOutcome::FinalityPending {
-                    reason: "another authenticated transaction remains pending".to_owned(),
-                },
+                outcome: LiveJournalOrderOutcome::FinalityPending { reason },
                 evidence_hashes: http_attempt_hashes(&pending_evidence).unwrap(),
                 evidence: pending_evidence,
             })),
@@ -7587,7 +7866,26 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 2,
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 3,
+                timestamp: OffsetDateTime::from_unix_timestamp(6).unwrap(),
+                payload: LiveJournalPayload::OrderReconciled(Box::new(
+                    LiveOrderReconciliationAudit {
+                        identity: prepared.identity.clone(),
+                        order_hash: prepared.prepared.order_hash.clone(),
+                        source: LiveReconciliationSource::PostResponse,
+                        outcome: LiveJournalOrderOutcome::Matched {
+                            venue_order_id: "venue-order".to_owned(),
+                            transaction_hashes: vec![first_hash, second_hash],
+                            executed: None,
+                        },
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                )),
             },
             pending,
             rewritten_final,
@@ -7742,7 +8040,11 @@ mod tests {
             mark.venue_position_evidence.pages.clear();
         }
         assert!(matches!(
-            derive_projection_rows_with_sources(&account_id, &[no_account], &baseline_sources()),
+            derive_projection_rows_with_sources(
+                &account_id,
+                &[no_account],
+                &baseline_sources(&account_id),
+            ),
             Err(ProjectionReducerError::InvalidAccountEvidence)
         ));
 
@@ -7751,7 +8053,11 @@ mod tests {
             mark.venue_position_evidence.pages.clear();
         }
         assert!(matches!(
-            derive_projection_rows_with_sources(&account_id, &[no_positions], &baseline_sources()),
+            derive_projection_rows_with_sources(
+                &account_id,
+                &[no_positions],
+                &baseline_sources(&account_id),
+            ),
             Err(ProjectionReducerError::InvalidPositionEvidence)
         ));
 
@@ -7760,7 +8066,11 @@ mod tests {
             mark.account_state.collateral_balance = CollateralAmount::from_atomic(9_999_999);
         }
         assert!(matches!(
-            derive_projection_rows_with_sources(&account_id, &[copied_cash], &baseline_sources()),
+            derive_projection_rows_with_sources(
+                &account_id,
+                &[copied_cash],
+                &baseline_sources(&account_id),
+            ),
             Err(ProjectionReducerError::InvalidAccountEvidence)
         ));
 
@@ -7769,11 +8079,15 @@ mod tests {
             mark.account_state.evidence_hashes[0] = "rewritten".to_owned();
         }
         assert!(matches!(
-            derive_projection_rows_with_sources(&account_id, &[copied_hash], &baseline_sources()),
+            derive_projection_rows_with_sources(
+                &account_id,
+                &[copied_hash],
+                &baseline_sources(&account_id),
+            ),
             Err(ProjectionReducerError::InvalidAccountEvidence)
         ));
 
-        let mut corrupted_position_sources = baseline_sources();
+        let mut corrupted_position_sources = baseline_sources(&account_id);
         corrupted_position_sources[0].raw_payload_hash = blake3::hash(b"rewritten");
         assert!(matches!(
             derive_projection_rows_with_sources(
@@ -7798,33 +8112,80 @@ mod tests {
     }
 
     /// PASS: valid account-B responses and empty position pages cannot establish account A's
-    /// Baseline, because the nonsecret credential/custody binding is checked against the envelope.
+    /// Baseline or Daily mark after the copied account/request labels are changed to A.
     #[test]
     fn baseline_rejects_cross_account_evidence_even_when_positions_are_empty() {
         let account_a = AccountId::new("account-a").unwrap();
         let account_b = AccountId::new("account-b").unwrap();
-        let mut account_b_baseline = baseline_event(&account_b, 1);
-        account_b_baseline.account_id = account_a.clone();
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let binding_a = account_binding_fixture(&account_a, wallet);
+        let binding_b = account_binding_fixture(&account_b, wallet);
+        let (account_b_positions, account_b_sources) =
+            empty_position_evidence(120, OffsetDateTime::UNIX_EPOCH, &binding_b);
+        let mut copied_account = baseline_event(&account_a, 1);
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut copied_account.payload {
+            mark.account_state = account_state_fixture_for_binding(
+                CollateralAmount::from_whole(10).unwrap(),
+                OffsetDateTime::UNIX_EPOCH,
+                &binding_b,
+            );
+            mark.account_binding = binding_a.clone();
+            mark.venue_position_evidence = account_b_positions.clone();
+        }
         assert!(matches!(
-            derive_projection_rows_with_sources(
-                &account_a,
-                &[account_b_baseline],
-                &baseline_sources(),
-            ),
+            derive_projection_rows_with_sources(&account_a, &[copied_account], &account_b_sources,),
             Err(ProjectionReducerError::InvalidAccountEvidence)
         ));
 
-        let mut wrong_wallet_request = baseline_event(&account_a, 1);
-        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut wrong_wallet_request.payload
-        {
-            mark.venue_position_evidence.requested_wallet =
-                "0x2222222222222222222222222222222222222222".to_owned();
+        let mut copied_positions = baseline_event(&account_a, 1);
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut copied_positions.payload {
+            mark.venue_position_evidence = account_b_positions.clone();
         }
         assert!(matches!(
             derive_projection_rows_with_sources(
                 &account_a,
-                &[wrong_wallet_request],
-                &baseline_sources(),
+                &[copied_positions],
+                &account_b_sources,
+            ),
+            Err(ProjectionReducerError::InvalidPositionEvidence)
+        ));
+
+        let daily_at = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
+        let mut copied_daily = baseline_event(&account_a, 2);
+        copied_daily.timestamp = daily_at;
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut copied_daily.payload {
+            mark.kind = MarkKind::Daily;
+            mark.cutoff_unix = 86_400;
+            mark.account_state = account_state_fixture_for_binding(
+                CollateralAmount::from_whole(10).unwrap(),
+                daily_at,
+                &binding_b,
+            );
+            mark.venue_position_evidence = account_b_positions.clone();
+        }
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_a,
+                &[baseline_event(&account_a, 1), copied_daily],
+                &account_b_sources,
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut copied_daily_positions = baseline_event(&account_a, 2);
+        copied_daily_positions.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) =
+            &mut copied_daily_positions.payload
+        {
+            mark.kind = MarkKind::Daily;
+            mark.cutoff_unix = 86_400;
+            mark.venue_position_evidence = account_b_positions;
+        }
+        assert!(matches!(
+            derive_with_baseline_evidence(
+                &account_a,
+                &[baseline_event(&account_a, 1), copied_daily_positions],
+                &account_b_sources,
             ),
             Err(ProjectionReducerError::InvalidPositionEvidence)
         ));
@@ -8116,6 +8477,58 @@ mod tests {
         assert_eq!(losing.economic_cash, Some(dec!(7.499880)));
     }
 
+    /// PASS: a post-cutoff fill remains part of the Daily event's current custody state, so an
+    /// otherwise valid empty response cannot hide it behind the cutoff-bounded projection.
+    #[test]
+    fn daily_rejects_empty_current_inventory_that_hides_a_post_cutoff_fill() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let binding =
+            account_binding_fixture(&account_id, "0x1111111111111111111111111111111111111111");
+        let daily_at = OffsetDateTime::from_unix_timestamp(86_402).unwrap();
+        let (position_evidence, position_sources) =
+            empty_position_evidence(120, daily_at, &binding);
+        let mut fill = finalized_fill_event(&account_id, &prepared, 3, 2);
+        fill.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
+        let daily = LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 4,
+            timestamp: daily_at,
+            payload: LiveJournalPayload::AccountPortfolioMarked(Box::new(
+                pe_execution_core::AccountPortfolioMarkedAudit {
+                    kind: MarkKind::Daily,
+                    cutoff_unix: 86_400,
+                    account_binding: binding.clone(),
+                    account_state: account_state_fixture_for_binding(
+                        CollateralAmount::from_decimal_exact(dec!(7.499880)).unwrap(),
+                        daily_at,
+                        &binding,
+                    ),
+                    venue_positions: Vec::new(),
+                    venue_position_evidence: position_evidence,
+                    marked_positions: Vec::new(),
+                    prices: Vec::new(),
+                    equity: CollateralAmount::from_whole(10).unwrap(),
+                },
+            )),
+        };
+        let events = vec![
+            baseline_event(&account_id, 1),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: OffsetDateTime::from_unix_timestamp(86_401).unwrap(),
+                payload: LiveJournalPayload::OrderPrepared(prepared),
+            },
+            fill,
+            daily,
+        ];
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_id, &events, &position_sources),
+            Err(ProjectionReducerError::CustodyInventoryMismatch)
+        ));
+    }
+
     /// PASS: a catch-up Daily mark rejects an absent price preimage, then accepts the real
     /// classified response while ignoring a resolution received after its cutoff.
     #[test]
@@ -8125,20 +8538,31 @@ mod tests {
         let mut resolution = resolution_event(&account_id, 4);
         resolution.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
         let source = resolution_source_envelope(&resolution);
-        let (daily_position_evidence, daily_position_sources) =
-            empty_position_evidence(120, OffsetDateTime::from_unix_timestamp(86_402).unwrap());
-        let account_binding = LiveAccountBindingAudit::new(
-            account_id.clone(),
-            CredentialBindingIdentity {
-                version: 1,
-                key_id: "key".to_owned(),
-            },
-            WalletAddress::from_hex(&daily_position_evidence.requested_wallet).unwrap(),
-            blake3::hash(account_id.as_str().as_bytes())
-                .to_hex()
-                .to_string(),
+        let account_binding =
+            account_binding_fixture(&account_id, "0x1111111111111111111111111111111111111111");
+        let current_position = CanonicalPositionAudit {
+            condition_id: prepared.prepared.condition_id.clone(),
+            outcome_index: 0,
+            token_id: prepared.prepared.token_id.clone(),
+            size: ShareAmount::from_atomic(3_125_000),
+            redeemable: true,
+        };
+        let redeemable_body = serde_json::to_vec(&serde_json::json!([{
+            "proxyWallet": account_binding.custody_wallet,
+            "asset": prepared.prepared.token_id.0,
+            "conditionId": prepared.prepared.condition_id.0,
+            "outcomeIndex": 0,
+            "size": "3.125",
+            "negativeRisk": false,
+        }]))
+        .unwrap();
+        let (daily_position_evidence, daily_position_sources) = position_evidence(
+            120,
+            OffsetDateTime::from_unix_timestamp(86_402).unwrap(),
+            &account_binding,
+            [b"[]".to_vec(), redeemable_body],
         );
-        let cash = CollateralAmount::from_decimal_exact(dec!(10.624880)).unwrap();
+        let cash = CollateralAmount::from_decimal_exact(dec!(7.499880)).unwrap();
         let daily = LiveJournalEvent {
             account_id: account_id.clone(),
             seq: 5,
@@ -8147,12 +8571,13 @@ mod tests {
                 pe_execution_core::AccountPortfolioMarkedAudit {
                     kind: MarkKind::Daily,
                     cutoff_unix: 86_400,
-                    account_binding,
-                    account_state: account_state_fixture(
+                    account_binding: account_binding.clone(),
+                    account_state: account_state_fixture_for_binding(
                         cash,
                         OffsetDateTime::from_unix_timestamp(86_402).unwrap(),
+                        &account_binding,
                     ),
-                    venue_positions: Vec::new(),
+                    venue_positions: vec![current_position],
                     venue_position_evidence: daily_position_evidence,
                     marked_positions: vec![CanonicalPositionAudit {
                         condition_id: prepared.prepared.condition_id.clone(),
@@ -8352,13 +8777,18 @@ mod tests {
             adapter: "adapter".to_owned(),
             custody_wallet: prepared.prepared.funder.clone(),
         };
-        let (custody_position_evidence, custody_sources) =
-            empty_position_evidence(110, OffsetDateTime::from_unix_timestamp(30).unwrap());
+        let custody_binding = account_binding_fixture(&account_id, &prepared.prepared.funder);
+        let (custody_position_evidence, custody_sources) = empty_position_evidence(
+            110,
+            OffsetDateTime::from_unix_timestamp(30).unwrap(),
+            &custody_binding,
+        );
         let custody_audit = pe_execution_core::RedemptionCustodyReconciledAudit {
             identity: redemption_identity.clone(),
-            account_state: account_state_fixture(
+            account_state: account_state_fixture_for_binding(
                 reconciled_cash,
                 OffsetDateTime::from_unix_timestamp(30).unwrap(),
+                &custody_binding,
             ),
             venue_positions: Vec::new(),
             venue_position_receipts: custody_position_evidence
@@ -8431,6 +8861,19 @@ mod tests {
                 payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(custody_audit)),
             },
         ]);
+        let account_b = AccountId::new("account-b").unwrap();
+        let binding_b = account_binding_fixture(&account_b, &prepared.prepared.funder);
+        let (_, account_b_custody_sources) = empty_position_evidence(
+            110,
+            OffsetDateTime::from_unix_timestamp(30).unwrap(),
+            &binding_b,
+        );
+        let mut substituted_custody_sources = vec![resolution_source.clone()];
+        substituted_custody_sources.extend(account_b_custody_sources);
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_id, &events, &substituted_custody_sources),
+            Err(ProjectionReducerError::InvalidPositionEvidence)
+        ));
         let mut custody_and_resolution_sources = vec![resolution_source];
         custody_and_resolution_sources.extend(custody_sources);
         let mut copied_position_events = events.clone();
