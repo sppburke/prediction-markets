@@ -527,11 +527,14 @@ threshold live only in `_GLOSSARY.md`.
 The panel requests a mode, but the service is the sole writer of effective mode through the atomic
 `account_set_effective_mode` control RPC. Arming requires a decryptable, correctly bound credential
 bundle; venue state not `closed_only`; passing geoblock evidence; sufficient balance and allowance
-for both V2 exchange spenders; and an unrevoked promotion review newer than the executor's
-first-boot arming fence. Requested mode alone never authorizes an order. Invalid credentials, a
-missing/revoked promotion record, or `closed_only` demote an armed account; transient probe failure
-refuses orders without demotion. A pending, ambiguous, or failed redemption is the non-demoting
-exception: it closes that account's new-BUY admission until confirmation.
+for both V2 exchange spenders; a loaded `Pass` qualification report bound to the current seal,
+economic configuration hash, and financial semantic version; and an unrevoked review newer than the
+executor's first-boot arming fence that names that same seal. A legacy unbound review is invalid.
+Requested mode alone never authorizes an order. Invalid credentials, missing or mismatched
+qualification evidence, a missing/revoked/mismatched review, or `closed_only` demote an armed
+account; transient probe failure refuses orders without demotion. A pending, ambiguous, or failed
+redemption is the non-demoting exception: it closes that account's new-BUY admission until
+confirmation.
 
 Venue settlement is payoff authority (Decision 11). Ordinary live admission composes an automated
 `VenueSettlementRecord` from resolver evidence with fresh market evidence: condition, outcome, and
@@ -556,7 +559,8 @@ historical reconstruction
   -> one corrected financial era records exact paper decisions and economics
   -> the first eligible mark synchronizes QualificationSealed
   -> network-free exact replay emits Pass, Fail, or InsufficientEvidence
-  -> one manual review after Pass may authorize live-tiny
+  -> ordinary service loads that seal-bound Pass report via --qualification-report=<path>
+  -> one later manual review bound to the same seal may authorize live-tiny
 ```
 
 The exact quantitative gate is owned by `_GLOSSARY.md`. The observation begins at the first valid
