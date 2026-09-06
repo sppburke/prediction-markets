@@ -489,7 +489,6 @@ mod tests {
                 "artifact_blake3": OTHER_SEAL_HASH,
                 "static_config_hash": OTHER_SEAL_HASH,
                 "hot_config_hash": ECONOMIC_CONFIGURATION_HASH,
-                "policy_hash": OTHER_SEAL_HASH,
                 "financial_semantic_version": FINANCIAL_SEMANTIC_VERSION,
                 "economic_core_hashes": []
             },

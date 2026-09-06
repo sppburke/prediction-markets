@@ -605,7 +605,6 @@ fn active_start_record() -> PaperLogRecord {
         generation: "golden".to_owned(),
         activation_id: "golden".to_owned(),
         ranking_batch_id: 545,
-        policy_hash: "policy".to_owned(),
         membership: vec![WalletAddress::from_hex(wallet_hex()).unwrap()],
         membership_proofs_hash: "proof".to_owned(),
         schema_version: 3,

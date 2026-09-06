@@ -129,7 +129,6 @@ fn start_record(source_path: &std::path::Path, paper_path: &std::path::Path) -> 
         generation: "generation".to_owned(),
         activation_id: "activation".to_owned(),
         ranking_batch_id: 545,
-        policy_hash: "policy".to_owned(),
         membership: vec![
             WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
         ],

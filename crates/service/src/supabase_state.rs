@@ -1907,7 +1907,6 @@ mod tests {
                 generation: "generation".to_owned(),
                 activation_id: "activation".to_owned(),
                 ranking_batch_id: 1,
-                policy_hash: "policy".to_owned(),
                 membership: Vec::new(),
                 membership_proofs_hash: "proofs".to_owned(),
                 schema_version: 1,

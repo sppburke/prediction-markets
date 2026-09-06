@@ -1236,7 +1236,6 @@ mod tests {
             generation: "generation".to_owned(),
             activation_id: "activation".to_owned(),
             ranking_batch_id: 1,
-            policy_hash: "policy".to_owned(),
             membership: vec![
                 WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap(),
             ],

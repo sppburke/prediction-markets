@@ -780,7 +780,6 @@ async fn golden_source_stream_replays_exact_economic_core() {
         generation: "golden-stream-v1".to_owned(),
         activation_id: "golden-stream-v1".to_owned(),
         ranking_batch_id: 545,
-        policy_hash: "golden-policy-v1".to_owned(),
         membership: wallets.clone(),
         membership_proofs_hash: "golden-membership-v1".to_owned(),
         schema_version: 2,
