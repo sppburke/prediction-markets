@@ -318,9 +318,14 @@ mod tests {
             else {
                 panic!("capacity publisher sent a non-publication command");
             };
+            // This round trip publishes a full replacement: the membership before the change is
+            // exactly the removed set.
+            let current_membership: HashSet<WalletAddress> =
+                change.removed.iter().copied().collect();
             let result = crate::qualification::verify_published_membership_change(
                 &change.into_record(),
                 &verifier_source_log,
+                &current_membership,
             )
             .map(|()| pe_event_log::AppendReceipt {
                 sequence: pe_core_types::EventSeq(1),
@@ -478,6 +483,12 @@ mod tests {
                                 crate::qualification::verify_published_membership_change(
                                     &change.clone().into_record(),
                                     &verifier_source_log,
+                                    &live
+                                        .snapshot()
+                                        .entries
+                                        .iter()
+                                        .map(|entry| entry.wallet)
+                                        .collect(),
                                 )
                             {
                                 acknowledged.send(Err(error.to_string())).unwrap();
@@ -644,6 +655,12 @@ mod tests {
                         if let Err(error) = crate::qualification::verify_published_membership_change(
                             &change.clone().into_record(),
                             &verifier_source_log,
+                            &live_at_control
+                                .snapshot()
+                                .entries
+                                .iter()
+                                .map(|entry| entry.wallet)
+                                .collect(),
                         ) {
                             acknowledged.send(Err(error.to_string())).unwrap();
                             continue;
@@ -708,13 +725,21 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(source_records.len(), 1);
+        // The newcomer's admission proof is retained before the capacity-change publication,
+        // then the configuration receipt that the membership evidence references.
+        let source_ids: Vec<&str> = source_records
+            .iter()
+            .map(|(_, envelope)| envelope.source_id.0.as_str())
+            .collect();
         assert_eq!(
-            source_records[0].1.source_id.0,
-            "pe-service.watchlist-capacity-config"
+            source_ids,
+            vec![
+                "pe-service.watchlist-admission",
+                "pe-service.watchlist-capacity-config"
+            ]
         );
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&source_records[0].1.payload).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&source_records[1].1.payload).unwrap(),
             serde_json::json!({"generation": request.generation, "target": request.target})
         );
         source_log.task.abort();

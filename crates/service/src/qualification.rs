@@ -80,7 +80,7 @@ use crate::watchlist_admission::{
 };
 use crate::watchlist_maintenance::{
     KnockoutReason, MaintenanceConfig, MembershipMode, knockout_decision,
-    planned_admission_wallets, ranked_membership_wallet_change,
+    planned_admission_wallets, ranked_membership_change_wallets,
 };
 
 const QUALIFICATION_REPORT_VERSION: u16 = 1;
@@ -2244,10 +2244,15 @@ fn verify_ranked_change(
     if entry_wallets.len() != entries.len() || entries.len() > capacity {
         return insufficient("MembershipChanged ranked artifact is duplicate or over-capacity");
     }
+    let current_ordered: Vec<pe_core_types::WalletAddress> = current.iter().copied().collect();
     let (expected_removed, expected_added) =
-        ranked_membership_wallet_change(current, entries, capacity);
-    if expected_removed != removed.iter().copied().collect()
-        || expected_added != added.iter().copied().collect()
+        ranked_membership_change_wallets(&current_ordered, entries, capacity);
+    let expected_removed: HashSet<pe_core_types::WalletAddress> =
+        expected_removed.into_iter().collect();
+    let expected_added: HashSet<pe_core_types::WalletAddress> =
+        expected_added.into_iter().collect();
+    if expected_removed != removed.iter().copied().collect::<HashSet<_>>()
+        || expected_added != added.iter().copied().collect::<HashSet<_>>()
     {
         return insufficient(
             "MembershipChanged ranked artifact disagrees with its exact wallet mutation",
@@ -2339,6 +2344,7 @@ fn knockout_record_reason(
 pub(crate) fn verify_published_membership_change(
     record: &PaperLogRecord,
     source_log: &Path,
+    current_membership: &HashSet<pe_core_types::WalletAddress>,
 ) -> Result<(), QualificationError> {
     let PaperLogRecord::MembershipChanged {
         reason,
@@ -2354,7 +2360,6 @@ pub(crate) fn verify_published_membership_change(
     };
     let source_prefix = TailBinding::from(&Scanner::verify(source_log)?);
     let source = source_observations(source_log, &source_prefix)?;
-    let current_membership = removed.iter().copied().collect();
     verify_membership_change_evidence(
         *reason,
         removed,
@@ -2364,7 +2369,7 @@ pub(crate) fn verify_published_membership_change(
         evidence,
         &MembershipEvidenceContext {
             source: &source,
-            current_membership: &current_membership,
+            current_membership,
         },
     )
 }

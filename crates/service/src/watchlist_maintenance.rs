@@ -441,21 +441,6 @@ pub(crate) fn planned_admission_wallets(
 }
 
 /// Re-run the ranked-set membership owner using only structural wallet identity.
-pub(crate) fn ranked_membership_wallet_change(
-    current: &HashSet<WalletAddress>,
-    incoming: &[WatchlistEntry],
-    cap: usize,
-) -> (HashSet<WalletAddress>, HashSet<WalletAddress>) {
-    let published = incoming
-        .iter()
-        .take(cap)
-        .map(|entry| entry.wallet)
-        .collect::<HashSet<_>>();
-    let removed = current.difference(&published).copied().collect();
-    let added = published.difference(current).copied().collect();
-    (removed, added)
-}
-
 /// The exact membership change an incoming ranked set produces against `current`: the wallets
 /// dropped because they fall outside the incoming top-`cap`, and the wallets newly admitted.
 ///
@@ -470,6 +455,19 @@ pub(crate) fn ranked_membership_change(
     incoming: &[WatchlistEntry],
     cap: usize,
 ) -> (Vec<WalletAddress>, Vec<WalletAddress>) {
+    let current_wallets: Vec<WalletAddress> = current.iter().map(|entry| entry.wallet).collect();
+    ranked_membership_change_wallets(&current_wallets, incoming, cap)
+}
+
+/// Wallet-identity core of [`ranked_membership_change`]: the runtime passes its live entries,
+/// the offline verifier passes the membership it replayed from the paper log. One rule, two
+/// callers, so the sealed `MembershipChanged` mutation can never disagree with what production
+/// published for the same ranking artifact.
+pub(crate) fn ranked_membership_change_wallets(
+    current: &[WalletAddress],
+    incoming: &[WatchlistEntry],
+    cap: usize,
+) -> (Vec<WalletAddress>, Vec<WalletAddress>) {
     let incoming_set: HashSet<WalletAddress> = incoming
         .iter()
         .take(cap)
@@ -477,11 +475,12 @@ pub(crate) fn ranked_membership_change(
         .collect();
     let dropped: Vec<WalletAddress> = current
         .iter()
-        .map(|entry| entry.wallet)
+        .copied()
         .filter(|wallet| !incoming_set.contains(wallet))
         .collect();
     let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
-    let admissions = planned_admissions(current, &removed, incoming, cap);
+    let current_set: HashSet<WalletAddress> = current.iter().copied().collect();
+    let admissions = planned_admission_wallets(&current_set, &removed, incoming, cap);
     (dropped, admissions)
 }
 
@@ -1321,10 +1320,15 @@ mod tests {
             else {
                 panic!("membership publisher sent a non-publication command");
             };
+            // The round-trip helpers publish full replacements: the membership before the
+            // change is exactly the removed set.
+            let current_membership: HashSet<WalletAddress> =
+                change.removed.iter().copied().collect();
             let record = change.into_record();
             let result = crate::qualification::verify_published_membership_change(
                 &record,
                 &verifier_source_log,
+                &current_membership,
             )
             .map(|()| pe_event_log::AppendReceipt {
                 sequence: pe_core_types::EventSeq(1),
@@ -1856,6 +1860,12 @@ mod tests {
                                 crate::qualification::verify_published_membership_change(
                                     &change.clone().into_record(),
                                     &verifier_source_log,
+                                    &control_live
+                                        .snapshot()
+                                        .entries
+                                        .iter()
+                                        .map(|entry| entry.wallet)
+                                        .collect(),
                                 )
                             {
                                 acknowledged.send(Err(error.to_string())).unwrap();
