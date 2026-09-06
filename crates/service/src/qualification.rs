@@ -1443,7 +1443,10 @@ fn verify_live_wrappers(
                     );
                 if wrapper.identity.dispatch_id != paper_decision_id
                     || wrapper.identity.idempotency_key
-                        != format!("{paper_decision_id}:{account_id}")
+                        != pe_execution_core::LiveOrderIdentity::idempotency_key_for(
+                            &paper_decision_id,
+                            &account_id,
+                        )
                     || projection.leader_wallet != paper.operation.leader_wallet.to_string()
                     || projection.market_id != paper.economic.market.market_id
                     || projection.outcome_id
@@ -6292,9 +6295,10 @@ mod tests {
             price_receipts: vec![test_receipt(1007)],
             evaluated_at_unix_ms: EVALUATED_MS,
         };
+        // A REST-polled observation IS its own complete-read bound (bucket_commit's producer).
         let observation = ObservationEvidence {
             source_receipt: test_receipt(1005),
-            complete_bound_receipt: test_receipt(1006),
+            complete_bound_receipt: test_receipt(1005),
             observed_unix_ms: EVALUATED_MS - 5_000,
             provenance: "rest_poll".to_owned(),
         };
@@ -6445,12 +6449,12 @@ mod tests {
         (continuation, economic)
     }
 
-    /// PASS: observation, complete-bound, Gamma, CLOB-long, compact-CLOB, and book receipts at
-    /// the recorded risk clock are causal for a zero-position first trade.
+    /// PASS: the REST observation (its own complete-read bound), Gamma, CLOB-long, compact-CLOB,
+    /// and book receipts at the recorded risk clock are causal for a zero-position first trade.
     /// FAIL: moving any one receipt one millisecond after risk remains before Prepared but fails.
     #[tokio::test]
     async fn economic_receipts_are_bounded_by_the_recorded_risk_clock() {
-        const RECEIPTS: [u64; 6] = [1005, 1006, 1001, 1002, 1003, 1004];
+        const RECEIPTS: [u64; 5] = [1005, 1001, 1002, 1003, 1004];
         let fixture = receipt_backed_decline_fixture().await;
         let continuation = fixture.decision.continuation.clone();
         let mut economic = evaluated_economic(&fixture.decision).clone();
@@ -6464,6 +6468,13 @@ mod tests {
         for sequence in RECEIPTS {
             source.get_mut(&sequence).unwrap().received_unix_ms = evaluated_at_unix_ms;
         }
+        // The observation's recorded clock must agree with its (moved) selected receipt, and the
+        // recorded market/settlement clocks must equal the receipt-derived seconds.
+        if let Some(observation) = economic.observation.as_mut() {
+            observation.observed_unix_ms = evaluated_at_unix_ms;
+        }
+        economic.admission.market.observed_at_unix = evaluated_at_unix_ms.div_euclid(1_000);
+        economic.admission.settlement.observed_at_unix = evaluated_at_unix_ms.div_euclid(1_000);
         economic.risk.financial_prefix = frames[0].receipt;
         economic.risk.price_receipts.clear();
         economic.balance.cash_before = fixture.start.starting_bankroll;
@@ -7041,9 +7052,10 @@ mod tests {
     fn winner_follow_replay_accepts_golden_compatible_positive_outcome() {
         let (continuation, economic) = winner_follow_policy_fixture();
         let frozen = &continuation.facts;
+        // A REST-polled observation IS its own complete-read bound (bucket_commit's producer).
         let observation = ObservationEvidence {
             source_receipt: test_receipt(20),
-            complete_bound_receipt: test_receipt(21),
+            complete_bound_receipt: test_receipt(20),
             observed_unix_ms: frozen.source_epoch * 1_000,
             provenance: "rest_poll".to_owned(),
         };
@@ -9779,7 +9791,10 @@ mod tests {
         let economic = test_economic("prepare-approved", test_receipt(41), test_receipt(42));
         let identity = LiveOrderIdentity {
             dispatch_id: "prepare-approved".to_owned(),
-            idempotency_key: "prepare-approved:live-a".to_owned(),
+            idempotency_key: LiveOrderIdentity::idempotency_key_for(
+                "prepare-approved",
+                &AccountId::new("live-a").unwrap(),
+            ),
             quote_id: "prepare-quote".to_owned(),
             config_hash: economic.applied_configuration_hash.clone(),
             decision_hash: "prepare-decision".to_owned(),

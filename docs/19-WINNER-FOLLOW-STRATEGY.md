@@ -375,7 +375,8 @@ fraction_leader_promoted     = 0.25          # raise to 0.50 only with kelly_fra
 fraction_hard_max            = 0.50          # absolute ceiling without separate signed config change
 
 [winner_follow.risk]
-# Per-trade caps (ModeDefault resolution; production retired these — see header note)
+# Per-trade caps (ModeDefault resolution; the reviewed production row is `unlimited`, and any valid
+# post-activation row is accepted and recorded for strict replay — see the header note)
 max_trade_live_tiny_bps              = 25    # 0.25 % bankroll
 max_trade_promoted_bps               = 100   # 1.00 %
 

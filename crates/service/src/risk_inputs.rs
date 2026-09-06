@@ -2067,6 +2067,8 @@ mod tests {
     /// PASS: synchronization catch-up reads only from the retained next-frame offset, so damage
     /// deliberately injected into an already indexed frame makes full replay fail but does not
     /// prevent the independently hash-bound new tail frame from being indexed.
+    /// FAIL: catch-up rereads the corrupted indexed prefix, skips the hash-bound suffix, or
+    /// leaves the suffix unaddressable.
     #[test]
     fn source_receipt_index_catch_up_never_rereads_indexed_prefix() {
         let dir = tempfile::tempdir().unwrap();

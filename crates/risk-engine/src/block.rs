@@ -25,8 +25,8 @@ pub enum RiskBlock {
     /// The service-owned copy-latency kill switch is active.
     CopyLatencyKillSwitch,
     /// Proposed trade size exceeds `RiskSnapshot.per_trade_cap_bps` (the resolved
-    /// `PerTradeCap`; production runs `unlimited` = 10 000 bps since #508 — the price-impact
-    /// cap is the sole policy size limit there).
+    /// `PerTradeCap` recorded in the snapshot; the production cap policy is canonical in
+    /// `docs/19-WINNER-FOLLOW-STRATEGY.md`).
     PerTradeSizeExceeded,
     /// Resolver evidence is absent, stale, ambiguous, deferred, or mismatched.
     ResolverNotTradable,
