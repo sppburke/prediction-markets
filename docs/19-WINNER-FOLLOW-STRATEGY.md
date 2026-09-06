@@ -275,20 +275,21 @@ p = calibrated_probability(
 The strategy returns its configured fixed quantity or monetary allocation unchanged. It does not
 apply a book, depth, or notional cap.
 
-**Owner decision (#508, recorded): the ordinary per-trade bps caps are retired in production.** The
-production `service_config.per_trade_cap` row is `unlimited` after the #508 Phase-A cutover, and the
-**price-impact cap** (`price_impact_cap_bps`, `_GLOSSARY.md`) becomes the sole production policy
-order-size limit, below the always-applying available-bankroll affordability bound.
-`sizing_dollar_usd` stays the sizing input, not a cap.
+**Owner decision (#508, recorded): the reviewed production `service_config.per_trade_cap` row is
+`unlimited`** after the #508 Phase-A cutover, and the **price-impact cap** (`price_impact_cap_bps`,
+`_GLOSSARY.md`) is the production policy order-size limit, below the always-applying
+available-bankroll affordability bound. `sizing_dollar_usd` stays the sizing input, not a cap.
+The one-time #544 activation boot requires `unlimited`; after activation every valid row is a
+legitimate operator input (see below), and whatever cap is applied is recorded in each live risk
+snapshot so strict replay reuses the recorded value (#545).
 
-The `PerTradeCap` enum is retained for backtest/research and as the safe boot posture
-(set in `WinnerFollowConfig.per_trade_cap`):
+The `PerTradeCap` enum (set in `WinnerFollowConfig.per_trade_cap`) resolves as follows:
 
 | Variant | Resolved cap | Use |
 |---|---|---|
-| `ModeDefault` (default) | 25 bps LiveTiny / 100 bps Promoted | Boot/outage posture; backtest default |
-| `Bps(n)` | `n` bps of bankroll | Research / tuning |
-| `Unlimited` | 10 000 bps (full bankroll) | **Production (#508)**; backtest Kelly-fraction study |
+| `ModeDefault` (default) | 25 bps LiveTiny / 100 bps Promoted | Boot/outage posture; backtest default; valid post-activation row |
+| `Bps(n)` | `n` bps of bankroll | Research / tuning; valid post-activation row (`bps:1..=10000`) |
+| `Unlimited` | 10 000 bps (full bankroll) | **Reviewed production value (#508, #544 activation)**; backtest Kelly-fraction study |
 
 The service completes and validates the mandatory Supabase hot snapshot before any producer starts.
 There is no configuration-outage producer posture: the one-time #544 activation boot requires the
@@ -351,9 +352,12 @@ All values in basis points (1 bp = 0.01 %). Comments show the percent equivalent
 # winner-follow.toml — canonical risk caps. Other docs reference this block.
 #
 # Enforcement status (#508 Phase A owner decision, recorded):
-# - Per-trade bps caps: RETIRED in production (per_trade_cap = unlimited after the cutover;
-#   ModeDefault stays the boot/outage posture). The price-impact cap is the sole policy size
-#   limit — production default 100 bps of best ask (`price_impact_cap_bps`, _GLOSSARY.md).
+# - Per-trade bps caps: the reviewed production row is per_trade_cap = unlimited (required at the
+#   one-time #544 activation boot; ModeDefault stays the boot/outage posture). Any valid row
+#   (unlimited, mode_default, bps:1..=10000) is accepted after activation and the resolved cap
+#   is recorded in every live risk snapshot for strict replay (#545). The price-impact cap is
+#   the policy size limit — production default 100 bps of best ask (`price_impact_cap_bps`,
+#   _GLOSSARY.md).
 # - Concentration caps: UN-ENFORCED BY DECISION on the production copy path. The values below
 #   remain canonical for backtest/tests, carried as `RiskSnapshot.concentration_caps =
 #   Some(ConcentrationCaps::CANONICAL)`; production passes `None` (typed, not accidental).

@@ -7322,7 +7322,7 @@ mod tests {
         );
         let identity = LiveOrderIdentity {
             dispatch_id: dispatch_id.clone(),
-            idempotency_key: format!("{dispatch_id}:{account_id}"),
+            idempotency_key: LiveOrderIdentity::idempotency_key_for(&dispatch_id, &account_id),
             quote_id: "paper-quote".to_owned(),
             config_hash: economic.applied_configuration_hash.clone(),
             decision_hash: "paper-decision".to_owned(),

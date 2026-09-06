@@ -1004,6 +1004,8 @@ mod tests {
     /// PASS: synchronization uncertainty leaves a complete frame N for reopen, the receipt index
     /// catches N up before the held payload retries as N+1, and later appends remain acknowledged
     /// and addressable without an index gap.
+    /// FAIL: a permanent receipt-index gap after the fault, or a later append that cannot be
+    /// acknowledged or addressed.
     #[tokio::test(start_paused = true)]
     async fn coordinator_catches_index_up_after_complete_sync_fault_frame() {
         let dir = tempfile::tempdir().unwrap();

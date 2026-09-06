@@ -2031,7 +2031,10 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 },
                 identity: LiveOrderIdentity {
                     dispatch_id: live_dispatch_id.clone(),
-                    idempotency_key: format!("{live_dispatch_id}:{live_account_id}"),
+                    idempotency_key: LiveOrderIdentity::idempotency_key_for(
+                        &live_dispatch_id,
+                        &live_account_id,
+                    ),
                     quote_id: "golden-quote".to_owned(),
                     config_hash: first_economic.applied_configuration_hash.clone(),
                     decision_hash: "golden-decision".to_owned(),

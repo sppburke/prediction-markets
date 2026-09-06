@@ -3221,6 +3221,7 @@ mod tests {
     }
 
     /// PASS: recovery ignores every order/admission fact before the account's first Baseline.
+    /// FAIL: any pre-Baseline fact yields recovery work, or a later Baseline is accepted.
     #[test]
     fn recovery_slices_all_pre_baseline_account_facts() {
         let dir = tempdir().unwrap();
@@ -3296,6 +3297,8 @@ mod tests {
     }
 
     /// PASS: dispatch identity, not caller-provided idempotency text, deduplicates admissions.
+    /// FAIL: a second Approved admission for the same account/dispatch is accepted under a
+    /// different key.
     #[test]
     fn recovery_rejects_two_admissions_for_one_dispatch_with_different_keys() {
         let dir = tempdir().unwrap();
