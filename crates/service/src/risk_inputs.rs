@@ -1249,7 +1249,10 @@ mod tests {
         }
     }
 
-    fn latency_economic(source_receipt: AppendReceipt) -> EconomicPrepared {
+    fn latency_economic(
+        source_receipt: AppendReceipt,
+        financial_prefix: AppendReceipt,
+    ) -> EconomicPrepared {
         let condition = PolymarketConditionId("condition-latency".to_owned());
         let price = Price::new(dec!(0.5)).unwrap();
         let shares = ShareAmount::from_whole(2).unwrap();
@@ -1329,6 +1332,7 @@ mod tests {
                 reserve: CollateralAmount::ZERO,
             },
             risk: RiskAudit {
+                financial_prefix,
                 snapshot: RiskSnapshot {
                     leader_exposure_bps: BasisPoints::ZERO,
                     market_exposure_bps: BasisPoints::ZERO,
@@ -1654,7 +1658,7 @@ mod tests {
                         source_trade_id: pe_core_types::SourceTradeId("trade".to_owned()),
                         observed_at_bucket: 9_998,
                     },
-                    economic: latency_economic(source_receipt),
+                    economic: latency_economic(source_receipt, receipt(1, 1)),
                 },
             },
         );

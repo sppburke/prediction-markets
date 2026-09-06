@@ -2321,6 +2321,7 @@ mod tests {
                     reserve: CollateralAmount::ZERO,
                 },
                 risk: RiskAudit {
+                    financial_prefix: receipt,
                     snapshot: RiskSnapshot {
                         leader_exposure_bps: BasisPoints::ZERO,
                         market_exposure_bps: BasisPoints::ZERO,

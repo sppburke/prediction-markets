@@ -708,6 +708,7 @@ async fn verify_qualification(
     let mut waiting_for_anchor_mark = true;
     let mut valid_marks = Vec::<(u64, QualificationMarkReport)>::new();
     let mut latest_causal_financial = None;
+    let mut previous_fill_financial_prefix = None;
 
     for (offset, frame) in frames[start_index + 1..=financial_prefix_index]
         .iter()
@@ -724,17 +725,28 @@ async fn verify_qualification(
                         operation,
                         economic,
                     } => {
+                        let paper_prefix = recorded_fill_paper_prefix(
+                            &frames[start_index..frame_index],
+                            economic.risk.financial_prefix,
+                            economic.risk.evaluated_at_unix_ms,
+                            &mut previous_fill_financial_prefix,
+                        )?;
+                        let financial_at_prefix = financial_state_at_prefix(
+                            start.starting_bankroll.to_decimal(),
+                            &completed_financial_facts,
+                            economic.risk.financial_prefix,
+                        )?;
                         verify_economic(
                             operation,
                             economic,
                             &RiskReplayContext {
-                                cash: financial.cash,
-                                positions: &financial.positions,
-                                fills: &financial.fills,
-                                settlements: &financial.settlements,
-                                last_completed: financial.last_completed,
+                                cash: financial_at_prefix.cash,
+                                positions: &financial_at_prefix.positions,
+                                fills: &financial_at_prefix.fills,
+                                settlements: &financial_at_prefix.settlements,
+                                last_completed: financial_at_prefix.last_completed,
                                 start_receipt,
-                                paper_prefix: &frames[start_index..frame_index],
+                                paper_prefix,
                                 source: &source_observations,
                                 prepared_received_unix_ms: received_unix_ms(&frame.envelope)?,
                                 start_hot_config_hash: &start.hot_config_hash,
@@ -3975,6 +3987,7 @@ async fn verify_economic(
     }
 
     let risk = RiskAudit {
+        financial_prefix: economic.risk.financial_prefix,
         snapshot: reconstructed,
         decision: expected_risk,
         price_receipts: economic.risk.price_receipts.clone(),
@@ -4624,7 +4637,7 @@ struct DeclineReplayContext<'a> {
     start_receipt: AppendReceipt,
 }
 
-fn decline_financial_state(
+fn financial_state_at_prefix(
     starting_bankroll: Decimal,
     facts: &[CompletedFinancialFact],
     financial_prefix: AppendReceipt,
@@ -4637,32 +4650,48 @@ fn decline_financial_state(
     )
 }
 
-fn decline_paper_prefix<'a>(
-    context: &'a DeclineReplayContext<'_>,
+fn paper_prefix_at_financial_prefix(
+    frames: &[ScannedPaperFrame],
     financial_prefix: AppendReceipt,
     evaluated_at_unix_ms: i64,
-) -> Result<&'a [ScannedPaperFrame], QualificationError> {
-    let prefix_index = context
-        .frames
+) -> Result<&[ScannedPaperFrame], QualificationError> {
+    let prefix_index = frames
         .iter()
         .position(|frame| frame.receipt == financial_prefix)
         .ok_or_else(|| {
             QualificationError::InsufficientEvidence(
-                "decline financial prefix is absent from the sealed paper log".to_owned(),
+                "financial prefix is absent from the causal paper log".to_owned(),
             )
         })?;
-    if prefix_index < context.start_index {
-        return insufficient("decline financial prefix precedes QualificationStarted");
-    }
-    let prefix = &context.frames[context.start_index..=prefix_index];
+    let prefix = &frames[..=prefix_index];
     if prefix
         .last()
         .map(|frame| received_unix_ms(&frame.envelope))
         .transpose()?
         .is_none_or(|prefix_ms| prefix_ms > evaluated_at_unix_ms)
     {
-        return insufficient("decline risk evaluation precedes its financial prefix");
+        return insufficient("risk evaluation precedes its financial prefix");
     }
+    Ok(prefix)
+}
+
+fn recorded_fill_paper_prefix<'a>(
+    frames_before_prepared: &'a [ScannedPaperFrame],
+    financial_prefix: AppendReceipt,
+    evaluated_at_unix_ms: i64,
+    previous_fill_financial_prefix: &mut Option<AppendReceipt>,
+) -> Result<&'a [ScannedPaperFrame], QualificationError> {
+    let prefix = paper_prefix_at_financial_prefix(
+        frames_before_prepared,
+        financial_prefix,
+        evaluated_at_unix_ms,
+    )?;
+    if previous_fill_financial_prefix
+        .is_some_and(|previous| financial_prefix.sequence < previous.sequence)
+    {
+        return insufficient("fill financial prefix regresses from the previous fill");
+    }
+    *previous_fill_financial_prefix = Some(financial_prefix);
     Ok(prefix)
 }
 
@@ -4821,9 +4850,12 @@ async fn replay_unavailable_risk_inputs(
     let Some(financial_prefix) = evidence.financial_prefix else {
         return Ok(Some(RiskInputsUnavailable::SnapshotSequenceMismatch));
     };
-    let paper_prefix =
-        decline_paper_prefix(context, financial_prefix, evidence.evaluated_at_unix_ms)?;
-    let financial = decline_financial_state(
+    let paper_prefix = paper_prefix_at_financial_prefix(
+        &context.frames[context.start_index..],
+        financial_prefix,
+        evidence.evaluated_at_unix_ms,
+    )?;
+    let financial = financial_state_at_prefix(
         started.starting_bankroll.to_decimal(),
         context.completed_financial_facts,
         financial_prefix,
@@ -4930,12 +4962,12 @@ async fn verify_winner_follow_decline_decision(
                     frozen.source_trade_id
                 ));
             }
-            let paper_prefix = decline_paper_prefix(
-                context,
+            let paper_prefix = paper_prefix_at_financial_prefix(
+                &context.frames[context.start_index..],
                 *financial_prefix,
                 economic.risk.evaluated_at_unix_ms,
             )?;
-            let financial = decline_financial_state(
+            let financial = financial_state_at_prefix(
                 started.starting_bankroll.to_decimal(),
                 context.completed_financial_facts,
                 *financial_prefix,
@@ -6097,6 +6129,7 @@ mod tests {
                 reserve: CollateralAmount::ZERO,
             },
             risk: RiskAudit {
+                financial_prefix: receipt(1),
                 snapshot: RiskSnapshot {
                     leader_exposure_bps: pe_core_types::BasisPoints::ZERO,
                     market_exposure_bps: pe_core_types::BasisPoints::ZERO,
@@ -6554,7 +6587,7 @@ mod tests {
             result,
         }];
         let frames = vec![start_frame, prepared_frame, final_frame];
-        let financial = decline_financial_state(
+        let financial = financial_state_at_prefix(
             start.starting_bankroll.to_decimal(),
             &facts,
             frames[2].receipt,
@@ -6605,6 +6638,7 @@ mod tests {
         )
         .unwrap();
         let risk = RiskAudit {
+            financial_prefix: frames[2].receipt,
             decision: match evaluate_risk(&snapshot) {
                 RiskDecision::Approved => RiskDecisionAudit::Approved,
                 RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
@@ -6700,6 +6734,171 @@ mod tests {
                 observation,
             )]),
         }
+    }
+
+    /// PASS: a fill whose market resolves after its recorded risk prefix replays against the open
+    /// position at that prefix, while an absent or regressing receipt is insufficient evidence.
+    /// FAIL: replay uses the post-resolution state, or either falsifier reaches economic replay.
+    #[tokio::test]
+    async fn fill_risk_replay_is_bounded_by_its_recorded_financial_prefix() {
+        const EVALUATED_MS: i64 = 1_800_000_010_000;
+        let mut fixture = receipt_backed_decline_fixture().await;
+        let continuation = fixture.decision.continuation.clone();
+        let economic = fixture
+            .decision
+            .post_boundary
+            .body
+            .terminal
+            .decline
+            .as_ref()
+            .and_then(|decline| match &decline.inputs {
+                WinnerFollowDecisionInputs::Evaluated { economic, .. } => {
+                    Some(economic.as_ref().clone())
+                }
+                WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
+            })
+            .expect("receipt-backed fixture must contain evaluated inputs");
+        let recorded_prefix = fixture.frames[2].receipt;
+        assert_eq!(economic.risk.financial_prefix, recorded_prefix);
+
+        let open_condition = fixture
+            .facts
+            .first()
+            .and_then(|fact| match &fact.payload {
+                FinancialPayload::Fill { economic, .. } => {
+                    Some(economic.market.condition_id.clone())
+                }
+                FinancialPayload::Resolution { .. } => None,
+            })
+            .expect("fixture must begin with a fill");
+        let resolution_payload = FinancialPayload::Resolution {
+            condition_id: open_condition,
+            payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
+            resolution_source_receipt: test_receipt(2_000),
+        };
+        let resolution_prepared = test_frame(
+            4,
+            EVALUATED_MS.div_euclid(1_000) + 1,
+            PaperLogRecord::FinancialPrepared {
+                expected_authority: crate::paper_recovery::ExpectedAuthority {
+                    qualification_start_receipt: fixture.frames[0].receipt,
+                    prior_completed_prepared_sequence: Some(EventSeq(2)),
+                },
+                payload: resolution_payload.clone(),
+            },
+        );
+        let resolution_result = FinancialResult::Resolution {
+            canonical: crate::paper_recovery::CanonicalResolutionResult {
+                outcome: "applied".to_owned(),
+                bankroll: dec!(120),
+                applied_prepared_seq: resolution_prepared.receipt.sequence,
+                credit: CollateralAmount::from_decimal_exact(dec!(40)).unwrap(),
+                settled_at_unix: EVALUATED_MS.div_euclid(1_000) + 1,
+            },
+        };
+        let resolution_final = test_frame(
+            5,
+            EVALUATED_MS.div_euclid(1_000) + 2,
+            PaperLogRecord::FinancialFinal {
+                prepared_receipt: resolution_prepared.receipt,
+                result: resolution_result.clone(),
+            },
+        );
+        fixture.facts.push(CompletedFinancialFact {
+            prepared_receipt: resolution_prepared.receipt,
+            final_receipt: resolution_final.receipt,
+            payload: resolution_payload,
+            result: resolution_result,
+        });
+        fixture.frames.push(resolution_prepared);
+        fixture.frames.push(resolution_final);
+
+        let operation = crate::paper_recovery::PaperFillOperationIdentity {
+            leader_wallet: continuation.facts.wallet,
+            source_trade_id: continuation.facts.source_trade_id.clone(),
+            observed_at_bucket: continuation.facts.source_epoch,
+        };
+        fixture.frames.push(test_frame(
+            6,
+            EVALUATED_MS.div_euclid(1_000) + 3,
+            PaperLogRecord::FinancialPrepared {
+                expected_authority: crate::paper_recovery::ExpectedAuthority {
+                    qualification_start_receipt: fixture.frames[0].receipt,
+                    prior_completed_prepared_sequence: Some(EventSeq(4)),
+                },
+                payload: FinancialPayload::Fill {
+                    operation: operation.clone(),
+                    economic: economic.clone(),
+                },
+            },
+        ));
+        let prepared_index = fixture.frames.len() - 1;
+        let mut previous_fill_prefix = None;
+        let paper_prefix = recorded_fill_paper_prefix(
+            &fixture.frames[..prepared_index],
+            economic.risk.financial_prefix,
+            economic.risk.evaluated_at_unix_ms,
+            &mut previous_fill_prefix,
+        )
+        .unwrap();
+        assert_eq!(paper_prefix.last().unwrap().receipt, recorded_prefix);
+
+        let financial_at_prefix = financial_state_at_prefix(
+            fixture.start.starting_bankroll.to_decimal(),
+            &fixture.facts,
+            recorded_prefix,
+        )
+        .unwrap();
+        let post_resolution = financial_state_at_prefix(
+            fixture.start.starting_bankroll.to_decimal(),
+            &fixture.facts,
+            fixture.frames[4].receipt,
+        )
+        .unwrap();
+        assert_eq!(financial_at_prefix.positions.len(), 1);
+        assert!(post_resolution.positions.is_empty());
+
+        let replay = RiskReplayContext {
+            cash: financial_at_prefix.cash,
+            positions: &financial_at_prefix.positions,
+            fills: &financial_at_prefix.fills,
+            settlements: &financial_at_prefix.settlements,
+            last_completed: financial_at_prefix.last_completed,
+            start_receipt: fixture.frames[0].receipt,
+            paper_prefix,
+            source: &fixture.source,
+            prepared_received_unix_ms: received_unix_ms(&fixture.frames[prepared_index].envelope)
+                .unwrap(),
+            start_hot_config_hash: &fixture.start.hot_config_hash,
+            financial_semantic_version: fixture.start.financial_semantic_version,
+        };
+        assert_eq!(
+            verify_economic(&operation, &economic, &replay)
+                .await
+                .unwrap(),
+            economic
+        );
+
+        assert!(matches!(
+            recorded_fill_paper_prefix(
+                &fixture.frames[..prepared_index],
+                test_receipt(999),
+                economic.risk.evaluated_at_unix_ms,
+                &mut previous_fill_prefix,
+            ),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("absent")
+        ));
+        assert!(matches!(
+            recorded_fill_paper_prefix(
+                &fixture.frames[..prepared_index],
+                fixture.frames[0].receipt,
+                economic.risk.evaluated_at_unix_ms,
+                &mut previous_fill_prefix,
+            ),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("regresses")
+        ));
     }
 
     /// PASS: the verifier accepts a recorded Entry only when the shared complete-second
@@ -7137,6 +7336,7 @@ mod tests {
                 reserve: CollateralAmount::ZERO,
             },
             risk: RiskAudit {
+                financial_prefix: test_receipt(1),
                 snapshot: RiskSnapshot {
                     leader_exposure_bps: BasisPoints::ZERO,
                     market_exposure_bps: BasisPoints::ZERO,

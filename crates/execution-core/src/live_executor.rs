@@ -1349,6 +1349,7 @@ mod tests {
                 reserve: CollateralAmount::ZERO,
             },
             risk: RiskAudit {
+                financial_prefix: receipt,
                 snapshot: risk_snapshot,
                 decision: RiskDecisionAudit::Approved,
                 price_receipts: Vec::new(),

@@ -74,6 +74,9 @@ pub enum RiskDecisionAudit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskAudit {
+    /// Paper-log tail observed before the snapshot was built; the durable state this audit was
+    /// evaluated on.
+    pub financial_prefix: AppendReceipt,
     pub snapshot: RiskSnapshot,
     pub decision: RiskDecisionAudit,
     /// Source-log receipts of every current-price observation consumed by `snapshot`, sorted by
@@ -362,6 +365,7 @@ mod tests {
 
     fn risk() -> RiskAudit {
         RiskAudit {
+            financial_prefix: receipt(4),
             snapshot: RiskSnapshot {
                 leader_exposure_bps: BasisPoints::ZERO,
                 market_exposure_bps: BasisPoints::ZERO,
@@ -442,6 +446,7 @@ mod tests {
         assert_eq!(prepared.sizing.all_in_price.0, dec!(0.5151));
         assert_eq!(prepared.book_receipt, receipt(4));
         assert_eq!(prepared.admission.receipts.gamma, receipt(1));
+        assert_eq!(prepared.risk.financial_prefix, receipt(4));
         assert_eq!(prepared.risk.price_receipts, vec![receipt(5), receipt(6)]);
         assert_eq!(prepared.risk.evaluated_at_unix_ms, 1_800_000_000_000);
         assert!(prepared.fee.reserve >= prepared.fee.expected_fee);
@@ -577,6 +582,10 @@ mod tests {
         let plan = plan();
         let prepared = EconomicPrepared::compose(inputs(&admission, &plan)).unwrap();
         let original = prepared.core_hash().unwrap();
+
+        let mut changed_financial_prefix = prepared.clone();
+        changed_financial_prefix.risk.financial_prefix = receipt(3);
+        assert_ne!(changed_financial_prefix.core_hash().unwrap(), original);
 
         let mut changed_receipt = prepared.clone();
         changed_receipt.risk.price_receipts[0] = receipt(7);

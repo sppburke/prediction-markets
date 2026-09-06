@@ -613,7 +613,10 @@ fn active_start_record() -> PaperLogRecord {
     }))
 }
 
-fn active_economic(source_receipt: AppendReceipt) -> EconomicPrepared {
+fn active_economic(
+    source_receipt: AppendReceipt,
+    financial_prefix: AppendReceipt,
+) -> EconomicPrepared {
     let price = Price::new(dec!(0.5)).unwrap();
     let shares = ShareAmount::from_whole(2).unwrap();
     let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
@@ -692,6 +695,7 @@ fn active_economic(source_receipt: AppendReceipt) -> EconomicPrepared {
             reserve: CollateralAmount::ZERO,
         },
         risk: RiskAudit {
+            financial_prefix,
             snapshot: RiskSnapshot {
                 leader_exposure_bps: BasisPoints::ZERO,
                 market_exposure_bps: BasisPoints::ZERO,
@@ -801,7 +805,7 @@ async fn active_fill_crash_matrix_converges_once() {
         };
         let payload = FinancialPayload::Fill {
             operation: operation.clone(),
-            economic: active_economic(source_receipt),
+            economic: active_economic(source_receipt, start),
         };
         let prepared_receipt = append_active_record(
             &mut writer,
@@ -942,7 +946,7 @@ async fn prepared_authority_changed_field_conflict_matrix() {
         source_trade_id: SourceTradeId("g2:authority-fill".to_owned()),
         observed_at_bucket: 1_800_000_000,
     };
-    let economic = active_economic(active_receipt(5, 5));
+    let economic = active_economic(active_receipt(5, 5), start);
     let request =
         PreparedFillRequest::from_prepared(expected, active_receipt(11, 11), &operation, &economic);
     authority.commit_prepared_fill(&request).await.unwrap();

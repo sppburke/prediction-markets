@@ -960,22 +960,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     &attempt,
                 )
             })?;
-        let financial_prefix = crate::paper_recovery::scan_paper_log(&paper_log_path)
-            .map_err(|_| {
-                ActivePaperRiskFailure::new(
-                    RiskInputsUnavailable::SnapshotSequenceMismatch,
-                    &attempt,
-                )
-            })?
-            .last()
-            .map(|frame| frame.receipt)
-            .ok_or_else(|| {
-                ActivePaperRiskFailure::new(
-                    RiskInputsUnavailable::SnapshotSequenceMismatch,
-                    &attempt,
-                )
-            })?;
-        attempt.financial_prefix = Some(financial_prefix);
+        let financial_prefix = attempt.financial_prefix.ok_or_else(|| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
         self.apply_global_halts_to_snapshot(&mut snapshot);
         let decision = match pe_risk_engine::evaluate_risk(&snapshot) {
             pe_risk_engine::RiskDecision::Approved => {
@@ -987,6 +974,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         };
         Ok((
             pe_execution_core::RiskAudit {
+                financial_prefix,
                 snapshot,
                 decision,
                 price_receipts,

@@ -1467,7 +1467,7 @@ mod paper_log_tests {
         }
     }
 
-    fn economic() -> EconomicPrepared {
+    fn economic(financial_prefix: AppendReceipt) -> EconomicPrepared {
         let price = Price::new(dec!(0.5)).unwrap();
         let shares = ShareAmount::from_whole(2).unwrap();
         let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
@@ -1542,6 +1542,7 @@ mod paper_log_tests {
                 reserve: CollateralAmount::ZERO,
             },
             risk: RiskAudit {
+                financial_prefix,
                 snapshot: RiskSnapshot {
                     leader_exposure_bps: BasisPoints::ZERO,
                     market_exposure_bps: BasisPoints::ZERO,
@@ -1611,7 +1612,7 @@ mod paper_log_tests {
                     source_trade_id: SourceTradeId(source_trade_id.to_owned()),
                     observed_at_bucket: 1,
                 },
-                economic: economic(),
+                economic: economic(start_receipt),
             },
         }
     }
@@ -1805,7 +1806,7 @@ mod paper_log_tests {
 
     #[test]
     fn economic_record_hash_and_debits_are_exact() {
-        let economic = economic();
+        let economic = economic(receipt(0));
         assert_eq!(economic.core_hash().unwrap(), economic.core_hash().unwrap());
         assert_eq!(
             economic.all_in_debit().unwrap(),
