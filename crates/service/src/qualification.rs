@@ -43,14 +43,17 @@ use pe_risk_engine::{
     aggregate_resolution_credit, evaluate_risk, nearest_rank_p95,
 };
 use pe_source_polymarket_public::ClassifiedPricesHistory;
+#[cfg(test)]
+use pe_source_polymarket_public::GAMMA_BATCH_LIMIT_PARAM;
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
     ClobPricesHistoryClient, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
-    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, LIVE_MARKET_PARSER_VERSION,
-    LIVE_MARKET_SCHEMA_VERSION, MarketFilter, PageFetcher, RECONCILIATION_PAGE_LIMIT,
-    ReconciliationPageEvidence, aggregate_activity_rows, parse_activity_response,
-    parse_activity_row, parse_activity_trade_observation, parse_clob_market, validate_live_market,
+    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaOpenConditionRequest,
+    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, MarketFilter, PageFetcher,
+    RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence, aggregate_activity_rows,
+    parse_activity_response, parse_activity_row, parse_activity_trade_observation,
+    parse_clob_market, validate_live_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
 use pe_venue_polymarket::{BuySizing, LadderError, parse_compact_market, plan_sized_buy};
@@ -66,7 +69,6 @@ use crate::decision_replay::{
 use crate::mid_price_cache::{
     GAMMA_PRICE_ATTEMPT_PARSER_VERSION, GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
     GammaPriceAttemptRecord, StrictPriceInput, classify_strict_price_time, classify_strict_prices,
-    gamma_price_request,
 };
 use crate::paper_recovery::{
     CapacityMembershipArtifact, FINANCIAL_SEMANTIC_VERSION, FinancialPayload, FinancialResult,
@@ -3484,7 +3486,7 @@ async fn replayed_risk_prices(
                 error: _,
             } => (request_url, None),
         };
-        let request = gamma_price_request(&request_url).ok_or_else(|| {
+        let request = GammaOpenConditionRequest::parse(&request_url).ok_or_else(|| {
             RiskPriceReplayError::Insufficient(
                 "risk Gamma acquisition has an invalid request identity".to_owned(),
             )
@@ -3879,6 +3881,18 @@ async fn verify_economic(
         context.start_hot_config_hash,
         context.financial_semantic_version,
     )?;
+    let financial_prefix = context
+        .paper_prefix
+        .last()
+        .map(|frame| frame.receipt)
+        .ok_or_else(|| {
+            QualificationError::InsufficientEvidence(
+                "EconomicPrepared risk prefix has no causal paper frame".to_owned(),
+            )
+        })?;
+    if financial_prefix != economic.risk.financial_prefix {
+        return insufficient("EconomicPrepared risk prefix differs from causal replay");
+    }
     let cash_before = CollateralAmount::from_decimal_exact(context.cash).map_err(|error| {
         QualificationError::InsufficientEvidence(format!(
             "replayed cash cannot be represented exactly: {error}"
@@ -3985,7 +3999,7 @@ async fn verify_economic(
     }
 
     let risk = RiskAudit {
-        financial_prefix: economic.risk.financial_prefix,
+        financial_prefix,
         snapshot: reconstructed,
         decision: expected_risk,
         price_receipts: economic.risk.price_receipts.clone(),
@@ -4944,10 +4958,7 @@ async fn verify_winner_follow_decline_decision(
             }
             pe_strategy_winner_follow::WinnerFollowDeclineAudit::RiskInputsUnavailable
         }
-        WinnerFollowDecisionInputs::Evaluated {
-            economic,
-            financial_prefix,
-        } => {
+        WinnerFollowDecisionInputs::Evaluated { economic } => {
             if economic.applied_configuration_hash != frozen.applied_configuration_hash
                 || economic.market.market_id != frozen.market_id.0.0
                 || u16::from(economic.market.outcome_index) != frozen.outcome_id.0
@@ -4962,13 +4973,13 @@ async fn verify_winner_follow_decline_decision(
             }
             let paper_prefix = paper_prefix_at_financial_prefix(
                 &context.frames[context.start_index..],
-                *financial_prefix,
+                economic.risk.financial_prefix,
                 economic.risk.evaluated_at_unix_ms,
             )?;
             let financial = financial_state_at_prefix(
                 started.starting_bankroll.to_decimal(),
                 context.completed_financial_facts,
-                *financial_prefix,
+                economic.risk.financial_prefix,
             )?;
             let replay = RiskReplayContext {
                 cash: financial.cash,
@@ -6382,8 +6393,9 @@ mod tests {
             "outcomePrices": "[\"0.45\",\"0.55\"]"
         }]))
         .unwrap();
-        let risk_price_url =
-            format!("https://offline.invalid/markets?condition_ids={OPEN_CONDITION}&limit=500");
+        let risk_price_url = format!(
+            "https://offline.invalid/markets?condition_ids={OPEN_CONDITION}&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
         let risk_price_record =
             gamma_price_page_record(&risk_price_url, EVALUATED_MS - 3_000, &risk_prices, true);
         let source = BTreeMap::from([
@@ -6697,7 +6709,6 @@ mod tests {
             &error,
             WinnerFollowDecisionInputs::Evaluated {
                 economic: Box::new(economic),
-                financial_prefix: frames[2].receipt,
             },
         );
         let terminal_disposition = terminal.disposition.clone();
@@ -6991,6 +7002,60 @@ mod tests {
         .unwrap();
     }
 
+    /// PASS: evaluated inputs have no wrapper financial-prefix field, and changing the economic
+    /// owner's prefix makes the decline insufficient even after recomputing its document hash.
+    /// FAIL: an evaluated wrapper prefix deserializes, or the tampered economic core is certified.
+    #[tokio::test]
+    async fn winner_follow_replay_rejects_tampered_economic_financial_prefix() {
+        let fixture = receipt_backed_decline_fixture().await;
+        let decision = fixture.decision.clone();
+        let mut body = decision.post_boundary.body;
+        let decline = body.terminal.decline.as_mut().unwrap();
+        let economic = match &mut decline.inputs {
+            WinnerFollowDecisionInputs::Evaluated { economic } => Some(economic),
+            WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
+        }
+        .expect("receipt-backed fixture must contain evaluated inputs");
+        economic.risk.financial_prefix = fixture.frames[0].receipt;
+        let mut duplicate = serde_json::to_value(&decline.inputs).unwrap();
+        duplicate.as_object_mut().unwrap().insert(
+            "financial_prefix".to_owned(),
+            serde_json::to_value(fixture.frames[2].receipt).unwrap(),
+        );
+        assert!(serde_json::from_value::<WinnerFollowDecisionInputs>(duplicate).is_err());
+        let post_commit_inputs_json = serde_json::to_string(
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+        )
+        .unwrap();
+        let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
+        let frozen_inputs_json =
+            format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap());
+        let recomputed = replay_decision_pending(&DecisionPendingRow {
+            source_trade_id: decision.continuation.facts.source_trade_id.clone(),
+            semantic_revision: decision.continuation.facts.semantic_revision.clone(),
+            wallet: decision.continuation.facts.wallet,
+            source_epoch: decision.continuation.facts.source_epoch,
+            frozen_inputs_json,
+            post_commit_inputs_json,
+            state: DecisionPendingState::Terminal,
+            terminal_disposition: Some("no_fill".to_owned()),
+            updated_at_unix: 1_700_000_001,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            bind_final_receipts(
+                &[recomputed],
+                &[],
+                &fixture.observations,
+                &fixture.start,
+                &fixture.context(),
+            )
+            .await,
+            Err(QualificationError::InsufficientEvidence(_))
+        ));
+    }
+
     /// PASS: recomputing the terminal document hash after replacing `NoEdge` with another typed
     /// decline remains insufficient because qualification re-executes the shared decision.
     #[tokio::test]
@@ -7062,20 +7127,18 @@ mod tests {
         };
         let mut body = decision.post_boundary.body;
         let decline = body.terminal.decline.as_mut().unwrap();
-        let (economic, financial_prefix) = match &decline.inputs {
-            WinnerFollowDecisionInputs::Evaluated {
-                economic,
-                financial_prefix,
-            } => Some((economic, financial_prefix)),
+        let economic = match &decline.inputs {
+            WinnerFollowDecisionInputs::Evaluated { economic } => Some(economic),
             WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
         }
         .expect("receipt-backed fixture must contain evaluated inputs");
+        let financial_prefix = economic.risk.financial_prefix;
         decline.outcome =
             pe_strategy_winner_follow::WinnerFollowDeclineAudit::RiskInputsUnavailable;
         decline.inputs = WinnerFollowDecisionInputs::RiskInputsUnavailable {
             cause: RiskInputsUnavailable::PriceMissing,
             evidence: WinnerFollowRiskInputEvidence {
-                financial_prefix: Some(*financial_prefix),
+                financial_prefix: Some(financial_prefix),
                 price_receipts: Vec::new(),
                 evaluated_at_unix_ms: economic.risk.evaluated_at_unix_ms,
                 proposed_debit: economic.balance.worst_case_debit,
@@ -7111,8 +7174,9 @@ mod tests {
         const EVALUATED_MS: i64 = 1_800_000_010_000;
         let mut fixture = receipt_backed_decline_fixture().await;
         let failed_receipt = test_receipt(1009);
-        let request_url =
-            format!("https://offline.invalid/markets?condition_ids={OPEN_CONDITION}&limit=500");
+        let request_url = format!(
+            "https://offline.invalid/markets?condition_ids={OPEN_CONDITION}&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
         fixture.source.insert(
             failed_receipt.sequence.0,
             source_observation(
@@ -7141,20 +7205,18 @@ mod tests {
         };
         let mut body = decision.post_boundary.body;
         let decline = body.terminal.decline.as_mut().unwrap();
-        let (economic, financial_prefix) = match &decline.inputs {
-            WinnerFollowDecisionInputs::Evaluated {
-                economic,
-                financial_prefix,
-            } => Some((economic, financial_prefix)),
+        let economic = match &decline.inputs {
+            WinnerFollowDecisionInputs::Evaluated { economic } => Some(economic),
             WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
         }
         .expect("receipt-backed fixture must contain evaluated inputs");
+        let financial_prefix = economic.risk.financial_prefix;
         decline.outcome =
             pe_strategy_winner_follow::WinnerFollowDeclineAudit::RiskInputsUnavailable;
         decline.inputs = WinnerFollowDecisionInputs::RiskInputsUnavailable {
             cause: RiskInputsUnavailable::PriceMissing,
             evidence: WinnerFollowRiskInputEvidence {
-                financial_prefix: Some(*financial_prefix),
+                financial_prefix: Some(financial_prefix),
                 price_receipts: vec![failed_receipt],
                 evaluated_at_unix_ms: economic.risk.evaluated_at_unix_ms,
                 proposed_debit: economic.balance.worst_case_debit,
@@ -7193,7 +7255,9 @@ mod tests {
         }]))
         .unwrap();
         fixture.source.get_mut(&1007).unwrap().payload = gamma_price_page_record(
-            &format!("https://offline.invalid/markets?condition_ids={OPEN_CONDITION}&limit=500"),
+            &format!(
+                "https://offline.invalid/markets?condition_ids={OPEN_CONDITION}&limit={GAMMA_BATCH_LIMIT_PARAM}"
+            ),
             1_800_000_007_000,
             &raw,
             true,
@@ -7215,21 +7279,19 @@ mod tests {
         };
         let mut body = decision.post_boundary.body;
         let decline = body.terminal.decline.as_mut().unwrap();
-        let (economic, financial_prefix) = match &decline.inputs {
-            WinnerFollowDecisionInputs::Evaluated {
-                economic,
-                financial_prefix,
-            } => Some((economic, financial_prefix)),
+        let economic = match &decline.inputs {
+            WinnerFollowDecisionInputs::Evaluated { economic } => Some(economic),
             WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
         }
         .expect("receipt-backed fixture must contain evaluated inputs");
+        let financial_prefix = economic.risk.financial_prefix;
         let price_receipt = economic.risk.price_receipts[0];
         decline.outcome =
             pe_strategy_winner_follow::WinnerFollowDeclineAudit::RiskInputsUnavailable;
         decline.inputs = WinnerFollowDecisionInputs::RiskInputsUnavailable {
             cause: RiskInputsUnavailable::PriceMissing,
             evidence: WinnerFollowRiskInputEvidence {
-                financial_prefix: Some(*financial_prefix),
+                financial_prefix: Some(financial_prefix),
                 price_receipts: vec![price_receipt],
                 evaluated_at_unix_ms: economic.risk.evaluated_at_unix_ms,
                 proposed_debit: economic.balance.worst_case_debit,
@@ -9096,7 +9158,9 @@ mod tests {
             short: ShareAmount::ZERO,
         };
         let raw = br#"[{"conditionId":"condition-a","outcomePrices":"[\"0.4\",\"0.6\"]"}]"#;
-        let request_url = "https://offline.invalid/markets?condition_ids=condition-a&limit=500";
+        let request_url = format!(
+            "https://offline.invalid/markets?condition_ids=condition-a&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
         let observation = SourceObservation {
             receipt,
             observed_at: SourceTimestamp(
@@ -9108,7 +9172,7 @@ mod tests {
             schema_version: GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
             parser_version: GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
             content_type: ContentType::Json,
-            payload: gamma_price_page_record(request_url, 1_700_000_000_000, raw, true),
+            payload: gamma_price_page_record(&request_url, 1_700_000_000_000, raw, true),
         };
         let source = BTreeMap::from([(receipt.sequence.0, observation.clone())]);
         let prices = replayed_risk_prices(

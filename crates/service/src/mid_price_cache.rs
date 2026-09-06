@@ -18,9 +18,11 @@ use std::time::Duration;
 
 use pe_core_types::{MarketId, MarketOutcomeId, Price, ReceivedAt, SourceTimestamp};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
+#[cfg(test)]
+use pe_source_polymarket_public::GAMMA_BATCH_LIMIT_PARAM;
 use pe_source_polymarket_public::{
-    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, MarketFilter, MetadataPageEvidence, PageFetcher,
-    ReqwestFetcher,
+    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaOpenConditionRequest, MarketFilter,
+    MetadataPageEvidence, PageFetcher, ReqwestFetcher,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -56,46 +58,6 @@ pub(crate) enum GammaPriceAttemptRecord {
         request_url: String,
         error: String,
     },
-}
-
-/// Parsed identity of the canonical open-only condition request emitted by the Gamma client.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GammaPriceRequest {
-    pub base_url: String,
-    pub condition_ids: Vec<String>,
-}
-
-/// Recover and validate the exact requested conditions from a durable strict-price page record.
-pub(crate) fn gamma_price_request(request_url: &str) -> Option<GammaPriceRequest> {
-    const LIMIT: &str = "500";
-    let (base_url, query) = request_url.split_once("/markets?")?;
-    if base_url.is_empty() {
-        return None;
-    }
-    let parts = query.split('&').collect::<Vec<_>>();
-    let (limit, conditions) = parts.split_last()?;
-    if *limit != format!("limit={LIMIT}") || conditions.is_empty() {
-        return None;
-    }
-    let condition_ids = conditions
-        .iter()
-        .map(|part| part.strip_prefix("condition_ids=").map(str::to_owned))
-        .collect::<Option<Vec<_>>>()?;
-    if condition_ids.iter().any(String::is_empty) {
-        return None;
-    }
-    let rebuilt = format!(
-        "{base_url}/markets?{}&limit={LIMIT}",
-        condition_ids
-            .iter()
-            .map(|id| format!("condition_ids={id}"))
-            .collect::<Vec<_>>()
-            .join("&")
-    );
-    (rebuilt == request_url).then_some(GammaPriceRequest {
-        base_url: base_url.to_owned(),
-        condition_ids,
-    })
 }
 
 /// Per-market Gamma liquidity metadata captured alongside the mids, for the
@@ -499,7 +461,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             .map(|(_, receipt)| *receipt)
             .collect::<Vec<_>>();
         for (evidence, _) in &fetched.pages {
-            let Some(request) = gamma_price_request(&evidence.request_url) else {
+            let Some(request) = GammaOpenConditionRequest::parse(&evidence.request_url) else {
                 continue;
             };
             if request.condition_ids.iter().any(|condition_id| {
@@ -548,9 +510,10 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                     .and_then(|hash| {
                         fetched.pages.iter().find_map(|(evidence, _)| {
                             (evidence.raw_page_hash == *hash
-                                && gamma_price_request(&evidence.request_url).is_some_and(
-                                    |request| request.condition_ids.contains(&id.to_string()),
-                                ))
+                                && GammaOpenConditionRequest::parse(&evidence.request_url)
+                                    .is_some_and(|request| {
+                                        request.condition_ids.contains(&id.to_string())
+                                    }))
                             .then_some((evidence.request_url.clone(), hash.clone()))
                         })
                     })
@@ -664,10 +627,11 @@ mod tests {
     }
 
     /// The exact URL the shared client builds for a single-id `OpenOnly` batch
-    /// (`condition_ids={id}&limit=500`, no `&closed=true`). The orchestrator/snapshot worker
-    /// fetch one market per call, so every live mid fetch is a batch-of-one keyed like this.
+    /// (`condition_ids={id}` plus the canonical limit, no `&closed=true`). The
+    /// orchestrator/snapshot worker fetch one market per call, so every live mid fetch is a
+    /// batch-of-one keyed like this.
     fn url(base: &str, id: &str) -> String {
-        format!("{base}/markets?condition_ids={id}&limit=500")
+        format!("{base}/markets?condition_ids={id}&limit={GAMMA_BATCH_LIMIT_PARAM}")
     }
 
     const BASE: &str = "https://gamma-api.polymarket.com";
@@ -1287,7 +1251,9 @@ mod tests {
         // keyed under its own id and never attributed to a requested market.
         let mut fx = HashMap::new();
         fx.insert(
-            format!("{BASE}/markets?condition_ids=0xA&condition_ids=0xB&limit=500"),
+            format!(
+                "{BASE}/markets?condition_ids=0xA&condition_ids=0xB&limit={GAMMA_BATCH_LIMIT_PARAM}"
+            ),
             br#"[{"conditionId":"0xB","outcomePrices":"[\"0.3\",\"0.7\"]"},
                  {"conditionId":"0xZ","outcomePrices":"[\"0.99\",\"0.01\"]"},
                  {"conditionId":"0xA","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#

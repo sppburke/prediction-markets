@@ -118,7 +118,6 @@ pub struct WinnerFollowRiskInputEvidence {
 pub enum WinnerFollowDecisionInputs {
     Evaluated {
         economic: Box<EconomicPrepared>,
-        financial_prefix: AppendReceipt,
     },
     RiskInputsUnavailable {
         cause: crate::risk_inputs::RiskInputsUnavailable,
