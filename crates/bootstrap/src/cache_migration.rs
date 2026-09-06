@@ -7,8 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr as _;
 use std::time::Duration;
 
@@ -37,7 +39,7 @@ use time::OffsetDateTime;
 
 use crate::cache::{CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2, REQUIRED_TRADES_INDEXES};
 use crate::error::BootstrapError;
-use crate::lock::ForgeActivationLocks;
+use crate::lock::{ForgeActivationLocks, ForgeLockHandoff};
 use crate::reclamation_evidence::{
     ReclamationEvidenceReport, capture as capture_reclamation_evidence, eval_results_dir_for_cache,
 };
@@ -266,6 +268,99 @@ pub struct CacheActivationReport {
 pub struct PriorCacheBinding {
     pub sha256: String,
     pub schema_version: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DurablePublishRequest {
+    version: u32,
+    batch: Value,
+    entries: Vec<Value>,
+    keep_batches: u64,
+    cache_activation: DurableCacheActivation,
+    publish_key: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DurableCacheActivation {
+    side_path: PathBuf,
+    fixed_path: PathBuf,
+    prior_cache_backup_path: PathBuf,
+    expected_sha256: String,
+}
+
+/// Authoritative lookup used to decide whether a hash-bound publication was
+/// consumed. Failure to obtain an answer must be returned as an error.
+pub trait PublicationConsumptionProbe {
+    fn was_published<'a>(
+        &'a self,
+        publish_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, BootstrapError>> + Send + 'a>>;
+}
+
+/// Supabase `ranking_batches.publish_key` lookup for prior-cache recovery.
+pub struct SupabasePublicationProbe {
+    client: reqwest::Client,
+    base_url: String,
+    key: String,
+}
+
+impl SupabasePublicationProbe {
+    pub fn new(base_url: String, key: String) -> Result<Self, BootstrapError> {
+        if base_url.trim().is_empty() || key.trim().is_empty() {
+            return invalid("publication authority credentials are unavailable".to_owned());
+        }
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|error| BootstrapError::Invalid {
+                    message: format!("publication authority client unavailable: {error}"),
+                })?,
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            key,
+        })
+    }
+}
+
+impl PublicationConsumptionProbe for SupabasePublicationProbe {
+    fn was_published<'a>(
+        &'a self,
+        publish_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, BootstrapError>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(format!(
+                    "{}/rest/v1/ranking_batches?select=batch_id&publish_key=eq.{}&limit=1",
+                    self.base_url, publish_key
+                ))
+                .header("apikey", &self.key)
+                .bearer_auth(&self.key)
+                .send()
+                .await
+                .map_err(|error| BootstrapError::Invalid {
+                    message: format!("publication authority unavailable: {error}"),
+                })?;
+            if !response.status().is_success() {
+                return invalid(format!(
+                    "publication authority returned HTTP {}",
+                    response.status()
+                ));
+            }
+            let rows =
+                response
+                    .json::<Vec<Value>>()
+                    .await
+                    .map_err(|error| BootstrapError::Invalid {
+                        message: format!(
+                            "publication authority returned malformed evidence: {error}"
+                        ),
+                    })?;
+            Ok(!rows.is_empty())
+        })
+    }
 }
 
 /// Populate per-wallet v2 activity checkpoints for one verified frozen universe.
@@ -1627,7 +1722,17 @@ pub fn finalize_cache_v2(
 pub fn activate_cache_v2(
     request: &CacheActivationRequest,
 ) -> Result<CacheActivationReport, BootstrapError> {
-    let _locks = ForgeActivationLocks::acquire(&request.fixed_path)?;
+    activate_cache_v2_with_handoff(request, None)
+}
+
+/// Install a finalized cache while accepting a verified shell lock handoff.
+/// Direct callers use [`activate_cache_v2`] and retain the full Rust-owned
+/// loop/run/cache lock stack.
+pub fn activate_cache_v2_with_handoff(
+    request: &CacheActivationRequest,
+    handoff: Option<&ForgeLockHandoff>,
+) -> Result<CacheActivationReport, BootstrapError> {
+    let _locks = ForgeActivationLocks::acquire_with_handoff(&request.fixed_path, handoff)?;
     require_regular_file(&request.fixed_path, "current fixed cache")?;
     validate_hex_sha256(&request.expected_side_sha256, "expected side sha256")?;
     if !request.side_path.exists() {
@@ -1742,21 +1847,34 @@ pub fn activate_cache_v2(
     })
 }
 
-/// Restore the hash-bound prior cache only before its corrected publication is current.
-pub fn restore_prior_cache(
+/// Restore the hash-bound prior cache only when the durable pending request is
+/// intact and authoritative `ranking_batches.publish_key` evidence proves that
+/// exact publication has never been consumed.
+pub async fn restore_prior_cache(
     fixed_path: &Path,
     prior_cache_backup_path: &Path,
     displaced_cache_backup_path: &Path,
     binding: &PriorCacheBinding,
-    bound_batch_is_current: bool,
+    publication_request_path: &Path,
+    pending_pointer_path: &Path,
+    publication_probe: &dyn PublicationConsumptionProbe,
 ) -> Result<(), BootstrapError> {
-    if bound_batch_is_current {
+    let _locks = ForgeActivationLocks::acquire(fixed_path)?;
+    let request = verified_pending_publication(
+        publication_request_path,
+        pending_pointer_path,
+        fixed_path,
+        prior_cache_backup_path,
+    )?;
+    if publication_probe
+        .was_published(&request.publish_key)
+        .await?
+    {
         return invalid(
-            "prior-cache restore is retired after the bound ranking batch becomes current"
+            "prior-cache restore is retired after the bound ranking publication was consumed"
                 .to_owned(),
         );
     }
-    let _locks = ForgeActivationLocks::acquire(fixed_path)?;
     validate_hex_sha256(&binding.sha256, "prior cache sha256")?;
     require_regular_file(prior_cache_backup_path, "prior cache restore main")?;
     if sha256_file(prior_cache_backup_path)? != binding.sha256
@@ -1795,6 +1913,61 @@ pub fn restore_prior_cache(
         return invalid("restored cache does not match its recorded schema/hash".to_owned());
     }
     Ok(())
+}
+
+fn verified_pending_publication(
+    request_path: &Path,
+    pending_pointer_path: &Path,
+    fixed_path: &Path,
+    prior_cache_backup_path: &Path,
+) -> Result<DurablePublishRequest, BootstrapError> {
+    require_regular_file(request_path, "publication request")?;
+    require_regular_file(pending_pointer_path, "pending publication pointer")?;
+    require_regular_file(fixed_path, "corrected fixed cache")?;
+    require_regular_file(prior_cache_backup_path, "prior cache restore main")?;
+    let pending = std::fs::read_to_string(pending_pointer_path)?;
+    let lines = pending.lines().collect::<Vec<_>>();
+    if lines.len() != 1 || lines[0].is_empty() || Path::new(lines[0]).is_absolute() {
+        return invalid(
+            "pending publication pointer must contain one repository-relative request path"
+                .to_owned(),
+        );
+    }
+    if std::fs::canonicalize(lines[0])? != std::fs::canonicalize(request_path)? {
+        return invalid("pending publication pointer names another request".to_owned());
+    }
+
+    let request: DurablePublishRequest = serde_json::from_slice(&std::fs::read(request_path)?)?;
+    if request.version != 1 || request.entries.is_empty() {
+        return invalid("publication request has an unsupported or empty shape".to_owned());
+    }
+    validate_hex_sha256(&request.publish_key, "publication request publish_key")?;
+    validate_hex_sha256(
+        &request.cache_activation.expected_sha256,
+        "publication request cache activation hash",
+    )?;
+    let mut identity = BTreeMap::new();
+    identity.insert("batch", request.batch.clone());
+    identity.insert(
+        "cache_activation",
+        serde_json::to_value(&request.cache_activation)?,
+    );
+    identity.insert("entries", Value::Array(request.entries.clone()));
+    let identity = serde_json::to_value(identity)?;
+    if sha256_bytes(python_canonical_json(&identity)?.as_bytes()) != request.publish_key {
+        return invalid("publication request content hash mismatch".to_owned());
+    }
+    if std::fs::canonicalize(&request.cache_activation.fixed_path)?
+        != std::fs::canonicalize(fixed_path)?
+        || std::fs::canonicalize(&request.cache_activation.prior_cache_backup_path)?
+            != std::fs::canonicalize(prior_cache_backup_path)?
+    {
+        return invalid("publication request is bound to another cache activation".to_owned());
+    }
+    if sha256_file(fixed_path)? != request.cache_activation.expected_sha256 {
+        return invalid("fixed cache no longer matches the bound corrected cache".to_owned());
+    }
+    Ok(request)
 }
 
 fn frozen_freshness(connection: &Connection) -> Result<FrozenCacheFreshness, BootstrapError> {
@@ -2208,6 +2381,93 @@ fn canonical_json(value: &(impl Serialize + ?Sized)) -> Result<String, Bootstrap
     serde_json::to_string(value).map_err(BootstrapError::from)
 }
 
+// `publish_key` is owned by Python's `json.dumps(sort_keys=True, separators=(",", ":"))`.
+// Serde and Python choose different display forms for otherwise-equal JSON floats around
+// the scientific-notation thresholds. Reproduce Python's spelling from serde_json's exact
+// decimal rendering instead of parsing financial values into Rust floating point.
+fn python_canonical_json(value: &Value) -> Result<String, BootstrapError> {
+    fn append(value: &Value, output: &mut String) -> Result<(), BootstrapError> {
+        match value {
+            Value::Null => output.push_str("null"),
+            Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+            Value::Number(value) => output.push_str(&python_json_number(value)?),
+            Value::String(value) => output.push_str(&serde_json::to_string(value)?),
+            Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    append(value, output)?;
+                }
+                output.push(']');
+            }
+            Value::Object(values) => {
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                output.push('{');
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    output.push_str(&serde_json::to_string(key)?);
+                    output.push(':');
+                    append(&values[key], output)?;
+                }
+                output.push('}');
+            }
+        }
+        Ok(())
+    }
+
+    let mut output = String::new();
+    append(value, &mut output)?;
+    Ok(output)
+}
+
+fn python_json_number(value: &serde_json::Number) -> Result<String, BootstrapError> {
+    let rendered = value.to_string();
+    if value.is_i64() || value.is_u64() {
+        return Ok(rendered);
+    }
+    if let Some((mantissa, exponent)) = rendered.split_once('e') {
+        let (sign, digits) = exponent.strip_prefix('-').map_or_else(
+            || ('+', exponent.strip_prefix('+').unwrap_or(exponent)),
+            |v| ('-', v),
+        );
+        let digits = digits.trim_start_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        return Ok(format!("{mantissa}e{sign}{digits:0>2}"));
+    }
+
+    let (sign, magnitude) = rendered
+        .strip_prefix('-')
+        .map_or(("", rendered.as_str()), |value| ("-", value));
+    let Some(fraction) = magnitude.strip_prefix("0.") else {
+        return Ok(rendered);
+    };
+    let Some(first_nonzero) = fraction.find(|character| character != '0') else {
+        return Ok(rendered);
+    };
+    let exponent_magnitude =
+        first_nonzero
+            .checked_add(1)
+            .ok_or_else(|| BootstrapError::Invalid {
+                message: "publication request number exponent overflow".to_owned(),
+            })?;
+    if exponent_magnitude <= 4 {
+        return Ok(rendered);
+    }
+    let digits = &fraction[first_nonzero..];
+    let (first, remainder) = digits.split_at(1);
+    let mantissa = if remainder.is_empty() {
+        first.to_owned()
+    } else {
+        format!("{first}.{remainder}")
+    };
+    Ok(format!("{sign}{mantissa}e-{exponent_magnitude:0>2}"))
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -2404,4 +2664,25 @@ fn map_rename_error(error: std::io::Error) -> BootstrapError {
 
 fn invalid<T>(message: String) -> Result<T, BootstrapError> {
     Err(BootstrapError::Invalid { message })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod publication_json_tests {
+    use super::python_canonical_json;
+
+    #[test]
+    fn matches_python_json_float_spelling_at_scientific_thresholds() {
+        let value = serde_json::json!({
+            "integer": 1,
+            "large": 1e16,
+            "ordinary": 0.0001,
+            "small": 1.23e-5,
+            "whole_float": 1.0,
+        });
+        assert_eq!(
+            python_canonical_json(&value).unwrap(),
+            r#"{"integer":1,"large":1e+16,"ordinary":0.0001,"small":1.23e-05,"whole_float":1.0}"#
+        );
+    }
 }

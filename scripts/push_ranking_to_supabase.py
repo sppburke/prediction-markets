@@ -401,7 +401,20 @@ def validate_publish_request(request: dict) -> None:
         raise ValueError("publish request content hash mismatch")
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    replace_fn=os.replace,
+    fsync_fn=os.fsync,
+    directory_open_fn=os.open,
+    close_fn=os.close,
+) -> None:
+    """Atomically and crash-durably replace ``path``.
+
+    The injectable filesystem calls let the ordering contract be tested without
+    pretending that a successful rename alone is durable.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_name: str | None = None
     try:
@@ -416,9 +429,17 @@ def _atomic_write_text(path: Path, text: str) -> None:
             os.chmod(temp_name, 0o600)
             temporary.write(text)
             temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temp_name, path)
+            fsync_fn(temporary.fileno())
+        replace_fn(temp_name, path)
         temp_name = None
+        directory_fd = directory_open_fn(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            fsync_fn(directory_fd)
+        finally:
+            close_fn(directory_fd)
     finally:
         if temp_name is not None:
             try:
@@ -473,6 +494,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--resume-request",
         help="replay an existing validated publication request without rebuilding it",
+    )
+    ap.add_argument(
+        "--validate-request",
+        help="validate an existing request and print only its cache activation tuple",
     )
     ap.add_argument(
         "--prepare-only",
@@ -758,12 +783,38 @@ def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
 
 def main() -> int:
     a = build_parser().parse_args()
+
+    if a.validate_request:
+        if any((a.ranked_csv, a.request_file, a.pending_file, a.resume_request,
+                a.prepare_only, a.snapshot_current, a.manifest_file is not None,
+                a.cache_stage_record, a.cache_side_db, a.cache_fixed_db,
+                a.prior_cache_backup)):
+            print("FATAL: --validate-request cannot be combined with other modes",
+                  file=sys.stderr)
+            return 1
+        try:
+            request = load_publish_request(a.validate_request)
+            activation = request.get("cache_activation")
+            if activation is not None:
+                for key in (
+                    "side_path",
+                    "fixed_path",
+                    "prior_cache_backup_path",
+                    "expected_sha256",
+                ):
+                    print(activation[key])
+            return 0
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            print(f"FATAL: invalid publication request: {error}", file=sys.stderr)
+            return 1
+
     process_now = int(time.time())  # single time anchor: active filter + last-trade stamps
 
     if a.snapshot_current:
         if any((a.ranked_csv, a.request_file, a.pending_file, a.resume_request,
                 a.prepare_only, a.manifest_file is not None, a.cache_stage_record,
-                a.cache_side_db, a.cache_fixed_db, a.prior_cache_backup)):
+                a.cache_side_db, a.cache_fixed_db, a.prior_cache_backup,
+                a.validate_request)):
             print("FATAL: --snapshot-current cannot be combined with publication arguments",
                   file=sys.stderr)
             return 1
