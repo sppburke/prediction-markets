@@ -3,9 +3,9 @@
 
 set -euo pipefail
 
-[[ $# -eq 1 ]] || { echo "usage: $0 REHEARSAL_ENV" >&2; exit 2; }
+[[ $# -eq 1 ]] || { echo "usage: $0 SANITIZED_REHEARSAL_ENV" >&2; exit 2; }
 env_file=$1
-[[ -f "$env_file" ]] || { echo "FATAL: missing rehearsal environment: $env_file" >&2; exit 1; }
+[[ -f "$env_file" ]] || { echo "FATAL: missing sanitized rehearsal environment: $env_file" >&2; exit 1; }
 command -v psql >/dev/null || { echo "FATAL: psql not installed" >&2; exit 1; }
 command -v curl >/dev/null || { echo "FATAL: curl not installed" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "FATAL: python3 not installed" >&2; exit 1; }

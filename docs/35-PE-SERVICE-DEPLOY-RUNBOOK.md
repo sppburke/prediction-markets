@@ -266,11 +266,15 @@ scripts/deploy/rehearsal545.sh --dry-run \
   --target-config <reviewed-service.toml> \
   --target-environment <reviewed-production-env> \
   <reviewed-40-hex>
-scripts/deploy/rehearsal545.sh \
+SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/rehearsal545.sh \
   --target-config <reviewed-service.toml> \
   --target-environment <reviewed-production-env> \
   <reviewed-40-hex>
 ```
+
+The no-target `--dry-run <reviewed-40-hex>` form used by CI is intentionally a path-independent
+parser/syntax check. The reviewed target pair remains accepted in dry-run and is mandatory for an
+actual rehearsal; if either target flag is present, both must be present.
 
 The harness requires `/home/sean/pe-activation.json` to be `verified`, reads the active generation
 from it, and checkpoints its SQLite database, all three framed logs, and the captured legacy-history
@@ -279,21 +283,27 @@ input. A new or reused checkpoint must have the exact six-entry `copied.sha256` 
 address with a nonzero port different from the installed service's port; the harness passes it to
 the child as `PE_BIND`, derives the readiness URL from it, and runs against real first-party venue
 endpoints.
-The harness resolves those target paths canonically and requires their paths and SHA-256 values to
-equal the activation manifest's reviewed `config` and `environment` artifacts. If legacy
+The #557 activation manifest is inherited-generation and installed-old authority only. The harness
+requires its full production schema and exact six-artifact inventory, verifies the installed old
+binary/config/environment against those #557 hashes and destinations, and reads the active generation
+from it. The explicit #545 config and production environment are independent reviewed targets: their
+paths need not equal any #557 staged path, and the harness hashes their bytes directly. If legacy
 `PE_REHEARSAL_CONFIG` or `PE_REHEARSAL_ENV` is present, it must resolve to the corresponding explicit
-target path; an arbitrary override is refused. Their `config_sha256` and `environment_sha256`
-identities are carried in both evidence layers for the financial driver to compare to its target
-arguments.
+target path; an arbitrary override is refused.
 
-The rehearsal environment must put the same publishable Supabase key in both credential slots. It
-may be a modern `sb_publishable_*` key or a legacy JWT whose payload has `role=anon`; a modern secret
-key, service-role JWT, malformed key, or mismatched slots fails before any HTTP request.
-`rehearsal_preflight.sh` runs in a separate sanitized process, passes the database-admin URL only to
-sanitized `psql` children, and removes its marker rows on every exit. The service then starts under
-`env -i` with only the explicit `ServiceConfig` environment allowlist and fixed rehearsal overrides;
-`SUPABASE_DB_URL`, `PGDATABASE`, `CREDENTIALS_DIRECTORY`, and unrelated inherited variables cannot
-reach it.
+The reviewed production environment must carry a publishable/anon-class value in
+`PE_SUPABASE_ANON_KEY` and a distinct secret/service-role-class value in
+`PE_SUPABASE_SECRET_KEY`. The harness deterministically creates its own mode-`0600` sanitized
+derivative by replacing only those two assignments with the publishable value; each assignment must
+occur exactly once. It passes only that derivative to `rehearsal_preflight.sh` and to the service
+child. The preflight accepts a modern `sb_publishable_*` key or a legacy JWT with `role=anon` and
+rejects a modern secret key, service-role JWT, malformed key, or mismatched slots before any HTTP
+request. It receives the database-admin URL through an fd-backed environment handoff in a separate
+sanitized process, passes it only to sanitized `psql` children, and removes its marker rows on every
+exit. The service then starts under `env -i`
+with only the explicit `ServiceConfig` environment allowlist and fixed rehearsal overrides;
+the production service-role credential, `SUPABASE_DB_URL`, `PGDATABASE`, `CREDENTIALS_DIRECTORY`,
+and unrelated inherited variables cannot reach it.
 
 Path and cadence overrides are environment variables, not flags:
 `PE_REHEARSAL_ROOT`, `PE_ACTIVATION_MANIFEST`, `PE_REHEARSAL_RELEASE_ROOT`,
@@ -317,10 +327,13 @@ same invocation. The harness prints
 file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, and the rehearsed
 binary's revision, embedded BLAKE3 identity, file SHA-256, activation ID, canonical generation
 directory, copied-state manifest SHA-256, exact passing readiness-body SHA-256, config SHA-256, and
-environment SHA-256. Preserve and review the JSON file and its result manifest, which binds the same
-identities; the financial driver binds both before entering `prepared` and revalidates them from disk
-before entering `guarded`. The copy manifest, result manifest, and outer JSON are installed with the
-shared durable atomic-write primitive (file sync, rename, then parent-directory sync).
+both environment identities. `environment_sha256` is the reviewed production target;
+`rehearsal_environment_sha256` is the generated publishable-only derivative. Preserve and review the
+JSON file and its result manifest, which binds the same identities; the financial driver compares the
+production identity to `--target-environment`, binds both before entering `prepared`, and revalidates
+them from disk before entering `guarded`. The copy manifest, result manifest, and outer JSON are
+installed with the shared durable atomic-write primitive (file sync, rename, then parent-directory
+sync).
 
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
@@ -354,7 +367,11 @@ creating the financial manifest, the driver proves the installed old binary, con
 match the #557 artifact hashes and installed destinations. The reviewed #545 target is independent:
 its binary self-reports its revision and BLAKE3 under `--verify-staged-identity`, and the driver binds
 the binary/config/environment SHA-256 values to the rehearsal evidence. A #545 target is neither
-path-equal nor revision-equal to the inherited #557 artifacts. The Start hot-config identity is not an operator assertion:
+path-equal nor revision-equal to the inherited #557 artifacts. Before it creates the financial
+manifest or can approach Start, the driver also requires the reviewed production
+`PE_SUPABASE_SECRET_KEY` to be a modern `sb_secret_*` key or a legacy JWT with `role=service_role`;
+the publishable-only rehearsal derivative is never adopted as production. The Start hot-config
+identity is not an operator assertion:
 while the service is inert, the driver exports the database rows that the 17→15 migration retains to
 a mode-private temporary file (the credential-bearing database URL remains in `PGDATABASE`, never
 argv), and the Rust prepare owner parses them as `ConfigEra::Financial15` and calls
@@ -374,7 +391,8 @@ rehearsal binding named above without changing service or financial state.
 Before any stop intent, the `prepared → guarded` transition rereads the bound evidence JSON and result
 manifest, verifies the recorded hash, requires PASS, and requires the activation/generation,
 copied-state/readiness, reviewed config/environment, revision, embedded BLAKE3 identity, and binary
-SHA-256 to remain exact. A missing, changed, failed, or mismatched rehearsal is a typed
+SHA-256 to remain exact, including both the reviewed production-environment hash and the sanitized
+rehearsal-environment hash. A missing, changed, failed, or mismatched rehearsal is a typed
 `REHEARSAL_REFUSAL` and leaves the service and financial state untouched. Identical reruns preserve
 the original binding. After that gate, the driver records stop intent, stops the service once, proves
 it inert, verifies the old 17-name contract, takes and verifies a complete SQLite online backup,
@@ -442,7 +460,7 @@ It emits canonical compact JSON plus one trailing newline and reports its BLAKE3
 | unit | systemd **system** unit `pe-service` (`/etc/systemd/system/pe-service.service` + drop-in `pe-service.service.d/age-identity.conf`); `WantedBy=multi-user.target`, `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2` (SIGINT — the binary's shutdown signal, so a restart drains buffered trades). Start/stop/restart need root: run [`scripts/vps_grant_pe_service_sudo.sh`](../scripts/vps_grant_pe_service_sudo.sh) once as root to grant the deploy user passwordless, command-scoped `systemctl` control of the pe-service units (verified with `sudo -n -l`); until then use `ssh -t … 'sudo systemctl restart pe-service'` |
 | binary path | `ExecStart` runs `/bin/bash -c 'set -a; source /home/sean/prediction-markets/.env; set +a; exec /home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml'` with `WorkingDirectory=/home/sean/prediction-markets` (verified 2026-08-31) |
 | backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
-| env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
+| env | `.env` on the VPS (REST URL plus both credential identities: publishable/anon-class `PE_SUPABASE_ANON_KEY` and secret/service-role-class `PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). The #545 rehearsal derives its publishable-only file from this reviewed production target and never installs the derivative. `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
 | build box | the VPS has no cargo — build on the dev box and `scp`. Release-like builds derive the full revision directly from the checked-out Git object and reject a dirty, unknown, or invalid checkout; no environment override is accepted. Dev/test builds use the explicit `dev-dirty` sentinel when needed. |
 | logs | `journalctl -u pe-service -f` (Tier-1 prod check); JSONL sinks per `jsonl_log_path`; `status.json` in the working directory |
 
