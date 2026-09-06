@@ -140,6 +140,7 @@ fn start_record(source_path: &std::path::Path, paper_path: &std::path::Path) -> 
 }
 
 fn economic(
+    financial_prefix: AppendReceipt,
     source_receipt: AppendReceipt,
     complete_bound_receipt: AppendReceipt,
 ) -> EconomicPrepared {
@@ -224,6 +225,7 @@ fn economic(
             reserve: CollateralAmount::ZERO,
         },
         risk: RiskAudit {
+            financial_prefix,
             snapshot: RiskSnapshot {
                 leader_exposure_bps: BasisPoints::ZERO,
                 market_exposure_bps: BasisPoints::ZERO,
@@ -540,7 +542,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
         })
     );
 
-    let economic = economic(websocket, complete_page);
+    let economic = economic(start, websocket, complete_page);
     let prepared = append_paper(
         &mut paper_writer,
         &PaperLogRecord::FinancialPrepared {

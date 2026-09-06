@@ -1490,6 +1490,11 @@ async fn live_risk_audit(
         scan_paper_log(&state.config.paper_log_path)
             .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?,
     );
+    let financial_prefix = latency_era
+        .frames
+        .last()
+        .map(|frame| frame.receipt)
+        .ok_or(RiskInputsUnavailable::SnapshotSequenceMismatch)?;
     let latency_seed = crate::risk_inputs::latency_hysteresis_seed(
         &latency_era,
         &latency_owner,
@@ -1518,6 +1523,7 @@ async fn live_risk_audit(
     let evaluated_at_unix_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000)
         .map_err(|_| RiskInputsUnavailable::Overflow)?;
     Ok(RiskAudit {
+        financial_prefix,
         snapshot,
         decision,
         price_receipts,
@@ -6878,6 +6884,7 @@ mod tests {
                 reserve: CollateralAmount::from_atomic(120),
             },
             risk: RiskAudit {
+                financial_prefix: receipt,
                 snapshot: RiskSnapshot {
                     leader_exposure_bps: BasisPoints(0),
                     market_exposure_bps: BasisPoints(0),
