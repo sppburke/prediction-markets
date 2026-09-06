@@ -6,6 +6,7 @@ use pe_core_types::{
 };
 use pe_event_log::AppendReceipt;
 use pe_risk_engine::{RiskBlock, RiskSnapshot};
+use pe_venue_polymarket::fee::signed_price;
 use pe_venue_polymarket::{CompactFeeSchedule, FeeError, LadderPlan, fee_reserve, taker_fee};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -164,6 +165,7 @@ impl EconomicPrepared {
         let outcome_index = usize::from(inputs.market.outcome_index);
         if inputs.market.side != Side::Buy
             || inputs.market.condition_id != inputs.admission.market.condition_id
+            || inputs.market.market_id != inputs.admission.market.condition_id.0
             || inputs
                 .admission
                 .market
@@ -192,14 +194,7 @@ impl EconomicPrepared {
             .plan
             .vwap()
             .ok_or(EconomicError::InvalidLadderAudit)?;
-        let signed_value = inputs
-            .plan
-            .shares
-            .to_decimal()
-            .checked_mul(inputs.plan.limit_price.0)
-            .ok_or(pe_core_types::Error::OutOfRange {
-                field: "EconomicPrepared.signed_value",
-            })?;
+        let actual_signed_price = signed_price(inputs.plan.worst_case_debit, inputs.plan.shares)?;
         let endpoints_match = inputs.plan.used_asks.first().is_some_and(|ask| {
             ask.price == inputs.plan.best_ask && ask.shares != ShareAmount::ZERO
         }) && inputs.plan.used_asks.last().is_some_and(|ask| {
@@ -219,13 +214,13 @@ impl EconomicPrepared {
             || expected_vwap != plan_vwap
             || expected_shares < inputs.plan.shares
             || expected_spend > inputs.plan.worst_case_debit
-            || signed_value < inputs.plan.worst_case_debit.to_decimal()
+            || actual_signed_price < inputs.plan.limit_price
         {
             return Err(EconomicError::InvalidLadderAudit);
         }
 
         let schedule = inputs.admission.fee_schedule;
-        let expected_fee = taker_fee(schedule, inputs.plan.shares, inputs.plan.limit_price)?;
+        let expected_fee = taker_fee(schedule, inputs.plan.shares, actual_signed_price)?;
         let reserve = fee_reserve(
             schedule,
             inputs.plan.worst_case_debit,
@@ -453,6 +448,50 @@ mod tests {
     }
 
     #[test]
+    fn composer_accepts_non_divisible_dollar_principal_and_fees_the_signed_ratio() {
+        let admission = admission();
+        let plan = LadderPlan {
+            used_asks: vec![AskLevel {
+                price: Price::new(dec!(0.15)).unwrap(),
+                shares: ShareAmount::from_decimal_exact(dec!(6.666686)).unwrap(),
+            }],
+            best_ask: Price::new(dec!(0.15)).unwrap(),
+            limit_price: Price::new(dec!(0.15)).unwrap(),
+            shares: ShareAmount::from_decimal_exact(dec!(6.6666)).unwrap(),
+            worst_case_debit: CollateralAmount::from_decimal_exact(dec!(1.000003)).unwrap(),
+        };
+        let mut economic_inputs = inputs(&admission, &plan);
+        economic_inputs.sizing_mode = SizingModeAudit::Dollar { usd: dec!(1.1) };
+        let prepared = EconomicPrepared::compose(economic_inputs).unwrap();
+
+        assert_eq!(prepared.fee.expected_fee.to_decimal(), dec!(0.03400));
+        assert_eq!(prepared.sizing.principal.to_decimal(), dec!(1.000003));
+        assert_eq!(prepared.sizing.minimum_shares.to_decimal(), dec!(6.6666));
+    }
+
+    #[test]
+    fn composer_accepts_non_divisible_kelly_principal() {
+        let admission = admission();
+        let plan = LadderPlan {
+            used_asks: vec![AskLevel {
+                price: Price::new(dec!(0.33)).unwrap(),
+                shares: ShareAmount::from_decimal_exact(dec!(3.030306)).unwrap(),
+            }],
+            best_ask: Price::new(dec!(0.33)).unwrap(),
+            limit_price: Price::new(dec!(0.33)).unwrap(),
+            shares: ShareAmount::from_decimal_exact(dec!(3.0303)).unwrap(),
+            worst_case_debit: CollateralAmount::from_decimal_exact(dec!(1.000001)).unwrap(),
+        };
+        let mut economic_inputs = inputs(&admission, &plan);
+        economic_inputs.sizing_mode = SizingModeAudit::Kelly {
+            fraction: KellyFraction(dec!(0.1)),
+            probability: Probability::new(dec!(0.6)).unwrap(),
+        };
+
+        assert!(EconomicPrepared::compose(economic_inputs).is_ok());
+    }
+
+    #[test]
     fn composer_rejects_an_unbound_book_receipt() {
         let admission = admission();
         let plan = plan();
@@ -468,29 +507,68 @@ mod tests {
     }
 
     #[test]
-    fn composer_rejects_split_market_identity_and_inconsistent_signed_value() {
+    fn composer_rejects_a_signed_price_below_the_walked_ask() {
         let admission = admission();
         let plan = plan();
-        let mut split = inputs(&admission, &plan);
-        split.market.token_id = PolymarketTokenId("22".to_owned());
+        let mut below_walked_ask = plan.clone();
+        below_walked_ask.shares = ShareAmount::from_decimal_exact(dec!(5.0001)).unwrap();
         assert!(matches!(
-            EconomicPrepared::compose(split),
+            EconomicPrepared::compose(inputs(&admission, &below_walked_ask)),
+            Err(EconomicError::InvalidLadderAudit)
+        ));
+
+        let mut inconsistent_endpoint = plan;
+        inconsistent_endpoint.best_ask = Price::new(dec!(0.39)).unwrap();
+        assert!(matches!(
+            EconomicPrepared::compose(inputs(&admission, &inconsistent_endpoint)),
+            Err(EconomicError::InvalidLadderAudit)
+        ));
+    }
+
+    fn assert_market_identity_rejected(mutate: impl FnOnce(&mut MarketSelection)) {
+        let admission = admission();
+        let plan = plan();
+        let mut economic_inputs = inputs(&admission, &plan);
+        mutate(&mut economic_inputs.market);
+        assert!(matches!(
+            EconomicPrepared::compose(economic_inputs),
             Err(EconomicError::InvalidMarketIdentity)
         ));
+    }
 
-        let mut inconsistent = plan.clone();
-        inconsistent.shares = ShareAmount::from_decimal_exact(dec!(4)).unwrap();
-        assert!(matches!(
-            EconomicPrepared::compose(inputs(&admission, &inconsistent)),
-            Err(EconomicError::InvalidLadderAudit)
-        ));
+    #[test]
+    fn composer_rejects_condition_identity_independently() {
+        assert_market_identity_rejected(|market| {
+            market.condition_id = PolymarketConditionId("other-condition".to_owned());
+        });
+    }
 
-        let mut inconsistent = plan;
-        inconsistent.best_ask = Price::new(dec!(0.39)).unwrap();
-        assert!(matches!(
-            EconomicPrepared::compose(inputs(&admission, &inconsistent)),
-            Err(EconomicError::InvalidLadderAudit)
-        ));
+    #[test]
+    fn composer_rejects_token_identity_independently() {
+        assert_market_identity_rejected(|market| {
+            market.token_id = PolymarketTokenId("22".to_owned());
+        });
+    }
+
+    #[test]
+    fn composer_rejects_outcome_identity_independently() {
+        assert_market_identity_rejected(|market| {
+            market.outcome_index = 1;
+        });
+    }
+
+    #[test]
+    fn composer_rejects_side_identity_independently() {
+        assert_market_identity_rejected(|market| {
+            market.side = Side::Sell;
+        });
+    }
+
+    #[test]
+    fn composer_rejects_market_id_identity_independently() {
+        assert_market_identity_rejected(|market| {
+            market.market_id = "other-condition".to_owned();
+        });
     }
 
     #[test]

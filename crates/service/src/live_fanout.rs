@@ -1733,6 +1733,10 @@ fn build_order_identity(
     book_receipt: AppendReceipt,
     strategy: &pe_strategy_winner_follow::WinnerFollowConfig,
 ) -> Result<LiveOrderIdentity, FanoutError> {
+    validate_live_market_identity(
+        &signal.market_id.to_string(),
+        &admission.market.condition_id,
+    )?;
     let asks = plan
         .used_asks
         .iter()
@@ -1790,6 +1794,19 @@ fn build_order_identity(
         schema_version: 1,
         parser_version: 1,
     })
+}
+
+fn validate_live_market_identity(
+    market_id: &str,
+    condition_id: &PolymarketConditionId,
+) -> Result<(), FanoutError> {
+    if market_id == condition_id.0 {
+        Ok(())
+    } else {
+        Err(FanoutError::Signal(
+            "live market ID disagrees with admitted condition ID".to_owned(),
+        ))
+    }
 }
 
 fn hash_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, FanoutError> {
@@ -5474,6 +5491,16 @@ mod tests {
     use crate::config::ServiceConfig;
     use crate::live_accounts::{AccountRow, CredentialMetaRow, LiveAccountsSnapshot};
     use crate::runtime_config::RuntimeConfig;
+
+    #[test]
+    fn economic_live_order_rejects_split_market_identity() {
+        let condition = PolymarketConditionId("condition".to_owned());
+        assert!(validate_live_market_identity("condition", &condition).is_ok());
+        assert!(matches!(
+            validate_live_market_identity("other-condition", &condition),
+            Err(FanoutError::Signal(_))
+        ));
+    }
 
     #[test]
     fn outcome_to_target_state_mapping_and_freeze_rule() {

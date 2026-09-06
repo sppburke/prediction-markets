@@ -159,6 +159,7 @@ pub struct PreparedFillRequest {
     pub idempotency_key: String,
     pub leader_wallet: WalletAddress,
     pub source_trade_id: SourceTradeId,
+    pub condition_id: PolymarketConditionId,
     pub market_id: String,
     pub outcome_id: u16,
     pub side: Side,
@@ -191,6 +192,7 @@ impl PreparedFillRequest {
             idempotency_key,
             leader_wallet: operation.leader_wallet,
             source_trade_id: operation.source_trade_id.clone(),
+            condition_id: economic.market.condition_id.clone(),
             market_id: economic.market.market_id.clone(),
             outcome_id,
             side: economic.market.side,
@@ -200,6 +202,19 @@ impl PreparedFillRequest {
             fee: economic.fee.expected_fee,
             entry_unix: operation.observed_at_bucket,
         }
+    }
+}
+
+fn validate_authority_market_identity(
+    condition_id: &PolymarketConditionId,
+    market_id: &str,
+) -> Result<(), SupabaseStateError> {
+    if market_id == condition_id.0 {
+        Ok(())
+    } else {
+        Err(SupabaseStateError::Corrupt(
+            "paper authority market ID disagrees with admitted condition ID".to_owned(),
+        ))
     }
 }
 
@@ -737,6 +752,7 @@ impl SupabaseStateTrait for SupabaseStateClient {
         &self,
         request: &PreparedFillRequest,
     ) -> Result<CanonicalFillResult, SupabaseStateError> {
+        validate_authority_market_identity(&request.condition_id, &request.market_id)?;
         let body = serde_json::json!({
             "p_start_seq": request.expected_authority.qualification_start_receipt.sequence.0,
             "p_start_hash": request.expected_authority.qualification_start_receipt.this_hash.to_hex().to_string(),
@@ -1705,6 +1721,16 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    #[test]
+    fn economic_authority_request_rejects_split_market_identity() {
+        let condition = PolymarketConditionId("condition".to_owned());
+        assert!(validate_authority_market_identity(&condition, "condition").is_ok());
+        assert!(matches!(
+            validate_authority_market_identity(&condition, "other-condition"),
+            Err(SupabaseStateError::Corrupt(_))
+        ));
+    }
 
     /// Fixture "table": `rows` total rows, returning at most `server_cap` per response
     /// regardless of the requested limit (models PostgREST `db-max-rows`), failing with

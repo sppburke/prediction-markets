@@ -152,12 +152,33 @@ pub fn taker_fee(
     CollateralAmount::from_decimal_exact(fee).map_err(|_| FeeError::Arithmetic)
 }
 
-/// Greatest fee reachable for the principal-implied signed quantity over the inclusive price band.
+/// Exact price encoded by a collateral-path BUY's signed maker and taker amounts.
+///
+/// A market BUY's walked limit is the lowest acceptable execution bound. The signed order price
+/// can be slightly higher because the venue floors the taker quantity while retaining the exact
+/// maker principal.
+pub fn signed_price(
+    maker_collateral: CollateralAmount,
+    taker_shares: ShareAmount,
+) -> Result<Price, FeeError> {
+    if maker_collateral == CollateralAmount::ZERO || taker_shares == ShareAmount::ZERO {
+        return Err(FeeError::Arithmetic);
+    }
+    let ratio = maker_collateral
+        .to_decimal()
+        .checked_div(taker_shares.to_decimal())
+        .ok_or(FeeError::Arithmetic)?;
+    Price::new(ratio).map_err(|_| FeeError::Arithmetic)
+}
+
+/// Greatest fee reachable for a principal-implied quantity over the inclusive walked-ask band.
 ///
 /// The supported exponent-one curve reaches its maximum at one half, so only the interval
 /// endpoints and `0.5` can be the maximizer. The result is rounded upward to the venue's
-/// five-decimal fee quantum. Quantity is derived from the signed principal and limit price here;
-/// callers cannot supply an independent, inconsistent quantity.
+/// five-decimal fee quantum. Quantity is derived from the signed principal and worst walked ask
+/// here; callers cannot supply an independent, inconsistent quantity. The actual signed ratio can
+/// only move upward after share flooring, so this remains conservative without accepting shares as
+/// a fifth input.
 pub fn fee_reserve(
     schedule: CompactFeeSchedule,
     principal: CollateralAmount,
@@ -188,7 +209,7 @@ pub fn fee_reserve(
     CollateralAmount::from_decimal_exact(reserve).map_err(|_| FeeError::Arithmetic)
 }
 
-/// Exact share quantity implied by a collateral principal and signed limit price.
+/// Exact share quantity implied by a collateral principal and worst walked ask.
 ///
 /// The ladder owns tick-aware flooring of this quotient; fee reserve deliberately keeps the exact
 /// value so it cannot under-reserve relative to the floored signed quantity.
@@ -467,6 +488,36 @@ mod tests {
             .unwrap()
             .to_decimal(),
             dec!(0.16191)
+        );
+    }
+
+    #[test]
+    fn signed_price_drives_the_five_decimal_fee_boundary() {
+        let principal = CollateralAmount::from_decimal_exact(dec!(1.000003)).unwrap();
+        let shares = ShareAmount::from_decimal_exact(dec!(6.6666)).unwrap();
+        let walked_ask = Price::new(dec!(0.15)).unwrap();
+        let actual_signed_price = signed_price(principal, shares).unwrap();
+
+        assert!(actual_signed_price > walked_ask);
+        assert_eq!(
+            taker_fee(
+                CompactFeeSchedule::Taker { rate: dec!(0.04) },
+                shares,
+                walked_ask,
+            )
+            .unwrap()
+            .to_decimal(),
+            dec!(0.03399)
+        );
+        assert_eq!(
+            taker_fee(
+                CompactFeeSchedule::Taker { rate: dec!(0.04) },
+                shares,
+                actual_signed_price,
+            )
+            .unwrap()
+            .to_decimal(),
+            dec!(0.03400)
         );
     }
 
