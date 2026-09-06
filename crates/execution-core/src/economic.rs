@@ -75,6 +75,11 @@ pub enum RiskDecisionAudit {
 pub struct RiskAudit {
     pub snapshot: RiskSnapshot,
     pub decision: RiskDecisionAudit,
+    /// Source-log receipts of every current-price observation consumed by the snapshot.
+    /// Receipts are sorted by sequence and deduplicated before the Prepared is composed.
+    pub price_receipts: Vec<AppendReceipt>,
+    /// Wall clock used to evaluate the snapshot's intraday, rolling, and latency windows.
+    pub evaluated_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +328,8 @@ mod tests {
                 concentration_caps: None,
             },
             decision: RiskDecisionAudit::Approved,
+            price_receipts: Vec::new(),
+            evaluated_at_unix_ms: 1_800_000_000_000,
         }
     }
 

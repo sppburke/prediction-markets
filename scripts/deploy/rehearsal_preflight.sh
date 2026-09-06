@@ -22,12 +22,14 @@ set +a
   exit 1
 }
 
+# shellcheck source=generation_common.sh
+source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+verify_legacy_service_contract "$SUPABASE_DB_URL"
+
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
 do $$
 declare
-  role_name text;
   table_name text;
-  function_name text;
   dml text;
   live_tables constant text[] := array['live_fills', 'live_positions', 'live_account_state'];
   rls_tables constant text[] := array[
@@ -35,31 +37,7 @@ declare
     'fill_market_snapshots', 'supabase_sink_hwm', 'service_watchlist',
     'service_runtime', 'wallet_lifecycle_events'
   ];
-  functions constant text[] := array[
-    'commit_fill(text,text,text,text,integer,text,bigint,text,bigint,bigint)',
-    'commit_fill_v2(text,text,text,text,integer,text,bigint,text,bigint,bigint)',
-    'apply_resolution(text,jsonb,text,bigint)',
-    'apply_resolution_v2(text,jsonb,bigint)',
-    'service_watchlist_replace_v1(timestamp with time zone,jsonb)',
-    'account_set_effective_mode(text,text,text,text)'
-  ];
 begin
-  if (select rolbypassrls from pg_roles where rolname = 'anon') is distinct from false then
-    raise exception 'anon must exist and must not bypass RLS';
-  end if;
-
-  foreach function_name in array functions loop
-    if to_regprocedure(function_name) is null then
-      raise exception 'required write function is absent: %', function_name;
-    end if;
-    if has_function_privilege('anon', function_name, 'EXECUTE') then
-      raise exception 'anon unexpectedly has EXECUTE on %', function_name;
-    end if;
-    if not has_function_privilege('service_role', function_name, 'EXECUTE') then
-      raise exception 'service_role lacks EXECUTE on %', function_name;
-    end if;
-  end loop;
-
   foreach table_name in array live_tables loop
     foreach dml in array array['INSERT', 'UPDATE', 'DELETE'] loop
       if has_table_privilege('anon', 'public.' || table_name, dml) then

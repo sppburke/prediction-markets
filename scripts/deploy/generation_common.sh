@@ -275,6 +275,87 @@ verify_installed_unit_owner() {
     die "pe-service process snapshot changed during ownership proof"
 }
 
+# Read-only proof of the complete pre-financial-era database contract (#545). Both the publishable-
+# key rehearsal and the financial-era driver call this owner so callable signatures, grants, and the
+# Legacy17 hot-config inventory cannot drift between the rehearsal and the Start boundary.
+verify_legacy_service_contract() {
+  local database_url=${1:-${SUPABASE_DB_URL:-}}
+  [[ -n "$database_url" ]] || die "database URL is required for the Legacy17 contract guard"
+  psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
+set search_path = public, pg_catalog;
+do $$
+declare
+  function_name text;
+  expected_functions constant text[] := array[
+    'commit_fill(text,text,text,text,integer,text,bigint,text,bigint,bigint)',
+    'commit_fill_v2(text,text,text,text,integer,text,bigint,text,bigint,bigint)',
+    'apply_resolution(text,jsonb,text,bigint)',
+    'apply_resolution_v2(text,jsonb,bigint)',
+    'service_watchlist_replace_v1(timestamp with time zone,jsonb)',
+    'account_set_effective_mode(text,text,text,text)'
+  ];
+  legacy_keys constant text[] := array[
+    'active_watchlist_size','mode','max_fill_price','min_fill_price',
+    'min_resolution_horizon_secs','max_resolution_horizon_secs','fill_mode',
+    'price_impact_cap_bps','flip_human_approved',
+    'kelly_fraction_above_default_human_approved','polymarket_fee_rate',
+    'kelly_fraction_override','per_trade_cap','slippage_rate','sizing_mode',
+    'sizing_dollar_usd','sizing_contracts'
+  ];
+begin
+  if (select rolbypassrls from pg_roles where rolname = 'anon') is distinct from false then
+    raise exception 'anon must exist and must not bypass RLS';
+  end if;
+  if (select rolbypassrls from pg_roles where rolname = 'service_role') is distinct from true then
+    raise exception 'service_role must exist and bypass RLS';
+  end if;
+
+  if exists (
+    select signature from unnest(expected_functions) signature
+    except
+    select p.oid::regprocedure::text
+      from pg_proc p
+     where p.pronamespace = 'public'::regnamespace
+       and p.proname in (
+       'commit_fill','commit_fill_v2','apply_resolution','apply_resolution_v2',
+       'service_watchlist_replace_v1','account_set_effective_mode'
+     )
+  ) or exists (
+    select p.oid::regprocedure::text
+      from pg_proc p
+     where p.pronamespace = 'public'::regnamespace
+       and p.proname in (
+       'commit_fill','commit_fill_v2','apply_resolution','apply_resolution_v2',
+       'service_watchlist_replace_v1','account_set_effective_mode'
+     )
+    except
+    select signature from unnest(expected_functions) signature
+  ) then
+    raise exception 'pre-Start callable-function inventory differs from Legacy17';
+  end if;
+
+  foreach function_name in array expected_functions loop
+    if has_function_privilege('anon', function_name, 'EXECUTE') then
+      raise exception 'anon unexpectedly has EXECUTE on %', function_name;
+    end if;
+    if not has_function_privilege('service_role', function_name, 'EXECUTE') then
+      raise exception 'service_role lacks EXECUTE on %', function_name;
+    end if;
+  end loop;
+
+  if exists (select key from service_config except select key from unnest(legacy_keys) key)
+     or exists (
+       select key from unnest(legacy_keys) key
+        where key <> 'kelly_fraction_override'
+       except select key from service_config
+     )
+     or (select count(*) from service_config where key = 'kelly_fraction_override') > 1 then
+    raise exception 'service_config does not match the Legacy17 contract';
+  end if;
+end $$;
+SQL
+}
+
 activation_archive_counts() {
   # The archive tables gain `activation_id` only when archive_paper_state.sql first runs (`add column if
   # not exists`); the deployed database had no such column before the first activation (EVIDENCE F7
