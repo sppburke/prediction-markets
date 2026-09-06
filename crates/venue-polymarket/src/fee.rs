@@ -1,10 +1,11 @@
 //! Exact compact-market fee economics (#545).
 
 use pe_core_types::{CollateralAmount, Price, ShareAmount};
-use polymarket_client_sdk_v2::clob::types::response::ClobMarketInfoResponse;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::value::RawValue;
+
+use std::collections::BTreeMap;
 
 /// Compact `/clob-markets/{condition}` fee shape accepted for economics (#545): zero-fee or
 /// taker-only exponent-one.
@@ -31,95 +32,97 @@ pub enum FeeScheduleError {
     Malformed,
 }
 
-/// Classify the compact market's `fd` / `mbf` / `tbf` fields.
-pub fn compact_fee_schedule(
-    info: &ClobMarketInfoResponse,
-) -> Result<CompactFeeSchedule, FeeScheduleError> {
-    let maker_base = info.maker_base_fee.unwrap_or(Decimal::ZERO);
-    if maker_base != Decimal::ZERO {
+/// Parse the compact wire's exact `fd` / `mbf` / `tbf` lexemes.
+///
+/// This deliberately reads the raw JSON lexemes before the shared SDK DTO is deserialized by the
+/// market parser. Financial decimals therefore never traverse `f64`, and absent fields remain
+/// distinguishable from explicit `null`.
+pub fn parse_compact_fee_schedule(bytes: &[u8]) -> Result<CompactFeeSchedule, FeeScheduleError> {
+    let fields: BTreeMap<String, Box<RawValue>> =
+        serde_json::from_slice(bytes).map_err(|_| FeeScheduleError::Malformed)?;
+    let maker_base = optional_base_fee(&fields, "mbf")?;
+    if maker_base.is_some_and(|value| value != Decimal::ZERO) {
         return Err(FeeScheduleError::MakerFee);
     }
-
-    let taker_base = info.taker_base_fee.unwrap_or(Decimal::ZERO);
-    let Some(details) = info.fee_details.as_ref() else {
-        return if taker_base == Decimal::ZERO {
+    let taker_base = optional_base_fee(&fields, "tbf")?;
+    let Some(details) = fields.get("fd") else {
+        return if taker_base.is_none_or(|value| value == Decimal::ZERO) {
             Ok(CompactFeeSchedule::Zero)
         } else {
             Err(FeeScheduleError::UnknownBase)
         };
     };
-
-    if taker_base != Decimal::ZERO {
-        return Err(FeeScheduleError::Contradictory);
-    }
-    if !details.taker_only {
-        return Err(FeeScheduleError::MakerFee);
-    }
-    if details.exponent != 1 {
-        return Err(FeeScheduleError::Exponent);
-    }
-    if details.rate < Decimal::ZERO || details.rate >= Decimal::ONE || details.rate.scale() > 6 {
-        return Err(FeeScheduleError::Unrepresentable);
-    }
-
-    Ok(CompactFeeSchedule::Taker { rate: details.rate })
-}
-
-/// Deserialize a compact response into the vendored SDK wire DTO, then validate its fee fields.
-pub fn parse_compact_fee_schedule(bytes: &[u8]) -> Result<CompactFeeSchedule, FeeScheduleError> {
-    let mut raw: Value = serde_json::from_slice(bytes).map_err(|_| FeeScheduleError::Malformed)?;
-    let fields = raw.as_object_mut().ok_or(FeeScheduleError::Malformed)?;
-    for base in ["mbf", "tbf"] {
-        if fields.get(base).is_some_and(Value::is_null) {
-            return Err(FeeScheduleError::UnknownBase);
-        }
-    }
-    if let Some(details) = fields.get_mut("fd") {
-        if details.is_null() {
-            return Err(FeeScheduleError::Malformed);
-        }
-        normalize_fee_details(details)?;
-    }
-    let info: ClobMarketInfoResponse =
-        serde_json::from_value(raw).map_err(|_| FeeScheduleError::Malformed)?;
-    compact_fee_schedule(&info)
-}
-
-fn normalize_fee_details(details: &mut Value) -> Result<(), FeeScheduleError> {
-    let fields = details.as_object_mut().ok_or(FeeScheduleError::Malformed)?;
-    let rate = take_alias(fields, &["r", "rate"])?;
-    let exponent = take_alias(fields, &["e", "exponent"])?;
-    let taker_only = take_alias(fields, &["to", "taker_only", "takerOnly"])?;
-    if !fields.is_empty() || rate.is_none() || exponent.is_none() || taker_only.is_none() {
+    if details.get().trim() == "null" {
         return Err(FeeScheduleError::Malformed);
     }
-    if let Some(value) = rate {
-        fields.insert("r".to_owned(), value);
+    if taker_base.is_some_and(|value| value != Decimal::ZERO) {
+        return Err(FeeScheduleError::Contradictory);
     }
-    if let Some(value) = exponent {
-        fields.insert("e".to_owned(), value);
+
+    let detail_fields: BTreeMap<String, Box<RawValue>> =
+        serde_json::from_str(details.get()).map_err(|_| FeeScheduleError::Malformed)?;
+    if detail_fields.len() != 3
+        || !detail_fields.contains_key("r")
+        || !detail_fields.contains_key("e")
+        || !detail_fields.contains_key("to")
+    {
+        return Err(FeeScheduleError::Malformed);
     }
-    if let Some(value) = taker_only {
-        fields.insert("to".to_owned(), value);
+    let rate = parse_decimal_lexeme(detail_fields.get("r").ok_or(FeeScheduleError::Malformed)?)?;
+    let exponent: i64 = serde_json::from_str(
+        detail_fields
+            .get("e")
+            .ok_or(FeeScheduleError::Malformed)?
+            .get(),
+    )
+    .map_err(|_| FeeScheduleError::Malformed)?;
+    let taker_only: bool = serde_json::from_str(
+        detail_fields
+            .get("to")
+            .ok_or(FeeScheduleError::Malformed)?
+            .get(),
+    )
+    .map_err(|_| FeeScheduleError::Malformed)?;
+    if !taker_only {
+        return Err(FeeScheduleError::MakerFee);
     }
-    Ok(())
+    if exponent != 1 {
+        return Err(FeeScheduleError::Exponent);
+    }
+    if rate < Decimal::ZERO || rate >= Decimal::ONE {
+        return Err(FeeScheduleError::Unrepresentable);
+    }
+    Ok(CompactFeeSchedule::Taker { rate })
 }
 
-fn take_alias(
-    fields: &mut Map<String, Value>,
-    aliases: &[&str],
-) -> Result<Option<Value>, FeeScheduleError> {
-    let mut selected = None;
-    for alias in aliases {
-        let Some(value) = fields.remove(*alias) else {
-            continue;
-        };
-        if selected.as_ref().is_some_and(|current| current != &value) {
-            return Err(FeeScheduleError::Contradictory);
-        }
-        selected = Some(value);
-    }
-    Ok(selected)
+fn optional_base_fee(
+    fields: &BTreeMap<String, Box<RawValue>>,
+    key: &str,
+) -> Result<Option<Decimal>, FeeScheduleError> {
+    fields
+        .get(key)
+        .map(|raw| {
+            if raw.get().trim() == "null" {
+                Err(FeeScheduleError::UnknownBase)
+            } else {
+                parse_decimal_lexeme(raw).map_err(|_| FeeScheduleError::UnknownBase)
+            }
+        })
+        .transpose()
+}
+
+pub(crate) fn parse_decimal_lexeme(raw: &RawValue) -> Result<Decimal, FeeScheduleError> {
+    let lexeme = raw.get().trim();
+    let owned;
+    let unquoted = if lexeme.starts_with('"') {
+        owned = serde_json::from_str::<String>(lexeme).map_err(|_| FeeScheduleError::Malformed)?;
+        owned.as_str()
+    } else {
+        lexeme
+    };
+    Decimal::from_str_exact(unquoted)
+        .or_else(|_| Decimal::from_scientific(unquoted))
+        .map_err(|_| FeeScheduleError::Unrepresentable)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -258,9 +261,7 @@ fn validate_band(floor: Price, ceiling: Price) -> Result<(), FeeError> {
 fn validated_rate(schedule: CompactFeeSchedule) -> Result<Option<Decimal>, FeeError> {
     match schedule {
         CompactFeeSchedule::Zero => Ok(None),
-        CompactFeeSchedule::Taker { rate }
-            if rate >= Decimal::ZERO && rate < Decimal::ONE && rate.scale() <= 6 =>
-        {
+        CompactFeeSchedule::Taker { rate } if rate >= Decimal::ZERO && rate < Decimal::ONE => {
             Ok(Some(rate))
         }
         CompactFeeSchedule::Taker { .. } => Err(FeeError::Arithmetic),
@@ -305,7 +306,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use rust_decimal_macros::dec;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -337,8 +338,6 @@ mod tests {
         for fields in [
             json!({"fd": {"r": 0, "e": 1, "to": true}}),
             json!({"fd": {"r": 0.0025, "e": 1, "to": true}}),
-            json!({"fd": {"rate": 0.0025, "exponent": 1, "taker_only": true}}),
-            json!({"fd": {"rate": 0.0025, "exponent": 1, "takerOnly": true}}),
             json!({"fd": {"r": 0.0025, "e": 1, "to": true}, "mbf": 0, "tbf": 0}),
         ] {
             let expected_rate = fields
@@ -353,6 +352,12 @@ mod tests {
                 }
             );
         }
+        assert_eq!(
+            parse_compact_fee_schedule(br#"{"fd":{"r":"0.0000001","e":1,"to":true}}"#,).unwrap(),
+            CompactFeeSchedule::Taker {
+                rate: dec!(0.0000001)
+            }
+        );
     }
 
     #[test]
@@ -376,16 +381,24 @@ mod tests {
                 FeeScheduleError::Unrepresentable,
             ),
             (
-                json!({"fd": {"r": "0.0000001", "e": 1, "to": true}}),
-                FeeScheduleError::Unrepresentable,
-            ),
-            (
                 json!({"fd": {"r": 0.0025, "e": 1, "to": true}, "tbf": 1}),
                 FeeScheduleError::Contradictory,
             ),
             (
                 json!({"fd": {"r": 0.0025, "rate": 0.003, "e": 1, "to": true}}),
-                FeeScheduleError::Contradictory,
+                FeeScheduleError::Malformed,
+            ),
+            (
+                json!({"fd": {"r": 0.0025, "rate": 0.0025, "e": 1, "to": true}}),
+                FeeScheduleError::Malformed,
+            ),
+            (
+                json!({"fd": {"rate": 0.0025, "exponent": 1, "taker_only": true}}),
+                FeeScheduleError::Malformed,
+            ),
+            (
+                json!({"fd": {"r": 0.0025, "e": 1, "takerOnly": true}}),
+                FeeScheduleError::Malformed,
             ),
             (
                 json!({"fd": {"r": 0.0025, "e": 1, "to": true, "unknown": 1}}),

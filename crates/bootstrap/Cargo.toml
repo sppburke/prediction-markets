@@ -27,6 +27,7 @@ pe-position-ledger            = { path = "../position-ledger",              vers
 pe-source-core                = { path = "../source-core",                  version = "0.1.0" }
 pe-source-polymarket-public   = { path = "../source-polymarket-public",     version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",                 version = "0.1.0" }
+pe-venue-polymarket           = { path = "../venue-polymarket",             version = "0.1.0" }
 
 alloy-primitives = { workspace = true }
 anyhow          = { workspace = true }

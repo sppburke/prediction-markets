@@ -253,10 +253,12 @@ create a generation, stage new state paths, invoke `seed_v1_empty.sh`, or replac
 `/home/sean/pe-financial-era.json` (`kind: financial-era-v1`) is the sole financial-transition
 manifest.
 
-Before `QualificationStarted`, installed artifacts and the complete 17-name hot-configuration
-contract stay active. The two legacy compatibility rows remain required but are ignored by corrected
-economics. After Start, apply the reviewed migration to the 15 economic names; an optional
-`risk_halt_release_hash` is separate incident control. Do not apply post-Start changes early.
+Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
+superseded values are accepted only by the private compatibility decoder and never enter corrected
+economics. After Start, apply the reviewed migration and switch consumers to
+`ConfigEra::Financial15`; an optional `risk_halt_release_hash` is separate incident control. The
+driver runs the configuration migration only after the physical Start and financial schema-v3
+migration. Do not apply post-Start changes early.
 
 Run the exact reviewed driver command on the production host:
 

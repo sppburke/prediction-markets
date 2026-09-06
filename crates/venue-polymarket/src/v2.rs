@@ -768,7 +768,9 @@ fn validate_wire(bytes: &[u8]) -> Result<(), CanaryV2Error> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| CanaryV2Error::Wire(e.to_string()))?;
     if value.get("orderType").and_then(serde_json::Value::as_str) != Some("FOK")
-        || value.get("postOnly").and_then(serde_json::Value::as_bool) != Some(false)
+        // The vendored SDK never serializes `postOnly` for a market order (its market build fixes
+        // `post_only: None`); the collateral path must therefore carry no such field at all.
+        || value.get("postOnly").is_some()
         || value.get("deferExec").and_then(serde_json::Value::as_bool) != Some(false)
         || value
             .pointer("/order/expiration")
@@ -1187,7 +1189,10 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_slice(&state.body.lock().unwrap()).unwrap();
         assert_eq!(body["orderType"], "FOK");
-        assert_eq!(body["postOnly"], false);
+        assert!(
+            body.get("postOnly").is_none(),
+            "market orders carry no postOnly field"
+        );
         assert_eq!(body["deferExec"], false);
         assert_eq!(body["order"]["makerAmount"], "500000");
         assert_eq!(body["order"]["takerAmount"], "5000000");

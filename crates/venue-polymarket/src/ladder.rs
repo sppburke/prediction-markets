@@ -9,7 +9,7 @@ use pe_core_types::{CollateralAmount, Price, ShareAmount};
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::canary_market::AskLevel;
-use crate::fee::{CompactFeeSchedule, FeeError, fee_reserve, principal_for_budget};
+use crate::fee::{CompactFeeSchedule, FeeError, fee_reserve, principal_for_budget, taker_fee};
 
 const ATOMICS_PER_SHARE: u64 = 1_000_000;
 
@@ -32,6 +32,10 @@ pub enum LadderError {
     BelowMinimum,
     #[error("principal plus fee reserve exceeds a monetary cap")]
     CapExceeded,
+    #[error("aggregate all-in economics have no Kelly edge")]
+    NoEdge,
+    #[error("Kelly sizing inputs or result are invalid")]
+    KellySizing,
     #[error("fee calculation failed: {0}")]
     Fee(#[from] FeeError),
     #[error("exact amount arithmetic failed")]
@@ -78,12 +82,22 @@ impl LadderPlan {
     }
 }
 
+/// Caller-owned allocation from an exact all-in price per share.
+pub type KellyAllocator<'a> = &'a dyn Fn(Price) -> Result<ShareAmount, LadderError>;
+
 /// Requested sizing before the common ladder and cap checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuySizing {
-    Dollar { budget: CollateralAmount },
-    Contract { contracts: u64 },
-    Kelly { contracts: u64 },
+#[derive(Clone, Copy)]
+pub enum BuySizing<'a> {
+    Dollar {
+        budget: CollateralAmount,
+    },
+    Contract {
+        contracts: u64,
+    },
+    Kelly {
+        allocate: KellyAllocator<'a>,
+        slippage_rate: Decimal,
+    },
 }
 
 /// A plan together with the exact conservative fee reserve used by every monetary cap.
@@ -108,7 +122,7 @@ impl SizedBuyPlan {
 pub fn plan_sized_buy(
     asks: &[AskLevel],
     schedule: CompactFeeSchedule,
-    sizing: BuySizing,
+    sizing: BuySizing<'_>,
     monetary_caps: &[CollateralAmount],
     minimum_order_size: ShareAmount,
     minimum_tick_size: Price,
@@ -137,7 +151,6 @@ pub fn plan_sized_buy(
 
     let (budget, ladder) = match sizing {
         BuySizing::Dollar { budget } => {
-            let budget = budget.min(smallest_cap);
             let principal = principal_for_budget(schedule, budget, best_ask, ceiling)?;
             let ladder = plan_principal_buy_with_scale(
                 asks,
@@ -159,29 +172,37 @@ pub fn plan_sized_buy(
             })?;
             (budget, ladder)
         }
-        BuySizing::Contract { contracts } | BuySizing::Kelly { contracts } => {
-            let requested = whole_shares(contracts)?;
-            if requested < minimum_order_size {
-                return Err(LadderError::BelowMinimum);
-            }
-            let exact = plan_exact_shares(
+        BuySizing::Contract { contracts } => (
+            smallest_cap,
+            plan_contract_buy(
                 asks,
-                requested,
-                minimum_price,
-                maximum_price_exclusive,
-                ceiling,
-            )?;
-            let ladder = plan_principal_buy_with_scale(
-                asks,
-                exact.worst_case_debit,
+                contracts,
                 signed_share_scale,
+                minimum_order_size,
                 minimum_price,
                 maximum_price_exclusive,
                 chase_ceiling,
                 impact_ceiling,
-            )?;
-            (smallest_cap, ladder)
-        }
+            )?,
+        ),
+        BuySizing::Kelly {
+            allocate,
+            slippage_rate,
+        } => (
+            smallest_cap,
+            plan_kelly_buy(
+                asks,
+                schedule,
+                allocate,
+                slippage_rate,
+                signed_share_scale,
+                minimum_order_size,
+                minimum_price,
+                maximum_price_exclusive,
+                chase_ceiling,
+                impact_ceiling,
+            )?,
+        ),
     };
 
     let reserve = fee_reserve(
@@ -209,9 +230,182 @@ pub fn plan_sized_buy(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn plan_contract_buy(
+    asks: &[AskLevel],
+    contracts: u64,
+    signed_share_scale: u32,
+    minimum_order_size: ShareAmount,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    chase_ceiling: Price,
+    impact_ceiling: Price,
+) -> Result<LadderPlan, LadderError> {
+    let requested = whole_shares(contracts)?;
+    plan_share_buy(
+        asks,
+        requested,
+        signed_share_scale,
+        minimum_order_size,
+        minimum_price,
+        maximum_price_exclusive,
+        chase_ceiling,
+        impact_ceiling,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_share_buy(
+    asks: &[AskLevel],
+    requested: ShareAmount,
+    signed_share_scale: u32,
+    minimum_order_size: ShareAmount,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    chase_ceiling: Price,
+    impact_ceiling: Price,
+) -> Result<LadderPlan, LadderError> {
+    if requested < minimum_order_size {
+        return Err(LadderError::BelowMinimum);
+    }
+    let ceiling = chase_ceiling.min(impact_ceiling);
+    let mut available_principal = Decimal::ZERO;
+    let mut prior_price = None;
+    let mut signed_principal = None;
+    for level in asks {
+        if prior_price.is_some_and(|prior| level.price < prior) {
+            return Err(LadderError::Amount);
+        }
+        prior_price = Some(level.price);
+        if level.price < minimum_price {
+            return Err(LadderError::BelowBandAsk);
+        }
+        if level.price >= maximum_price_exclusive || level.price > ceiling {
+            break;
+        }
+        if level.price == Price::ZERO || level.shares == ShareAmount::ZERO {
+            return Err(LadderError::Amount);
+        }
+        available_principal = available_principal
+            .checked_add(
+                level
+                    .shares
+                    .to_decimal()
+                    .checked_mul(level.price.0)
+                    .ok_or(LadderError::Amount)?,
+            )
+            .ok_or(LadderError::Amount)?;
+        let required = requested
+            .to_decimal()
+            .checked_mul(level.price.0)
+            .ok_or(LadderError::Amount)?;
+        if available_principal >= required {
+            signed_principal = Some(
+                CollateralAmount::from_decimal_exact(required).map_err(|_| LadderError::Amount)?,
+            );
+            break;
+        }
+    }
+    let signed_principal = signed_principal.ok_or(LadderError::InsufficientDepth)?;
+    plan_principal_buy_with_scale(
+        asks,
+        signed_principal,
+        signed_share_scale,
+        minimum_price,
+        maximum_price_exclusive,
+        chase_ceiling,
+        impact_ceiling,
+    )
+}
+
+/// Kelly's first estimate uses the one-share aggregate fee. The eventual quantity is then priced
+/// with one aggregate fee calculation and resized exactly once. A lower second result wins; a
+/// higher result cannot expand the first allocation. This is the sole deterministic convergence
+/// chain used by production planners and backtests.
+#[allow(clippy::too_many_arguments)]
+fn plan_kelly_buy(
+    asks: &[AskLevel],
+    schedule: CompactFeeSchedule,
+    allocate: KellyAllocator<'_>,
+    slippage_rate: Decimal,
+    signed_share_scale: u32,
+    minimum_order_size: ShareAmount,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    chase_ceiling: Price,
+    impact_ceiling: Price,
+) -> Result<LadderPlan, LadderError> {
+    if slippage_rate < Decimal::ZERO {
+        return Err(LadderError::NoEdge);
+    }
+    let one_share_plan = plan_share_buy(
+        asks,
+        whole_shares(1)?,
+        signed_share_scale,
+        ShareAmount::ZERO,
+        minimum_price,
+        maximum_price_exclusive,
+        chase_ceiling,
+        impact_ceiling,
+    )?;
+    let first_price = aggregate_all_in_price(&one_share_plan, schedule, slippage_rate)?;
+    let first = allocate(first_price)?;
+    if first == ShareAmount::ZERO {
+        return Err(LadderError::NoEdge);
+    }
+    let candidate = plan_share_buy(
+        asks,
+        first,
+        signed_share_scale,
+        minimum_order_size,
+        minimum_price,
+        maximum_price_exclusive,
+        chase_ceiling,
+        impact_ceiling,
+    )?;
+    let aggregate_price = aggregate_all_in_price(&candidate, schedule, slippage_rate)?;
+    let second = allocate(aggregate_price)?;
+    let accepted = first.min(second);
+    if accepted == ShareAmount::ZERO {
+        return Err(LadderError::NoEdge);
+    }
+    if accepted == first {
+        Ok(candidate)
+    } else {
+        plan_share_buy(
+            asks,
+            accepted,
+            signed_share_scale,
+            minimum_order_size,
+            minimum_price,
+            maximum_price_exclusive,
+            chase_ceiling,
+            impact_ceiling,
+        )
+    }
+}
+
+fn aggregate_all_in_price(
+    plan: &LadderPlan,
+    schedule: CompactFeeSchedule,
+    slippage_rate: Decimal,
+) -> Result<Price, LadderError> {
+    let fee = taker_fee(schedule, plan.shares, plan.limit_price)?;
+    let all_in = plan
+        .worst_case_debit
+        .checked_add(fee)
+        .map_err(|_| LadderError::Amount)?
+        .to_decimal()
+        .checked_div(plan.shares.to_decimal())
+        .and_then(|price| price.checked_mul(Decimal::ONE.checked_add(slippage_rate)?))
+        .ok_or(LadderError::Amount)?;
+    Price::new(all_in).map_err(|_| LadderError::NoEdge)
+}
+
 /// Walk the full signed principal across asks. The signed minimum quantity is determined only by
 /// the worst accepted tick; improved quantities remain in `used_asks` for paper/replay.
-pub fn plan_principal_buy(
+#[cfg(test)]
+fn plan_principal_buy(
     asks: &[AskLevel],
     principal: CollateralAmount,
     minimum_price: Price,
@@ -264,7 +458,23 @@ fn plan_principal_buy_with_scale(
 }
 
 /// Exact-share compatibility adapter used by the isolated canary.
-pub fn plan_exact_shares(
+pub(crate) fn plan_exact_shares(
+    asks: &[AskLevel],
+    requested_shares: ShareAmount,
+    minimum_price: Price,
+    maximum_price_exclusive: Price,
+    origin_ceiling: Price,
+) -> Result<LadderPlan, LadderError> {
+    plan_requested_shares(
+        asks,
+        requested_shares,
+        minimum_price,
+        maximum_price_exclusive,
+        origin_ceiling,
+    )
+}
+
+fn plan_requested_shares(
     asks: &[AskLevel],
     requested_shares: ShareAmount,
     minimum_price: Price,
@@ -303,37 +513,6 @@ pub fn plan_exact_shares(
         shares: requested_shares,
         worst_case_debit: principal,
     })
-}
-
-/// Backward-compatible budget entry point. `budget` is now the exact signed principal.
-pub fn plan_budget_buy(
-    asks: &[AskLevel],
-    budget: CollateralAmount,
-    max_shares: Option<u64>,
-    minimum_price: Price,
-    maximum_price_exclusive: Price,
-    origin_ceiling: Price,
-) -> Result<LadderPlan, LadderError> {
-    if let Some(maximum) = max_shares {
-        let capped = plan_exact_shares(
-            asks,
-            whole_shares(maximum)?,
-            minimum_price,
-            maximum_price_exclusive,
-            origin_ceiling,
-        )?;
-        if capped.worst_case_debit <= budget {
-            return Ok(capped);
-        }
-    }
-    plan_principal_buy(
-        asks,
-        budget,
-        minimum_price,
-        maximum_price_exclusive,
-        origin_ceiling,
-        origin_ceiling,
-    )
 }
 
 struct PrincipalWalk {
@@ -523,6 +702,8 @@ fn expected_spend_decimal(asks: &[AskLevel]) -> Result<Decimal, LadderError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::cell::Cell;
+
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -665,6 +846,79 @@ mod tests {
                 price(dec!(0.50)),
             ),
             Err(LadderError::CapExceeded)
+        );
+    }
+
+    #[test]
+    fn principal_plus_reserve_cap_accepts_equality_and_rejects_one_atomic_less() {
+        let asks = vec![level(dec!(0.40), dec!(100))];
+        let schedule = CompactFeeSchedule::Taker { rate: dec!(0.04) };
+        let common = |caps: &[CollateralAmount]| {
+            plan_sized_buy(
+                &asks,
+                schedule,
+                BuySizing::Contract { contracts: 3 },
+                caps,
+                ShareAmount::from_decimal_exact(dec!(1)).unwrap(),
+                price(dec!(0.01)),
+                Price::ZERO,
+                price(dec!(0.99)),
+                price(dec!(0.40)),
+                price(dec!(0.40)),
+            )
+        };
+        let uncapped = common(&[]).unwrap();
+        let exact = uncapped.worst_case_all_in_debit().unwrap();
+        let equality = common(&[exact]).unwrap();
+        assert_eq!(equality.ladder, uncapped.ladder);
+        assert_eq!(equality.reserve, uncapped.reserve);
+        assert_eq!(equality.worst_case_all_in_debit().unwrap(), exact);
+        let one_atomic_less = exact.checked_sub(CollateralAmount::from_atomic(1)).unwrap();
+        assert_eq!(common(&[one_atomic_less]), Err(LadderError::CapExceeded));
+    }
+
+    #[test]
+    fn kelly_resizes_once_from_the_exact_aggregate_fee() {
+        let allocation_calls = Cell::new(0u8);
+        let allocate = |all_in_price: Price| {
+            let contracts = if all_in_price.0 == dec!(0.156241) {
+                67
+            } else if all_in_price.0 == dec!(10.468217) / dec!(67) {
+                66
+            } else {
+                return Err(LadderError::KellySizing);
+            };
+            allocation_calls.set(allocation_calls.get() + 1);
+            ShareAmount::from_whole(contracts).map_err(|_| LadderError::KellySizing)
+        };
+        let plan = plan_sized_buy(
+            &[level(dec!(0.151111), dec!(1_000))],
+            CompactFeeSchedule::Taker { rate: dec!(0.04) },
+            BuySizing::Kelly {
+                allocate: &allocate,
+                slippage_rate: Decimal::ZERO,
+            },
+            &[],
+            ShareAmount::from_whole(1).unwrap(),
+            price(dec!(0.0001)),
+            Price::ZERO,
+            price(dec!(1)),
+            price(dec!(0.151111)),
+            price(dec!(0.151111)),
+        )
+        .unwrap();
+        assert_eq!(allocation_calls.get(), 2);
+        assert_eq!(plan.ladder.shares.to_decimal(), dec!(66));
+        assert_eq!(plan.ladder.worst_case_debit.to_decimal(), dec!(9.973326));
+        assert_eq!(
+            taker_fee(
+                CompactFeeSchedule::Taker { rate: dec!(0.04) },
+                plan.ladder.shares,
+                plan.ladder.limit_price,
+            )
+            .unwrap()
+            .to_decimal(),
+            dec!(0.33864)
         );
     }
 
