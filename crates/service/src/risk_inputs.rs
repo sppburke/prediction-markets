@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
-use pe_core_types::{EventSeq, MarketId, OutcomeId, Price};
+use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
 use pe_event_log::{AppendReceipt, Reader};
 use pe_paper_state::FinancialSnapshot;
 use pe_risk_engine::{
@@ -265,13 +266,19 @@ pub fn build_paper_risk_snapshot(
 ) -> Result<RiskSnapshot, RiskInputsUnavailable> {
     let mut composed =
         build_paper_risk_snapshot_without_latency(base, snapshot, era, current_prices, now_unix)?;
-    let latency = paper_latency_samples(era, source_log_path, now_unix)?;
+    let source_receipts = paper_fill_source_receipts(era)?;
+    let received_millis =
+        source_receipt_millis_index(source_log_path, source_receipts.into_iter())?;
+    let latency = paper_latency_samples_from_source_receipts(era, now_unix, &|receipt| {
+        source_receipt_received_millis(&received_millis, receipt)
+    })?;
     composed.copy_latency_kill_switch_active = latency.switch_active(latency_was_active);
     Ok(composed)
 }
 
 /// Compose paper risk from a source prefix that the caller has already replayed and verified.
-/// Offline qualification uses this entry point so every Prepared reuses its sealed-prefix view.
+/// Runtime supplies the maintained receipt-time index; offline qualification keeps its own
+/// sealed-prefix view so every Prepared reuses the correct historical boundary.
 pub(crate) fn build_paper_risk_snapshot_from_source_receipts<F>(
     base: &RiskSnapshot,
     snapshot: &FinancialSnapshot,
@@ -509,14 +516,11 @@ pub(crate) fn latency_hysteresis_seed(
 /// observation timestamp. Completion belongs to the hour containing the Final endpoint.
 pub(crate) fn paper_latency_samples(
     era: &PaperEra,
-    source_log_path: &Path,
+    source_receipt_millis: &SourceReceiptMillisIndex,
     now_unix: i64,
 ) -> Result<LatencySamples, RiskInputsUnavailable> {
-    let source_receipts = paper_fill_source_receipts(era)?;
-    let received_millis =
-        source_receipt_millis_index(source_log_path, source_receipts.into_iter())?;
     paper_latency_samples_from_source_receipts(era, now_unix, &|receipt| {
-        source_receipt_received_millis(&received_millis, receipt)
+        source_receipt_millis.received_millis(receipt)
     })
 }
 
@@ -749,6 +753,92 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
         .collect()
 }
 
+/// Process-wide verified source receipt-to-received-time projection.
+///
+/// Boot replays the source log once to populate this append-only map. The sole synchronized
+/// source-log coordinator records each later append before acknowledging its receipt, so runtime
+/// paper risk and incident release never need to replay the growing source prefix.
+#[derive(Clone, Default)]
+pub struct SourceReceiptMillisIndex {
+    entries: Arc<RwLock<BTreeMap<EventSeq, (AppendReceipt, i64)>>>,
+}
+
+impl SourceReceiptMillisIndex {
+    /// Rebuild the complete verified source-log projection at boot.
+    pub fn replay(source_log_path: &Path) -> Result<Self, RiskInputsUnavailable> {
+        let mut entries = BTreeMap::new();
+        for item in
+            Reader::replay(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)?
+        {
+            let (_sequence, envelope) = item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+            let receipt = AppendReceipt {
+                sequence: envelope.seq,
+                this_hash: envelope.this_hash,
+            };
+            let received_millis = received_at_millis(&envelope.received_at)?;
+            if entries
+                .insert(envelope.seq, (receipt, received_millis))
+                .is_some()
+            {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+        }
+        Ok(Self {
+            entries: Arc::new(RwLock::new(entries)),
+        })
+    }
+
+    /// Extend the projection with an append that the source-log owner has already synchronized.
+    pub(crate) fn record_synced_append(
+        &self,
+        receipt: AppendReceipt,
+        received_at: &ReceivedAt,
+    ) -> Result<(), RiskInputsUnavailable> {
+        let received_millis = received_at_millis(received_at)?;
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(known) = entries.get(&receipt.sequence) {
+            return if *known == (receipt, received_millis) {
+                Ok(())
+            } else {
+                Err(RiskInputsUnavailable::PriceConflict)
+            };
+        }
+        entries.insert(receipt.sequence, (receipt, received_millis));
+        Ok(())
+    }
+
+    pub(crate) fn received_millis(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<i64, RiskInputsUnavailable> {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        source_receipt_received_millis(&entries, receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> BTreeMap<EventSeq, (AppendReceipt, i64)> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+fn received_at_millis(received_at: &ReceivedAt) -> Result<i64, RiskInputsUnavailable> {
+    received_at
+        .0
+        .unix_timestamp_nanos()
+        .checked_div(1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RiskInputsUnavailable::Overflow)
+}
+
 fn source_receipt_millis_index(
     source_log_path: &Path,
     receipts: impl Iterator<Item = AppendReceipt>,
@@ -777,13 +867,7 @@ fn source_receipt_millis_index(
         if envelope.this_hash != receipt.this_hash {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        let millis = envelope
-            .received_at
-            .0
-            .unix_timestamp_nanos()
-            .checked_div(1_000_000)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(RiskInputsUnavailable::Overflow)?;
+        let millis = received_at_millis(&envelope.received_at)?;
         received_millis.insert(envelope.seq, (*receipt, millis));
         if envelope.seq == max_sequence {
             break;
@@ -912,10 +996,22 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use pe_core_types::{
-        AccountId, CollateralAmount, ReceivedAt, SourceId, SourceTimestamp, WalletAddress,
+        AccountId, BasisPoints, CollateralAmount, KellyFraction, PolymarketConditionId,
+        PolymarketTokenId, Probability, ReceivedAt, ShareAmount, Side, SourceId, SourceTimestamp,
+        WalletAddress,
     };
-    use pe_event_log::{ContentType, EventEnvelope};
+    use pe_event_log::{ContentType, EnvelopeIn, EventEnvelope, Writer};
+    use pe_execution_core::{
+        AdmissionReceipts, BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
+        LadderAskAudit, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit,
+        MarketSelection, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit,
+        SizingModeAudit,
+    };
+    use pe_resolver_card::{
+        VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+    };
     use pe_source_polymarket_public::PricePoint;
+    use pe_venue_polymarket::CompactFeeSchedule;
     use rust_decimal_macros::dec;
     use time::OffsetDateTime;
 
@@ -999,6 +1095,115 @@ mod tests {
             schema_version: 2,
             parser_version: 1,
             financial_semantic_version: 1,
+        }
+    }
+
+    fn latency_economic(source_receipt: AppendReceipt) -> EconomicPrepared {
+        let condition = PolymarketConditionId("condition-latency".to_owned());
+        let price = Price::new(dec!(0.5)).unwrap();
+        let shares = ShareAmount::from_whole(2).unwrap();
+        let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
+        EconomicPrepared {
+            version: ECONOMIC_PREPARED_VERSION,
+            market: MarketSelection {
+                condition_id: condition.clone(),
+                outcome_index: 0,
+                token_id: PolymarketTokenId("token-yes".to_owned()),
+                side: Side::Buy,
+                market_id: condition.0.clone(),
+            },
+            admission: LiveAdmissionArtifactAudit {
+                market: LiveMarketEvidenceAudit {
+                    condition_id: condition.clone(),
+                    ordered_outcome_token_ids: [
+                        PolymarketTokenId("token-yes".to_owned()),
+                        PolymarketTokenId("token-no".to_owned()),
+                    ],
+                    neg_risk: false,
+                    minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                    minimum_order_size: shares,
+                    observed_at_unix: 9_998,
+                    schema_version: 1,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                },
+                settlement: VenueSettlementRecord {
+                    schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+                    condition_id: condition,
+                    status: VenueResolutionStatus::Unresolved,
+                    raw_evidence_hash: "settlement".to_owned(),
+                    source_timestamp_unix: Some(9_998),
+                    observed_at_unix: 9_998,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                },
+                fee_schedule: CompactFeeSchedule::Zero,
+                scheduled_end_unix: Some(20_000),
+                receipts: AdmissionReceipts {
+                    gamma: source_receipt,
+                    clob_long: source_receipt,
+                    clob_compact: source_receipt,
+                },
+            },
+            ladder: LadderPlanAudit {
+                used_asks: vec![LadderAskAudit { price, shares }],
+                best_ask: price,
+                limit_price: price,
+                minimum_shares: shares,
+                principal,
+            },
+            book_receipt: source_receipt,
+            observation: Some(ObservationEvidence {
+                source_receipt,
+                complete_bound_receipt: source_receipt,
+                observed_unix_ms: 9_998_000,
+                provenance: "activity_ws".to_owned(),
+            }),
+            sizing: SizingAudit {
+                mode: SizingModeAudit::Kelly {
+                    fraction: KellyFraction::new(dec!(0.25)).unwrap(),
+                    probability: Probability::new(dec!(0.6)).unwrap(),
+                },
+                budget: principal,
+                principal,
+                minimum_shares: shares,
+                expected_shares: shares,
+                expected_vwap: price,
+                all_in_price: price,
+                slippage_rate: Decimal::ZERO,
+            },
+            fee: FeeAudit {
+                schedule: CompactFeeSchedule::Zero,
+                expected_fee: CollateralAmount::ZERO,
+                reserve: CollateralAmount::ZERO,
+            },
+            risk: RiskAudit {
+                snapshot: RiskSnapshot {
+                    leader_exposure_bps: BasisPoints::ZERO,
+                    market_exposure_bps: BasisPoints::ZERO,
+                    family_exposure_bps: BasisPoints::ZERO,
+                    total_copy_exposure_bps: BasisPoints::ZERO,
+                    intraday_pnl_bps: BasisPoints::ZERO,
+                    rolling_7d_pnl_bps: BasisPoints::ZERO,
+                    absolute_pnl_bps: BasisPoints::ZERO,
+                    copy_latency_kill_switch_active: false,
+                    proposed_trade_bps: BasisPoints(10),
+                    per_trade_cap_bps: 25,
+                    concentration_caps: None,
+                },
+                decision: RiskDecisionAudit::Approved,
+                price_receipts: Vec::new(),
+                evaluated_at_unix_ms: 9_999_000,
+            },
+            balance: BalanceAudit {
+                cash_before: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+                worst_case_debit: principal,
+                price_impact_cap_bps: 100,
+                chase_ceiling: price,
+                band_floor: Price::ZERO,
+                band_ceiling_exclusive: Price::ONE,
+            },
+            applied_configuration_hash: "config".to_owned(),
         }
     }
 
@@ -1254,6 +1459,90 @@ mod tests {
         assert_eq!((previous.sample_count, previous.p95_ms), (2, Some(200)));
         assert_eq!((latest.sample_count, latest.p95_ms), (2, Some(3_200)));
         assert_eq!((empty.sample_count, empty.p95_ms), (0, None));
+    }
+
+    /// PASS: replacing the per-evaluation source replay with the maintained receipt-time index
+    /// leaves a non-empty paper latency sample and its completed-hour p95 byte-for-byte unchanged.
+    #[test]
+    fn maintained_receipt_index_preserves_paper_latency_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let source_at = OffsetDateTime::from_unix_timestamp(9_998).unwrap();
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let source_receipt = source_writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("latency-source".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(source_at),
+                received_at: ReceivedAt(source_at),
+                content_type: ContentType::Json,
+                payload: br#"{"latency":true}"#.to_vec(),
+            })
+            .unwrap();
+        drop(source_writer);
+
+        let prepared = frame(
+            2,
+            9_999,
+            PaperLogRecord::FinancialPrepared {
+                expected_authority: crate::paper_recovery::ExpectedAuthority {
+                    qualification_start_receipt: receipt(1, 1),
+                    prior_completed_prepared_sequence: None,
+                },
+                payload: FinancialPayload::Fill {
+                    operation: crate::paper_recovery::PaperFillOperationIdentity {
+                        leader_wallet: WalletAddress::from_hex(
+                            "0x1111111111111111111111111111111111111111",
+                        )
+                        .unwrap(),
+                        source_trade_id: pe_core_types::SourceTradeId("trade".to_owned()),
+                        observed_at_bucket: 9_998,
+                    },
+                    economic: latency_economic(source_receipt),
+                },
+            },
+        );
+        let final_frame = frame(
+            3,
+            10_000,
+            PaperLogRecord::FinancialFinal {
+                prepared_receipt: prepared.receipt,
+                result: FinancialResult::Fill {
+                    canonical: crate::paper_recovery::CanonicalFillResult {
+                        outcome: "applied".to_owned(),
+                        bankroll: dec!(99),
+                        applied_prepared_seq: prepared.receipt.sequence,
+                        quantity: ShareAmount::from_whole(2).unwrap(),
+                        principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                        fee: CollateralAmount::ZERO,
+                        fill_price: Price::new(dec!(0.5)).unwrap(),
+                    },
+                },
+            },
+        );
+        let era = PaperEra {
+            start: None,
+            frames: vec![prepared, final_frame],
+        };
+
+        let source_receipts = paper_fill_source_receipts(&era).unwrap();
+        let from_scratch_index =
+            source_receipt_millis_index(&source_path, source_receipts.into_iter()).unwrap();
+        let from_scratch = paper_latency_samples_from_source_receipts(&era, 10_800, &|receipt| {
+            source_receipt_received_millis(&from_scratch_index, receipt)
+        })
+        .unwrap();
+        let maintained = paper_latency_samples(
+            &era,
+            &SourceReceiptMillisIndex::replay(&source_path).unwrap(),
+            10_800,
+        )
+        .unwrap();
+
+        assert_eq!(maintained, from_scratch);
+        assert_eq!(maintained.latest.sample_count, 1);
+        assert_eq!(maintained.latest.p95_ms, Some(2_000));
     }
 
     /// PASS: replay folds each owner/cause independently and any active cause blocks entries.

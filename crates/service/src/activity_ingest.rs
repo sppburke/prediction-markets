@@ -66,6 +66,7 @@ use tracing::{debug, info, warn};
 
 use crate::health::{HealthState, ReaderHealth, SharedHealth};
 use crate::live_watchlist::LiveWatchlist;
+use crate::risk_inputs::SourceReceiptMillisIndex;
 use crate::source_event_sink::SourceEventSink;
 
 /// Source id stamped on every websocket envelope in the source event log.
@@ -163,6 +164,7 @@ pub struct ActivityIngest {
     trigger_tx: mpsc::Sender<ReconciliationTrigger>,
     health: SharedHealth,
     reconciliation_triggers_dropped: Arc<AtomicU64>,
+    source_receipt_millis: SourceReceiptMillisIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
 }
@@ -206,6 +208,7 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipt_millis: SourceReceiptMillisIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -225,6 +228,7 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipt_millis: SourceReceiptMillisIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -251,8 +255,19 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipt_millis: SourceReceiptMillisIndex::default(),
             reader_append_gate: None,
         }
+    }
+
+    /// Install the verified boot projection extended by this ingest's synchronized appends.
+    #[must_use]
+    pub fn with_source_receipt_millis_index(
+        mut self,
+        source_receipt_millis: SourceReceiptMillisIndex,
+    ) -> Self {
+        self.source_receipt_millis = source_receipt_millis;
+        self
     }
 
     /// Counter projected into `source_health` by the status writer.
@@ -325,6 +340,7 @@ impl ActivityIngest {
                 fan_in: fan_in_rx,
                 source_rx: self.source_rx.rx,
                 reconciliation_triggers_dropped: self.reconciliation_triggers_dropped,
+                source_receipt_millis: self.source_receipt_millis,
                 #[cfg(feature = "scenario")]
                 reader_append_gate: self.reader_append_gate,
             }
@@ -612,6 +628,7 @@ struct Coordinator {
     fan_in: mpsc::Receiver<Observation>,
     source_rx: mpsc::Receiver<SourceLogRequest>,
     reconciliation_triggers_dropped: Arc<AtomicU64>,
+    source_receipt_millis: SourceReceiptMillisIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
 }
@@ -707,7 +724,7 @@ impl Coordinator {
         slot: Option<usize>,
     ) -> Result<AppendReceipt, Shutdown> {
         match self.sink.append_durable(duplicate_envelope(&envelope)) {
-            Ok(seq) => return Ok(seq),
+            Ok(receipt) => return self.index_synced_append(receipt, &envelope.received_at),
             Err(error) => {
                 self.set_health(|h| {
                     h.ws_sink_poisoned = true;
@@ -729,7 +746,7 @@ impl Coordinator {
                 continue;
             }
             match self.sink.append_durable(duplicate_envelope(&envelope)) {
-                Ok(seq) => {
+                Ok(receipt) => {
                     self.set_health(|h| {
                         h.ws_sink_poisoned = false;
                         h.source_durability_uncertain = false;
@@ -737,13 +754,28 @@ impl Coordinator {
                     });
                     info!(trade = %label,
                         "source log recovered; held payload appended durably");
-                    return Ok(seq);
+                    return self.index_synced_append(receipt, &envelope.received_at);
                 }
                 Err(error) => {
                     warn!(error = %error, "source log re-poisoned immediately after reopen");
                 }
             }
         }
+    }
+
+    fn index_synced_append(
+        &self,
+        receipt: AppendReceipt,
+        received_at: &ReceivedAt,
+    ) -> Result<AppendReceipt, Shutdown> {
+        self.source_receipt_millis
+            .record_synced_append(receipt, received_at)
+            .map(|()| receipt)
+            .map_err(|error| {
+                warn!(%error, sequence = receipt.sequence.0,
+                    "synchronized source append could not extend receipt-time index");
+                Shutdown
+            })
     }
 
     fn set_health(&self, f: impl FnOnce(&mut HealthState)) {
@@ -845,6 +877,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipt_millis: SourceReceiptMillisIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -915,6 +948,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipt_millis: SourceReceiptMillisIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -996,6 +1030,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::clone(&dropped),
+                source_receipt_millis: SourceReceiptMillisIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -1061,6 +1096,7 @@ mod tests {
             fan_in: fan_in_rx,
             source_rx: source_rx.rx,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipt_millis: SourceReceiptMillisIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -1087,6 +1123,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipt_millis: SourceReceiptMillisIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -1100,5 +1137,70 @@ mod tests {
             .await
             .expect("coordinator must exit once downstream closes")
             .unwrap();
+    }
+
+    /// PASS: the boot receipt-time index equals a fresh verified replay, and the same equality
+    /// holds after the coordinator synchronizes and indexes a later source append.
+    #[tokio::test]
+    async fn receipt_time_index_matches_fresh_replay_at_boot_and_after_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let boot_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let runtime_at = OffsetDateTime::from_unix_timestamp(1_800_000_002).unwrap();
+        let envelope = |received_at: OffsetDateTime, payload: &[u8]| EnvelopeIn {
+            source_id: SourceId("receipt-index-test".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(received_at),
+            received_at: ReceivedAt(received_at),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        };
+
+        let mut boot_sink = SourceEventSink::open(&path).unwrap();
+        let boot_receipt = boot_sink
+            .append_durable(envelope(boot_at, br#"{"boot":true}"#))
+            .unwrap();
+        drop(boot_sink);
+
+        let index = SourceReceiptMillisIndex::replay(&path).unwrap();
+        assert_eq!(
+            index.snapshot(),
+            SourceReceiptMillisIndex::replay(&path).unwrap().snapshot()
+        );
+        assert_eq!(
+            index.received_millis(boot_receipt).unwrap(),
+            1_800_000_000_000
+        );
+
+        let sink = SourceEventSink::open(&path).unwrap();
+        let (source_log, source_rx) = SourceLogHandle::channel(1);
+        let (trigger_tx, trigger_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(
+            ActivityIngest::poll_only(
+                sink,
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, true, 90),
+            )
+            .with_source_receipt_millis_index(index.clone())
+            .run(),
+        );
+        let runtime_receipt = source_log
+            .append(envelope(runtime_at, br#"{"runtime":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(
+            index.received_millis(runtime_receipt).unwrap(),
+            1_800_000_002_000
+        );
+
+        drop(source_log);
+        drop(trigger_rx);
+        coordinator.await.unwrap();
+        assert_eq!(
+            index.snapshot(),
+            SourceReceiptMillisIndex::replay(&path).unwrap().snapshot()
+        );
     }
 }

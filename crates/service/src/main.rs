@@ -849,10 +849,13 @@ async fn main() -> Result<()> {
 
     // Bounded service-side activity-bucket/admission control channel (#544).
     let (control_tx, control_rx) = mpsc::channel(2);
+    let source_receipt_millis =
+        pe_service::risk_inputs::SourceReceiptMillisIndex::replay(&cfg.source_event_log_path)
+            .context("build verified source receipt-time index")?;
     let risk_halt_release = financial_start.is_some().then(|| {
         RiskHaltReleaseHandle::new(
             cfg.event_log_path.clone(),
-            cfg.source_event_log_path.clone(),
+            source_receipt_millis.clone(),
             control_tx.clone(),
         )
     });
@@ -911,6 +914,7 @@ async fn main() -> Result<()> {
             trigger_tx,
             activity_health,
         )
+        .with_source_receipt_millis_index(source_receipt_millis.clone())
     } else {
         pe_service::activity_ingest::ActivityIngest::poll_only(
             sink,
@@ -918,6 +922,7 @@ async fn main() -> Result<()> {
             trigger_tx,
             activity_health,
         )
+        .with_source_receipt_millis_index(source_receipt_millis.clone())
     };
     let reconciliation_obligations_dropped =
         activity_ingest.reconciliation_triggers_dropped_counter();
@@ -1289,6 +1294,7 @@ async fn main() -> Result<()> {
             cfg.source_event_log_path.clone(),
             admission_builder,
             boundary_mark_fetcher,
+            source_receipt_millis,
         )
         .context("configure active financial protocol")?;
     }
