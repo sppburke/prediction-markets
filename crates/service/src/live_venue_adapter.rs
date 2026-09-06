@@ -18,7 +18,7 @@ use pe_core_types::{
     RawTransportFailure, ReceivedAt, SourceId, SourceTimestamp, TransportErrorClass, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
-use pe_execution_core::live_journal::LiveAccountBindingAudit;
+use pe_execution_core::live_journal::{LiveAccountBindingAudit, bind_http_response_to_request};
 use pe_execution_core::{
     AdmissionReceipts, LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact,
     LiveExecutedAmounts, LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification,
@@ -335,7 +335,9 @@ impl PolymarketLiveVenue {
     ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
+        let (mut evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
+        bind_account_read_responses(&mut evidence, &self.account_binding)
+            .map_err(|()| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
         if protocol_failure.is_some() {
             return Err(account_read_error(
                 LiveAccountReadFailure::Protocol,
@@ -351,7 +353,9 @@ impl PolymarketLiveVenue {
     {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
+        let (mut evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
+        bind_account_read_responses(&mut evidence, &self.account_binding)
+            .map_err(|()| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
         if protocol_failure.is_some() {
             return Err(account_read_error(
                 LiveAccountReadFailure::Protocol,
@@ -371,6 +375,34 @@ impl PolymarketLiveVenue {
             },
         ))
     }
+}
+
+fn bind_account_read_responses(
+    evidence: &mut [RawEvidence],
+    binding: &LiveAccountBindingAudit,
+) -> Result<(), ()> {
+    if evidence.iter().any(|item| match item {
+        RawEvidence::HttpResponse(response) => response.headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case(pe_core_types::http_evidence::REQUEST_DESCRIPTOR_HASH_HEADER)
+        }),
+        RawEvidence::HttpTransportFailure(_) | RawEvidence::Artifact(_) => false,
+    }) {
+        return Err(());
+    }
+    for item in evidence {
+        let RawEvidence::HttpResponse(response) = item else {
+            continue;
+        };
+        let descriptor = binding.request_descriptor(
+            response.method.clone(),
+            response.path.clone(),
+            response.endpoint_kind.clone(),
+            0,
+            response.ordered_query.clone(),
+        );
+        bind_http_response_to_request(response, &descriptor).map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 fn live_account_credential_fingerprint(credentials: &LiveAccountCredentials) -> String {

@@ -10,16 +10,24 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::Mutex;
 
+use pe_core_types::http_evidence::{
+    REQUEST_DESCRIPTOR_HASH_HEADER, SanitizedHttpRequestDescriptor,
+};
 use pe_core_types::{
     AccountId, CollateralAmount, EventSeq, PolymarketConditionId, PolymarketTokenId, Price,
-    RawHttpAttempt, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress,
+    RawHttpAttempt, RawHttpResponse, ReceivedAt, ShareAmount, SourceId, SourceTimestamp,
+    WalletAddress,
 };
 use pe_event_log::{
     AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer,
 };
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
-use pe_venue_polymarket::{CompactFeeSchedule, LadderPlan, PreparedPolymarketBuy};
+use pe_venue_polymarket::{
+    CompactFeeSchedule, DecodedOrderFill, LadderPlan, MatchedReceipt, PreparedPolymarketBuy,
+    ReceiptError, canonical_block_matches, decode_order_fills, fee_within_reserve,
+    parse_chain_id_response, parse_finalized_block_response, parse_receipt_response,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -72,6 +80,27 @@ impl LiveAccountBindingAudit {
                 .credential_fingerprint
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    #[must_use]
+    pub fn request_descriptor(
+        &self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        partition: impl Into<String>,
+        offset: u64,
+        ordered_query: Vec<(String, String)>,
+    ) -> SanitizedHttpRequestDescriptor {
+        SanitizedHttpRequestDescriptor {
+            account_id: self.account_id.as_str().to_owned(),
+            credential_fingerprint: self.credential_fingerprint.clone(),
+            custody_wallet: self.custody_wallet.clone(),
+            method: method.into(),
+            path: path.into(),
+            partition: partition.into(),
+            offset,
+            ordered_query,
+        }
     }
 }
 
@@ -760,6 +789,10 @@ pub enum LiveJournalError {
     SequenceMismatch,
     #[error("live journal order facts do not form a strict Prepared-to-terminal sequence")]
     OrderFactConflict,
+    #[error("retained HTTP response is not bound to its canonical account request")]
+    RequestBinding,
+    #[error("retained Polygon reconciliation evidence is incomplete, malformed, or misclassified")]
+    InvalidFinalityEvidence,
     #[error("live journal mutex is poisoned")]
     Poisoned,
 }
@@ -949,6 +982,368 @@ pub fn prepared_order_fact_matches(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetainedPolygonDisposition {
+    Reconciled(LiveJournalOrderOutcome),
+    Finalized,
+}
+
+fn malformed_polygon_body(error: &ReceiptError) -> bool {
+    matches!(
+        error,
+        ReceiptError::MalformedRpc
+            | ReceiptError::MissingResult
+            | ReceiptError::UnsupportedFinalizedTag
+            | ReceiptError::MalformedHex
+    )
+}
+
+fn unavailable_polygon_error(error: &ReceiptError) -> bool {
+    matches!(
+        error,
+        ReceiptError::MalformedRpc
+            | ReceiptError::RpcError
+            | ReceiptError::MissingResult
+            | ReceiptError::UnsupportedFinalizedTag
+    )
+}
+
+fn verified_rpc_body<'a>(
+    attempt: &'a RawHttpAttempt,
+    endpoint_kind: &str,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<Option<&'a [u8]>, LiveJournalError> {
+    let valid_query = |ordered_query: &[(String, String)]| {
+        ordered_query.len() == 2
+            && ordered_query[0] == ("rpc_method".to_owned(), method.to_owned())
+            && ordered_query[1].0 == "rpc_params"
+            && serde_json::from_str::<serde_json::Value>(&ordered_query[1].1)
+                .is_ok_and(|actual| actual == *params)
+    };
+    match attempt {
+        RawHttpAttempt::Response(response) => {
+            if response.source_id != "polygon-receipt-rpc"
+                || response.endpoint_kind != endpoint_kind
+                || response.method != "POST"
+                || response.path.is_empty()
+                || !valid_query(&response.ordered_query)
+                || response.attempt_ordinal != 1
+                || response.received_at < response.observed_at
+                || response.schema_version != 1
+                || response.parser_version != 1
+                || response.adapter_version.is_empty()
+            {
+                return Err(LiveJournalError::InvalidFinalityEvidence);
+            }
+            Ok((200..300)
+                .contains(&response.status)
+                .then_some(response.body.as_slice()))
+        }
+        RawHttpAttempt::TransportFailure(failure) => {
+            if failure.source_id != "polygon-receipt-rpc"
+                || failure.endpoint_kind != endpoint_kind
+                || failure.method != "POST"
+                || failure.path.is_empty()
+                || !valid_query(&failure.ordered_query)
+                || failure.attempt_ordinal != 1
+                || failure.received_at < failure.observed_at
+                || failure.schema_version != 1
+                || failure.parser_version != 1
+                || failure.adapter_version.is_empty()
+            {
+                return Err(LiveJournalError::InvalidFinalityEvidence);
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn classify_retained_polygon_finality(
+    prepared: &LiveOrderPreparedAudit,
+    transaction_hashes: &[String],
+    chain_id: Option<u64>,
+    head: &Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>,
+    receipts: &BTreeMap<String, Result<Option<MatchedReceipt>, ReceiptError>>,
+    blocks: &BTreeMap<u64, Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>>,
+) -> RetainedPolygonDisposition {
+    let pending = |reason| {
+        RetainedPolygonDisposition::Reconciled(LiveJournalOrderOutcome::FinalityPending { reason })
+    };
+    let conflict = |reason| {
+        RetainedPolygonDisposition::Reconciled(LiveJournalOrderOutcome::FinalityConflict { reason })
+    };
+    if chain_id != Some(pe_venue_polymarket::FINALIZED_CHAIN_ID) {
+        return pending("polygon chain identity unavailable or not 137".to_owned());
+    }
+    let Ok(head) = head else {
+        return pending("polygon finalized head unavailable".to_owned());
+    };
+    if transaction_hashes.is_empty() {
+        return pending("authenticated match has no nonzero transaction hash yet".to_owned());
+    }
+
+    let mut fills = BTreeMap::<(String, u64), DecodedOrderFill>::new();
+    let mut has_unfinalized = false;
+    for hash in transaction_hashes {
+        let Some(observation) = receipts.get(hash) else {
+            return conflict(format!(
+                "receipt request missing for authenticated transaction {hash}"
+            ));
+        };
+        let receipt = match observation {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                has_unfinalized = true;
+                continue;
+            }
+            Err(error) if unavailable_polygon_error(error) => {
+                return pending(format!("transaction receipt unavailable: {error}"));
+            }
+            Err(error) => return conflict(format!("transaction receipt conflict: {error}")),
+        };
+        if receipt.block_number > head.number {
+            has_unfinalized = true;
+            continue;
+        }
+        if receipt.block_number == head.number {
+            if receipt.block_hash != head.hash {
+                return conflict("receipt block hash conflicts with finalized head".to_owned());
+            }
+        } else {
+            let Some(block) = blocks.get(&receipt.block_number) else {
+                return conflict("canonical lower block evidence is missing".to_owned());
+            };
+            match block {
+                Ok(canonical) if canonical.hash == receipt.block_hash => {}
+                Ok(_) => return conflict("receipt block hash is not canonical".to_owned()),
+                Err(error) if unavailable_polygon_error(error) => {
+                    return pending(format!("canonical block unavailable: {error}"));
+                }
+                Err(error) => return conflict(format!("canonical block conflict: {error}")),
+            }
+        }
+        let decoded = match decode_order_fills(receipt, &prepared.prepared) {
+            Ok(decoded) => decoded,
+            Err(error) => return conflict(format!("OrderFilled conflict: {error}")),
+        };
+        for fill in decoded {
+            let key = (fill.transaction_hash.clone(), fill.log_index);
+            match fills.get(&key) {
+                Some(existing) if existing == &fill => {}
+                Some(_) => {
+                    return conflict(
+                        "OrderFilled log identity was reused with different content".to_owned(),
+                    );
+                }
+                None => {
+                    fills.insert(key, fill);
+                }
+            }
+        }
+    }
+    if has_unfinalized {
+        return pending("one or more authenticated transactions are not finalized".to_owned());
+    }
+    if fills.is_empty() {
+        return conflict("finalized receipts contain zero matching OrderFilled logs".to_owned());
+    }
+    let aggregates = fills.values().try_fold(
+        (
+            CollateralAmount::ZERO,
+            ShareAmount::ZERO,
+            CollateralAmount::ZERO,
+        ),
+        |(principal, quantity, fee), fill| {
+            Some((
+                principal.checked_add(fill.principal).ok()?,
+                quantity.checked_add(fill.quantity).ok()?,
+                fee.checked_add(fill.fee).ok()?,
+            ))
+        },
+    );
+    let Some((principal, quantity, fee)) = aggregates else {
+        return conflict("finalized fill aggregation overflow".to_owned());
+    };
+    if prepared.economic.sizing.principal != prepared.prepared.maker_collateral
+        || prepared.economic.ladder.minimum_shares != prepared.prepared.taker_shares
+    {
+        return conflict("prepared economics disagree with the signed order".to_owned());
+    }
+    let expected_principal = prepared.prepared.maker_collateral;
+    if principal < expected_principal {
+        return pending("finalized principal remains below the signed principal".to_owned());
+    }
+    if principal > expected_principal {
+        return conflict("finalized principal exceeds the signed principal".to_owned());
+    }
+    if quantity < prepared.economic.ladder.minimum_shares {
+        return conflict(
+            "full-principal finalized quantity is below the signed minimum".to_owned(),
+        );
+    }
+    if !fee_within_reserve(fee, prepared.economic.fee.reserve) {
+        return conflict("finalized fee exceeds the prepared reserve".to_owned());
+    }
+    RetainedPolygonDisposition::Finalized
+}
+
+/// Strictly re-execute a retained Polygon Pending/Conflict fact from its complete raw evidence.
+/// The returned receipts are the immutable canonical observations that a later Final must retain.
+pub fn verify_polygon_reconciliation(
+    prepared: &LiveOrderPreparedAudit,
+    transaction_hashes: &[String],
+    reconciled: &LiveOrderReconciliationAudit,
+) -> Result<BTreeMap<String, MatchedReceipt>, LiveJournalError> {
+    if reconciled.source != LiveReconciliationSource::PolygonFinality
+        || http_attempt_hashes(&reconciled.evidence)? != reconciled.evidence_hashes
+    {
+        return Err(LiveJournalError::InvalidFinalityEvidence);
+    }
+    let ordered_hashes = transaction_hashes.iter().cloned().collect::<BTreeSet<_>>();
+    if ordered_hashes.len() != transaction_hashes.len() {
+        return Err(LiveJournalError::InvalidFinalityEvidence);
+    }
+    let ordered_hashes = ordered_hashes.into_iter().collect::<Vec<_>>();
+    let mut attempts = reconciled.evidence.iter();
+    let chain_attempt = attempts
+        .next()
+        .ok_or(LiveJournalError::InvalidFinalityEvidence)?;
+    let chain_body = verified_rpc_body(
+        chain_attempt,
+        "polygon-chain-id",
+        "eth_chainId",
+        &serde_json::json!([]),
+    )?;
+    let chain_id = match chain_body {
+        Some(body) => Some(
+            parse_chain_id_response(body).map_err(|_| LiveJournalError::InvalidFinalityEvidence)?,
+        ),
+        None => None,
+    };
+
+    let mut receipts = BTreeMap::new();
+    for hash in &ordered_hashes {
+        let attempt = attempts
+            .next()
+            .ok_or(LiveJournalError::InvalidFinalityEvidence)?;
+        let body = verified_rpc_body(
+            attempt,
+            "polygon-transaction-receipt",
+            "eth_getTransactionReceipt",
+            &serde_json::json!([hash]),
+        )?;
+        let parsed = match body {
+            Some(body) => match parse_receipt_response(body, hash) {
+                Err(error) if malformed_polygon_body(&error) => {
+                    return Err(LiveJournalError::InvalidFinalityEvidence);
+                }
+                parsed => parsed,
+            },
+            None => Err(ReceiptError::MalformedRpc),
+        };
+        receipts.insert(hash.clone(), parsed);
+    }
+
+    let head_attempt = attempts
+        .next()
+        .ok_or(LiveJournalError::InvalidFinalityEvidence)?;
+    let head_body = verified_rpc_body(
+        head_attempt,
+        "polygon-finalized-block",
+        "eth_getBlockByNumber",
+        &serde_json::json!(["finalized", false]),
+    )?;
+    let head = match head_body {
+        Some(body) => Ok(parse_finalized_block_response(body)
+            .map_err(|_| LiveJournalError::InvalidFinalityEvidence)?),
+        None => Err(ReceiptError::MalformedRpc),
+    };
+
+    let lower_heights = match &head {
+        Ok(head) => receipts
+            .values()
+            .filter_map(|receipt| match receipt {
+                Ok(Some(receipt)) if receipt.block_number < head.number => {
+                    Some(receipt.block_number)
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => None,
+            })
+            .collect::<BTreeSet<_>>(),
+        Err(_) => BTreeSet::new(),
+    };
+    let mut blocks = BTreeMap::new();
+    for height in lower_heights {
+        let expected_hash = receipts.values().find_map(|receipt| match receipt {
+            Ok(Some(receipt)) if receipt.block_number == height => {
+                Some(receipt.block_hash.as_str())
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => None,
+        });
+        let expected_hash = expected_hash.ok_or(LiveJournalError::InvalidFinalityEvidence)?;
+        let attempt = attempts
+            .next()
+            .ok_or(LiveJournalError::InvalidFinalityEvidence)?;
+        let body = verified_rpc_body(
+            attempt,
+            "polygon-canonical-block",
+            "eth_getBlockByNumber",
+            &serde_json::json!([format!("0x{height:x}"), false]),
+        )?;
+        let block = match body {
+            Some(body) => match canonical_block_matches(body, height, expected_hash) {
+                Err(error) if malformed_polygon_body(&error) => {
+                    return Err(LiveJournalError::InvalidFinalityEvidence);
+                }
+                block => block,
+            },
+            None => Err(ReceiptError::MalformedRpc),
+        };
+        blocks.insert(height, block);
+    }
+    if attempts.next().is_some() {
+        return Err(LiveJournalError::InvalidFinalityEvidence);
+    }
+
+    let derived = classify_retained_polygon_finality(
+        prepared,
+        &ordered_hashes,
+        chain_id,
+        &head,
+        &receipts,
+        &blocks,
+    );
+    if derived != RetainedPolygonDisposition::Reconciled(reconciled.outcome.clone()) {
+        return Err(LiveJournalError::InvalidFinalityEvidence);
+    }
+
+    let mut immutable = BTreeMap::new();
+    if chain_id == Some(pe_venue_polymarket::FINALIZED_CHAIN_ID)
+        && let Ok(head) = &head
+    {
+        for (hash, receipt) in &receipts {
+            let Ok(Some(receipt)) = receipt else {
+                continue;
+            };
+            let canonical = if receipt.block_number > head.number {
+                false
+            } else if receipt.block_number == head.number {
+                receipt.block_hash == head.hash
+            } else {
+                blocks.get(&receipt.block_number).is_some_and(|block| {
+                    block
+                        .as_ref()
+                        .is_ok_and(|block| block.hash == receipt.block_hash)
+                })
+            };
+            if canonical {
+                immutable.insert(hash.clone(), receipt.clone());
+            }
+        }
+    }
+    Ok(immutable)
+}
+
 struct OpenOrderState {
     entry: OpenOrderInventoryEntry,
     order_hash: String,
@@ -956,6 +1351,7 @@ struct OpenOrderState {
     transaction_hashes: BTreeSet<String>,
     terminal: bool,
     finality_conflict: bool,
+    terminal_reconciliation: Option<Box<LiveOrderReconciliationAudit>>,
 }
 
 fn insert_open_order(
@@ -983,6 +1379,7 @@ fn insert_open_order(
             transaction_hashes: BTreeSet::new(),
             terminal: false,
             finality_conflict: false,
+            terminal_reconciliation: None,
         },
     );
     Ok(())
@@ -1057,7 +1454,10 @@ pub fn recovery_inventory(
                 let order = orders
                     .get_mut(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
-                if order.finality_conflict {
+                if order.terminal {
+                    if order.terminal_reconciliation.as_deref() == Some(reconciled.as_ref()) {
+                        continue;
+                    }
                     return Err(LiveJournalError::OrderFactConflict);
                 }
                 if !prepared_order_fact_matches(
@@ -1067,6 +1467,15 @@ pub fn recovery_inventory(
                     PreparedOrderFact::Reconciled(&reconciled),
                 ) {
                     return Err(LiveJournalError::OrderFactConflict);
+                }
+                if reconciled.source == LiveReconciliationSource::PolygonFinality {
+                    let prepared = order
+                        .prepared
+                        .as_deref()
+                        .ok_or(LiveJournalError::InvalidFinalityEvidence)?;
+                    let transaction_hashes =
+                        order.transaction_hashes.iter().cloned().collect::<Vec<_>>();
+                    verify_polygon_reconciliation(prepared, &transaction_hashes, &reconciled)?;
                 }
                 if let LiveJournalOrderOutcome::Matched {
                     transaction_hashes, ..
@@ -1082,6 +1491,7 @@ pub fn recovery_inventory(
                         | LiveJournalOrderOutcome::Rejected { .. }
                 ) {
                     order.terminal = true;
+                    order.terminal_reconciliation = Some(reconciled.clone());
                 }
                 if matches!(
                     reconciled.outcome,
@@ -1089,6 +1499,7 @@ pub fn recovery_inventory(
                 ) {
                     order.terminal = true;
                     order.finality_conflict = true;
+                    order.terminal_reconciliation = Some(reconciled);
                 }
             }
             LiveJournalPayload::OrderFillFinalized(finalized) => {
@@ -1342,6 +1753,53 @@ pub(crate) fn hash_serializable<T: Serialize + ?Sized>(
     serde_json::to_vec(value)
         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
         .map_err(Into::into)
+}
+
+/// Stable hash that binds an account/custody request descriptor into retained response evidence.
+pub fn request_descriptor_hash(
+    descriptor: &SanitizedHttpRequestDescriptor,
+) -> Result<String, LiveJournalError> {
+    hash_serializable(&(
+        "prediction-edge/live-http-request-descriptor/v1",
+        descriptor,
+    ))
+}
+
+/// Add the reserved descriptor binding to a response before it becomes durable evidence.
+pub fn bind_http_response_to_request(
+    response: &mut RawHttpResponse,
+    descriptor: &SanitizedHttpRequestDescriptor,
+) -> Result<(), LiveJournalError> {
+    if response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(REQUEST_DESCRIPTOR_HASH_HEADER))
+    {
+        return Err(LiveJournalError::RequestBinding);
+    }
+    response.headers.push((
+        REQUEST_DESCRIPTOR_HASH_HEADER.to_owned(),
+        request_descriptor_hash(descriptor)?,
+    ));
+    Ok(())
+}
+
+/// Verify the unique reserved descriptor binding before a retained response body is parsed.
+pub fn verify_http_response_request(
+    response: &RawHttpResponse,
+    descriptor: &SanitizedHttpRequestDescriptor,
+) -> Result<(), LiveJournalError> {
+    let expected = request_descriptor_hash(descriptor)?;
+    let mut bindings = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(REQUEST_DESCRIPTOR_HASH_HEADER));
+    if bindings.next().map(|(_, value)| value.as_str()) != Some(expected.as_str())
+        || bindings.next().is_some()
+    {
+        return Err(LiveJournalError::RequestBinding);
+    }
+    Ok(())
 }
 
 pub(crate) fn http_attempt_hash(attempt: &RawHttpAttempt) -> Result<String, LiveJournalError> {
@@ -1634,22 +2092,6 @@ mod tests {
                 })),
             )
             .unwrap();
-        journal
-            .append(
-                open_account.clone(),
-                at,
-                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
-                    identity: open.identity.clone(),
-                    order_hash: open.prepared.order_hash.clone(),
-                    source: LiveReconciliationSource::PolygonFinality,
-                    outcome: LiveJournalOrderOutcome::FinalityPending {
-                        reason: "above finalized head".to_owned(),
-                    },
-                    evidence: Vec::new(),
-                    evidence_hashes: Vec::new(),
-                })),
-            )
-            .unwrap();
         drop(journal);
 
         assert_eq!(
@@ -1671,6 +2113,65 @@ mod tests {
             recovery.open_orders[0].transaction_hashes,
             vec![format!("0x{}", "2".repeat(64))]
         );
+    }
+
+    /// PASS: recovery tolerates only a complete exact retry of Killed/Rejected and rejects every
+    /// changed reconciliation after that terminal fact.
+    #[test]
+    fn recovery_terminal_reconciliation_retries_are_complete_fact_exact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("account").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared("terminal-retry");
+        let terminal = LiveOrderReconciliationAudit {
+            identity: prepared.identity.clone(),
+            order_hash: prepared.prepared.order_hash.clone(),
+            source: LiveReconciliationSource::OrderHashLookupAndCancel,
+            outcome: LiveJournalOrderOutcome::Killed {
+                venue_order_id: Some("venue-order".to_owned()),
+            },
+            evidence: Vec::new(),
+            evidence_hashes: Vec::new(),
+        };
+        journal
+            .append(
+                account_id.clone(),
+                at,
+                LiveJournalPayload::OrderPrepared(prepared.clone()),
+            )
+            .unwrap();
+        for audit in [terminal.clone(), terminal.clone()] {
+            journal
+                .append(
+                    account_id.clone(),
+                    at,
+                    LiveJournalPayload::OrderReconciled(Box::new(audit)),
+                )
+                .unwrap();
+        }
+        assert!(recovery_inventory(&path).unwrap().open_orders.is_empty());
+
+        let mut changed = terminal;
+        changed.source = LiveReconciliationSource::PostResponse;
+        changed.outcome = LiveJournalOrderOutcome::Matched {
+            venue_order_id: "venue-order".to_owned(),
+            transaction_hashes: vec![format!("0x{}", "2".repeat(64))],
+            executed: None,
+        };
+        journal
+            .append(
+                account_id,
+                at,
+                LiveJournalPayload::OrderReconciled(Box::new(changed)),
+            )
+            .unwrap();
+        drop(journal);
+        assert!(matches!(
+            recovery_inventory(&path),
+            Err(LiveJournalError::OrderFactConflict)
+        ));
     }
 
     #[test]
