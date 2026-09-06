@@ -438,6 +438,11 @@ case "$*" in
     ;;
   *--financial-era=prepare*)
     record_offline_environment prepare
+    if grep -Fq 'approved-only' \
+      "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/live_journal.log"; then
+      echo 'financial-era prepare found an unmatched Approved admission' >&2
+      exit 1
+    fi
     cat <<'JSON'
 {"start":{"starting_bankroll":10000000000,"paper_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"source_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"live_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"artifact_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","static_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","hot_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"g557","activation_id":"act-545","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"],"membership_proofs_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","schema_version":3,"parser_version":1,"financial_semantic_version":1},"expected_receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
 JSON
@@ -1434,6 +1439,31 @@ after=$(sha256sum "$root/prediction-markets/gen/g557/"{paper.log,source_events.l
   fail "prepare mutated a durable input or ran before the service was inert"
 [[ $(<"$root/test-state/stop-count") -eq 1 ]] || fail "prepare did not stop the service exactly once"
 [[ ! -e "$root/test-state/archive-count" ]] || fail "prepare reached the remote archive"
+
+# Scenario FE-PREP-APPROVED-01A
+# Preconditions: each fresh fixture contains an Approved-only live admission marker.
+# Injected boundaries: preparation and representative later forward crash seams.
+# PASS: every invocation refuses at the real offline preparation call before archive or Start.
+# FAIL: a requested later crash seam bypasses preparation, mutates a durable input, or starts.
+for boundary in preparation guarded qualification-started; do
+  root="$TEST_TMP/prepare-approved-$boundary"
+  setup_fixture "$root"
+  driver_args "$root"
+  printf '%s\n' approved-only >> \
+    "$root/prediction-markets/gen/g557/live_journal.log"
+  before=$(sha256sum "$root/prediction-markets/gen/g557/"{paper.log,source_events.log,live_journal.log,paper_state.db})
+  set +e
+  output=$(run_driver "$root" --simulate-crash-after "$boundary" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *'unmatched Approved admission'* ]] ||
+    fail "Approved-only preparation was not refused for $boundary: $output"
+  after=$(sha256sum "$root/prediction-markets/gen/g557/"{paper.log,source_events.log,live_journal.log,paper_state.db})
+  [[ "$before" == "$after" && $(<"$root/test-state/service.active") == false ]] ||
+    fail "Approved-only preparation changed a durable input or left the service active for $boundary"
+  [[ ! -e "$root/test-state/archive-count" && ! -e "$root/test-state/complete-start" ]] ||
+    fail "Approved-only preparation crossed archive or Start for $boundary"
+done
 
 # Scenario FE-START-UNKNOWN-02
 # Preconditions: stopped service with no Start and a completed stop receipt.

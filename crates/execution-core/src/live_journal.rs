@@ -15,7 +15,7 @@ use pe_core_types::{
     RawHttpAttempt, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress,
 };
 use pe_event_log::{
-    AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer,
+    AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Scanner, Writer,
 };
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
@@ -1856,8 +1856,9 @@ fn verify_recovery_admission(
 /// recovery; only an operator may resolve the frozen journal state.
 pub fn open_order_inventory(
     path: impl AsRef<Path>,
+    era_live_prefix: Option<&LogTailBinding>,
 ) -> Result<Vec<OpenOrderInventoryEntry>, LiveJournalError> {
-    Ok(recovery_inventory(path)?
+    Ok(recovery_inventory(path, era_live_prefix)?
         .open_orders
         .into_iter()
         .map(|order| order.inventory)
@@ -1866,8 +1867,27 @@ pub fn open_order_inventory(
 
 pub fn recovery_inventory(
     path: impl AsRef<Path>,
+    era_live_prefix: Option<&LogTailBinding>,
 ) -> Result<LiveRecoveryInventory, LiveJournalError> {
-    let events = replay_all(path)?;
+    let path = path.as_ref();
+    let mut events = replay_all(path)?;
+    if let Some(prefix) = era_live_prefix {
+        let current = Scanner::verify_prefix(prefix)?;
+        let requested_path = std::fs::canonicalize(path)?;
+        if current.path != requested_path {
+            return Err(LiveJournalError::EventLog(pe_event_log::LogError::Io(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "live recovery prefix belongs to a different journal",
+                ),
+            )));
+        }
+        events.retain(|event| {
+            prefix
+                .last_sequence
+                .is_none_or(|last_sequence| event.seq > last_sequence.0)
+        });
+    }
     let mut orders = BTreeMap::<(AccountId, String), OpenOrderState>::new();
     let mut account_ids = BTreeSet::new();
     let mut account_bindings = BTreeMap::<AccountId, LiveAccountBindingAudit>::new();
@@ -2782,14 +2802,14 @@ mod tests {
         drop(journal);
 
         assert_eq!(
-            open_order_inventory(&path).unwrap(),
+            open_order_inventory(&path, None).unwrap(),
             vec![OpenOrderInventoryEntry {
                 identity: open.identity.clone(),
                 account_id: open_account,
                 prepared_journal_seq: open_prepared,
             }]
         );
-        let recovery = recovery_inventory(&path).unwrap();
+        let recovery = recovery_inventory(&path, None).unwrap();
         assert_eq!(recovery.account_ids.len(), 2);
         assert_eq!(recovery.open_orders.len(), 1);
         assert_eq!(
@@ -2817,7 +2837,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            recovery_inventory(&path),
+            recovery_inventory(&path, None),
             Err(LiveJournalError::RequestBinding)
         ));
     }
@@ -2856,7 +2876,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            recovery_inventory(&path),
+            recovery_inventory(&path, None),
             Err(LiveJournalError::OrderFactConflict)
         ));
     }
@@ -2891,7 +2911,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(recovery_inventory(&path).unwrap().open_orders.is_empty());
+        assert!(
+            recovery_inventory(&path, None)
+                .unwrap()
+                .open_orders
+                .is_empty()
+        );
 
         let mut changed = terminal;
         changed.source = LiveReconciliationSource::PostResponse;
@@ -2909,7 +2934,7 @@ mod tests {
             .unwrap();
         drop(journal);
         assert!(matches!(
-            recovery_inventory(&path),
+            recovery_inventory(&path, None),
             Err(LiveJournalError::OrderFactConflict)
         ));
     }
@@ -2937,7 +2962,7 @@ mod tests {
             .unwrap();
         drop(missing);
         assert!(matches!(
-            recovery_inventory(&missing_path),
+            recovery_inventory(&missing_path, None),
             Err(LiveJournalError::OrderFactConflict)
         ));
 
@@ -2967,7 +2992,7 @@ mod tests {
             .unwrap();
         drop(underfunded_journal);
         assert!(matches!(
-            recovery_inventory(&underfunded_path),
+            recovery_inventory(&underfunded_path, None),
             Err(LiveJournalError::OrderFactConflict)
         ));
     }
@@ -2994,7 +3019,7 @@ mod tests {
                 .append(account_id.clone(), at, approved_admission_for(&prepared))
                 .unwrap();
 
-            let recovery = recovery_inventory(&path).unwrap();
+            let recovery = recovery_inventory(&path, None).unwrap();
             assert!(recovery.open_orders.is_empty(), "{seam}");
             assert_eq!(recovery.approved_admissions.len(), 1, "{seam}");
             assert_eq!(
@@ -3018,10 +3043,49 @@ mod tests {
                     )),
                 )
                 .unwrap();
-            let recovered = recovery_inventory(&path).unwrap();
+            let recovered = recovery_inventory(&path, None).unwrap();
             assert!(recovered.approved_admissions.is_empty(), "{seam}");
             assert!(recovered.open_orders.is_empty(), "{seam}");
         }
+    }
+
+    /// PASS: a verified financial-era prefix excludes every earlier Approved admission, while a
+    /// changed prefix identity is rejected instead of selecting an unverified suffix.
+    #[test]
+    fn recovery_inventory_enforces_and_slices_the_verified_era_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("era-recovery").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "era-recovery");
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
+        journal
+            .append(account_id, at, approved_admission_for(&prepared))
+            .unwrap();
+        drop(journal);
+
+        let prefix = LiveJournal::verified_tail(&path).unwrap();
+        assert_eq!(
+            recovery_inventory(&path, None)
+                .unwrap()
+                .approved_admissions
+                .len(),
+            1
+        );
+        let sliced = recovery_inventory(&path, Some(&prefix)).unwrap();
+        assert!(sliced.account_ids.is_empty());
+        assert!(sliced.approved_admissions.is_empty());
+        assert!(sliced.open_orders.is_empty());
+
+        let mut changed = prefix;
+        changed.last_hash = blake3::hash(b"changed-era-prefix");
+        assert!(matches!(
+            recovery_inventory(&path, Some(&changed)),
+            Err(LiveJournalError::EventLog(_))
+        ));
     }
 
     /// PASS: recovery recomputes the pure risk decision and rejects a producer-recorded Approved
@@ -3047,7 +3111,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            recovery_inventory(&path),
+            recovery_inventory(&path, None),
             Err(LiveJournalError::OrderFactConflict)
         ));
     }
@@ -3098,7 +3162,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            open_order_inventory(&path),
+            open_order_inventory(&path, None),
             Err(LiveJournalError::OrderFactConflict)
         ));
     }
@@ -3489,7 +3553,7 @@ mod tests {
             LiveJournalPayload::RedemptionReceiptTransition(_)
         ));
         assert_eq!(
-            open_order_inventory(&path).unwrap(),
+            open_order_inventory(&path, None).unwrap(),
             vec![OpenOrderInventoryEntry {
                 identity: identity("legacy-prepared"),
                 account_id,

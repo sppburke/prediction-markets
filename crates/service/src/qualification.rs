@@ -5296,12 +5296,15 @@ fn verify_live_preparation_posture(
     let before = pe_execution_core::LiveJournal::verified_tail(live_path).map_err(|error| {
         QualificationError::InsufficientEvidence(format!("live journal: {error}"))
     })?;
-    let open_live_orders = pe_execution_core::live_journal::open_order_inventory(live_path)
-        .map_err(|error| {
-            QualificationError::InsufficientEvidence(format!("live open-order inventory: {error}"))
+    let recovery =
+        pe_execution_core::live_journal::recovery_inventory(live_path, None).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!("live recovery inventory: {error}"))
         })?;
-    if !open_live_orders.is_empty() {
+    if !recovery.open_orders.is_empty() {
         return insufficient("financial-era prepare found a nonterminal live order");
+    }
+    if !recovery.approved_admissions.is_empty() {
+        return insufficient("financial-era prepare found an unmatched Approved admission");
     }
 
     let status: serde_json::Value =
@@ -5391,7 +5394,7 @@ fn verify_live_preparation_posture(
                     "live journal account replay failed for {account_id}: {error}"
                 ))
             })?;
-        crate::live_fanout::derive_projection_rows_with_sources(
+        let derived = crate::live_fanout::derive_projection_rows_with_sources(
             &account_id,
             &events,
             &source_envelopes,
@@ -5401,6 +5404,11 @@ fn verify_live_preparation_posture(
                 "live journal strict reduction failed for {account_id}: {error}"
             ))
         })?;
+        if !derived.pending_approved_admission_keys.is_empty() {
+            return insufficient(format!(
+                "financial-era prepare found an unmatched Approved admission for {account_id}"
+            ));
+        }
         if pe_execution_core::reconstruct_redemption_attempts(&events)
             .values()
             .any(|attempt| {
@@ -9781,6 +9789,75 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[test]
+    fn financial_prepare_rejects_unmatched_approved_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("source.log");
+        let live_journal = temp.path().join("live_journal.log");
+        let status_path = temp.path().join("status.json");
+        drop(Writer::open(&source_log).unwrap());
+        let journal = LiveJournal::open(&live_journal).unwrap();
+        let account_id = AccountId::new("live-a").unwrap();
+        let binding = pe_execution_core::CredentialBindingIdentity {
+            version: 1,
+            key_id: "key".to_owned(),
+        };
+        let observed_at = OffsetDateTime::from_unix_timestamp(1).unwrap();
+        let account_state = authenticated_boundary_state(&account_id, &binding, observed_at);
+        journal
+            .append(
+                account_id.clone(),
+                observed_at,
+                boundary_baseline(&account_id, &binding, &account_state, 1),
+            )
+            .unwrap();
+        let economic = test_economic("prepare-approved", test_receipt(41), test_receipt(42));
+        let identity = LiveOrderIdentity {
+            dispatch_id: "prepare-approved".to_owned(),
+            idempotency_key: "prepare-approved:live-a".to_owned(),
+            quote_id: "prepare-quote".to_owned(),
+            config_hash: economic.applied_configuration_hash.clone(),
+            decision_hash: "prepare-decision".to_owned(),
+            evidence_hashes: vec!["prepare-evidence".to_owned()],
+            fill_projection: None,
+            schema_version: 1,
+            parser_version: 1,
+        };
+        journal
+            .append(
+                account_id,
+                observed_at,
+                LiveJournalPayload::AdmissionEvaluated(Box::new(LiveAdmissionEvaluationAudit {
+                    identity,
+                    frozen_binding: binding.clone(),
+                    current_binding: binding,
+                    requested_mode: LiveControlMode::LiveTiny,
+                    effective_mode: LiveControlMode::LiveTiny,
+                    economic,
+                    account_state: Some(account_state),
+                    account_read_failure_evidence: Vec::new(),
+                    account_read_failure_request_descriptor_hashes: Vec::new(),
+                    account_read_failure_evidence_hashes: Vec::new(),
+                    verdict: LiveAdmissionVerdict::Approved,
+                })),
+            )
+            .unwrap();
+        drop(journal);
+        fs::write(
+            &status_path,
+            br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"live-a","requested_live_mode":"off","effective_live_mode":"off","armed":false}]}}"#,
+        )
+        .unwrap();
+
+        let error =
+            verify_live_preparation_posture(&live_journal, &source_log, &status_path).unwrap_err();
+        assert!(matches!(
+            error,
+            QualificationError::InsufficientEvidence(reason)
+                if reason.contains("unmatched Approved admission")
+        ));
     }
 
     #[test]
