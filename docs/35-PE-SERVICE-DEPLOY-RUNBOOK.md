@@ -297,11 +297,12 @@ observation, process exit, or its bound. PASS requires the reviewed revision, a 
 poll after start, successful re-anchor, real readiness, healthy critical owners, accounts off and
 unarmed, and no credit loss, unexpected fence/error, or successful database write. The harness prints
 `REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
-file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, and the rehearsed
-binary's revision, embedded BLAKE3 identity, and file SHA-256. Preserve and review the JSON file and
-its result manifest, which also binds the validated copy-manifest digest and the real readiness
-response digest; the financial driver binds both before entering `prepared` and revalidates them from
-disk before entering `guarded`.
+file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, the rehearsed
+binary's revision, embedded BLAKE3 identity, and file SHA-256, plus `activation_id`, canonical
+`generation_dir`, `copy_manifest_sha256`, `readiness_sha256`, `config_sha256`, and
+`environment_sha256`. Preserve and review the JSON file and its result manifest. The financial driver
+compares both evidence layers, binds all of those identities before entering `prepared`, and
+revalidates the exact binding before entering `guarded`.
 
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
@@ -329,9 +330,14 @@ SUPABASE_DB_URL=<session-pooler-url> \
   --membership-json <canonical-membership-array.json>
 ```
 
-The driver requires the real #557 activation manifest to be `state: verified`, reads its
-`generation_dir`, and binds the target artifact paths/hashes and embedded revision to that manifest's
-artifact inventory and `merge_commit`. The Start hot-config identity is not an operator assertion:
+The driver requires the real #557 activation manifest to be `state: verified`. That manifest owns
+only the inherited generation identity: `activation_id`, canonical `generation_dir`, `merge_commit`,
+bankroll, source-v1-main evidence, legacy-history evidence, and the #557 artifact inventory. Before
+creating the financial manifest, the driver proves the installed old binary, config, and environment
+match the #557 artifact hashes and installed destinations. The reviewed #545 target is independent:
+its binary self-reports its revision and BLAKE3 under `--verify-staged-identity`, and the driver binds
+the binary/config/environment SHA-256 values to the rehearsal evidence. A #545 target is neither
+path-equal nor revision-equal to the inherited #557 artifacts. The Start hot-config identity is not an operator assertion:
 while the service is inert, the driver exports the database rows that the 17→15 migration retains to
 a mode-private temporary file (the credential-bearing database URL remains in `PGDATABASE`, never
 argv), and the Rust prepare owner parses them as `ConfigEra::Financial15` and calls
@@ -345,12 +351,13 @@ preserved in `QualificationStarted` for a future artifact owner; do not substitu
 free-form label.
 
 The exact resumable forward order is `rehearsal PASS → prepared → guarded → started → verified`.
-Creating `prepared` records the verified #557 identity, reviewed target identities, durable paths,
-ranking/membership inputs, the validated policy assertion, fresh bankroll, result-manifest hash, and
-the rehearsed binary identity without changing service or financial state. Before any stop intent,
-the `prepared → guarded` transition rereads the bound evidence JSON and result manifest, verifies the
-recorded hash, requires PASS, and requires the rehearsed revision, embedded BLAKE3 identity, and file
-SHA-256 to equal the staged binary. A missing, changed, failed, or mismatched rehearsal is a typed
+Creating `prepared` records the verified #557 identity and source/history evidence; the independently
+reviewed target identities; durable paths; ranking/membership inputs; the validated policy assertion;
+fresh bankroll; and every rehearsal binding named above without changing service or financial state.
+Before any stop intent, the `prepared → guarded` transition rereads the bound evidence JSON and result
+manifest, verifies the recorded hash, requires PASS, and requires the activation/generation,
+copied-state/readiness, reviewed config/environment, revision, embedded BLAKE3 identity, and binary
+SHA-256 to remain exact. A missing, changed, failed, or mismatched rehearsal is a typed
 `REHEARSAL_REFUSAL` and leaves the service and financial state untouched. Identical reruns preserve
 the original binding. After that gate, the driver records stop intent, stops the service once, proves
 it inert, verifies the old 17-name contract, takes and verifies a complete SQLite online backup,
@@ -366,15 +373,18 @@ from `started` performs the first invocation-fresh verification and records `ver
 `started → verified` checks the installed identities; guarded log-prefix continuity; exact local and
 remote Start/fresh-financial state; applied hot hash; ranking and membership; public projection;
 required producers and critical owners; and accounts off, unarmed, fresh, and free of dispatch work.
-Readiness has no wait loop: if the invocation-fresh status proof is not already present and complete,
-the command fails immediately and the operator reruns the same command. There is no soak, dwell,
-repeated sample, or site approval.
+It also queries the proven installed invocation's numeric-loopback `/health/ready` endpoint exactly
+once and requires HTTP success, `ready: true`, and no issues. Readiness has no wait loop: if either the
+invocation-fresh status proof or that one endpoint response is not already complete, the command fails
+immediately and the operator reruns the same command. There is no soak, dwell, repeated sample, or
+site approval.
 
-`--rollback-before-start` is the only rollback route. It is accepted only while no complete Start
-exists and restores only from the durable activation archive and complete SQLite backup before
-recording `rolled_back`. A scanned complete Start forces roll-forward even when the shell manifest is
-stale. At or after Start, rollback is forbidden: preserve the append-only era and recover with a
-compatible reader.
+`--rollback-before-start` is the only rollback route. Rollback-check scans and validates an exact
+manifest-bound complete Start before consulting mutable status or live posture. A complete Start
+forces roll-forward even when the shell manifest or status is missing or stale. Only the no-Start path
+requires the pre-Start posture and may repair a partial final frame; it restores only from the durable
+activation archive and complete SQLite backup before recording `rolled_back`. At or after Start,
+rollback is forbidden: preserve the append-only era and recover with a compatible reader.
 
 The driver invokes these early-dispatch service commands; they accept either `--name=value` or
 `--name value` spellings:

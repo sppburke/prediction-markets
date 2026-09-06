@@ -3326,29 +3326,12 @@ fn rollback_check_financial_era(
     config: &ServiceConfig,
 ) -> Result<String, QualificationError> {
     validate_financial_manifest(manifest, config)?;
-    verify_live_preparation_posture(
-        &configured_live_journal_path(config),
-        &config.source_event_log_path,
-        &config.status_path,
-    )?;
     let scan = Scanner::inspect(&manifest.paths.paper_log)?;
-    let mut repaired = false;
-    if scan.incomplete_tail.is_some() {
-        let preparation = manifest.preparation.as_ref().ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "rollback-check has no trusted prepared paper tail".to_owned(),
-            )
-        })?;
-        let expected = LogTailBinding {
-            path: scan.verified_tail.path.clone(),
-            physical_tail: preparation.start.paper_prefix.physical_tail,
-            last_sequence: preparation.start.paper_prefix.last_sequence,
-            last_hash: tail_hash(&preparation.start.paper_prefix)?,
-        };
-        Writer::open_with_expected_tail(&manifest.paths.paper_log, &expected)?;
-        repaired = true;
-    }
-    let frames = scan_paper_log(&manifest.paths.paper_log)?;
+    let frames = scan_verified_paper_prefix(
+        &manifest.paths.paper_log,
+        scan.verified_tail.physical_tail,
+        scan.incomplete_tail.is_none(),
+    )?;
     if let Some(started) = frames.iter().find(|frame| {
         matches!(
             frame.frame,
@@ -3374,9 +3357,75 @@ fn rollback_check_financial_era(
             serde_json::to_string(&started.receipt)?
         ));
     }
+    verify_live_preparation_posture(
+        &configured_live_journal_path(config),
+        &config.source_event_log_path,
+        &config.status_path,
+    )?;
+    let mut repaired = false;
+    if scan.incomplete_tail.is_some() {
+        let preparation = manifest.preparation.as_ref().ok_or_else(|| {
+            QualificationError::InsufficientEvidence(
+                "rollback-check has no trusted prepared paper tail".to_owned(),
+            )
+        })?;
+        let expected = LogTailBinding {
+            path: scan.verified_tail.path.clone(),
+            physical_tail: preparation.start.paper_prefix.physical_tail,
+            last_sequence: preparation.start.paper_prefix.last_sequence,
+            last_hash: tail_hash(&preparation.start.paper_prefix)?,
+        };
+        Writer::open_with_expected_tail(&manifest.paths.paper_log, &expected)?;
+        repaired = true;
+    }
     Ok(format!(
         "{{\"complete_start\":false,\"repaired\":{repaired}}}"
     ))
+}
+
+static ROLLBACK_PREFIX_COPY_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn scan_verified_paper_prefix(
+    path: &Path,
+    verified_tail: u64,
+    complete_file: bool,
+) -> Result<Vec<ScannedPaperFrame>, QualificationError> {
+    if complete_file {
+        return Ok(scan_paper_log(path)?);
+    }
+
+    let ordinal = ROLLBACK_PREFIX_COPY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary_path = std::env::temp_dir().join(format!(
+        ".pe-financial-era-prefix-{}-{ordinal}.log",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut target = options.open(&temporary_path)?;
+    let result = (|| -> Result<Vec<ScannedPaperFrame>, QualificationError> {
+        use std::io::Read as _;
+
+        let source = fs::File::open(path)?;
+        let copied = std::io::copy(&mut source.take(verified_tail), &mut target)?;
+        if copied != verified_tail {
+            return insufficient(
+                "rollback-check could not copy the complete verified paper prefix",
+            );
+        }
+        target.sync_all()?;
+        drop(target);
+        Ok(scan_paper_log(&temporary_path)?)
+    })();
+    let cleanup = fs::remove_file(&temporary_path);
+    let frames = result?;
+    cleanup?;
+    Ok(frames)
 }
 
 fn start_envelope(
@@ -4748,5 +4797,34 @@ mod tests {
             Some(dec!(100))
         );
         assert_eq!(scan_paper_log(&paper_log).unwrap().len(), 1);
+        fs::remove_file(&config.status_path).unwrap();
+        let rollback_check = rollback_check_financial_era(&manifest, &config).unwrap();
+        let rollback_check: serde_json::Value = serde_json::from_str(&rollback_check).unwrap();
+        assert_eq!(
+            rollback_check.get("complete_start"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            rollback_check.get("receipt"),
+            Some(&serde_json::to_value(preparation.expected_receipt).unwrap())
+        );
+        {
+            use std::io::Write as _;
+
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&paper_log)
+                .unwrap()
+                .write_all(&[0])
+                .unwrap();
+        }
+        let incomplete_len = fs::metadata(&paper_log).unwrap().len();
+        let rollback_check = rollback_check_financial_era(&manifest, &config).unwrap();
+        let rollback_check: serde_json::Value = serde_json::from_str(&rollback_check).unwrap();
+        assert_eq!(
+            rollback_check.get("complete_start"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(fs::metadata(&paper_log).unwrap().len(), incomplete_len);
     }
 }
