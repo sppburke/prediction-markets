@@ -27,7 +27,7 @@ env_file=${PE_REHEARSAL_ENV:-"$root/.env"}
 copy_dir=${PE_REHEARSAL_COPY_DIR:-"$root/gen-$short"}
 timeout_secs=${PE_REHEARSAL_TIMEOUT_SECS:-10800}
 poll_secs=${PE_REHEARSAL_POLL_SECS:-10}
-evidence_hash_file=${PE_REHEARSAL_EVIDENCE_HASH_FILE:-"$root/evidence-$short.sha256"}
+evidence_hash_file=${PE_REHEARSAL_EVIDENCE_HASH_FILE:-"$root/evidence-$short.json"}
 
 if [[ "$dry_run" == 1 ]]; then
   printf '%s\n' \
@@ -44,6 +44,7 @@ if [[ "$dry_run" == 1 ]]; then
     "observers=status_file_poller,reader_drop_classifier,fence_anchor_census,write_refusal_counter" \
     "proof=exact-revision,poll-after-start,reanchor,critical-health,accounts-off-unarmed,no-unsafe-evidence" \
     "stop=first-complete-evidence-or-first-failure-or-timeout" \
+    "evidence_contract=rehearsal545-evidence-v1" \
     "evidence_hash_file=$evidence_hash_file"
   exit 0
 fi
@@ -61,6 +62,27 @@ done
   echo "FATAL: rehearsal timeout and poll cadence must be positive integers" >&2
   exit 1
 }
+
+staged_identity_output=$("$binary" --verify-staged-identity) || {
+  echo "FATAL: rehearsal binary could not derive its own identity" >&2
+  exit 1
+}
+read -r target_revision artifact_blake3 < <(python3 -c 'import re,sys
+match=re.fullmatch(r"prediction-edge revision=([0-9a-f]{40}) artifact_blake3=([0-9a-f]{64})\n?",sys.stdin.read())
+if match is None: raise SystemExit(1)
+print(*match.groups())' <<< "$staged_identity_output") || {
+  echo "FATAL: rehearsal binary identity output is invalid" >&2
+  exit 1
+}
+[[ "$target_revision" == "$sha" ]] || {
+  echo "FATAL: rehearsal binary revision does not match the reviewed Git identity" >&2
+  exit 1
+}
+"$binary" --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null || {
+  echo "FATAL: rehearsal binary identity self-verification failed" >&2
+  exit 1
+}
+artifact_sha256=$(sha256sum "$binary" | awk '{print $1}')
 
 readarray -t activation < <(python3 - "$activation_manifest" <<'PY'
 import json, os, sys
@@ -348,8 +370,9 @@ service_pid=""
 observer_pids=()
 trap - EXIT TERM INT
 {
-  printf 'result=%s\nreason=%s\nsha=%s\nactivation_id=%s\nactive_generation=%s\nwallet=%s\nanchor_before=%s\n' \
-    "$result" "$reason" "$sha" "$activation_id" "$active_generation" "$wallet" "$anchor_before"
+  printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\nactive_generation=%s\nwallet=%s\nanchor_before=%s\n' \
+    "$result" "$reason" "$sha" "$target_revision" "$artifact_blake3" "$artifact_sha256" \
+    "$activation_id" "$active_generation" "$wallet" "$anchor_before"
   printf 'final=%s\n' "$last"
   printf 'copy_manifest_sha256=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
     "$(sha256sum "$copy_manifest" | awk '{print $1}')" \
@@ -358,7 +381,22 @@ trap - EXIT TERM INT
 } > "$manifest.tmp"
 mv "$manifest.tmp" "$manifest"
 hash=$(sha256sum "$manifest" | awk '{print $1}')
-printf '%s  %s\n' "$hash" "$manifest" > "$evidence_hash_file.tmp"
+python3 -c 'import json,os,sys
+path,result,digest,manifest,revision,artifact,artifact_sha=sys.argv[1:]
+value={
+    "kind":"rehearsal545-evidence-v1",
+    "result":result,
+    "evidence_sha256":digest,
+    "manifest_path":os.path.realpath(manifest),
+    "target_revision":revision,
+    "artifact_blake3":artifact,
+    "artifact_sha256":artifact_sha,
+}
+with open(path,"w",encoding="utf-8") as output:
+    json.dump(value,output,sort_keys=True,separators=(",",":"))
+    output.write("\n")' \
+  "$evidence_hash_file.tmp" "$result" "$hash" "$manifest" "$target_revision" \
+  "$artifact_blake3" "$artifact_sha256"
 mv "$evidence_hash_file.tmp" "$evidence_hash_file"
 printf 'REHEARSAL545_%s reason=%s evidence_sha256=%s evidence_file=%s\n' \
   "$result" "$reason" "$hash" "$evidence_hash_file"

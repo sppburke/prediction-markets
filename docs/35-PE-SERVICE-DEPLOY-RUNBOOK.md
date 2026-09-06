@@ -280,8 +280,11 @@ census, and write-refusal counter. The run stops at the first complete same-invo
 first unsafe observation, process exit, or its bound. PASS requires the reviewed revision, a complete
 ordinary poll after start, successful re-anchor, healthy critical owners, accounts off and unarmed,
 and no credit loss, unexpected fence/error, or successful database write. The harness prints
-`REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a SHA-256 evidence file over its result
-manifest. Preserve and review that evidence before entering the financial driver's `guarded` state.
+`REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
+file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, and the rehearsed
+binary's revision, embedded BLAKE3 identity, and file SHA-256. Preserve and review the JSON file and
+its result manifest; the financial driver binds both before entering `prepared` and revalidates them
+from disk before entering `guarded`.
 
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
@@ -303,8 +306,7 @@ SUPABASE_DB_URL=<session-pooler-url> \
   --live-journal <active-generation-live_journal.log> \
   --paper-state <active-generation-paper_state.db> \
   --fresh-bankroll <amount> \
-  --target-revision <reviewed-40-hex> \
-  --artifact-blake3 <hash> \
+  --rehearsal-evidence <rehearsal-evidence-json> \
   --hot-config-hash <expected-15-name-hash> \
   --ranking-batch-id <id> \
   --policy-hash <hash> \
@@ -312,14 +314,19 @@ SUPABASE_DB_URL=<session-pooler-url> \
   --membership-proofs-hash <hash>
 ```
 
-The resumable forward order is `prepared → guarded → started → verified`. Creating `prepared` records
-the verified #557 identity, reviewed target identities, durable paths, expected financial identity,
-ranking/membership evidence, and fresh bankroll without changing service or financial state. To
-enter `guarded`, the driver records stop intent, stops the service once, proves it inert, verifies the
-old 17-name contract, takes and verifies a complete SQLite online backup, records the remote census
-and all three log identities, and invokes the staged network-free `prepare` command. That command
-scans the logs and returns the exact Start payload and expected synchronized receipt; it does not
-mutate them.
+The exact resumable forward order is `rehearsal PASS → prepared → guarded → started → verified`.
+Creating `prepared` records the verified #557 identity, reviewed target identities, durable paths,
+expected financial identity, ranking/membership evidence, fresh bankroll, result-manifest hash, and
+the rehearsed binary identity without changing service or financial state. Before any stop intent,
+the `prepared → guarded` transition rereads the bound evidence JSON and result manifest, verifies the
+recorded hash, requires PASS, and requires the rehearsed revision, embedded BLAKE3 identity, and file
+SHA-256 to equal the staged binary. A missing, changed, failed, or mismatched rehearsal is a typed
+`REHEARSAL_REFUSAL` and leaves the service and financial state untouched. Identical reruns preserve
+the original binding. After that gate, the driver records stop intent, stops the service once, proves
+it inert, verifies the old 17-name contract, takes and verifies a complete SQLite online backup,
+records the remote census and all three log identities, and invokes the staged network-free
+`prepare` command. That command scans the logs and returns the exact Start payload and expected
+synchronized receipt; it does not mutate them.
 
 From `guarded`, the driver archives/resets the remote paper state, invokes the network-free local
 reset/Start, installs and seeds the Start-bound authority schema, applies the 15-name configuration
