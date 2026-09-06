@@ -945,6 +945,10 @@ fn validate_artifact_and_ladder(
         || request.identity.evidence_hashes.is_empty()
         || request.identity.schema_version == 0
         || request.identity.parser_version == 0
+        || request.economic.market.condition_id != request.condition_id
+        || u16::from(request.economic.market.outcome_index) != request.outcome_id.0
+        || request.economic.market.token_id != request.token_id
+        || request.economic.market.side != pe_core_types::Side::Buy
         || market.condition_id != request.condition_id
         || request.admission.settlement.condition_id != request.condition_id
         || market
@@ -1020,9 +1024,13 @@ fn prepared_matches_request(
     request: &LiveOrderRequest,
     account: &LiveVenueAccountState,
 ) -> bool {
-    prepared.condition_id == request.condition_id
+    request.economic.market.condition_id == request.condition_id
+        && u16::from(request.economic.market.outcome_index) == request.outcome_id.0
+        && request.economic.market.token_id == request.token_id
+        && request.economic.market.side == pe_core_types::Side::Buy
+        && prepared.condition_id == request.economic.market.condition_id
         && prepared.outcome_id == request.outcome_id
-        && prepared.token_id == request.token_id
+        && prepared.token_id == request.economic.market.token_id
         && prepared.neg_risk == request.admission.market.neg_risk
         && prepared.side == "BUY"
         && prepared.order_type == "FOK"
