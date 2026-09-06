@@ -879,6 +879,8 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         &self,
         account_id: AccountId,
         admission: Box<LiveAdmissionEvaluationAudit>,
+        current_mode: LiveModeSnapshot,
+        current_binding: CredentialBindingIdentity,
         clock: C,
     ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError>
     where
@@ -889,10 +891,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         let reproduced = account_state.map(|account| {
             classify_live_admission(LiveAdmissionClassificationInput {
                 evaluated_at,
-                requested_mode: admission.requested_mode,
-                effective_mode: admission.effective_mode,
+                requested_mode: current_mode.requested,
+                effective_mode: current_mode.effective,
                 frozen_binding: &admission.frozen_binding,
-                current_binding: &admission.current_binding,
+                current_binding: &current_binding,
                 identity: &admission.identity,
                 condition_id: &admission.economic.market.condition_id,
                 outcome_id: OutcomeId(u16::from(admission.economic.market.outcome_index)),
@@ -2240,6 +2242,11 @@ mod tests {
                     .resume_approved_admission_with_clock(
                         account_id.clone(),
                         admission.clone(),
+                        LiveModeSnapshot {
+                            requested: LiveControlMode::LiveTiny,
+                            effective: LiveControlMode::LiveTiny,
+                        },
+                        admission.frozen_binding.clone(),
                         now,
                     )
                     .await
@@ -2268,6 +2275,75 @@ mod tests {
                 "{seam}"
             );
         }
+    }
+
+    /// PASS: resumption evaluates the current control mode and terminalizes an old Approved
+    /// admission without venue preparation or POST when the account is now off.
+    #[tokio::test]
+    async fn approved_admission_resume_requires_current_live_tiny_modes() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("source.log");
+        let source_journal = LiveJournal::open(&source_path).unwrap();
+        let source_venue = FixtureVenue::new(LivePostClassification::Killed {
+            venue_order_id: None,
+        });
+        let source_executor = LiveExecutor::new(&source_venue, &source_journal);
+        let account_id = AccountId::new("resume-off").unwrap();
+        let _ = source_executor
+            .prepare(request(&account_id), now())
+            .await
+            .unwrap();
+        let admission = replay_account(&source_path, &account_id)
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event.payload {
+                LiveJournalPayload::AdmissionEvaluated(admission) => Some(admission),
+                _ => None,
+            })
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        journal
+            .append(
+                account_id.clone(),
+                now(),
+                LiveJournalPayload::AdmissionEvaluated(admission.clone()),
+            )
+            .unwrap();
+        let venue = FixtureVenue::new(LivePostClassification::Killed {
+            venue_order_id: None,
+        });
+        let executor = LiveExecutor::new(&venue, &journal);
+        let outcome = executor
+            .resume_approved_admission_with_clock(
+                account_id.clone(),
+                admission.clone(),
+                LiveModeSnapshot {
+                    requested: LiveControlMode::Off,
+                    effective: LiveControlMode::Off,
+                },
+                admission.frozen_binding.clone(),
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, LivePrepareResult::Terminal(_)));
+        assert_eq!(venue.posts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            replay_account(&path, &account_id).unwrap().as_slice(),
+            [
+                crate::LiveJournalEvent {
+                    payload: LiveJournalPayload::AdmissionEvaluated(_),
+                    ..
+                },
+                crate::LiveJournalEvent {
+                    payload: LiveJournalPayload::OrderPreparationFailed(failed),
+                    ..
+                }
+            ] if failed.failure == LiveOrderPreparationFailure::RecoveryAdmissionExpired
+        ));
     }
 
     #[tokio::test]
