@@ -3428,7 +3428,7 @@ mod tests {
             br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}"#,
         )
         .unwrap();
-        let config = ServiceConfig {
+        let mut config = ServiceConfig {
             event_log_path: paper_log.clone(),
             source_event_log_path: source_log.clone(),
             ..ServiceConfig::default()
