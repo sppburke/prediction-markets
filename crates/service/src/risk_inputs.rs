@@ -30,6 +30,32 @@ const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
 pub(crate) const MAX_HISTORICAL_MARK_AGE_SECS: i64 = 120;
 
+/// Apply the strategy-wide halt overlay reconstructed from the durable paper prefix. Halt owners
+/// are deliberately ignored here: every active cause gates every new strategy entry.
+pub(crate) fn apply_global_risk_halts(
+    active: &HashSet<(RiskHaltOwner, RiskHaltCause)>,
+    snapshot: &mut RiskSnapshot,
+) {
+    use pe_risk_engine::{INTRADAY_STOP_BPS, KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS};
+
+    for (_, cause) in active {
+        match cause {
+            RiskHaltCause::AbsoluteLoss => {
+                snapshot.absolute_pnl_bps.0 =
+                    snapshot.absolute_pnl_bps.0.min(KILL_SWITCH_DRAWDOWN_BPS);
+            }
+            RiskHaltCause::IntradayDrawdown => {
+                snapshot.intraday_pnl_bps.0 = snapshot.intraday_pnl_bps.0.min(INTRADAY_STOP_BPS);
+            }
+            RiskHaltCause::Rolling7dDrawdown => {
+                snapshot.rolling_7d_pnl_bps.0 =
+                    snapshot.rolling_7d_pnl_bps.0.min(ROLLING_7D_STOP_BPS);
+            }
+            RiskHaltCause::CopyLatency => snapshot.copy_latency_kill_switch_active = true,
+        }
+    }
+}
+
 /// Service-owned reason that replayable evidence could not produce a risk snapshot; the strategy
 /// crate sees only the unit `RiskInputsUnavailable` decline.
 #[derive(
@@ -1729,6 +1755,91 @@ mod tests {
         assert!(!active.is_empty());
         assert!(active.contains(&(RiskHaltOwner::Paper, RiskHaltCause::AbsoluteLoss)));
         assert!(!active.contains(&(account(), RiskHaltCause::CopyLatency)));
+    }
+
+    /// PASS: each active cause owned by a different live account applies its strategy-wide field
+    /// clamp to a healthy paper snapshot.
+    #[test]
+    fn global_halt_overlay_applies_every_foreign_owner_cause() {
+        let cases = [
+            (
+                RiskHaltCause::AbsoluteLoss,
+                pe_risk_engine::RiskBlock::KillSwitchDrawdown,
+            ),
+            (
+                RiskHaltCause::IntradayDrawdown,
+                pe_risk_engine::RiskBlock::IntradayDrawdownStop,
+            ),
+            (
+                RiskHaltCause::Rolling7dDrawdown,
+                pe_risk_engine::RiskBlock::Rolling7dDrawdownStop,
+            ),
+            (
+                RiskHaltCause::CopyLatency,
+                pe_risk_engine::RiskBlock::CopyLatencyKillSwitch,
+            ),
+        ];
+
+        for (index, (cause, expected)) in cases.into_iter().enumerate() {
+            let account_id = format!("live-{index}");
+            let owner = RiskHaltOwner::LiveAccount(AccountId::new(account_id.as_str()).unwrap());
+            let active = HashSet::from([(owner, cause)]);
+            let mut snapshot = RiskSnapshot {
+                leader_exposure_bps: BasisPoints::ZERO,
+                market_exposure_bps: BasisPoints::ZERO,
+                family_exposure_bps: BasisPoints::ZERO,
+                total_copy_exposure_bps: BasisPoints::ZERO,
+                intraday_pnl_bps: BasisPoints::ZERO,
+                rolling_7d_pnl_bps: BasisPoints::ZERO,
+                absolute_pnl_bps: BasisPoints::ZERO,
+                copy_latency_kill_switch_active: false,
+                proposed_trade_bps: BasisPoints(1),
+                per_trade_cap_bps: 25,
+                concentration_caps: None,
+            };
+
+            apply_global_risk_halts(&active, &mut snapshot);
+
+            assert_eq!(
+                pe_risk_engine::evaluate_risk(&snapshot),
+                pe_risk_engine::RiskDecision::Blocked(expected)
+            );
+        }
+    }
+
+    /// PASS: an absolute-loss engagement remains effective after raw finances recover because the
+    /// durable active set, not the recovered raw PnL, owns the manual latch.
+    #[test]
+    fn global_halt_overlay_preserves_manually_latched_recovered_cause() {
+        let era = PaperEra {
+            start: None,
+            frames: vec![halt(
+                1,
+                RiskHaltOwner::Paper,
+                RiskHaltCause::AbsoluteLoss,
+                HaltState::Engaged,
+            )],
+        };
+        let mut recovered = RiskSnapshot {
+            leader_exposure_bps: BasisPoints::ZERO,
+            market_exposure_bps: BasisPoints::ZERO,
+            family_exposure_bps: BasisPoints::ZERO,
+            total_copy_exposure_bps: BasisPoints::ZERO,
+            intraday_pnl_bps: BasisPoints::ZERO,
+            rolling_7d_pnl_bps: BasisPoints::ZERO,
+            absolute_pnl_bps: BasisPoints::ZERO,
+            copy_latency_kill_switch_active: false,
+            proposed_trade_bps: BasisPoints(1),
+            per_trade_cap_bps: 25,
+            concentration_caps: None,
+        };
+
+        apply_global_risk_halts(&active_risk_halts(&era), &mut recovered);
+
+        assert_eq!(
+            pe_risk_engine::evaluate_risk(&recovered),
+            pe_risk_engine::RiskDecision::Blocked(pe_risk_engine::RiskBlock::KillSwitchDrawdown)
+        );
     }
 
     /// PASS: only the latest still-active absolute/latency engagement can be manually released.
