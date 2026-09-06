@@ -91,7 +91,7 @@ pub struct LiveAdmissionArtifact {
     pub receipts: AdmissionReceipts,
 }
 
-/// One complete frozen order target presented to [`LiveExecutor::prepare`].
+/// One complete frozen order target presented to [`LiveExecutor::prepare_with_clock`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveOrderRequest {
     pub target: FrozenLiveTarget,
@@ -231,6 +231,121 @@ pub fn classify_live_account_responses(
             Err(error) => LiveAccountResponseClassification::ReadFailure(error),
         },
     )
+}
+
+/// Failure from replaying the complete durable admission evaluation.
+#[derive(Debug, thiserror::Error)]
+pub enum LiveAdmissionEvaluationError {
+    #[error("recorded risk decision disagrees with deterministic risk evaluation")]
+    InvalidRiskDecision,
+    #[error("recorded admission account evidence or verdict is inconsistent")]
+    InvalidAccountEvidence,
+    #[error(transparent)]
+    Journal(#[from] LiveJournalError),
+}
+
+/// Re-evaluate one durable admission from its retained economics and account evidence.
+///
+/// This is the sole outer admission verifier used by journal recovery and strict service
+/// reduction. It performs no I/O and does not trust the producer-recorded verdict.
+pub fn verify_live_admission_evaluation(
+    admission: &LiveAdmissionEvaluationAudit,
+    evaluated_at: OffsetDateTime,
+    binding: Option<&LiveAccountBindingAudit>,
+) -> Result<(), LiveAdmissionEvaluationError> {
+    let risk_decision = match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
+        pe_risk_engine::RiskDecision::Approved => crate::RiskDecisionAudit::Approved,
+        pe_risk_engine::RiskDecision::Blocked(reason) => {
+            crate::RiskDecisionAudit::Blocked { reason }
+        }
+    };
+    if admission.economic.risk.decision != risk_decision
+        || (admission.verdict == LiveAdmissionVerdict::Approved
+            && risk_decision != crate::RiskDecisionAudit::Approved)
+    {
+        return Err(LiveAdmissionEvaluationError::InvalidRiskDecision);
+    }
+
+    let classify = |account| {
+        classify_live_admission(LiveAdmissionClassificationInput {
+            evaluated_at,
+            requested_mode: admission.requested_mode,
+            effective_mode: admission.effective_mode,
+            frozen_binding: &admission.frozen_binding,
+            current_binding: &admission.current_binding,
+            identity: &admission.identity,
+            condition_id: &admission.economic.market.condition_id,
+            outcome_id: OutcomeId(u16::from(admission.economic.market.outcome_index)),
+            token_id: &admission.economic.market.token_id,
+            admission: &admission.economic.admission,
+            ladder: &admission.economic.ladder,
+            economic: &admission.economic,
+            account,
+        })
+    };
+    let has_failure_evidence = !admission.account_read_failure_evidence.is_empty()
+        || !admission
+            .account_read_failure_request_descriptor_hashes
+            .is_empty()
+        || !admission.account_read_failure_evidence_hashes.is_empty();
+    if let Ok(expected) = classify(LiveAdmissionAccountEvidence::NotRead) {
+        if admission.account_state.is_some()
+            || has_failure_evidence
+            || admission.verdict != expected
+        {
+            return Err(LiveAdmissionEvaluationError::InvalidAccountEvidence);
+        }
+        return Ok(());
+    }
+
+    let binding = binding.ok_or(LiveAdmissionEvaluationError::InvalidAccountEvidence)?;
+    if !binding.is_valid_for_frozen_credential(&binding.account_id, &admission.frozen_binding)
+        || admission.current_binding != binding.credential
+        || (admission.account_state.is_some() == has_failure_evidence)
+    {
+        return Err(LiveAdmissionEvaluationError::InvalidAccountEvidence);
+    }
+    let selected_spender = if admission.economic.admission.market.neg_risk {
+        pe_venue_polymarket::CanaryV2Client::negrisk_spender()
+    } else {
+        pe_venue_polymarket::CanaryV2Client::standard_spender()
+    }
+    .map_err(|_| LiveAdmissionEvaluationError::InvalidAccountEvidence)?;
+    let expected = if let Some(account) = &admission.account_state {
+        let classified = classify_live_account_responses(
+            &account.evidence,
+            &selected_spender,
+            &account.request_descriptor_hashes,
+            Some(&account.evidence_hashes),
+            binding,
+        )?;
+        let LiveAccountResponseClassification::State(state) = classified else {
+            return Err(LiveAdmissionEvaluationError::InvalidAccountEvidence);
+        };
+        let derived = state.audit()?;
+        if *account != derived {
+            return Err(LiveAdmissionEvaluationError::InvalidAccountEvidence);
+        }
+        classify(LiveAdmissionAccountEvidence::State(&derived))
+    } else {
+        let classified = classify_live_account_responses(
+            &admission.account_read_failure_evidence,
+            &selected_spender,
+            &admission.account_read_failure_request_descriptor_hashes,
+            Some(&admission.account_read_failure_evidence_hashes),
+            binding,
+        )?;
+        let LiveAccountResponseClassification::ReadFailure(failure) = classified else {
+            return Err(LiveAdmissionEvaluationError::InvalidAccountEvidence);
+        };
+        classify(LiveAdmissionAccountEvidence::ReadFailure(failure.kind))
+    };
+    if expected.map_err(|_| LiveAdmissionEvaluationError::InvalidAccountEvidence)?
+        != admission.verdict
+    {
+        return Err(LiveAdmissionEvaluationError::InvalidAccountEvidence);
+    }
+    Ok(())
 }
 
 fn classify_raw_account_responses(
@@ -624,7 +739,8 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         Self { venue, journal }
     }
 
-    /// Phase one: evaluate ordered admission checks, prepare, and fsync the full audit record.
+    /// Test-only fixed-instant compatibility wrapper.
+    #[cfg(test)]
     pub async fn prepare(
         &self,
         request: LiveOrderRequest,
@@ -991,7 +1107,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
     }
 
     /// Consume an unmatched Approved admission with a durable typed preparation failure.
-    pub fn terminalize_approved_admission(
+    fn terminalize_approved_admission(
         &self,
         account_id: AccountId,
         identity: LiveOrderIdentity,
@@ -1030,7 +1146,8 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         })
     }
 
-    /// Phase two: consume the POST capability exactly once and classify/reconcile its result.
+    /// Test-only fixed-instant compatibility wrapper.
+    #[cfg(test)]
     pub async fn submit(
         &self,
         prepared: PreparedLiveOrder<V::Submission>,

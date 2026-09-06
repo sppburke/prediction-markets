@@ -31,13 +31,13 @@ pub use economic::{
     SizingModeAudit,
 };
 pub use live_executor::{
-    FrozenLiveTarget, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutor,
-    LiveExecutorError, LiveModeSnapshot, LiveOrderOutcome, LiveOrderRequest, LiveOrderVenue,
-    LivePostClassification, LivePostFuture, LivePostParseError, LivePrepareResult,
+    FrozenLiveTarget, LiveAccountStateFuture, LiveAdmissionArtifact, LiveAdmissionEvaluationError,
+    LiveExecutor, LiveExecutorError, LiveModeSnapshot, LiveOrderOutcome, LiveOrderRequest,
+    LiveOrderVenue, LivePostClassification, LivePostFuture, LivePostParseError, LivePrepareResult,
     LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
     LiveVenuePreparationError, LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared,
     LiveVenueReconciledOutcome, LiveVenueReconciliation, LiveVenueReconciliationError,
-    PreparedLiveOrder,
+    PreparedLiveOrder, verify_live_admission_evaluation,
 };
 pub use live_journal::{
     AccountPortfolioMarkedAudit, AdmissionReceipts, CanonicalPositionAudit,
@@ -54,8 +54,8 @@ pub use live_journal::{
     RedemptionAttemptIdentity, RedemptionCustodyAudit, RedemptionCustodyReconciledAudit,
     RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
     RedemptionRequestedAudit, RedemptionTransactionAudit, ResolutionFinalizedAudit,
-    http_attempt_hashes, open_order_inventory, prepared_order_fact_matches, recovery_inventory,
-    replay_account,
+    TerminalAdmissionRecoveryEntry, TerminalAdmissionRecoveryOutcome, http_attempt_hashes,
+    open_order_inventory, prepared_order_fact_matches, recovery_inventory, replay_account,
 };
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,

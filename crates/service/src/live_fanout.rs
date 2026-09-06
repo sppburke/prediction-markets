@@ -15,10 +15,11 @@ use pe_core_types::{
     PolymarketConditionId, Price, Probability, RawHttpAttempt, ReceivedAt, ShareAmount, Side,
     SourceId, SourceTimestamp, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope};
 use pe_execution_core::live_executor::{
     LiveAccountResponseClassification, LiveAdmissionAccountEvidence,
-    LiveAdmissionClassificationInput, classify_live_account_responses, classify_live_admission,
+    LiveAdmissionClassificationInput, LiveAdmissionEvaluationError,
+    classify_live_account_responses, classify_live_admission, verify_live_admission_evaluation,
 };
 use pe_execution_core::live_journal::{
     LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
@@ -31,12 +32,12 @@ use pe_execution_core::{
     LiveFillProjectionIdentity, LiveJournal, LiveJournalEvent, LiveJournalOrderOutcome,
     LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit, LiveModeTransitionReason,
     LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome, LiveOrderReconciliationAudit,
-    LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveVenueReconciledOutcome,
-    MarkKind, OrderFillFinalizedAudit, PreparedOrderFact, RedemptionAttempt,
-    RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput, RiskAudit,
-    RiskDecisionAudit, SizingModeAudit, http_attempt_hashes, prepared_order_fact_matches,
-    reconstruct_redemption_attempts, recovery_inventory, redemption_posture, replay_account,
-    run_redemption_pass,
+    LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveRecoveryInventory,
+    LiveVenueReconciledOutcome, MarkKind, OrderFillFinalizedAudit, PreparedOrderFact,
+    RedemptionAttempt, RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput,
+    RiskAudit, RiskDecisionAudit, SizingModeAudit, TerminalAdmissionRecoveryOutcome,
+    http_attempt_hashes, prepared_order_fact_matches, reconstruct_redemption_attempts,
+    recovery_inventory, redemption_posture, replay_account, run_redemption_pass,
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
@@ -85,7 +86,7 @@ use crate::paper_recovery::{
     FINANCIAL_SEMANTIC_VERSION, HaltState, PaperLogFrame, PaperLogRecord, RiskHaltOwner,
     active_risk_halts, paper_era, scan_paper_log,
 };
-use crate::risk_inputs::RiskInputsUnavailable;
+use crate::risk_inputs::{RiskInputsUnavailable, SourceReceiptMillisIndex};
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::supabase_reader::auth_token;
 
@@ -119,8 +120,8 @@ pub struct LiveFanoutConfig {
     pub book_fetcher: Arc<ReqwestClobBookFetcher>,
     pub mid_price_cache: MidPriceCache,
     pub source_log: SourceLogHandle,
-    /// Read-only source-log path. Callers supply its verified envelopes to the pure reducer.
-    pub source_log_path: PathBuf,
+    /// Boot-verified, append-extended source receipt and evidence projection.
+    pub source_receipt_millis: SourceReceiptMillisIndex,
     pub paper_log_path: PathBuf,
     pub orchestrator_control: tokio::sync::mpsc::Sender<OrchestratorControl>,
     pub http: reqwest::Client,
@@ -172,67 +173,12 @@ fn replay_live_account(
     Ok(events)
 }
 
-fn replay_source_envelopes(
-    state: &FanoutState,
-) -> Result<Vec<EventEnvelope>, pe_event_log::LogError> {
-    Reader::replay(&state.config.source_log_path)?
-        .map(|item| item.map(|(_, envelope)| envelope))
-        .collect()
-}
-
-fn restamp_admission_from_source_receipts(
-    state: &FanoutState,
-    admission: &mut pe_execution_core::LiveAdmissionArtifact,
-) -> Result<(), FanoutError> {
-    let receipts = [
-        admission.receipts.gamma,
-        admission.receipts.clob_long,
-        admission.receipts.clob_compact,
-    ];
-    let mut observed = BTreeMap::new();
-    let replay = Reader::replay(&state.config.source_log_path)
-        .map_err(|error| FanoutError::Signal(format!("source receipt replay failed: {error}")))?;
-    for item in replay {
-        let (_, envelope) = item.map_err(|error| {
-            FanoutError::Signal(format!("source receipt replay failed: {error}"))
-        })?;
-        if let Some(receipt) = receipts
-            .iter()
-            .find(|receipt| receipt.sequence == envelope.seq)
-        {
-            if receipt.this_hash != envelope.this_hash {
-                return Err(FanoutError::Signal(
-                    "admission source receipt hash mismatch".to_owned(),
-                ));
-            }
-            observed.insert(envelope.seq, envelope.observed_at.0);
-        }
-    }
-    let gamma_at = observed
-        .get(&admission.receipts.gamma.sequence)
-        .copied()
-        .ok_or_else(|| FanoutError::Signal("Gamma admission receipt missing".to_owned()))?;
-    let clob_long_at = observed
-        .get(&admission.receipts.clob_long.sequence)
-        .copied()
-        .ok_or_else(|| FanoutError::Signal("CLOB admission receipt missing".to_owned()))?;
-    if !observed.contains_key(&admission.receipts.clob_compact.sequence) {
-        return Err(FanoutError::Signal(
-            "compact CLOB admission receipt missing".to_owned(),
-        ));
-    }
-    admission.market.observed_at_unix = gamma_at.max(clob_long_at).unix_timestamp();
-    admission.settlement.observed_at_unix = clob_long_at.unix_timestamp();
-    Ok(())
-}
-
 fn derive_projection_rows_for_state(
     state: &FanoutState,
     account_id: &AccountId,
     events: &[LiveJournalEvent],
 ) -> Result<ProjectionDerivation, ProjectionReducerError> {
-    let source_envelopes = replay_source_envelopes(state)
-        .map_err(|_| ProjectionReducerError::InvalidResolutionEvidence)?;
+    let source_envelopes = state.config.source_receipt_millis.source_envelopes();
     derive_projection_rows_with_sources(account_id, events, &source_envelopes)
 }
 
@@ -247,7 +193,7 @@ pub enum LiveFanoutOwnerError {
     #[error("record first-boot fence: {0}")]
     FirstBootFence(#[source] pe_paper_state::PaperStateError),
     #[error("read recovery state during shutdown: {0}")]
-    ShutdownRecovery(#[source] pe_execution_core::LiveJournalError),
+    ShutdownRecovery(String),
     #[error("drain live recovery during shutdown: {0}")]
     ShutdownDrain(String),
     #[error("inspect live journal poison state: {0}")]
@@ -382,7 +328,9 @@ pub async fn run_live_fanout_until(
         }
     }
 
-    if recovery_is_pending(&state).map_err(LiveFanoutOwnerError::ShutdownRecovery)? {
+    if recovery_is_pending(&state)
+        .map_err(|error| LiveFanoutOwnerError::ShutdownRecovery(error.to_string()))?
+    {
         run_recovery_pass(&mut state, OffsetDateTime::now_utc(), false)
             .await
             .map_err(|error| LiveFanoutOwnerError::ShutdownDrain(error.to_string()))?;
@@ -401,12 +349,115 @@ pub async fn run_live_fanout_until(
     Ok(())
 }
 
-fn recovery_is_pending(state: &FanoutState) -> Result<bool, pe_execution_core::LiveJournalError> {
-    recovery_inventory(
+fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
+    let inventory = recovery_inventory(
         &state.config.journal_path,
         state.config.era_live_prefix.as_ref(),
-    )
-    .map(|inventory| !inventory.approved_admissions.is_empty() || !inventory.open_orders.is_empty())
+    )?;
+    let mut recoverable_accounts = inventory
+        .approved_admissions
+        .iter()
+        .map(|entry| entry.account_id.clone())
+        .chain(
+            inventory
+                .open_orders
+                .iter()
+                .map(|entry| entry.inventory.account_id.clone()),
+        )
+        .chain(
+            inventory
+                .terminal_admissions
+                .iter()
+                .map(|entry| entry.account_id.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    let source_envelopes = state.config.source_receipt_millis.source_envelopes();
+    for account_id in std::mem::take(&mut recoverable_accounts) {
+        let events = replay_live_account(state, &account_id)?;
+        let derived = derive_projection_rows_with_sources(&account_id, &events, &source_envelopes)
+            .map_err(|error| {
+                FanoutError::Signal(format!(
+                    "live recovery strict reduction failed for {account_id}: {error}"
+                ))
+            })?;
+        if derived.baseline_sequence.is_none() {
+            return Err(FanoutError::Signal(format!(
+                "live recovery account {account_id} has no verified financial-era Baseline"
+            )));
+        }
+    }
+    Ok(inventory)
+}
+
+fn terminal_recovery_reason(outcome: &TerminalAdmissionRecoveryOutcome) -> &'static str {
+    match outcome {
+        TerminalAdmissionRecoveryOutcome::Refused(
+            LiveAdmissionRefusal::CredentialVersionChanged,
+        ) => "credential_version_changed",
+        TerminalAdmissionRecoveryOutcome::Refused(_) => "admission_refused",
+        TerminalAdmissionRecoveryOutcome::PreparationFailed(
+            pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged,
+        ) => "recovery_credential_changed",
+        TerminalAdmissionRecoveryOutcome::PreparationFailed(
+            pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+        ) => "recovery_admission_expired",
+        TerminalAdmissionRecoveryOutcome::PreparationFailed(_) => "rejected",
+    }
+}
+
+fn terminal_projection_is_pending(
+    state: &FanoutState,
+    inventory: &LiveRecoveryInventory,
+) -> Result<bool, FanoutError> {
+    for terminal in &inventory.terminal_admissions {
+        if state
+            .config
+            .paper_state
+            .dispatch_targets(&terminal.identity.dispatch_id)?
+            .into_iter()
+            .any(|target| {
+                target.account_id == terminal.account_id.as_str() && target.state != "terminal"
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn recovery_is_pending(state: &FanoutState) -> Result<bool, FanoutError> {
+    let inventory = verified_recovery_inventory(state)?;
+    Ok(!inventory.approved_admissions.is_empty()
+        || !inventory.open_orders.is_empty()
+        || terminal_projection_is_pending(state, &inventory)?)
+}
+
+fn reconcile_terminal_recovery_work(
+    state: &FanoutState,
+    inventory: &LiveRecoveryInventory,
+    now: OffsetDateTime,
+) -> Result<(), FanoutError> {
+    for terminal in &inventory.terminal_admissions {
+        let targets = state
+            .config
+            .paper_state
+            .dispatch_targets(&terminal.identity.dispatch_id)?;
+        for target in targets.into_iter().filter(|target| {
+            target.account_id == terminal.account_id.as_str() && target.state != "terminal"
+        }) {
+            terminalize(
+                state,
+                &target,
+                terminal_recovery_reason(&terminal.outcome),
+                now,
+            )?;
+        }
+        state
+            .config
+            .paper_state
+            .finalize_dispatch_if_terminal(&terminal.identity.dispatch_id, now.unix_timestamp())?;
+    }
+    Ok(())
 }
 
 fn due(last: Option<i64>, now: i64, interval: i64) -> bool {
@@ -788,10 +839,8 @@ async fn run_recovery_pass(
     resume_approved_admissions: bool,
 ) -> Result<(), FanoutError> {
     let mut freeze = false;
-    let initial_inventory = recovery_inventory(
-        &state.config.journal_path,
-        state.config.era_live_prefix.as_ref(),
-    )?;
+    let initial_inventory = verified_recovery_inventory(state)?;
+    reconcile_terminal_recovery_work(state, &initial_inventory, now)?;
     let snapshot = state.config.live_accounts.snapshot();
     for pending in initial_inventory
         .approved_admissions
@@ -883,8 +932,9 @@ async fn run_recovery_pass(
             freeze = true;
             continue;
         }
-        let recovery_price_expired = risk_price_expired(state, &pending.admission.economic.risk)?;
         let recovery_check_at = now;
+        let recovery_price_expired =
+            risk_price_expired(state, &pending.admission.economic.risk, recovery_check_at)?;
         let recovery_risk_failure =
             if risk_day_changed(&pending.admission.economic.risk, recovery_check_at) {
                 Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged)
@@ -1002,10 +1052,7 @@ async fn run_recovery_pass(
     // across every authenticated target relevant to this recovery pass.
     let mut finality_targets = Vec::new();
     let mut pending = Vec::new();
-    let inventory = recovery_inventory(
-        &state.config.journal_path,
-        state.config.era_live_prefix.as_ref(),
-    )?;
+    let inventory = verified_recovery_inventory(state)?;
     for order in inventory.open_orders {
         let Some(prepared) = order.prepared else {
             freeze = true;
@@ -1118,7 +1165,7 @@ async fn resume_approved_with_venue<V: LiveOrderVenue>(
             Ok(false)
         }
         LivePrepareResult::Prepared(prepared) => {
-            let risk_price_expired = prepared_risk_price_expired(state, prepared.audit())?;
+            let risk_price_expired = prepared_risk_price_expired(state, prepared.audit(), now)?;
             let failure = if prepared_risk_day_changed(prepared.audit(), now) {
                 Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged)
             } else if risk_price_expired {
@@ -1170,6 +1217,36 @@ async fn process_target(
     signal: &LeaderSignal,
     now: OffsetDateTime,
 ) -> Result<PassControl, FanoutError> {
+    if target.state == "pending" {
+        let inventory = verified_recovery_inventory(state)?;
+        if let Some(terminal) = inventory.terminal_admissions.iter().find(|terminal| {
+            terminal.account_id.as_str() == target.account_id
+                && terminal.identity.dispatch_id == target.dispatch_id
+        }) {
+            terminalize(
+                state,
+                target,
+                terminal_recovery_reason(&terminal.outcome),
+                now,
+            )?;
+            state
+                .config
+                .paper_state
+                .finalize_dispatch_if_terminal(&target.dispatch_id, now.unix_timestamp())?;
+            return Ok(PassControl::Continue);
+        }
+        let approved_pending = inventory.approved_admissions.iter().any(|admission| {
+            admission.account_id.as_str() == target.account_id
+                && admission.admission.identity.dispatch_id == target.dispatch_id
+        });
+        let prepared_pending = inventory.open_orders.iter().any(|order| {
+            order.inventory.account_id.as_str() == target.account_id
+                && order.inventory.identity.dispatch_id == target.dispatch_id
+        });
+        if approved_pending || prepared_pending {
+            return Ok(PassControl::StopSeed);
+        }
+    }
     let accounts = state.config.live_accounts.snapshot();
     let account = accounts
         .accounts
@@ -1236,7 +1313,7 @@ async fn process_target(
 
     let condition_id = PolymarketConditionId(signal.market_id.0.0.clone());
     let admission_started_at = OffsetDateTime::now_utc();
-    let mut admission = match state
+    let admission = match state
         .admission
         .build(&condition_id, admission_started_at)
         .await
@@ -1256,7 +1333,6 @@ async fn process_target(
             return Ok(PassControl::Continue);
         }
     };
-    restamp_admission_from_source_receipts(state, &mut admission)?;
     let token_id = match admission
         .market
         .ordered_outcome_token_ids
@@ -1608,8 +1684,9 @@ async fn process_target(
         ladder: plan.clone(),
         economic,
     };
-    let prepare_price_expired = risk_price_expired(state, &request.economic.risk)?;
     let prepare_check_at = OffsetDateTime::now_utc();
+    let prepare_price_expired =
+        risk_price_expired(state, &request.economic.risk, prepare_check_at)?;
     if risk_day_changed(&request.economic.risk, prepare_check_at) || prepare_price_expired {
         if ensure_live_portfolio_marks(
             state,
@@ -1661,8 +1738,9 @@ async fn process_target(
         }
         request.economic.risk = refreshed;
     }
-    let final_prepare_price_expired = risk_price_expired(state, &request.economic.risk)?;
     let final_prepare_check_at = OffsetDateTime::now_utc();
+    let final_prepare_price_expired =
+        risk_price_expired(state, &request.economic.risk, final_prepare_check_at)?;
     if risk_day_changed(&request.economic.risk, final_prepare_check_at)
         || final_prepare_price_expired
     {
@@ -1711,8 +1789,9 @@ async fn process_target(
                 persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
                 return Ok(PassControl::StopSeed);
             }
-            let risk_price_expired = prepared_risk_price_expired(state, prepared.audit())?;
             let post_check_at = OffsetDateTime::now_utc();
+            let risk_price_expired =
+                prepared_risk_price_expired(state, prepared.audit(), post_check_at)?;
             let risk_day_changed = prepared_risk_day_changed(prepared.audit(), post_check_at);
             let admission_expired =
                 !prepared_admission_is_approved_at(prepared.audit(), post_check_at);
@@ -1809,39 +1888,32 @@ fn risk_day_changed(risk: &RiskAudit, now: OffsetDateTime) -> bool {
 fn prepared_risk_price_expired(
     state: &FanoutState,
     prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    now: OffsetDateTime,
 ) -> Result<bool, FanoutError> {
-    risk_price_expired(state, &prepared.economic.risk)
+    risk_price_expired(state, &prepared.economic.risk, now)
 }
 
-fn risk_price_expired(state: &FanoutState, risk: &RiskAudit) -> Result<bool, FanoutError> {
-    let receipts = &risk.price_receipts;
-    if receipts.is_empty() {
+fn risk_price_expired(
+    state: &FanoutState,
+    risk: &RiskAudit,
+    now: OffsetDateTime,
+) -> Result<bool, FanoutError> {
+    if risk.price_receipts.is_empty() {
         return Ok(false);
     }
-    let mut unmatched = receipts
-        .iter()
-        .map(|receipt| (receipt.sequence, receipt.this_hash))
-        .collect::<BTreeMap<_, _>>();
-    let mut observed_at = Vec::new();
-    let replay = Reader::replay(&state.config.source_log_path)
-        .map_err(|error| FanoutError::Signal(format!("risk price replay failed: {error}")))?;
-    for item in replay {
-        let (_, envelope) = item
-            .map_err(|error| FanoutError::Signal(format!("risk price replay failed: {error}")))?;
-        if let Some(expected_hash) = unmatched.get(&envelope.seq) {
-            if *expected_hash != envelope.this_hash {
-                return Ok(true);
-            }
-            observed_at.push(envelope.observed_at.0.unix_timestamp_nanos());
-            unmatched.remove(&envelope.seq);
-        }
-    }
-    if !unmatched.is_empty() {
-        return Ok(true);
-    }
-    let evaluated_at = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    Ok(observed_at.into_iter().any(|observed_at| {
-        crate::mid_price_cache::classify_strict_price_time(observed_at, evaluated_at).is_err()
+    let evaluated_at_unix_ms = now.unix_timestamp_nanos().div_euclid(1_000_000);
+    Ok(risk.price_receipts.iter().any(|receipt| {
+        state
+            .config
+            .source_receipt_millis
+            .received_millis(*receipt)
+            .map_or(true, |observed_at_unix_ms| {
+                crate::mid_price_cache::classify_strict_price_time(
+                    i128::from(observed_at_unix_ms),
+                    evaluated_at_unix_ms,
+                )
+                .is_err()
+            })
     }))
 }
 
@@ -2608,7 +2680,16 @@ pub(crate) fn derive_projection_rows_with_sources(
                 let binding = current_account_binding
                     .as_ref()
                     .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-                verify_admission_account_evidence(admission, binding, event.timestamp)?;
+                verify_live_admission_evaluation(admission, event.timestamp, Some(binding))
+                    .map_err(|error| match error {
+                        LiveAdmissionEvaluationError::InvalidRiskDecision => {
+                            ProjectionReducerError::InvalidRiskDecision
+                        }
+                        LiveAdmissionEvaluationError::InvalidAccountEvidence
+                        | LiveAdmissionEvaluationError::Journal(_) => {
+                            ProjectionReducerError::InvalidAccountEvidence
+                        }
+                    })?;
                 let key = admission.identity.idempotency_key.clone();
                 if !evaluated_admissions.insert(key.clone()) {
                     return Err(ProjectionReducerError::IdentityConflict);
@@ -3195,105 +3276,6 @@ pub(crate) fn verify_account_state(
         .audit()
         .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     if *account != expected {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_admission_account_evidence(
-    admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
-    binding: &LiveAccountBindingAudit,
-    evaluated_at: OffsetDateTime,
-) -> Result<(), ProjectionReducerError> {
-    let risk_decision = match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
-        pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
-        pe_risk_engine::RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
-    };
-    if admission.economic.risk.decision != risk_decision
-        || (admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved
-            && risk_decision != RiskDecisionAudit::Approved)
-    {
-        return Err(ProjectionReducerError::InvalidRiskDecision);
-    }
-    let has_failure_evidence = !admission.account_read_failure_evidence.is_empty()
-        || !admission
-            .account_read_failure_request_descriptor_hashes
-            .is_empty()
-        || !admission.account_read_failure_evidence_hashes.is_empty();
-    let classify = |account| {
-        classify_live_admission(LiveAdmissionClassificationInput {
-            evaluated_at,
-            requested_mode: admission.requested_mode,
-            effective_mode: admission.effective_mode,
-            frozen_binding: &admission.frozen_binding,
-            current_binding: &admission.current_binding,
-            identity: &admission.identity,
-            condition_id: &admission.economic.market.condition_id,
-            outcome_id: OutcomeId(u16::from(admission.economic.market.outcome_index)),
-            token_id: &admission.economic.market.token_id,
-            admission: &admission.economic.admission,
-            ladder: &admission.economic.ladder,
-            economic: &admission.economic,
-            account,
-        })
-    };
-    if let Ok(expected) = classify(LiveAdmissionAccountEvidence::NotRead) {
-        if admission.account_state.is_some()
-            || has_failure_evidence
-            || admission.verdict != expected
-        {
-            return Err(ProjectionReducerError::InvalidAccountEvidence);
-        }
-        return Ok(());
-    }
-
-    if !binding.is_valid_for_frozen_credential(&binding.account_id, &admission.frozen_binding)
-        || admission.current_binding != binding.credential
-        || (admission.account_state.is_some() == has_failure_evidence)
-    {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    }
-    let selected_spender = if admission.economic.admission.market.neg_risk {
-        pe_venue_polymarket::CanaryV2Client::negrisk_spender()
-    } else {
-        pe_venue_polymarket::CanaryV2Client::standard_spender()
-    }
-    .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    let account = if let Some(account_state) = &admission.account_state {
-        let classified = classify_live_account_responses(
-            &account_state.evidence,
-            &selected_spender,
-            &account_state.request_descriptor_hashes,
-            Some(&account_state.evidence_hashes),
-            binding,
-        )
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-        let LiveAccountResponseClassification::State(state) = classified else {
-            return Err(ProjectionReducerError::InvalidAccountEvidence);
-        };
-        let expected = state
-            .audit()
-            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-        if *account_state != expected {
-            return Err(ProjectionReducerError::InvalidAccountEvidence);
-        }
-        LiveAdmissionAccountEvidence::State(account_state)
-    } else {
-        let classified = classify_live_account_responses(
-            &admission.account_read_failure_evidence,
-            &selected_spender,
-            &admission.account_read_failure_request_descriptor_hashes,
-            Some(&admission.account_read_failure_evidence_hashes),
-            binding,
-        )
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-        let LiveAccountResponseClassification::ReadFailure(failure) = classified else {
-            return Err(ProjectionReducerError::InvalidAccountEvidence);
-        };
-        LiveAdmissionAccountEvidence::ReadFailure(failure.kind)
-    };
-    let expected = classify(account).map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    if admission.verdict != expected {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
     Ok(())
@@ -5094,6 +5076,7 @@ async fn ensure_live_portfolio_marks(
         .unix_timestamp()
         .div_euclid(86_400)
         * 86_400;
+    let source_envelopes = state.config.source_receipt_millis.source_envelopes();
     while cutoff <= completed_cutoff {
         let cutoff_is_missing = !derived.daily_marks.contains_key(&cutoff);
         if cutoff_is_missing {
@@ -5102,13 +5085,10 @@ async fn ensure_live_portfolio_marks(
                 .filter(|event| event.timestamp.unix_timestamp() < cutoff)
                 .cloned()
                 .collect::<Vec<_>>();
-            let source_envelopes = match replay_source_envelopes(state) {
-                Ok(envelopes) => envelopes,
-                Err(_) => return CheckOutcome::Transient("source replay unavailable"),
-            };
             let cutoff_sources = source_envelopes
-                .into_iter()
+                .iter()
                 .filter(|envelope| envelope.received_at.0.unix_timestamp() < cutoff)
+                .cloned()
                 .collect::<Vec<_>>();
             let cutoff_derived = match derive_projection_rows_with_sources(
                 &account.account_id,
@@ -6723,6 +6703,59 @@ mod tests {
         );
     }
 
+    /// PASS: live risk price expiry uses millisecond units through the receipt index: observations
+    /// aged 1 ms and 59,999 ms remain fresh, while the strict 60,000 ms boundary is expired.
+    #[tokio::test]
+    async fn risk_price_expiry_uses_millisecond_ttl_boundaries() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let state = fanout_state(
+            &dir,
+            db,
+            LiveAccountsSnapshot::default(),
+            "http://127.0.0.1:9",
+            None,
+        );
+        let observed_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let receipt = state
+            .config
+            .source_log
+            .append(EnvelopeIn {
+                source_id: SourceId("risk-price-boundary".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(observed_at),
+                received_at: ReceivedAt(observed_at),
+                content_type: ContentType::Json,
+                payload: br#"{"price":"0.50"}"#.to_vec(),
+            })
+            .await
+            .unwrap();
+        let mut risk = finality_prepared().economic.risk;
+        risk.price_receipts = vec![receipt];
+
+        assert!(
+            !risk_price_expired(&state, &risk, observed_at + time::Duration::milliseconds(1))
+                .unwrap()
+        );
+        assert!(
+            !risk_price_expired(
+                &state,
+                &risk,
+                observed_at + time::Duration::milliseconds(59_999),
+            )
+            .unwrap()
+        );
+        assert!(
+            risk_price_expired(
+                &state,
+                &risk,
+                observed_at + time::Duration::milliseconds(60_000),
+            )
+            .unwrap()
+        );
+    }
+
     fn settings(
         mode: Option<&str>,
         dollar: Option<&str>,
@@ -7728,7 +7761,58 @@ mod tests {
             .unwrap();
     }
 
-    fn stage_recoverable_approved(
+    async fn append_recovery_baseline(
+        state: &FanoutState,
+        account_id: &AccountId,
+        now: OffsetDateTime,
+        equity: CollateralAmount,
+    ) -> pe_execution_core::LiveAccountStateAudit {
+        let cash = CollateralAmount::from_atomic(10_000_000);
+        let binding =
+            account_binding_fixture(account_id, "0x1111111111111111111111111111111111111111");
+        let (mut position_evidence, source_envelopes) = empty_position_evidence(0, now, &binding);
+        for (page, envelope) in position_evidence.pages.iter_mut().zip(source_envelopes) {
+            page.receipt = state
+                .config
+                .source_log
+                .append(EnvelopeIn {
+                    source_id: envelope.source_id,
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    observed_at: envelope.observed_at,
+                    received_at: envelope.received_at,
+                    content_type: envelope.content_type,
+                    payload: envelope.payload,
+                })
+                .await
+                .unwrap();
+        }
+        let account_state = account_state_fixture_for_binding(cash, now, &binding);
+        state
+            .config
+            .journal
+            .append(
+                account_id.clone(),
+                now,
+                LiveJournalPayload::AccountPortfolioMarked(Box::new(
+                    pe_execution_core::AccountPortfolioMarkedAudit {
+                        kind: MarkKind::Baseline,
+                        cutoff_unix: now.unix_timestamp(),
+                        account_binding: binding,
+                        account_state: account_state.clone(),
+                        venue_positions: Vec::new(),
+                        venue_position_evidence: position_evidence,
+                        marked_positions: Vec::new(),
+                        prices: Vec::new(),
+                        equity,
+                    },
+                )),
+            )
+            .unwrap();
+        account_state
+    }
+
+    async fn stage_recoverable_approved(
         state: &mut FanoutState,
         now: OffsetDateTime,
     ) -> (
@@ -7743,31 +7827,24 @@ mod tests {
             &["acct"],
         );
         let mut prepared = finality_prepared();
-        let mut baseline = baseline_event(&account_id, 0);
-        let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut baseline.payload else {
-            unreachable!();
-        };
-        prepared.account_state = mark.account_state.clone();
+        prepared.account_state = append_recovery_baseline(
+            state,
+            &account_id,
+            now,
+            CollateralAmount::from_atomic(10_000_000),
+        )
+        .await;
         prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
         prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         prepared.economic.admission.settlement.source_timestamp_unix = Some(now.unix_timestamp());
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = now.unix_timestamp().saturating_mul(1_000);
         prepared.economic.risk.price_receipts.clear();
-        baseline.timestamp = now;
-        state
-            .config
-            .journal
-            .append(account_id.clone(), now, baseline.payload)
-            .unwrap();
         append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
-        let pending = recovery_inventory(
-            &state.config.journal_path,
-            state.config.era_live_prefix.as_ref(),
-        )
-        .unwrap()
-        .approved_admissions
-        .remove(0);
+        let pending = verified_recovery_inventory(state)
+            .unwrap()
+            .approved_admissions
+            .remove(0);
         (pending, prepared.prepared)
     }
 
@@ -9513,16 +9590,13 @@ mod tests {
         );
         let account_id = AccountId::new("acct").unwrap();
         let mut prepared = finality_prepared();
-        let baseline = baseline_event(&account_id, 0);
-        let LiveJournalPayload::AccountPortfolioMarked(mark) = &baseline.payload else {
-            unreachable!();
-        };
-        prepared.account_state = mark.account_state.clone();
-        state
-            .config
-            .journal
-            .append(account_id.clone(), baseline.timestamp, baseline.payload)
-            .unwrap();
+        prepared.account_state = append_recovery_baseline(
+            &state,
+            &account_id,
+            OffsetDateTime::UNIX_EPOCH,
+            CollateralAmount::from_atomic(10_000_000),
+        )
+        .await;
         append_approved_admission(
             state.config.journal.as_ref(),
             &account_id,
@@ -9534,6 +9608,179 @@ mod tests {
         let prefix = LiveJournal::verified_tail(&state.config.journal_path).unwrap();
         state.config.era_live_prefix = Some(prefix);
         assert!(!recovery_is_pending(&state).unwrap());
+    }
+
+    /// PASS: recovery exposes no admission when the same strict reducer rejects a zero-equity or
+    /// duplicate same-era Baseline, even though the journal-only inventory can parse both logs.
+    #[tokio::test]
+    async fn recovery_requires_the_strict_source_backed_baseline_rule() {
+        for duplicate in [false, true] {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let state = fanout_state(
+                &dir,
+                db,
+                LiveAccountsSnapshot::default(),
+                "http://127.0.0.1:9",
+                None,
+            );
+            let account_id = AccountId::new("acct").unwrap();
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let equity = if duplicate {
+                CollateralAmount::from_atomic(10_000_000)
+            } else {
+                CollateralAmount::ZERO
+            };
+            let account_state = append_recovery_baseline(&state, &account_id, now, equity).await;
+            if duplicate {
+                let baseline = replay_live_account(&state, &account_id).unwrap()[0]
+                    .payload
+                    .clone();
+                state
+                    .config
+                    .journal
+                    .append(account_id.clone(), now, baseline)
+                    .unwrap();
+            }
+            let mut prepared = finality_prepared();
+            prepared.account_state = account_state;
+            prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
+            prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
+            prepared.economic.admission.settlement.source_timestamp_unix =
+                Some(now.unix_timestamp());
+            prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
+            prepared.economic.risk.evaluated_at_unix_ms =
+                now.unix_timestamp().saturating_mul(1_000);
+            prepared.economic.risk.price_receipts.clear();
+            append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
+
+            assert_eq!(
+                recovery_inventory(&state.config.journal_path, None)
+                    .unwrap()
+                    .approved_admissions
+                    .len(),
+                1
+            );
+            let error = verified_recovery_inventory(&state).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("live recovery strict reduction failed")
+            );
+        }
+    }
+
+    /// PASS: crashes after a durable Refused admission or preparation failure leave a pending
+    /// SQLite target that recovery deterministically terminalizes without appending another fact.
+    #[tokio::test]
+    async fn terminal_admission_crash_seams_reconcile_the_dispatch_projection() {
+        for preparation_failed in [false, true] {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let mut state = fanout_state(
+                &dir,
+                db.clone(),
+                LiveAccountsSnapshot::default(),
+                "http://127.0.0.1:9",
+                None,
+            );
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            stage(
+                db.as_ref(),
+                "dispatch-finality",
+                now.unix_timestamp(),
+                &["acct"],
+            );
+            let account_id = AccountId::new("acct").unwrap();
+            let account_state = append_recovery_baseline(
+                &state,
+                &account_id,
+                now,
+                CollateralAmount::from_atomic(10_000_000),
+            )
+            .await;
+            let mut prepared = finality_prepared();
+            prepared.account_state = account_state;
+            prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
+            prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
+            prepared.economic.admission.settlement.source_timestamp_unix =
+                Some(now.unix_timestamp());
+            prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
+            prepared.economic.risk.evaluated_at_unix_ms =
+                now.unix_timestamp().saturating_mul(1_000);
+            prepared.economic.risk.price_receipts.clear();
+            if preparation_failed {
+                append_approved_admission(
+                    state.config.journal.as_ref(),
+                    &account_id,
+                    &prepared,
+                    now,
+                );
+                state
+                    .config
+                    .journal
+                    .append(
+                        account_id,
+                        now,
+                        LiveJournalPayload::OrderPreparationFailed(Box::new(
+                            pe_execution_core::LiveOrderPreparationFailedAudit {
+                                identity: prepared.identity.clone(),
+                                failure: pe_execution_core::LiveOrderPreparationFailure::Venue,
+                            },
+                        )),
+                    )
+                    .unwrap();
+            } else {
+                let mut refused = approved_admission(&prepared);
+                refused.requested_mode = LiveControlMode::Off;
+                refused.effective_mode = LiveControlMode::Off;
+                refused.account_state = None;
+                refused.verdict = pe_execution_core::LiveAdmissionVerdict::Refused(
+                    LiveAdmissionRefusal::ModeNotArmed,
+                );
+                state
+                    .config
+                    .journal
+                    .append(
+                        account_id,
+                        now,
+                        LiveJournalPayload::AdmissionEvaluated(refused),
+                    )
+                    .unwrap();
+            }
+
+            assert_eq!(
+                db.dispatch_targets("dispatch-finality").unwrap()[0].state,
+                "pending"
+            );
+            let inventory = verified_recovery_inventory(&state).unwrap();
+            assert_eq!(inventory.terminal_admissions.len(), 1);
+            assert!(recovery_is_pending(&state).unwrap());
+            let journal_len = replay_live_account(&state, &AccountId::new("acct").unwrap())
+                .unwrap()
+                .len();
+            let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
+            let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+            assert_eq!(
+                process_target(&mut state, &seed, &target, &projection_signal(), now)
+                    .await
+                    .unwrap(),
+                PassControl::Continue
+            );
+            assert_eq!(
+                db.dispatch_targets("dispatch-finality").unwrap()[0].state,
+                "terminal"
+            );
+            assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+            assert_eq!(
+                replay_live_account(&state, &AccountId::new("acct").unwrap())
+                    .unwrap()
+                    .len(),
+                journal_len,
+                "ordinary dispatch must not append a second admission"
+            );
+            assert!(!recovery_is_pending(&state).unwrap());
+        }
     }
 
     /// PASS: a failed account request consumes exactly one descriptor bound to the active
@@ -10751,9 +10998,11 @@ mod tests {
         let source_log_path = dir.path().join("live-source.log");
         let source_sink =
             crate::source_event_sink::SourceEventSink::open(&source_log_path).unwrap();
+        let source_receipt_millis = SourceReceiptMillisIndex::replay(&source_log_path).unwrap();
         let paper_log_path = dir.path().join("paper.log");
         drop(pe_event_log::Writer::open(&paper_log_path).unwrap());
-        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(1);
+        let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move { while trigger_rx.recv().await.is_some() {} });
         let (orchestrator_control, _orchestrator_control_rx) = tokio::sync::mpsc::channel(1);
         let source_health = crate::health::new_shared_health_with_ws(false, true, 90);
         tokio::spawn(
@@ -10763,6 +11012,7 @@ mod tests {
                 trigger_tx,
                 source_health,
             )
+            .with_source_receipt_millis_index(source_receipt_millis.clone())
             .run(),
         );
         let admission = LiveAdmissionBuilder::new(
@@ -10793,7 +11043,7 @@ mod tests {
                 book_fetcher: Arc::new(ReqwestClobBookFetcher::new(http.clone())),
                 mid_price_cache: MidPriceCache::new("http://127.0.0.1:9".to_owned()),
                 source_log: source_log.clone(),
-                source_log_path,
+                source_receipt_millis,
                 paper_log_path,
                 orchestrator_control,
                 http: http.clone(),
@@ -10858,7 +11108,7 @@ mod tests {
             "http://127.0.0.1:9",
             None,
         );
-        let (pending, prepared) = stage_recoverable_approved(&mut armed_state, now);
+        let (pending, prepared) = stage_recoverable_approved(&mut armed_state, now).await;
         let target = armed_db
             .dispatch_targets("dispatch-finality")
             .unwrap()
@@ -10912,7 +11162,7 @@ mod tests {
                 snapshot.accounts[0].effective_live_mode = "off".to_owned();
             }
             let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
-            let _ = stage_recoverable_approved(&mut state, now);
+            let _ = stage_recoverable_approved(&mut state, now).await;
             if case == "closed" {
                 state
                     .closures
@@ -10955,7 +11205,7 @@ mod tests {
         let mut snapshot = armed_snapshot("acct");
         snapshot.fetched_at_unix = Some(now.unix_timestamp());
         let mut state = fanout_state(&dir, db, snapshot, &format!("http://{address}"), None);
-        let _ = stage_recoverable_approved(&mut state, now);
+        let _ = stage_recoverable_approved(&mut state, now).await;
         run_live_fanout_until(state.config, std::future::ready(()))
             .await
             .unwrap();

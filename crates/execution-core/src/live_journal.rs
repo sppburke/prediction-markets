@@ -20,18 +20,14 @@ use pe_event_log::{
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
 use pe_venue_polymarket::{
-    CanaryV2Client, CompactFeeSchedule, DecodedOrderFill, LadderPlan, MatchedReceipt,
-    PreparedPolymarketBuy, ReceiptError, canonical_block_matches, decode_order_fills,
-    fee_within_reserve, parse_chain_id_response, parse_finalized_block_response,
-    parse_receipt_response,
+    CompactFeeSchedule, DecodedOrderFill, LadderPlan, MatchedReceipt, PreparedPolymarketBuy,
+    ReceiptError, canonical_block_matches, decode_order_fills, fee_within_reserve,
+    parse_chain_id_response, parse_finalized_block_response, parse_receipt_response,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::live_executor::{
-    LiveAccountResponseClassification, LiveAdmissionAccountEvidence,
-    LiveAdmissionClassificationInput, classify_live_account_responses, classify_live_admission,
-};
+use crate::live_executor::{LiveAdmissionEvaluationError, verify_live_admission_evaluation};
 
 const LIVE_JOURNAL_SOURCE: &str = "ordinary-live-execution";
 const LIVE_JOURNAL_SCHEMA_VERSION: u32 = 2;
@@ -840,10 +836,26 @@ pub struct ApprovedAdmissionRecoveryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Verified journal-owned accounts and nonterminal orders for one recovery pass.
+/// One durable terminal admission/preparation fact awaiting local dispatch projection.
+pub struct TerminalAdmissionRecoveryEntry {
+    pub account_id: AccountId,
+    pub journal_seq: u64,
+    pub identity: LiveOrderIdentity,
+    pub outcome: TerminalAdmissionRecoveryOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalAdmissionRecoveryOutcome {
+    Refused(LiveAdmissionRefusal),
+    PreparationFailed(LiveOrderPreparationFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Verified journal-owned accounts and durable execution/local-projection work for one recovery pass.
 pub struct LiveRecoveryInventory {
     pub account_ids: Vec<AccountId>,
     pub approved_admissions: Vec<ApprovedAdmissionRecoveryEntry>,
+    pub terminal_admissions: Vec<TerminalAdmissionRecoveryEntry>,
     pub open_orders: Vec<OpenOrderRecoveryEntry>,
 }
 
@@ -1751,105 +1763,6 @@ fn insert_open_order(
     Ok(())
 }
 
-fn verify_recovery_admission(
-    admission: &LiveAdmissionEvaluationAudit,
-    evaluated_at: OffsetDateTime,
-    binding: Option<&LiveAccountBindingAudit>,
-) -> Result<(), LiveJournalError> {
-    let risk_decision = match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
-        pe_risk_engine::RiskDecision::Approved => crate::RiskDecisionAudit::Approved,
-        pe_risk_engine::RiskDecision::Blocked(reason) => {
-            crate::RiskDecisionAudit::Blocked { reason }
-        }
-    };
-    if admission.economic.risk.decision != risk_decision
-        || (admission.verdict == LiveAdmissionVerdict::Approved
-            && risk_decision != crate::RiskDecisionAudit::Approved)
-    {
-        return Err(LiveJournalError::OrderFactConflict);
-    }
-    let classify = |account| {
-        classify_live_admission(LiveAdmissionClassificationInput {
-            evaluated_at,
-            requested_mode: admission.requested_mode,
-            effective_mode: admission.effective_mode,
-            frozen_binding: &admission.frozen_binding,
-            current_binding: &admission.current_binding,
-            identity: &admission.identity,
-            condition_id: &admission.economic.market.condition_id,
-            outcome_id: pe_core_types::OutcomeId(u16::from(
-                admission.economic.market.outcome_index,
-            )),
-            token_id: &admission.economic.market.token_id,
-            admission: &admission.economic.admission,
-            ladder: &admission.economic.ladder,
-            economic: &admission.economic,
-            account,
-        })
-    };
-    let has_failure_evidence = !admission.account_read_failure_evidence.is_empty()
-        || !admission
-            .account_read_failure_request_descriptor_hashes
-            .is_empty()
-        || !admission.account_read_failure_evidence_hashes.is_empty();
-    if let Ok(expected) = classify(LiveAdmissionAccountEvidence::NotRead) {
-        if admission.account_state.is_some()
-            || has_failure_evidence
-            || admission.verdict != expected
-        {
-            return Err(LiveJournalError::OrderFactConflict);
-        }
-        return Ok(());
-    }
-
-    let binding = binding.ok_or(LiveJournalError::RequestBinding)?;
-    if !binding.is_valid_for_frozen_credential(&binding.account_id, &admission.frozen_binding)
-        || admission.current_binding != binding.credential
-        || (admission.account_state.is_some() == has_failure_evidence)
-    {
-        return Err(LiveJournalError::RequestBinding);
-    }
-    let selected_spender = if admission.economic.admission.market.neg_risk {
-        CanaryV2Client::negrisk_spender()
-    } else {
-        CanaryV2Client::standard_spender()
-    }
-    .map_err(|_| LiveJournalError::RequestBinding)?;
-    let expected = if let Some(account) = &admission.account_state {
-        let classified = classify_live_account_responses(
-            &account.evidence,
-            &selected_spender,
-            &account.request_descriptor_hashes,
-            Some(&account.evidence_hashes),
-            binding,
-        )?;
-        let LiveAccountResponseClassification::State(state) = classified else {
-            return Err(LiveJournalError::OrderFactConflict);
-        };
-        let derived = state.audit()?;
-        if *account != derived {
-            return Err(LiveJournalError::OrderFactConflict);
-        }
-        classify(LiveAdmissionAccountEvidence::State(&derived))
-    } else {
-        let classified = classify_live_account_responses(
-            &admission.account_read_failure_evidence,
-            &selected_spender,
-            &admission.account_read_failure_request_descriptor_hashes,
-            Some(&admission.account_read_failure_evidence_hashes),
-            binding,
-        )?;
-        let LiveAccountResponseClassification::ReadFailure(failure) = classified else {
-            return Err(LiveJournalError::OrderFactConflict);
-        };
-        classify(LiveAdmissionAccountEvidence::ReadFailure(failure.kind))
-    };
-    if expected.map_err(|_| LiveJournalError::OrderFactConflict)? != admission.verdict {
-        return Err(LiveJournalError::OrderFactConflict);
-    }
-    Ok(())
-}
-
 /// Replay the verified global journal once and return every Prepared order without a terminal fact.
 /// `Killed`, `Rejected`, `FinalityConflict`, and `OrderFillFinalized` are terminal. A finality
 /// conflict deliberately preserves the reservation while removing the order from automated
@@ -1894,6 +1807,7 @@ pub fn recovery_inventory(
     let mut evaluated_admissions = BTreeSet::<(AccountId, String)>::new();
     let mut approved_admissions =
         BTreeMap::<(AccountId, String), (u64, Box<LiveAdmissionEvaluationAudit>)>::new();
+    let mut terminal_admissions = Vec::new();
     for event in events {
         account_ids.insert(event.account_id.clone());
         match event.payload {
@@ -1924,11 +1838,18 @@ pub fn recovery_inventory(
                 )?;
             }
             LiveJournalPayload::AdmissionEvaluated(admission) => {
-                verify_recovery_admission(
+                verify_live_admission_evaluation(
                     &admission,
                     event.timestamp,
                     account_bindings.get(&event.account_id),
-                )?;
+                )
+                .map_err(|error| match error {
+                    LiveAdmissionEvaluationError::Journal(error) => error,
+                    LiveAdmissionEvaluationError::InvalidRiskDecision
+                    | LiveAdmissionEvaluationError::InvalidAccountEvidence => {
+                        LiveJournalError::OrderFactConflict
+                    }
+                })?;
                 let key = (
                     event.account_id.clone(),
                     admission.identity.idempotency_key.clone(),
@@ -1938,10 +1859,20 @@ pub fn recovery_inventory(
                 }
                 if admission.verdict == LiveAdmissionVerdict::Approved {
                     approved_admissions.insert(key, (event.seq, admission));
+                } else if let LiveAdmissionVerdict::Refused(reason) = &admission.verdict {
+                    terminal_admissions.push(TerminalAdmissionRecoveryEntry {
+                        account_id: event.account_id,
+                        journal_seq: event.seq,
+                        identity: admission.identity.clone(),
+                        outcome: TerminalAdmissionRecoveryOutcome::Refused(reason.clone()),
+                    });
                 }
             }
             LiveJournalPayload::OrderPreparationFailed(failed) => {
-                let key = (event.account_id, failed.identity.idempotency_key.clone());
+                let key = (
+                    event.account_id.clone(),
+                    failed.identity.idempotency_key.clone(),
+                );
                 if let Some((_, admission)) = approved_admissions.remove(&key) {
                     if admission.identity != failed.identity {
                         return Err(LiveJournalError::OrderFactConflict);
@@ -1955,6 +1886,12 @@ pub fn recovery_inventory(
                     }
                     order.terminal = true;
                 }
+                terminal_admissions.push(TerminalAdmissionRecoveryEntry {
+                    account_id: event.account_id,
+                    journal_seq: event.seq,
+                    identity: failed.identity.clone(),
+                    outcome: TerminalAdmissionRecoveryOutcome::PreparationFailed(failed.failure),
+                });
             }
             LiveJournalPayload::AccountPortfolioMarked(mark) => {
                 if mark.kind == MarkKind::Baseline {
@@ -2118,9 +2055,11 @@ pub fn recovery_inventory(
         })
         .collect::<Vec<_>>();
     approved_admissions.sort_by_key(|admission| admission.admission_journal_seq);
+    terminal_admissions.sort_by_key(|admission| admission.journal_seq);
     Ok(LiveRecoveryInventory {
         account_ids: account_ids.into_iter().collect(),
         approved_admissions,
+        terminal_admissions,
         open_orders,
     })
 }
@@ -2610,7 +2549,7 @@ mod tests {
         observed_at: OffsetDateTime,
     ) -> LiveAccountStateAudit {
         let binding = account_binding_for(account_id, credential);
-        let spender = CanaryV2Client::standard_spender().unwrap();
+        let spender = pe_venue_polymarket::CanaryV2Client::standard_spender().unwrap();
         let collateral = CollateralAmount::from_whole(10).unwrap();
         let response = |endpoint_kind: &str,
                         path: &str,
@@ -3046,6 +2985,13 @@ mod tests {
             let recovered = recovery_inventory(&path, None).unwrap();
             assert!(recovered.approved_admissions.is_empty(), "{seam}");
             assert!(recovered.open_orders.is_empty(), "{seam}");
+            assert_eq!(recovered.terminal_admissions.len(), 1, "{seam}");
+            assert!(matches!(
+                recovered.terminal_admissions[0].outcome,
+                TerminalAdmissionRecoveryOutcome::PreparationFailed(
+                    LiveOrderPreparationFailure::RecoveryAdmissionExpired
+                )
+            ));
         }
     }
 

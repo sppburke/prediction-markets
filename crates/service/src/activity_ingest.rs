@@ -724,7 +724,7 @@ impl Coordinator {
         slot: Option<usize>,
     ) -> Result<AppendReceipt, Shutdown> {
         match self.sink.append_durable(duplicate_envelope(&envelope)) {
-            Ok(receipt) => return self.index_synced_append(receipt, &envelope.received_at),
+            Ok(receipt) => return self.index_synced_append(receipt, &envelope),
             Err(error) => {
                 self.set_health(|h| {
                     h.ws_sink_poisoned = true;
@@ -754,7 +754,7 @@ impl Coordinator {
                     });
                     info!(trade = %label,
                         "source log recovered; held payload appended durably");
-                    return self.index_synced_append(receipt, &envelope.received_at);
+                    return self.index_synced_append(receipt, &envelope);
                 }
                 Err(error) => {
                     warn!(error = %error, "source log re-poisoned immediately after reopen");
@@ -766,10 +766,10 @@ impl Coordinator {
     fn index_synced_append(
         &self,
         receipt: AppendReceipt,
-        received_at: &ReceivedAt,
+        envelope: &EnvelopeIn,
     ) -> Result<AppendReceipt, Shutdown> {
         self.source_receipt_millis
-            .record_synced_append(receipt, received_at)
+            .record_synced_append(receipt, envelope)
             .map(|()| receipt)
             .map_err(|error| {
                 warn!(%error, sequence = receipt.sequence.0,
