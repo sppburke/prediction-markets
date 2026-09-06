@@ -47,7 +47,9 @@ use crate::paper_recovery::{
     PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, PaperMarkPrice, PortfolioMark,
     QualificationSealed, SealReason, TailBinding,
 };
-use crate::risk_inputs::{BoundaryMarkError, RiskInputsUnavailable, SourceReceiptMillisIndex};
+use crate::risk_inputs::{
+    BoundaryMarkError, RiskInputsUnavailable, SourceReceiptMillisIndex, apply_global_risk_halts,
+};
 use crate::runtime_config::{self, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::SinkHandle;
@@ -327,34 +329,6 @@ pub struct Orchestrator<
         crate::paper_recovery::RiskHaltOwner,
         pe_risk_engine::RiskHaltCause,
     )>,
-}
-
-fn apply_global_risk_halts(
-    active: &HashSet<(
-        crate::paper_recovery::RiskHaltOwner,
-        pe_risk_engine::RiskHaltCause,
-    )>,
-    snapshot: &mut RiskSnapshot,
-) {
-    use pe_risk_engine::{
-        INTRADAY_STOP_BPS, KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS, RiskHaltCause,
-    };
-    for (_, cause) in active {
-        match cause {
-            RiskHaltCause::AbsoluteLoss => {
-                snapshot.absolute_pnl_bps.0 =
-                    snapshot.absolute_pnl_bps.0.min(KILL_SWITCH_DRAWDOWN_BPS);
-            }
-            RiskHaltCause::IntradayDrawdown => {
-                snapshot.intraday_pnl_bps.0 = snapshot.intraday_pnl_bps.0.min(INTRADAY_STOP_BPS);
-            }
-            RiskHaltCause::Rolling7dDrawdown => {
-                snapshot.rolling_7d_pnl_bps.0 =
-                    snapshot.rolling_7d_pnl_bps.0.min(ROLLING_7D_STOP_BPS);
-            }
-            RiskHaltCause::CopyLatency => snapshot.copy_latency_kill_switch_active = true,
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3441,7 +3415,8 @@ mod tests {
     use crate::paper_recovery::{RiskHaltOwner, SealReason};
     use crate::qualification::QualificationCompletion;
 
-    use super::{Orchestrator, apply_global_risk_halts, check_resolution_horizon};
+    use super::{Orchestrator, check_resolution_horizon};
+    use crate::risk_inputs::apply_global_risk_halts;
 
     const NOW: i64 = 1_700_000_000;
 

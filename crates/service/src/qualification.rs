@@ -77,7 +77,7 @@ use crate::paper_recovery::{
     SealedMembershipEvidence, TailBinding, active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::risk_inputs::{
-    PaperExposureBase, RiskInputsUnavailable, build_paper_risk_base,
+    PaperExposureBase, RiskInputsUnavailable, apply_global_risk_halts, build_paper_risk_base,
     build_paper_risk_snapshot_from_source_receipts, historical_mark_price,
 };
 use crate::runtime_config::{
@@ -755,6 +755,7 @@ async fn verify_qualification(
                                 start_hot_config_hash: &start.hot_config_hash,
                                 financial_semantic_version: start.financial_semantic_version,
                             },
+                            true,
                         )
                         .await?;
                         economic_hashes.push(economic.core_hash().map_err(|error| {
@@ -3873,6 +3874,7 @@ async fn verify_economic(
     operation: &crate::paper_recovery::PaperFillOperationIdentity,
     economic: &EconomicPrepared,
     context: &RiskReplayContext<'_>,
+    require_risk_approval: bool,
 ) -> Result<EconomicPrepared, QualificationError> {
     verify_economic_configuration(
         economic,
@@ -3936,8 +3938,9 @@ async fn verify_economic(
     )
     .await?;
     let era = paper_era(context.paper_prefix.to_vec());
+    let active_halts = active_risk_halts(&era);
     let latency_was_active =
-        active_risk_halts(&era).contains(&(RiskHaltOwner::Paper, RiskHaltCause::CopyLatency));
+        active_halts.contains(&(RiskHaltOwner::Paper, RiskHaltCause::CopyLatency));
     let proposed_debit = sized.worst_case_all_in_debit().map_err(|error| {
         QualificationError::InsufficientEvidence(format!(
             "proposed risk debit reconstruction failed: {error}"
@@ -3950,7 +3953,7 @@ async fn verify_economic(
         economic.risk.snapshot.per_trade_cap_bps,
         &era,
     )?;
-    let reconstructed = build_paper_risk_snapshot_from_source_receipts(
+    let mut reconstructed = build_paper_risk_snapshot_from_source_receipts(
         &base,
         &snapshot,
         &era,
@@ -3972,6 +3975,7 @@ async fn verify_economic(
             "risk snapshot reconstruction failed: {error}"
         ))
     })?;
+    apply_global_risk_halts(&active_halts, &mut reconstructed);
     if reconstructed != economic.risk.snapshot {
         return insufficient("EconomicPrepared risk snapshot differs from causal replay");
     }
@@ -3982,6 +3986,9 @@ async fn verify_economic(
     };
     if expected_risk != economic.risk.decision {
         return insufficient("EconomicPrepared risk decision differs from shared risk owner");
+    }
+    if require_risk_approval && expected_risk != RiskDecisionAudit::Approved {
+        return insufficient("Financial Fill risk decision is not an approval");
     }
 
     let risk = RiskAudit {
@@ -4899,8 +4906,9 @@ async fn replay_unavailable_risk_inputs(
         Ok(base) => base,
         Err(cause) => return Ok(Some(cause)),
     };
+    let active_halts = active_risk_halts(&era);
     let latency_was_active =
-        active_risk_halts(&era).contains(&(RiskHaltOwner::Paper, RiskHaltCause::CopyLatency));
+        active_halts.contains(&(RiskHaltOwner::Paper, RiskHaltCause::CopyLatency));
     match build_paper_risk_snapshot_from_source_receipts(
         &base,
         &snapshot,
@@ -4988,7 +4996,7 @@ async fn verify_winner_follow_decline_decision(
                 source_trade_id: frozen.source_trade_id.clone(),
                 observed_at_bucket: frozen.source_epoch,
             };
-            let reconstructed = verify_economic(&operation, economic, &replay).await?;
+            let reconstructed = verify_economic(&operation, economic, &replay, false).await?;
             let (signal, mode) = reconstruct_winner_follow_signal(continuation)?;
             match pe_strategy_winner_follow::WinnerFollowStrategy::new(
                 frozen.applied_configuration.winner_follow_config(),
@@ -6873,11 +6881,16 @@ mod tests {
             financial_semantic_version: fixture.start.financial_semantic_version,
         };
         assert_eq!(
-            verify_economic(&operation, &economic, &replay)
+            verify_economic(&operation, &economic, &replay, false)
                 .await
                 .unwrap(),
             economic
         );
+        assert!(matches!(
+            verify_economic(&operation, &economic, &replay, true).await,
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("risk decision is not an approval")
+        ));
 
         assert!(matches!(
             recorded_fill_paper_prefix(
@@ -6899,6 +6912,109 @@ mod tests {
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason.contains("regresses")
         ));
+    }
+
+    /// PASS: qualification replays every foreign-owner halt cause through the shared global
+    /// overlay, and a recovered raw absolute-loss value remains blocked by its paper-owned latch.
+    /// FAIL: any recorded globally clamped snapshot differs from causal qualification replay.
+    #[tokio::test]
+    async fn economic_risk_replay_applies_complete_global_halt_overlay() {
+        let cases = [
+            (
+                RiskHaltOwner::LiveAccount(AccountId::new("live-absolute").unwrap()),
+                RiskHaltCause::AbsoluteLoss,
+            ),
+            (
+                RiskHaltOwner::LiveAccount(AccountId::new("live-intraday").unwrap()),
+                RiskHaltCause::IntradayDrawdown,
+            ),
+            (
+                RiskHaltOwner::LiveAccount(AccountId::new("live-rolling").unwrap()),
+                RiskHaltCause::Rolling7dDrawdown,
+            ),
+            (
+                RiskHaltOwner::LiveAccount(AccountId::new("live-latency").unwrap()),
+                RiskHaltCause::CopyLatency,
+            ),
+            (RiskHaltOwner::Paper, RiskHaltCause::AbsoluteLoss),
+        ];
+
+        for (owner, cause) in cases {
+            let fixture = receipt_backed_decline_fixture().await;
+            let continuation = fixture.decision.continuation.clone();
+            let mut economic = fixture
+                .decision
+                .post_boundary
+                .body
+                .terminal
+                .decline
+                .as_ref()
+                .and_then(|decline| match &decline.inputs {
+                    WinnerFollowDecisionInputs::Evaluated { economic, .. } => {
+                        Some(economic.as_ref().clone())
+                    }
+                    WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
+                })
+                .expect("receipt-backed fixture must contain evaluated inputs");
+            if owner == RiskHaltOwner::Paper {
+                assert!(
+                    economic.risk.snapshot.absolute_pnl_bps.0 > KILL_SWITCH_DRAWDOWN_BPS,
+                    "the manual-latch case requires recovered raw absolute PnL"
+                );
+            }
+            let halt = test_frame(
+                4,
+                economic.risk.evaluated_at_unix_ms.div_euclid(1_000) - 20,
+                PaperLogRecord::RiskHaltChanged {
+                    owner: owner.clone(),
+                    cause,
+                    state: crate::paper_recovery::HaltState::Engaged,
+                    evidence: serde_json::json!({}),
+                },
+            );
+            economic.risk.financial_prefix = halt.receipt;
+            apply_global_risk_halts(
+                &HashSet::from([(owner, cause)]),
+                &mut economic.risk.snapshot,
+            );
+            economic.risk.decision = match evaluate_risk(&economic.risk.snapshot) {
+                RiskDecision::Approved => RiskDecisionAudit::Approved,
+                RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
+            };
+            let mut frames = fixture.frames.clone();
+            frames.push(halt);
+            let financial = financial_state_at_prefix(
+                fixture.start.starting_bankroll.to_decimal(),
+                &fixture.facts,
+                economic.risk.financial_prefix,
+            )
+            .unwrap();
+            let operation = crate::paper_recovery::PaperFillOperationIdentity {
+                leader_wallet: continuation.facts.wallet,
+                source_trade_id: continuation.facts.source_trade_id,
+                observed_at_bucket: continuation.facts.source_epoch,
+            };
+            let replay = RiskReplayContext {
+                cash: financial.cash,
+                positions: &financial.positions,
+                fills: &financial.fills,
+                settlements: &financial.settlements,
+                last_completed: financial.last_completed,
+                start_receipt: frames[0].receipt,
+                paper_prefix: &frames,
+                source: &fixture.source,
+                prepared_received_unix_ms: economic.risk.evaluated_at_unix_ms,
+                start_hot_config_hash: &fixture.start.hot_config_hash,
+                financial_semantic_version: fixture.start.financial_semantic_version,
+            };
+
+            assert_eq!(
+                verify_economic(&operation, &economic, &replay, false)
+                    .await
+                    .unwrap(),
+                economic
+            );
+        }
     }
 
     /// PASS: the verifier accepts a recorded Entry only when the shared complete-second
@@ -6989,6 +7105,39 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// PASS: a decline whose recorded risk decision differs from evaluating its recorded snapshot
+    /// is insufficient even when its other receipt-backed inputs remain unchanged.
+    #[tokio::test]
+    async fn winner_follow_replay_rejects_mismatched_decline_risk_decision() {
+        let fixture = receipt_backed_decline_fixture().await;
+        let mut decision = fixture.decision.clone();
+        let economic = decision
+            .post_boundary
+            .body
+            .terminal
+            .decline
+            .as_mut()
+            .and_then(|decline| match &mut decline.inputs {
+                WinnerFollowDecisionInputs::Evaluated { economic, .. } => Some(economic),
+                WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
+            })
+            .expect("receipt-backed fixture must contain evaluated inputs");
+        economic.risk.decision = RiskDecisionAudit::Approved;
+
+        assert!(matches!(
+            bind_final_receipts(
+                &[decision],
+                &[],
+                &fixture.observations,
+                &fixture.start,
+                &fixture.context(),
+            )
+            .await,
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("risk decision differs from shared risk owner")
+        ));
     }
 
     /// PASS: recomputing the terminal document hash after replacing `NoEdge` with another typed

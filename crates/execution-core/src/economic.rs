@@ -5,7 +5,7 @@ use pe_core_types::{
     ShareAmount, Side,
 };
 use pe_event_log::AppendReceipt;
-use pe_risk_engine::{RiskBlock, RiskSnapshot};
+use pe_risk_engine::{RiskBlock, RiskDecision, RiskSnapshot, evaluate_risk};
 use pe_venue_polymarket::fee::signed_price;
 use pe_venue_polymarket::{CompactFeeSchedule, FeeError, LadderPlan, fee_reserve, taker_fee};
 use rust_decimal::Decimal;
@@ -155,6 +155,8 @@ pub enum EconomicError {
     InvalidLadderAudit,
     #[error("selected market identity disagrees with admission evidence")]
     InvalidMarketIdentity,
+    #[error("recorded risk decision disagrees with the deterministic risk evaluation")]
+    InvalidRiskDecision,
     #[error("the book source receipt is unbound")]
     MissingBookReceipt,
 }
@@ -162,6 +164,13 @@ pub enum EconomicError {
 impl EconomicPrepared {
     /// Compose the canonical economic record exactly once from already-acquired evidence.
     pub fn compose(inputs: EconomicInputs<'_>) -> Result<Self, EconomicError> {
+        let evaluated_risk = match evaluate_risk(&inputs.risk.snapshot) {
+            RiskDecision::Approved => RiskDecisionAudit::Approved,
+            RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
+        };
+        if inputs.risk.decision != evaluated_risk {
+            return Err(EconomicError::InvalidRiskDecision);
+        }
         if inputs.book_receipt.this_hash == blake3::Hash::from_bytes([0; 32]) {
             return Err(EconomicError::MissingBookReceipt);
         }
@@ -509,6 +518,27 @@ mod tests {
             EconomicPrepared::compose(inputs),
             Err(EconomicError::MissingBookReceipt)
         ));
+    }
+
+    /// PASS: composition rejects a recorded approval when the deterministic risk owner blocks
+    /// the same snapshot, while preserving an exactly matching blocked decision for decline audit.
+    #[test]
+    fn composer_rederives_recorded_risk_decision() {
+        let admission = admission();
+        let plan = plan();
+        let mut forged = inputs(&admission, &plan);
+        forged.risk.snapshot.absolute_pnl_bps = BasisPoints(-1_000);
+        assert!(matches!(
+            EconomicPrepared::compose(forged),
+            Err(EconomicError::InvalidRiskDecision)
+        ));
+
+        let mut declined = inputs(&admission, &plan);
+        declined.risk.snapshot.absolute_pnl_bps = BasisPoints(-1_000);
+        declined.risk.decision = RiskDecisionAudit::Blocked {
+            reason: RiskBlock::KillSwitchDrawdown,
+        };
+        assert!(EconomicPrepared::compose(declined).is_ok());
     }
 
     #[test]
