@@ -65,6 +65,7 @@ use tracing::{info, warn};
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
 use crate::live_watchlist::LiveWatchlist;
 use crate::paper_recovery::{MembershipChange, MembershipReason};
+use crate::qualification::{SealedKnockoutEvidence, SealedMembershipEvidence};
 use crate::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
 use crate::supabase_reader;
 use crate::watchlist_admission::AdmissionPreparer;
@@ -254,6 +255,10 @@ pub struct Eviction {
     /// The wallet's real last-trade time (its poll cursor = the inactivity clock) at eviction
     /// (#357); `None` for a never-polled wallet evicted on a non-inactivity trigger.
     pub last_trade_unix: Option<i64>,
+    /// Trailing realized P&L used by an underperformance decision.
+    windowed_pnl: Option<Decimal>,
+    /// Upper confidence bound used by an underperformance decision.
+    upper_cb: Option<Decimal>,
 }
 
 /// Decide whether a single live wallet is knocked out this tick. Pure.
@@ -321,9 +326,40 @@ pub fn decide_evictions(
                 trades_observed: s.map_or(0, |st| st.settled_count),
                 // The poll cursor IS the real last-trade time (#357) — record it for the audit.
                 last_trade_unix: last_ts,
+                windowed_pnl: s.map(|st| st.windowed_pnl),
+                upper_cb: s.and_then(|st| st.upper_cb),
             })
         })
         .collect()
+}
+
+fn sealed_knockout_evidence(
+    eviction: &Eviction,
+    cfg: &MaintenanceConfig,
+    evaluated_at_unix: i64,
+) -> Option<SealedKnockoutEvidence> {
+    match eviction.reason {
+        KnockoutReason::Inactivity => Some(SealedKnockoutEvidence::inactivity(
+            eviction.wallet,
+            evaluated_at_unix,
+            eviction.last_trade_unix?,
+            cfg.inactivity_threshold_secs,
+        )),
+        KnockoutReason::InactivityHardCap => Some(SealedKnockoutEvidence::inactivity_hard_cap(
+            eviction.wallet,
+            evaluated_at_unix,
+            eviction.last_trade_unix?,
+            cfg.inactivity_hard_cap_secs,
+        )),
+        KnockoutReason::Underperformance => Some(SealedKnockoutEvidence::underperformance(
+            eviction.wallet,
+            eviction.trades_observed,
+            cfg.demotion_min_trades,
+            eviction.windowed_pnl?,
+            eviction.upper_cb?,
+        )),
+        KnockoutReason::RankerRotation => None,
+    }
 }
 
 fn planned_admissions(
@@ -716,6 +752,16 @@ async fn maintenance_tick(
                                     "full_rerank: admission preparation failed; keeping membership and batch marker for retry");
                                 return;
                             }
+                            let evidence = match SealedMembershipEvidence::full_rerank(
+                                incoming.entries.clone(),
+                            ) {
+                                Ok(evidence) => evidence,
+                                Err(error) => {
+                                    warn!(%error,
+                                        "full_rerank: membership evidence encoding failed; keeping membership and batch marker for retry");
+                                    return;
+                                }
+                            };
                             let (live_total, dropped) = match apply_full_rerank_swap(
                                 live,
                                 paper_state,
@@ -724,10 +770,7 @@ async fn maintenance_tick(
                                 MembershipPublication {
                                     reason: MembershipReason::FullRerank,
                                     ranking_batch_id: Some(batch_id),
-                                    evidence: serde_json::json!({
-                                        "kind": "full_rerank",
-                                        "replacement_entries": incoming.entries,
-                                    }),
+                                    evidence,
                                 },
                                 applied_capacity,
                                 capacity_epoch,
@@ -908,6 +951,28 @@ async fn maintenance_tick(
         }
     };
 
+    let Some(knockout_evictions) = evictions
+        .iter()
+        .map(|eviction| sealed_knockout_evidence(eviction, cfg, now_unix))
+        .collect::<Option<Vec<_>>>()
+    else {
+        warn!(
+            "maintenance: decided eviction lacks its typed causal statistic; keeping membership and eviction memory"
+        );
+        return;
+    };
+    let evidence = match SealedMembershipEvidence::knockout_backfill(
+        knockout_evictions,
+        candidates.clone(),
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            warn!(%error,
+                "maintenance: knockout evidence encoding failed; keeping membership and eviction memory");
+            return;
+        }
+    };
+
     let live_total = match apply_evictions_and_backfill(
         live,
         paper_state,
@@ -927,14 +992,7 @@ async fn maintenance_tick(
                 .or_else(|| evictions.first().map(|eviction| eviction.reason))
                 .map_or(MembershipReason::KnockoutInactivity, Into::into),
             ranking_batch_id: sync.marker,
-            evidence: serde_json::json!({
-                "kind": "knockout_backfill",
-                "evictions": evictions.iter().map(|eviction| serde_json::json!({
-                    "wallet": eviction.wallet,
-                    "reason": eviction.reason.reason_text(),
-                })).collect::<Vec<_>>(),
-                "replacement_entries": candidates,
-            }),
+            evidence,
         },
         applied_capacity,
         capacity_epoch,
@@ -979,10 +1037,15 @@ async fn maintenance_tick(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use pe_core_types::{BasisPoints, ReconstructionQuality};
+    use pe_trader_index::WatchlistTier;
     use rust_decimal_macros::dec;
+    use tokio::sync::mpsc;
+
+    use crate::orchestrator_control::OrchestratorControl;
 
     fn cfg() -> MaintenanceConfig {
         MaintenanceConfig {
@@ -1015,6 +1078,151 @@ mod tests {
     }
 
     const NOW: i64 = 1_900_000_000;
+
+    fn evidence_entry(wallet: WalletAddress) -> WatchlistEntry {
+        WatchlistEntry {
+            wallet,
+            tier: WatchlistTier::Active,
+            leader_score_bps: BasisPoints::ZERO,
+            lcb_5pct_bps: BasisPoints::ZERO,
+            win_rate_bps: BasisPoints::ZERO,
+            closed_trades_in_window: 0,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        }
+    }
+
+    async fn publish_and_verify(change: MembershipChange, replacements: Vec<WatchlistEntry>) {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("source.log");
+        drop(pe_event_log::Writer::open(&source_log).unwrap());
+        let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let verifier_source_log = source_log.clone();
+        let control = tokio::spawn(async move {
+            let command = control_rx.recv().await.unwrap();
+            let OrchestratorControl::PublishMembership {
+                change,
+                acknowledged,
+                ..
+            } = command
+            else {
+                panic!("membership publisher sent a non-publication command");
+            };
+            let record = change.into_record();
+            let result = crate::qualification::verify_published_membership_change(
+                &record,
+                &verifier_source_log,
+            )
+            .map(|()| pe_event_log::AppendReceipt {
+                sequence: pe_core_types::EventSeq(1),
+                this_hash: blake3::hash(b"membership-round-trip"),
+            })
+            .map_err(|error| error.to_string());
+            acknowledged.send(result).unwrap();
+        });
+        AdmissionPreparer::new(control_tx, paper_state)
+            .publish_membership(change, replacements)
+            .await
+            .unwrap();
+        control.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_rerank_publication_round_trips_membership_verifier() {
+        let (removed, added) = (WalletAddress([1; 20]), WalletAddress([2; 20]));
+        let replacements = vec![evidence_entry(added)];
+        publish_and_verify(
+            MembershipChange {
+                reason: MembershipReason::FullRerank,
+                removed: vec![removed],
+                added: vec![added],
+                capacity: 1,
+                ranking_batch_id: Some(7),
+                evidence: SealedMembershipEvidence::full_rerank(replacements.clone()).unwrap(),
+            },
+            replacements,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn inactivity_publication_round_trips_membership_verifier() {
+        let removed = WalletAddress([5; 20]);
+        publish_and_verify(
+            MembershipChange {
+                reason: MembershipReason::KnockoutInactivity,
+                removed: vec![removed],
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: Some(9),
+                evidence: SealedMembershipEvidence::knockout_backfill(
+                    vec![SealedKnockoutEvidence::inactivity(
+                        removed,
+                        NOW,
+                        NOW - 259_200,
+                        259_200,
+                    )],
+                    Vec::new(),
+                )
+                .unwrap(),
+            },
+            Vec::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn inactivity_hard_cap_publication_round_trips_membership_verifier() {
+        let removed = WalletAddress([6; 20]);
+        publish_and_verify(
+            MembershipChange {
+                reason: MembershipReason::KnockoutInactivityHardCap,
+                removed: vec![removed],
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: Some(10),
+                evidence: SealedMembershipEvidence::knockout_backfill(
+                    vec![SealedKnockoutEvidence::inactivity_hard_cap(
+                        removed,
+                        NOW,
+                        NOW - 604_800,
+                        604_800,
+                    )],
+                    Vec::new(),
+                )
+                .unwrap(),
+            },
+            Vec::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn underperformance_publication_round_trips_membership_verifier() {
+        let removed = WalletAddress([7; 20]);
+        publish_and_verify(
+            MembershipChange {
+                reason: MembershipReason::KnockoutUnderperformance,
+                removed: vec![removed],
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: Some(11),
+                evidence: SealedMembershipEvidence::knockout_backfill(
+                    vec![SealedKnockoutEvidence::underperformance(
+                        removed,
+                        12,
+                        10,
+                        dec!(-2.5),
+                        dec!(-0.1),
+                    )],
+                    Vec::new(),
+                )
+                .unwrap(),
+            },
+            Vec::new(),
+        )
+        .await;
+    }
 
     #[test]
     fn no_stats_idle_under_threshold_is_kept() {
@@ -1298,6 +1506,8 @@ mod tests {
                 .collect();
             let base_url = fake.serve().await;
             let temp = TempDir::new().unwrap();
+            let source_log = temp.path().join("source.log");
+            drop(pe_event_log::Writer::open(&source_log).unwrap());
             let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
             for wallet in history_wallets {
                 paper_state
@@ -1314,6 +1524,7 @@ mod tests {
             let controls: Arc<StdMutex<ControlLog>> = Arc::new(StdMutex::new(Vec::new()));
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
             let fake_paper_state = Arc::clone(&paper_state);
+            let verifier_source_log = source_log.clone();
             std::mem::drop(tokio::spawn(async move {
                 while let Some(message) = control_rx.recv().await {
                     match message {
@@ -1368,6 +1579,15 @@ mod tests {
                             replacements,
                             acknowledged,
                         } => {
+                            if let Err(error) =
+                                crate::qualification::verify_published_membership_change(
+                                    &change.clone().into_record(),
+                                    &verifier_source_log,
+                                )
+                            {
+                                acknowledged.send(Err(error.to_string())).unwrap();
+                                continue;
+                            }
                             let removed = change.removed.into_iter().collect::<HashSet<_>>();
                             control_live.replace(&removed, &replacements, change.capacity);
                             acknowledged
