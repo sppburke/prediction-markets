@@ -18,9 +18,7 @@ use pe_core_types::{
 };
 use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
 use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
-use pe_paper_state::{
-    FillRecord, FillRow, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence,
-};
+use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{EquityInputs, RiskSnapshot, TradingMode, current_equity};
 use pe_source_polymarket_public::PageFetcher;
@@ -46,16 +44,14 @@ use crate::live_watchlist::LiveWatchlist;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
-    LegacyPaperFill, PAPER_LOG_SCHEMA_VERSION_V2, PaperLogRecord, PaperMarkPrice, PortfolioMark,
-    TailBinding,
+    PAPER_LOG_SCHEMA_VERSION_V2, PaperLogFrame, PaperLogRecord, PaperMarkPrice, PortfolioMark,
+    QualificationSealed, SealReason, TailBinding,
 };
 use crate::risk_inputs::{BoundaryMarkError, BoundaryMarkFetcher};
 use crate::runtime_config::{self, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
-use crate::supabase_sink::{SinkHandle, SupabaseFillRow, supabase_fill_from};
-use crate::supabase_state::{
-    AuthoritativeFillOutcome, SupabaseStateClient, commit_fill_authoritative,
-};
+use crate::supabase_sink::SinkHandle;
+use crate::supabase_state::SupabaseStateClient;
 use crate::supabase_state::{
     PreparedFillRequest, PreparedResolutionRequest, SupabaseStateTrait, apply_financial_result,
     reconcile_active_financial_frames, resolution_source_received_at,
@@ -72,9 +68,6 @@ const CLOB_BOOK_HOT_PATH_TIMEOUT_SECS: u64 = 2;
 /// silent log-and-continue). Restart recovery remains the durable backstop.
 const LOCAL_COMMIT_RETRIES: u32 = 3;
 const LOCAL_COMMIT_RETRY_DELAY_MS: u64 = 100;
-
-/// #511 parked-fill retry cadence (frozen v2 retries; matches the poll interval scale).
-const PARKED_RETRY_SECS: u64 = 30;
 
 /// Outcome of the enabled price-impact gate for one admitted signal (#508).
 enum GatePlan {
@@ -184,35 +177,6 @@ struct RollbackCtx {
     enabled: bool,
 }
 
-/// A post-frame fill whose authority commit has not reached a terminal outcome (#511).
-/// Everything needed to retry the FROZEN decision without re-running admission.
-struct ParkedFill {
-    leader: LeaderPositionRow,
-    record: FillRecord,
-    seq: EventSeq,
-    /// `Some` in authoritative mode (the frozen v2 request); `None` in legacy mode
-    /// (the frozen local commit is the terminal protocol).
-    sup_row: Option<SupabaseFillRow>,
-    dispatch_id: Option<String>,
-    filled_key: MarketOutcomeId,
-    decision_evidence: Option<DecisionEvidenceAccumulator>,
-}
-
-/// Terminal-vs-parked result of a paper fill commit (#511).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaperCommitResult {
-    /// Applied (or converged on an existing canonical fill) — mark the contract filled.
-    Filled,
-    /// Authority/settled refusal — terminal typed no-fill; do NOT mark filled.
-    Refused,
-    /// No terminal outcome yet — frozen retry owns the trade (ticker + boot walk).
-    Parked,
-    /// Remote authority committed but the local mirror failed (#544 review):
-    /// financial state is uncertain — the caller fails readiness and stops
-    /// producer intake; the durable frame + idempotent RPC reconverge at boot.
-    DurabilityUncertain,
-}
-
 /// Orchestrator configuration.
 pub struct OrchestratorConfig {
     pub bankroll: Decimal,
@@ -298,24 +262,12 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // Tracks (market, outcome) pairs we already hold a paper position in.
     // Prevents multiple leaders entering the same contract from stacking fills.
     filled_positions: HashSet<MarketOutcomeId>,
-    /// #511 parked post-frame fills: the frame is durable but the authority commit has
-    /// not reached a terminal outcome. Retried on a coarse ticker with the FROZEN
-    /// record via `commit_fill_v2` by idempotency key — never by re-running admission
-    /// (mutable gates would misclassify a redelivery). Keyed by `source_trade_id`
-    /// (1:1 with the signal-derived idempotency key for a given trade). In-memory
-    /// only: across a crash the frozen #510 watermark marks the frames pending and
-    /// the boot frame-walk resolves them.
-    parked: HashMap<SourceTradeId, ParkedFill>,
     // Copy-entry gate: admits only a leader's first-ever BUY entry into a market
     // (#290; price band removed in #339).
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
     control_rx: mpsc::Receiver<OrchestratorControl>,
-    // Best-effort Supabase analytics sink (issue #343). `None` when disabled — and always
-    // `None` in authoritative mode (issue #397), where `run_sink` is not spawned, so the
-    // best-effort `send_fill` below is suppressed automatically.
-    sink: Option<SinkHandle>,
     // Liquidity-at-fill snapshot enqueue handle (issue #350 WS2 PR-H). `None` when capture is
     // disabled. Buy-only; enqueue is non-blocking (drop-on-full), off the trade hot path.
     snapshot_sink: Option<SnapshotHandle>,
@@ -343,6 +295,7 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     pending_boot: VecDeque<IncomingTrade>,
     pending_continuations: HashMap<SourceTradeId, DecisionContinuationV2>,
     financial_log_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    qualification_start: Option<pe_event_log::AppendReceipt>,
     admission_builder: Option<crate::live_venue_adapter::LiveAdmissionBuilder>,
     boundary_mark_fetcher: Option<Arc<BoundaryMarkFetcher>>,
     active_risk_halts: HashSet<(
@@ -379,6 +332,121 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 payload,
             })
             .map_err(|error| error.to_string())
+    }
+
+    fn qualification_seal_reason(
+        started: &crate::paper_recovery::QualificationStarted,
+        proposed_economic_hash: &str,
+        proposed_financial_semantic_version: u32,
+    ) -> Option<SealReason> {
+        crate::qualification::seal_if_semantic_drift(started, proposed_economic_hash).or_else(
+            || {
+                (started.financial_semantic_version != proposed_financial_semantic_version).then(
+                    || {
+                        SealReason::InsufficientEvidence(format!(
+                            "financial semantic version changed from {} to {proposed_financial_semantic_version}",
+                            started.financial_semantic_version
+                        ))
+                    },
+                )
+            },
+        )
+    }
+
+    fn seal_qualification(
+        &mut self,
+        reason: SealReason,
+        sealed_cutoff_unix: i64,
+    ) -> Result<(), String> {
+        let (paper_log_path, source_log_path) = self
+            .financial_log_paths
+            .as_ref()
+            .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
+        let era = crate::paper_recovery::paper_era(
+            crate::paper_recovery::scan_paper_log(paper_log_path)
+                .map_err(|error| error.to_string())?,
+        );
+        let (start_receipt, _) = era
+            .start
+            .as_ref()
+            .ok_or_else(|| "qualification seal has no verified Start".to_owned())?;
+        if era.frames.iter().any(|frame| {
+            matches!(
+                &frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+            )
+        }) {
+            return Ok(());
+        }
+        if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
+            return Err("qualification seal waits for the oldest unmatched Prepared".to_owned());
+        }
+        let start_unix = era
+            .frames
+            .iter()
+            .find(|frame| frame.receipt == *start_receipt)
+            .map(|frame| frame.envelope.received_at.0.unix_timestamp())
+            .ok_or_else(|| "qualification Start receipt is absent from its era".to_owned())?;
+        let mut decisions = self
+            .paper_state
+            .decision_pending_history()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|row| row.source_epoch >= start_unix && row.source_epoch <= sealed_cutoff_unix)
+            .collect::<Vec<_>>();
+        decisions.sort_by(|left, right| {
+            (left.source_epoch, &left.source_trade_id.0)
+                .cmp(&(right.source_epoch, &right.source_trade_id.0))
+        });
+        let decision_keys = decisions
+            .into_iter()
+            .map(|row| (row.source_trade_id, row.semantic_revision))
+            .collect::<Vec<_>>();
+        let decision_evidence = self
+            .paper_state
+            .seal_decision_evidence(&decision_keys)
+            .map_err(|error| error.to_string())?;
+        let source_prefix = Scanner::verify(source_log_path).map_err(|error| error.to_string())?;
+        let financial_prefix =
+            Scanner::verify(paper_log_path).map_err(|error| error.to_string())?;
+        self.append_paper_record(&PaperLogRecord::QualificationSealed(Box::new(
+            QualificationSealed {
+                start_receipt: *start_receipt,
+                source_prefix: TailBinding::from(&source_prefix),
+                financial_prefix: TailBinding::from(&financial_prefix),
+                decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
+                sealed_cutoff_unix,
+                reason,
+            },
+        )))?;
+        Ok(())
+    }
+
+    fn apply_seal_check(
+        &mut self,
+        proposed_economic_hash: &str,
+        proposed_financial_semantic_version: u32,
+    ) -> Result<(), String> {
+        let (paper_log_path, _) = self
+            .financial_log_paths
+            .as_ref()
+            .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
+        let era = crate::paper_recovery::paper_era(
+            crate::paper_recovery::scan_paper_log(paper_log_path)
+                .map_err(|error| error.to_string())?,
+        );
+        let (_, started) = era
+            .start
+            .as_ref()
+            .ok_or_else(|| "qualification seal check has no verified Start".to_owned())?;
+        let Some(reason) = Self::qualification_seal_reason(
+            started,
+            proposed_economic_hash,
+            proposed_financial_semantic_version,
+        ) else {
+            return Ok(());
+        };
+        self.seal_qualification(reason, OffsetDateTime::now_utc().unix_timestamp())
     }
 
     async fn apply_resolution_candidate(
@@ -1158,10 +1226,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 let result = self.mark_at_boundary(cutoff_unix, boundary_receipt).await;
                 let _ = acknowledged.send(result);
             }
-            OrchestratorControl::SealCheck { acknowledged, .. } => {
-                let _ = acknowledged.send(Err(
-                    "seal check requires Lane F's complete QualificationSealed record".to_owned(),
-                ));
+            OrchestratorControl::SealCheck {
+                proposed_economic_hash,
+                proposed_financial_semantic_version,
+                acknowledged,
+            } => {
+                let result = self
+                    .apply_seal_check(&proposed_economic_hash, proposed_financial_semantic_version);
+                let _ = acknowledged.send(result);
             }
         }
     }
@@ -1179,7 +1251,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         health: SharedHealth,
         mid_price_cache: MidPriceCache<F>,
         control_rx: mpsc::Receiver<OrchestratorControl>,
-        sink: Option<SinkHandle>,
+        _sink: Option<SinkHandle>,
         snapshot_sink: Option<SnapshotHandle>,
         supabase_state: Option<SupabaseStateClient>,
         book_fetcher: Arc<B>,
@@ -1195,7 +1267,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             health,
             mid_price_cache,
             control_rx,
-            sink,
+            _sink,
             snapshot_sink,
             supabase_state,
             book_fetcher,
@@ -1217,7 +1289,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         health: SharedHealth,
         mid_price_cache: MidPriceCache<F>,
         control_rx: mpsc::Receiver<OrchestratorControl>,
-        sink: Option<SinkHandle>,
+        _sink: Option<SinkHandle>,
         snapshot_sink: Option<SnapshotHandle>,
         supabase_state: Option<SupabaseStateClient>,
         book_fetcher: Arc<B>,
@@ -1233,7 +1305,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             health,
             mid_price_cache,
             control_rx,
-            sink,
+            _sink,
             snapshot_sink,
             supabase_state,
             book_fetcher,
@@ -1252,7 +1324,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         health: SharedHealth,
         mid_price_cache: MidPriceCache<F>,
         control_rx: mpsc::Receiver<OrchestratorControl>,
-        sink: Option<SinkHandle>,
+        _sink: Option<SinkHandle>,
         snapshot_sink: Option<SnapshotHandle>,
         supabase_state: Option<SupabaseStateClient>,
         book_fetcher: Arc<B>,
@@ -1340,10 +1412,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             max_fill_price: config.max_fill_price,
             min_fill_price: config.min_fill_price,
             filled_positions,
-            parked: HashMap::new(),
             min_quality,
             control_rx,
-            sink,
             snapshot_sink,
             supabase_state,
             runtime_config: config.runtime_config,
@@ -1355,6 +1425,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             pending_boot,
             pending_continuations,
             financial_log_paths: None,
+            qualification_start: None,
             admission_builder: None,
             boundary_mark_fetcher: None,
             active_risk_halts: HashSet::new(),
@@ -1373,6 +1444,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             &paper_log_path,
         )?);
         self.active_risk_halts = crate::paper_recovery::active_risk_halts(&era);
+        self.qualification_start = era.start.as_ref().map(|(receipt, _)| *receipt);
         self.financial_log_paths = Some((paper_log_path, source_log_path));
         self.admission_builder = Some(admission_builder);
         self.boundary_mark_fetcher = Some(boundary_mark_fetcher);
@@ -1458,10 +1530,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
         let mut trades_done = self.trade_rx.is_none();
         let mut control_done = false;
-        // #511 frozen-retry ticker: drives parked post-frame fills to a terminal outcome.
-        let mut parked_tick = tokio::time::interval(Duration::from_secs(PARKED_RETRY_SECS));
-        parked_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         loop {
             if trades_done && control_done {
                 break;
@@ -1480,9 +1548,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         self.handle_trade(trade).await;
                     }
                     break;
-                }
-                _ = parked_tick.tick(), if !self.parked.is_empty() => {
-                    self.retry_parked().await;
                 }
                 result = self.control_rx.recv(), if !control_done => {
                     match result {
@@ -1510,9 +1575,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
     }
 
-    /// Supervised production loop. Once `shutdown` resolves this owner drains both accepted
-    /// input channels and every parked durable continuation before returning. A channel closure
-    /// before coordinated shutdown is a typed critical failure.
+    /// Supervised production loop. Once `shutdown` resolves this owner drains both accepted input
+    /// channels before returning. A channel closure before coordinated shutdown is a typed
+    /// critical failure.
     pub async fn run_coordinated(
         mut self,
         shutdown: impl std::future::Future<Output = ()>,
@@ -1524,23 +1589,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         let mut draining = false;
         let mut trades_done = self.trade_rx.is_none();
         let mut control_done = false;
-        let mut parked_tick = tokio::time::interval(Duration::from_secs(PARKED_RETRY_SECS));
-        parked_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         loop {
             if self.intake_stopped {
                 return Err(OrchestratorRunError::PaperDurabilityUncertain);
             }
-            if draining && trades_done && control_done && self.parked.is_empty() {
+            if draining && trades_done && control_done {
                 return Ok(());
             }
 
             tokio::select! {
                 biased;
                 _ = &mut shutdown, if !draining => draining = true,
-                _ = parked_tick.tick(), if !self.parked.is_empty() => {
-                    self.retry_parked().await;
-                }
                 result = self.control_rx.recv(), if !control_done => {
                     match result {
                         Some(message) => self.apply_control_message(message).await,
@@ -2246,13 +2305,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // Look up wallet in watchlist; skip non-watchlisted wallets.
         let quality = self.quality_for(&watchlist, &trade.wallet);
 
-        // #511: a parked post-frame fill owns this trade — the frozen-retry ticker
-        // resolves it via the authority; a redelivered copy must not re-run admission
-        // (or re-ingest the leader ledger).
-        if self.parked.contains_key(&trade.source_trade_id) {
-            return;
-        }
-
         let (rb, leader_row, signal) = if let Some(continuation) = pending.as_ref() {
             let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
             (
@@ -2399,7 +2451,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     return;
                 }
             },
-            None if self.financial_log_paths.is_some() => {
+            None if self.qualification_start.is_some() => {
                 error!(market = %signal.market_id, "active financial era has no admission builder");
                 self.intake_stopped = true;
                 return;
@@ -2526,7 +2578,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
         let sizing_bankroll = match pending.as_ref() {
             Some(continuation) => continuation.frozen_basis.bankroll,
-            None if self.financial_log_paths.is_some() => match self
+            None if self.qualification_start.is_some() => match self
                 .paper_state
                 .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
             {
@@ -2923,7 +2975,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         self.intake_stopped = true;
                     }
                 }
-                return;
             }
         }
     }
@@ -3144,366 +3195,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
         }
         false
-    }
-
-    /// Commit dedup + leader-ledger mirror + fill accounting, and update the in-memory
-    /// bankroll to the new persisted value (drawdown-aware sizing). Returns `true` when the
-    /// fill committed (the caller then marks the contract filled); `false` only on an
-    /// authoritative fail-closed skip.
-    ///
-    /// Authoritative mode (#397/#511): `commit_fill_v2` first (typed outcome), then one
-    /// local convergence transaction; on RPC failure the FROZEN record is retried bounded
-    /// and then PARKED (#511 — never re-admitted; the ticker + boot frame-walk converge).
-    /// Legacy mode: SQLite authoritative with the same settled-refusal semantics.
-    async fn commit_paper_fill(
-        &mut self,
-        trade: &IncomingTrade,
-        leader: &LeaderPositionRow,
-        fill: &LegacyPaperFill,
-        seq: EventSeq,
-        dispatch_id: Option<&str>,
-        decision_evidence: Option<&DecisionEvidenceAccumulator>,
-    ) -> PaperCommitResult {
-        let record = FillRecord {
-            idempotency_key: fill.intent.idempotency_key.clone(),
-            market_id: fill.intent.market_id.clone(),
-            outcome_id: fill.intent.outcome_id,
-            side: fill.intent.side,
-            contracts: fill.intent.contracts.0,
-            fill_price: fill.simulated_fill_price,
-        };
-        let filled_key =
-            MarketOutcomeId::new(fill.intent.market_id.clone(), fill.intent.outcome_id);
-
-        // Authoritative path (issue #397): Supabase RPC first, then SQLite mirror. The client
-        // and Arc are cloned (cheap) so neither borrows `self` across the `.await`.
-        if self.supabase_state.is_some() {
-            let event_seq = i64::try_from(seq.0).unwrap_or(i64::MAX);
-            let fill_row = FillRow {
-                idempotency_key: record.idempotency_key.clone(),
-                market_id: record.market_id.clone(),
-                outcome_id: record.outcome_id,
-                side: record.side,
-                contracts: record.contracts,
-                fill_price: record.fill_price,
-                event_seq,
-            };
-            // Every Winner-Follow fill is `wf|`-keyed; a non-`wf` key has no leader and cannot
-            // satisfy `paper_fills.leader_wallet` (NOT NULL) — skip it fail-closed.
-            let Some(sup_row) = supabase_fill_from(&fill_row) else {
-                error!(
-                    key = %record.idempotency_key,
-                    "authoritative fill: non-winner-follow key has no leader; skipping (fail-closed)"
-                );
-                return PaperCommitResult::Parked; // frame is durable; boot frame-walk skips it
-            };
-            let parked = ParkedFill {
-                leader: leader.clone(),
-                record: record.clone(),
-                seq,
-                sup_row: Some(sup_row),
-                dispatch_id: dispatch_id.map(str::to_owned),
-                filled_key,
-                decision_evidence: decision_evidence.cloned(),
-            };
-            // Bounded in-process attempts before parking (#508 round-4 posture).
-            let mut result = PaperCommitResult::Parked;
-            for attempt in 1u32..=3 {
-                result = self
-                    .attempt_parked_commit(trade.source_trade_id.clone(), &parked)
-                    .await;
-                if !matches!(result, PaperCommitResult::Parked) {
-                    break;
-                }
-                if attempt < 3 {
-                    tokio::time::sleep(Duration::from_millis(LOCAL_COMMIT_RETRY_DELAY_MS)).await;
-                }
-            }
-            if matches!(result, PaperCommitResult::Parked) {
-                error!(
-                    key = %record.idempotency_key,
-                    seq = seq.0,
-                    "authoritative fill: no terminal outcome after bounded retries; PARKED \
-                     (#511 frozen retry — ticker + boot frame-walk converge; never re-admitted)"
-                );
-                self.parked.insert(trade.source_trade_id.clone(), parked);
-            } else if let PaperCommitResult::Filled = result {
-                // Liquidity-at-fill capture (#350) stays alive in authoritative mode (its
-                // sink is a separate worker, not gated off with `run_sink`).
-                enqueue_if_buy(
-                    self.snapshot_sink.as_ref(),
-                    fill.intent.side,
-                    &fill.intent.idempotency_key,
-                    &fill.intent.market_id,
-                    fill.intent.outcome_id,
-                    OffsetDateTime::now_utc().unix_timestamp(),
-                );
-            }
-            return result;
-        }
-
-        // Legacy path: SQLite authoritative + best-effort Supabase sink mirror. A failed
-        // commit retries in-process (#508 round-4) and finally parks (#511) — the caller
-        // must NOT mark the contract filled on an unacknowledged commit.
-        let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
-            dispatch_id: id,
-            paper_outcome: "fill",
-        });
-        let fill_pending = match render_pending_evidence(
-            decision_evidence,
-            AuthorityEvidence::local("committed"),
-            recorded_fill_terminal(&record, seq),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                error!(%error, trade = %trade.source_trade_id, "encode fill decision evidence failed");
-                return PaperCommitResult::Parked;
-            }
-        };
-        let settled_pending = match render_pending_evidence(
-            decision_evidence,
-            AuthorityEvidence::local("settled_refusal"),
-            TerminalDispositionEvidence::settled_refusal(),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                error!(%error, trade = %trade.source_trade_id, "encode refusal decision evidence failed");
-                return PaperCommitResult::Parked;
-            }
-        };
-        let mut committed = None;
-        for attempt in 1..=LOCAL_COMMIT_RETRIES {
-            match self.paper_state.commit_fill_with_flip_pending(
-                &trade.source_trade_id,
-                leader,
-                &record,
-                seq,
-                flip,
-                fill_pending.as_ref().map(pending_terminal),
-                settled_pending.as_ref().map(pending_terminal),
-            ) {
-                Ok(outcome) => {
-                    committed = Some(outcome);
-                    break;
-                }
-                Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
-                    error!(error = %e, attempt, "paper-state commit_fill failed; retrying in-process");
-                    tokio::time::sleep(Duration::from_millis(LOCAL_COMMIT_RETRY_DELAY_MS)).await;
-                }
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        "paper-state commit_fill failed after in-process retries; PARKED \
-                         (#511 frozen retry via the ticker)"
-                    );
-                }
-            }
-        }
-        match committed {
-            Some(pe_paper_state::FillCommitOutcome::Applied(new_bankroll)) => {
-                self.bankroll = new_bankroll;
-                // Best-effort mirror to Supabase (issue #343). Never blocks the trade path.
-                if let Some(sink) = &self.sink {
-                    sink.send_fill(FillRow {
-                        idempotency_key: record.idempotency_key,
-                        market_id: record.market_id,
-                        outcome_id: record.outcome_id,
-                        side: record.side,
-                        contracts: record.contracts,
-                        fill_price: record.fill_price,
-                        event_seq: i64::try_from(seq.0).unwrap_or(i64::MAX),
-                    });
-                }
-                // Liquidity-at-fill capture (issue #350 WS2 PR-H): enqueue a snapshot request
-                // for BUY fills only, off the hot path. Non-blocking (drop-on-full); `record`
-                // is moved into `FillRow` above, so read the still-borrowed `fill.intent`.
-                enqueue_if_buy(
-                    self.snapshot_sink.as_ref(),
-                    fill.intent.side,
-                    &fill.intent.idempotency_key,
-                    &fill.intent.market_id,
-                    fill.intent.outcome_id,
-                    OffsetDateTime::now_utc().unix_timestamp(),
-                );
-                PaperCommitResult::Filled
-            }
-            Some(pe_paper_state::FillCommitOutcome::RefusedSettled(bankroll)) => {
-                self.bankroll = bankroll;
-                info!(
-                    key = %record.idempotency_key,
-                    market = %record.market_id,
-                    "fill refused: market already settled (terminal no-fill disposition)"
-                );
-                PaperCommitResult::Refused
-            }
-            None => {
-                self.parked.insert(
-                    trade.source_trade_id.clone(),
-                    ParkedFill {
-                        leader: leader.clone(),
-                        record,
-                        seq,
-                        sup_row: None,
-                        dispatch_id: dispatch_id.map(str::to_owned),
-                        filled_key,
-                        decision_evidence: decision_evidence.cloned(),
-                    },
-                );
-                PaperCommitResult::Parked
-            }
-        }
-    }
-
-    /// One bounded attempt to bring a frozen post-frame fill to a terminal outcome via
-    /// the authority (#511). Updates bankroll / filled-positions on success. Returns
-    /// `Parked` when no terminal outcome was reached.
-    async fn attempt_parked_commit(
-        &mut self,
-        source_trade_id: SourceTradeId,
-        parked: &ParkedFill,
-    ) -> PaperCommitResult {
-        let Some(supabase) = self.supabase_state.clone() else {
-            // Legacy: the frozen local commit is the terminal protocol.
-            let flip = parked
-                .dispatch_id
-                .as_deref()
-                .map(|id| pe_paper_state::DispatchFlip {
-                    dispatch_id: id,
-                    paper_outcome: "fill",
-                });
-            let fill_pending = match render_pending_evidence(
-                parked.decision_evidence.as_ref(),
-                AuthorityEvidence::local("committed"),
-                recorded_fill_terminal(&parked.record, parked.seq),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    error!(%error, trade = %source_trade_id, "encode parked fill evidence failed");
-                    return PaperCommitResult::Parked;
-                }
-            };
-            let settled_pending = match render_pending_evidence(
-                parked.decision_evidence.as_ref(),
-                AuthorityEvidence::local("settled_refusal"),
-                TerminalDispositionEvidence::settled_refusal(),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    error!(%error, trade = %source_trade_id, "encode parked refusal evidence failed");
-                    return PaperCommitResult::Parked;
-                }
-            };
-            return match self.paper_state.commit_fill_with_flip_pending(
-                &source_trade_id,
-                &parked.leader,
-                &parked.record,
-                parked.seq,
-                flip,
-                fill_pending.as_ref().map(pending_terminal),
-                settled_pending.as_ref().map(pending_terminal),
-            ) {
-                Ok(pe_paper_state::FillCommitOutcome::Applied(b)) => {
-                    self.bankroll = b;
-                    self.filled_positions.insert(parked.filled_key.clone());
-                    PaperCommitResult::Filled
-                }
-                Ok(pe_paper_state::FillCommitOutcome::RefusedSettled(b)) => {
-                    self.bankroll = b;
-                    PaperCommitResult::Refused
-                }
-                Err(e) => {
-                    error!(error = %e, "parked legacy fill commit failed; will retry");
-                    PaperCommitResult::Parked
-                }
-            };
-        };
-        let Some(sup_row) = parked.sup_row.as_ref() else {
-            // Unreachable: authoritative parks always carry the frozen v2 request.
-            error!("parked authoritative fill without a frozen request; will retry");
-            return PaperCommitResult::Parked;
-        };
-        let paper_state = self.paper_state.clone();
-        let flip = parked
-            .dispatch_id
-            .as_deref()
-            .map(|id| pe_paper_state::DispatchFlip {
-                dispatch_id: id,
-                paper_outcome: "fill",
-            });
-        match commit_fill_authoritative(
-            &supabase,
-            &paper_state,
-            &source_trade_id,
-            &parked.leader,
-            &parked.record,
-            parked.seq,
-            sup_row,
-            flip,
-            parked.decision_evidence.as_ref(),
-        )
-        .await
-        {
-            Ok(AuthoritativeFillOutcome::Filled(bankroll)) => {
-                self.bankroll = bankroll;
-                self.filled_positions.insert(parked.filled_key.clone());
-                PaperCommitResult::Filled
-            }
-            Ok(AuthoritativeFillOutcome::LocalDurabilityUncertain(bankroll)) => {
-                // Remote committed, local did not converge: financial state is
-                // uncertain. Do NOT advance in-memory bankroll/positions past
-                // durable local truth; fail readiness and stop producer intake —
-                // the durable frame + idempotent RPC reconverge at boot (#544).
-                error!(
-                    key = %parked.record.idempotency_key,
-                    market = %parked.record.market_id,
-                    authority_bankroll = %bankroll,
-                    "authoritative fill uncertain: remote committed, local mirror failed; stopping producers"
-                );
-                {
-                    let mut health = self
-                        .health
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    health.paper_durability_uncertain = true;
-                    health.refresh_event_log_writable();
-                }
-                self.intake_stopped = true;
-                PaperCommitResult::DurabilityUncertain
-            }
-            Ok(AuthoritativeFillOutcome::RefusedSettled(bankroll)) => {
-                self.bankroll = bankroll;
-                info!(
-                    key = %parked.record.idempotency_key,
-                    market = %parked.record.market_id,
-                    "fill refused by authority: market already settled (terminal)"
-                );
-                PaperCommitResult::Refused
-            }
-            Err(e) => {
-                warn!(error = %e, key = %parked.record.idempotency_key, "authoritative fill attempt failed");
-                PaperCommitResult::Parked
-            }
-        }
-    }
-
-    /// #511 frozen-retry ticker: drive every parked fill toward a terminal outcome.
-    pub async fn retry_parked(&mut self) {
-        let ids: Vec<SourceTradeId> = self.parked.keys().cloned().collect();
-        for id in ids {
-            let Some(parked) = self.parked.remove(&id) else {
-                continue;
-            };
-            match self.attempt_parked_commit(id.clone(), &parked).await {
-                PaperCommitResult::Parked => {
-                    self.parked.insert(id, parked);
-                }
-                // Uncertainty keeps the frozen obligation: boot reconverges it.
-                PaperCommitResult::DurabilityUncertain => {
-                    self.parked.insert(id, parked);
-                }
-                PaperCommitResult::Filled | PaperCommitResult::Refused => {}
-            }
-        }
     }
 
     fn quality_for(&self, watchlist: &Watchlist, wallet: &WalletAddress) -> ReconstructionQuality {

@@ -124,6 +124,29 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         self
     }
 
+    /// Install a fresh but value-unavailable cache row for a deterministic paper-API scenario.
+    /// This seam is absent from production builds and performs no network I/O.
+    #[cfg(feature = "scenario")]
+    pub async fn seed_unavailable_scenario_price(
+        &self,
+        market_id: MarketId,
+        observed_at: OffsetDateTime,
+        receipt: AppendReceipt,
+    ) {
+        self.inner.lock().await.insert(
+            market_id,
+            CachedEntry {
+                mids: Vec::new(),
+                strict_mids: None,
+                snapshot: MidMarketSnapshot::default(),
+                at: Instant::now(),
+                observed_at,
+                receipt: Some(receipt),
+                conflicting: false,
+            },
+        );
+    }
+
     /// Current mids (per `outcome_id`) for `market_ids`, served from cache within
     /// [`TTL`] and otherwise fetched concurrently through the rate gate. Markets
     /// whose fetch fails or lacks `outcomePrices` are omitted from the result.

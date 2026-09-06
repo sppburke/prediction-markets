@@ -172,6 +172,37 @@ pub struct RiskHaltReleaseHandle {
     control: mpsc::Sender<OrchestratorControl>,
 }
 
+/// Orders the active qualification seal check before an economic proposal is published.
+#[derive(Clone)]
+pub struct QualificationSealHandle {
+    control: mpsc::Sender<OrchestratorControl>,
+}
+
+impl QualificationSealHandle {
+    pub fn new(control: mpsc::Sender<OrchestratorControl>) -> Self {
+        Self { control }
+    }
+
+    pub async fn apply(
+        &self,
+        proposed_economic_hash: String,
+        proposed_financial_semantic_version: u32,
+    ) -> Result<(), String> {
+        let (acknowledged, response) = tokio::sync::oneshot::channel();
+        self.control
+            .send(OrchestratorControl::SealCheck {
+                proposed_economic_hash,
+                proposed_financial_semantic_version,
+                acknowledged,
+            })
+            .await
+            .map_err(|_| "orchestrator control channel closed during seal check".to_owned())?;
+        response
+            .await
+            .map_err(|_| "orchestrator dropped seal-check acknowledgement".to_owned())?
+    }
+}
+
 impl RiskHaltReleaseHandle {
     pub fn new(
         paper_log_path: PathBuf,
@@ -337,6 +368,7 @@ async fn fetch_with_timeout<F: ConfigFetcher>(
 
 /// One bounded poll cycle: fetch, parse, publish ordinary edits, and coalesce a capacity request.
 /// A potentially long capacity transition is never awaited here.
+#[allow(clippy::too_many_arguments)]
 pub async fn poll_once<F: ConfigFetcher>(
     live: &LiveRuntimeConfig,
     status: &RuntimeConfigStatus,
@@ -345,6 +377,7 @@ pub async fn poll_once<F: ConfigFetcher>(
     clob_creds_present: bool,
     era: ConfigEra,
     risk_release: Option<&RiskHaltReleaseHandle>,
+    qualification_seal: Option<&QualificationSealHandle>,
 ) {
     let rows =
         match fetch_with_timeout(fetcher, Duration::from_secs(CONFIG_FETCH_TIMEOUT_SECS)).await {
@@ -381,6 +414,18 @@ pub async fn poll_once<F: ConfigFetcher>(
         }
     };
     let requested_target = parsed.active_watchlist_size;
+
+    if let Some(handle) = qualification_seal
+        && let Err(error) = handle
+            .apply(
+                parsed.canonical_hash(),
+                crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+            )
+            .await
+    {
+        warn!(%error, "qualification seal check was not synchronized; keeping last-known-good config");
+        return;
+    }
 
     if let (Some(handle), Some(release_hash)) =
         (risk_release, partitioned.risk_halt_release_hash.as_deref())
@@ -493,6 +538,7 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     era: ConfigEra,
     health: Option<SharedHealth>,
     risk_release: Option<RiskHaltReleaseHandle>,
+    qualification_seal: Option<QualificationSealHandle>,
 ) -> Result<(), ConfigPollError> {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -510,6 +556,7 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
                     clob_creds_present,
                     era,
                     risk_release.as_ref(),
+                    qualification_seal.as_ref(),
                 ).await;
                 publish_generation_health(health.as_ref(), &capacity_requests, &applied_capacity);
             }
@@ -750,10 +797,70 @@ mod tests {
             false,
             ConfigEra::Financial15,
             None,
+            None,
         )
         .await;
         assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
         assert_eq!(requests.current().target, 100);
+    }
+
+    /// PASS: a financial-era proposal is not published until the orchestrator acknowledges the
+    /// exact economic hash and financial-semantic version carried by `SealCheck`.
+    #[tokio::test]
+    async fn poll_once_seal_check_precedes_config_publication() {
+        let live = LiveRuntimeConfig::new(boot());
+        let status = RuntimeConfigStatus::new(&live.snapshot());
+        let (requests, _rx) = request_channel(100);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let seal = QualificationSealHandle::new(control);
+        let observed = live.clone();
+        let responder = tokio::spawn(async move {
+            let Some(message) = control_rx.recv().await else {
+                return Err("control channel closed before SealCheck");
+            };
+            let OrchestratorControl::SealCheck {
+                proposed_economic_hash,
+                proposed_financial_semantic_version,
+                acknowledged,
+            } = message
+            else {
+                return Err("received another control before SealCheck");
+            };
+            assert_eq!(observed.snapshot().max_fill_price, Decimal::new(85, 2));
+            assert_eq!(
+                proposed_financial_semantic_version,
+                crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION
+            );
+            assert_eq!(
+                proposed_economic_hash,
+                parse_config(
+                    &rows_with("max_fill_price", "0.50"),
+                    &boot(),
+                    false,
+                    ConfigEra::Financial15,
+                )
+                .unwrap()
+                .canonical_hash()
+            );
+            acknowledged
+                .send(Ok(()))
+                .map_err(|_| "seal acknowledgement receiver dropped")?;
+            Ok(())
+        });
+
+        poll_once(
+            &live,
+            &status,
+            &OkFetcher(rows_with("max_fill_price", "0.50")),
+            &requests,
+            false,
+            ConfigEra::Financial15,
+            None,
+            Some(&seal),
+        )
+        .await;
+        assert_eq!(responder.await.unwrap(), Ok(()));
+        assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
     }
 
     #[tokio::test]
@@ -769,6 +876,7 @@ mod tests {
             &requests,
             false,
             ConfigEra::Financial15,
+            None,
             None,
         )
         .await;
@@ -796,6 +904,7 @@ mod tests {
             false,
             ConfigEra::Financial15,
             None,
+            None,
         )
         .await;
         let snapshot = live.snapshot();
@@ -818,6 +927,7 @@ mod tests {
             false,
             ConfigEra::Financial15,
             None,
+            None,
         )
         .await;
         poll_once(
@@ -827,6 +937,7 @@ mod tests {
             &requests,
             false,
             ConfigEra::Financial15,
+            None,
             None,
         )
         .await;
@@ -883,6 +994,7 @@ mod tests {
                 3_600,
                 false,
                 ConfigEra::Financial15,
+                None,
                 None,
                 None,
             )
@@ -1002,6 +1114,7 @@ mod tests {
             3_600,
             false,
             ConfigEra::Financial15,
+            None,
             None,
             None,
         ));

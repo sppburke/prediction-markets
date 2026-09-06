@@ -47,24 +47,60 @@ use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletA
 use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
+use pe_service::orchestrator_control::OrchestratorControl;
+use pe_service::paper_recovery::MembershipReason;
 use pe_service::runtime_config::{
     AppliedWatchlistCapacity, DEFAULT_ACTIVE_WATCHLIST_SIZE, WatchlistCapacityEpoch,
 };
+use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_maintenance::{
-    KnockoutReason, MaintenanceConfig, MembershipMode, apply_evictions_and_backfill,
-    apply_full_rerank_swap, decide_evictions,
+    KnockoutReason, MaintenanceConfig, MembershipMode, MembershipPublication,
+    apply_evictions_and_backfill, apply_full_rerank_swap, decide_evictions,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 fn capacity(target: usize) -> (AppliedWatchlistCapacity, WatchlistCapacityEpoch) {
     let applied = AppliedWatchlistCapacity::new(target);
     let epoch = applied.load();
     (applied, epoch)
+}
+
+fn membership_preparer(live: LiveWatchlist, paper_state: Arc<PaperStateDb>) -> AdmissionPreparer {
+    let (control, mut commands) = mpsc::channel(1);
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            let OrchestratorControl::PublishMembership {
+                change,
+                replacements,
+                acknowledged,
+            } = command
+            else {
+                panic!("membership scenario sent an unrelated control")
+            };
+            let removed = change.removed.into_iter().collect::<HashSet<_>>();
+            live.replace(&removed, &replacements, change.capacity);
+            acknowledged
+                .send(Ok(pe_event_log::AppendReceipt {
+                    sequence: pe_core_types::EventSeq(1),
+                    this_hash: blake3::hash(b"scenario-membership"),
+                }))
+                .unwrap();
+        }
+    });
+    AdmissionPreparer::new(control, paper_state)
+}
+
+fn publication() -> MembershipPublication {
+    MembershipPublication {
+        reason: MembershipReason::CapacityChange,
+        ranking_batch_id: None,
+        evidence: serde_json::json!({"scenario": "membership"}),
+    }
 }
 
 const NOW: i64 = 1_900_000_000;
@@ -372,6 +408,8 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
         &live,
         &db,
         &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
         &applied,
         epoch,
         &HashSet::new(),
@@ -426,6 +464,8 @@ async fn stale_seeded_wallet_no_admission_grace() {
         &live,
         &db,
         &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
         &applied,
         epoch,
         &HashSet::new(),
@@ -504,6 +544,8 @@ async fn writer_mutex_serializes_refresh_and_replace() {
             &live_m,
             &db_m,
             &lock_m,
+            &membership_preparer(live_m.clone(), Arc::clone(&db_m)),
+            publication(),
             &applied_m,
             epoch,
             &removed,
@@ -567,6 +609,8 @@ async fn full_rerank_swap_wholesale() {
         &live,
         &db,
         &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
         &applied,
         epoch,
         &incoming,
@@ -619,10 +663,19 @@ async fn full_rerank_swap_identity_noop() {
     let side: HashMap<WalletAddress, i64> = HashMap::new();
     let (applied, epoch) = capacity(25);
 
-    let (total, dropped) =
-        apply_full_rerank_swap(&live, &db, &lock, &applied, epoch, &incoming, &side)
-            .await
-            .unwrap();
+    let (total, dropped) = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
+        &applied,
+        epoch,
+        &incoming,
+        &side,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(total, 2);
     assert!(dropped.is_empty(), "identity swap must drop nobody");
@@ -662,6 +715,8 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
         &live,
         &db,
         &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
         &grow_capacity,
         grow_epoch,
         &top_100,
@@ -681,6 +736,8 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
         &live,
         &db,
         &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
         &shrink_capacity,
         shrink_epoch,
         &top_75,
@@ -722,9 +779,19 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
         .map(|n| entry(wallet(n), 3_000 - i32::from(n)))
         .collect();
     let side: HashMap<WalletAddress, i64> = HashMap::new();
-    let error = apply_full_rerank_swap(&live, &db, &lock, &applied, stale_50, &top_50, &side)
-        .await
-        .unwrap_err();
+    let error = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
+        &applied,
+        stale_50,
+        &top_50,
+        &side,
+    )
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("stale watchlist capacity plan"));
     assert_eq!(live.snapshot().entries.len(), 100);
 
@@ -733,9 +800,19 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
         generation: 2,
         target: 50,
     });
-    let error = apply_full_rerank_swap(&live, &db, &lock, &applied, stale_50, &top_50, &side)
-        .await
-        .unwrap_err();
+    let error = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
+        &applied,
+        stale_50,
+        &top_50,
+        &side,
+    )
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("stale watchlist capacity plan"));
     assert_eq!(live.snapshot().entries.len(), 100);
     println!("PASS: stale capacity epochs cannot undo newer membership (including ABA)");
@@ -758,6 +835,8 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
         &live,
         &db,
         &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
         &applied,
         epoch,
         &incoming,
@@ -806,6 +885,8 @@ async fn survivor_bench_exhausted_still_evicts_and_shrinks_below_cap() {
         &live,
         &db,
         &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
         &applied,
         epoch,
         &removed,
@@ -853,10 +934,19 @@ async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
     let live = LiveWatchlist::new(watchlist(before));
     let (applied, epoch) = capacity(100);
 
-    let (size, dropped) =
-        apply_full_rerank_swap(&live, &db, &lock, &applied, epoch, &[], &HashMap::new())
-            .await
-            .unwrap();
+    let (size, dropped) = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &membership_preparer(live.clone(), Arc::clone(&db)),
+        publication(),
+        &applied,
+        epoch,
+        &[],
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         size, 0,

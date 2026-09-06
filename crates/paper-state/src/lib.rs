@@ -6652,8 +6652,102 @@ mod tests {
         assert_eq!(settled.fills_for_open_and_7d.len(), 1);
     }
 
+    /// PASS: a resolution committed on a second connection while a snapshot read transaction is
+    /// open cannot expose new cash/version together with old positions (or the inverse).
+    /// FAIL: any field read through the snapshot helpers crosses the transaction boundary.
     #[test]
-    fn financial_protocol_rejects_changed_identity_predecessor_and_start() {
+    fn financial_snapshot_transaction_cannot_split_a_concurrent_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-financial-snapshot.db");
+        let reader = PaperStateDb::open(&path).unwrap();
+        reader.init_bankroll(dec!(10)).unwrap();
+        let start = append_receipt(10, 1);
+        reader.seed_financial_start(start).unwrap();
+        let fill = FinancialFillRecord {
+            idempotency_key: "concurrent-fill".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(1).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(0.5)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        reader
+            .apply_financial_fill(start, None, EventSeq(11), &fill, dec!(9.5))
+            .unwrap();
+        let writer = PaperStateDb::open(&path).unwrap();
+
+        let mut connection = reader.lock();
+        let transaction = connection.transaction().unwrap();
+        let cash = tx_read_bankroll(&transaction).unwrap();
+        let snapshot_start = tx_financial_start(&transaction).unwrap();
+        let last_prepared = tx_financial_last_prepared(&transaction).unwrap();
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            let source = append_receipt(40, 2);
+            let result = writer.apply_financial_resolution(
+                start,
+                Some(EventSeq(11)),
+                EventSeq(12),
+                &market(),
+                "[\"1\",\"0\"]",
+                source,
+                999_999,
+                CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                dec!(10.5),
+            );
+            completed_tx.send(result).unwrap();
+        });
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cash, dec!(9.5));
+        assert_eq!(
+            snapshot_start.map(|value| value.sequence),
+            Some(EventSeq(10))
+        );
+        assert_eq!(last_prepared, Some(EventSeq(11)));
+        assert_eq!(
+            read_financial_positions(&transaction, true).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            read_settlements_window(&transaction, 0, 1_000_000)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            read_financial_fills_window(&transaction, 0, 1_000_000)
+                .unwrap()
+                .len(),
+            1
+        );
+        transaction.commit().unwrap();
+        drop(connection);
+        writer_thread.join().unwrap();
+
+        let after = reader.financial_snapshot(1_000_000).unwrap();
+        assert_eq!(after.cash, dec!(10.5));
+        assert_eq!(after.last_prepared_seq, Some(EventSeq(12)));
+        assert!(after.positions.is_empty());
+        assert_eq!(after.settlements_7d.len(), 1);
+    }
+
+    /// I16-C8-CONFLICT-LOCAL
+    ///
+    /// Preconditions: one exact fill and its resolution have committed under one Start and
+    /// monotonically adjacent Prepared sequences.
+    /// PASS: every immutable fill identity/economic field and every resolution
+    /// condition/payout/time/evidence/era/sequence field conflicts on retry, while exact retries
+    /// remain idempotent.
+    /// FAIL: any changed retry mutates SQLite, changes cash, or is accepted as an existing result.
+    #[test]
+    fn financial_protocol_changed_field_conflict_matrix() {
         let (_dir, db) = db();
         db.init_bankroll(dec!(10)).unwrap();
         let start = append_receipt(1, 1);
@@ -6675,17 +6769,60 @@ mod tests {
         db.apply_financial_fill(start, None, EventSeq(2), &fill, dec!(9.5))
             .unwrap();
         assert!(matches!(
+            db.apply_financial_fill(start, None, EventSeq(2), &fill, dec!(9.5)),
+            Ok(FinancialApplyOutcome::Existing { cash }) if cash == dec!(9.5)
+        ));
+
+        let mut changed_fills = Vec::new();
+        let mut changed = fill.clone();
+        changed.idempotency_key = "different-key".to_owned();
+        changed_fills.push(("idempotency_key", changed));
+        let mut changed = fill.clone();
+        changed.market_id = MarketId(VenueMarketId("different-market".to_owned()));
+        changed_fills.push(("market_id", changed));
+        let mut changed = fill.clone();
+        changed.outcome_id = OutcomeId(1);
+        changed_fills.push(("outcome_id", changed));
+        let mut changed = fill.clone();
+        changed.side = Side::Sell;
+        changed_fills.push(("side", changed));
+        let mut changed = fill.clone();
+        changed.quantity = ShareAmount::from_decimal_exact(dec!(1.000001)).unwrap();
+        changed_fills.push(("quantity", changed));
+        let mut changed = fill.clone();
+        changed.fill_price = Price::new(dec!(0.500001)).unwrap();
+        changed_fills.push(("fill_price", changed));
+        let mut changed = fill.clone();
+        changed.principal = CollateralAmount::from_decimal_exact(dec!(0.500001)).unwrap();
+        changed_fills.push(("principal", changed));
+        let mut changed = fill.clone();
+        changed.fee = CollateralAmount::from_decimal_exact(dec!(0.000001)).unwrap();
+        changed_fills.push(("fee", changed));
+
+        for (field, changed) in changed_fills {
+            assert!(
+                matches!(
+                    db.apply_financial_fill(start, None, EventSeq(2), &changed, dec!(9.5)),
+                    Err(PaperStateError::FinancialConflict(_))
+                ),
+                "changed fill {field} must conflict"
+            );
+        }
+        assert!(matches!(
             db.apply_financial_fill(start, Some(EventSeq(1)), EventSeq(2), &fill, dec!(9.5)),
             Err(PaperStateError::FinancialConflict(_))
         ));
-        let mut changed = fill;
-        changed.fee = CollateralAmount::from_decimal_exact(dec!(0.000001)).unwrap();
         assert!(matches!(
-            db.apply_financial_fill(start, None, EventSeq(2), &changed, dec!(9.5)),
+            db.apply_financial_fill(start, Some(EventSeq(2)), EventSeq(3), &fill, dec!(9.5)),
             Err(PaperStateError::FinancialConflict(_))
         ));
         assert!(matches!(
-            db.seed_financial_start(append_receipt(3, 3)),
+            db.apply_financial_fill(start, None, EventSeq(2), &fill, dec!(9.500001)),
+            Err(PaperStateError::FinancialConflict(_))
+        ));
+        let other_start = append_receipt(3, 3);
+        assert!(matches!(
+            db.apply_financial_fill(other_start, None, EventSeq(2), &fill, dec!(9.5)),
             Err(PaperStateError::FinancialStartConflict)
         ));
 
@@ -6706,7 +6843,7 @@ mod tests {
         assert!(matches!(
             db.apply_financial_resolution(
                 start,
-                None,
+                Some(EventSeq(2)),
                 EventSeq(3),
                 &market(),
                 "[\"0.5\",\"0.5\"]",
@@ -6715,8 +6852,155 @@ mod tests {
                 credit,
                 dec!(10),
             ),
-            Err(PaperStateError::FinancialConflict(_))
+            Ok(FinancialApplyOutcome::Existing { cash }) if cash == dec!(10)
         ));
+
+        let resolution_retries = [
+            (
+                "condition",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                MarketId(VenueMarketId("different-market".to_owned())),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "payout",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"1\",\"0\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "source_receipt",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                append_receipt(9, 5),
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "settled_at_unix",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                5,
+                credit,
+                dec!(10),
+            ),
+            (
+                "credit",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                CollateralAmount::from_decimal_exact(dec!(0.500001)).unwrap(),
+                dec!(10),
+            ),
+            (
+                "canonical_cash",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10.000001),
+            ),
+            (
+                "era",
+                other_start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "prior_sequence",
+                start,
+                None,
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "prepared_sequence",
+                start,
+                Some(EventSeq(3)),
+                EventSeq(4),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+        ];
+        for (
+            field,
+            retry_start,
+            prior,
+            prepared,
+            condition,
+            payout,
+            retry_source,
+            settled_at,
+            retry_credit,
+            cash,
+        ) in resolution_retries
+        {
+            assert!(
+                matches!(
+                    db.apply_financial_resolution(
+                        retry_start,
+                        prior,
+                        prepared,
+                        &condition,
+                        payout,
+                        retry_source,
+                        settled_at,
+                        retry_credit,
+                        cash,
+                    ),
+                    Err(PaperStateError::FinancialConflict(_)
+                        | PaperStateError::FinancialStartConflict)
+                ),
+                "changed resolution {field} must conflict"
+            );
+        }
+        let snapshot = db.financial_snapshot(10).unwrap();
+        assert_eq!(snapshot.cash, dec!(10));
+        assert_eq!(snapshot.last_prepared_seq, Some(EventSeq(3)));
+        assert_eq!(snapshot.settlements_7d.len(), 1);
     }
 
     #[test]

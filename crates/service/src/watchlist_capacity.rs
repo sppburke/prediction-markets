@@ -17,11 +17,13 @@ use tracing::info;
 
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
+use crate::paper_recovery::MembershipReason;
 use crate::runtime_config::AppliedWatchlistCapacity;
 use crate::supabase_reader::{self, SupabaseError};
 use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use crate::watchlist_maintenance::{
-    MembershipApplyError, apply_ranked_membership_locked, ranked_membership_change,
+    MembershipApplyError, MembershipPublication, apply_ranked_membership_locked,
+    ranked_membership_change,
 };
 
 /// Failure surface for one capacity transition. Every variant is fail-soft to the caller.
@@ -128,10 +130,21 @@ impl SupabaseWatchlistCapacity {
         let (actual, dropped) = apply_ranked_membership_locked(
             &self.live,
             &self.paper_state,
+            &self.preparer,
+            MembershipPublication {
+                reason: MembershipReason::CapacityChange,
+                ranking_batch_id: None,
+                evidence: serde_json::json!({
+                    "kind": "capacity_change",
+                    "generation": request.generation,
+                    "replacement_entries": incoming.entries,
+                }),
+            },
             &incoming.entries,
             &incoming_last_trade,
             target,
-        )?;
+        )
+        .await?;
         self.applied_capacity.store(request);
         drop(_writer);
 
@@ -321,26 +334,42 @@ mod tests {
             tokio::spawn(async move {
                 let mut attempts = 0;
                 while let Some(command) = control_rx.recv().await {
-                    let OrchestratorControl::PrepareAdmissions {
-                        wallets,
-                        acknowledged,
-                    } = command
-                    else {
-                        panic!("capacity transition sent an activity bucket")
-                    };
-                    let mut wallets = wallets;
-                    wallets.sort_unstable_by_key(|w| w.0);
-                    fake_install_anchors(&fake_paper_state, &wallets, 1_700_000_100);
-                    prepared_sets
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(wallets);
-                    attempts += 1;
-                    if attempts == 1 {
-                        let removed: HashSet<WalletAddress> = [departing].into_iter().collect();
-                        live.replace(&removed, &[], 2);
+                    match command {
+                        OrchestratorControl::PrepareAdmissions {
+                            wallets,
+                            acknowledged,
+                        } => {
+                            let mut wallets = wallets;
+                            wallets.sort_unstable_by_key(|w| w.0);
+                            fake_install_anchors(&fake_paper_state, &wallets, 1_700_000_100);
+                            prepared_sets
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(wallets);
+                            attempts += 1;
+                            if attempts == 1 {
+                                let removed: HashSet<WalletAddress> =
+                                    [departing].into_iter().collect();
+                                live.replace(&removed, &[], 2);
+                            }
+                            acknowledged.send(()).unwrap();
+                        }
+                        OrchestratorControl::PublishMembership {
+                            change,
+                            replacements,
+                            acknowledged,
+                        } => {
+                            let removed = change.removed.into_iter().collect::<HashSet<_>>();
+                            live.replace(&removed, &replacements, change.capacity);
+                            acknowledged
+                                .send(Ok(pe_event_log::AppendReceipt {
+                                    sequence: pe_core_types::EventSeq(1),
+                                    this_hash: blake3::hash(b"test-capacity"),
+                                }))
+                                .unwrap();
+                        }
+                        _ => panic!("capacity transition sent an unrelated control"),
                     }
-                    acknowledged.send(()).unwrap();
                 }
             })
         };
@@ -479,8 +508,21 @@ mod tests {
                 | OrchestratorControl::CaptureAdmissionLedger { .. } => {
                     panic!("legacy admission test sent a causal-bracket command")
                 }
+                OrchestratorControl::PublishMembership {
+                    change,
+                    replacements,
+                    acknowledged,
+                } => {
+                    let removed = change.removed.into_iter().collect::<HashSet<_>>();
+                    live_at_control.replace(&removed, &replacements, change.capacity);
+                    acknowledged
+                        .send(Ok(pe_event_log::AppendReceipt {
+                            sequence: pe_core_types::EventSeq(1),
+                            this_hash: blake3::hash(b"test-capacity"),
+                        }))
+                        .unwrap();
+                }
                 OrchestratorControl::ResolutionCandidate { .. }
-                | OrchestratorControl::PublishMembership { .. }
                 | OrchestratorControl::RiskHaltChange { .. }
                 | OrchestratorControl::DailyBoundary { .. }
                 | OrchestratorControl::SealCheck { .. } => {

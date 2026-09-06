@@ -64,6 +64,7 @@ use tracing::{info, warn};
 
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
 use crate::live_watchlist::LiveWatchlist;
+use crate::paper_recovery::{MembershipChange, MembershipReason};
 use crate::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
 use crate::supabase_reader;
 use crate::watchlist_admission::AdmissionPreparer;
@@ -143,6 +144,17 @@ pub enum MembershipApplyError {
     IncompleteHistory { wallet: WalletAddress },
     #[error("newly admitted wallet {wallet} lacks a current causal position validation")]
     UnvalidatedPosition { wallet: WalletAddress },
+    #[error("publish synchronized membership: {0}")]
+    Publication(String),
+}
+
+/// Durable context for one structural publication. Exact removed/added sets and capacity are
+/// derived under the writer lock immediately before the orchestrator handoff.
+#[derive(Debug, Clone)]
+pub struct MembershipPublication {
+    pub reason: MembershipReason,
+    pub ranking_batch_id: Option<i64>,
+    pub evidence: serde_json::Value,
 }
 
 fn remove_loaded_fences(
@@ -395,6 +407,8 @@ pub async fn apply_evictions_and_backfill(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
     writer_lock: &Mutex<()>,
+    publisher: &AdmissionPreparer,
+    publication: MembershipPublication,
     applied_capacity: &AppliedWatchlistCapacity,
     expected_capacity: WatchlistCapacityEpoch,
     removed: &HashSet<WalletAddress>,
@@ -414,21 +428,51 @@ pub async fn apply_evictions_and_backfill(
         candidates,
         expected_capacity.target,
     );
+    let current_wallets = current
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    let mut actual_removed = removed
+        .iter()
+        .filter(|wallet| current_wallets.contains(wallet))
+        .copied()
+        .collect::<Vec<_>>();
+    actual_removed.sort_unstable_by_key(|wallet| wallet.0);
+    if actual_removed.is_empty() && admissions.is_empty() {
+        return Ok(current.entries.len());
+    }
     recheck_admissions(paper_state, &admissions)?;
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
     // #511: insert-only — an existing (possibly HELD) delivery cursor is already a valid
     // lower bound and must never be jumped by a re-admission seed; activity MAX-seeds.
     paper_state.seed_cursors_if_absent(&seeds)?;
-    Ok(live.replace(removed, candidates, expected_capacity.target))
+    publisher
+        .publish_membership(
+            MembershipChange {
+                reason: publication.reason,
+                removed: actual_removed,
+                added: admissions,
+                capacity: expected_capacity.target,
+                ranking_batch_id: publication.ranking_batch_id,
+                evidence: publication.evidence,
+            },
+            candidates.to_vec(),
+        )
+        .await
+        .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
+    Ok(live.snapshot().entries.len())
 }
 
 /// Apply an exact ranked membership while the caller holds the structural-writer mutex.
 ///
 /// Used by both same-cap full reranks and runtime capacity transitions. Cursor persistence is a
 /// fail-closed prerequisite to ArcSwap publication.
-pub(crate) fn apply_ranked_membership_locked(
+pub(crate) async fn apply_ranked_membership_locked(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
+    publisher: &AdmissionPreparer,
+    publication: MembershipPublication,
     incoming: &[WatchlistEntry],
     incoming_last_trade: &HashMap<WalletAddress, i64>,
     cap: usize,
@@ -436,21 +480,43 @@ pub(crate) fn apply_ranked_membership_locked(
     remove_loaded_fences(live, paper_state)?;
     let current = live.snapshot();
     let (dropped, admissions) = ranked_membership_change(&current.entries, incoming, cap);
-    let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
+    if dropped.is_empty()
+        && admissions.is_empty()
+        && publication.reason != MembershipReason::CapacityChange
+    {
+        return Ok((current.entries.len(), dropped));
+    }
     recheck_admissions(paper_state, &admissions)?;
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
     // #511: insert-only (see membership admission above).
     paper_state.seed_cursors_if_absent(&seeds)?;
-    let total = live.replace(&removed, incoming, cap);
+    publisher
+        .publish_membership(
+            MembershipChange {
+                reason: publication.reason,
+                removed: dropped.clone(),
+                added: admissions,
+                capacity: cap,
+                ranking_batch_id: publication.ranking_batch_id,
+                evidence: publication.evidence,
+            },
+            incoming.to_vec(),
+        )
+        .await
+        .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
+    let total = live.snapshot().entries.len();
     Ok((total, dropped))
 }
 
 /// Wholesale membership rotation for [`MembershipMode::FullRerank`]. The operation is rejected
 /// if network work was planned against an applied capacity epoch that is no longer current.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_full_rerank_swap(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
     writer_lock: &Mutex<()>,
+    publisher: &AdmissionPreparer,
+    publication: MembershipPublication,
     applied_capacity: &AppliedWatchlistCapacity,
     expected_capacity: WatchlistCapacityEpoch,
     incoming: &[WatchlistEntry],
@@ -464,10 +530,13 @@ pub async fn apply_full_rerank_swap(
     apply_ranked_membership_locked(
         live,
         paper_state,
+        publisher,
+        publication,
         incoming,
         incoming_last_trade,
         expected_capacity.target,
     )
+    .await
 }
 
 /// Cross-tick ranking-batch memory.
@@ -651,6 +720,15 @@ async fn maintenance_tick(
                                 live,
                                 paper_state,
                                 writer_lock,
+                                preparer,
+                                MembershipPublication {
+                                    reason: MembershipReason::FullRerank,
+                                    ranking_batch_id: Some(batch_id),
+                                    evidence: serde_json::json!({
+                                        "kind": "full_rerank",
+                                        "replacement_entries": incoming.entries,
+                                    }),
+                                },
                                 applied_capacity,
                                 capacity_epoch,
                                 &incoming.entries,
@@ -834,6 +912,30 @@ async fn maintenance_tick(
         live,
         paper_state,
         writer_lock,
+        preparer,
+        MembershipPublication {
+            reason: evictions
+                .iter()
+                .map(|eviction| eviction.reason)
+                .find(|reason| *reason == KnockoutReason::Underperformance)
+                .or_else(|| {
+                    evictions
+                        .iter()
+                        .map(|eviction| eviction.reason)
+                        .find(|reason| *reason == KnockoutReason::InactivityHardCap)
+                })
+                .or_else(|| evictions.first().map(|eviction| eviction.reason))
+                .map_or(MembershipReason::KnockoutInactivity, Into::into),
+            ranking_batch_id: sync.marker,
+            evidence: serde_json::json!({
+                "kind": "knockout_backfill",
+                "evictions": evictions.iter().map(|eviction| serde_json::json!({
+                    "wallet": eviction.wallet,
+                    "reason": eviction.reason.reason_text(),
+                })).collect::<Vec<_>>(),
+                "replacement_entries": candidates,
+            }),
+        },
         applied_capacity,
         capacity_epoch,
         &removed,
@@ -1261,8 +1363,21 @@ mod tests {
                         | OrchestratorControl::CaptureAdmissionLedger { .. } => {
                             panic!("legacy admission test sent a causal-bracket command")
                         }
+                        OrchestratorControl::PublishMembership {
+                            change,
+                            replacements,
+                            acknowledged,
+                        } => {
+                            let removed = change.removed.into_iter().collect::<HashSet<_>>();
+                            control_live.replace(&removed, &replacements, change.capacity);
+                            acknowledged
+                                .send(Ok(pe_event_log::AppendReceipt {
+                                    sequence: pe_core_types::EventSeq(1),
+                                    this_hash: blake3::hash(b"test-membership"),
+                                }))
+                                .unwrap();
+                        }
                         OrchestratorControl::ResolutionCandidate { .. }
-                        | OrchestratorControl::PublishMembership { .. }
                         | OrchestratorControl::RiskHaltChange { .. }
                         | OrchestratorControl::DailyBoundary { .. }
                         | OrchestratorControl::SealCheck { .. } => {

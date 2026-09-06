@@ -86,7 +86,8 @@ pub enum OrchestratorControl {
     },
     /// Qualification seal producer handoff. Lane F owns the verifier semantics.
     SealCheck {
-        proposed_hash: String,
+        proposed_economic_hash: String,
+        proposed_financial_semantic_version: u32,
         acknowledged: oneshot::Sender<Result<(), String>>,
     },
 }
