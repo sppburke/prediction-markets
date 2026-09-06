@@ -291,8 +291,12 @@ The `PerTradeCap` enum is retained for backtest/research and as the safe boot po
 | `Unlimited` | 10 000 bps (full bankroll) | **Production (#508)**; backtest Kelly-fraction study |
 
 The service completes and validates the mandatory Supabase hot snapshot before any producer starts.
-There is no configuration-outage producer posture: production applies the reviewed
-`per_trade_cap=unlimited` together with the mandatory impact cap, or boot fails closed.
+There is no configuration-outage producer posture: the one-time #544 activation boot requires the
+reviewed `per_trade_cap=unlimited` together with the mandatory impact cap, or boot fails closed.
+After activation an ordinary boot or hot poll accepts any valid `per_trade_cap` row
+(`unlimited`, `mode_default`, or `bps:1..=10000`); the resolved cap is recorded in every live risk
+snapshot and strict replay reuses that recorded value (#545), so a later edit never makes an
+earlier admission unreplayable.
 
 The venue planner alone evaluates the requested allocation against the current ask ladder, venue
 minimum, and resolved monetary bounds. It returns `InsufficientDepth` when the complete request cannot
