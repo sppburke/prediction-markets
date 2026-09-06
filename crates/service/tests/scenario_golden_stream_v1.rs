@@ -29,7 +29,7 @@ use pe_execution_core::{
     LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
     LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared, RiskDecisionAudit,
 };
-use pe_paper_state::{DecisionPendingState, PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
@@ -950,6 +950,18 @@ fn rewrite_state_receipts(
     }
 }
 
+/// Snapshot the write-ahead-log state database; a raw file copy drops frames still in the log.
+fn clone_state(state_path: &std::path::Path, destination: &std::path::Path) {
+    let source = rusqlite::Connection::open_with_flags(
+        state_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    source
+        .execute("VACUUM INTO ?1", [destination.to_str().unwrap()])
+        .unwrap();
+}
+
 fn decision_evidence_digest(paper_path: &std::path::Path, state_path: &std::path::Path) -> String {
     let era = paper_era(scan_paper_log(paper_path).unwrap());
     let (_, start) = era.start.as_ref().unwrap();
@@ -964,11 +976,10 @@ fn decision_evidence_digest(paper_path: &std::path::Path, state_path: &std::path
         })
         .unwrap();
     let state = PaperStateDb::open(state_path).unwrap();
-    // Only terminal documents are seal evidence; the post-seal fixture row is still open.
-    let rows = state.decision_pending_history().unwrap();
-    let keys = rows
+    let keys = state
+        .decision_pending_history()
+        .unwrap()
         .into_iter()
-        .filter(|row| row.state == DecisionPendingState::Terminal)
         .map(|row| (row.source_trade_id, row.semantic_revision))
         .collect::<Vec<_>>();
     let evidence = state
@@ -1050,7 +1061,7 @@ fn assert_source_preimage_rejected(
     let cloned_paper = case.join("paper.log");
     let cloned_state = case.join("paper.db");
     let cloned_live = case.join("live_journal.log");
-    std::fs::copy(state_path, &cloned_state).unwrap();
+    clone_state(state_path, &cloned_state);
     std::fs::copy(live_path, &cloned_live).unwrap();
     let source = rewrite_source_preimage(source_path, &cloned_source, target, mutation);
     let (_, paper_receipts, paper_prefixes) =
@@ -1098,7 +1109,7 @@ fn assert_decision_preimage_rejected(
     let cloned_live = case.join("live_journal.log");
     std::fs::copy(source_path, &cloned_source).unwrap();
     std::fs::copy(paper_path, &cloned_paper).unwrap();
-    std::fs::copy(state_path, &cloned_state).unwrap();
+    clone_state(state_path, &cloned_state);
     std::fs::copy(live_path, &cloned_live).unwrap();
     let connection = rusqlite::Connection::open(&cloned_state).unwrap();
     let expected_reason = match mutation {
@@ -1229,7 +1240,7 @@ fn assert_live_wrapper_preimage_rejected(
     let cloned_live = case.join("live_journal.log");
     std::fs::copy(source_path, &cloned_source).unwrap();
     std::fs::copy(paper_path, &cloned_paper).unwrap();
-    std::fs::copy(state_path, &cloned_state).unwrap();
+    clone_state(state_path, &cloned_state);
     rewrite_live_wrapper_preimage(live_path, &cloned_live, mutation);
     let expected_reason = match mutation {
         PreimageMutation::Delete => {
