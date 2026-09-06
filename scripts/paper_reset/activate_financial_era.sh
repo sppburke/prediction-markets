@@ -13,7 +13,7 @@ usage() {
   echo "usage: $0 --target-binary PATH --target-config PATH --target-environment PATH \
 --paper-log PATH --source-log PATH --live-journal PATH --paper-state PATH \
 --fresh-bankroll DECIMAL --rehearsal-evidence PATH \
---ranking-batch-id ID --policy-hash HASH --membership-json PATH \
+--ranking-batch-id ID --membership-json PATH \
 [--rollback-before-start] [--simulate-crash-after BOUNDARY]" >&2
   exit 2
 }
@@ -22,7 +22,7 @@ target_binary= target_config= target_environment=
 paper_log= source_log= live_journal= paper_state=
 fresh_bankroll= artifact_blake3= ranking_batch_id=
 target_revision=
-policy_hash= membership_json= rehearsal_evidence=
+membership_json= rehearsal_evidence=
 rollback_before_start=false
 while (($#)); do
   case "$1" in
@@ -36,7 +36,6 @@ while (($#)); do
     --fresh-bankroll) [[ $# -ge 2 ]] || usage; fresh_bankroll=$2; shift 2 ;;
     --rehearsal-evidence) [[ $# -ge 2 ]] || usage; rehearsal_evidence=$2; shift 2 ;;
     --ranking-batch-id) [[ $# -ge 2 ]] || usage; ranking_batch_id=$2; shift 2 ;;
-    --policy-hash) [[ $# -ge 2 ]] || usage; policy_hash=$2; shift 2 ;;
     --membership-json) [[ $# -ge 2 ]] || usage; membership_json=$2; shift 2 ;;
     --rollback-before-start) rollback_before_start=true; shift ;;
     --simulate-crash-after) [[ $# -ge 2 ]] || usage; SIMULATE_CRASH_AFTER=$2; shift 2 ;;
@@ -45,12 +44,11 @@ while (($#)); do
 done
 
 for value in target_binary target_config target_environment paper_log source_log live_journal \
-  paper_state fresh_bankroll rehearsal_evidence ranking_batch_id policy_hash membership_json; do
+  paper_state fresh_bankroll rehearsal_evidence ranking_batch_id membership_json; do
   [[ -n "${!value}" ]] || usage
 done
 [[ "$fresh_bankroll" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "fresh bankroll must be an exact non-negative six-decimal value"
 [[ "$ranking_batch_id" =~ ^[0-9]+$ ]] || die "invalid ranking batch id"
-[[ "$policy_hash" =~ ^[0-9a-f]{64}$ ]] || die "invalid policy hash"
 [[ -f "$target_binary" && -f "$target_config" && -f "$target_environment" ]] ||
   die "one or more reviewed target artifacts are absent"
 [[ -f "$membership_json" ]] || die "membership JSON is absent"
@@ -509,7 +507,7 @@ if [[ ! -f "$MANIFEST" ]]; then
   target_environment_json=$(file_identity_json "$target_environment")
   initial=$(python3 -c 'import decimal,json,sys,time
 (activation,generation,generation_commit,generation_bankroll,generation_source,generation_history,
- bankroll,revision,artifact,static,batch,policy,members_path,
+ bankroll,revision,artifact,static,batch,members_path,
  paper,source,live,state,old_binary,old_config,old_env,target_binary,target_config,target_env,rehearsal)=sys.argv[1:]
 amount=decimal.Decimal(bankroll)
 atomic=amount*decimal.Decimal(1000000)
@@ -522,7 +520,7 @@ value={
  "generation_source_v1_main":json.loads(generation_source),
  "generation_legacy_history":json.loads(generation_history),
  "fresh_bankroll":int(atomic),"target_revision":revision,"artifact_blake3":artifact,"static_config_hash":static,
- "ranking_batch_id":int(batch),"policy_hash":policy,"membership":members,
+ "ranking_batch_id":int(batch),"membership":members,
  "schema_version":3,"parser_version":1,"financial_semantic_version":1,
  "start_unix":int(time.time()),"paths":{"paper_log":paper,"source_log":source,"live_journal":live,"paper_state":state},
  "old_artifact_sha256":json.loads(old_binary)["sha256"],"target_artifact_sha256":json.loads(target_binary)["sha256"],
@@ -533,7 +531,7 @@ print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
     "$activation_id" "$generation" "$generation_merge_commit" "$generation_bankroll" \
     "$generation_source_v1_main" "$generation_legacy_history" \
     "$fresh_bankroll" "$target_revision" \
-    "$artifact_blake3" "$static_config_hash" "$ranking_batch_id" "$policy_hash" "$membership_json" \
+    "$artifact_blake3" "$static_config_hash" "$ranking_batch_id" "$membership_json" \
     "$paper_log" "$source_log" "$live_journal" "$paper_state" \
     "$old_binary" "$old_config" "$old_environment" "$target_binary_json" \
     "$target_config_json" "$target_environment_json" "$rehearsal_evidence_json") || die "construct financial-era manifest"
@@ -563,8 +561,7 @@ if manifest.get("generation_legacy_history") != json.loads(sys.argv[3]): raise S
    "$paper_state" == "$(manifest_get paths.paper_state)" ]] || die "financial-era durable paths changed"
 [[ "$artifact_blake3" == "$(manifest_get artifact_blake3)" &&
    "$static_config_hash" == "$(manifest_get static_config_hash)" &&
-   "$ranking_batch_id" == "$(manifest_get ranking_batch_id)" &&
-   "$policy_hash" == "$(manifest_get policy_hash)" ]] ||
+   "$ranking_batch_id" == "$(manifest_get ranking_batch_id)" ]] ||
   die "financial-era evidence identity changed"
 ranking_identity="batch:$ranking_batch_id"
 python3 -c 'import decimal,json,sys

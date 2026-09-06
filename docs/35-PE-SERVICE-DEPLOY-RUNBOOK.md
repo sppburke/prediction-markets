@@ -344,7 +344,6 @@ SUPABASE_DB_URL=<session-pooler-url> \
   --fresh-bankroll <amount> \
   --rehearsal-evidence <rehearsal-evidence-json> \
   --ranking-batch-id <id> \
-  --policy-hash <64-lowercase-hex-policy-hash> \
   --membership-json <canonical-membership-array.json>
 ```
 
@@ -363,15 +362,15 @@ argv), and the Rust prepare owner parses them as `ConfigEra::Financial15` and ca
 the exact manifest membership array plus each member's current complete-history, coverage, latest
 position-anchor, and position-validation records. Missing or inconsistent evidence fails prepare.
 
-There is no durable activation policy artifact in the current repository: `policy_hash` is therefore
-the one remaining caller assertion and must be exactly 64 lowercase hexadecimal characters. It is
-preserved in `QualificationStarted` for a future artifact owner; do not substitute a policy name or
-free-form label.
+There is no durable activation policy artifact in the current repository, so Start carries no
+separate policy identity. `QualificationStarted` binds the reviewed artifact, effective static
+configuration, Rust-derived hot configuration, generation and activation, ranking batch, fresh
+bankroll, membership and its proofs, and schema, parser, and financial-semantic model versions.
 
 The exact resumable forward order is `rehearsal PASS → prepared → guarded → started → verified`.
 Creating `prepared` records the verified #557 identity and source/history evidence; the independently
-reviewed target identities; durable paths; ranking/membership inputs; the validated policy assertion;
-fresh bankroll; and every rehearsal binding named above without changing service or financial state.
+reviewed target identities; durable paths; ranking/membership inputs; fresh bankroll; and every
+rehearsal binding named above without changing service or financial state.
 Before any stop intent, the `prepared → guarded` transition rereads the bound evidence JSON and result
 manifest, verifies the recorded hash, requires PASS, and requires the activation/generation,
 copied-state/readiness, reviewed config/environment, revision, embedded BLAKE3 identity, and binary
