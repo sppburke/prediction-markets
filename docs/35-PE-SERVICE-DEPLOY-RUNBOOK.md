@@ -329,37 +329,41 @@ Path and cadence overrides are environment variables, not flags:
 `PE_REHEARSAL_POLL_SECS`, and `PE_REHEARSAL_EVIDENCE_HASH_FILE`.
 
 The four concurrent observers are the status-file poller, reader-drop classifier, fence/anchor
-census, and write-refusal counter. Each decision pass also queries the staged process's real
-`/health/ready` endpoint at the dedicated loopback bind and requires HTTP success plus
+census, and write-refusal counter. A fifth, privileged account observer runs synchronously before
+the child starts and again after it has exited. Each decision pass also queries the staged process's
+real `/health/ready` endpoint at the dedicated loopback bind and requires HTTP success plus
 `ready: true` with no reported issues (the empty `issues` field may be omitted); status freshness
 and critical-task assertions remain independent requirements. Before the publishable-only child is
 started, the descriptor-fed privileged preflight queries `accounts` once and emits its canonical
-C-ordered count and SHA-256 receipt. The child still receives no service-role credential. Its fresh
-status must contain `live`, report `stale: false`, and list exactly the same uniquely identified
-account rows with requested/effective modes `off` and `armed: false`; absent, stale, empty when the
-census is nonempty, armed/`live_tiny`, or count/digest-mismatched evidence fails immediately. The
-run stops at the first complete
-same-invocation proof, the first unsafe
-observation, process exit, or its bound. PASS requires the reviewed revision, a complete ordinary
-poll after start, successful re-anchor, real readiness, healthy critical owners, accounts off and
-unarmed, and no credit loss, unexpected fence/error, or successful database write. Immediately before
-PASS, the harness synchronously rescans one exact complete service-log prefix and queries the current
-anchor/reanchor/fence database observation. The result binds that prefix's byte length and SHA-256
-plus the database values; unsafe evidence arriving while readiness is in flight therefore fails the
-same invocation. The harness prints
-`REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
+C-ordered count and SHA-256 receipt after proving unique account IDs and requested/effective modes
+of `off` on every row. The child still receives no service-role credential. Consequently, its fresh
+status must contain the authorization-denied `live` shape: `stale: true` and an empty `accounts`
+list. Any other child shape fails the rehearsal because it is evidence that a privileged credential
+reached the child; the child snapshot is not compared with the privileged census. After the child
+has quiesced and written final status, the descriptor-fed privileged observer takes a second
+canonical account census. PASS requires both censuses to be safe and identical in count and digest.
+The run stops at the first complete same-invocation proof, the first unsafe observation, process
+exit, or its bound. PASS requires the reviewed revision, a complete ordinary poll after start,
+successful re-anchor, real readiness, healthy critical owners, identical safe
+before/after privileged account censuses, the expected authorization-denied child snapshot, and no
+credit loss, unexpected fence/error, or successful database write. Immediately before PASS, the
+harness quiesces the child, synchronously rescans one exact complete service-log prefix, queries the
+current anchor/reanchor/fence database observation, and takes the final privileged account census.
+The result binds that prefix's byte length and SHA-256 plus the database and census values; unsafe
+evidence arriving while readiness is in flight therefore fails the same invocation. The harness
+prints `REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
 file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, and the rehearsed
 binary's revision, embedded BLAKE3 identity, file SHA-256, activation ID, canonical generation
 directory, copied-state manifest SHA-256, exact passing readiness-body SHA-256, config SHA-256, and
 both environment identities. `environment_sha256` is the reviewed production target;
 `rehearsal_environment_sha256` is the generated publishable-only derivative. Preserve and review the
-JSON file and its result manifest. The result manifest records `account_census_count` and
-`account_census_sha256`; the outer JSON's `evidence_sha256` binds those fields as part of the exact
-result-manifest bytes. The financial driver compares the
-production identity to `--target-environment`, binds both before entering `prepared`, and revalidates
-them from disk before entering `guarded`. The copy manifest, result manifest, and outer JSON are
-installed with the shared durable atomic-write primitive (file sync, rename, then parent-directory
-sync).
+JSON file and its result manifest. The result manifest records each privileged census's count,
+SHA-256, and safety result plus `account_census_before_after_identical`; the outer JSON's
+`evidence_sha256` binds those fields as part of the exact result-manifest bytes. The financial driver
+compares the production identity to `--target-environment`, binds both before entering `prepared`,
+and revalidates them from disk before entering `guarded`. The copy manifest, result manifest, and
+outer JSON are installed with the shared durable atomic-write primitive (file sync, rename, then
+parent-directory sync).
 
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
