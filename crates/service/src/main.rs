@@ -870,7 +870,8 @@ async fn main() -> Result<()> {
         control_tx.clone(),
         paper_state.clone(),
         position_validator,
-    );
+    )
+    .with_source_log(orchestrator_source_log.clone());
 
     // Rebuild durable reader obligations before either source producer starts.
     // The existing source log plus aggregate records are sufficient, so #544
