@@ -253,6 +253,15 @@ pub fn verify_live_admission_evaluation(
     evaluated_at: OffsetDateTime,
     binding: Option<&LiveAccountBindingAudit>,
 ) -> Result<(), LiveAdmissionEvaluationError> {
+    let binding = binding.ok_or(LiveAdmissionEvaluationError::InvalidAccountEvidence)?;
+    if admission.identity.idempotency_key
+        != LiveOrderIdentity::idempotency_key_for(
+            &admission.identity.dispatch_id,
+            &binding.account_id,
+        )
+    {
+        return Err(LiveAdmissionEvaluationError::InvalidAccountEvidence);
+    }
     let risk_decision = match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
         pe_risk_engine::RiskDecision::Approved => crate::RiskDecisionAudit::Approved,
         pe_risk_engine::RiskDecision::Blocked(reason) => {
@@ -298,7 +307,6 @@ pub fn verify_live_admission_evaluation(
         return Ok(());
     }
 
-    let binding = binding.ok_or(LiveAdmissionEvaluationError::InvalidAccountEvidence)?;
     if !binding.is_valid_for_frozen_credential(&binding.account_id, &admission.frozen_binding)
         || admission.current_binding != binding.credential
         || (admission.account_state.is_some() == has_failure_evidence)
@@ -997,14 +1005,15 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         admission: Box<LiveAdmissionEvaluationAudit>,
         current_mode: LiveModeSnapshot,
         current_binding: CredentialBindingIdentity,
+        current_account_state: LiveVenueAccountState,
         clock: C,
     ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError>
     where
         C: Fn() -> OffsetDateTime,
     {
         let evaluated_at = clock();
-        let account_state = admission.account_state.as_ref();
-        let reproduced = account_state.map(|account| {
+        let current_account_audit = current_account_state.audit()?;
+        let reproduced = {
             classify_live_admission(LiveAdmissionClassificationInput {
                 evaluated_at,
                 requested_mode: current_mode.requested,
@@ -1018,12 +1027,12 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 admission: &admission.economic.admission,
                 ladder: &admission.economic.ladder,
                 economic: &admission.economic,
-                account: LiveAdmissionAccountEvidence::State(account),
+                account: LiveAdmissionAccountEvidence::State(&current_account_audit),
             })
-        });
+        };
         if admission.verdict != LiveAdmissionVerdict::Approved
             || !recorded_risk_is_approved(&admission.economic)
-            || !matches!(reproduced, Some(Ok(LiveAdmissionVerdict::Approved)))
+            || !matches!(reproduced, Ok(LiveAdmissionVerdict::Approved))
         {
             self.terminalize_approved_admission(
                 account_id,
@@ -1037,7 +1046,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 kind: LiveOrderRejectKind::PreparationFailed,
             }));
         }
-        let account_state = match account_state {
+        let recorded_account_state = match admission.account_state.as_ref() {
             Some(account) => account.clone(),
             None => {
                 self.terminalize_approved_admission(
@@ -1070,8 +1079,11 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 }));
             }
         };
-        if !prepared_matches_approved_admission(venue_prepared.audit(), &admission, &account_state)
-        {
+        if !prepared_matches_approved_admission(
+            venue_prepared.audit(),
+            &admission,
+            &current_account_audit,
+        ) {
             self.terminalize_approved_admission(
                 account_id,
                 admission.identity.clone(),
@@ -1089,7 +1101,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             admission.identity.clone(),
             admission.frozen_binding.clone(),
             admission.economic.clone(),
-            account_state,
+            recorded_account_state,
             prepared.clone(),
         );
         self.journal.append(
@@ -2010,7 +2022,7 @@ mod tests {
     fn request(account_id: &AccountId) -> LiveOrderRequest {
         let identity = LiveOrderIdentity {
             dispatch_id: "dispatch-1".to_owned(),
-            idempotency_key: "idempotency-1".to_owned(),
+            idempotency_key: LiveOrderIdentity::idempotency_key_for("dispatch-1", account_id),
             quote_id: "quote-1".to_owned(),
             config_hash: "config-hash".to_owned(),
             decision_hash: "decision-hash".to_owned(),
@@ -2364,6 +2376,7 @@ mod tests {
                             effective: LiveControlMode::LiveTiny,
                         },
                         admission.frozen_binding.clone(),
+                        account_state(),
                         now,
                     )
                     .await
@@ -2442,6 +2455,7 @@ mod tests {
                     effective: LiveControlMode::Off,
                 },
                 admission.frozen_binding.clone(),
+                account_state(),
                 now,
             )
             .await

@@ -103,6 +103,7 @@ use crate::risk_inputs::{
 };
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::supabase_reader::auth_token;
+use crate::supervisor::{ShutdownController, ShutdownPhase};
 
 const FANOUT_INTERVAL_SECS: u64 = 2;
 const MODE_INTERVAL_SECS: i64 = 30;
@@ -147,6 +148,8 @@ pub struct LiveFanoutConfig {
     pub clob_base_url: String,
     pub data_base_url: String,
     pub projection_reconcile_interval_secs: u64,
+    /// Cheap ordered-shutdown probe used to revoke Approved resumption at StopProducers.
+    pub shutdown: ShutdownController,
 }
 
 #[derive(Default)]
@@ -969,6 +972,184 @@ async fn run_dispatch_pass(state: &mut FanoutState) -> Result<(), FanoutError> {
 
 /// Recover ordinary-live work. Runtime passes may resume a currently authorized Approved
 /// admission; shutdown passes reconcile only already-Prepared work and never create a POST.
+enum RecoveryAuthorization {
+    Ready {
+        account: AccountContext,
+        mode: LiveModeSnapshot,
+        binding: CredentialBindingIdentity,
+    },
+    Pause,
+    Terminal {
+        failure: pe_execution_core::LiveOrderPreparationFailure,
+        target_reason: &'static str,
+    },
+}
+
+enum RecoveryVenueGate {
+    Ready(RecoveryExecutionState),
+    Control(RecoveryAuthorization),
+    MarkUnavailable,
+}
+
+struct RecoveryExecutionState {
+    mode: LiveModeSnapshot,
+    binding: CredentialBindingIdentity,
+    account_state: pe_execution_core::LiveVenueAccountState,
+}
+
+struct RecoveryVenueContext<'a, V> {
+    venue: &'a V,
+    account_binding: &'a LiveAccountBindingAudit,
+    custody_wallet: &'a str,
+}
+
+fn recovery_authorization(
+    state: &FanoutState,
+    account_id: &AccountId,
+    frozen_binding: &CredentialBindingIdentity,
+    now: OffsetDateTime,
+) -> Result<RecoveryAuthorization, FanoutError> {
+    if state.config.shutdown.phase() >= ShutdownPhase::StopProducers {
+        return Ok(RecoveryAuthorization::Pause);
+    }
+    let snapshot = state.config.live_accounts.snapshot();
+    if !snapshot.is_fresh(now.unix_timestamp()) {
+        return Ok(RecoveryAuthorization::Pause);
+    }
+    let Some(account) = snapshot
+        .accounts
+        .iter()
+        .find(|account| account.account_id == *account_id)
+        .cloned()
+    else {
+        return Ok(RecoveryAuthorization::Terminal {
+            failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+            target_reason: "recovery_account_not_armed",
+        });
+    };
+    if account.requested_live_mode != "live_tiny"
+        || account.effective_live_mode != "live_tiny"
+        || !account.is_armed()
+    {
+        return Ok(RecoveryAuthorization::Terminal {
+            failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+            target_reason: "recovery_account_not_armed",
+        });
+    }
+    let Some((binding_version, binding_key_id)) = account.credential_binding.as_ref() else {
+        return Ok(RecoveryAuthorization::Terminal {
+            failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+            target_reason: "recovery_account_not_armed",
+        });
+    };
+    let binding = CredentialBindingIdentity {
+        version: *binding_version,
+        key_id: binding_key_id.clone(),
+    };
+    if binding != *frozen_binding {
+        return Ok(RecoveryAuthorization::Terminal {
+            failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged,
+            target_reason: "recovery_credential_changed",
+        });
+    }
+    let redemption_closed =
+        reconstruct_redemption_attempts(&replay_live_account(state, account_id)?)
+            .values()
+            .any(|attempt| redemption_posture(&attempt.state).closes_new_buy_admission);
+    if state.closures.reason(account_id.as_str()).is_some()
+        || redemption_closed
+        || global_risk_halt_active(state)?
+    {
+        return Ok(RecoveryAuthorization::Pause);
+    }
+    Ok(RecoveryAuthorization::Ready {
+        mode: LiveModeSnapshot {
+            requested: mode_value(&account.requested_live_mode),
+            effective: mode_value(&account.effective_live_mode),
+        },
+        account,
+        binding,
+    })
+}
+
+async fn fresh_recovery_venue_gate<V, C>(
+    state: &mut FanoutState,
+    account_id: &AccountId,
+    frozen_binding: &CredentialBindingIdentity,
+    neg_risk: bool,
+    venue_context: &RecoveryVenueContext<'_, V>,
+    clock: C,
+) -> Result<RecoveryVenueGate, FanoutError>
+where
+    V: LiveOrderVenue,
+    C: Fn() -> OffsetDateTime + Copy + Send + Sync,
+{
+    let account_state = match venue_context
+        .venue
+        .read_balance_and_allowance(neg_risk)
+        .await
+    {
+        Ok(account_state) => account_state,
+        Err(_) => {
+            return match recovery_authorization(state, account_id, frozen_binding, clock())? {
+                RecoveryAuthorization::Ready { .. } => Ok(RecoveryVenueGate::MarkUnavailable),
+                control => Ok(RecoveryVenueGate::Control(control)),
+            };
+        }
+    };
+    let reconciliation_at = clock();
+    let authorization =
+        recovery_authorization(state, account_id, frozen_binding, reconciliation_at)?;
+    let RecoveryAuthorization::Ready { account, .. } = &authorization else {
+        return Ok(RecoveryVenueGate::Control(authorization));
+    };
+    if ensure_live_portfolio_marks_at(
+        state,
+        account,
+        &account_state,
+        venue_context.account_binding,
+        venue_context.custody_wallet,
+        reconciliation_at,
+    )
+    .await
+        != CheckOutcome::Pass
+    {
+        return match recovery_authorization(state, account_id, frozen_binding, clock())? {
+            RecoveryAuthorization::Ready { .. } => Ok(RecoveryVenueGate::MarkUnavailable),
+            control => Ok(RecoveryVenueGate::Control(control)),
+        };
+    }
+    match recovery_authorization(state, account_id, frozen_binding, clock())? {
+        RecoveryAuthorization::Ready { mode, binding, .. } => {
+            Ok(RecoveryVenueGate::Ready(RecoveryExecutionState {
+                mode,
+                binding,
+                account_state,
+            }))
+        }
+        control => Ok(RecoveryVenueGate::Control(control)),
+    }
+}
+
+fn terminalize_unprepared_recovery(
+    state: &FanoutState,
+    target: &DispatchTargetRow,
+    identity: LiveOrderIdentity,
+    failure: pe_execution_core::LiveOrderPreparationFailure,
+    target_reason: &'static str,
+    now: OffsetDateTime,
+) -> Result<(), FanoutError> {
+    state.config.journal.append(
+        AccountId::new(&target.account_id)
+            .map_err(|error| FanoutError::Signal(error.to_string()))?,
+        now,
+        LiveJournalPayload::OrderPreparationFailed(Box::new(
+            pe_execution_core::LiveOrderPreparationFailedAudit { identity, failure },
+        )),
+    )?;
+    terminalize(state, target, target_reason, now)
+}
+
 async fn run_recovery_pass<C>(
     state: &mut FanoutState,
     clock: C,
@@ -989,7 +1170,6 @@ where
     let (finality_orders, recoverable_orders): (Vec<_>, Vec<_>) = open_orders
         .into_iter()
         .partition(|order| !order.transaction_hashes.is_empty());
-    let snapshot = state.config.live_accounts.snapshot();
     for pending in approved_admissions
         .into_iter()
         .filter(|_| resume_approved_admissions)
@@ -1005,95 +1185,31 @@ where
             terminal_reason: None,
             updated_at_unix: pass_started_at.unix_timestamp(),
         };
-        if !snapshot.is_fresh(recovery_check_at.unix_timestamp()) {
-            freeze = true;
-            continue;
-        }
-        let Some(account) = snapshot
-            .accounts
-            .iter()
-            .find(|account| account.account_id == pending.account_id)
-        else {
-            state.config.journal.append(
-                pending.account_id.clone(),
-                recovery_check_at,
-                LiveJournalPayload::OrderPreparationFailed(Box::new(
-                    pe_execution_core::LiveOrderPreparationFailedAudit {
-                        identity: pending.admission.identity.clone(),
-                        failure:
-                            pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
-                    },
-                )),
-            )?;
-            terminalize(
-                state,
-                &target,
-                "recovery_account_not_armed",
-                recovery_check_at,
-            )?;
-            continue;
-        };
-        if account.requested_live_mode != "live_tiny"
-            || account.effective_live_mode != "live_tiny"
-            || !account.is_armed()
-        {
-            state.config.journal.append(
-                pending.account_id.clone(),
-                recovery_check_at,
-                LiveJournalPayload::OrderPreparationFailed(Box::new(
-                    pe_execution_core::LiveOrderPreparationFailedAudit {
-                        identity: pending.admission.identity.clone(),
-                        failure:
-                            pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
-                    },
-                )),
-            )?;
-            terminalize(
-                state,
-                &target,
-                "recovery_account_not_armed",
-                recovery_check_at,
-            )?;
-            continue;
-        }
-        let Some((binding_version, binding_key_id)) = account.credential_binding.as_ref() else {
-            freeze = true;
-            continue;
-        };
-        let current_binding = CredentialBindingIdentity {
-            version: *binding_version,
-            key_id: binding_key_id.clone(),
-        };
-        if current_binding != pending.admission.frozen_binding {
-            state.config.journal.append(
-                pending.account_id.clone(),
-                recovery_check_at,
-                LiveJournalPayload::OrderPreparationFailed(Box::new(
-                    pe_execution_core::LiveOrderPreparationFailedAudit {
-                        identity: pending.admission.identity.clone(),
-                        failure:
-                            pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged,
-                    },
-                )),
-            )?;
-            terminalize(
-                state,
-                &target,
-                "recovery_credential_changed",
-                recovery_check_at,
-            )?;
-            continue;
-        }
-        let redemption_closed =
-            reconstruct_redemption_attempts(&replay_live_account(state, &pending.account_id)?)
-                .values()
-                .any(|attempt| redemption_posture(&attempt.state).closes_new_buy_admission);
-        if state.closures.reason(&target.account_id).is_some()
-            || redemption_closed
-            || global_risk_halt_active(state)?
-        {
-            freeze = true;
-            continue;
+        match recovery_authorization(
+            state,
+            &pending.account_id,
+            &pending.admission.frozen_binding,
+            recovery_check_at,
+        )? {
+            RecoveryAuthorization::Ready { .. } => {}
+            RecoveryAuthorization::Pause => {
+                freeze = true;
+                continue;
+            }
+            RecoveryAuthorization::Terminal {
+                failure,
+                target_reason,
+            } => {
+                terminalize_unprepared_recovery(
+                    state,
+                    &target,
+                    pending.admission.identity.clone(),
+                    failure,
+                    target_reason,
+                    recovery_check_at,
+                )?;
+                continue;
+            }
         }
         let preparation_check_at = clock();
         let recovery_price_expired = risk_price_expired(
@@ -1158,6 +1274,32 @@ where
                 continue;
             }
         };
+        match recovery_authorization(
+            state,
+            &pending.account_id,
+            &pending.admission.frozen_binding,
+            clock(),
+        )? {
+            RecoveryAuthorization::Ready { .. } => {}
+            RecoveryAuthorization::Pause => {
+                freeze = true;
+                continue;
+            }
+            RecoveryAuthorization::Terminal {
+                failure,
+                target_reason,
+            } => {
+                terminalize_unprepared_recovery(
+                    state,
+                    &target,
+                    pending.admission.identity.clone(),
+                    failure,
+                    target_reason,
+                    clock(),
+                )?;
+                continue;
+            }
+        }
         let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
             Ok(venue) => venue,
             Err(_) => {
@@ -1165,23 +1307,75 @@ where
                 continue;
             }
         };
-        if resume_approved_with_venue(
+        match recovery_authorization(
             state,
-            &target,
-            pending,
-            LiveModeSnapshot {
-                requested: mode_value(&account.requested_live_mode),
-                effective: mode_value(&account.effective_live_mode),
-            },
-            current_binding,
-            &venue,
+            &pending.account_id,
+            &pending.admission.frozen_binding,
+            clock(),
+        )? {
+            RecoveryAuthorization::Ready { .. } => {}
+            RecoveryAuthorization::Pause => {
+                freeze = true;
+                continue;
+            }
+            RecoveryAuthorization::Terminal {
+                failure,
+                target_reason,
+            } => {
+                terminalize_unprepared_recovery(
+                    state,
+                    &target,
+                    pending.admission.identity.clone(),
+                    failure,
+                    target_reason,
+                    clock(),
+                )?;
+                continue;
+            }
+        }
+        let custody_wallet = venue.deposit_wallet();
+        let venue_context = RecoveryVenueContext {
+            venue: &venue,
+            account_binding: venue.account_binding(),
+            custody_wallet: &custody_wallet,
+        };
+        let execution = match fresh_recovery_venue_gate(
+            state,
+            &pending.account_id,
+            &pending.admission.frozen_binding,
+            pending.admission.economic.admission.market.neg_risk,
+            &venue_context,
             clock,
         )
         .await?
         {
+            RecoveryVenueGate::Ready(execution) => execution,
+            RecoveryVenueGate::Control(RecoveryAuthorization::Terminal {
+                failure,
+                target_reason,
+            }) => {
+                terminalize_unprepared_recovery(
+                    state,
+                    &target,
+                    pending.admission.identity.clone(),
+                    failure,
+                    target_reason,
+                    clock(),
+                )?;
+                continue;
+            }
+            RecoveryVenueGate::Control(_) | RecoveryVenueGate::MarkUnavailable => {
+                freeze = true;
+                continue;
+            }
+        };
+        if resume_approved_with_venue(state, &target, pending, execution, &venue_context, clock)
+            .await?
+        {
             freeze = true;
         }
     }
+    let snapshot = state.config.live_accounts.snapshot();
     for order in recoverable_orders.into_iter() {
         let Some(prepared) = order.prepared else {
             freeze = true;
@@ -1300,25 +1494,26 @@ where
 }
 
 async fn resume_approved_with_venue<V, C>(
-    state: &FanoutState,
+    state: &mut FanoutState,
     target: &DispatchTargetRow,
     pending: pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
-    current_mode: LiveModeSnapshot,
-    current_binding: CredentialBindingIdentity,
-    venue: &V,
+    execution: RecoveryExecutionState,
+    venue_context: &RecoveryVenueContext<'_, V>,
     clock: C,
 ) -> Result<bool, FanoutError>
 where
     V: LiveOrderVenue,
     C: Fn() -> OffsetDateTime + Copy + Send + Sync,
 {
-    let executor = LiveExecutor::new(venue, state.config.journal.as_ref());
+    let journal = state.config.journal.clone();
+    let executor = LiveExecutor::new(venue_context.venue, journal.as_ref());
     match executor
         .resume_approved_admission_with_clock(
             pending.account_id,
             pending.admission,
-            current_mode,
-            current_binding,
+            execution.mode,
+            execution.binding,
+            execution.account_state,
             clock,
         )
         .await?
@@ -1328,6 +1523,59 @@ where
             Ok(false)
         }
         LivePrepareResult::Prepared(prepared) => {
+            let authorization_check_at = clock();
+            let initial_authorization = recovery_authorization(
+                state,
+                prepared.account_id(),
+                &prepared.audit().frozen_binding,
+                authorization_check_at,
+            )?;
+            if !matches!(initial_authorization, RecoveryAuthorization::Ready { .. }) {
+                let failure = match initial_authorization {
+                    RecoveryAuthorization::Terminal { failure, .. } => failure,
+                    RecoveryAuthorization::Pause | RecoveryAuthorization::Ready { .. } => {
+                        pe_execution_core::LiveOrderPreparationFailure::PrePostAdmissionExpired
+                    }
+                };
+                let outcome =
+                    executor.terminalize_prepared(prepared, authorization_check_at, failure)?;
+                persist_outcome(state, target, &outcome, authorization_check_at)?;
+                return Ok(false);
+            }
+            let execution = match fresh_recovery_venue_gate(
+                state,
+                prepared.account_id(),
+                &prepared.audit().frozen_binding,
+                prepared.audit().economic.admission.market.neg_risk,
+                venue_context,
+                clock,
+            )
+            .await?
+            {
+                RecoveryVenueGate::Ready(execution) => execution,
+                RecoveryVenueGate::Control(control) => {
+                    let failure = match control {
+                        RecoveryAuthorization::Terminal { failure, .. } => failure,
+                        RecoveryAuthorization::Pause | RecoveryAuthorization::Ready { .. } => {
+                            pe_execution_core::LiveOrderPreparationFailure::PrePostAdmissionExpired
+                        }
+                    };
+                    let failed_at = clock();
+                    let outcome = executor.terminalize_prepared(prepared, failed_at, failure)?;
+                    persist_outcome(state, target, &outcome, failed_at)?;
+                    return Ok(false);
+                }
+                RecoveryVenueGate::MarkUnavailable => {
+                    let failed_at = clock();
+                    let outcome = executor.terminalize_prepared(
+                        prepared,
+                        failed_at,
+                        pe_execution_core::LiveOrderPreparationFailure::PrePostMarkUnavailable,
+                    )?;
+                    persist_outcome(state, target, &outcome, failed_at)?;
+                    return Ok(false);
+                }
+            };
             let post_check_at = clock();
             let risk_price_expired =
                 prepared_risk_price_expired(state, prepared.audit(), post_check_at)?;
@@ -1335,7 +1583,13 @@ where
                 Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged)
             } else if risk_price_expired {
                 Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskPriceExpired)
-            } else if !prepared_admission_is_approved_at(prepared.audit(), post_check_at) {
+            } else if !prepared_admission_is_approved_at(prepared.audit(), post_check_at)
+                || !prepared_admission_is_approved_with_fresh_account_at(
+                    prepared.audit(),
+                    &execution,
+                    post_check_at,
+                )?
+            {
                 Some(pe_execution_core::LiveOrderPreparationFailure::PrePostAdmissionExpired)
             } else {
                 None
@@ -1343,6 +1597,24 @@ where
             if let Some(failure) = failure {
                 let outcome = executor.terminalize_prepared(prepared, post_check_at, failure)?;
                 persist_outcome(state, target, &outcome, post_check_at)?;
+                return Ok(false);
+            }
+            let final_authorization = recovery_authorization(
+                state,
+                prepared.account_id(),
+                &prepared.audit().frozen_binding,
+                clock(),
+            )?;
+            if !matches!(final_authorization, RecoveryAuthorization::Ready { .. }) {
+                let failure = match final_authorization {
+                    RecoveryAuthorization::Terminal { failure, .. } => failure,
+                    RecoveryAuthorization::Pause | RecoveryAuthorization::Ready { .. } => {
+                        pe_execution_core::LiveOrderPreparationFailure::PrePostAdmissionExpired
+                    }
+                };
+                let failed_at = clock();
+                let outcome = executor.terminalize_prepared(prepared, failed_at, failure)?;
+                persist_outcome(state, target, &outcome, failed_at)?;
                 return Ok(false);
             }
             state.config.paper_state.set_dispatch_target_state(
@@ -2071,6 +2343,32 @@ fn prepared_admission_is_approved_at(
     )
 }
 
+fn prepared_admission_is_approved_with_fresh_account_at(
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    execution: &RecoveryExecutionState,
+    evaluated_at: OffsetDateTime,
+) -> Result<bool, FanoutError> {
+    let account_audit = execution.account_state.audit()?;
+    Ok(matches!(
+        classify_live_admission(LiveAdmissionClassificationInput {
+            evaluated_at,
+            requested_mode: execution.mode.requested,
+            effective_mode: execution.mode.effective,
+            frozen_binding: &prepared.frozen_binding,
+            current_binding: &execution.binding,
+            identity: &prepared.identity,
+            condition_id: &prepared.economic.market.condition_id,
+            outcome_id: OutcomeId(u16::from(prepared.economic.market.outcome_index)),
+            token_id: &prepared.economic.market.token_id,
+            admission: &prepared.economic.admission,
+            ladder: &prepared.economic.ladder,
+            economic: &prepared.economic,
+            account: LiveAdmissionAccountEvidence::State(&account_audit),
+        }),
+        Ok(pe_execution_core::LiveAdmissionVerdict::Approved)
+    ))
+}
+
 fn unix_ms(now: OffsetDateTime) -> u64 {
     u64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
@@ -2719,7 +3017,11 @@ fn build_order_identity(
     ))?;
     Ok(LiveOrderIdentity {
         dispatch_id: seed.dispatch_id.clone(),
-        idempotency_key: format!("{}:{}", seed.dispatch_id, target.account_id),
+        idempotency_key: LiveOrderIdentity::idempotency_key_for(
+            &seed.dispatch_id,
+            &AccountId::new(&target.account_id)
+                .map_err(|error| FanoutError::Signal(error.to_string()))?,
+        ),
         quote_id,
         config_hash,
         decision_hash,
@@ -2965,6 +3267,12 @@ pub(crate) fn derive_projection_rows_with_sources(
     events: &[LiveJournalEvent],
     source_envelopes: &[EventEnvelope],
 ) -> Result<ProjectionDerivation, ProjectionReducerError> {
+    if events.iter().any(|event| event.account_id != *account_id) {
+        return Err(ProjectionReducerError::IdentityConflict);
+    }
+    let first_baseline_index =
+        pe_execution_core::live_journal::first_account_baseline_index(events, account_id)
+            .unwrap_or(events.len());
     let mut baseline_seen = false;
     let mut economic_cash = None;
     let mut fills = BTreeMap::<String, (OrderFillFinalizedAudit, LiveFillRow)>::new();
@@ -2992,10 +3300,7 @@ pub(crate) fn derive_projection_rows_with_sources(
     let mut matched_transaction_hashes = BTreeMap::<String, BTreeSet<String>>::new();
     let mut current_account_binding = None::<LiveAccountBindingAudit>;
 
-    for (event_index, event) in events.iter().enumerate() {
-        if event.account_id != *account_id {
-            return Err(ProjectionReducerError::IdentityConflict);
-        }
+    for (event_index, event) in events.iter().enumerate().skip(first_baseline_index) {
         if let LiveJournalPayload::AccountPortfolioMarked(mark) = &event.payload
             && mark.kind == MarkKind::Baseline
         {
@@ -3045,7 +3350,7 @@ pub(crate) fn derive_projection_rows_with_sources(
         }
         match &event.payload {
             LiveJournalPayload::OrderPrepared(order) => {
-                let key = order.identity.idempotency_key.clone();
+                let key = order.identity.dispatch_id.clone();
                 let admission = approved_admissions
                     .remove(&key)
                     .ok_or(ProjectionReducerError::MissingApprovedAdmission)?;
@@ -3069,6 +3374,10 @@ pub(crate) fn derive_projection_rows_with_sources(
                 }
             }
             LiveJournalPayload::AdmissionEvaluated(admission) => {
+                let key = admission.identity.dispatch_id.clone();
+                if !evaluated_admissions.insert(key.clone()) {
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
                 let binding = current_account_binding
                     .as_ref()
                     .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
@@ -3082,16 +3391,12 @@ pub(crate) fn derive_projection_rows_with_sources(
                             ProjectionReducerError::InvalidAccountEvidence
                         }
                     })?;
-                let key = admission.identity.idempotency_key.clone();
-                if !evaluated_admissions.insert(key.clone()) {
-                    return Err(ProjectionReducerError::IdentityConflict);
-                }
                 if admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved {
                     approved_admissions.insert(key, admission.clone());
                 }
             }
             LiveJournalPayload::OrderPreparationFailed(failed) => {
-                let key = &failed.identity.idempotency_key;
+                let key = &failed.identity.dispatch_id;
                 if let Some(admission) = approved_admissions.remove(key) {
                     if admission.identity != failed.identity {
                         return Err(ProjectionReducerError::IdentityConflict);
@@ -3109,7 +3414,7 @@ pub(crate) fn derive_projection_rows_with_sources(
             }
             LiveJournalPayload::OrderPosted(posted) => {
                 let Some((prepared_seq, prepared, terminal)) =
-                    prepared_orders.get(&posted.identity.idempotency_key)
+                    prepared_orders.get(&posted.identity.dispatch_id)
                 else {
                     return Err(ProjectionReducerError::MissingPrepared);
                 };
@@ -3125,7 +3430,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                 }
             }
             LiveJournalPayload::OrderReconciled(reconciled) => {
-                let key = reconciled.identity.idempotency_key.clone();
+                let key = reconciled.identity.dispatch_id.clone();
                 let Some((prepared_seq, prepared, terminal)) = prepared_orders.get_mut(&key) else {
                     return Err(ProjectionReducerError::MissingPrepared);
                 };
@@ -3198,13 +3503,13 @@ pub(crate) fn derive_projection_rows_with_sources(
                     LiveJournalOrderOutcome::Killed { .. }
                         | LiveJournalOrderOutcome::Rejected { .. }
                 ) {
-                    reservations.remove(&reconciled.identity.idempotency_key);
+                    reservations.remove(&reconciled.identity.dispatch_id);
                     *terminal = true;
                     terminal_reconciliations.insert(key, reconciled.clone());
                 }
             }
             LiveJournalPayload::OrderFillFinalized(finalized) => {
-                let key = finalized.identity.idempotency_key.clone();
+                let key = finalized.identity.dispatch_id.clone();
                 let Some((prepared_seq, prepared_audit, terminal)) = prepared_orders.get_mut(&key)
                 else {
                     return Err(ProjectionReducerError::MissingPrepared);
@@ -3258,7 +3563,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                     i64::try_from(event.seq).map_err(|_| ProjectionReducerError::Arithmetic)?;
                 let row = LiveFillRow {
                     account_id: account_id.as_str().to_owned(),
-                    idempotency_key: key.clone(),
+                    idempotency_key: finalized.identity.idempotency_key.clone(),
                     leader_wallet: projection.leader_wallet.clone(),
                     source_trade_id: projection.source_trade_id.clone(),
                     market_id: projection.market_id.clone(),
@@ -5363,6 +5668,25 @@ async fn ensure_live_portfolio_marks(
     account_binding: &LiveAccountBindingAudit,
     custody_wallet: &str,
 ) -> CheckOutcome {
+    ensure_live_portfolio_marks_at(
+        state,
+        account,
+        account_state,
+        account_binding,
+        custody_wallet,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+}
+
+async fn ensure_live_portfolio_marks_at(
+    state: &mut FanoutState,
+    account: &AccountContext,
+    account_state: &pe_execution_core::LiveVenueAccountState,
+    account_binding: &LiveAccountBindingAudit,
+    custody_wallet: &str,
+    now: OffsetDateTime,
+) -> CheckOutcome {
     let mut events = match replay_live_account(state, &account.account_id) {
         Ok(events) => events,
         Err(_) => return CheckOutcome::Transient("live journal unavailable"),
@@ -5396,7 +5720,7 @@ async fn ensure_live_portfolio_marks(
             Ok(inventory) => inventory,
             Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
         };
-    let inventory_observed_at = OffsetDateTime::now_utc();
+    let inventory_observed_at = now;
     if derived.baseline_equity.is_none() {
         // The first Baseline is the account's era boundary. Older records remain readable audit
         // history and deliberately create no managed state; only current complete venue inventory
@@ -5475,10 +5799,7 @@ async fn ensure_live_portfolio_marks(
     else {
         return CheckOutcome::PersistentFail("live boundary arithmetic overflow");
     };
-    let completed_cutoff = OffsetDateTime::now_utc()
-        .unix_timestamp()
-        .div_euclid(86_400)
-        * 86_400;
+    let completed_cutoff = now.unix_timestamp().div_euclid(86_400) * 86_400;
     while cutoff <= completed_cutoff {
         let cutoff_is_missing = !derived.daily_marks.contains_key(&cutoff);
         if cutoff_is_missing {
@@ -5554,7 +5875,7 @@ async fn ensure_live_portfolio_marks(
                 .journal
                 .append(
                     account.account_id.clone(),
-                    OffsetDateTime::now_utc(),
+                    now,
                     LiveJournalPayload::AccountPortfolioMarked(Box::new(
                         pe_execution_core::AccountPortfolioMarkedAudit {
                             kind: MarkKind::Daily,
@@ -6608,7 +6929,7 @@ async fn fetch_complete_venue_inventory(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::panic, clippy::unwrap_used)]
 
     use std::collections::HashSet;
     use std::future::Future;
@@ -7884,6 +8205,9 @@ mod tests {
         prepare_clock_millis: Option<Arc<AtomicI64>>,
         prepare_advance_millis: i64,
         post_attempts: Option<Arc<AtomicUsize>>,
+        account_state: Option<pe_execution_core::LiveVenueAccountState>,
+        prepare_barrier: Option<Arc<tokio::sync::Barrier>>,
+        prepare_release: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl LiveOrderVenue for RecoveryPostVenue {
@@ -7904,6 +8228,12 @@ mod tests {
             >,
         > {
             Box::pin(async move {
+                if let Some(barrier) = &self.prepare_barrier {
+                    barrier.wait().await;
+                }
+                if let Some(release) = &self.prepare_release {
+                    release.notified().await;
+                }
                 if let Some(clock_millis) = &self.prepare_clock_millis {
                     clock_millis.fetch_add(self.prepare_advance_millis, Ordering::SeqCst);
                 }
@@ -7986,13 +8316,33 @@ mod tests {
                     + 'a,
             >,
         > {
-            Box::pin(async {
-                Err(LiveVenueAccountReadError {
-                    kind: LiveAccountReadFailure::Protocol,
-                    evidence: Vec::new(),
-                    request_descriptor_hashes: Vec::new(),
-                })
+            Box::pin(async move {
+                self.account_state
+                    .clone()
+                    .ok_or_else(|| LiveVenueAccountReadError {
+                        kind: LiveAccountReadFailure::Protocol,
+                        evidence: Vec::new(),
+                        request_descriptor_hashes: Vec::new(),
+                    })
             })
+        }
+    }
+
+    fn venue_account_state_from_audit(
+        audit: &pe_execution_core::LiveAccountStateAudit,
+    ) -> pe_execution_core::LiveVenueAccountState {
+        pe_execution_core::LiveVenueAccountState {
+            observed_at: audit.observed_at,
+            closed_only: audit.closed_only,
+            geoblocked: audit.geoblocked,
+            selected_spender: audit.selected_spender.clone(),
+            collateral_balance: audit.collateral_balance,
+            allowance: audit.allowance,
+            reconciled_free_collateral: audit.reconciled_free_collateral,
+            schema_version: audit.schema_version,
+            parser_version: audit.parser_version,
+            evidence: audit.evidence.clone(),
+            request_descriptor_hashes: audit.request_descriptor_hashes.clone(),
         }
     }
 
@@ -8024,9 +8374,10 @@ mod tests {
 
     fn projection_identity(dispatch_id: &str) -> LiveOrderIdentity {
         let signal = projection_signal();
+        let account_id = AccountId::new("account").unwrap();
         LiveOrderIdentity {
             dispatch_id: dispatch_id.to_owned(),
-            idempotency_key: format!("{dispatch_id}:account"),
+            idempotency_key: LiveOrderIdentity::idempotency_key_for(dispatch_id, &account_id),
             quote_id: "quote".to_owned(),
             config_hash: "config".to_owned(),
             decision_hash: "decision".to_owned(),
@@ -8107,6 +8458,73 @@ mod tests {
         assert!(rows.fills.is_empty());
         assert!(rows.positions.is_empty());
         assert!(rows.economic_cash.is_none());
+    }
+
+    /// PASS: admission, preparation, POST, and reconciliation facts before the first Baseline are
+    /// audit-only in both strict projection reduction and execution-core recovery inventory.
+    #[test]
+    fn recovery_and_reducer_share_the_pre_baseline_slice() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let at = OffsetDateTime::UNIX_EPOCH;
+        let events = vec![
+            approved_admission_event(&account_id, &prepared, 1, at),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: at,
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 3,
+                timestamp: at,
+                payload: LiveJournalPayload::OrderPosted(Box::new(
+                    pe_execution_core::LiveOrderPostAudit {
+                        identity: prepared.identity.clone(),
+                        order_hash: prepared.prepared.order_hash.clone(),
+                        evidence: RawHttpAttempt::TransportFailure(
+                            pe_core_types::RawTransportFailure {
+                                source_id: "fixture".to_owned(),
+                                endpoint_kind: "post".to_owned(),
+                                method: "POST".to_owned(),
+                                path: "/order".to_owned(),
+                                ordered_query: Vec::new(),
+                                attempt_ordinal: 1,
+                                observed_at: at,
+                                received_at: at,
+                                error_class: pe_core_types::TransportErrorClass::Other,
+                                schema_version: 1,
+                                parser_version: 1,
+                                adapter_version: "fixture".to_owned(),
+                            },
+                        ),
+                        evidence_hash: "ignored-before-baseline".to_owned(),
+                    },
+                )),
+            },
+            matched_projection_event(&account_id, "dispatch-finality", 4),
+            baseline_event(&account_id, 5),
+        ];
+        let derived = derive_with_baseline_evidence(&account_id, &events, &[]).unwrap();
+        assert_eq!(derived.baseline_sequence, Some(5));
+        assert!(derived.fills.is_empty());
+        assert!(derived.positions.is_empty());
+        assert_eq!(derived.reserved, Decimal::ZERO);
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        for event in events {
+            journal
+                .append(event.account_id, event.timestamp, event.payload)
+                .unwrap();
+        }
+        drop(journal);
+        let recovery = recovery_inventory(&path, None).unwrap();
+        assert!(recovery.approved_admissions.is_empty());
+        assert!(recovery.open_orders.is_empty());
+        assert!(recovery.terminal_admissions.is_empty());
     }
 
     fn fixture_receipt(sequence: u64) -> AppendReceipt {
@@ -8728,11 +9146,14 @@ mod tests {
         seq: u64,
         timestamp: OffsetDateTime,
     ) -> LiveJournalEvent {
+        let mut admission = approved_admission(prepared);
+        admission.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for(&admission.identity.dispatch_id, account_id);
         LiveJournalEvent {
             account_id: account_id.clone(),
             seq,
             timestamp,
-            payload: LiveJournalPayload::AdmissionEvaluated(approved_admission(prepared)),
+            payload: LiveJournalPayload::AdmissionEvaluated(admission),
         }
     }
 
@@ -8742,11 +9163,14 @@ mod tests {
         prepared: &pe_execution_core::LiveOrderPreparedAudit,
         timestamp: OffsetDateTime,
     ) {
+        let mut admission = approved_admission(prepared);
+        admission.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for(&admission.identity.dispatch_id, account_id);
         journal
             .append(
                 account_id.clone(),
                 timestamp,
-                LiveJournalPayload::AdmissionEvaluated(approved_admission(prepared)),
+                LiveJournalPayload::AdmissionEvaluated(admission),
             )
             .unwrap();
     }
@@ -8819,6 +9243,8 @@ mod tests {
             &["acct"],
         );
         let mut prepared = finality_prepared();
+        prepared.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for("dispatch-finality", &account_id);
         prepared.account_state = append_recovery_baseline(
             state,
             &account_id,
@@ -8854,6 +9280,43 @@ mod tests {
         };
         let pending = inventory.approved_admissions.remove(0);
         (pending, prepared.prepared)
+    }
+
+    /// PASS: two Approved facts for one account/dispatch conflict before any recovery
+    /// preparation, even when the second carries a different nonempty idempotency key.
+    #[tokio::test]
+    async fn duplicate_dispatch_admissions_stop_recovery_before_preparation() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(now.unix_timestamp());
+        let mut state = fanout_state(&dir, db, snapshot, "http://127.0.0.1:9", None);
+        let (pending, _) = stage_recoverable_approved(&mut state, now, None).await;
+        let mut duplicate = pending.admission;
+        duplicate.identity.idempotency_key = "different-nonempty-key".to_owned();
+        state
+            .config
+            .journal
+            .append(
+                pending.account_id.clone(),
+                now,
+                LiveJournalPayload::AdmissionEvaluated(duplicate),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            verified_recovery_inventory(&state),
+            Err(FanoutError::Journal(
+                pe_execution_core::LiveJournalError::OrderFactConflict
+            ))
+        ));
+        assert!(
+            replay_live_account(&state, &pending.account_id)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event.payload, LiveJournalPayload::OrderPrepared(_)))
+        );
     }
 
     fn finality_matched(
@@ -10509,6 +10972,8 @@ mod tests {
         let account_id = AccountId::new("risk-recheck").unwrap();
         let prepared = finality_prepared();
         let mut admission = approved_admission(&prepared);
+        admission.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for(&admission.identity.dispatch_id, &account_id);
         admission.economic.risk.snapshot.absolute_pnl_bps = pe_core_types::BasisPoints(-1_000);
         admission.economic.risk.decision = RiskDecisionAudit::Approved;
         let events = vec![
@@ -10554,7 +11019,7 @@ mod tests {
             let pending = derive_with_baseline_evidence(&account_id, &prefix, &[]).unwrap();
             assert_eq!(
                 pending.pending_approved_admission_keys,
-                BTreeSet::from([prepared.identity.idempotency_key.clone()])
+                BTreeSet::from([prepared.identity.dispatch_id.clone()])
             );
 
             let mut resumed = prefix.clone();
@@ -10705,6 +11170,8 @@ mod tests {
                     .unwrap();
             }
             let mut prepared = finality_prepared();
+            prepared.identity.idempotency_key =
+                LiveOrderIdentity::idempotency_key_for(&prepared.identity.dispatch_id, &account_id);
             prepared.account_state = account_state;
             prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
             prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
@@ -10773,6 +11240,8 @@ mod tests {
             )
             .await;
             let mut prepared = finality_prepared();
+            prepared.identity.idempotency_key =
+                LiveOrderIdentity::idempotency_key_for(&prepared.identity.dispatch_id, &account_id);
             prepared.account_state = account_state;
             prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
             prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
@@ -12128,6 +12597,7 @@ mod tests {
                 clob_base_url: "http://127.0.0.1:9".to_owned(),
                 data_base_url: "http://127.0.0.1:9".to_owned(),
                 projection_reconcile_interval_secs: 3_600,
+                shutdown: ShutdownController::new().0,
             },
             admission,
             polygon_receipt_rpc: PolygonReceiptRpc::new(http, "http://127.0.0.1:9"),
@@ -12201,6 +12671,111 @@ mod tests {
         StatusCode::BAD_REQUEST
     }
 
+    async fn empty_positions() -> Json<Vec<serde_json::Value>> {
+        Json(Vec::new())
+    }
+
+    async fn recovery_positions(
+        State(include_unknown): State<bool>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Vec<serde_json::Value>> {
+        if include_unknown && query.get("redeemable").map(String::as_str) == Some("false") {
+            return Json(vec![serde_json::json!({
+                "proxyWallet": "0x1111111111111111111111111111111111111111",
+                "asset": "999",
+                "conditionId": format!("0x{}", "99".repeat(32)),
+                "outcomeIndex": 0,
+                "size": "0.000001",
+                "negativeRisk": false,
+            })]);
+        }
+        Json(Vec::new())
+    }
+
+    /// PASS: unknown venue inventory, one-atomic cash drift, insufficient allowance, and a
+    /// transient authenticated read all stop Approved recovery before any POST.
+    #[tokio::test]
+    async fn recovery_fresh_portfolio_and_allowance_gate_zero_posts() {
+        for case in ["unknown_position", "cash_drift", "allowance", "transient"] {
+            let app = Router::new()
+                .route("/positions", get(recovery_positions))
+                .with_state(case == "unknown_position");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let mut snapshot = armed_snapshot("acct");
+            snapshot.fetched_at_unix = Some(now.unix_timestamp());
+            let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+            state.config.data_base_url = format!("http://{address}");
+            let (pending, prepared) = stage_recoverable_approved(&mut state, now, None).await;
+            let mut current_account_state =
+                venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+            if case == "cash_drift" {
+                current_account_state.collateral_balance = CollateralAmount::from_atomic(9_999_999);
+                current_account_state.reconciled_free_collateral =
+                    CollateralAmount::from_atomic(9_999_999);
+            } else if case == "allowance" {
+                current_account_state.allowance = CollateralAmount::from_atomic(2_500_119);
+            }
+            let account_binding = account_binding_fixture(
+                &pending.account_id,
+                "0x1111111111111111111111111111111111111111",
+            );
+            let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+            let posts = Arc::new(AtomicUsize::new(0));
+            let venue = RecoveryPostVenue {
+                client: reqwest::Client::new(),
+                order_url: "http://127.0.0.1:9/order".to_owned(),
+                prepared,
+                observed_at: now,
+                prepare_clock_millis: None,
+                prepare_advance_millis: 0,
+                post_attempts: Some(posts.clone()),
+                account_state: (case != "transient").then_some(current_account_state.clone()),
+                prepare_barrier: None,
+                prepare_release: None,
+            };
+            let venue_context = RecoveryVenueContext {
+                venue: &venue,
+                account_binding: &account_binding,
+                custody_wallet: "0x1111111111111111111111111111111111111111",
+            };
+            let gate = fresh_recovery_venue_gate(
+                &mut state,
+                &pending.account_id,
+                &pending.admission.frozen_binding,
+                pending.admission.economic.admission.market.neg_risk,
+                &venue_context,
+                || now,
+            )
+            .await
+            .unwrap();
+            if case == "allowance" {
+                let RecoveryVenueGate::Ready(execution) = gate else {
+                    panic!("allowance case must reach the executor admission gate");
+                };
+                assert!(
+                    !resume_approved_with_venue(
+                        &mut state,
+                        &target,
+                        pending,
+                        execution,
+                        &venue_context,
+                        || now,
+                    )
+                    .await
+                    .unwrap()
+                );
+            } else {
+                assert!(matches!(gate, RecoveryVenueGate::MarkUnavailable), "{case}");
+            }
+            assert_eq!(posts.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
     /// PASS: fresh current off/missing evidence terminalizes Approved-only work, stale or closed
     /// evidence pauses it, and only the fresh armed case reaches exactly one loopback POST.
     /// FAIL: any non-armed, stale, closed, or missing account case reaches a loopback POST, or
@@ -12210,6 +12785,7 @@ mod tests {
         let posts = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/order", post(count_order_post))
+            .route("/positions", get(empty_positions))
             .with_state(posts.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -12228,6 +12804,13 @@ mod tests {
             None,
         );
         let (pending, prepared) = stage_recoverable_approved(&mut armed_state, now, None).await;
+        let current_account_state =
+            venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+        let account_binding = account_binding_fixture(
+            &pending.account_id,
+            "0x1111111111111111111111111111111111111111",
+        );
+        armed_state.config.data_base_url = format!("http://{address}");
         let target = armed_db
             .dispatch_targets("dispatch-finality")
             .unwrap()
@@ -12240,21 +12823,32 @@ mod tests {
             prepare_clock_millis: None,
             prepare_advance_millis: 0,
             post_attempts: None,
+            account_state: Some(current_account_state.clone()),
+            prepare_barrier: None,
+            prepare_release: None,
+        };
+        let venue_context = RecoveryVenueContext {
+            venue: &venue,
+            account_binding: &account_binding,
+            custody_wallet: "0x1111111111111111111111111111111111111111",
         };
         assert!(
             !resume_approved_with_venue(
-                &armed_state,
+                &mut armed_state,
                 &target,
                 pending,
-                LiveModeSnapshot {
-                    requested: LiveControlMode::LiveTiny,
-                    effective: LiveControlMode::LiveTiny,
+                RecoveryExecutionState {
+                    mode: LiveModeSnapshot {
+                        requested: LiveControlMode::LiveTiny,
+                        effective: LiveControlMode::LiveTiny,
+                    },
+                    account_state: current_account_state,
+                    binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
                 },
-                CredentialBindingIdentity {
-                    version: 1,
-                    key_id: "key".to_owned(),
-                },
-                &venue,
+                &venue_context,
                 || now,
             )
             .await
@@ -12315,6 +12909,10 @@ mod tests {
     #[tokio::test]
     async fn recovery_rechecks_price_expiry_after_preparation() {
         let posts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/positions", get(empty_positions));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let pass_started_at = observed_at + time::Duration::milliseconds(59_999);
         let dir = tempdir().unwrap();
@@ -12338,6 +12936,13 @@ mod tests {
             .unwrap();
         let (pending, prepared) =
             stage_recoverable_approved(&mut state, observed_at, Some(price_receipt)).await;
+        let current_account_state =
+            venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+        let account_binding = account_binding_fixture(
+            &pending.account_id,
+            "0x1111111111111111111111111111111111111111",
+        );
+        state.config.data_base_url = format!("http://{address}");
 
         let clock_millis = Arc::new(AtomicI64::new(
             i64::try_from(pass_started_at.unix_timestamp_nanos() / 1_000_000).unwrap(),
@@ -12350,6 +12955,9 @@ mod tests {
             prepare_clock_millis: Some(clock_millis.clone()),
             prepare_advance_millis: 2,
             post_attempts: Some(posts.clone()),
+            account_state: Some(current_account_state.clone()),
+            prepare_barrier: None,
+            prepare_release: None,
         };
         let sampled_clock = clock_millis.clone();
         let clock = move || {
@@ -12359,21 +12967,29 @@ mod tests {
             .unwrap()
         };
         let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        let venue_context = RecoveryVenueContext {
+            venue: &venue,
+            account_binding: &account_binding,
+            custody_wallet: "0x1111111111111111111111111111111111111111",
+        };
 
         assert!(
             !resume_approved_with_venue(
-                &state,
+                &mut state,
                 &target,
                 pending,
-                LiveModeSnapshot {
-                    requested: LiveControlMode::LiveTiny,
-                    effective: LiveControlMode::LiveTiny,
+                RecoveryExecutionState {
+                    mode: LiveModeSnapshot {
+                        requested: LiveControlMode::LiveTiny,
+                        effective: LiveControlMode::LiveTiny,
+                    },
+                    account_state: current_account_state,
+                    binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
                 },
-                CredentialBindingIdentity {
-                    version: 1,
-                    key_id: "key".to_owned(),
-                },
-                &venue,
+                &venue_context,
                 &clock,
             )
             .await
@@ -12396,6 +13012,180 @@ mod tests {
                         == pe_execution_core::LiveOrderPreparationFailure::PrePostRiskPriceExpired
             ) && event.timestamp == after_preparation
         }));
+    }
+
+    /// PASS: StopProducers reached while venue preparation is parked prevents the POST and
+    /// terminalizes the now-durable Prepared capability before it can be consumed.
+    #[tokio::test]
+    async fn recovery_rechecks_shutdown_after_parked_preparation() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(now.unix_timestamp());
+        let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+        let shutdown = state.config.shutdown.clone();
+        let journal_path = state.config.journal_path.clone();
+        let (pending, prepared) = stage_recoverable_approved(&mut state, now, None).await;
+        let current_account_state =
+            venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+        let account_binding = account_binding_fixture(
+            &pending.account_id,
+            "0x1111111111111111111111111111111111111111",
+        );
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let venue = RecoveryPostVenue {
+            client: reqwest::Client::new(),
+            order_url: "http://127.0.0.1:9/order".to_owned(),
+            prepared,
+            observed_at: now,
+            prepare_clock_millis: None,
+            prepare_advance_millis: 0,
+            post_attempts: Some(posts.clone()),
+            account_state: Some(current_account_state.clone()),
+            prepare_barrier: Some(barrier.clone()),
+            prepare_release: Some(release.clone()),
+        };
+        let task = tokio::spawn(async move {
+            let venue_context = RecoveryVenueContext {
+                venue: &venue,
+                account_binding: &account_binding,
+                custody_wallet: "0x1111111111111111111111111111111111111111",
+            };
+            resume_approved_with_venue(
+                &mut state,
+                &target,
+                pending,
+                RecoveryExecutionState {
+                    mode: LiveModeSnapshot {
+                        requested: LiveControlMode::LiveTiny,
+                        effective: LiveControlMode::LiveTiny,
+                    },
+                    account_state: current_account_state,
+                    binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
+                },
+                &venue_context,
+                || now,
+            )
+            .await
+        });
+        barrier.wait().await;
+        shutdown.advance(ShutdownPhase::StopProducers);
+        release.notify_one();
+
+        assert!(!task.await.unwrap().unwrap());
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        let events = replay_account(&journal_path, &AccountId::new("acct").unwrap()).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            LiveJournalPayload::OrderPreparationFailed(failed)
+                if failed.failure
+                    == pe_execution_core::LiveOrderPreparationFailure::PrePostAdmissionExpired
+        )));
+    }
+
+    /// PASS: an off/off transition or rotated binding observed after parked preparation prevents
+    /// every POST and records the corresponding terminal preparation failure.
+    #[tokio::test]
+    async fn recovery_rechecks_account_control_after_parked_preparation() {
+        for case in ["off", "rotated"] {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let mut snapshot = armed_snapshot("acct");
+            snapshot.fetched_at_unix = Some(now.unix_timestamp());
+            let mut state = fanout_state(&dir, db, snapshot, "http://127.0.0.1:9", None);
+            let live_accounts = state.config.live_accounts.clone();
+            let journal_path = state.config.journal_path.clone();
+            let (pending, prepared) = stage_recoverable_approved(&mut state, now, None).await;
+            let current_account_state =
+                venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+            let account_binding = account_binding_fixture(
+                &pending.account_id,
+                "0x1111111111111111111111111111111111111111",
+            );
+            let target = state
+                .config
+                .paper_state
+                .dispatch_targets("dispatch-finality")
+                .unwrap()
+                .remove(0);
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let release = Arc::new(tokio::sync::Notify::new());
+            let posts = Arc::new(AtomicUsize::new(0));
+            let venue = RecoveryPostVenue {
+                client: reqwest::Client::new(),
+                order_url: "http://127.0.0.1:9/order".to_owned(),
+                prepared,
+                observed_at: now,
+                prepare_clock_millis: None,
+                prepare_advance_millis: 0,
+                post_attempts: Some(posts.clone()),
+                account_state: Some(current_account_state.clone()),
+                prepare_barrier: Some(barrier.clone()),
+                prepare_release: Some(release.clone()),
+            };
+            let task = tokio::spawn(async move {
+                let venue_context = RecoveryVenueContext {
+                    venue: &venue,
+                    account_binding: &account_binding,
+                    custody_wallet: "0x1111111111111111111111111111111111111111",
+                };
+                resume_approved_with_venue(
+                    &mut state,
+                    &target,
+                    pending,
+                    RecoveryExecutionState {
+                        mode: LiveModeSnapshot {
+                            requested: LiveControlMode::LiveTiny,
+                            effective: LiveControlMode::LiveTiny,
+                        },
+                        account_state: current_account_state,
+                        binding: CredentialBindingIdentity {
+                            version: 1,
+                            key_id: "key".to_owned(),
+                        },
+                    },
+                    &venue_context,
+                    || now,
+                )
+                .await
+            });
+            barrier.wait().await;
+            let mut changed = armed_snapshot("acct");
+            changed.fetched_at_unix = Some(now.unix_timestamp());
+            if case == "off" {
+                changed.accounts[0].enabled = false;
+                changed.accounts[0].requested_live_mode = "off".to_owned();
+                changed.accounts[0].effective_live_mode = "off".to_owned();
+            } else {
+                changed.accounts[0].credential_binding = Some((2, "key-2".to_owned()));
+            }
+            live_accounts.store(changed);
+            release.notify_one();
+
+            assert!(!task.await.unwrap().unwrap(), "{case}");
+            assert_eq!(posts.load(Ordering::SeqCst), 0, "{case}");
+            let expected = if case == "rotated" {
+                pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged
+            } else {
+                pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired
+            };
+            let events = replay_account(&journal_path, &AccountId::new("acct").unwrap()).unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    LiveJournalPayload::OrderPreparationFailed(failed) if failed.failure == expected
+                )),
+                "{case}"
+            );
+        }
     }
 
     /// PASS: resolving the owner shutdown future leaves an Approved-but-unprepared admission
