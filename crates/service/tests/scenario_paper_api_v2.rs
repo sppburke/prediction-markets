@@ -75,11 +75,7 @@ async fn exact_paper_api_contract_uses_decimal_strings() {
         CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
     )
     .unwrap();
-    db.apply_financial_fill(
-        start,
-        None,
-        EventSeq(11),
-        &FinancialFillRecord {
+    db.apply_financial_fill(start, None, EventSeq(11), receipt(20, 3), 100, &FinancialFillRecord {
             idempotency_key: "wf|0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|g2:golden|condition-golden|0|buy|1800000000".to_owned(),
             market_id: market(),
             outcome_id: OutcomeId(0),
@@ -179,6 +175,8 @@ async fn paper_pnl_is_typed_unavailable_when_price_is_missing() {
         start,
         None,
         EventSeq(21),
+        receipt(20, 3),
+        100,
         &FinancialFillRecord {
             idempotency_key: "missing-price".to_owned(),
             market_id: market(),

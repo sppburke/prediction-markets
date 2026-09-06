@@ -7339,7 +7339,15 @@ mod tests {
         ));
         let other_start = append_receipt(3, 3);
         assert!(matches!(
-            db.apply_financial_fill(other_start, None, EventSeq(2), append_receipt(20, 3), 100, &fill, dec!(9.5)),
+            db.apply_financial_fill(
+                other_start,
+                None,
+                EventSeq(2),
+                append_receipt(20, 3),
+                100,
+                &fill,
+                dec!(9.5)
+            ),
             Err(PaperStateError::FinancialStartConflict)
         ));
 
