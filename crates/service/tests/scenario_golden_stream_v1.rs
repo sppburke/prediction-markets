@@ -67,8 +67,8 @@ use pe_service::supabase_state::{
 };
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityTransport, BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION,
-    CLOB_RESOLUTION_SCHEMA_VERSION, FixtureFetcher, LIVE_MARKET_PARSER_VERSION,
-    LIVE_MARKET_SCHEMA_VERSION, parse_activity_response, validate_live_market,
+    CLOB_RESOLUTION_SCHEMA_VERSION, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
+    PageFetcher, parse_activity_response, validate_live_market,
 };
 use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
@@ -536,24 +536,36 @@ fn golden_watchlist(wallets: &[WalletAddress]) -> Watchlist {
     }
 }
 
-fn golden_mid_cache(anchor_cutoff: i64) -> MidPriceCache<FixtureFetcher> {
+/// Gamma fixture that answers the production client's repeat-key batches
+/// (`condition_ids=A&condition_ids=B&…`) with every requested market it knows, in request order.
+struct GoldenGammaFetcher {
+    markets: HashMap<String, serde_json::Value>,
+}
+
+impl PageFetcher for GoldenGammaFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+        let query = url.split_once('?').map_or("", |(_, query)| query);
+        let markets = query
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("condition_ids="))
+            .filter_map(|condition| self.markets.get(condition).cloned())
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_vec(&markets).unwrap())
+    }
+}
+
+fn golden_mid_cache(anchor_cutoff: i64) -> MidPriceCache<GoldenGammaFetcher> {
     const BASE: &str = "fixture://gamma";
-    let responses = (0..QUALIFICATION_DAYS * COPIES_PER_DAY)
+    let markets = (0..QUALIFICATION_DAYS * COPIES_PER_DAY)
         .map(|index| {
             let source_unix = golden_source_unix(anchor_cutoff, index);
             let bodies = golden_trade_bodies(index, source_unix);
             let mut gamma: serde_json::Value = serde_json::from_slice(&bodies.gamma).unwrap();
             gamma[0]["outcomePrices"] = "[\"0.50\",\"0.50\"]".into();
-            (
-                format!(
-                    "{BASE}/markets?condition_ids={}&limit=500",
-                    bodies.condition.0
-                ),
-                serde_json::to_vec(&gamma).unwrap(),
-            )
+            (bodies.condition.0.clone(), gamma[0].take())
         })
         .collect();
-    MidPriceCache::with_fetcher(FixtureFetcher::new(responses), BASE.to_owned())
+    MidPriceCache::with_fetcher(GoldenGammaFetcher { markets }, BASE.to_owned())
 }
 
 struct GoldenLiveVenue;
@@ -1735,17 +1747,19 @@ async fn golden_source_stream_replays_exact_economic_core() {
         Arc::clone(&paper),
         leader_ledger,
         new_shared_health_with_ws(false, true, 90),
-        golden_mid_cache(anchor_cutoff).with_clock({
-            let hooks = hooks.clone();
-            Arc::new(move || {
-                OffsetDateTime::from_unix_timestamp(
-                    hooks
-                        .financial_clock_unix
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                )
-                .unwrap()
-            })
-        }),
+        golden_mid_cache(anchor_cutoff)
+            .with_source_log(source_log.clone())
+            .with_clock({
+                let hooks = hooks.clone();
+                Arc::new(move || {
+                    OffsetDateTime::from_unix_timestamp(
+                        hooks
+                            .financial_clock_unix
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                    .unwrap()
+                })
+            }),
         control_rx,
         None,
         authority.clone(),
