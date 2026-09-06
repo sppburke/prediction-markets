@@ -1249,25 +1249,40 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
         let Some(fill) = frame.legacy_fill() else {
             continue;
         };
+        let quantity = ShareAmount::from_whole(fill.intent.contracts.0)
+            .map_err(|error| anyhow::anyhow!("legacy paper quantity: {error}"))?;
+        let principal = CollateralAmount::from_decimal_exact(
+            fill.simulated_fill_price
+                .0
+                .checked_mul(quantity.to_decimal())
+                .ok_or_else(|| anyhow::anyhow!("legacy paper principal overflow"))?,
+        )
+        .map_err(|error| anyhow::anyhow!("legacy paper principal: {error}"))?;
         let record = FillRecord {
             idempotency_key: fill.intent.idempotency_key.clone(),
             market_id: fill.intent.market_id.clone(),
             outcome_id: fill.intent.outcome_id,
             side: fill.intent.side,
-            contracts: fill.intent.contracts.0,
+            quantity,
             fill_price: fill.simulated_fill_price,
+            principal,
+            fee: CollateralAmount::ZERO,
         };
         let source_trade_id = i64::try_from(seq.0)
             .ok()
-            .and_then(|event_seq| {
+            .and_then(|_| {
                 supabase_fill_from(&FillRow {
                     idempotency_key: record.idempotency_key.clone(),
                     market_id: record.market_id.clone(),
                     outcome_id: record.outcome_id,
                     side: record.side,
-                    contracts: record.contracts,
+                    quantity: record.quantity,
                     fill_price: record.fill_price,
-                    event_seq,
+                    principal: record.principal,
+                    fee: record.fee,
+                    event_seq: seq,
+                    prepared_seq: seq,
+                    source_receipt_seq: None,
                 })
             })
             .and_then(|row| row.source_trade_id)

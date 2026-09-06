@@ -11,7 +11,7 @@ use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, VenueMarketId,
 };
 use pe_event_log::AppendReceipt;
-use pe_paper_state::{FinancialFillRecord, PaperStateDb};
+use pe_paper_state::{FillRecord, PaperStateDb};
 use pe_service::market_end_cache::{MarketEndCache, MarketResolution};
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::paper_api::{PaperApiState, fills, pnl, positions, status};
@@ -81,7 +81,7 @@ async fn exact_paper_api_contract_uses_decimal_strings() {
         EventSeq(11),
         receipt(9, 9),
         1_700_000_000,
-        &FinancialFillRecord {
+        &FillRecord {
             idempotency_key: "wf|0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|g2:golden|condition-golden|0|buy|1800000000".to_owned(),
             market_id: market(),
             outcome_id: OutcomeId(0),
@@ -183,7 +183,7 @@ async fn paper_pnl_is_typed_unavailable_when_price_is_missing() {
         EventSeq(21),
         receipt(19, 19),
         1_700_000_000,
-        &FinancialFillRecord {
+        &FillRecord {
             idempotency_key: "missing-price".to_owned(),
             market_id: market(),
             outcome_id: OutcomeId(0),

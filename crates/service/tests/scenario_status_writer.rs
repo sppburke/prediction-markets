@@ -17,7 +17,8 @@
 use std::str::FromStr as _;
 
 use pe_core_types::{
-    EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
+    CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
+    VenueMarketId, WalletAddress,
 };
 use pe_paper_state::{AnchorInstallRecord, FillRecord, LeaderPositionRow, PaperStateDb};
 use pe_service::status_writer::{build_snapshot, write_snapshot};
@@ -46,8 +47,10 @@ fn seeded_db() -> (TempDir, PaperStateDb) {
         market_id: market(),
         outcome_id: OutcomeId(0),
         side: Side::Buy,
-        contracts: 10,
+        quantity: ShareAmount::from_whole(10).unwrap(),
         fill_price: Price(dec!(0.40)),
+        principal: CollateralAmount::from_decimal_exact(dec!(4)).unwrap(),
+        fee: CollateralAmount::ZERO,
     };
     db.commit_fill(
         &SourceTradeId("s1".to_string()),

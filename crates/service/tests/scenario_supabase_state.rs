@@ -49,7 +49,7 @@ use pe_execution_core::{
     SizingModeAudit,
 };
 use pe_paper_pnl::ResolutionStore;
-use pe_paper_state::{FillRecord, FillRow, FinancialFillRecord, LeaderPositionRow, PaperStateDb};
+use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
@@ -108,22 +108,30 @@ fn fill_pair(
     price: Decimal,
     seq: i64,
 ) -> (FillRecord, SupabaseFillRow) {
+    let quantity = ShareAmount::from_whole(contracts).unwrap();
+    let principal = CollateralAmount::from_decimal_exact(price * quantity.to_decimal()).unwrap();
     let record = FillRecord {
         idempotency_key: key.to_string(),
         market_id: market(),
         outcome_id: OutcomeId(0),
         side,
-        contracts,
+        quantity,
         fill_price: Price(price),
+        principal,
+        fee: CollateralAmount::ZERO,
     };
     let fill_row = FillRow {
         idempotency_key: record.idempotency_key.clone(),
         market_id: record.market_id.clone(),
         outcome_id: record.outcome_id,
         side: record.side,
-        contracts: record.contracts,
+        quantity: record.quantity,
         fill_price: record.fill_price,
-        event_seq: seq,
+        principal: record.principal,
+        fee: record.fee,
+        event_seq: EventSeq(u64::try_from(seq).unwrap()),
+        prepared_seq: EventSeq(u64::try_from(seq).unwrap()),
+        source_receipt_seq: None,
     };
     let sup_row = supabase_fill_from(&fill_row).expect("wf key parses to a SupabaseFillRow");
     (record, sup_row)
@@ -210,15 +218,18 @@ impl FakeSupabaseState {
 
     /// The v1-arithmetic apply (insert gate + netting + clamped debit), returning the row.
     fn apply(&self, row: &SupabaseFillRow) -> CanonicalFill {
+        const ATOMIC_SCALE: u64 = 1_000_000;
+        assert_eq!(row.fill.quantity.atomic() % ATOMIC_SCALE, 0);
+        let contracts = row.fill.quantity.atomic() / ATOMIC_SCALE;
         let mut bankroll = self.bankroll.lock().unwrap();
         let mut positions = self.positions.lock().unwrap();
         let pos_key = (row.fill.market_id.0.0.clone(), row.fill.outcome_id.0);
         let (long, short) = positions.get(&pos_key).copied().unwrap_or((0, 0));
         positions.insert(
             pos_key,
-            apply_fill_to_net(long, short, row.fill.side, row.fill.contracts),
+            apply_fill_to_net(long, short, row.fill.side, contracts),
         );
-        let notional = row.fill.fill_price.0 * Decimal::from(row.fill.contracts);
+        let notional = row.fill.principal.to_decimal();
         *bankroll = match row.fill.side {
             Side::Buy => (*bankroll - notional).max(Decimal::ZERO),
             Side::Sell => *bankroll + notional,
@@ -229,10 +240,12 @@ impl FakeSupabaseState {
                 market_id: row.fill.market_id.clone(),
                 outcome_id: row.fill.outcome_id,
                 side: row.fill.side,
-                contracts: row.fill.contracts,
+                quantity: row.fill.quantity,
                 fill_price: row.fill.fill_price,
+                principal: row.fill.principal,
+                fee: row.fill.fee,
             },
-            event_seq: EventSeq(u64::try_from(row.fill.event_seq).unwrap()),
+            event_seq: row.fill.event_seq,
             source_trade_id: row.source_trade_id.clone().unwrap_or_default(),
         };
         self.rows
@@ -351,10 +364,12 @@ impl SupabaseStateTrait for FakeSupabaseState {
         &self,
         row: &SupabaseFillRow,
     ) -> Result<FillV2Outcome, SupabaseStateError> {
-        if self.fail_all_commits || self.fail_commit_seq == Some(row.fill.event_seq) {
+        if self.fail_all_commits
+            || self.fail_commit_seq == Some(i64::try_from(row.fill.event_seq.0).unwrap())
+        {
             return Err(SupabaseStateError::Status(503, "injected".to_string()));
         }
-        if self.apply_then_error_seq == Some(row.fill.event_seq)
+        if self.apply_then_error_seq == Some(i64::try_from(row.fill.event_seq.0).unwrap())
             && !self
                 .rows
                 .lock()
@@ -368,7 +383,10 @@ impl SupabaseStateTrait for FakeSupabaseState {
                 "gateway timeout".to_string(),
             ));
         }
-        self.commit_calls.lock().unwrap().push(row.fill.event_seq);
+        self.commit_calls
+            .lock()
+            .unwrap()
+            .push(i64::try_from(row.fill.event_seq.0).unwrap());
         // v2 ordering (#511 R1): existing key FIRST — even if the market settled later.
         if let Some(existing) = self.rows.lock().unwrap().get(&row.fill.idempotency_key) {
             return Ok(FillV2Outcome::Existing {
@@ -468,8 +486,8 @@ impl SupabaseBootTrait for FakeSupabaseState {
                     Ok(pe_paper_state::PaperPositionRow {
                         market_id: MarketId(VenueMarketId(market_id.clone())),
                         outcome_id: OutcomeId(*outcome_id),
-                        long_contracts: *long_contracts,
-                        short_contracts: *short_contracts,
+                        long: ShareAmount::from_whole(*long_contracts).unwrap(),
+                        short: ShareAmount::from_whole(*short_contracts).unwrap(),
                     })
                 },
             )
@@ -723,7 +741,13 @@ async fn ac_authoritative_boot_rejects_a_physically_incomplete_final_frame() {
 async fn ac_authoritative_boot_replaces_the_complete_local_position_set() {
     let (dir, db) = db_with_bankroll(dec!(1000));
     let stale = MarketId(VenueMarketId("0xstale".to_owned()));
-    db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+    db.upsert_position(
+        &stale,
+        OutcomeId(0),
+        ShareAmount::from_whole(9).unwrap(),
+        ShareAmount::ZERO,
+    )
+    .unwrap();
     let fake = FakeSupabaseState::new(dec!(123.45));
     fake.positions
         .lock()
@@ -745,7 +769,13 @@ async fn ac_authoritative_boot_replaces_the_complete_local_position_set() {
 async fn ac_authoritative_boot_page_failure_mutates_no_local_authority() {
     let (dir, db) = db_with_bankroll(dec!(1000));
     let stale = MarketId(VenueMarketId("0xstale".to_owned()));
-    db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+    db.upsert_position(
+        &stale,
+        OutcomeId(0),
+        ShareAmount::from_whole(9).unwrap(),
+        ShareAmount::ZERO,
+    )
+    .unwrap();
     let failing = FakeSupabaseState {
         fail_boot_positions: true,
         ..FakeSupabaseState::new(dec!(123.45))
@@ -1320,7 +1350,7 @@ async fn active_fill_crash_matrix_converges_once() {
                     prepared_receipt.sequence,
                     source_receipt,
                     1_700_000_000,
-                    &FinancialFillRecord {
+                    &FillRecord {
                         idempotency_key: request.idempotency_key.clone(),
                         market_id: MarketId(VenueMarketId(request.market_id.clone())),
                         outcome_id: OutcomeId(request.outcome_id),
@@ -1361,7 +1391,7 @@ async fn active_fill_crash_matrix_converges_once() {
             "unexpected recovered Final count at {seam:?}"
         );
         assert_eq!(authority.prepared_mutations(), 1, "seam {seam:?}");
-        assert_eq!(state.list_financial_fills().unwrap().len(), 1);
+        assert_eq!(state.list_fills().unwrap().len(), 1);
         assert_eq!(
             state.financial_snapshot(1_800_000_001).unwrap().cash,
             dec!(9)

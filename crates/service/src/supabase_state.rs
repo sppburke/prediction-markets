@@ -29,8 +29,7 @@ use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Writer};
 use pe_execution_core::EconomicPrepared;
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{
-    FillRecord, FillRow, FinancialFillRecord, LeaderPositionRow, PaperPositionRow, PaperStateDb,
-    PaperStateError,
+    FillRecord, FillRow, LeaderPositionRow, PaperPositionRow, PaperStateDb, PaperStateError,
 };
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_source_polymarket_public::{
@@ -491,11 +490,11 @@ impl SupabaseStateClient {
                     outcome_id: OutcomeId(u16::try_from(r.outcome_id).map_err(|_| {
                         SupabaseStateError::Corrupt(format!("outcome_id {}", r.outcome_id))
                     })?),
-                    long_contracts: u64::try_from(r.long_contracts).map_err(|_| {
-                        SupabaseStateError::Corrupt(format!("long {}", r.long_contracts))
+                    long: ShareAmount::from_decimal_exact(r.long_contracts).map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("paper position long: {error}"))
                     })?,
-                    short_contracts: u64::try_from(r.short_contracts).map_err(|_| {
-                        SupabaseStateError::Corrupt(format!("short {}", r.short_contracts))
+                    short: ShareAmount::from_decimal_exact(r.short_contracts).map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("paper position short: {error}"))
                     })?,
                 })
             })
@@ -517,8 +516,8 @@ impl SupabaseStateClient {
         let body = serde_json::json!([{
             "market_id": row.market_id.0.0,
             "outcome_id": row.outcome_id.0,
-            "long_contracts": row.long_contracts,
-            "short_contracts": row.short_contracts,
+            "long_contracts": row.long.to_decimal().to_string(),
+            "short_contracts": row.short.to_decimal().to_string(),
         }]);
         self.post_upsert("paper_positions", "market_id,outcome_id", &body)
             .await
@@ -676,19 +675,31 @@ fn canonical_fill(row: FillV2RowJson) -> Result<CanonicalFill, SupabaseStateErro
     };
     let contracts = u64::try_from(row.contracts)
         .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row contracts {}", row.contracts)))?;
+    let quantity = ShareAmount::from_whole(contracts)
+        .map_err(|error| SupabaseStateError::Corrupt(format!("v2 row quantity: {error}")))?;
     let event_seq = u64::try_from(row.event_seq)
         .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row event_seq {}", row.event_seq)))?;
     let outcome_id = u16::try_from(row.outcome_id).map_err(|_| {
         SupabaseStateError::Corrupt(format!("v2 row outcome_id {}", row.outcome_id))
     })?;
+    let fill_price = Price::new(money(&row.fill_price, "v2 row fill_price")?)
+        .map_err(|error| SupabaseStateError::Corrupt(format!("v2 row fill_price: {error}")))?;
+    let principal = fill_price
+        .0
+        .checked_mul(quantity.to_decimal())
+        .ok_or_else(|| SupabaseStateError::Corrupt("v2 row principal overflow".to_owned()))?;
     Ok(CanonicalFill {
         record: FillRecord {
             idempotency_key: row.idempotency_key,
             market_id: MarketId(pe_core_types::VenueMarketId(row.market_id)),
             outcome_id: OutcomeId(outcome_id),
             side,
-            contracts,
-            fill_price: Price(money(&row.fill_price, "v2 row fill_price")?),
+            quantity,
+            fill_price,
+            principal: CollateralAmount::from_decimal_exact(principal).map_err(|error| {
+                SupabaseStateError::Corrupt(format!("v2 row principal: {error}"))
+            })?,
+            fee: CollateralAmount::ZERO,
         },
         event_seq: EventSeq(event_seq),
         source_trade_id: row.source_trade_id,
@@ -700,7 +711,14 @@ impl SupabaseStateTrait for SupabaseStateClient {
         &self,
         row: &SupabaseFillRow,
     ) -> Result<FillV2Outcome, SupabaseStateError> {
-        // Decimals as strings (no f64); the RPC casts text → numeric.
+        const ATOMIC_SCALE: u64 = 1_000_000;
+        if !row.fill.quantity.atomic().is_multiple_of(ATOMIC_SCALE) {
+            return Err(SupabaseStateError::Corrupt(
+                "legacy commit_fill_v2 cannot encode fractional shares".to_owned(),
+            ));
+        }
+        let contracts = row.fill.quantity.atomic() / ATOMIC_SCALE;
+        // Decimals as strings (no f64); the legacy RPC accepts whole contracts only.
         let body = serde_json::json!({
             "p_idempotency_key": row.fill.idempotency_key,
             "p_leader_wallet": row.leader_wallet,
@@ -708,10 +726,10 @@ impl SupabaseStateTrait for SupabaseStateClient {
             "p_market_id": row.fill.market_id.0.0,
             "p_outcome_id": row.fill.outcome_id.0,
             "p_side": side_str(row.fill.side),
-            "p_contracts": row.fill.contracts,
+            "p_contracts": contracts,
             "p_fill_price": row.fill.fill_price.0.to_string(),
             "p_entry_unix": row.entry_unix,
-            "p_event_seq": row.fill.event_seq,
+            "p_event_seq": row.fill.event_seq.0,
         });
         let value = self.post_rpc_json("commit_fill_v2", &body).await?;
         let resp: FillV2Resp = serde_json::from_value(value)
@@ -962,8 +980,8 @@ struct BankrollRow {
 struct PositionRow {
     market_id: String,
     outcome_id: i64,
-    long_contracts: i64,
-    short_contracts: i64,
+    long_contracts: Decimal,
+    short_contracts: Decimal,
 }
 
 // ── Write-through paths (RPC first, SQLite mirror second) ───────────────────────
@@ -1430,7 +1448,7 @@ pub(crate) fn apply_financial_result(
                     "fill Final canonical values differ from Prepared".to_owned(),
                 ));
             }
-            let record = FinancialFillRecord {
+            let record = FillRecord {
                 idempotency_key: request.idempotency_key,
                 market_id: MarketId(VenueMarketId(request.market_id)),
                 outcome_id: OutcomeId(request.outcome_id),
@@ -1682,9 +1700,25 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
             market_id: fill.intent.market_id.clone(),
             outcome_id: fill.intent.outcome_id,
             side: fill.intent.side,
-            contracts: fill.intent.contracts.0,
+            quantity: ShareAmount::from_whole(fill.intent.contracts.0).map_err(|error| {
+                SupabaseStateError::Corrupt(format!("legacy fill quantity: {error}"))
+            })?,
             fill_price: fill.simulated_fill_price,
-            event_seq: seq_i,
+            principal: CollateralAmount::from_decimal_exact(
+                fill.simulated_fill_price
+                    .0
+                    .checked_mul(Decimal::from(fill.intent.contracts.0))
+                    .ok_or_else(|| {
+                        SupabaseStateError::Corrupt("legacy fill principal overflow".to_owned())
+                    })?,
+            )
+            .map_err(|error| {
+                SupabaseStateError::Corrupt(format!("legacy fill principal: {error}"))
+            })?,
+            fee: CollateralAmount::ZERO,
+            event_seq: seq,
+            prepared_seq: seq,
+            source_receipt_seq: None,
         };
         let disposition = match supabase_fill_from(&fill_row) {
             // Non-`wf|` fill (no leader): cannot write `paper_fills.leader_wallet` (NOT
@@ -2339,8 +2373,8 @@ mod tests {
         db.upsert_position(
             &MarketId(VenueMarketId("0xstale".to_owned())),
             OutcomeId(0),
-            9,
-            0,
+            ShareAmount::from_whole(9).unwrap(),
+            ShareAmount::ZERO,
         )
         .unwrap();
 
@@ -2367,7 +2401,13 @@ mod tests {
         let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
         let stale = MarketId(VenueMarketId("0xstale".to_owned()));
         db.set_bankroll(Decimal::ONE).unwrap();
-        db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+        db.upsert_position(
+            &stale,
+            OutcomeId(0),
+            ShareAmount::from_whole(9).unwrap(),
+            ShareAmount::ZERO,
+        )
+        .unwrap();
 
         let result =
             supabase_authoritative_boot(&client(&base), &db, &dir.path().join("absent-paper.log"))

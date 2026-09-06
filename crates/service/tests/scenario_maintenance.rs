@@ -335,7 +335,9 @@ fn small_sample_consistent_bleeder_demoted() {
     // wallet_edge_stats → decide_evictions): 12 consistent −$12.5 settled fills fire
     // the knockout at a sample size where the old per-share R=2 gate was structurally
     // unable to fire (term2 = 13.98/(n−1) > 1 for all n ≤ 14).
-    use pe_core_types::{MarketId, OutcomeId, Price, Side, VenueMarketId};
+    use pe_core_types::{
+        CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, VenueMarketId,
+    };
     use pe_paper_pnl::ResolutionStore;
     use pe_paper_state::FillRow;
     use pe_service::demotion_stat::wallet_edge_stats;
@@ -356,9 +358,13 @@ fn small_sample_consistent_bleeder_demoted() {
             market_id: mid.clone(),
             outcome_id: OutcomeId(0),
             side: Side::Buy,
-            contracts: 25,
+            quantity: ShareAmount::from_whole(25).unwrap(),
             fill_price: Price(dec!(0.50)),
-            event_seq: i,
+            principal: CollateralAmount::from_decimal_exact(dec!(12.5)).unwrap(),
+            fee: CollateralAmount::ZERO,
+            event_seq: EventSeq(i),
+            prepared_seq: EventSeq(i),
+            source_receipt_seq: None,
         })
         .collect();
 

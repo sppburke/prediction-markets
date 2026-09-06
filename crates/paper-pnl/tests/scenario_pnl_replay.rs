@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pe_core_types::{
-    EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, VenueMarketId,
-    WalletAddress,
+    CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
+    VenueMarketId, WalletAddress,
 };
 use pe_paper_pnl::{PnlLedger, ResolutionStore};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
@@ -37,13 +37,16 @@ fn leader(market_id: MarketId, long: u64) -> LeaderPositionRow {
 }
 
 fn fill(key: &str, market_id: MarketId, side: Side, contracts: u64, price: Decimal) -> FillRecord {
+    let quantity = ShareAmount::from_whole(contracts).unwrap();
     FillRecord {
         idempotency_key: key.to_string(),
         market_id,
         outcome_id: OutcomeId(0),
         side,
-        contracts,
+        quantity,
         fill_price: Price(price),
+        principal: CollateralAmount::from_decimal_exact(price * quantity.to_decimal()).unwrap(),
+        fee: CollateralAmount::ZERO,
     }
 }
 

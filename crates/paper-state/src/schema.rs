@@ -82,7 +82,6 @@ CREATE TABLE IF NOT EXISTS fills (
     market_id       TEXT    NOT NULL,
     outcome_id      INTEGER NOT NULL,
     side            TEXT    NOT NULL CHECK(side IN ('buy', 'sell')),
-    contracts       INTEGER NOT NULL,
     quantity_str    TEXT    NOT NULL,
     fill_price_str  TEXT    NOT NULL,
     principal_str   TEXT    NOT NULL,
@@ -98,8 +97,6 @@ CREATE TABLE IF NOT EXISTS fills (
 CREATE TABLE IF NOT EXISTS positions (
     market_id       TEXT    NOT NULL,
     outcome_id      INTEGER NOT NULL,
-    long_contracts  INTEGER NOT NULL,
-    short_contracts INTEGER NOT NULL,
     long_str        TEXT    NOT NULL,
     short_str       TEXT    NOT NULL,
     PRIMARY KEY (market_id, outcome_id)

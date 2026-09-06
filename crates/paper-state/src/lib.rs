@@ -473,15 +473,6 @@ pub struct LegacyHistoryImport {
     pub already_imported: bool,
 }
 
-/// One of our own net paper positions in a `(market, outcome)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaperPositionRow {
-    pub market_id: MarketId,
-    pub outcome_id: OutcomeId,
-    pub long_contracts: u64,
-    pub short_contracts: u64,
-}
-
 /// Outcome of a local fill commit (#511). Both arms carry the post-commit bankroll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillCommitOutcome {
@@ -490,32 +481,6 @@ pub enum FillCommitOutcome {
     /// The market is already settled: seen + typed flip written, no fill applied —
     /// a fill here could never be credited (`settle_and_credit` retries credit zero).
     RefusedSettled(Decimal),
-}
-
-/// A paper fill to record. Built by the service tier from the executed `OrderIntent`
-/// and the `PaperFill` returned by the executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FillRecord {
-    pub idempotency_key: String,
-    pub market_id: MarketId,
-    pub outcome_id: OutcomeId,
-    pub side: Side,
-    pub contracts: u64,
-    pub fill_price: Price,
-}
-
-/// A recorded paper fill, read back from the `fills` table for inspection
-/// (dashboard, `/paper/fills`). The `idempotency_key` still encodes the leader,
-/// source trade id and observed-at bucket; callers parse it for those fields.
-#[derive(Debug, Clone)]
-pub struct FillRow {
-    pub idempotency_key: String,
-    pub market_id: MarketId,
-    pub outcome_id: OutcomeId,
-    pub side: Side,
-    pub contracts: u64,
-    pub fill_price: Price,
-    pub event_seq: i64,
 }
 
 /// One settled market, read back from the `settled_markets` table to hydrate the
@@ -532,18 +497,19 @@ pub struct SettledMarketRow {
     pub source_receipt_seq: Option<EventSeq>,
 }
 
-/// Exact local position used by the post-Start financial protocol (#545).
+/// The exact local paper position owner for both legacy recovery and the active era.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinancialPositionRow {
+pub struct PaperPositionRow {
     pub market_id: MarketId,
     pub outcome_id: OutcomeId,
     pub long: ShareAmount,
     pub short: ShareAmount,
 }
 
-/// Exact fill economics stored by one Prepared transition (#545).
+/// Exact paper fill economics. Schema-one recovery converts its private whole-contract
+/// payload into this public shape before touching the projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinancialFillRecord {
+pub struct FillRecord {
     pub idempotency_key: String,
     pub market_id: MarketId,
     pub outcome_id: OutcomeId,
@@ -554,9 +520,11 @@ pub struct FinancialFillRecord {
     pub fee: CollateralAmount,
 }
 
-/// Exact fill row returned by [`FinancialSnapshot`].
+/// Exact persisted fill row returned by [`PaperStateDb::list_fills`] and
+/// [`FinancialSnapshot`]. `event_seq` remains the paper-log frame identity; in the
+/// financial era it equals `prepared_seq`. Legacy migrated rows have no source receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinancialFillRow {
+pub struct FillRow {
     pub idempotency_key: String,
     pub market_id: MarketId,
     pub outcome_id: OutcomeId,
@@ -565,7 +533,9 @@ pub struct FinancialFillRow {
     pub fill_price: Price,
     pub principal: CollateralAmount,
     pub fee: CollateralAmount,
+    pub event_seq: EventSeq,
     pub prepared_seq: EventSeq,
+    pub source_receipt_seq: Option<EventSeq>,
 }
 
 /// Bounded coherent view of the financial projection. All fields are selected from one
@@ -573,9 +543,9 @@ pub struct FinancialFillRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinancialSnapshot {
     pub cash: Decimal,
-    pub positions: Vec<FinancialPositionRow>,
+    pub positions: Vec<PaperPositionRow>,
     pub settlements_7d: Vec<SettledMarketRow>,
-    pub fills_for_open_and_7d: Vec<FinancialFillRow>,
+    pub fills_for_open_and_7d: Vec<FillRow>,
     pub last_prepared_seq: Option<EventSeq>,
     pub start: Option<(EventSeq, blake3::Hash)>,
 }
@@ -2935,47 +2905,14 @@ impl PaperStateDb {
             .map_err(|_| PaperStateError::Internal(format!("settled_count {n} exceeds usize::MAX")))
     }
 
-    /// All recorded fills in chronological (event-log) order, newest last.
+    /// Exact lifetime fill history in Prepared/event-log order. Risk continues to use the bounded
+    /// transactional [`FinancialSnapshot`]; this reader preserves endpoint and maintenance scope.
     pub fn list_fills(&self) -> Result<Vec<FillRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT idempotency_key, market_id, outcome_id, side, contracts, fill_price_str, \
-             event_seq FROM fills ORDER BY event_seq ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (key, market, outcome, side, contracts, price_str, event_seq) = row?;
-            out.push(FillRow {
-                idempotency_key: key,
-                market_id: MarketId(VenueMarketId(market)),
-                outcome_id: OutcomeId(parse_u16(outcome)?),
-                side: parse_side(&side)?,
-                contracts: parse_u64(contracts)?,
-                fill_price: Price(parse_decimal(&price_str)?),
-                event_seq,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Exact lifetime fill history for the stable paper API. Risk continues to use the bounded
-    /// transactional [`FinancialSnapshot`]; this reader preserves the endpoint's lifetime scope.
-    pub fn list_financial_fills(&self) -> Result<Vec<FinancialFillRow>, PaperStateError> {
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT idempotency_key, market_id, outcome_id, side, quantity_str, \
-                    fill_price_str, principal_str, fee_str, prepared_seq \
+                    fill_price_str, principal_str, fee_str, event_seq, prepared_seq, \
+                    source_receipt_seq \
              FROM fills ORDER BY prepared_seq, idempotency_key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -2989,12 +2926,26 @@ impl PaperStateDb {
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<i64>>(10)?,
             ))
         })?;
         let mut result = Vec::new();
         for row in rows {
-            let (key, market, outcome, side, quantity, price, principal, fee, prepared) = row?;
-            result.push(FinancialFillRow {
+            let (
+                key,
+                market,
+                outcome,
+                side,
+                quantity,
+                price,
+                principal,
+                fee,
+                event,
+                prepared,
+                source_receipt,
+            ) = row?;
+            result.push(FillRow {
                 idempotency_key: key,
                 market_id: MarketId(VenueMarketId(market)),
                 outcome_id: OutcomeId(parse_u16(outcome)?),
@@ -3005,7 +2956,9 @@ impl PaperStateDb {
                 })?,
                 principal: parse_collateral_amount(&principal)?,
                 fee: parse_collateral_amount(&fee)?,
+                event_seq: EventSeq(parse_u64(event)?),
                 prepared_seq: EventSeq(parse_u64(prepared)?),
+                source_receipt_seq: source_receipt.map(parse_u64).transpose()?.map(EventSeq),
             });
         }
         Ok(result)
@@ -3191,7 +3144,7 @@ impl PaperStateDb {
         prepared_seq: EventSeq,
         source_receipt: AppendReceipt,
         causal_received_at_unix: i64,
-        fill: &FinancialFillRecord,
+        fill: &FillRecord,
         canonical_cash: Decimal,
     ) -> Result<FinancialApplyOutcome, PaperStateError> {
         if fill.outcome_id.0 > 1 {
@@ -3462,7 +3415,7 @@ impl PaperStateDb {
                     && (*long != ShareAmount::ZERO || *short != ShareAmount::ZERO)
             })
             .map(
-                |((market_id, outcome_id), (long, short))| FinancialPositionRow {
+                |((market_id, outcome_id), (long, short))| PaperPositionRow {
                     market_id,
                     outcome_id,
                     long,
@@ -3552,15 +3505,14 @@ impl PaperStateDb {
     /// All of our own paper position rows, for restoring open positions on restart.
     pub fn paper_positions(&self) -> Result<Vec<PaperPositionRow>, PaperStateError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT market_id, outcome_id, long_contracts, short_contracts FROM positions",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT market_id, outcome_id, long_str, short_str FROM positions")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -3569,8 +3521,8 @@ impl PaperStateDb {
             out.push(PaperPositionRow {
                 market_id: MarketId(VenueMarketId(market)),
                 outcome_id: OutcomeId(parse_u16(outcome)?),
-                long_contracts: parse_u64(long)?,
-                short_contracts: parse_u64(short)?,
+                long: parse_share_amount(&long)?,
+                short: parse_share_amount(&short)?,
             });
         }
         Ok(out)
@@ -3584,26 +3536,22 @@ impl PaperStateDb {
         &self,
         market_id: &MarketId,
         outcome_id: OutcomeId,
-        long_contracts: u64,
-        short_contracts: u64,
+        long: ShareAmount,
+        short: ShareAmount,
     ) -> Result<(), PaperStateError> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO positions \
-                (market_id, outcome_id, long_contracts, short_contracts, long_str, short_str) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                (market_id, outcome_id, long_str, short_str) \
+             VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
-                long_contracts = excluded.long_contracts, \
-                short_contracts = excluded.short_contracts, \
                 long_str = excluded.long_str, \
                 short_str = excluded.short_str",
             params![
                 market_id.to_string(),
                 i64::from(outcome_id.0),
-                to_i64(long_contracts)?,
-                to_i64(short_contracts)?,
-                long_contracts.to_string(),
-                short_contracts.to_string(),
+                long.to_decimal().to_string(),
+                short.to_decimal().to_string(),
             ],
         )?;
         Ok(())
@@ -3652,10 +3600,8 @@ impl PaperStateDb {
             encoded.push((
                 key.0,
                 i64::from(position.outcome_id.0),
-                to_i64(position.long_contracts)?,
-                to_i64(position.short_contracts)?,
-                position.long_contracts.to_string(),
-                position.short_contracts.to_string(),
+                position.long.to_decimal().to_string(),
+                position.short.to_decimal().to_string(),
             ));
         }
 
@@ -3670,27 +3616,18 @@ impl PaperStateDb {
         {
             let mut statement = tx.prepare(
                 "INSERT INTO positions \
-                 (market_id, outcome_id, long_contracts, short_contracts, long_str, short_str) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (market_id, outcome_id, long_str, short_str) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for (
-                index,
-                (market_id, outcome_id, long_contracts, short_contracts, long_str, short_str),
-            ) in encoded.into_iter().enumerate()
+            for (index, (market_id, outcome_id, long_str, short_str)) in
+                encoded.into_iter().enumerate()
             {
                 if fail_after == Some(index) {
                     return Err(PaperStateError::Internal(
                         "injected authoritative replacement failure".to_owned(),
                     ));
                 }
-                statement.execute(params![
-                    market_id,
-                    outcome_id,
-                    long_contracts,
-                    short_contracts,
-                    long_str,
-                    short_str,
-                ])?;
+                statement.execute(params![market_id, outcome_id, long_str, short_str,])?;
             }
         }
         tx.commit()?;
@@ -4347,27 +4284,20 @@ fn tx_record_fill(
     fill: &FillRecord,
     fill_seq: EventSeq,
 ) -> Result<bool, PaperStateError> {
-    let quantity = ShareAmount::from_whole(fill.contracts)
-        .map_err(|error| PaperStateError::Internal(error.to_string()))?;
-    let principal = fill
-        .fill_price
-        .0
-        .checked_mul(Decimal::from(fill.contracts))
-        .ok_or_else(|| PaperStateError::Internal("legacy fill principal overflow".to_owned()))?;
     let affected = tx.execute(
         "INSERT OR IGNORE INTO fills \
-            (idempotency_key, market_id, outcome_id, side, contracts, quantity_str, \
+            (idempotency_key, market_id, outcome_id, side, quantity_str, \
              fill_price_str, principal_str, fee_str, event_seq, prepared_seq) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '0', ?9, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         params![
             fill.idempotency_key,
             fill.market_id.to_string(),
             i64::from(fill.outcome_id.0),
             side_str(fill.side),
-            to_i64(fill.contracts)?,
-            quantity.to_decimal().to_string(),
+            fill.quantity.to_decimal().to_string(),
             fill.fill_price.0.to_string(),
-            principal.to_string(),
+            fill.principal.to_decimal().to_string(),
+            fill.fee.to_decimal().to_string(),
             to_i64(fill_seq.0)?,
         ],
     )?;
@@ -4376,61 +4306,37 @@ fn tx_record_fill(
 
 /// Apply a fill to our own net position for its `(market, outcome)`.
 fn tx_apply_our_position(tx: &Transaction<'_>, fill: &FillRecord) -> Result<(), PaperStateError> {
-    let market = fill.market_id.to_string();
-    let outcome = i64::from(fill.outcome_id.0);
-    let current: Option<(i64, i64)> = tx
-        .query_row(
-            "SELECT long_contracts, short_contracts FROM positions \
-             WHERE market_id = ?1 AND outcome_id = ?2",
-            params![market, outcome],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (long, short) = match current {
-        Some((l, s)) => (parse_u64(l)?, parse_u64(s)?),
-        None => (0, 0),
-    };
-    let (new_long, new_short) = apply_fill_to_net(long, short, fill.side, fill.contracts);
-    tx.execute(
-        "INSERT INTO positions \
-            (market_id, outcome_id, long_contracts, short_contracts, long_str, short_str) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
-            long_contracts = excluded.long_contracts, \
-            short_contracts = excluded.short_contracts, \
-            long_str = excluded.long_str, \
-            short_str = excluded.short_str",
-        params![
-            market,
-            outcome,
-            to_i64(new_long)?,
-            to_i64(new_short)?,
-            new_long.to_string(),
-            new_short.to_string(),
-        ],
-    )?;
-    Ok(())
+    tx_apply_financial_position(tx, fill)
 }
 
-/// Apply a fill's cash flow to the bankroll and persist it. BUY debits
-/// `fill_price × contracts` (clamped at zero so the bankroll never goes negative);
-/// SELL credits the same proceeds. Returns the new bankroll.
+/// Apply the fill's recorded exact principal and fee once. BUY debits principal plus fee;
+/// SELL credits principal less fee. The pre-Start path retains its historical zero-floor.
 fn tx_apply_bankroll(tx: &Transaction<'_>, fill: &FillRecord) -> Result<Decimal, PaperStateError> {
     let current = tx_read_bankroll(tx)?;
-    let qty = Decimal::from(fill.contracts);
-    let notional = fill
-        .fill_price
-        .0
-        .checked_mul(qty)
-        .ok_or_else(|| PaperStateError::Internal("fill notional overflow".to_string()))?;
+    let principal = fill.principal.to_decimal();
+    let fee = fill.fee.to_decimal();
     let new = match fill.side {
         Side::Buy => current
-            .checked_sub(notional)
+            .checked_sub(
+                principal
+                    .checked_add(fee)
+                    .ok_or_else(|| PaperStateError::Internal("fill debit overflow".to_owned()))?,
+            )
             .ok_or_else(|| PaperStateError::Internal("bankroll debit overflow".to_string()))?
             .max(Decimal::ZERO),
-        Side::Sell => current
-            .checked_add(notional)
-            .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?,
+        Side::Sell => {
+            let proceeds = principal
+                .checked_sub(fee)
+                .ok_or_else(|| PaperStateError::Internal("fill proceeds overflow".to_owned()))?;
+            if proceeds.is_sign_negative() {
+                return Err(PaperStateError::FinancialConflict(
+                    "fill fee exceeds sell principal".to_owned(),
+                ));
+            }
+            current
+                .checked_add(proceeds)
+                .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?
+        }
     };
     tx.execute(
         "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
@@ -4496,15 +4402,15 @@ fn tx_positions_for_market(
     market_id: &MarketId,
 ) -> Result<Vec<PaperPositionRow>, PaperStateError> {
     let mut statement = tx.prepare(
-        "SELECT market_id, outcome_id, long_contracts, short_contracts \
+        "SELECT market_id, outcome_id, long_str, short_str \
          FROM positions WHERE market_id = ?1",
     )?;
     let rows = statement.query_map(params![market_id.to_string()], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -4516,8 +4422,8 @@ fn tx_positions_for_market(
                 u16::try_from(outcome)
                     .map_err(|_| PaperStateError::Internal(format!("outcome_id {outcome}")))?,
             ),
-            long_contracts: parse_u64(long)?,
-            short_contracts: parse_u64(short)?,
+            long: parse_share_amount(&long)?,
+            short: parse_share_amount(&short)?,
         });
     }
     Ok(out)
@@ -4659,7 +4565,7 @@ fn tx_set_financial_last_prepared(
 }
 
 struct StoredFinancialFill {
-    record: FinancialFillRecord,
+    record: FillRecord,
     prepared_seq: EventSeq,
     source_receipt: AppendReceipt,
     causal_received_at_unix: i64,
@@ -4708,7 +4614,7 @@ fn tx_financial_fill(
             causal_received_at_unix,
         )| {
             Ok(StoredFinancialFill {
-                record: FinancialFillRecord {
+                record: FillRecord {
                     idempotency_key: idempotency_key.to_owned(),
                     market_id: MarketId(VenueMarketId(market)),
                     outcome_id: OutcomeId(parse_u16(outcome)?),
@@ -4736,25 +4642,22 @@ fn tx_financial_fill(
 
 fn tx_insert_financial_fill(
     tx: &Transaction<'_>,
-    fill: &FinancialFillRecord,
+    fill: &FillRecord,
     prepared_seq: EventSeq,
     source_receipt: AppendReceipt,
     causal_received_at_unix: i64,
 ) -> Result<(), PaperStateError> {
-    const ATOMIC_SCALE: u64 = 1_000_000;
-    let legacy_whole = fill.quantity.atomic() / ATOMIC_SCALE;
     tx.execute(
         "INSERT INTO fills \
-            (idempotency_key, market_id, outcome_id, side, contracts, quantity_str, \
+            (idempotency_key, market_id, outcome_id, side, quantity_str, \
              fill_price_str, principal_str, fee_str, event_seq, prepared_seq, \
              source_receipt_seq, source_receipt_hash, causal_received_at_unix) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)",
         params![
             fill.idempotency_key,
             fill.market_id.to_string(),
             i64::from(fill.outcome_id.0),
             side_str(fill.side),
-            to_i64(legacy_whole)?,
             fill.quantity.to_decimal().to_string(),
             fill.fill_price.0.to_string(),
             fill.principal.to_decimal().to_string(),
@@ -4770,9 +4673,8 @@ fn tx_insert_financial_fill(
 
 fn tx_apply_financial_position(
     tx: &Transaction<'_>,
-    fill: &FinancialFillRecord,
+    fill: &FillRecord,
 ) -> Result<(), PaperStateError> {
-    const ATOMIC_SCALE: u64 = 1_000_000;
     let current = tx
         .query_row(
             "SELECT long_str, short_str FROM positions \
@@ -4808,17 +4710,13 @@ fn tx_apply_financial_position(
     };
     tx.execute(
         "INSERT INTO positions \
-            (market_id, outcome_id, long_contracts, short_contracts, long_str, short_str) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            (market_id, outcome_id, long_str, short_str) \
+         VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
-            long_contracts = excluded.long_contracts, \
-            short_contracts = excluded.short_contracts, \
             long_str = excluded.long_str, short_str = excluded.short_str",
         params![
             fill.market_id.to_string(),
             i64::from(fill.outcome_id.0),
-            to_i64(new_long.atomic() / ATOMIC_SCALE)?,
-            to_i64(new_short.atomic() / ATOMIC_SCALE)?,
             new_long.to_decimal().to_string(),
             new_short.to_decimal().to_string(),
         ],
@@ -4830,7 +4728,7 @@ fn tx_apply_financial_position(
 fn read_financial_positions(
     conn: &Connection,
     open_only: bool,
-) -> Result<Vec<FinancialPositionRow>, PaperStateError> {
+) -> Result<Vec<PaperPositionRow>, PaperStateError> {
     let suffix = if open_only {
         " WHERE (CAST(p.long_str AS NUMERIC) > 0 OR CAST(p.short_str AS NUMERIC) > 0) \
            AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id)"
@@ -4852,7 +4750,7 @@ fn read_financial_positions(
     let mut result = Vec::new();
     for row in rows {
         let (market, outcome, long, short) = row?;
-        result.push(FinancialPositionRow {
+        result.push(PaperPositionRow {
             market_id: MarketId(VenueMarketId(market)),
             outcome_id: OutcomeId(parse_u16(outcome)?),
             long: parse_share_amount(&long)?,
@@ -4901,11 +4799,11 @@ fn read_settlements_window(
 
 #[derive(Clone)]
 struct CausalFinancialFill {
-    row: FinancialFillRow,
+    row: FillRow,
 }
 
 impl std::ops::Deref for CausalFinancialFill {
-    type Target = FinancialFillRow;
+    type Target = FillRow;
 
     fn deref(&self) -> &Self::Target {
         &self.row
@@ -4967,7 +4865,7 @@ fn read_causal_financial_fills(
                 .map_err(|_| PaperStateError::Corrupt("bad fill source receipt hash".to_owned()))?,
         };
         result.push(CausalFinancialFill {
-            row: FinancialFillRow {
+            row: FillRow {
                 idempotency_key: key,
                 market_id: MarketId(VenueMarketId(market)),
                 outcome_id: OutcomeId(parse_u16(outcome)?),
@@ -4978,7 +4876,9 @@ fn read_causal_financial_fills(
                 })?,
                 principal: parse_collateral_amount(&principal)?,
                 fee: parse_collateral_amount(&fee)?,
+                event_seq: EventSeq(parse_u64(prepared)?),
                 prepared_seq: EventSeq(parse_u64(prepared)?),
+                source_receipt_seq: Some(EventSeq(parse_u64(source_sequence)?)),
             },
         });
     }
@@ -5032,10 +4932,11 @@ fn read_financial_fills_window(
     conn: &Connection,
     lower: i64,
     upper: i64,
-) -> Result<Vec<FinancialFillRow>, PaperStateError> {
+) -> Result<Vec<FillRow>, PaperStateError> {
     let mut statement = conn.prepare(
         "SELECT f.idempotency_key, f.market_id, f.outcome_id, f.side, f.quantity_str, \
-                f.fill_price_str, f.principal_str, f.fee_str, f.prepared_seq \
+                f.fill_price_str, f.principal_str, f.fee_str, f.event_seq, f.prepared_seq, \
+                f.source_receipt_seq \
          FROM fills f \
          WHERE EXISTS (SELECT 1 FROM positions p WHERE p.market_id = f.market_id \
                          AND (CAST(p.long_str AS NUMERIC) > 0 \
@@ -5057,12 +4958,26 @@ fn read_financial_fills_window(
             row.get::<_, String>(6)?,
             row.get::<_, String>(7)?,
             row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, Option<i64>>(10)?,
         ))
     })?;
     let mut result = Vec::new();
     for row in rows {
-        let (key, market, outcome, side, quantity, price, principal, fee, prepared) = row?;
-        result.push(FinancialFillRow {
+        let (
+            key,
+            market,
+            outcome,
+            side,
+            quantity,
+            price,
+            principal,
+            fee,
+            event,
+            prepared,
+            source_receipt,
+        ) = row?;
+        result.push(FillRow {
             idempotency_key: key,
             market_id: MarketId(VenueMarketId(market)),
             outcome_id: OutcomeId(parse_u16(outcome)?),
@@ -5073,14 +4988,17 @@ fn read_financial_fills_window(
             })?,
             principal: parse_collateral_amount(&principal)?,
             fee: parse_collateral_amount(&fee)?,
+            event_seq: EventSeq(parse_u64(event)?),
             prepared_seq: EventSeq(parse_u64(prepared)?),
+            source_receipt_seq: source_receipt.map(parse_u64).transpose()?.map(EventSeq),
         });
     }
     Ok(result)
 }
 
-/// One-time, lossless v2 whole-contract financial migration (#545). SQLite permits
-/// transactional `ALTER TABLE`, so a failure leaves both the columns and user_version at v2.
+/// One-time, lossless v2 whole-contract financial migration (#545). The legacy columns are read
+/// only here and the tables are rebuilt without integer mirrors. SQLite transactional DDL leaves
+/// both the old tables and `user_version = 2` intact on any failure.
 fn migrate_v2_financial_columns(conn: &mut Connection) -> Result<(), PaperStateError> {
     let tx = conn.transaction()?;
     let meta_affinity: String = tx.query_row(
@@ -5100,69 +5018,151 @@ fn migrate_v2_financial_columns(conn: &mut Connection) -> Result<(), PaperStateE
              DROP TABLE meta_v2_financial_migration;",
         )?;
     }
-    for (table, column, declaration) in [
-        ("fills", "quantity_str", "quantity_str TEXT"),
-        ("fills", "principal_str", "principal_str TEXT"),
-        ("fills", "fee_str", "fee_str TEXT"),
-        ("fills", "prepared_seq", "prepared_seq INTEGER"),
-        ("fills", "source_receipt_seq", "source_receipt_seq INTEGER"),
-        ("fills", "source_receipt_hash", "source_receipt_hash TEXT"),
-        (
-            "fills",
-            "causal_received_at_unix",
-            "causal_received_at_unix INTEGER",
-        ),
-        ("positions", "long_str", "long_str TEXT"),
-        ("positions", "short_str", "short_str TEXT"),
-        ("settled_markets", "prepared_seq", "prepared_seq INTEGER"),
-        (
-            "settled_markets",
-            "source_receipt_seq",
-            "source_receipt_seq INTEGER",
-        ),
-    ] {
-        let present = tx
-            .prepare(&format!(
-                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
-            ))?
-            .exists(params![column])?;
-        if !present {
-            tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {declaration}"), [])?;
+    let fills_have_integer_owner = tx
+        .prepare("SELECT 1 FROM pragma_table_info('fills') WHERE name = 'contracts'")?
+        .exists([])?;
+    if fills_have_integer_owner {
+        let mut legacy_fills = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT idempotency_key, market_id, outcome_id, side, contracts, \
+                        fill_price_str, event_seq FROM fills",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (key, market, outcome, side, contracts, price, event_seq) = row?;
+                let whole = parse_u64(contracts)?;
+                let quantity = ShareAmount::from_whole(whole)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+                let price = Price::new(parse_decimal(&price)?).map_err(|error| {
+                    PaperStateError::Corrupt(format!("legacy fill {key} price: {error}"))
+                })?;
+                let principal = price.0.checked_mul(quantity.to_decimal()).ok_or_else(|| {
+                    PaperStateError::Corrupt(format!("legacy fill {key} overflow"))
+                })?;
+                let principal =
+                    CollateralAmount::from_decimal_exact(principal).map_err(|error| {
+                        PaperStateError::Corrupt(format!("legacy fill {key} principal: {error}"))
+                    })?;
+                legacy_fills.push((
+                    key,
+                    market,
+                    outcome,
+                    side,
+                    quantity.to_decimal().to_string(),
+                    price.0.to_string(),
+                    principal.to_decimal().to_string(),
+                    event_seq,
+                ));
+            }
         }
+        tx.execute_batch(
+            "ALTER TABLE fills RENAME TO fills_v2_financial_migration;
+             CREATE TABLE fills (
+                 idempotency_key TEXT PRIMARY KEY NOT NULL,
+                 market_id TEXT NOT NULL,
+                 outcome_id INTEGER NOT NULL,
+                 side TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+                 quantity_str TEXT NOT NULL,
+                 fill_price_str TEXT NOT NULL,
+                 principal_str TEXT NOT NULL,
+                 fee_str TEXT NOT NULL,
+                 event_seq INTEGER NOT NULL,
+                 prepared_seq INTEGER NOT NULL,
+                 source_receipt_seq INTEGER,
+                 source_receipt_hash TEXT,
+                 causal_received_at_unix INTEGER
+             );",
+        )?;
+        for (key, market, outcome, side, quantity, price, principal, event_seq) in legacy_fills {
+            tx.execute(
+                "INSERT INTO fills \
+                     (idempotency_key, market_id, outcome_id, side, quantity_str, \
+                      fill_price_str, principal_str, fee_str, event_seq, prepared_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '0', ?8, ?8)",
+                params![
+                    key, market, outcome, side, quantity, price, principal, event_seq
+                ],
+            )?;
+        }
+        tx.execute("DROP TABLE fills_v2_financial_migration", [])?;
     }
 
-    let mut legacy_fills = Vec::new();
-    {
-        let mut statement =
-            tx.prepare("SELECT idempotency_key, contracts, fill_price_str, event_seq FROM fills")?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
-        for row in rows {
-            legacy_fills.push(row?);
+    let positions_have_integer_owner = tx
+        .prepare("SELECT 1 FROM pragma_table_info('positions') WHERE name = 'long_contracts'")?
+        .exists([])?;
+    if positions_have_integer_owner {
+        let mut legacy_positions = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT market_id, outcome_id, long_contracts, short_contracts FROM positions",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (market, outcome, long, short) = row?;
+                let long = ShareAmount::from_whole(parse_u64(long)?)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+                let short = ShareAmount::from_whole(parse_u64(short)?)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+                legacy_positions.push((
+                    market,
+                    outcome,
+                    long.to_decimal().to_string(),
+                    short.to_decimal().to_string(),
+                ));
+            }
+        }
+        tx.execute_batch(
+            "ALTER TABLE positions RENAME TO positions_v2_financial_migration;
+             CREATE TABLE positions (
+                 market_id TEXT NOT NULL,
+                 outcome_id INTEGER NOT NULL,
+                 long_str TEXT NOT NULL,
+                 short_str TEXT NOT NULL,
+                 PRIMARY KEY (market_id, outcome_id)
+             );",
+        )?;
+        for (market, outcome, long, short) in legacy_positions {
+            tx.execute(
+                "INSERT INTO positions (market_id, outcome_id, long_str, short_str) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![market, outcome, long, short],
+            )?;
+        }
+        tx.execute("DROP TABLE positions_v2_financial_migration", [])?;
+    }
+
+    for (column, declaration) in [
+        ("prepared_seq", "prepared_seq INTEGER"),
+        ("source_receipt_seq", "source_receipt_seq INTEGER"),
+    ] {
+        let present = tx
+            .prepare("SELECT 1 FROM pragma_table_info('settled_markets') WHERE name = ?1")?
+            .exists(params![column])?;
+        if !present {
+            tx.execute(
+                &format!("ALTER TABLE settled_markets ADD COLUMN {declaration}"),
+                [],
+            )?;
         }
     }
-    for (key, contracts, price, event_seq) in legacy_fills {
-        let whole = parse_u64(contracts)?;
-        let principal = parse_decimal(&price)?
-            .checked_mul(Decimal::from(whole))
-            .ok_or_else(|| PaperStateError::Corrupt(format!("legacy fill {key} overflow")))?;
-        tx.execute(
-            "UPDATE fills SET quantity_str = ?2, principal_str = ?3, fee_str = '0', \
-                 prepared_seq = ?4 WHERE idempotency_key = ?1",
-            params![key, whole.to_string(), principal.to_string(), event_seq],
-        )?;
-    }
-    tx.execute(
-        "UPDATE positions SET long_str = CAST(long_contracts AS TEXT), \
-             short_str = CAST(short_contracts AS TEXT)",
-        [],
-    )?;
     tx.commit()?;
     Ok(())
 }
@@ -5195,21 +5195,6 @@ fn read_last_applied(conn: &Connection) -> Result<Option<u64>, PaperStateError> 
 }
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
-
-/// Net-position update, identical to `PositionLedger::ingest`: a BUY covers shorts
-/// first then adds to long; a SELL trims longs first then adds to short.
-fn apply_fill_to_net(long: u64, short: u64, side: Side, qty: u64) -> (u64, u64) {
-    match side {
-        Side::Buy => {
-            let covered = short.min(qty);
-            (long.saturating_add(qty - covered), short - covered)
-        }
-        Side::Sell => {
-            let trimmed = long.min(qty);
-            (long - trimmed, short.saturating_add(qty - trimmed))
-        }
-    }
-}
 
 fn apply_exact_fill_to_net(
     long: ShareAmount,
@@ -5469,14 +5454,21 @@ mod tests {
         }
     }
 
+    fn shares(whole: u64) -> ShareAmount {
+        ShareAmount::from_whole(whole).unwrap()
+    }
+
     fn fill(key: &str, side: Side, contracts: u64, price: Decimal) -> FillRecord {
+        let quantity = shares(contracts);
         FillRecord {
             idempotency_key: key.to_string(),
             market_id: market(),
             outcome_id: OutcomeId(0),
             side,
-            contracts,
+            quantity,
             fill_price: Price(price),
+            principal: CollateralAmount::from_decimal_exact(price * quantity.to_decimal()).unwrap(),
+            fee: CollateralAmount::ZERO,
         }
     }
 
@@ -5488,6 +5480,17 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+        let integer_mirrors: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM pragma_table_info('fills') WHERE name = 'contracts') +
+                    (SELECT COUNT(*) FROM pragma_table_info('positions')
+                        WHERE name IN ('long_contracts', 'short_contracts'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(integer_mirrors, 0);
     }
 
     #[test]
@@ -6114,8 +6117,8 @@ mod tests {
         assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(7));
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos.len(), 1);
-        assert_eq!(pos[0].long_contracts, 10);
-        assert_eq!(pos[0].short_contracts, 0);
+        assert_eq!(pos[0].long, shares(10));
+        assert_eq!(pos[0].short, ShareAmount::ZERO);
     }
 
     #[test]
@@ -6140,7 +6143,7 @@ mod tests {
             .unwrap();
         assert_eq!(new, FillCommitOutcome::Applied(dec!(97.40)));
         let pos = db.paper_positions().unwrap();
-        assert_eq!(pos[0].long_contracts, 6);
+        assert_eq!(pos[0].long, shares(6));
     }
 
     #[test]
@@ -6184,7 +6187,7 @@ mod tests {
         assert_eq!(new, FillCommitOutcome::Applied(dec!(995.0)));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(995.0)));
         let pos = db.paper_positions().unwrap();
-        assert_eq!(pos[0].long_contracts, 10);
+        assert_eq!(pos[0].long, shares(10));
     }
 
     #[test]
@@ -6337,15 +6340,15 @@ mod tests {
         db.upsert_position(
             &MarketId(VenueMarketId("0xopen".to_string())),
             OutcomeId(0),
-            3,
-            0,
+            shares(3),
+            ShareAmount::ZERO,
         )
         .unwrap();
         db.upsert_position(
             &MarketId(VenueMarketId("0xflat".to_string())),
             OutcomeId(0),
-            0,
-            0,
+            ShareAmount::ZERO,
+            ShareAmount::ZERO,
         )
         .unwrap();
         assert_eq!(db.positions_count().unwrap(), 1);
@@ -6426,29 +6429,32 @@ mod tests {
     #[test]
     fn upsert_position_round_trips_and_overwrites() {
         let (_dir, db) = db();
-        db.upsert_position(&market(), OutcomeId(0), 10, 3).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(10), shares(3))
+            .unwrap();
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos.len(), 1);
-        assert_eq!(pos[0].long_contracts, 10);
-        assert_eq!(pos[0].short_contracts, 3);
+        assert_eq!(pos[0].long, shares(10));
+        assert_eq!(pos[0].short, shares(3));
         // Same key overwrites (ON CONFLICT DO UPDATE).
-        db.upsert_position(&market(), OutcomeId(0), 0, 5).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), ShareAmount::ZERO, shares(5))
+            .unwrap();
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos.len(), 1);
-        assert_eq!(pos[0].long_contracts, 0);
-        assert_eq!(pos[0].short_contracts, 5);
+        assert_eq!(pos[0].long, ShareAmount::ZERO);
+        assert_eq!(pos[0].short, shares(5));
     }
 
     #[test]
     fn authoritative_replacement_deletes_stale_rows_atomically() {
         let (_dir, db) = db();
         db.set_bankroll(dec!(10)).unwrap();
-        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(5), ShareAmount::ZERO)
+            .unwrap();
         let replacement = PaperPositionRow {
             market_id: MarketId(VenueMarketId("0xfresh".to_owned())),
             outcome_id: OutcomeId(1),
-            long_contracts: 7,
-            short_contracts: 2,
+            long: shares(7),
+            short: shares(2),
         };
 
         db.replace_authoritative_state(dec!(42.5), std::slice::from_ref(&replacement))
@@ -6462,12 +6468,13 @@ mod tests {
     fn invalid_authoritative_replacement_leaves_prior_state_untouched() {
         let (_dir, db) = db();
         db.set_bankroll(dec!(10)).unwrap();
-        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(5), ShareAmount::ZERO)
+            .unwrap();
         let duplicate = PaperPositionRow {
             market_id: market(),
             outcome_id: OutcomeId(1),
-            long_contracts: 7,
-            short_contracts: 2,
+            long: shares(7),
+            short: shares(2),
         };
         let result = db.replace_authoritative_state(dec!(99), &[duplicate.clone(), duplicate]);
 
@@ -6476,7 +6483,7 @@ mod tests {
             Err(PaperStateError::DuplicateAuthoritativePosition { .. })
         ));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(10)));
-        assert_eq!(db.paper_positions().unwrap()[0].long_contracts, 5);
+        assert_eq!(db.paper_positions().unwrap()[0].long, shares(5));
     }
 
     #[cfg(feature = "scenario")]
@@ -6484,19 +6491,20 @@ mod tests {
     fn mid_transaction_authoritative_replacement_failure_rolls_back_every_write() {
         let (_dir, db) = db();
         db.set_bankroll(dec!(10)).unwrap();
-        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(5), ShareAmount::ZERO)
+            .unwrap();
         let replacements = [
             PaperPositionRow {
                 market_id: MarketId(VenueMarketId("0xfresh-1".to_owned())),
                 outcome_id: OutcomeId(0),
-                long_contracts: 7,
-                short_contracts: 2,
+                long: shares(7),
+                short: shares(2),
             },
             PaperPositionRow {
                 market_id: MarketId(VenueMarketId("0xfresh-2".to_owned())),
                 outcome_id: OutcomeId(1),
-                long_contracts: 8,
-                short_contracts: 3,
+                long: shares(8),
+                short: shares(3),
             },
         ];
 
@@ -6508,7 +6516,7 @@ mod tests {
         let prior = db.paper_positions().unwrap();
         assert_eq!(prior.len(), 1);
         assert_eq!(prior[0].market_id, market());
-        assert_eq!(prior[0].long_contracts, 5);
+        assert_eq!(prior[0].long, shares(5));
     }
 
     #[test]
@@ -6949,7 +6957,7 @@ mod tests {
         db.seed_financial_start(start).unwrap();
         db.seed_financial_start(start).unwrap();
 
-        let fill = FinancialFillRecord {
+        let fill = FillRecord {
             idempotency_key: "exact-fill".to_owned(),
             market_id: market(),
             outcome_id: OutcomeId(0),
@@ -7002,6 +7010,13 @@ mod tests {
             snapshot.fills_for_open_and_7d[0].fee.to_decimal(),
             dec!(0.000010)
         );
+        assert_eq!(snapshot.fills_for_open_and_7d[0].event_seq, EventSeq(11));
+        assert_eq!(snapshot.fills_for_open_and_7d[0].prepared_seq, EventSeq(11));
+        assert_eq!(
+            snapshot.fills_for_open_and_7d[0].source_receipt_seq,
+            Some(fill_source.sequence)
+        );
+        assert_eq!(db.list_fills().unwrap(), snapshot.fills_for_open_and_7d);
 
         let source = append_receipt(40, 2);
         let credit = CollateralAmount::from_decimal_exact(dec!(0.666666)).unwrap();
@@ -7040,7 +7055,7 @@ mod tests {
         db.init_bankroll(dec!(10)).unwrap();
         let start = append_receipt(10, 1);
         db.seed_financial_start(start).unwrap();
-        let first = FinancialFillRecord {
+        let first = FillRecord {
             idempotency_key: "first".to_owned(),
             market_id: market(),
             outcome_id: OutcomeId(0),
@@ -7061,7 +7076,7 @@ mod tests {
         )
         .unwrap();
         let later_market = MarketId(VenueMarketId("later-market".to_owned()));
-        let later = FinancialFillRecord {
+        let later = FillRecord {
             idempotency_key: "later".to_owned(),
             market_id: later_market.clone(),
             outcome_id: OutcomeId(1),
@@ -7123,7 +7138,7 @@ mod tests {
         reader.init_bankroll(dec!(10)).unwrap();
         let start = append_receipt(10, 1);
         reader.seed_financial_start(start).unwrap();
-        let fill = FinancialFillRecord {
+        let fill = FillRecord {
             idempotency_key: "concurrent-fill".to_owned(),
             market_id: market(),
             outcome_id: OutcomeId(0),
@@ -7221,7 +7236,7 @@ mod tests {
         db.init_bankroll(dec!(10)).unwrap();
         let start = append_receipt(1, 1);
         db.seed_financial_start(start).unwrap();
-        let fill = FinancialFillRecord {
+        let fill = FillRecord {
             idempotency_key: "f".to_owned(),
             market_id: market(),
             outcome_id: OutcomeId(0),
@@ -7522,7 +7537,7 @@ mod tests {
                 "changed resolution {field} must conflict"
             );
         }
-        let snapshot = db.financial_snapshot(10).unwrap();
+        let snapshot = db.financial_snapshot(100).unwrap();
         assert_eq!(snapshot.cash, dec!(10));
         assert_eq!(snapshot.last_prepared_seq, Some(EventSeq(3)));
         assert_eq!(snapshot.settlements_7d.len(), 1);
@@ -7546,8 +7561,10 @@ mod tests {
             market_id: market(),
             outcome_id: OutcomeId(0),
             side: Side::Buy,
-            contracts: 2,
+            quantity: shares(2),
             fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+            fee: CollateralAmount::ZERO,
         };
         db.commit_fill(
             &SourceTradeId("legacy-source".to_owned()),
@@ -7618,5 +7635,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(position, ("3".to_owned(), "0".to_owned()));
+        let integer_mirrors: i64 = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM pragma_table_info('fills') WHERE name = 'contracts') +
+                    (SELECT COUNT(*) FROM pragma_table_info('positions')
+                        WHERE name IN ('long_contracts', 'short_contracts'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(integer_mirrors, 0);
     }
 }

@@ -120,10 +120,7 @@ pub async fn positions(
 pub async fn fills(
     Extension(state): Extension<Arc<PaperApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
-    let fills = state
-        .paper_state
-        .list_financial_fills()
-        .map_err(internal_err)?;
+    let fills = state.paper_state.list_fills().map_err(internal_err)?;
     let settled = state
         .paper_state
         .list_settled_markets()

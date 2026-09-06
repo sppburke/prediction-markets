@@ -21,7 +21,7 @@ use pe_execution_core::{
 };
 use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{
-    DecisionPendingState, FinancialFillRow, FinancialPositionRow, FinancialSnapshot, PaperStateDb,
+    DecisionPendingState, FillRow, FinancialSnapshot, PaperPositionRow, PaperStateDb,
     SettledMarketRow,
 };
 use pe_resolver_card::{
@@ -348,7 +348,7 @@ struct CausalFinancialState {
 struct RiskReplayContext<'a> {
     cash: Decimal,
     positions: &'a [OpenPosition],
-    fills: &'a [FinancialFillRow],
+    fills: &'a [FillRow],
     settlements: &'a [SettledMarketRow],
     last_completed: Option<EventSeq>,
     start_receipt: AppendReceipt,
@@ -436,7 +436,7 @@ async fn verify_qualification(
     let mut prepared = BTreeMap::<(u64, String), &FinancialPayload>::new();
     let mut completed_fills = Vec::new();
     let mut open_positions: Vec<OpenPosition> = Vec::new();
-    let mut financial_fills = Vec::<FinancialFillRow>::new();
+    let mut financial_fills = Vec::<FillRow>::new();
     let mut financial_settlements = Vec::<SettledMarketRow>::new();
     let mut completed_financial_facts = Vec::<CompletedFinancialFact>::new();
     let mut economic_hashes = Vec::new();
@@ -550,7 +550,7 @@ async fn verify_qualification(
                                 economic.market.side,
                                 operation.observed_at_bucket,
                             );
-                        financial_fills.push(FinancialFillRow {
+                        financial_fills.push(FillRow {
                             idempotency_key,
                             market_id: MarketId(VenueMarketId(economic.market.market_id.clone())),
                             outcome_id: OutcomeId(u16::from(economic.market.outcome_index)),
@@ -559,7 +559,12 @@ async fn verify_qualification(
                             fill_price: canonical.fill_price,
                             principal: canonical.principal,
                             fee: canonical.fee,
+                            event_seq: prepared_receipt.sequence,
                             prepared_seq: prepared_receipt.sequence,
+                            source_receipt_seq: economic
+                                .observation
+                                .as_ref()
+                                .map(|value| value.source_receipt.sequence),
                         });
                         let observation = economic.observation.as_ref().ok_or_else(|| {
                             QualificationError::InsufficientEvidence(
@@ -1342,7 +1347,7 @@ fn replayed_financial_snapshot(
     let positions = context
         .positions
         .iter()
-        .map(|position| FinancialPositionRow {
+        .map(|position| PaperPositionRow {
             market_id: MarketId(VenueMarketId(position.market_id.clone())),
             outcome_id: OutcomeId(u16::from(position.outcome_index)),
             long: ShareAmount::from_atomic(position.shares_atomic),
@@ -1387,7 +1392,7 @@ fn replayed_financial_snapshot(
 async fn replayed_risk_prices(
     price_receipts: &[AppendReceipt],
     evaluated_at_unix_ms: i64,
-    positions: &[FinancialPositionRow],
+    positions: &[PaperPositionRow],
     source: &BTreeMap<u64, SourceObservation>,
 ) -> Result<HashMap<(MarketId, OutcomeId), Price>, QualificationError> {
     if price_receipts
@@ -3478,7 +3483,7 @@ mod tests {
             this_hash: blake3::hash(b"gamma-risk-price"),
         };
         let market = MarketId(VenueMarketId("condition-a".to_owned()));
-        let position = FinancialPositionRow {
+        let position = PaperPositionRow {
             market_id: market.clone(),
             outcome_id: OutcomeId(1),
             long: ShareAmount::from_atomic(1_000_000),
