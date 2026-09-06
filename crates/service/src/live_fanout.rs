@@ -1978,6 +1978,10 @@ pub(crate) fn derive_projection_rows_with_sources(
         }
         match &event.payload {
             LiveJournalPayload::OrderPrepared(order) => {
+                let binding = current_account_binding
+                    .as_ref()
+                    .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
+                verify_prepared_account_evidence(order, binding)?;
                 let key = order.identity.idempotency_key.clone();
                 if let Some((existing_seq, existing, _)) = prepared_orders.get(&key) {
                     if *existing_seq != event.seq || existing.as_ref() != order.as_ref() {
@@ -1990,6 +1994,12 @@ pub(crate) fn derive_projection_rows_with_sources(
                     );
                     prepared_orders.insert(key, (event.seq, order.clone(), false));
                 }
+            }
+            LiveJournalPayload::AdmissionEvaluated(admission) => {
+                let binding = current_account_binding
+                    .as_ref()
+                    .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
+                verify_admission_account_evidence(admission, binding)?;
             }
             LiveJournalPayload::OrderPosted(posted) => {
                 let Some((prepared_seq, prepared, _)) =
@@ -2394,8 +2404,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                     &bounded.custody_positions,
                 )?;
             }
-            LiveJournalPayload::AdmissionEvaluated(_)
-            | LiveJournalPayload::OrderPreparationFailed(_)
+            LiveJournalPayload::OrderPreparationFailed(_)
             | LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::RedemptionRequested(_)
             | LiveJournalPayload::RedemptionTransactionIdentified(_)
@@ -2526,15 +2535,17 @@ fn same_finalized_fill(left: &OrderFillFinalizedAudit, right: &OrderFillFinalize
     left == right
 }
 
-fn verify_account_state(
-    account: &pe_execution_core::LiveAccountStateAudit,
+fn verify_account_attempts(
+    evidence: &[RawHttpAttempt],
+    request_descriptor_hashes: &[String],
+    evidence_hashes: &[String],
     binding: &LiveAccountBindingAudit,
 ) -> Result<(), ProjectionReducerError> {
     if !binding.is_valid_for(&binding.account_id) {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
-    let mut request_descriptor_hashes = account.request_descriptor_hashes.iter();
-    for attempt in &account.evidence {
+    let mut retained_descriptors = request_descriptor_hashes.iter();
+    for attempt in evidence {
         let RawHttpAttempt::Response(response) = attempt else {
             continue;
         };
@@ -2545,20 +2556,33 @@ fn verify_account_state(
             0,
             response.ordered_query.clone(),
         );
-        let retained_descriptor_hash = request_descriptor_hashes
+        let retained_descriptor_hash = retained_descriptors
             .next()
             .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
         verify_http_response_request(&descriptor, retained_descriptor_hash)
             .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     }
-    if request_descriptor_hashes.next().is_some() {
+    if retained_descriptors.next().is_some() {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
-    let evidence_hashes = http_attempt_hashes(&account.evidence)
+    let expected_hashes = http_attempt_hashes(evidence)
         .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    if evidence_hashes != account.evidence_hashes {
+    if expected_hashes != evidence_hashes {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
+    Ok(())
+}
+
+pub(crate) fn verify_account_state(
+    account: &pe_execution_core::LiveAccountStateAudit,
+    binding: &LiveAccountBindingAudit,
+) -> Result<(), ProjectionReducerError> {
+    verify_account_attempts(
+        &account.evidence,
+        &account.request_descriptor_hashes,
+        &account.evidence_hashes,
+        binding,
+    )?;
     let expected = classify_account_responses(
         account.evidence.clone(),
         account.selected_spender.clone(),
@@ -2571,6 +2595,65 @@ fn verify_account_state(
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
     Ok(())
+}
+
+pub(crate) fn verify_admission_account_evidence(
+    admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
+    binding: &LiveAccountBindingAudit,
+) -> Result<(), ProjectionReducerError> {
+    let account_read_failed = matches!(
+        admission.verdict,
+        pe_execution_core::LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountStateUnavailable(_)
+        )
+    );
+    let has_failure_evidence = !admission.account_read_failure_evidence.is_empty()
+        || !admission
+            .account_read_failure_request_descriptor_hashes
+            .is_empty()
+        || !admission.account_read_failure_evidence_hashes.is_empty();
+    let needs_binding = admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved
+        || admission.account_state.is_some()
+        || account_read_failed
+        || has_failure_evidence;
+    if !needs_binding {
+        return Ok(());
+    }
+    if !binding.is_valid_for_frozen_credential(&binding.account_id, &admission.frozen_binding)
+        || admission.current_binding != binding.credential
+    {
+        return Err(ProjectionReducerError::InvalidAccountEvidence);
+    }
+    if let Some(account_state) = &admission.account_state {
+        verify_account_state(account_state, binding)?;
+    }
+    if has_failure_evidence {
+        verify_account_attempts(
+            &admission.account_read_failure_evidence,
+            &admission.account_read_failure_request_descriptor_hashes,
+            &admission.account_read_failure_evidence_hashes,
+            binding,
+        )?;
+    }
+    if (admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved
+        && admission.account_state.is_none())
+        || (account_read_failed
+            && (admission.account_state.is_some()
+                || admission.account_read_failure_evidence.is_empty()))
+    {
+        return Err(ProjectionReducerError::InvalidAccountEvidence);
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_prepared_account_evidence(
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    binding: &LiveAccountBindingAudit,
+) -> Result<(), ProjectionReducerError> {
+    if !binding.is_valid_for_frozen_credential(&binding.account_id, &prepared.frozen_binding) {
+        return Err(ProjectionReducerError::InvalidAccountEvidence);
+    }
+    verify_account_state(&prepared.account_state, binding)
 }
 
 fn verify_account_binding(
@@ -7011,20 +7094,7 @@ mod tests {
                 key_id: "key".to_owned(),
             },
             economic,
-            account_state: pe_execution_core::LiveAccountStateAudit {
-                observed_at: OffsetDateTime::UNIX_EPOCH,
-                closed_only: false,
-                geoblocked: false,
-                selected_spender: "spender".to_owned(),
-                collateral_balance: cash,
-                allowance: cash,
-                reconciled_free_collateral: cash,
-                schema_version: 1,
-                parser_version: 1,
-                evidence: Vec::new(),
-                request_descriptor_hashes: Vec::new(),
-                evidence_hashes: Vec::new(),
-            },
+            account_state: account_state_fixture(cash, OffsetDateTime::UNIX_EPOCH),
             prepared: pe_venue_polymarket::PreparedPolymarketBuy {
                 condition_id,
                 outcome_id: OutcomeId(0),
@@ -7057,6 +7127,24 @@ mod tests {
                 metadata_hashes: Vec::new(),
                 worst_case_debit: CollateralAmount::from_atomic(2_500_120),
             },
+        })
+    }
+
+    fn approved_admission(
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    ) -> Box<pe_execution_core::LiveAdmissionEvaluationAudit> {
+        Box::new(pe_execution_core::LiveAdmissionEvaluationAudit {
+            identity: prepared.identity.clone(),
+            frozen_binding: prepared.frozen_binding.clone(),
+            current_binding: prepared.frozen_binding.clone(),
+            requested_mode: LiveControlMode::LiveTiny,
+            effective_mode: LiveControlMode::LiveTiny,
+            economic: prepared.economic.clone(),
+            account_state: Some(prepared.account_state.clone()),
+            account_read_failure_evidence: Vec::new(),
+            account_read_failure_request_descriptor_hashes: Vec::new(),
+            account_read_failure_evidence_hashes: Vec::new(),
+            verdict: pe_execution_core::LiveAdmissionVerdict::Approved,
         })
     }
 
@@ -8321,6 +8409,213 @@ mod tests {
                 pe_venue_polymarket::CanaryV2Client::negrisk_spender().unwrap();
         }
         assert!(derive_with_baseline_evidence(&account_id, &[negrisk], &[]).is_ok());
+    }
+
+    /// PASS: approved admission and Prepared account reads are accepted only when their request
+    /// descriptors bind the active Baseline account; failed reads retain the same binding check.
+    #[test]
+    fn admission_and_prepared_account_evidence_bind_the_active_baseline() {
+        let account_a = AccountId::new("account").unwrap();
+        let account_b = AccountId::new("account-b").unwrap();
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let binding_a = account_binding_fixture(&account_a, wallet);
+        let binding_b = account_binding_fixture(&account_b, wallet);
+        let prepared = finality_prepared();
+        let event = |seq, payload| LiveJournalEvent {
+            account_id: account_a.clone(),
+            seq,
+            timestamp: OffsetDateTime::from_unix_timestamp(i64::try_from(seq).unwrap()).unwrap(),
+            payload,
+        };
+
+        let valid_admission = approved_admission(&prepared);
+        crate::qualification::verify_qualification_admission_account(
+            &account_a,
+            Some(&binding_a),
+            &valid_admission,
+        )
+        .unwrap();
+        crate::qualification::verify_qualification_prepared_account(
+            &account_a,
+            Some(&binding_a),
+            &prepared.frozen_binding,
+            &prepared.account_state,
+        )
+        .unwrap();
+        let valid = vec![
+            baseline_event(&account_a, 1),
+            event(2, LiveJournalPayload::AdmissionEvaluated(valid_admission)),
+            event(3, LiveJournalPayload::OrderPrepared(prepared.clone())),
+        ];
+        assert!(derive_with_baseline_evidence(&account_a, &valid, &[]).is_ok());
+
+        let account_b_state = account_state_fixture_for_binding(
+            CollateralAmount::from_atomic(10_000_000),
+            OffsetDateTime::UNIX_EPOCH,
+            &binding_b,
+        );
+        let mut substituted_prepared = prepared.clone();
+        substituted_prepared.account_state = account_b_state.clone();
+        let substituted_admission = approved_admission(&substituted_prepared);
+        assert!(
+            crate::qualification::verify_qualification_admission_account(
+                &account_a,
+                Some(&binding_a),
+                &substituted_admission,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::qualification::verify_qualification_prepared_account(
+                &account_a,
+                Some(&binding_a),
+                &substituted_prepared.frozen_binding,
+                &substituted_prepared.account_state,
+            )
+            .is_err()
+        );
+        let substituted = vec![
+            baseline_event(&account_a, 1),
+            event(
+                2,
+                LiveJournalPayload::AdmissionEvaluated(substituted_admission),
+            ),
+            event(
+                3,
+                LiveJournalPayload::OrderPrepared(substituted_prepared.clone()),
+            ),
+        ];
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_a, &substituted, &[]),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut prepared_only_substitution = valid.clone();
+        if let LiveJournalPayload::OrderPrepared(order) = &mut prepared_only_substitution[2].payload
+        {
+            order.account_state = account_b_state.clone();
+        }
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_a, &prepared_only_substitution, &[]),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut credential_substitution = valid.clone();
+        if let LiveJournalPayload::AdmissionEvaluated(admission) =
+            &mut credential_substitution[1].payload
+        {
+            admission.frozen_binding.version = 2;
+            admission.current_binding.version = 2;
+            assert!(
+                crate::qualification::verify_qualification_admission_account(
+                    &account_a,
+                    Some(&binding_a),
+                    admission,
+                )
+                .is_err()
+            );
+        }
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_a, &credential_substitution, &[]),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut descriptor_tamper = valid.clone();
+        if let LiveJournalPayload::AdmissionEvaluated(admission) = &mut descriptor_tamper[1].payload
+            && let Some(account_state) = &mut admission.account_state
+        {
+            account_state.request_descriptor_hashes[0] = "rewritten".to_owned();
+            assert!(
+                crate::qualification::verify_qualification_prepared_account(
+                    &account_a,
+                    Some(&binding_a),
+                    &admission.frozen_binding,
+                    account_state,
+                )
+                .is_err()
+            );
+            assert!(
+                crate::qualification::verify_qualification_admission_account(
+                    &account_a,
+                    Some(&binding_a),
+                    admission,
+                )
+                .is_err()
+            );
+        }
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_a, &descriptor_tamper, &[]),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut refused = approved_admission(&prepared);
+        let account_state = refused.account_state.take().unwrap();
+        refused.account_read_failure_evidence = vec![account_state.evidence[0].clone()];
+        refused.account_read_failure_request_descriptor_hashes =
+            vec![account_state.request_descriptor_hashes[0].clone()];
+        refused.account_read_failure_evidence_hashes =
+            http_attempt_hashes(&refused.account_read_failure_evidence).unwrap();
+        refused.verdict = pe_execution_core::LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountStateUnavailable(
+                pe_execution_core::LiveAccountReadFailure::Authentication,
+            ),
+        );
+        let refused_events = vec![
+            baseline_event(&account_a, 1),
+            event(2, LiveJournalPayload::AdmissionEvaluated(refused.clone())),
+        ];
+        crate::qualification::verify_qualification_admission_account(
+            &account_a,
+            Some(&binding_a),
+            &refused,
+        )
+        .unwrap();
+        assert!(derive_with_baseline_evidence(&account_a, &refused_events, &[]).is_ok());
+
+        let mut refused_substitution = refused.clone();
+        refused_substitution.account_read_failure_evidence =
+            vec![account_b_state.evidence[0].clone()];
+        refused_substitution.account_read_failure_request_descriptor_hashes =
+            vec![account_b_state.request_descriptor_hashes[0].clone()];
+        refused_substitution.account_read_failure_evidence_hashes =
+            http_attempt_hashes(&refused_substitution.account_read_failure_evidence).unwrap();
+        assert!(
+            crate::qualification::verify_qualification_admission_account(
+                &account_a,
+                Some(&binding_a),
+                &refused_substitution,
+            )
+            .is_err()
+        );
+        let refused_substituted_events = vec![
+            baseline_event(&account_a, 1),
+            event(
+                2,
+                LiveJournalPayload::AdmissionEvaluated(refused_substitution),
+            ),
+        ];
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_a, &refused_substituted_events, &[]),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        refused.account_read_failure_request_descriptor_hashes[0] = "rewritten".to_owned();
+        assert!(
+            crate::qualification::verify_qualification_admission_account(
+                &account_a,
+                Some(&binding_a),
+                &refused,
+            )
+            .is_err()
+        );
+        let refused_tamper = vec![
+            baseline_event(&account_a, 1),
+            event(2, LiveJournalPayload::AdmissionEvaluated(refused)),
+        ];
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_a, &refused_tamper, &[]),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
     }
 
     /// PASS: valid account-B responses and empty position pages cannot establish account A's

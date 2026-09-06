@@ -1381,6 +1381,64 @@ fn paper_live_wrapper_bases(
     Ok(bases)
 }
 
+pub(crate) fn verify_qualification_admission_account(
+    account_id: &AccountId,
+    binding: Option<&pe_execution_core::live_journal::LiveAccountBindingAudit>,
+    admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
+) -> Result<(), QualificationError> {
+    let account_read_failed = matches!(
+        &admission.verdict,
+        pe_execution_core::LiveAdmissionVerdict::Refused(
+            pe_execution_core::LiveAdmissionRefusal::AccountStateUnavailable(_)
+        )
+    );
+    let has_failure_evidence = !admission.account_read_failure_evidence.is_empty()
+        || !admission
+            .account_read_failure_request_descriptor_hashes
+            .is_empty()
+        || !admission.account_read_failure_evidence_hashes.is_empty();
+    let needs_binding = admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved
+        || admission.account_state.is_some()
+        || account_read_failed
+        || has_failure_evidence;
+    if !needs_binding {
+        return Ok(());
+    }
+    let binding = binding.ok_or_else(|| {
+        QualificationError::InsufficientEvidence(format!(
+            "live admission account evidence precedes Baseline for account {account_id}"
+        ))
+    })?;
+    crate::live_fanout::verify_admission_account_evidence(admission, binding).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "live admission account evidence is invalid for account {account_id}: {error}"
+        ))
+    })
+}
+
+pub(crate) fn verify_qualification_prepared_account(
+    account_id: &AccountId,
+    binding: Option<&pe_execution_core::live_journal::LiveAccountBindingAudit>,
+    frozen_binding: &pe_execution_core::CredentialBindingIdentity,
+    account_state: &pe_execution_core::LiveAccountStateAudit,
+) -> Result<(), QualificationError> {
+    let binding = binding.ok_or_else(|| {
+        QualificationError::InsufficientEvidence(format!(
+            "live Prepared account evidence precedes Baseline for account {account_id}"
+        ))
+    })?;
+    if !binding.is_valid_for_frozen_credential(account_id, frozen_binding) {
+        return insufficient(format!(
+            "live Prepared account binding is invalid for account {account_id}"
+        ));
+    }
+    crate::live_fanout::verify_account_state(account_state, binding).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "live Prepared account evidence is invalid for account {account_id}: {error}"
+        ))
+    })
+}
+
 fn verify_live_wrappers(
     live_journal: &Path,
     source_log: &Path,
@@ -1417,11 +1475,23 @@ fn verify_live_wrappers(
 
         let mut approved = BTreeMap::new();
         let mut completed = HashSet::new();
+        let mut current_account_binding = None;
         for event in &events {
             match &event.payload {
-                pe_execution_core::LiveJournalPayload::AdmissionEvaluated(admission)
-                    if admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved =>
+                pe_execution_core::LiveJournalPayload::AccountPortfolioMarked(mark)
+                    if mark.kind == pe_execution_core::MarkKind::Baseline =>
                 {
+                    current_account_binding = Some(mark.account_binding.clone());
+                }
+                pe_execution_core::LiveJournalPayload::AdmissionEvaluated(admission) => {
+                    verify_qualification_admission_account(
+                        &account_id,
+                        current_account_binding.as_ref(),
+                        admission,
+                    )?;
+                    if admission.verdict != pe_execution_core::LiveAdmissionVerdict::Approved {
+                        continue;
+                    }
                     let key = admission.identity.idempotency_key.clone();
                     if approved.insert(key.clone(), admission.as_ref()).is_some() {
                         return insufficient(format!(
@@ -1443,6 +1513,12 @@ fn verify_live_wrappers(
                     }
                 }
                 pe_execution_core::LiveJournalPayload::OrderPrepared(wrapper) => {
+                    verify_qualification_prepared_account(
+                        &account_id,
+                        current_account_binding.as_ref(),
+                        &wrapper.frozen_binding,
+                        &wrapper.account_state,
+                    )?;
                     let key = &wrapper.identity.idempotency_key;
                     let admission = approved.get(key).ok_or_else(|| {
                         QualificationError::InsufficientEvidence(format!(
