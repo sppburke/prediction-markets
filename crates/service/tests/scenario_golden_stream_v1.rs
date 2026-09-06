@@ -714,7 +714,6 @@ type ReceiptMap = HashMap<(u64, String), AppendReceipt>;
 type PrefixMap = HashMap<(u64, String), TailBinding>;
 
 struct RewrittenSource {
-    tail: TailBinding,
     receipts: ReceiptMap,
     prefixes: PrefixMap,
 }
@@ -775,11 +774,8 @@ fn rewrite_source_preimage(
     }
     assert!(found);
     drop(writer);
-    RewrittenSource {
-        tail: TailBinding::from(&Scanner::verify(destination).unwrap()),
-        receipts,
-        prefixes,
-    }
+    Scanner::verify(destination).unwrap();
+    RewrittenSource { receipts, prefixes }
 }
 
 fn remap_receipts(
