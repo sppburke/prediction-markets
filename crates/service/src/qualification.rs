@@ -2815,11 +2815,25 @@ fn knockout_record_reason(
         .or_else(|| evidence.first().map(|eviction| eviction.reason))
 }
 
-/// Verify one synchronized production membership record against the current source-log prefix and
-/// return the exact replacement vector retained by its receipt-bound artifact.
+/// Immutable source-log view shared by every membership record during one boot replay.
+pub(crate) struct PublishedMembershipSource {
+    observations: BTreeMap<u64, SourceObservation>,
+}
+
+impl PublishedMembershipSource {
+    pub(crate) fn scan(source_log: &Path) -> Result<Self, QualificationError> {
+        let verified_prefix = TailBinding::from(&Scanner::verify(source_log)?);
+        Ok(Self {
+            observations: source_observations(source_log, &verified_prefix)?,
+        })
+    }
+}
+
+/// Verify one synchronized production membership record against one immutable, verified
+/// source-log view and return the exact replacement vector retained by its receipt-bound artifact.
 pub(crate) fn replay_published_membership_change(
     record: &PaperLogRecord,
-    source_log: &Path,
+    source: &PublishedMembershipSource,
     current_membership: &HashSet<pe_core_types::WalletAddress>,
 ) -> Result<Vec<pe_trader_index::WatchlistEntry>, QualificationError> {
     let PaperLogRecord::MembershipChanged {
@@ -2834,8 +2848,6 @@ pub(crate) fn replay_published_membership_change(
     else {
         return insufficient("published record is not MembershipChanged");
     };
-    let source_prefix = TailBinding::from(&Scanner::verify(source_log)?);
-    let source = source_observations(source_log, &source_prefix)?;
     verify_membership_change_evidence(
         *reason,
         removed,
@@ -2844,7 +2856,7 @@ pub(crate) fn replay_published_membership_change(
         *ranking_batch_id,
         evidence,
         &MembershipEvidenceContext {
-            source: &source,
+            source: &source.observations,
             current_membership,
         },
     )
@@ -2856,7 +2868,8 @@ pub(crate) fn verify_published_membership_change(
     source_log: &Path,
     current_membership: &HashSet<pe_core_types::WalletAddress>,
 ) -> Result<(), QualificationError> {
-    replay_published_membership_change(record, source_log, current_membership).map(drop)
+    let source = PublishedMembershipSource::scan(source_log)?;
+    replay_published_membership_change(record, &source, current_membership).map(drop)
 }
 
 fn verify_knockout_causal_inputs(

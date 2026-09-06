@@ -31,6 +31,7 @@ use crate::bucket_commit::DecisionContinuationV3;
 use crate::decision_replay::{
     AuthorityEvidence, DecisionEvidenceAccumulator, TerminalDispositionEvidence,
 };
+use crate::live_watchlist::replace_entries;
 use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pending_evidence};
 use crate::position_seeder::ledger_capture;
 use crate::supabase_sink::supabase_fill_from;
@@ -834,6 +835,24 @@ pub fn replay_membership(
     }
 
     let mut last_ranking_batch_id = start.ranking_batch_id;
+    let Some(first_membership_sequence) = era.frames.iter().find_map(|frame| {
+        matches!(
+            &frame.frame,
+            PaperLogFrame::Record(PaperLogRecord::MembershipChanged { .. })
+        )
+        .then_some(frame.receipt.sequence.0)
+    }) else {
+        return Ok(Some(ReplayedMembership {
+            watchlist: watchlist_with_entries(start_batch, entries),
+            last_ranking_batch_id,
+        }));
+    };
+    let membership_source = crate::qualification::PublishedMembershipSource::scan(source_log)
+        .map_err(|source| MembershipReplayError::Evidence {
+            sequence: first_membership_sequence,
+            source,
+        })?;
+
     for frame in &era.frames {
         let PaperLogFrame::Record(
             record @ PaperLogRecord::MembershipChanged {
@@ -865,30 +884,22 @@ pub fn replay_membership(
             });
         }
 
-        let replacements =
-            crate::qualification::replay_published_membership_change(record, source_log, &present)
-                .map_err(|source| MembershipReplayError::Evidence {
-                    sequence: frame.receipt.sequence.0,
-                    source,
-                })?;
+        let replacements = crate::qualification::replay_published_membership_change(
+            record,
+            &membership_source,
+            &present,
+        )
+        .map_err(|source| MembershipReplayError::Evidence {
+            sequence: frame.receipt.sequence.0,
+            source,
+        })?;
         present = next_present;
         let removed = removed.iter().copied().collect::<HashSet<_>>();
-        entries.retain(|entry| !removed.contains(&entry.wallet));
-        let mut entry_wallets = entries
+        entries = replace_entries(&entries, &removed, &replacements, *capacity);
+        let entry_wallets = entries
             .iter()
             .map(|entry| entry.wallet)
             .collect::<HashSet<_>>();
-        for replacement in replacements {
-            if entries.len() >= *capacity {
-                break;
-            }
-            if !removed.contains(&replacement.wallet) && entry_wallets.insert(replacement.wallet) {
-                entries.push(replacement);
-            }
-        }
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.leader_score_bps.0));
-        entries.truncate(*capacity);
-        entry_wallets = entries.iter().map(|entry| entry.wallet).collect();
         if entry_wallets != present {
             return Err(MembershipReplayError::ReconstructionMismatch {
                 sequence: frame.receipt.sequence.0,
@@ -1272,8 +1283,9 @@ mod paper_log_tests {
     use crate::orchestrator::{Orchestrator, OrchestratorConfig};
     use crate::runtime_config::RuntimeConfig;
     use crate::watchlist_admission::{
-        CAPACITY_CONFIG_SOURCE_ID, KNOCKOUT_CAUSAL_SOURCE_ID, MEMBERSHIP_ARTIFACT_PARSER_VERSION,
-        MEMBERSHIP_ARTIFACT_SCHEMA_VERSION, RANKING_MEMBERSHIP_SOURCE_ID,
+        AdmissionPreparer, CAPACITY_CONFIG_SOURCE_ID, KNOCKOUT_CAUSAL_SOURCE_ID,
+        MEMBERSHIP_ARTIFACT_PARSER_VERSION, MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+        RANKING_MEMBERSHIP_SOURCE_ID,
     };
 
     fn receipt(sequence: u64) -> AppendReceipt {
@@ -1969,6 +1981,112 @@ mod paper_log_tests {
         assert_eq!(replayed.last_ranking_batch_id, 8);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, first);
+    }
+
+    /// PASS: a structural change published by the runtime orchestrator and replayed from that
+    /// same paper log produces byte-for-byte-equivalent watchlist entries;
+    /// FAIL: runtime and boot differ in survivor fields, ordering, deduplication, or capping.
+    #[tokio::test]
+    async fn structural_membership_runtime_and_boot_replay_exact_entries() {
+        let dir = tempdir().unwrap();
+        let paper_path = dir.path().join("membership-runtime.log");
+        let source_path = dir.path().join("source.log");
+        let first = wallet();
+        let second = WalletAddress([2; 20]);
+        let third = WalletAddress([3; 20]);
+        let removed_wallet = WalletAddress([4; 20]);
+        let initial_entries = vec![
+            watchlist_entry(first, 600),
+            watchlist_entry(second, 500),
+            watchlist_entry(third, 400),
+            watchlist_entry(removed_wallet, 300),
+        ];
+        let live = LiveWatchlist::new(watchlist(initial_entries.clone()));
+
+        let mut started = start("activation");
+        started.membership = vec![first, second, third, removed_wallet];
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(started)),
+        );
+
+        let replacements = vec![
+            watchlist_entry(first, 900),
+            watchlist_entry(second, 800),
+            watchlist_entry(third, 700),
+        ];
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let ranking_receipt = append_membership_artifact(
+            &mut source_writer,
+            RANKING_MEMBERSHIP_SOURCE_ID,
+            &RankingMembershipArtifact {
+                batch_id: Some(8),
+                entries: replacements.clone(),
+            },
+        );
+        drop(source_writer);
+        let change = MembershipChange {
+            reason: MembershipReason::FullRerank,
+            removed: vec![removed_wallet],
+            added: Vec::new(),
+            capacity: 3,
+            ranking_batch_id: Some(8),
+            evidence: SealedMembershipEvidence::full_rerank(ranking_receipt, Vec::new()).unwrap(),
+        };
+
+        let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let orchestrator = Orchestrator::new(
+            live.clone(),
+            OrchestratorConfig {
+                bankroll: dec!(100),
+                mode: ExecutionMode::Paper,
+                signal_config: SignalConfig::default(),
+                max_resolution_horizon_secs: 0,
+                min_resolution_horizon_secs: 0,
+                max_fill_price: Decimal::ZERO,
+                min_fill_price: Decimal::ZERO,
+                price_impact_cap_bps: 100,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+                watchlist_writer_lock: None,
+                entry_gate_config: CopyEntryGateConfig,
+                runtime_config: None,
+                live_accounts: None,
+            },
+            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+            paper_writer,
+            paper_state.clone(),
+            PositionLedger::new(),
+            new_shared_health(false),
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new()),
+            control_rx,
+            None,
+            None,
+            None,
+            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        )
+        .unwrap();
+        let runtime = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+        let preparer = AdmissionPreparer::new(control_tx, paper_state);
+        preparer
+            .publish_membership(change, replacements)
+            .await
+            .unwrap();
+        drop(preparer);
+        runtime.await.unwrap();
+
+        let runtime_entries = live.snapshot().entries.clone();
+        let era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let replayed = replay_membership(&era, watchlist(initial_entries), &source_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&replayed.watchlist.entries).unwrap(),
+            serde_json::to_vec(&runtime_entries).unwrap()
+        );
     }
 
     /// PASS: a crash before the new MembershipChanged record leaves boot on Start's A/N;
