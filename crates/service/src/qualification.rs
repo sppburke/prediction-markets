@@ -969,7 +969,7 @@ async fn verify_qualification(
                 {
                     return insufficient("MembershipChanged structural evidence is invalid");
                 }
-                drop(verify_membership_change_evidence(
+                verify_membership_change_evidence(
                     *reason,
                     removed,
                     added,
@@ -980,7 +980,7 @@ async fn verify_qualification(
                         source: &source_observations,
                         current_membership: &membership,
                     },
-                )?);
+                )?;
                 for wallet in removed {
                     membership.remove(wallet);
                 }
