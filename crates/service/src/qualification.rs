@@ -81,8 +81,8 @@ use crate::watchlist_admission::{
     RANKING_MEMBERSHIP_SOURCE_ID,
 };
 use crate::watchlist_maintenance::{
-    KnockoutReason, MaintenanceConfig, MembershipMode, knockout_decision,
-    planned_admission_wallets, ranked_membership_change_wallets,
+    MaintenanceConfig, MembershipMode, knockout_decision, planned_admission_wallets,
+    ranked_membership_change_wallets,
 };
 
 const QUALIFICATION_REPORT_VERSION: u16 = 1;
@@ -965,8 +965,7 @@ async fn verify_qualification(
                 ranking_batch_id,
                 evidence,
             } => {
-                if *reason == MembershipReason::Initial
-                    || removed.iter().collect::<HashSet<_>>().len() != removed.len()
+                if removed.iter().collect::<HashSet<_>>().len() != removed.len()
                     || added.iter().collect::<HashSet<_>>().len() != added.len()
                     || removed.iter().any(|wallet| added.contains(wallet))
                     || removed.iter().any(|wallet| !membership.contains(wallet))
@@ -2518,13 +2517,6 @@ fn verify_membership_change_evidence(
                 admission_receipts,
             },
             MembershipReason::FullRerank,
-        )
-        | (
-            SealedMembershipEvidence::FullRerank {
-                ranking_receipt,
-                admission_receipts,
-            },
-            MembershipReason::RankerRotation,
         ) => {
             let Some(ranking_batch_id) = ranking_batch_id else {
                 return insufficient("ranking membership change lacks a ranking batch identity");
@@ -2613,7 +2605,7 @@ fn verify_membership_change_evidence(
                     &config,
                     artifact.evaluated_at_unix,
                 )
-                .map(membership_reason_from_knockout);
+                .map(MembershipReason::from);
                 if rederived != Some(eviction.reason) {
                     return insufficient(
                         "MembershipChanged knockout semantic owner rejects its causal inputs",
@@ -2805,15 +2797,6 @@ fn replay_membership_resolutions(
             "MembershipChanged settlement replay failed: {error}"
         ))
     })
-}
-
-fn membership_reason_from_knockout(reason: KnockoutReason) -> MembershipReason {
-    match reason {
-        KnockoutReason::Inactivity => MembershipReason::KnockoutInactivity,
-        KnockoutReason::InactivityHardCap => MembershipReason::KnockoutInactivityHardCap,
-        KnockoutReason::Underperformance => MembershipReason::KnockoutUnderperformance,
-        KnockoutReason::RankerRotation => MembershipReason::RankerRotation,
-    }
 }
 
 fn knockout_record_reason(
@@ -7764,9 +7747,7 @@ mod tests {
         }
         for reason in [
             MembershipReason::FullRerank,
-            MembershipReason::RankerRotation,
             MembershipReason::CapacityChange,
-            MembershipReason::Initial,
         ] {
             assert!(!reason_moves_anchor(reason));
         }

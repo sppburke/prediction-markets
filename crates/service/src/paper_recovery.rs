@@ -159,9 +159,7 @@ pub enum MembershipReason {
     KnockoutInactivity,
     KnockoutInactivityHardCap,
     KnockoutUnderperformance,
-    RankerRotation,
     CapacityChange,
-    Initial,
 }
 
 /// Structural membership publication passed through the orchestrator writer lock.
@@ -1759,9 +1757,7 @@ mod paper_log_tests {
             MembershipReason::KnockoutInactivity,
             MembershipReason::KnockoutInactivityHardCap,
             MembershipReason::KnockoutUnderperformance,
-            MembershipReason::RankerRotation,
             MembershipReason::CapacityChange,
-            MembershipReason::Initial,
         ] {
             let bytes = serde_json::to_vec(&reason).unwrap();
             assert_eq!(
@@ -1819,7 +1815,7 @@ mod paper_log_tests {
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
             &PaperLogRecord::MembershipChanged {
-                reason: MembershipReason::Initial,
+                reason: MembershipReason::FullRerank,
                 removed: Vec::new(),
                 added: vec![wallet()],
                 capacity: 1,

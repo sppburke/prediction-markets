@@ -259,7 +259,8 @@ impl From<KnockoutReason> for crate::paper_recovery::MembershipReason {
             KnockoutReason::Inactivity => Self::KnockoutInactivity,
             KnockoutReason::InactivityHardCap => Self::KnockoutInactivityHardCap,
             KnockoutReason::Underperformance => Self::KnockoutUnderperformance,
-            KnockoutReason::RankerRotation => Self::RankerRotation,
+            // A rotation eviction is published as part of its full rerank, never as a knockout.
+            KnockoutReason::RankerRotation => Self::FullRerank,
         }
     }
 }
