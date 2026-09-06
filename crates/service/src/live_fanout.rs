@@ -17,12 +17,13 @@ use pe_core_types::{
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
 use pe_execution_core::live_executor::{
-    LiveAdmissionAccountEvidence, LiveAdmissionClassificationInput, classify_live_admission,
+    LiveAccountResponseClassification, LiveAdmissionAccountEvidence,
+    LiveAdmissionClassificationInput, classify_live_account_responses, classify_live_admission,
 };
 use pe_execution_core::live_journal::{
     LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
     PolygonFinalityClassification, SanitizedHttpRequestDescriptor, classify_polygon_finality,
-    verify_http_response_request, verify_polygon_finalized, verify_polygon_reconciliation,
+    verify_polygon_finalized, verify_polygon_reconciliation,
 };
 use pe_execution_core::{
     CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
@@ -74,7 +75,7 @@ use crate::live_projections::{
 };
 use crate::live_venue_adapter::{
     LiveAdmissionBuilder, LiveRedemptionAdapter, LiveVenueAdapterError, PolygonReceiptReader,
-    PolygonReceiptRpc, PolymarketLiveVenue, classify_account_responses,
+    PolygonReceiptRpc, PolymarketLiveVenue,
 };
 use crate::live_watchlist::LiveWatchlist;
 use crate::mark_prices::HistoricalMarkAdapter;
@@ -2584,49 +2585,24 @@ fn same_finalized_fill(left: &OrderFillFinalizedAudit, right: &OrderFillFinalize
     left == right
 }
 
-fn verify_account_attempts(
-    evidence: &[RawHttpAttempt],
-    request_descriptor_hashes: &[String],
-    evidence_hashes: &[String],
-    binding: &LiveAccountBindingAudit,
-) -> Result<(), ProjectionReducerError> {
-    if !binding.is_valid_for(&binding.account_id) {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    }
-    if evidence.len() != request_descriptor_hashes.len() {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    }
-    for (attempt, retained_descriptor_hash) in evidence.iter().zip(request_descriptor_hashes) {
-        let descriptor = binding.request_descriptor_for_attempt(attempt);
-        verify_http_response_request(&descriptor, retained_descriptor_hash)
-            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    }
-    let expected_hashes = http_attempt_hashes(evidence)
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    if expected_hashes != evidence_hashes {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    }
-    Ok(())
-}
-
 pub(crate) fn verify_account_state(
     account: &pe_execution_core::LiveAccountStateAudit,
     binding: &LiveAccountBindingAudit,
 ) -> Result<(), ProjectionReducerError> {
-    verify_account_attempts(
+    let classified = classify_live_account_responses(
         &account.evidence,
+        &account.selected_spender,
         &account.request_descriptor_hashes,
-        &account.evidence_hashes,
+        Some(&account.evidence_hashes),
         binding,
-    )?;
-    let expected = classify_account_responses(
-        account.evidence.clone(),
-        account.selected_spender.clone(),
-        account.request_descriptor_hashes.clone(),
     )
-    .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?
-    .audit()
     .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+    let LiveAccountResponseClassification::State(state) = classified else {
+        return Err(ProjectionReducerError::InvalidAccountEvidence);
+    };
+    let expected = state
+        .audit()
+        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     if *account != expected {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
@@ -2683,40 +2659,36 @@ pub(crate) fn verify_admission_account_evidence(
     }
     .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     let account = if let Some(account_state) = &admission.account_state {
-        verify_account_attempts(
+        let classified = classify_live_account_responses(
             &account_state.evidence,
+            &selected_spender,
             &account_state.request_descriptor_hashes,
-            &account_state.evidence_hashes,
+            Some(&account_state.evidence_hashes),
             binding,
-        )?;
-        let expected = classify_account_responses(
-            account_state.evidence.clone(),
-            selected_spender,
-            account_state.request_descriptor_hashes.clone(),
         )
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?
-        .audit()
         .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+        let LiveAccountResponseClassification::State(state) = classified else {
+            return Err(ProjectionReducerError::InvalidAccountEvidence);
+        };
+        let expected = state
+            .audit()
+            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
         if *account_state != expected {
             return Err(ProjectionReducerError::InvalidAccountEvidence);
         }
         LiveAdmissionAccountEvidence::State(account_state)
     } else {
-        verify_account_attempts(
+        let classified = classify_live_account_responses(
             &admission.account_read_failure_evidence,
+            &selected_spender,
             &admission.account_read_failure_request_descriptor_hashes,
-            &admission.account_read_failure_evidence_hashes,
+            Some(&admission.account_read_failure_evidence_hashes),
             binding,
-        )?;
-        let failure = classify_account_responses(
-            admission.account_read_failure_evidence.clone(),
-            selected_spender,
-            admission
-                .account_read_failure_request_descriptor_hashes
-                .clone(),
         )
-        .err()
-        .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
+        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+        let LiveAccountResponseClassification::ReadFailure(failure) = classified else {
+            return Err(ProjectionReducerError::InvalidAccountEvidence);
+        };
         LiveAdmissionAccountEvidence::ReadFailure(failure.kind)
     };
     let expected = classify(account).map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
@@ -6637,22 +6609,36 @@ mod tests {
                 );
                 let request_descriptor_hashes =
                     account_request_descriptor_hashes(&ordered_evidence, &binding);
-                let classified = classify_account_responses(
-                    ordered_evidence,
-                    spender.clone(),
-                    request_descriptor_hashes,
-                );
+                let classified = classify_live_account_responses(
+                    &ordered_evidence,
+                    &spender,
+                    &request_descriptor_hashes,
+                    None,
+                    &binding,
+                )
+                .unwrap();
 
                 if let Some(expected_allowance) = expected_allowance {
-                    let state = classified.unwrap();
+                    assert!(matches!(
+                        classified,
+                        LiveAccountResponseClassification::State(_)
+                    ));
+                    let LiveAccountResponseClassification::State(state) = classified else {
+                        return;
+                    };
                     assert_eq!(state.allowance, expected_allowance);
                     let audit = state.audit().unwrap();
                     verify_account_state(&audit, &binding).unwrap();
                 } else {
-                    assert_eq!(
-                        classified.unwrap_err().kind,
-                        pe_execution_core::LiveAccountReadFailure::Protocol
-                    );
+                    assert!(matches!(
+                        classified,
+                        LiveAccountResponseClassification::ReadFailure(
+                            pe_execution_core::LiveVenueAccountReadError {
+                                kind: pe_execution_core::LiveAccountReadFailure::Protocol,
+                                ..
+                            }
+                        )
+                    ));
                 }
             }
         }

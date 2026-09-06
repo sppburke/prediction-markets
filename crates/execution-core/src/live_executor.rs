@@ -13,16 +13,18 @@ use pe_source_polymarket_public::{
 };
 use pe_venue_polymarket::{CompactFeeSchedule, LadderPlan, PreparedPolymarketBuy};
 use rust_decimal::Decimal;
+use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::live_journal::{
-    AdmissionReceipts, CredentialBindingIdentity, LadderPlanAudit, LiveAccountReadFailure,
-    LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
-    LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode, LiveExecutedAmounts, LiveJournal,
-    LiveJournalError, LiveJournalOrderOutcome, LiveJournalPayload, LiveOrderAmbiguityKind,
-    LiveOrderIdentity, LiveOrderPostAudit, LiveOrderPreparationFailedAudit,
-    LiveOrderPreparationFailure, LiveOrderPreparedAudit, LiveOrderReconciliationAudit,
-    LiveOrderRejectKind, LiveReconciliationSource, http_attempt_hash, http_attempt_hashes,
+    AdmissionReceipts, CredentialBindingIdentity, LadderPlanAudit, LiveAccountBindingAudit,
+    LiveAccountReadFailure, LiveAccountStateAudit, LiveAdmissionArtifactAudit,
+    LiveAdmissionEvaluationAudit, LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode,
+    LiveExecutedAmounts, LiveJournal, LiveJournalError, LiveJournalOrderOutcome,
+    LiveJournalPayload, LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderPostAudit,
+    LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure, LiveOrderPreparedAudit,
+    LiveOrderReconciliationAudit, LiveOrderRejectKind, LiveReconciliationSource, http_attempt_hash,
+    http_attempt_hashes, verify_http_response_request,
 };
 
 /// Frozen per-target account and credential identity supplied by the dispatch aggregate.
@@ -44,8 +46,6 @@ pub struct LiveModeSnapshot {
 pub enum LiveAdmissionAccountEvidence<'a> {
     /// The ordered pre-I/O gates are being evaluated before an account read is attempted.
     NotRead,
-    /// Qualification is replaying a paper wrapper, for which account gates do not apply.
-    PaperMode,
     /// A complete authenticated account state was reconstructed from retained evidence.
     State(&'a LiveAccountStateAudit),
     /// Retained evidence deterministically classified as this account-read failure.
@@ -185,6 +185,228 @@ pub struct LiveVenueAccountReadError {
     pub evidence: Vec<RawHttpAttempt>,
     /// Descriptor hashes in exact attempt order for attempts retained by the failed read.
     pub request_descriptor_hashes: Vec<String>,
+}
+
+/// Canonical classification of one descriptor-bound raw account read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveAccountResponseClassification {
+    State(LiveVenueAccountState),
+    ReadFailure(LiveVenueAccountReadError),
+}
+
+/// Verify and classify retained account responses at the shared runtime/replay boundary.
+///
+/// Runtime callers omit `evidence_hashes`; durable replay callers supply the retained hashes.
+/// Empty evidence and descriptor/hash mismatches are invalid retained evidence, distinct from a
+/// response-derived transport, authentication, or protocol failure.
+pub fn classify_live_account_responses(
+    evidence: &[RawHttpAttempt],
+    selected_spender: &str,
+    request_descriptor_hashes: &[String],
+    evidence_hashes: Option<&[String]>,
+    binding: &LiveAccountBindingAudit,
+) -> Result<LiveAccountResponseClassification, LiveJournalError> {
+    if evidence.is_empty()
+        || !binding.is_valid_for(&binding.account_id)
+        || evidence.len() != request_descriptor_hashes.len()
+    {
+        return Err(LiveJournalError::RequestBinding);
+    }
+    for (attempt, retained_hash) in evidence.iter().zip(request_descriptor_hashes) {
+        verify_http_response_request(
+            &binding.request_descriptor_for_attempt(attempt),
+            retained_hash,
+        )?;
+    }
+    if let Some(retained) = evidence_hashes
+        && http_attempt_hashes(evidence)? != retained
+    {
+        return Err(LiveJournalError::RequestBinding);
+    }
+
+    Ok(
+        match classify_raw_account_responses(evidence, selected_spender, request_descriptor_hashes)
+        {
+            Ok(state) => LiveAccountResponseClassification::State(state),
+            Err(error) => LiveAccountResponseClassification::ReadFailure(error),
+        },
+    )
+}
+
+fn classify_raw_account_responses(
+    evidence: &[RawHttpAttempt],
+    selected_spender: &str,
+    request_descriptor_hashes: &[String],
+) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
+    let account_error = |kind| LiveVenueAccountReadError {
+        kind,
+        evidence: evidence.to_vec(),
+        request_descriptor_hashes: request_descriptor_hashes.to_vec(),
+    };
+    if evidence
+        .iter()
+        .any(|item| matches!(item, RawHttpAttempt::TransportFailure(_)))
+    {
+        return Err(account_error(LiveAccountReadFailure::Transport));
+    }
+    if evidence.len() != 3
+        || !is_known_account_spender(selected_spender)
+        || ["geoblock", "closed-only", "balance-allowance"]
+            .into_iter()
+            .any(|kind| account_response_by_kind(evidence, kind).is_none())
+    {
+        return Err(account_error(LiveAccountReadFailure::Protocol));
+    }
+    let response = |kind: &str| {
+        account_response_by_kind(evidence, kind)
+            .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))
+    };
+    let geoblock = response("geoblock")?;
+    let closed_only_response = response("closed-only")?;
+    let balance = response("balance-allowance")?;
+    if [geoblock, closed_only_response, balance]
+        .iter()
+        .any(|response| response.status == 401 || response.status == 403)
+    {
+        return Err(account_error(LiveAccountReadFailure::Authentication));
+    }
+    if !valid_account_response(geoblock, "geoblock", "/api/geoblock", &[])
+        || !valid_account_response(
+            closed_only_response,
+            "closed-only",
+            "/auth/ban-status/closed-only",
+            &[],
+        )
+        || !valid_account_response(
+            balance,
+            "balance-allowance",
+            "/balance-allowance",
+            &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
+        )
+    {
+        return Err(account_error(LiveAccountReadFailure::Protocol));
+    }
+    let geoblock_json = account_response_json(geoblock)
+        .map_err(|()| account_error(LiveAccountReadFailure::Protocol))?;
+    let closed_json = account_response_json(closed_only_response)
+        .map_err(|()| account_error(LiveAccountReadFailure::Protocol))?;
+    let balance_json = account_response_json(balance)
+        .map_err(|()| account_error(LiveAccountReadFailure::Protocol))?;
+    let blocked = geoblock_json
+        .get("blocked")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
+    let country = geoblock_json
+        .get("country")
+        .and_then(Value::as_str)
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
+    let geoblocked = blocked && !matches!(country, "IE" | "JP" | "MT" | "NL");
+    let closed_only = closed_json
+        .get("closed_only")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
+    let collateral_balance = account_atomic_amount(balance_json.get("balance"))
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
+    let allowances = balance_json
+        .get("allowances")
+        .and_then(Value::as_object)
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
+    let allowance = match allowances
+        .iter()
+        .find(|(spender, _)| spender.eq_ignore_ascii_case(selected_spender))
+    {
+        Some((_, value)) => account_atomic_amount(Some(value))
+            .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?,
+        None => CollateralAmount::ZERO,
+    };
+    let observed_at = [geoblock, closed_only_response, balance]
+        .iter()
+        .map(|response| response.observed_at)
+        .min()
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
+    Ok(LiveVenueAccountState {
+        observed_at,
+        closed_only,
+        geoblocked,
+        selected_spender: selected_spender.to_owned(),
+        collateral_balance,
+        allowance,
+        // The ordinary service has no separate local reservation owner yet; the durable
+        // dispatch reservation prevents another account/order from overtaking this read.
+        reconciled_free_collateral: collateral_balance,
+        schema_version: 1,
+        parser_version: 1,
+        evidence: evidence.to_vec(),
+        request_descriptor_hashes: request_descriptor_hashes.to_vec(),
+    })
+}
+
+fn account_response_by_kind<'a>(
+    evidence: &'a [RawHttpAttempt],
+    endpoint_kind: &str,
+) -> Option<&'a RawHttpResponse> {
+    let mut matches = evidence.iter().filter_map(|attempt| match attempt {
+        RawHttpAttempt::Response(response) if response.endpoint_kind == endpoint_kind => {
+            Some(response)
+        }
+        RawHttpAttempt::Response(_) | RawHttpAttempt::TransportFailure(_) => None,
+    });
+    let response = matches.next()?;
+    matches.next().is_none().then_some(response)
+}
+
+fn is_known_account_spender(selected_spender: &str) -> bool {
+    [
+        pe_venue_polymarket::CanaryV2Client::standard_spender(),
+        pe_venue_polymarket::CanaryV2Client::negrisk_spender(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|spender| spender == selected_spender)
+}
+
+fn valid_account_response(
+    response: &RawHttpResponse,
+    endpoint_kind: &str,
+    path: &str,
+    ordered_query: &[(&str, &str)],
+) -> bool {
+    let query_matches = response.ordered_query.len() == ordered_query.len()
+        && response.ordered_query.iter().zip(ordered_query).all(
+            |((actual_name, actual_value), (name, value))| {
+                actual_name == name && actual_value == value
+            },
+        );
+    response.source_id == "polymarket-clob-v2"
+        && response.endpoint_kind == endpoint_kind
+        && response.method == "GET"
+        && response.path == path
+        && query_matches
+        && (200..300).contains(&response.status)
+        && response.attempt_ordinal == 1
+        && response.received_at >= response.observed_at
+        && response.schema_version == 1
+        && response.parser_version == 1
+        && response.adapter_version == pe_venue_polymarket::SDK_VERSION
+}
+
+fn account_response_json(response: &RawHttpResponse) -> Result<Value, ()> {
+    if !(200..300).contains(&response.status) {
+        return Err(());
+    }
+    serde_json::from_slice(&response.body).map_err(|_| ())
+}
+
+fn account_atomic_amount(value: Option<&Value>) -> Option<CollateralAmount> {
+    let value = value?;
+    let encoded = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    encoded
+        .parse::<u64>()
+        .ok()
+        .map(CollateralAmount::from_atomic)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -961,7 +1183,6 @@ pub fn classify_live_admission(
 
     let account = match input.account {
         LiveAdmissionAccountEvidence::NotRead => return Err(LiveAdmissionNeedsAccountState),
-        LiveAdmissionAccountEvidence::PaperMode => return Ok(LiveAdmissionVerdict::Approved),
         LiveAdmissionAccountEvidence::ReadFailure(kind) => {
             return Ok(LiveAdmissionVerdict::Refused(
                 LiveAdmissionRefusal::AccountStateUnavailable(kind),
@@ -1849,29 +2070,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn paper_mode_replays_shared_pre_account_admission_without_account_state() {
-        let account_id = AccountId::new("paper-account").unwrap();
-        let request = request(&account_id);
-        let verdict = classify_live_admission(LiveAdmissionClassificationInput {
-            evaluated_at: now(),
-            requested_mode: request.mode.requested,
-            effective_mode: request.mode.effective,
-            frozen_binding: &request.target.credential_binding,
-            current_binding: &request.current_credential_binding,
-            identity: &request.identity,
-            condition_id: &request.condition_id,
-            outcome_id: request.outcome_id,
-            token_id: &request.token_id,
-            admission: &request.economic.admission,
-            ladder: &request.economic.ladder,
-            economic: &request.economic,
-            account: LiveAdmissionAccountEvidence::PaperMode,
-        });
-
-        assert_eq!(verdict, Ok(LiveAdmissionVerdict::Approved));
     }
 
     #[tokio::test]
