@@ -42,6 +42,11 @@ require_text "$DRIVER" 'archive_paper_state.sql'
 require_text "$DRIVER" '--financial-era=prepare'
 require_text "$DRIVER" '--financial-era=start'
 require_text "$DRIVER" '--financial-era=rollback-check'
+require_text "$DRIVER" '--verify-staged-identity'
+require_text "$DRIVER" 'verify_legacy_service_contract'
+require_text "$DRIVER" 'archive_restored'
+require_text "$DRIVER" 'local_restored'
+require_text "$DRIVER" 'old_service_started'
 reject_text "$DRIVER" 'seed_v1_empty.sh'
 reject_text "$DRIVER" 'sleep '
 
@@ -60,6 +65,9 @@ for path in "$RESTORE" "$ROLLBACK"; do
   require_text "$path" 'not a.attisdropped'
 done
 reject_text "$RESTORE" 'paper_fills (idempotency_key'
+require_text "$RESTORE" 'except all'
+require_text "$COMMON" 'verify_legacy_service_contract()'
+require_text "$DRIVER" 'activation_archive_matches_live()'
 
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
@@ -86,6 +94,17 @@ case "$1" in
     echo true > "$state/service.active"
     count=0; [[ ! -f "$state/start-count" ]] || count=$(<"$state/start-count")
     echo $((count + 1)) > "$state/start-count"
+    python3 -c 'import datetime,json,os,sys
+root=sys.argv[1]; path=os.path.join(root,"prediction-markets/gen/g557/status.json")
+value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+"tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,"uptime_secs":1,
+"mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,
+"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+"runtime_config":{"applied_hash":"b"*64,"rejected":None},
+"watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
+"supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
+"accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,"requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
+json.dump(value,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT"
     ;;
   *) echo "unexpected systemctl command: $*" >&2; exit 97 ;;
 esac
@@ -94,7 +113,7 @@ SH
 #!/usr/bin/env bash
 set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
-file= sql=
+file= sql= stdin=
 while (($#)); do
   case "$1" in
     -f) file=$2; shift 2 ;;
@@ -103,14 +122,26 @@ while (($#)); do
     *) shift ;;
   esac
 done
+if [[ -z "$file" && -z "$sql" ]]; then stdin=$(dd bs=4096 2>/dev/null || true); fi
 if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ $(<"$state/service.active") == false ]] || exit 98
   count=0; [[ ! -f "$state/archive-count" ]] || count=$(<"$state/archive-count")
-  echo $((count + 1)) > "$state/archive-count"
+  [[ ! -f "$state/remote-state" || $(<"$state/remote-state") != fresh ]] &&
+    echo $((count + 1)) > "$state/archive-count"
+  echo fresh > "$state/remote-state"
 elif [[ "$file" == *restore_paper_state.sql ]]; then
   [[ $(<"$state/service.active") == false ]] || exit 99
   count=0; [[ ! -f "$state/restore-count" ]] || count=$(<"$state/restore-count")
   echo $((count + 1)) > "$state/restore-count"
+  echo restored > "$state/remote-state"
+elif [[ "$stdin" == *"live % differs from activation"* ]]; then
+  [[ -f "$state/remote-state" && $(<"$state/remote-state") == restored ]] || exit 1
+elif [[ "$sql" == *information_schema.columns* ]]; then
+  echo 5
+elif [[ "$sql" == *paper_fills_archive* ]]; then
+  echo '0 0 0 1 0'
+elif [[ "$sql" == *"'start_seq'"* ]]; then
+  echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
 elif [[ "$sql" == *json_build_object* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"paper_bankroll":1,"fill_market_snapshots":0}'
 fi
@@ -133,7 +164,13 @@ setup_fixture() {
   printf 'source-before\n' > "$service/gen/g557/source_events.log"
   printf 'live-before\n' > "$service/gen/g557/live_journal.log"
   python3 -c 'import sqlite3,sys
-db=sqlite3.connect(sys.argv[1]); db.execute("create table durable(value text)"); db.execute("insert into durable values (\"before\")"); db.commit(); db.close()' \
+db=sqlite3.connect(sys.argv[1]); db.executescript("""
+create table durable(value text); insert into durable values ("before");
+create table fills(value text); create table positions(value text);
+create table settled_markets(value text); create table fill_market_snapshots(value text);
+create table bankroll(id integer primary key, bankroll_str text not null);
+insert into bankroll values(0,"10000"); create table meta(key text primary key,value blob not null);
+"""); db.commit(); db.close()' \
     "$service/gen/g557/paper_state.db"
   python3 -c 'import json,sys
 path,generation=sys.argv[1:]
@@ -144,12 +181,22 @@ json.dump({"state":"verified","activation_id":"act-545","generation":generation}
 set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
 case "$*" in
+  *--verify-staged-identity*)
+    echo 'prediction-edge revision=1111111111111111111111111111111111111111 artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    ;;
   *--financial-era=prepare*)
     cat <<'JSON'
 {"start":{"starting_bankroll":10000000000,"paper_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"source_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"live_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"artifact_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","static_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","hot_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"g557","activation_id":"act-545","ranking_batch_id":545,"policy_hash":"policy-545","membership":[],"membership_proofs_hash":"proof-545","schema_version":3,"parser_version":1,"financial_semantic_version":1},"expected_receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
 JSON
     ;;
   *--financial-era=start*)
+    python3 -c 'import sqlite3,sys
+db=sqlite3.connect(sys.argv[1]);
+for table in ("fills","positions","settled_markets","fill_market_snapshots"): db.execute("delete from "+table)
+db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"10000\")")
+db.execute("delete from meta"); db.execute("insert into meta values(\"financial_start_seq\",\"1\")")
+db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.commit(); db.close()' \
+      "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/paper_state.db"
     : > "$state/complete-start"
     echo '{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     ;;
@@ -176,6 +223,7 @@ driver_args() {
     --live-journal "$service/gen/g557/live_journal.log"
     --paper-state "$service/gen/g557/paper_state.db"
     --fresh-bankroll 10000
+    --target-revision 1111111111111111111111111111111111111111
     --artifact-blake3 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     --hot-config-hash bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     --ranking-batch-id 545
@@ -189,6 +237,19 @@ run_driver() {
   local root=$1; shift
   PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" SUPABASE_DB_URL=fake \
     PATH="$root/bin:$PATH" "$DRIVER" "${DRIVER_ARGS[@]}" "$@"
+}
+
+drive_to_verified() {
+  local root=$1 state attempt
+  for attempt in 1 2 3 4; do
+    state=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["state"])
+except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
+    [[ "$state" == verified ]] && return 0
+    if [[ "$state" == started ]]; then touch "$root/prediction-markets/gen/g557/status.json"; fi
+    run_driver "$root" >/dev/null
+  done
+  return 1
 }
 
 # The sole authoritative prepare occurs only after stop/inert and leaves every durable input
@@ -280,4 +341,89 @@ run_driver "$root" >/dev/null
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
   fail "Start recovery did not durably roll forward to started"
 
-echo 'PASS: financial-era driver preserves read-only prepare, restores every pre-Start seam once, forces roll-forward after Start, shares process proofs, and uses catalog-derived restore equality'
+# The first no-wait verification binds Start/reset/log-prefix/ranking/membership/account posture
+# rather than accepting a generic readiness bit.
+python3 -c 'import datetime,json,sys
+path=sys.argv[1]
+value={
+ "revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+ "tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,
+ "uptime_secs":1,"mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,
+ "fills_total":0,"settled_total":0,"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+ "runtime_config":{"applied_hash":"b"*64,"rejected":None},
+ "watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
+ "supabase_rpc_calls":0,
+ "live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
+         "accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,
+                      "requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
+json.dump(value,open(path,"w"))' "$root/prediction-markets/gen/g557/status.json"
+run_driver "$root" >/dev/null
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1]));
+assert value["state"]=="verified" and value["verified_state_assertions"] is True' \
+  "$root/pe-financial-era.json" || fail "verified state did not retain all merged assertions"
+
+# Every executable forward boundary is restartable. The mocked archive and Start retain their own
+# durable identities, so before-receipt crashes cannot duplicate either external transition.
+forward_boundaries=(
+  before-manifest-prepared prepared service-stop-intent before-manifest-service-stopped
+  service-stopped legacy-contract-verified preparation guarded remote-archive-intent
+  before-manifest-remote-archived remote-archived qualification-start-intent
+  before-manifest-qualification-started qualification-started
+  before-manifest-authority-start-seeded authority-start-seeded financial-config-adopted
+  financial-environment-adopted financial-binary-adopted service-start-intent
+  before-manifest-started started before-manifest-verified verified
+)
+for boundary in "${forward_boundaries[@]}"; do
+  root="$TEST_TMP/forward-$boundary"
+  setup_fixture "$root"
+  driver_args "$root"
+  if [[ "$boundary" == before-manifest-verified || "$boundary" == verified ]]; then
+    run_driver "$root" >/dev/null
+    touch "$root/prediction-markets/gen/g557/status.json"
+  fi
+  set +e
+  run_driver "$root" --simulate-crash-after "$boundary" >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ $status -eq 86 ]] || fail "forward crash boundary $boundary returned $status"
+  drive_to_verified "$root" || fail "forward crash boundary $boundary did not converge"
+  [[ $(<"$root/test-state/stop-count") -eq 1 ]] || fail "$boundary stopped the service more than once"
+  [[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "$boundary archived the remote book more than once"
+  [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the service more than once"
+done
+
+# Every rollback receipt boundary converges without a second archive restore or old-service start.
+rollback_boundaries=(
+  before-manifest-rollback-service-stopped rollback-service-stopped rolling_back
+  rollback-archive-restore-intent
+  before-manifest-archive-restored archive-restored rollback-local-restore-intent
+  before-manifest-local-restored local-restored rollback-old-service-start-intent
+  before-manifest-old-service-started old-service-started rolled_back
+)
+for boundary in "${rollback_boundaries[@]}"; do
+  root="$TEST_TMP/rollback-$boundary"
+  setup_fixture "$root"
+  driver_args "$root"
+  set +e
+  run_driver "$root" --simulate-crash-after remote-archived >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ $status -eq 86 ]] || fail "rollback setup for $boundary did not reach the archive"
+  if [[ "$boundary" == before-manifest-rollback-service-stopped ||
+        "$boundary" == rollback-service-stopped ]]; then
+    echo true > "$root/test-state/service.active"
+  fi
+  set +e
+  run_driver "$root" --rollback-before-start --simulate-crash-after "$boundary" >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ $status -eq 86 ]] || fail "rollback crash boundary $boundary returned $status"
+  run_driver "$root" --rollback-before-start >/dev/null
+  [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == rolled_back ]] ||
+    fail "rollback crash boundary $boundary did not converge"
+  [[ $(<"$root/test-state/restore-count") -eq 1 ]] || fail "$boundary restored the archive more than once"
+  [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the old service more than once"
+done
+
+echo 'PASS: financial-era driver preserves read-only prepare, restores every pre-Start seam once, forces roll-forward after Start, verifies merged state, shares process proofs, and uses catalog-derived restore equality'

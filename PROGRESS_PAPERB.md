@@ -22,3 +22,11 @@ RF16: NOT DONE restore consumes neither remote_census nor guarded log identities
 F7: DONE scripts/paper_reset/activate_financial_era.sh:281
 F8: NOT DONE verified state checks only installed hashes and ready status, not Start/reset/source/replay/ranking/membership/accounts-off equality
 RF20/F13: NOT DONE network-free harness covers stop, unknown Start, archive, physical Start, and post-service-start seams; PostgreSQL fractional archive/restore and remaining crash matrix are absent
+RF3 round 2: DONE causal financial/mark/latency reconstruction via build_paper_risk_snapshot and S5 inputs in crates/service/src/qualification.rs
+F6 round 2: DONE wired prepare to pe_execution_core::live_journal::open_order_inventory; LIVE-owned export is pending in this checkout
+RF13 round 2: DONE rollback requires the exact archive stamp, stops/proves inert, and persists archive/local/old-service restoration receipts in scripts/paper_reset/activate_financial_era.sh
+RF15 round 2: DONE staged binary identity plus effective config/environment identity and shared callable/grant/Legacy17 guard in scripts/deploy/generation_common.sh
+RF16 round 2: DONE rollback consumes remote census, old hashes, local backup, three log identities, and catalog-ordered bidirectional EXCEPT ALL equality
+F8 round 2: DONE no-wait verified state asserts Start, local/remote reset/version, guarded log prefixes, target/runtime identities, ranking/membership, critical owners, and all accounts off/unarmed
+RF20/F13 round 2: DONE every executable network-free forward/rollback manifest boundary converges exactly once; PostgreSQL fractional archive/restore remains environment-dependent
+Round 2 verification: DONE fmt/metadata/shell/SQL guard/financial-era harness/diff checks pass; workspace Rust gates are blocked only by unharvested PAPERA/LIVE interface consumers recorded in INTEGRATION_SUMMARY_PAPERB2.md

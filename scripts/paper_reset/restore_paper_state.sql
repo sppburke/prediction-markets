@@ -31,6 +31,7 @@ declare
   missing_column text;
   live_n bigint;
   archived_n bigint;
+  differs boolean;
   tables constant text[] := array[
     'paper_fills', 'settled_markets', 'paper_positions',
     'paper_bankroll', 'fill_market_snapshots'
@@ -68,6 +69,16 @@ begin
     if live_n <> archived_n then
       raise exception 'restored % count % does not match activation % archive count %',
         t, live_n, activation, archived_n;
+    end if;
+    execute format(
+      'select exists ((select %1$s from %2$I) except all '
+      '(select %1$s from %3$I where activation_id = $1)) or exists '
+      '((select %1$s from %3$I where activation_id = $1) except all '
+      '(select %1$s from %2$I))',
+      collist, t, arch
+    ) into differs using activation;
+    if differs then
+      raise exception 'restored % differs from activation % archive', t, activation;
     end if;
   end loop;
   if (select count(*) from paper_bankroll) <> 1 then
