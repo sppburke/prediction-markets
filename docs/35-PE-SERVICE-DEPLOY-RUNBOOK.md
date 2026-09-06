@@ -307,16 +307,29 @@ SUPABASE_DB_URL=<session-pooler-url> \
   --paper-state <active-generation-paper_state.db> \
   --fresh-bankroll <amount> \
   --rehearsal-evidence <rehearsal-evidence-json> \
-  --hot-config-hash <expected-15-name-hash> \
   --ranking-batch-id <id> \
-  --policy-hash <hash> \
-  --membership-json <canonical-membership-array.json> \
-  --membership-proofs-hash <hash>
+  --policy-hash <64-lowercase-hex-policy-hash> \
+  --membership-json <canonical-membership-array.json>
 ```
+
+The driver requires the real #557 activation manifest to be `state: verified`, reads its
+`generation_dir`, and binds the target artifact paths/hashes and embedded revision to that manifest's
+artifact inventory and `merge_commit`. The Start hot-config identity is not an operator assertion:
+while the service is inert, the driver exports the database rows that the 17→15 migration retains to
+a mode-private temporary file (the credential-bearing database URL remains in `PGDATABASE`, never
+argv), and the Rust prepare owner parses them as `ConfigEra::Financial15` and calls
+`RuntimeConfig::canonical_hash`. The membership-proofs identity is likewise a Rust-owned BLAKE3 of
+the exact manifest membership array plus each member's current complete-history, coverage, latest
+position-anchor, and position-validation records. Missing or inconsistent evidence fails prepare.
+
+There is no durable activation policy artifact in the current repository: `policy_hash` is therefore
+the one remaining caller assertion and must be exactly 64 lowercase hexadecimal characters. It is
+preserved in `QualificationStarted` for a future artifact owner; do not substitute a policy name or
+free-form label.
 
 The exact resumable forward order is `rehearsal PASS → prepared → guarded → started → verified`.
 Creating `prepared` records the verified #557 identity, reviewed target identities, durable paths,
-expected financial identity, ranking/membership evidence, fresh bankroll, result-manifest hash, and
+ranking/membership inputs, the validated policy assertion, fresh bankroll, result-manifest hash, and
 the rehearsed binary identity without changing service or financial state. Before any stop intent,
 the `prepared → guarded` transition rereads the bound evidence JSON and result manifest, verifies the
 recorded hash, requires PASS, and requires the rehearsed revision, embedded BLAKE3 identity, and file
@@ -351,9 +364,11 @@ The driver invokes these early-dispatch service commands; they accept either `--
 
 ```bash
 pe-service <service.toml> --financial-era=prepare \
-  --activation-manifest=/home/sean/pe-financial-era.json
+  --activation-manifest=/home/sean/pe-financial-era.json \
+  --financial-config-rows=<driver-exported-financial15-rows.json>
 pe-service <service.toml> --financial-era=start \
-  --activation-manifest=/home/sean/pe-financial-era.json
+  --activation-manifest=/home/sean/pe-financial-era.json \
+  --financial-config-rows=<driver-exported-financial15-rows.json>
 pe-service <service.toml> --financial-era=rollback-check \
   --activation-manifest=/home/sean/pe-financial-era.json
 ```

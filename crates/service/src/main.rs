@@ -214,6 +214,13 @@ async fn main() -> Result<()> {
             ),
         };
         let manifest = PathBuf::from(required_arg_value(&args, "--activation-manifest")?);
+        let financial_config_rows = match command {
+            pe_service::qualification::FinancialEraCommand::Prepare
+            | pe_service::qualification::FinancialEraCommand::Start => Some(PathBuf::from(
+                required_arg_value(&args, "--financial-config-rows")?,
+            )),
+            pe_service::qualification::FinancialEraCommand::RollbackCheck => None,
+        };
         let config_path = args
             .first()
             .filter(|argument| !argument.starts_with("--"))
@@ -224,9 +231,13 @@ async fn main() -> Result<()> {
                 |path| format!("load financial-era config from {}", path.display()),
             )
         })?;
-        let result =
-            pe_service::qualification::run_financial_era(command, &manifest, &offline_config)
-                .context("run network-free financial-era command")?;
+        let result = pe_service::qualification::run_financial_era(
+            command,
+            &manifest,
+            &offline_config,
+            financial_config_rows.as_deref(),
+        )
+        .context("run network-free financial-era command")?;
         println!("{result}");
         return Ok(());
     }

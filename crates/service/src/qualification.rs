@@ -53,6 +53,9 @@ use crate::paper_recovery::{
     ScannedPaperFrame, SealReason, TailBinding, active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::risk_inputs::{build_paper_risk_snapshot, historical_mark_price};
+use crate::runtime_config::{
+    ConfigEra, ConfigRow, RISK_HALT_RELEASE_HASH_KEY, RuntimeConfig, parse_config,
+};
 use crate::supabase_state::resolution_source_received_at;
 
 const QUALIFICATION_REPORT_VERSION: u16 = 1;
@@ -2639,11 +2642,9 @@ pub struct FinancialEraManifest {
     pub target_revision: String,
     pub artifact_blake3: String,
     pub static_config_hash: String,
-    pub hot_config_hash: String,
     pub ranking_batch_id: i64,
     pub policy_hash: String,
     pub membership: Vec<pe_core_types::WalletAddress>,
-    pub membership_proofs_hash: String,
     pub schema_version: u32,
     pub parser_version: u32,
     pub financial_semantic_version: u32,
@@ -2655,9 +2656,6 @@ pub struct FinancialEraManifest {
     pub target_config_sha256: String,
     pub old_environment_sha256: String,
     pub target_environment_sha256: String,
-    pub expected_hot_config_names_hash: String,
-    pub ranking_identity: String,
-    pub fresh_bankroll_identity: String,
     pub preparation: Option<FinancialEraPreparation>,
     #[serde(default)]
     pub stop_invoked: bool,
@@ -2718,6 +2716,7 @@ pub fn run_financial_era(
     command: FinancialEraCommand,
     manifest_path: &Path,
     config: &ServiceConfig,
+    financial_config_rows_path: Option<&Path>,
 ) -> Result<String, QualificationError> {
     let bytes = fs::read(manifest_path)?;
     let manifest: FinancialEraManifest = serde_json::from_slice(&bytes)?;
@@ -2728,12 +2727,14 @@ pub fn run_financial_era(
                 return insufficient("financial-era prepare requires manifest state prepared");
             }
             validate_financial_target_config(config)?;
-            let preparation = prepare_financial_era(&manifest, config)?;
+            let config_rows = read_financial_config_rows(financial_config_rows_path)?;
+            let preparation = prepare_financial_era(&manifest, config, &config_rows)?;
             Ok(serde_json::to_string(&preparation)?)
         }
         FinancialEraCommand::Start => {
             validate_financial_target_config(config)?;
-            start_financial_era(&manifest, config)
+            let config_rows = read_financial_config_rows(financial_config_rows_path)?;
+            start_financial_era(&manifest, config, &config_rows)
         }
         FinancialEraCommand::RollbackCheck => rollback_check_financial_era(&manifest, config),
     }
@@ -2773,7 +2774,140 @@ fn validate_financial_manifest(
     {
         return insufficient("financial-era manifest kind or configured paths differ");
     }
+    if !is_lower_hex_64(&manifest.policy_hash) {
+        return insufficient("financial-era policy hash must be exactly 64 lowercase hex digits");
+    }
     Ok(())
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn read_financial_config_rows(path: Option<&Path>) -> Result<Vec<ConfigRow>, QualificationError> {
+    let path = path.ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "financial-era prepare/start requires the exported Financial15 rows".to_owned(),
+        )
+    })?;
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn derive_hot_config_hash(
+    rows: &[ConfigRow],
+    config: &ServiceConfig,
+) -> Result<String, QualificationError> {
+    if rows.iter().any(|row| row.key == RISK_HALT_RELEASE_HASH_KEY) {
+        return insufficient(
+            "exported Financial15 rows must exclude the incident-only risk halt release",
+        );
+    }
+    parse_config(
+        rows,
+        &RuntimeConfig::from_service_config(config),
+        false,
+        ConfigEra::Financial15,
+    )
+    .map(|runtime| runtime.canonical_hash())
+    .map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "exported Financial15 rows are invalid: {error}"
+        ))
+    })
+}
+
+fn derive_membership_proofs_hash(
+    state: &PaperStateDb,
+    membership: &[pe_core_types::WalletAddress],
+) -> Result<String, QualificationError> {
+    let mut unique = HashSet::new();
+    let mut proofs = Vec::with_capacity(membership.len());
+    for wallet in membership {
+        if !unique.insert(*wallet) {
+            return insufficient(format!("financial-era membership repeats wallet {wallet}"));
+        }
+        if !state.wallet_history_complete(wallet)? {
+            return insufficient(format!(
+                "financial-era membership lacks complete history for {wallet}"
+            ));
+        }
+        let coverage = state.wallet_coverage(wallet)?;
+        let (Some(activity_cutoff_unix), Some(anchor_seq), Some(anchored_at_unix)) = (
+            coverage.activity_cutoff_unix,
+            coverage.anchor_seq,
+            coverage.anchored_at_unix,
+        ) else {
+            return insufficient(format!(
+                "financial-era membership lacks installed anchor coverage for {wallet}"
+            ));
+        };
+        if coverage.reanchor_required {
+            return insufficient(format!(
+                "financial-era membership requires a new anchor for {wallet}"
+            ));
+        }
+        let anchors = state.position_anchors(wallet)?;
+        let anchor = anchors.last().ok_or_else(|| {
+            QualificationError::InsufficientEvidence(format!(
+                "financial-era membership lacks an anchor record for {wallet}"
+            ))
+        })?;
+        if anchor.anchor_seq != anchor_seq
+            || anchor.activity_cutoff_unix != activity_cutoff_unix
+            || anchor.anchored_at_unix != anchored_at_unix
+        {
+            return insufficient(format!(
+                "financial-era membership anchor and coverage disagree for {wallet}"
+            ));
+        }
+        let validation = state.position_validation(wallet)?.ok_or_else(|| {
+            QualificationError::InsufficientEvidence(format!(
+                "financial-era membership lacks a current position validation for {wallet}"
+            ))
+        })?;
+        if validation.ledger_hash != anchor.ledger_hash_after
+            || validation.proof_json != anchor.proof_json
+        {
+            return insufficient(format!(
+                "financial-era membership validation and anchor disagree for {wallet}"
+            ));
+        }
+        proofs.push(serde_json::json!({
+            "wallet": wallet.to_string(),
+            "coverage": {
+                "activity_cutoff_unix": activity_cutoff_unix,
+                "coverage_generation": coverage.coverage_generation,
+                "reanchor_required": coverage.reanchor_required,
+                "anchor_seq": anchor_seq,
+                "anchored_at_unix": anchored_at_unix,
+            },
+            "anchor": {
+                "anchor_seq": anchor.anchor_seq,
+                "anchored_at_unix": anchor.anchored_at_unix,
+                "activity_cutoff_unix": anchor.activity_cutoff_unix,
+                "balances_json": anchor.balances_json,
+                "ledger_hash_after": anchor.ledger_hash_after,
+                "proof_json": anchor.proof_json,
+            },
+            "validation": {
+                "ledger_hash": validation.ledger_hash,
+                "positions_proof_hash": validation.positions_proof_hash,
+                "activity_bounds_json": validation.activity_bounds_json,
+                "source_log_generation": validation.source_log_generation,
+                "proof_json": validation.proof_json,
+                "recorded_at_unix": validation.recorded_at_unix,
+            },
+        }));
+    }
+    let membership: Vec<_> = membership.iter().map(ToString::to_string).collect();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "membership": membership,
+        "proofs": proofs,
+    }))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn verify_live_preparation_posture(
@@ -2916,6 +3050,7 @@ fn verify_live_preparation_posture(
 fn prepare_financial_era(
     manifest: &FinancialEraManifest,
     config: &ServiceConfig,
+    financial_config_rows: &[ConfigRow],
 ) -> Result<FinancialEraPreparation, QualificationError> {
     let paper_prefix = Scanner::verify(&manifest.paths.paper_log)?;
     let source_prefix = Scanner::verify(&manifest.paths.source_log)?;
@@ -2957,6 +3092,8 @@ fn prepare_financial_era(
     if !unmatched_prepared.is_empty() {
         return insufficient("financial-era prepare found an unmatched Prepared");
     }
+    let hot_config_hash = derive_hot_config_hash(financial_config_rows, config)?;
+    let membership_proofs_hash = derive_membership_proofs_hash(&state, &manifest.membership)?;
     let start = QualificationStarted {
         starting_bankroll: manifest.fresh_bankroll,
         paper_prefix: TailBinding::from(&paper_prefix),
@@ -2964,13 +3101,13 @@ fn prepare_financial_era(
         live_prefix: TailBinding::from(&live_prefix),
         artifact_blake3: manifest.artifact_blake3.clone(),
         static_config_hash: manifest.static_config_hash.clone(),
-        hot_config_hash: manifest.hot_config_hash.clone(),
+        hot_config_hash,
         generation: manifest.generation.clone(),
         activation_id: manifest.activation_id.clone(),
         ranking_batch_id: manifest.ranking_batch_id,
         policy_hash: manifest.policy_hash.clone(),
         membership: manifest.membership.clone(),
-        membership_proofs_hash: manifest.membership_proofs_hash.clone(),
+        membership_proofs_hash,
         schema_version: manifest.schema_version,
         parser_version: manifest.parser_version,
         financial_semantic_version: manifest.financial_semantic_version,
@@ -3005,6 +3142,7 @@ fn prepare_financial_era(
 fn start_financial_era(
     manifest: &FinancialEraManifest,
     config: &ServiceConfig,
+    financial_config_rows: &[ConfigRow],
 ) -> Result<String, QualificationError> {
     if manifest.state != "guarded" && manifest.state != "started" {
         return insufficient("financial-era start requires guarded or started state");
@@ -3036,7 +3174,7 @@ fn start_financial_era(
     if TailBinding::from(&current) != preparation.start.paper_prefix {
         return insufficient("paper tail changed after financial-era preparation");
     }
-    let recomputed = prepare_financial_era(manifest, config)?;
+    let recomputed = prepare_financial_era(manifest, config, financial_config_rows)?;
     if &recomputed != preparation {
         return insufficient("financial-era preparation differs from the verified manifest inputs");
     }
@@ -3144,6 +3282,36 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    fn financial_config_rows() -> Vec<ConfigRow> {
+        [
+            ("active_watchlist_size", "100", "integer"),
+            ("mode", "paper", "text"),
+            ("max_fill_price", "0.85", "decimal"),
+            ("min_fill_price", "0.15", "decimal"),
+            ("min_resolution_horizon_secs", "60", "integer"),
+            ("max_resolution_horizon_secs", "172800", "integer"),
+            ("price_impact_cap_bps", "100", "integer"),
+            ("flip_human_approved", "false", "bool"),
+            (
+                "kelly_fraction_above_default_human_approved",
+                "false",
+                "bool",
+            ),
+            ("per_trade_cap", "unlimited", "text"),
+            ("slippage_rate", "0.01", "decimal"),
+            ("sizing_mode", "dollar", "text"),
+            ("sizing_dollar_usd", "25", "decimal"),
+            ("sizing_contracts", "1", "integer"),
+        ]
+        .into_iter()
+        .map(|(key, value, value_type)| ConfigRow {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            value_type: value_type.to_owned(),
+        })
+        .collect()
+    }
 
     fn started(hash: &str) -> QualificationStarted {
         QualificationStarted {
@@ -3583,11 +3751,9 @@ mod tests {
             target_revision: "1".repeat(40),
             artifact_blake3: "a".repeat(64),
             static_config_hash: "b".repeat(64),
-            hot_config_hash: "c".repeat(64),
             ranking_batch_id: 545,
-            policy_hash: "policy".to_owned(),
-            membership: started("c").membership,
-            membership_proofs_hash: "proof".to_owned(),
+            policy_hash: "d".repeat(64),
+            membership: Vec::new(),
             schema_version: 3,
             parser_version: 1,
             financial_semantic_version: 1,
@@ -3604,9 +3770,6 @@ mod tests {
             target_config_sha256: "0".repeat(64),
             old_environment_sha256: "1".repeat(64),
             target_environment_sha256: "2".repeat(64),
-            expected_hot_config_names_hash: "3".repeat(64),
-            ranking_identity: "batch:545".to_owned(),
-            fresh_bankroll_identity: "100".to_owned(),
             preparation: None,
             stop_invoked: false,
             service_was_active: None,
@@ -3646,7 +3809,13 @@ mod tests {
             br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}"#,
         )
         .unwrap();
-        let preparation = prepare_financial_era(&manifest, &config).unwrap();
+        let config_rows = financial_config_rows();
+        let preparation = prepare_financial_era(&manifest, &config, &config_rows).unwrap();
+        assert_eq!(
+            preparation.start.hot_config_hash,
+            derive_hot_config_hash(&config_rows, &config).unwrap()
+        );
+        assert!(is_lower_hex_64(&preparation.start.membership_proofs_hash));
         let after = paths
             .iter()
             .map(|path| fs::read(path).unwrap())
@@ -3655,8 +3824,8 @@ mod tests {
 
         manifest.state = "guarded".to_owned();
         manifest.preparation = Some(preparation.clone());
-        let first = start_financial_era(&manifest, &config).unwrap();
-        let second = start_financial_era(&manifest, &config).unwrap();
+        let first = start_financial_era(&manifest, &config, &config_rows).unwrap();
+        let second = start_financial_era(&manifest, &config, &config_rows).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             serde_json::from_str::<AppendReceipt>(&first).unwrap(),
