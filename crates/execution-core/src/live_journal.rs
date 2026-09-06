@@ -858,6 +858,19 @@ impl LiveJournal {
         Ok(binding)
     }
 
+    /// Replay and canonically decode the global journal through `last_sequence`, inclusive.
+    ///
+    /// Later suffix records are outside the requested prefix. The returned events still begin at
+    /// sequence zero so schema dispatch and global event sequencing use the same checks as full
+    /// journal replay.
+    pub fn replay_prefix(
+        path: impl AsRef<Path>,
+        last_sequence: EventSeq,
+    ) -> Result<Vec<LiveJournalEvent>, LiveJournalError> {
+        replay_with_receipts(path, Some(last_sequence))
+            .map(|events| events.into_iter().map(|(event, _receipt)| event).collect())
+    }
+
     /// Typed writer poison state for service readiness and producer shutdown.
     pub fn poisoned(&self) -> Result<Option<PoisonReason>, LiveJournalError> {
         let inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
@@ -1775,9 +1788,19 @@ fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJourn
 fn replay_all_with_receipts(
     path: impl AsRef<Path>,
 ) -> Result<Vec<(LiveJournalEvent, AppendReceipt)>, LiveJournalError> {
+    replay_with_receipts(path, None)
+}
+
+fn replay_with_receipts(
+    path: impl AsRef<Path>,
+    last_sequence: Option<EventSeq>,
+) -> Result<Vec<(LiveJournalEvent, AppendReceipt)>, LiveJournalError> {
     let mut events = Vec::new();
     for item in Reader::replay(path)? {
         let (seq, envelope) = item?;
+        if last_sequence.is_some_and(|last_sequence| seq > last_sequence) {
+            break;
+        }
         if envelope.source_id != SourceId(LIVE_JOURNAL_SOURCE.to_owned())
             || !matches!(envelope.schema_version, 1 | LIVE_JOURNAL_SCHEMA_VERSION)
             || envelope.parser_version != LIVE_JOURNAL_PARSER_VERSION
@@ -1804,6 +1827,11 @@ fn replay_all_with_receipts(
                 this_hash: envelope.this_hash,
             },
         ));
+    }
+    if last_sequence.is_some_and(|last_sequence| {
+        events.last().map(|(_, receipt)| receipt.sequence) != Some(last_sequence)
+    }) {
+        return Err(LiveJournalError::SequenceMismatch);
     }
     Ok(events)
 }

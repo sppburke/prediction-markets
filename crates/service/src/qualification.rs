@@ -581,6 +581,11 @@ struct RiskReplayContext<'a> {
 async fn verify_qualification(
     options: &QualifyOptions,
 ) -> Result<QualificationReport, QualificationError> {
+    let live_journal = options.live_journal.as_deref().ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "live journal is required for exact qualification replay".to_owned(),
+        )
+    })?;
     let requested_hash = blake3::Hash::from_hex(&options.seal_hash).map_err(|error| {
         QualificationError::InsufficientEvidence(format!("invalid seal hash: {error}"))
     })?;
@@ -592,10 +597,8 @@ async fn verify_qualification(
     verify_recorded_prefix(&options.paper_log, &seal.financial_prefix)?;
     verify_start_prefix(&frames[start_index], &start)?;
     verify_tail_extension(&start.live_prefix, &seal.live_prefix, "live journal")?;
-    if let Some(live_journal) = options.live_journal.as_deref() {
-        verify_recorded_prefix(live_journal, &start.live_prefix)?;
-        verify_recorded_prefix(live_journal, &seal.live_prefix)?;
-    }
+    verify_recorded_prefix(live_journal, &start.live_prefix)?;
+    verify_recorded_prefix(live_journal, &seal.live_prefix)?;
     if let SealReason::InsufficientEvidence(reason) = &seal.reason {
         return Ok(insufficient_seal_report(
             &start,
@@ -1042,7 +1045,7 @@ async fn verify_qualification(
         &start,
     )?;
     let live_evidence = verify_live_wrappers(
-        options.live_journal.as_deref(),
+        live_journal,
         &options.source_log,
         &seal.source_prefix,
         &seal.live_prefix,
@@ -1282,7 +1285,6 @@ fn insufficient<T>(reason: impl Into<String>) -> Result<T, QualificationError> {
 
 // ── Live-wrapper verification ────────────────────────────────────────────────
 
-#[derive(Default)]
 struct VerifiedLiveEvidence {
     prefix_hash: Option<String>,
     journal_hash: Option<String>,
@@ -1371,17 +1373,13 @@ fn paper_live_wrapper_bases(
 }
 
 fn verify_live_wrappers(
-    live_journal: Option<&Path>,
+    live_journal: &Path,
     source_log: &Path,
     source_prefix: &TailBinding,
     live_prefix: &TailBinding,
     start: &QualificationStarted,
     paper_frames: &[ScannedPaperFrame],
 ) -> Result<VerifiedLiveEvidence, QualificationError> {
-    let Some(live_journal) = live_journal else {
-        return Ok(VerifiedLiveEvidence::default());
-    };
-
     let sealed_events = replay_live_prefix(live_journal, &start.live_prefix, live_prefix)?;
     let source_envelopes = sealed_source_envelopes(source_log, source_prefix)?;
     let paper_bases = paper_live_wrapper_bases(paper_frames)?;
@@ -1548,39 +1546,20 @@ fn replay_live_prefix(
     let Some(sealed_sequence) = sealed_prefix.last_sequence else {
         return Ok(Vec::new());
     };
-    let start_hash = tail_hash(start_prefix)?;
-    let sealed_hash = tail_hash(sealed_prefix)?;
-    let mut events = Vec::new();
-    for item in Reader::replay(live_journal)? {
-        let (sequence, envelope) = item?;
-        if sequence > sealed_sequence {
-            break;
-        }
-        if start_prefix.last_sequence == Some(sequence) && envelope.this_hash != start_hash {
-            return insufficient("live journal replay differs from its Start prefix");
-        }
-        if sequence == sealed_sequence && envelope.this_hash != sealed_hash {
-            return insufficient("live journal replay differs from its sealed prefix");
-        }
-        if start_prefix
-            .last_sequence
-            .is_some_and(|start_sequence| sequence <= start_sequence)
-        {
-            continue;
-        }
-        let event: pe_execution_core::LiveJournalEvent = serde_json::from_slice(&envelope.payload)
-            .map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "live journal event decode failed at sequence {sequence}: {error}"
-                ))
-            })?;
-        if event.seq != sequence.0 || event.timestamp != envelope.observed_at.0 {
-            return insufficient(format!(
-                "live journal event identity differs at sequence {sequence}"
-            ));
-        }
-        events.push(event);
-    }
+    let events = pe_execution_core::LiveJournal::replay_prefix(live_journal, sealed_sequence)
+        .map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "live journal canonical replay failed: {error}"
+            ))
+        })?;
+    let events = events
+        .into_iter()
+        .filter(|event| {
+            start_prefix
+                .last_sequence
+                .is_none_or(|start_sequence| event.seq > start_sequence.0)
+        })
+        .collect::<Vec<_>>();
     if events
         .last()
         .map(|event| EventSeq(event.seq))
@@ -1825,23 +1804,21 @@ fn decision_rows_from_source_observations(
         return Ok(Vec::new());
     };
     let history = state.decision_pending_history()?;
-    let complete_reads = complete_activity_read_scopes(&history, sealed_sequence, observations)?;
-    let first_observations = first_trade_observations(sealed_sequence, observations)?;
-    let history_ids = history
+    let source_universe = source_trade_universe(sealed_sequence, observations)?;
+    let history_states = history
         .iter()
-        .map(|row| row.source_trade_id.clone())
-        .collect::<HashSet<_>>();
-    for source_trade_id in first_observations.keys() {
-        if let Some(group) = state.activity_group_state(source_trade_id)?
-            && group.disposition == "decision_pending"
-            && !history_ids.contains(source_trade_id)
+        .map(|row| (row.source_trade_id.clone(), row.state))
+        .collect::<HashMap<_, _>>();
+    for (source_trade_id, first_sequence) in &source_universe {
+        if start_sequence.is_none_or(|start| *first_sequence > start.0)
+            && history_states.get(source_trade_id) != Some(&DecisionPendingState::Terminal)
         {
             return insufficient(format!(
-                "parsed source trade {source_trade_id}/{} has no decision_pending row",
-                group.semantic_revision
+                "source-log trade {source_trade_id} has no terminal decision_pending row"
             ));
         }
     }
+    let complete_reads = complete_activity_read_scopes(&history, sealed_sequence, observations)?;
     let required = decision_keys_from_source_observations(
         start_sequence,
         sealed_sequence,
@@ -2030,7 +2007,10 @@ fn complete_activity_read_scopes(
     Ok(reads)
 }
 
-fn first_trade_observations(
+/// Source-only, fail-closed trade membership from every raw REST activity page in the prefix.
+/// Event envelopes retain payloads and receipts but not request URLs or bounds, so exact page
+/// grouping remains validated from V3 continuations after this projection-independent check.
+fn source_trade_universe(
     sealed_sequence: EventSeq,
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<HashMap<pe_core_types::SourceTradeId, u64>, QualificationError> {
@@ -2357,7 +2337,7 @@ fn decision_keys_from_source_observations(
     observations: &BTreeMap<u64, SourceObservation>,
     complete_reads: &[CompleteActivityReadScope],
 ) -> Result<Vec<(u64, pe_core_types::SourceTradeId, String)>, QualificationError> {
-    let first_observations = first_trade_observations(sealed_sequence, observations)?;
+    let first_observations = source_trade_universe(sealed_sequence, observations)?;
     let in_prefix = complete_reads
         .iter()
         .filter(|read| {
@@ -5419,6 +5399,89 @@ mod tests {
         ));
     }
 
+    /// PASS: a diagnostic invocation without the live journal emits typed insufficient evidence
+    /// and cannot claim exact replay.
+    #[tokio::test]
+    async fn omitted_live_journal_is_not_pass_or_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("qualification.json");
+        let options = QualifyOptions {
+            paper_log: temp.path().join("missing-paper.log"),
+            source_log: temp.path().join("missing-source.log"),
+            live_journal: None,
+            paper_state: temp.path().join("missing-paper.db"),
+            seal_hash: "not-a-seal".to_owned(),
+            output: output.clone(),
+        };
+
+        let (verdict, _) = run_qualify(&options).await.unwrap();
+        let report: QualificationReport =
+            serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(verdict, QualificationVerdict::InsufficientEvidence);
+        assert_eq!(report.verdict, QualificationVerdict::InsufficientEvidence);
+        assert!(!report.replay.exact);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("live journal is required"))
+        );
+    }
+
+    /// PASS: qualification delegates source-id, schema-version, and parser-version rejection to
+    /// the canonical prefix reader for hash-valid current-event envelopes.
+    #[test]
+    fn live_prefix_rejects_every_unsupported_canonical_envelope_contract() {
+        let contracts = [
+            ("wrong-source", 2_u32, 1_u32, "source"),
+            ("ordinary-live-execution", 99, 1, "schema"),
+            ("ordinary-live-execution", 2, 99, "parser"),
+        ];
+        for (source_id, schema_version, parser_version, label) in contracts {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(format!("wrong-{label}.log"));
+            let mut writer = Writer::open(&path).unwrap();
+            let start = TailBinding::from(&Scanner::verify(&path).unwrap());
+            let timestamp = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+            let event = pe_execution_core::LiveJournalEvent {
+                account_id: AccountId::new("qualification-test").unwrap(),
+                seq: 0,
+                timestamp,
+                payload: pe_execution_core::LiveJournalPayload::ModeTransitionApplied(
+                    pe_execution_core::LiveModeTransitionAudit {
+                        requested: pe_execution_core::LiveControlMode::LiveTiny,
+                        previous_effective: pe_execution_core::LiveControlMode::Off,
+                        new_effective: pe_execution_core::LiveControlMode::LiveTiny,
+                        reason: pe_execution_core::LiveModeTransitionReason::Armed,
+                    },
+                ),
+            };
+            let receipt = writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(source_id.to_owned()),
+                    schema_version,
+                    parser_version,
+                    observed_at: SourceTimestamp(timestamp),
+                    received_at: ReceivedAt(timestamp),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&event).unwrap(),
+                })
+                .unwrap();
+            drop(writer);
+            let sealed = TailBinding::from(&Scanner::verify(&path).unwrap());
+
+            assert!(matches!(
+                pe_execution_core::LiveJournal::replay_prefix(&path, receipt.sequence),
+                Err(pe_execution_core::LiveJournalError::UnexpectedEnvelope)
+            ));
+            assert!(matches!(
+                replay_live_prefix(&path, &start, &sealed),
+                Err(QualificationError::InsufficientEvidence(reason))
+                    if reason.contains("unsupported envelope")
+            ));
+        }
+    }
+
     fn activity_observation(sequence: u64, payload: &[u8]) -> SourceObservation {
         let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
         SourceObservation {
@@ -6479,10 +6542,10 @@ mod tests {
         );
     }
 
-    /// PASS: the immutable activity payload independently requires its composite decision key;
-    /// deleting the terminal SQLite row therefore returns typed insufficient evidence.
+    /// PASS: the immutable source prefix independently requires its decision key after the
+    /// terminal decision and every source-keyed companion projection are deleted.
     #[test]
-    fn parsed_source_trade_cannot_disappear_with_deleted_decision_row() {
+    fn source_trade_cannot_disappear_with_every_projection_deleted() {
         let payload = br#"[{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","usdcSize":"2.5","price":"0.5","timestamp":"1700000100","transactionHash":"0xabc","outcomeIndex":"0"}]"#;
         let temp = tempfile::tempdir().unwrap();
         let source_path = temp.path().join("source.log");
@@ -6519,15 +6582,17 @@ mod tests {
                 page_occurrence(&observation, "page", payload),
                 page_evidence("page", payload, Some(1_700_000_099), 1_700_000_100, 0),
             )],
-            [target_id],
+            [target_id.clone()],
         );
         let keys =
             decision_keys_from_source_observations(None, EventSeq(0), &observations, &[read])
                 .expect("valid complete activity read derives one decision key");
         assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].1, target_id);
 
         let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
         let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
+        let source_trade_id = keys[0].1.0.clone();
         connection
             .execute(
                 "INSERT INTO activity_groups
@@ -6536,9 +6601,38 @@ mod tests {
                  VALUES (?1, '0xabc', ?2, 1700000100, ?3, 'trade',
                          'decision_pending', '{}')",
                 rusqlite::params![
-                    keys[0].1.0,
+                    source_trade_id,
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     keys[0].2,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO activity_group_revisions
+                    (source_trade_id, semantic_revision, transaction_hash, disposition,
+                     proof_json, recorded_at_unix)
+                 VALUES (?1, ?2, '0xabc', 'decision_pending', '{}', 1700000101)",
+                rusqlite::params![source_trade_id, keys[0].2],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO no_copy_dispositions
+                    (source_trade_id, provenance, age_secs, reason, recorded_at_unix)
+                 VALUES (?1, 'rest_poll', 0, 'no_edge', 1700000101)",
+                rusqlite::params![source_trade_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO entry_gate_results
+                    (source_trade_id, wallet_hex, market_id, source_epoch, result,
+                     history_consumed)
+                 VALUES (?1, ?2, '0xcondition', 1700000100, 'admitted', 1)",
+                rusqlite::params![
+                    source_trade_id,
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ],
             )
             .unwrap();
@@ -6551,19 +6645,30 @@ mod tests {
                  VALUES (?1, ?2, ?3, 1700000100, '{}', '{\"decline\":\"no_edge\"}',
                          'terminal', 'no_fill', 1700000101)",
                 rusqlite::params![
-                    keys[0].1.0,
+                    source_trade_id,
                     keys[0].2,
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ],
             )
             .unwrap();
-        connection
-            .execute("DELETE FROM decision_pending", [])
-            .unwrap();
+        for table in [
+            "decision_pending",
+            "no_copy_dispositions",
+            "entry_gate_results",
+            "activity_group_revisions",
+            "activity_groups",
+        ] {
+            connection
+                .execute(
+                    &format!("DELETE FROM {table} WHERE source_trade_id = ?1"),
+                    rusqlite::params![source_trade_id],
+                )
+                .unwrap();
+        }
         assert!(matches!(
             decision_rows_for_source_prefix(&state, &source_path, &start, &sealed),
             Err(QualificationError::InsufficientEvidence(reason))
-                if reason.contains("has no decision_pending row")
+                if reason.contains("has no terminal decision_pending row")
         ));
     }
 
@@ -7354,6 +7459,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paper_log = temp.path().join("paper.log");
         let source_log = temp.path().join("source.log");
+        let live_journal = temp.path().join("live_journal.log");
         let paper_state = temp.path().join("paper.db");
         let output = temp.path().join("qualification.json");
         let mut paper_writer = Writer::open(&paper_log).unwrap();
@@ -7363,6 +7469,7 @@ mod tests {
         let cutoff_unix = 86_400;
         let start_unix = cutoff_unix - 100;
         let state = PaperStateDb::open(&paper_state).unwrap();
+        drop(pe_execution_core::LiveJournal::open(&live_journal).unwrap());
         let mut start = started("hot");
         let decision_wallet = start.membership[0];
         start.membership.clear();
@@ -7423,7 +7530,7 @@ mod tests {
         let options = QualifyOptions {
             paper_log: paper_log.clone(),
             source_log: source_log.clone(),
-            live_journal: None,
+            live_journal: Some(live_journal),
             paper_state: paper_state.clone(),
             seal_hash: seal_receipt.this_hash.to_hex().to_string(),
             output,
