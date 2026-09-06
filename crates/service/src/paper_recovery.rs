@@ -21,6 +21,7 @@ use pe_position_ledger::{
     AppliedEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation, PositionLedger,
 };
 use pe_risk_engine::RiskHaltCause;
+use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -234,36 +235,107 @@ pub fn active_risk_halts(era: &PaperEra) -> HashSet<(RiskHaltOwner, RiskHaltCaus
 pub enum MembershipReplayError {
     #[error("QualificationStarted membership repeats wallet {0}")]
     DuplicateInitial(WalletAddress),
+    #[error("QualificationStarted wallet {0} is absent from its pinned ranking batch")]
+    MissingInitial(WalletAddress),
     #[error("MembershipChanged removes absent wallet {0}")]
     MissingRemoval(WalletAddress),
     #[error("MembershipChanged adds existing wallet {0}")]
     DuplicateAddition(WalletAddress),
     #[error("MembershipChanged result {actual} exceeds capacity {capacity}")]
     Capacity { actual: usize, capacity: usize },
+    #[error("MembershipChanged at sequence {sequence} has no replacement_entries evidence")]
+    MissingReplacementEntries { sequence: u64 },
+    #[error("MembershipChanged replacement_entries decode failed at sequence {sequence}: {source}")]
+    ReplacementEntries {
+        sequence: u64,
+        source: serde_json::Error,
+    },
+    #[error(
+        "MembershipChanged replacement evidence disagrees with its wallet mutation at sequence {sequence}"
+    )]
+    ReplacementMismatch { sequence: u64 },
 }
 
-/// Reconstruct the sole structural membership generation from Start and subsequent synchronized
-/// membership records. Score refreshes and durable fence removals remain owned by their existing
-/// projections and therefore do not appear here.
+/// The structurally applied watchlist generation rebuilt from the durable paper prefix.
+#[derive(Debug)]
+pub struct ReplayedMembership {
+    pub watchlist: Watchlist,
+    pub last_ranking_batch_id: i64,
+}
+
+fn watchlist_with_entries(mut watchlist: Watchlist, entries: Vec<WatchlistEntry>) -> Watchlist {
+    let active_count = entries
+        .iter()
+        .filter(|entry| entry.tier == WatchlistTier::Active)
+        .count();
+    let total = entries.len();
+    watchlist.entries = entries;
+    watchlist.active_count = active_count;
+    watchlist.incubator_count = total.saturating_sub(active_count);
+    watchlist
+}
+
+fn replacement_entries(
+    frame: &ScannedPaperFrame,
+    evidence: &serde_json::Value,
+) -> Result<Vec<WatchlistEntry>, MembershipReplayError> {
+    let value = evidence.get("replacement_entries").cloned().ok_or(
+        MembershipReplayError::MissingReplacementEntries {
+            sequence: frame.receipt.sequence.0,
+        },
+    )?;
+    serde_json::from_value(value).map_err(|source| MembershipReplayError::ReplacementEntries {
+        sequence: frame.receipt.sequence.0,
+        source,
+    })
+}
+
+/// Reconstruct the sole structural watchlist generation from Start's pinned ranking rows and
+/// subsequent synchronized membership records. Score refreshes and durable fence removals remain
+/// owned by their existing projections and therefore do not appear here.
+///
+/// `start_batch` must be the result of `supabase_reader::fetch_batch` for
+/// `QualificationStarted.ranking_batch_id`. Later additions are recovered only from each durable
+/// record's sealed `replacement_entries`, never from the moving ranking view.
 pub fn replay_membership(
     era: &PaperEra,
-) -> Result<Option<Vec<WalletAddress>>, MembershipReplayError> {
+    start_batch: Watchlist,
+) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
     let Some((_, start)) = &era.start else {
         return Ok(None);
     };
-    let mut ordered = Vec::with_capacity(start.membership.len());
     let mut present = HashSet::with_capacity(start.membership.len());
     for wallet in &start.membership {
         if !present.insert(*wallet) {
             return Err(MembershipReplayError::DuplicateInitial(*wallet));
         }
-        ordered.push(*wallet);
     }
+    let mut entries = start_batch
+        .entries
+        .iter()
+        .filter(|entry| present.contains(&entry.wallet))
+        .cloned()
+        .collect::<Vec<_>>();
+    let available = entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    if let Some(missing) = start
+        .membership
+        .iter()
+        .find(|wallet| !available.contains(wallet))
+    {
+        return Err(MembershipReplayError::MissingInitial(*missing));
+    }
+
+    let mut last_ranking_batch_id = start.ranking_batch_id;
     for frame in &era.frames {
         let PaperLogFrame::Record(PaperLogRecord::MembershipChanged {
             removed,
             added,
             capacity,
+            ranking_batch_id,
+            evidence,
             ..
         }) = &frame.frame
         else {
@@ -274,21 +346,49 @@ pub fn replay_membership(
                 return Err(MembershipReplayError::MissingRemoval(*wallet));
             }
         }
-        ordered.retain(|wallet| present.contains(wallet));
         for wallet in added {
             if !present.insert(*wallet) {
                 return Err(MembershipReplayError::DuplicateAddition(*wallet));
             }
-            ordered.push(*wallet);
         }
-        if ordered.len() > *capacity {
+        if present.len() > *capacity {
             return Err(MembershipReplayError::Capacity {
-                actual: ordered.len(),
+                actual: present.len(),
                 capacity: *capacity,
             });
         }
+
+        let replacements = replacement_entries(frame, evidence)?;
+        let removed = removed.iter().copied().collect::<HashSet<_>>();
+        entries.retain(|entry| !removed.contains(&entry.wallet));
+        let mut entry_wallets = entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>();
+        for replacement in replacements {
+            if entries.len() >= *capacity {
+                break;
+            }
+            if !removed.contains(&replacement.wallet) && entry_wallets.insert(replacement.wallet) {
+                entries.push(replacement);
+            }
+        }
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.leader_score_bps.0));
+        entries.truncate(*capacity);
+        entry_wallets = entries.iter().map(|entry| entry.wallet).collect();
+        if entry_wallets != present {
+            return Err(MembershipReplayError::ReplacementMismatch {
+                sequence: frame.receipt.sequence.0,
+            });
+        }
+        if let Some(batch_id) = ranking_batch_id {
+            last_ranking_batch_id = *batch_id;
+        }
     }
-    Ok(Some(ordered))
+    Ok(Some(ReplayedMembership {
+        watchlist: watchlist_with_entries(start_batch, entries),
+        last_ranking_batch_id,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +760,28 @@ mod paper_log_tests {
         WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap()
     }
 
+    fn watchlist_entry(wallet: WalletAddress, score: i32) -> WatchlistEntry {
+        WatchlistEntry {
+            wallet,
+            tier: WatchlistTier::Active,
+            leader_score_bps: BasisPoints(score),
+            lcb_5pct_bps: BasisPoints(score),
+            win_rate_bps: BasisPoints(6_000),
+            closed_trades_in_window: 20,
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+        }
+    }
+
+    fn watchlist(entries: Vec<WatchlistEntry>) -> Watchlist {
+        let active_count = entries.len();
+        Watchlist {
+            entries,
+            snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            active_count,
+            incubator_count: 0,
+        }
+    }
+
     fn economic() -> EconomicPrepared {
         let price = Price::new(dec!(0.5)).unwrap();
         let shares = ShareAmount::from_whole(2).unwrap();
@@ -1022,13 +1144,16 @@ mod paper_log_tests {
         assert_eq!(frames[1].receipt.sequence, EventSeq(1));
     }
 
+    /// PASS: later membership uses its durable replacement entry and advances the applied batch;
+    /// FAIL: replay consults a moving ranking or reconstructs only wallet identifiers.
     #[test]
-    fn structural_membership_replays_start_and_later_changes() {
+    fn structural_membership_replays_start_and_later_replacement_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("membership.log");
         let mut writer = Writer::open(&path).unwrap();
         let initial = wallet();
         let added = WalletAddress([2; 20]);
+        let replacement = watchlist_entry(added, 800);
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
@@ -1038,18 +1163,76 @@ mod paper_log_tests {
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
             &PaperLogRecord::MembershipChanged {
-                reason: MembershipReason::CapacityChange,
+                reason: MembershipReason::FullRerank,
                 removed: vec![initial],
                 added: vec![added],
                 capacity: 1,
                 ranking_batch_id: Some(8),
-                evidence: serde_json::json!({"test": true}),
+                evidence: serde_json::json!({
+                    "kind": "full_rerank",
+                    "replacement_entries": [replacement]
+                }),
             },
         );
         drop(writer);
 
         let era = paper_era(scan_paper_log(&path).unwrap());
-        assert_eq!(replay_membership(&era).unwrap(), Some(vec![added]));
+        let replayed = replay_membership(&era, watchlist(vec![watchlist_entry(initial, 500)]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.last_ranking_batch_id, 8);
+        assert_eq!(replayed.watchlist.entries.len(), 1);
+        assert_eq!(replayed.watchlist.entries[0].wallet, added);
+        assert_eq!(
+            replayed.watchlist.entries[0].leader_score_bps,
+            BasisPoints(800)
+        );
+    }
+
+    /// PASS: a crash before the new MembershipChanged record leaves boot on Start's A/N;
+    /// FAIL: an unrecorded newer publication changes the replayed entries or marker.
+    #[test]
+    fn structural_membership_crash_before_record_keeps_start_generation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("membership-crash.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let initial = wallet();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+        );
+        drop(writer);
+
+        let era = paper_era(scan_paper_log(&path).unwrap());
+        let replayed = replay_membership(&era, watchlist(vec![watchlist_entry(initial, 500)]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.last_ranking_batch_id, 7);
+        assert_eq!(replayed.watchlist.entries.len(), 1);
+        assert_eq!(replayed.watchlist.entries[0].wallet, initial);
+    }
+
+    /// PASS: Start cannot be rebuilt when its durable wallet is absent from the pinned batch;
+    /// FAIL: replay silently drops the wallet or substitutes a row from another generation.
+    #[test]
+    fn structural_membership_requires_every_start_wallet_in_pinned_batch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("membership-missing-start.log");
+        let mut writer = Writer::open(&path).unwrap();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+        );
+        drop(writer);
+
+        let era = paper_era(scan_paper_log(&path).unwrap());
+        let other = WalletAddress([2; 20]);
+        assert!(matches!(
+            replay_membership(&era, watchlist(vec![watchlist_entry(other, 500)])),
+            Err(MembershipReplayError::MissingInitial(missing)) if missing == wallet()
+        ));
     }
 
     #[test]

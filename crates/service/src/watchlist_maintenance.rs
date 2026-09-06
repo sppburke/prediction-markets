@@ -621,11 +621,10 @@ pub async fn run_maintenance_loop(
     // Wallets evicted under the current ranking batch: excluded from backfill so a just-evicted
     // wallet is not instantly re-admitted with a reset clock. Cleared when a new batch is pushed.
     let mut evicted: HashSet<WalletAddress> = HashSet::new();
-    // Seeded with the batch observed at boot (fetched BEFORE the boot watchlist so a batch
-    // landing in between reads as a transition, never as already-seen — review finding on
-    // the first draft): a batch pushed between boot and the first tick now swaps on that
-    // first tick instead of being pinned as current and skipped until the next batch. A `None`
-    // marker (the boot batch read failed) is an ordinary transition too (#542): the first tick
+    // Financial boot supplies the last ranking batch named by a structurally applied durable
+    // generation. Pre-Start boot supplies the batch observed before its moving ranking read.
+    // Either way, a newer publication remains a transition for the first tick. A `None` marker
+    // (the pre-Start batch read failed) is an ordinary transition too (#542): the first tick
     // applies the batch it triggers on rather than adopting the identifier without applying it.
     let mut sync = BatchSync {
         marker: initial_batch_marker,
@@ -1679,8 +1678,11 @@ mod tests {
             wallets.iter().copied().collect()
         }
 
+        /// PASS: given the durable A/N generation left by a crash before MembershipChanged, the
+        /// first tick prepares and applies published B; FAIL: marker N is replaced by B at boot
+        /// and the tick suppresses the pending transition.
         #[tokio::test]
-        async fn full_rerank_prepares_exact_additions_before_publishing() {
+        async fn crash_before_membership_record_first_tick_applies_new_batch() {
             let (a, b) = (wallet(1), wallet(2));
             let mut fake = Fake::new(Some(2));
             fake.ranking_entries = vec![row(2, 1, a), row(2, 2, b)];
