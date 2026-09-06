@@ -39,7 +39,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
 };
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
@@ -163,6 +163,12 @@ pub enum PaperStateError {
         source_trade_id: String,
         semantic_revision: String,
     },
+    /// SQLite contains a post-Start decision key not present in the independently parsed source
+    /// prefix, or omits one that the source prefix requires.
+    #[error(
+        "qualification seal decision selection differs from the source prefix: requested {requested}, stored {stored}"
+    )]
+    SealEvidenceSelectionMismatch { requested: usize, stored: usize },
     /// The one-time legacy history input was not a valid sidecar.
     #[error("legacy wallet history import is invalid: {0}")]
     InvalidLegacyHistory(String),
@@ -419,6 +425,35 @@ struct SelectedSealTerminal {
     state: String,
     terminal_disposition: Option<String>,
     updated_at_unix: i64,
+}
+
+#[derive(Deserialize)]
+struct SealDecisionScope {
+    version: u16,
+    #[serde(default)]
+    observed_source_receipt: Option<AppendReceipt>,
+    #[serde(default)]
+    page_occurrences: Vec<SealPageOccurrence>,
+}
+
+#[derive(Deserialize)]
+struct SealPageOccurrence {
+    receipt: AppendReceipt,
+}
+
+fn validate_seal_decision_keys(
+    keys: &[(SourceTradeId, String)],
+) -> Result<BTreeSet<(String, String)>, PaperStateError> {
+    let mut unique = BTreeSet::new();
+    for (source_trade_id, semantic_revision) in keys {
+        if !unique.insert((source_trade_id.0.clone(), semantic_revision.clone())) {
+            return Err(PaperStateError::DuplicateSealEvidenceKey {
+                source_trade_id: source_trade_id.0.clone(),
+                semantic_revision: semantic_revision.clone(),
+            });
+        }
+    }
+    Ok(unique)
 }
 
 /// Caller-rendered versioned evidence attached to a terminal pending-decision
@@ -1845,18 +1880,75 @@ impl PaperStateDb {
         &self,
         keys: &[(SourceTradeId, String)],
     ) -> Result<Vec<u8>, PaperStateError> {
-        let mut unique = BTreeSet::new();
-        for (source_trade_id, semantic_revision) in keys {
-            if !unique.insert((source_trade_id.0.clone(), semantic_revision.clone())) {
-                return Err(PaperStateError::DuplicateSealEvidenceKey {
-                    source_trade_id: source_trade_id.0.clone(),
-                    semantic_revision: semantic_revision.clone(),
-                });
-            }
-        }
+        validate_seal_decision_keys(keys)?;
 
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let bytes = Self::seal_decision_evidence_in_transaction(&tx, keys)?;
+        tx.commit()?;
+        Ok(bytes)
+    }
+
+    /// Seal the source-derived key set and prove that it is the exact version-three decision set
+    /// for the source receipt interval. The selection and every companion read share one SQLite
+    /// read transaction, so a missing, open, additional, or revision-mismatched row cannot be
+    /// hidden by a self-consistent projection read.
+    pub fn seal_decision_evidence_for_source_prefix(
+        &self,
+        keys: &[(SourceTradeId, String)],
+        start_exclusive: Option<EventSeq>,
+        sealed_inclusive: Option<EventSeq>,
+    ) -> Result<Vec<u8>, PaperStateError> {
+        let requested = validate_seal_decision_keys(keys)?;
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut statement = tx.prepare(
+            "SELECT source_trade_id, semantic_revision, frozen_inputs_json \
+             FROM decision_pending ORDER BY source_trade_id",
+        )?;
+        let candidates = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut stored = BTreeSet::new();
+        for candidate in candidates {
+            let (source_trade_id, semantic_revision, frozen_inputs_json) = candidate?;
+            let scope: SealDecisionScope = serde_json::from_str(&frozen_inputs_json)?;
+            let receipts = scope
+                .page_occurrences
+                .iter()
+                .map(|page| page.receipt)
+                .chain(scope.observed_source_receipt)
+                .collect::<Vec<_>>();
+            let in_scope = scope.version == 3
+                && !receipts.is_empty()
+                && receipts.iter().all(|receipt| {
+                    start_exclusive.is_none_or(|start| receipt.sequence > start)
+                        && sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
+                });
+            if in_scope {
+                stored.insert((source_trade_id, semantic_revision));
+            }
+        }
+        drop(statement);
+        if requested != stored {
+            return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                requested: requested.len(),
+                stored: stored.len(),
+            });
+        }
+        let bytes = Self::seal_decision_evidence_in_transaction(&tx, keys)?;
+        tx.commit()?;
+        Ok(bytes)
+    }
+
+    fn seal_decision_evidence_in_transaction(
+        tx: &Transaction<'_>,
+        keys: &[(SourceTradeId, String)],
+    ) -> Result<Vec<u8>, PaperStateError> {
         let mut evidence_rows = Vec::with_capacity(keys.len());
         for (source_trade_id, requested_revision) in keys {
             let group: Option<(String, String, i64, String, String, String, String)> = tx
@@ -2044,7 +2136,6 @@ impl PaperStateDb {
         };
         let mut bytes = serde_json::to_vec(&document)?;
         bytes.push(b'\n');
-        tx.commit()?;
         Ok(bytes)
     }
 
@@ -6942,6 +7033,36 @@ mod tests {
             Err(PaperStateError::DuplicateSealEvidenceKey { .. })
         ));
     }
+
+    #[test]
+    fn source_prefix_seal_rejects_an_additional_scoped_decision_in_one_transaction() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let receipt = AppendReceipt {
+            sequence: EventSeq(5),
+            this_hash: blake3::hash(b"source-page"),
+        };
+        let frozen = serde_json::to_string(&serde_json::json!({
+            "version": 3,
+            "observed_source_receipt": null,
+            "page_occurrences": [{"receipt": receipt}],
+        }))
+        .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = 'g2:seal'",
+                params![frozen],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.seal_decision_evidence_for_source_prefix(&[], None, Some(EventSeq(5))),
+            Err(PaperStateError::SealEvidenceSelectionMismatch {
+                requested: 0,
+                stored: 1,
+            })
+        ));
+    }
+
     fn append_receipt(sequence: u64, byte: u8) -> AppendReceipt {
         AppendReceipt {
             sequence: EventSeq(sequence),
