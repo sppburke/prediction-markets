@@ -34,7 +34,8 @@ use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3};
 use crate::clob_book::ClobBookFetcher;
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
-    MarketPriceEvidence, TerminalDispositionEvidence, ladder_plan_blake3, replay_decision_pending,
+    MarketPriceEvidence, TerminalDispositionEvidence, WinnerFollowDecisionInputs,
+    ladder_plan_blake3, replay_decision_pending,
 };
 use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
@@ -2911,11 +2912,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 let decline = pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable;
                 let reason = format!("{decline}: {error}");
                 info!(reason = %reason, "signal did not produce order");
-                self.no_fill_or_rollback(
+                self.decline_or_rollback(
                     &trade,
                     &leader_row,
                     dispatch_id.as_deref(),
                     &format!("paper_reject:{reason}"),
+                    &decline,
+                    WinnerFollowDecisionInputs::RiskInputsUnavailable,
                     &rb,
                     Some(&signal.market_id),
                     decision_evidence.as_ref(),
@@ -2953,18 +2956,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &signal,
             economic.sizing.all_in_price,
             p,
-            snapshot,
+            snapshot.clone(),
             sizing_bankroll,
             self.mode,
         ) {
             Err(e) => {
                 info!(reason = %e, "signal did not produce order");
                 let reason = format!("paper_reject:{e}");
-                self.no_fill_or_rollback(
+                self.decline_or_rollback(
                     &trade,
                     &leader_row,
                     dispatch_id.as_deref(),
                     &reason,
+                    &e,
+                    WinnerFollowDecisionInputs::Evaluated {
+                        all_in_price: economic.sizing.all_in_price,
+                        risk_snapshot: snapshot,
+                    },
                     &rb,
                     Some(&signal.market_id),
                     decision_evidence.as_ref(),
@@ -3155,7 +3163,40 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         evidence: Option<&DecisionEvidenceAccumulator>,
     ) {
         if self
-            .commit_no_fill_flipping(trade, leader, dispatch_id, no_fill_reason, evidence)
+            .commit_no_fill_flipping(trade, leader, dispatch_id, no_fill_reason, None, evidence)
+            .await
+        {
+            return;
+        }
+        self.rollback_admission(rb, unrecord_market);
+    }
+
+    /// Persist the actual shared-strategy error together with the exact inputs that produced it.
+    /// Risk-input acquisition failure is represented explicitly because strategy evaluation cannot
+    /// run without a complete snapshot.
+    #[allow(clippy::too_many_arguments)]
+    async fn decline_or_rollback(
+        &mut self,
+        trade: &IncomingTrade,
+        leader: &LeaderPositionRow,
+        dispatch_id: Option<&str>,
+        no_fill_reason: &str,
+        error: &pe_strategy_winner_follow::WinnerFollowError,
+        inputs: WinnerFollowDecisionInputs,
+        rb: &RollbackCtx,
+        unrecord_market: Option<&MarketId>,
+        evidence: Option<&DecisionEvidenceAccumulator>,
+    ) {
+        let terminal = TerminalDispositionEvidence::declined(error, inputs);
+        if self
+            .commit_no_fill_flipping(
+                trade,
+                leader,
+                dispatch_id,
+                no_fill_reason,
+                Some(terminal),
+                evidence,
+            )
             .await
         {
             return;
@@ -3193,6 +3234,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         leader: &LeaderPositionRow,
         dispatch_id: Option<&str>,
         no_fill_reason: &str,
+        terminal: Option<TerminalDispositionEvidence>,
         evidence: Option<&DecisionEvidenceAccumulator>,
     ) -> bool {
         let durable_reason = if no_fill_reason.is_empty() {
@@ -3200,10 +3242,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         } else {
             no_fill_reason
         };
+        let terminal =
+            terminal.unwrap_or_else(|| TerminalDispositionEvidence::no_fill(durable_reason));
         let pending = match render_pending_evidence(
             evidence,
             AuthorityEvidence::not_read("terminal_before_fill_authority"),
-            TerminalDispositionEvidence::no_fill(durable_reason),
+            terminal,
         ) {
             Ok(value) => value,
             Err(error) => {

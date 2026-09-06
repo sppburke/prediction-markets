@@ -56,7 +56,7 @@ use time::OffsetDateTime;
 
 use crate::bucket_commit::DecisionContinuationV3;
 use crate::config::ServiceConfig;
-use crate::decision_replay::replay_decision_pending;
+use crate::decision_replay::{WinnerFollowDecisionInputs, replay_decision_pending};
 use crate::paper_recovery::{
     FINANCIAL_SEMANTIC_VERSION, FinancialPayload, FinancialResult, MembershipReason,
     PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, PortfolioMark, QualificationSealed,
@@ -3774,6 +3774,14 @@ fn bind_final_receipts(
     let mut matched_finals = HashSet::new();
     for decision in decisions {
         let terminal = &decision.post_boundary.body.terminal;
+        if let Some(expected_decline) = terminal.decline.as_ref() {
+            verify_winner_follow_decline_decision(
+                &decision.continuation,
+                &expected_decline.inputs,
+                &expected_decline.outcome,
+            )?;
+            continue;
+        }
         if terminal.disposition != "fill" {
             continue;
         }
@@ -3844,13 +3852,6 @@ fn verify_winner_follow_fill_decision(
     let frozen = &continuation.facts;
     let economic = &fill.economic;
     let configuration = &frozen.applied_configuration;
-    let mode =
-        crate::runtime_config::parse_execution_mode(&configuration.mode).ok_or_else(|| {
-            QualificationError::InsufficientEvidence(format!(
-                "decision {} has an invalid frozen execution mode",
-                frozen.source_trade_id
-            ))
-        })?;
     if economic.applied_configuration_hash != frozen.applied_configuration_hash
         || economic.market.market_id != frozen.market_id.0.0
         || u16::from(economic.market.outcome_index) != frozen.outcome_id.0
@@ -3862,27 +3863,7 @@ fn verify_winner_follow_fill_decision(
         ));
     }
 
-    let incoming = continuation.incoming_trade().map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "decision {} cannot reconstruct its strategy signal: {error}",
-            frozen.source_trade_id
-        ))
-    })?;
-    let signal = LeaderSignal {
-        leader: TraderId(incoming.wallet),
-        venue: VenueId::polymarket(),
-        market_id: incoming.market_id,
-        outcome_id: incoming.outcome_id,
-        action: frozen.pre_bucket_action,
-        leader_side: incoming.side,
-        leader_price: incoming.price,
-        leader_size: incoming.contracts,
-        observed_at: incoming.observed_at,
-        received_at: incoming.received_at,
-        reconstruction_quality: frozen.reconstruction_quality,
-        source_trade_id: incoming.source_trade_id,
-        action_confidence_ppm: frozen.action_confidence_ppm,
-    };
+    let (signal, mode) = reconstruct_winner_follow_signal(continuation)?;
     let intent =
         pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config())
             .evaluate_at_price(
@@ -3920,6 +3901,88 @@ fn verify_winner_follow_fill_decision(
         ));
     }
     Ok(())
+}
+
+fn verify_winner_follow_decline_decision(
+    continuation: &DecisionContinuationV3,
+    inputs: &WinnerFollowDecisionInputs,
+    expected: &pe_strategy_winner_follow::WinnerFollowDeclineAudit,
+) -> Result<(), QualificationError> {
+    let frozen = &continuation.facts;
+    let actual = match inputs {
+        WinnerFollowDecisionInputs::RiskInputsUnavailable => {
+            pe_strategy_winner_follow::WinnerFollowDeclineAudit::RiskInputsUnavailable
+        }
+        WinnerFollowDecisionInputs::Evaluated {
+            all_in_price,
+            risk_snapshot,
+        } => {
+            let (signal, mode) = reconstruct_winner_follow_signal(continuation)?;
+            match pe_strategy_winner_follow::WinnerFollowStrategy::new(
+                frozen.applied_configuration.winner_follow_config(),
+            )
+            .evaluate_at_price(
+                &signal,
+                *all_in_price,
+                frozen.frozen_basis.win_rate_p,
+                risk_snapshot.clone(),
+                frozen.frozen_basis.bankroll,
+                mode,
+            ) {
+                Ok(intent) => {
+                    return insufficient(format!(
+                        "decision {} recorded decline {expected:?} but Winner-Follow replay emitted intent {intent:?}",
+                        frozen.source_trade_id
+                    ));
+                }
+                Err(error) => pe_strategy_winner_follow::WinnerFollowDeclineAudit::from(&error),
+            }
+        }
+    };
+    if &actual != expected {
+        return insufficient(format!(
+            "decision {} Winner-Follow decline differs: recorded {expected:?}, replayed {actual:?}",
+            frozen.source_trade_id
+        ));
+    }
+    Ok(())
+}
+
+fn reconstruct_winner_follow_signal(
+    continuation: &DecisionContinuationV3,
+) -> Result<(LeaderSignal, pe_strategy_winner_follow::ExecutionMode), QualificationError> {
+    let frozen = &continuation.facts;
+    let mode = crate::runtime_config::parse_execution_mode(&frozen.applied_configuration.mode)
+        .ok_or_else(|| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision {} has an invalid frozen execution mode",
+                frozen.source_trade_id
+            ))
+        })?;
+    let incoming = continuation.incoming_trade().map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "decision {} cannot reconstruct its strategy signal: {error}",
+            frozen.source_trade_id
+        ))
+    })?;
+    Ok((
+        LeaderSignal {
+            leader: TraderId(incoming.wallet),
+            venue: VenueId::polymarket(),
+            market_id: incoming.market_id,
+            outcome_id: incoming.outcome_id,
+            action: frozen.pre_bucket_action,
+            leader_side: incoming.side,
+            leader_price: incoming.price,
+            leader_size: incoming.contracts,
+            observed_at: incoming.observed_at,
+            received_at: incoming.received_at,
+            reconstruction_quality: frozen.reconstruction_quality,
+            source_trade_id: incoming.source_trade_id,
+            action_confidence_ppm: frozen.action_confidence_ppm,
+        },
+        mode,
+    ))
 }
 
 /// Return the fail-closed seal result required before applying a changed semantic hash.
@@ -4963,6 +5026,74 @@ mod tests {
         (continuation, mutation)
     }
 
+    fn sealed_no_edge_decision() -> crate::decision_replay::ReplayedDecision {
+        let (mut continuation, _) = classification_fixture();
+        continuation.facts.applied_configuration.sizing_mode =
+            pe_strategy_winner_follow::SizingMode::Kelly;
+        continuation.facts.applied_configuration.sizing_dollar_usd = Decimal::ZERO;
+        continuation.facts.applied_configuration.sizing_contracts = 0;
+        continuation.facts.frozen_basis.win_rate_p = Probability::ZERO;
+        continuation.facts.applied_configuration_hash =
+            continuation.facts.applied_configuration.canonical_hash();
+        let risk_snapshot = risk_economic(
+            &continuation.facts.market_id.0.0,
+            CollateralAmount::from_atomic(1),
+        )
+        .risk
+        .snapshot;
+        let all_in_price = Price::new(dec!(0.5)).unwrap();
+        let (signal, mode) = reconstruct_winner_follow_signal(&continuation).unwrap();
+        let error = pe_strategy_winner_follow::WinnerFollowStrategy::new(
+            continuation
+                .facts
+                .applied_configuration
+                .winner_follow_config(),
+        )
+        .evaluate_at_price(
+            &signal,
+            all_in_price,
+            continuation.facts.frozen_basis.win_rate_p,
+            risk_snapshot.clone(),
+            continuation.facts.frozen_basis.bankroll,
+            mode,
+        )
+        .expect_err("zero-probability Kelly Entry must decline");
+        assert!(matches!(
+            &error,
+            pe_strategy_winner_follow::WinnerFollowError::NoEdge
+        ));
+        let terminal = crate::decision_replay::TerminalDispositionEvidence::declined(
+            &error,
+            WinnerFollowDecisionInputs::Evaluated {
+                all_in_price,
+                risk_snapshot,
+            },
+        );
+        let terminal_disposition = terminal.disposition.clone();
+        let post_commit_inputs_json =
+            crate::decision_replay::DecisionEvidenceAccumulator::new(&continuation.facts)
+                .render(
+                    crate::decision_replay::AuthorityEvidence::not_read("strategy_declined"),
+                    terminal,
+                )
+                .unwrap();
+        let facts_json = serde_json::to_string(&continuation.facts).unwrap();
+        let frozen_inputs_json =
+            format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap());
+        replay_decision_pending(&DecisionPendingRow {
+            source_trade_id: continuation.facts.source_trade_id.clone(),
+            semantic_revision: continuation.facts.semantic_revision.clone(),
+            wallet: continuation.facts.wallet,
+            source_epoch: continuation.facts.source_epoch,
+            frozen_inputs_json,
+            post_commit_inputs_json,
+            state: DecisionPendingState::Terminal,
+            terminal_disposition: Some(terminal_disposition),
+            updated_at_unix: 1_700_000_001,
+        })
+        .unwrap()
+    }
+
     /// PASS: the verifier accepts a recorded Entry only when the shared complete-second
     /// classifier independently derives Entry from the causal ledger.
     #[test]
@@ -5035,6 +5166,50 @@ mod tests {
         };
 
         verify_winner_follow_fill_decision(&continuation, &fill).unwrap();
+    }
+
+    /// PASS: a paper Entry whose shared evaluation returns `NoEdge` is sealed as a typed decline,
+    /// and the qualification binding accepts it only after re-executing the retained inputs.
+    #[test]
+    fn winner_follow_replay_accepts_sealed_no_edge_decline() {
+        let decision = sealed_no_edge_decision();
+
+        bind_final_receipts(&[decision], &[], &HashMap::new(), &started("unused")).unwrap();
+    }
+
+    /// PASS: recomputing the terminal document hash after replacing `NoEdge` with another typed
+    /// decline remains insufficient because qualification re-executes the shared decision.
+    #[test]
+    fn winner_follow_replay_rejects_recomputed_wrong_decline() {
+        let decision = sealed_no_edge_decision();
+        let mut row = DecisionPendingRow {
+            source_trade_id: decision.continuation.facts.source_trade_id.clone(),
+            semantic_revision: decision.continuation.facts.semantic_revision.clone(),
+            wallet: decision.continuation.facts.wallet,
+            source_epoch: decision.continuation.facts.source_epoch,
+            frozen_inputs_json: {
+                let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
+                format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap())
+            },
+            post_commit_inputs_json: String::new(),
+            state: DecisionPendingState::Terminal,
+            terminal_disposition: Some("no_fill".to_owned()),
+            updated_at_unix: 1_700_000_001,
+        };
+        let mut body = decision.post_boundary.body;
+        body.terminal.decline.as_mut().unwrap().outcome =
+            pe_strategy_winner_follow::WinnerFollowDeclineAudit::ShadowMode;
+        row.post_commit_inputs_json = serde_json::to_string(
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+        )
+        .unwrap();
+        let recomputed = replay_decision_pending(&row).unwrap();
+
+        assert!(matches!(
+            bind_final_receipts(&[recomputed], &[], &HashMap::new(), &started("unused")),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("Winner-Follow decline differs")
+        ));
     }
 
     fn test_economic(

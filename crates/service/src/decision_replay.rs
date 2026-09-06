@@ -3,7 +3,8 @@
 use pe_core_types::{EventSeq, Price, Side, SourceTradeId};
 use pe_event_log::AppendReceipt;
 use pe_paper_state::{DecisionPendingRow, DecisionPendingState};
-use pe_strategy_winner_follow::{KellyErrorAudit, WinnerFollowDeclineAudit, WinnerFollowError};
+use pe_risk_engine::RiskSnapshot;
+use pe_strategy_winner_follow::{WinnerFollowDeclineAudit, WinnerFollowError};
 use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +93,25 @@ pub struct RecordedFillEvidence {
     pub event_seq: u64,
 }
 
+/// Exact direct inputs to the shared Winner-Follow decision, or the typed fact that they could not
+/// be constructed. Qualification consumes this record without reading a live clock or database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum WinnerFollowDecisionInputs {
+    Evaluated {
+        all_in_price: Price,
+        risk_snapshot: RiskSnapshot,
+    },
+    RiskInputsUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WinnerFollowDeclineEvidence {
+    pub outcome: WinnerFollowDeclineAudit,
+    pub inputs: WinnerFollowDecisionInputs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalDispositionEvidence {
     pub disposition: String,
@@ -99,7 +119,7 @@ pub struct TerminalDispositionEvidence {
     pub fill: Option<RecordedFillEvidence>,
     pub dispatch_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decline: Option<WinnerFollowDeclineAudit>,
+    pub decline: Option<WinnerFollowDeclineEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_receipt: Option<AppendReceipt>,
 }
@@ -176,13 +196,16 @@ impl TerminalDispositionEvidence {
         }
     }
 
-    pub fn declined(error: &WinnerFollowError) -> Self {
+    pub fn declined(error: &WinnerFollowError, inputs: WinnerFollowDecisionInputs) -> Self {
         Self {
             disposition: "no_fill".to_owned(),
             reason: format!("paper_reject:{error}"),
             fill: None,
             dispatch_id: None,
-            decline: Some(WinnerFollowDeclineAudit::from(error)),
+            decline: Some(WinnerFollowDeclineEvidence {
+                outcome: WinnerFollowDeclineAudit::from(error),
+                inputs,
+            }),
             final_receipt: None,
         }
     }
@@ -447,8 +470,6 @@ pub enum ReplayDecisionError {
     AuthorityBinding,
     #[error("version-three terminal evidence contradicts its disposition")]
     TerminalEvidenceBinding,
-    #[error("typed Winner-Follow decline does not match its durable reason")]
-    DeclineReasonBinding,
     #[error("decision_pending row is not terminal")]
     OpenRow,
     #[error("frozen decision continuation: {0}")]
@@ -522,29 +543,24 @@ pub fn replay_decision_pending(
     let disposition = post_boundary.body.terminal.disposition.as_str();
     let terminal = &post_boundary.body.terminal;
     if post_boundary.body.version == TERMINAL_EVIDENCE_VERSION {
-        let is_typed_decline =
-            terminal.disposition == "no_fill" && terminal.reason.starts_with("paper_reject:");
-        if terminal.decline.is_some() != is_typed_decline
-            || terminal.final_receipt.is_some() != (terminal.disposition == "fill")
-            || terminal.fill.is_some()
-        {
+        let typed_decline = terminal.decline.is_some()
+            && terminal.disposition == "no_fill"
+            && terminal.fill.is_none()
+            && terminal.final_receipt.is_none();
+        let final_fill = terminal.final_receipt.is_some()
+            && terminal.disposition == "fill"
+            && terminal.decline.is_none()
+            && terminal.fill.is_none();
+        if !typed_decline && !final_fill {
             return Err(ReplayDecisionError::TerminalEvidenceBinding);
         }
     }
     if terminal.decline.is_some()
         && (terminal.disposition != "no_fill"
-            || !terminal.reason.starts_with("paper_reject:")
             || terminal.fill.is_some()
             || terminal.final_receipt.is_some())
     {
         return Err(ReplayDecisionError::TerminalEvidenceBinding);
-    }
-    if terminal
-        .decline
-        .as_ref()
-        .is_some_and(|decline| !decline_matches_reason(decline, &terminal.reason))
-    {
-        return Err(ReplayDecisionError::DeclineReasonBinding);
     }
     match (terminal.fill.as_ref(), terminal.final_receipt) {
         (Some(_), Some(_)) => return Err(ReplayDecisionError::TerminalEvidenceBinding),
@@ -616,53 +632,13 @@ pub fn replay_decision_pending(
     })
 }
 
-fn decline_matches_reason(decline: &WinnerFollowDeclineAudit, reason: &str) -> bool {
-    let expected = match decline {
-        WinnerFollowDeclineAudit::ShadowMode => {
-            "paper_reject:shadow mode: signal recorded but not executed".to_owned()
-        }
-        WinnerFollowDeclineAudit::FlipNotApproved => {
-            "paper_reject:flip action requires human approval (flip_human_approved = false)"
-                .to_owned()
-        }
-        WinnerFollowDeclineAudit::NoEdge => {
-            "paper_reject:no edge: Kelly sizing produced zero contracts".to_owned()
-        }
-        WinnerFollowDeclineAudit::Blocked(block) => {
-            format!("paper_reject:risk blocked: {block:?}")
-        }
-        WinnerFollowDeclineAudit::RiskInputsUnavailable => {
-            const PREFIX: &str = "paper_reject:risk inputs unavailable";
-            return reason == PREFIX
-                || reason
-                    .strip_prefix(PREFIX)
-                    .is_some_and(|detail| detail.starts_with(": ") && detail.len() > 2);
-        }
-        WinnerFollowDeclineAudit::KellySizing(error) => match error {
-            KellyErrorAudit::InvalidProbability { value } => format!(
-                "paper_reject:Kelly sizing error: probability p must be in [0, 1], got {value}"
-            ),
-            KellyErrorAudit::InvalidNetPrice { value } => format!(
-                "paper_reject:Kelly sizing error: net price c must be in (0, 1), got {value}"
-            ),
-            KellyErrorAudit::InvalidBankroll { value } => {
-                format!("paper_reject:Kelly sizing error: bankroll must be positive, got {value}")
-            }
-            KellyErrorAudit::ContractOverflow { value } => format!(
-                "paper_reject:Kelly sizing error: contract count overflow: floored value {value} out of u64 range"
-            ),
-        },
-    };
-    reason == expected
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use pe_copy_signal_engine::TradeProvenance;
     use pe_core_types::{
-        LeaderAction, MarketId, OutcomeId, ProbabilityPpm, ShareAmount, Side, VenueMarketId,
-        WalletAddress,
+        BasisPoints, LeaderAction, MarketId, OutcomeId, ProbabilityPpm, ShareAmount, Side,
+        VenueMarketId, WalletAddress,
     };
     use rust_decimal_macros::dec;
     use serde_json::json;
@@ -733,6 +709,25 @@ mod tests {
         });
         evidence.record_clock("book_staleness_check", 1_700_000_000_125);
         evidence
+    }
+
+    fn evaluated_inputs() -> WinnerFollowDecisionInputs {
+        WinnerFollowDecisionInputs::Evaluated {
+            all_in_price: Price(dec!(0.50)),
+            risk_snapshot: RiskSnapshot {
+                leader_exposure_bps: BasisPoints::ZERO,
+                market_exposure_bps: BasisPoints::ZERO,
+                family_exposure_bps: BasisPoints::ZERO,
+                total_copy_exposure_bps: BasisPoints::ZERO,
+                intraday_pnl_bps: BasisPoints::ZERO,
+                rolling_7d_pnl_bps: BasisPoints::ZERO,
+                absolute_pnl_bps: BasisPoints::ZERO,
+                copy_latency_kill_switch_active: false,
+                proposed_trade_bps: BasisPoints::ZERO,
+                per_trade_cap_bps: 10_000,
+                concentration_caps: None,
+            },
+        }
     }
 
     fn terminal_row(
@@ -844,6 +839,7 @@ mod tests {
 
         let declined = TerminalDispositionEvidence::declined(
             &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+            evaluated_inputs(),
         );
         assert_eq!(declined.disposition, "no_fill");
         assert_eq!(
@@ -851,8 +847,8 @@ mod tests {
             "paper_reject:no edge: Kelly sizing produced zero contracts"
         );
         assert_eq!(
-            declined.decline,
-            Some(pe_strategy_winner_follow::WinnerFollowDeclineAudit::NoEdge)
+            declined.decline.as_ref().map(|decline| &decline.outcome),
+            Some(&pe_strategy_winner_follow::WinnerFollowDeclineAudit::NoEdge)
         );
         let declined_row = terminal_row(
             "typed-decline",
@@ -891,6 +887,7 @@ mod tests {
             AuthorityEvidence::not_read("strategy_declined"),
             TerminalDispositionEvidence::declined(
                 &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+                evaluated_inputs(),
             ),
         );
         let document: DecisionPostBoundaryEvidence =
@@ -905,28 +902,26 @@ mod tests {
         ));
     }
 
-    /// PASS: recomputing the evidence hash cannot pair a typed decline with another decline's
-    /// durable display reason.
+    /// PASS: structural replay does not interpret display text as Winner-Follow semantics; the
+    /// qualification verifier independently re-executes the retained typed decision inputs.
     #[test]
-    fn replay_rejects_decline_enum_that_disagrees_with_reason() {
+    fn replay_does_not_make_decline_display_text_a_semantic_owner() {
         let mut row = terminal_row(
-            "wrong-decline",
+            "display-only",
             AuthorityEvidence::not_read("strategy_declined"),
             TerminalDispositionEvidence::declined(
                 &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+                evaluated_inputs(),
             ),
         );
         let document: DecisionPostBoundaryEvidence =
             serde_json::from_str(&row.post_commit_inputs_json).unwrap();
         let mut body = document.body;
-        body.terminal.decline = Some(WinnerFollowDeclineAudit::RiskInputsUnavailable);
+        body.terminal.reason = "operator-facing text changed".to_owned();
         row.post_commit_inputs_json =
             serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(body).unwrap()).unwrap();
 
-        assert!(matches!(
-            replay_decision_pending(&row),
-            Err(ReplayDecisionError::DeclineReasonBinding)
-        ));
+        replay_decision_pending(&row).unwrap();
     }
 
     #[test]
