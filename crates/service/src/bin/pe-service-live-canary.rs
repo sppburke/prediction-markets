@@ -24,7 +24,7 @@ use pe_risk_engine::{CanaryRiskSnapshot, exposure_bps_ceil};
 use pe_service::live_canary::LiveCanaryIo;
 use pe_service::organic_canary::{OrganicCandidateSource, OrganicObservation};
 use pe_source_polymarket_public::canary::{parse_strict_market, verify_geopolitics_tag};
-use pe_source_polymarket_public::{HttpRequestContext, ReqwestFetcher};
+use pe_source_polymarket_public::{GAMMA_BATCH_LIMIT_PARAM, HttpRequestContext, ReqwestFetcher};
 use pe_strategy_winner_follow::{
     OrganicCanaryOrder, OrganicCanaryPolicy, OrganicDecisionProof, organic_decision_proof_hash,
 };
@@ -1536,7 +1536,7 @@ fn authority_hash(kind: &str, path: &str) -> Result<String> {
 
 fn gamma_market_url(condition_id: &PolymarketConditionId) -> String {
     format!(
-        "{GAMMA_HOST}/markets?condition_ids={}&limit=500&include_tag=true",
+        "{GAMMA_HOST}/markets?condition_ids={}&limit={GAMMA_BATCH_LIMIT_PARAM}&include_tag=true",
         condition_id.0
     )
 }
@@ -1663,7 +1663,7 @@ mod tests {
 
         assert_eq!(
             gamma_market_url(&condition),
-            "https://gamma-api.polymarket.com/markets?condition_ids=0xcondition&limit=500&include_tag=true"
+            "https://gamma-api.polymarket.com/markets?condition_ids=0xcondition&limit={GAMMA_BATCH_LIMIT_PARAM}&include_tag=true"
         );
     }
 }
