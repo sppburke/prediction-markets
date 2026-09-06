@@ -4056,46 +4056,69 @@ struct AccountPromotionRow {
 
 async fn fetch_promotions(
     state: &FanoutState,
+    account_ids: &[AccountId],
 ) -> Result<HashMap<String, PromotionFacts>, &'static str> {
     let token = auth_token(
         &state.config.supabase_anon_key,
         &state.config.supabase_secret_key,
     );
-    let url = promotion_events_url(&state.config.supabase_url);
-    let response = state
-        .config
-        .http
-        .get(url)
-        .header("apikey", token)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|_| "transport")?;
-    if !response.status().is_success() {
-        return Err("status");
-    }
-    let rows: Vec<AccountPromotionRow> = response.json().await.map_err(|_| "decode")?;
-    let mut grouped: HashMap<String, Vec<PromotionEventRow>> = HashMap::new();
-    for row in rows {
-        grouped
-            .entry(row.account_id)
-            .or_default()
-            .push(PromotionEventRow {
-                event_kind: row.event_kind,
-                created_at: row.created_at,
-                evidence_ref: row.evidence_ref,
-            });
-    }
-    Ok(grouped
-        .into_iter()
-        .map(|(account, rows)| (account, promotion_facts_from_rows(&rows)))
-        .collect())
+    fetch_promotions_from(
+        &state.config.http,
+        &state.config.supabase_url,
+        token,
+        account_ids,
+    )
+    .await
 }
 
-fn promotion_events_url(supabase_url: &str) -> String {
+async fn fetch_promotions_from(
+    client: &reqwest::Client,
+    supabase_url: &str,
+    token: &str,
+    account_ids: &[AccountId],
+) -> Result<HashMap<String, PromotionFacts>, &'static str> {
+    let mut promotions = HashMap::with_capacity(account_ids.len());
+    for account_id in account_ids {
+        let mut rows = Vec::with_capacity(2);
+        for event_kind in ["promotion_reviewed", "promotion_review_revoked"] {
+            let response = client
+                .get(promotion_event_url(supabase_url, account_id, event_kind))
+                .header("apikey", token)
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+                .send()
+                .await
+                .map_err(|_| "transport")?;
+            if !response.status().is_success() {
+                return Err("status");
+            }
+            let event_rows: Vec<AccountPromotionRow> =
+                response.json().await.map_err(|_| "decode")?;
+            if event_rows.len() > 1 {
+                return Err("cardinality");
+            }
+            for row in event_rows {
+                if row.account_id != account_id.as_str() || row.event_kind != event_kind {
+                    return Err("identity");
+                }
+                rows.push(PromotionEventRow {
+                    event_kind: row.event_kind,
+                    created_at: row.created_at,
+                    evidence_ref: row.evidence_ref,
+                });
+            }
+        }
+        promotions.insert(
+            account_id.as_str().to_owned(),
+            promotion_facts_from_rows(&rows),
+        );
+    }
+    Ok(promotions)
+}
+
+fn promotion_event_url(supabase_url: &str, account_id: &AccountId, event_kind: &str) -> String {
     format!(
-        "{}/rest/v1/account_events?select=account_id,event_kind,created_at,evidence_ref&event_kind=in.(promotion_reviewed,promotion_review_revoked)&order=created_at.desc&limit=50",
-        supabase_url.trim_end_matches('/')
+        "{}/rest/v1/account_events?select=event_id,account_id,event_kind,created_at,evidence_ref&account_id=eq.{account_id}&event_kind=eq.{event_kind}&order=created_at.desc,event_id.desc&limit=1",
+        supabase_url.trim_end_matches('/'),
     )
 }
 
@@ -4148,7 +4171,13 @@ async fn drive_modes(state: &mut FanoutState, now: OffsetDateTime) {
         warn!("live accounts snapshot is stale; mode pass skipped");
         return;
     }
-    let promotions = match fetch_promotions(state).await {
+    let promotion_accounts = snapshot
+        .accounts
+        .iter()
+        .filter(|account| account.enabled && account.requested_live_mode == "live_tiny")
+        .map(|account| account.account_id.clone())
+        .collect::<Vec<_>>();
+    let promotions = match fetch_promotions(state, &promotion_accounts).await {
         Ok(promotions) => promotions,
         Err(reason) => {
             warn!(
@@ -5862,11 +5891,124 @@ mod tests {
     }
 
     #[test]
-    fn promotion_events_read_is_latest_first_and_bounded() {
-        let url = promotion_events_url("https://example.test/");
-        assert!(url.contains("created_at,evidence_ref"));
-        assert!(url.contains("order=created_at.desc"));
-        assert!(url.ends_with("limit=50"));
+    fn promotion_event_read_is_account_and_kind_scoped_with_total_order() {
+        let account_id = AccountId::new("victim").unwrap();
+        let url = promotion_event_url("https://example.test/", &account_id, "promotion_reviewed");
+        assert!(url.contains("select=event_id,account_id,event_kind,created_at,evidence_ref"));
+        assert!(url.contains("account_id=eq.victim"));
+        assert!(url.contains("event_kind=eq.promotion_reviewed"));
+        assert!(url.contains("order=created_at.desc,event_id.desc"));
+        assert!(url.ends_with("limit=1"));
+    }
+
+    async fn promotion_events_page(
+        State(events): State<Arc<Vec<serde_json::Value>>>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Vec<serde_json::Value>> {
+        assert_eq!(
+            query.get("select").map(String::as_str),
+            Some("event_id,account_id,event_kind,created_at,evidence_ref")
+        );
+        assert_eq!(
+            query.get("order").map(String::as_str),
+            Some("created_at.desc,event_id.desc")
+        );
+        assert_eq!(query.get("limit").map(String::as_str), Some("1"));
+        let account_id = query
+            .get("account_id")
+            .and_then(|value| value.strip_prefix("eq."))
+            .unwrap();
+        let event_kind = query
+            .get("event_kind")
+            .and_then(|value| value.strip_prefix("eq."))
+            .unwrap();
+        let mut selected = events
+            .iter()
+            .filter(|event| {
+                event.get("account_id").and_then(serde_json::Value::as_str) == Some(account_id)
+                    && event.get("event_kind").and_then(serde_json::Value::as_str)
+                        == Some(event_kind)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            right["created_at"]
+                .as_str()
+                .cmp(&left["created_at"].as_str())
+                .then_with(|| right["event_id"].as_i64().cmp(&left["event_id"].as_i64()))
+        });
+        selected.truncate(1);
+        Json(selected)
+    }
+
+    /// PASS: an account's latest review and revocation remain available when 50 newer events from
+    /// distinct other accounts would put all of its evidence beyond a global 50-row window.
+    #[tokio::test]
+    async fn promotion_fetch_is_not_truncated_by_cross_account_events() {
+        let mut events = (0..50)
+            .map(|index| {
+                serde_json::json!({
+                    "event_id": 100 + index,
+                    "account_id": format!("other-{index}"),
+                    "event_kind": "promotion_reviewed",
+                    "created_at": "2026-09-02T00:00:00Z",
+                    "evidence_ref": null
+                })
+            })
+            .collect::<Vec<_>>();
+        let old_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let selected_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        events.extend([
+            serde_json::json!({
+                "event_id": 1,
+                "account_id": "victim",
+                "event_kind": "promotion_reviewed",
+                "created_at": "2026-09-01T00:00:00Z",
+                "evidence_ref": format!("{old_digest}:{old_digest}")
+            }),
+            serde_json::json!({
+                "event_id": 2,
+                "account_id": "victim",
+                "event_kind": "promotion_reviewed",
+                "created_at": "2026-09-01T00:00:00Z",
+                "evidence_ref": format!("{selected_digest}:{selected_digest}")
+            }),
+            serde_json::json!({
+                "event_id": 3,
+                "account_id": "victim",
+                "event_kind": "promotion_review_revoked",
+                "created_at": "2026-08-31T00:00:00Z",
+                "evidence_ref": null
+            }),
+        ]);
+        let app = Router::new()
+            .route("/rest/v1/account_events", get(promotion_events_page))
+            .with_state(Arc::new(events));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let victim = AccountId::new("victim").unwrap();
+
+        let promotions = fetch_promotions_from(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "token",
+            &[victim],
+        )
+        .await
+        .unwrap();
+        let facts = promotions.get("victim").unwrap();
+
+        assert_eq!(
+            facts.latest_review_seal_hash.as_deref(),
+            Some(selected_digest),
+            "event_id breaks equal-created_at ties"
+        );
+        assert_eq!(
+            facts.latest_review_report_blake3.as_deref(),
+            Some(selected_digest)
+        );
+        assert!(facts.latest_revocation_unix < facts.latest_review_unix);
     }
 
     #[test]
