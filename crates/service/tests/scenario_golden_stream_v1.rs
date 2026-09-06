@@ -1099,7 +1099,6 @@ fn assert_decision_preimage_rejected(
     live_path: &std::path::Path,
     seal_receipt: AppendReceipt,
     source_trade_id: &pe_core_types::SourceTradeId,
-    semantic_revision: &str,
 ) {
     let case = root.join(format!("decision-{}", mutation.label()));
     std::fs::create_dir(&case).unwrap();
@@ -2409,7 +2408,6 @@ async fn golden_source_stream_replays_exact_economic_core() {
             &live_path,
             seal_receipt,
             &last_decision.source_trade_id,
-            &last_decision.semantic_revision,
         );
         assert_live_wrapper_preimage_rejected(
             &tamper_root,
