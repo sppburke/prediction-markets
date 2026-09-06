@@ -55,9 +55,6 @@ pub(crate) enum RiskInputsUnavailable {
     Overflow,
 }
 
-/// Compatibility name for the shared live/paper zero-retry adapter.
-pub use crate::mark_prices::HistoricalMarkAdapter as BoundaryMarkFetcher;
-
 #[allow(private_interfaces)]
 #[derive(Debug, thiserror::Error)]
 pub enum BoundaryMarkError {

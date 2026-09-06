@@ -1031,7 +1031,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(20))
         .build()
         .context("build bounded market-admission HTTP client")?;
-    let boundary_mark_fetcher = Arc::new(pe_service::risk_inputs::BoundaryMarkFetcher::new(
+    let boundary_mark_fetcher = Arc::new(pe_service::mark_prices::HistoricalMarkAdapter::new(
         admission_http_client.clone(),
         cfg.polymarket_clob_base_url.clone(),
         orchestrator_source_log.clone(),
