@@ -335,6 +335,7 @@ struct OpenPosition {
 #[derive(Debug, Clone)]
 struct CompletedFinancialFact {
     prepared_receipt: AppendReceipt,
+    final_receipt: AppendReceipt,
     payload: FinancialPayload,
     result: FinancialResult,
 }
@@ -343,6 +344,9 @@ struct CausalFinancialState {
     cash: Decimal,
     positions: Vec<OpenPosition>,
     last_completed: Option<EventSeq>,
+    completed_prepared: HashSet<EventSeq>,
+    closed_fill_final_conditions: HashMap<u64, String>,
+    open_fill_finals: Vec<(u64, String)>,
 }
 
 struct RiskReplayContext<'a> {
@@ -452,6 +456,7 @@ async fn verify_qualification(
     let mut anchor_mark_cutoff = None;
     let mut waiting_for_anchor_mark = true;
     let mut valid_marks = Vec::<(u64, QualificationMarkReport)>::new();
+    let mut latest_causal_financial = None;
 
     for (offset, frame) in frames[start_index + 1..=financial_prefix_index]
         .iter()
@@ -712,6 +717,7 @@ async fn verify_qualification(
                 }
                 completed_financial_facts.push(CompletedFinancialFact {
                     prepared_receipt: *prepared_receipt,
+                    final_receipt: frame.receipt,
                     payload: prepared_payload.clone(),
                     result: result.clone(),
                 });
@@ -780,6 +786,7 @@ async fn verify_qualification(
                     anchor_mark_cutoff = Some(report.cutoff_unix);
                     waiting_for_anchor_mark = false;
                 }
+                latest_causal_financial = Some(causal);
             }
             PaperLogRecord::QualificationStarted(_) => {
                 return insufficient("a second QualificationStarted occurs before the seal");
@@ -829,28 +836,31 @@ async fn verify_qualification(
     })?;
     let lcb = lcb_5pct_decimal(&growth);
 
-    let resolution_sequences = resolution_sequences(&frames, start_index, financial_prefix_index);
+    let causal_financial = latest_causal_financial.ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "no causal financial state exists at the sealed mark".to_owned(),
+        )
+    })?;
     let mut closed = completed_fills
         .iter()
         .filter(|fill| fill.final_receipt.sequence.0 > anchor_sequence)
         .filter(|fill| {
-            resolution_sequences
-                .get(&fill.condition_id)
-                .is_some_and(|sequences| {
-                    sequences
-                        .iter()
-                        .any(|sequence| *sequence > fill.final_receipt.sequence.0)
-                })
+            causal_financial
+                .closed_fill_final_conditions
+                .get(&fill.final_receipt.sequence.0)
+                == Some(&fill.condition_id)
         })
         .collect::<Vec<_>>();
     closed.sort_by_key(|fill| fill.final_receipt.sequence.0);
-    let completion =
-        qualification_completion(&paper_era(frames[..=financial_prefix_index].to_vec()))
-            .ok_or_else(|| {
-                QualificationError::InsufficientEvidence(
-                    "qualification completion inputs are invalid".to_owned(),
-                )
-            })?;
+    let completion = qualification_completion_for_causal_facts(
+        &paper_era(frames[..=financial_prefix_index].to_vec()),
+        &causal_financial.completed_prepared,
+    )
+    .ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "qualification completion inputs are invalid".to_owned(),
+        )
+    })?;
     if completion.complete_days != growth.len() || completion.causal_closes != closed.len() {
         return insufficient("qualification completion differs from verified replay");
     }
@@ -2106,6 +2116,9 @@ fn causal_financial_state(
         cash: starting_bankroll,
         positions: Vec::new(),
         last_completed: None,
+        completed_prepared: HashSet::new(),
+        closed_fill_final_conditions: HashMap::new(),
+        open_fill_finals: Vec::new(),
     };
     for fact in facts {
         let causal = match &fact.payload {
@@ -2116,7 +2129,6 @@ fn causal_financial_state(
                     )
                 })?;
                 is_causal(observation.source_receipt)?
-                    && is_causal(observation.complete_bound_receipt)?
             }
             FinancialPayload::Resolution {
                 resolution_source_receipt,
@@ -2138,6 +2150,10 @@ fn causal_financial_state(
                         )
                     })?;
                 apply_fill_position(&mut state.positions, economic, canonical.quantity)?;
+                state.open_fill_finals.push((
+                    fact.final_receipt.sequence.0,
+                    economic.market.condition_id.0.clone(),
+                ));
             }
             (
                 FinancialPayload::Resolution {
@@ -2190,6 +2206,16 @@ fn causal_financial_state(
                         "causal mark resolution cash overflow".to_owned(),
                     )
                 })?;
+                for (fill_sequence, fill_condition) in &state.open_fill_finals {
+                    if fill_condition == &condition_id.0 {
+                        state
+                            .closed_fill_final_conditions
+                            .insert(*fill_sequence, fill_condition.clone());
+                    }
+                }
+                state
+                    .open_fill_finals
+                    .retain(|(_, fill_condition)| fill_condition != &condition_id.0);
                 state
                     .positions
                     .retain(|position| position.condition_id != condition_id.0);
@@ -2197,6 +2223,9 @@ fn causal_financial_state(
             _ => return insufficient("causal mark Prepared/Final kinds disagree"),
         }
         state.last_completed = Some(fact.prepared_receipt.sequence);
+        state
+            .completed_prepared
+            .insert(fact.prepared_receipt.sequence);
     }
     Ok(state)
 }
@@ -2397,14 +2426,27 @@ fn complete_day_growth(
     Ok(growth)
 }
 
-/// Derive the completion inputs from the active financial era.
-///
-/// A close is causal only when its Fill Final follows the current promotion anchor and a matching
-/// Resolution Final follows that fill. Invalid or non-daily marks cannot trigger an automatic
-/// seal. The offline verifier invokes this same calculation against its verified sealed prefix.
+/// Scenario compatibility helper for fixtures whose entire financial era is already causal.
+#[cfg(feature = "scenario")]
 #[must_use]
 pub fn qualification_completion(
     era: &crate::paper_recovery::PaperEra,
+) -> Option<QualificationCompletion> {
+    qualification_completion_inner(era, None)
+}
+
+/// Derive completion using the exact causal facts selected for the boundary's financial state.
+/// Invalid or non-daily marks cannot trigger an automatic seal.
+pub(crate) fn qualification_completion_for_causal_facts(
+    era: &crate::paper_recovery::PaperEra,
+    completed_prepared: &HashSet<EventSeq>,
+) -> Option<QualificationCompletion> {
+    qualification_completion_inner(era, Some(completed_prepared))
+}
+
+fn qualification_completion_inner(
+    era: &crate::paper_recovery::PaperEra,
+    completed_prepared: Option<&HashSet<EventSeq>>,
 ) -> Option<QualificationCompletion> {
     era.start.as_ref()?;
 
@@ -2454,23 +2496,28 @@ pub fn qualification_completion(
             PaperLogRecord::FinancialFinal {
                 prepared_receipt,
                 result,
-            } => match result {
-                FinancialResult::Fill { .. } => {
-                    let condition = fill_prepared.get(&receipt_key(*prepared_receipt))?;
-                    fill_finals.push((frame.receipt.sequence.0, condition.clone()));
+            } if completed_prepared
+                .is_none_or(|completed| completed.contains(&prepared_receipt.sequence)) =>
+            {
+                match result {
+                    FinancialResult::Fill { .. } => {
+                        let condition = fill_prepared.get(&receipt_key(*prepared_receipt))?;
+                        fill_finals.push((frame.receipt.sequence.0, condition.clone()));
+                    }
+                    FinancialResult::Resolution { .. } => {
+                        let condition = resolution_prepared.get(&receipt_key(*prepared_receipt))?;
+                        resolution_finals
+                            .entry(condition.clone())
+                            .or_default()
+                            .push(frame.receipt.sequence.0);
+                    }
                 }
-                FinancialResult::Resolution { .. } => {
-                    let condition = resolution_prepared.get(&receipt_key(*prepared_receipt))?;
-                    resolution_finals
-                        .entry(condition.clone())
-                        .or_default()
-                        .push(frame.receipt.sequence.0);
-                }
-            },
+            }
             PaperLogRecord::QualificationStarted(_)
             | PaperLogRecord::QualificationSealed(_)
             | PaperLogRecord::RiskHaltChanged { .. }
-            | PaperLogRecord::MembershipChanged { .. } => {}
+            | PaperLogRecord::MembershipChanged { .. }
+            | PaperLogRecord::FinancialFinal { .. } => {}
         }
     }
 
@@ -2500,36 +2547,6 @@ fn reason_moves_anchor(reason: MembershipReason) -> bool {
             | MembershipReason::KnockoutInactivityHardCap
             | MembershipReason::KnockoutUnderperformance
     )
-}
-
-fn resolution_sequences(
-    frames: &[ScannedPaperFrame],
-    start_index: usize,
-    seal_index: usize,
-) -> HashMap<String, Vec<u64>> {
-    let mut prepared_conditions = HashMap::<(u64, String), String>::new();
-    let mut resolved = HashMap::<String, Vec<u64>>::new();
-    for frame in &frames[start_index + 1..=seal_index] {
-        if let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
-            payload: FinancialPayload::Resolution { condition_id, .. },
-            ..
-        }) = &frame.frame
-        {
-            prepared_conditions.insert(receipt_key(frame.receipt), condition_id.0.clone());
-        }
-        if let PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
-            prepared_receipt,
-            result: FinancialResult::Resolution { .. },
-        }) = &frame.frame
-            && let Some(condition) = prepared_conditions.get(&receipt_key(*prepared_receipt))
-        {
-            resolved
-                .entry(condition.clone())
-                .or_default()
-                .push(frame.receipt.sequence.0);
-        }
-    }
-    resolved
 }
 
 fn bind_final_receipts(
@@ -3140,10 +3157,21 @@ fn start_envelope(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use pe_core_types::WalletAddress;
+    use pe_core_types::{
+        KellyFraction, PolymarketConditionId, PolymarketTokenId, Probability, SourceTradeId,
+        WalletAddress,
+    };
+    use pe_event_log::EventEnvelope;
+    use pe_execution_core::{
+        BalanceAudit, ECONOMIC_PREPARED_VERSION, FeeAudit, LadderAskAudit, LadderPlanAudit,
+        LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit, MarketSelection, ObservationEvidence,
+        SizingAudit,
+    };
+    use pe_venue_polymarket::CompactFeeSchedule;
     use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::paper_recovery::PaperEra;
 
     fn started(hash: &str) -> QualificationStarted {
         QualificationStarted {
@@ -3175,6 +3203,148 @@ mod tests {
             schema_version: 3,
             parser_version: 1,
             financial_semantic_version: 1,
+        }
+    }
+
+    fn test_receipt(sequence: u64) -> AppendReceipt {
+        AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::hash(&sequence.to_be_bytes()),
+        }
+    }
+
+    fn test_frame(sequence: u64, unix: i64, record: PaperLogRecord) -> ScannedPaperFrame {
+        let receipt = test_receipt(sequence);
+        let timestamp = OffsetDateTime::from_unix_timestamp(unix).unwrap();
+        ScannedPaperFrame {
+            envelope: EventEnvelope {
+                seq: receipt.sequence,
+                source_id: SourceId("paper-test".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                raw_payload_hash: blake3::hash(b"payload"),
+                prev_hash: blake3::hash(b"prev"),
+                this_hash: receipt.this_hash,
+                payload: Vec::new(),
+            },
+            receipt,
+            frame: PaperLogFrame::Record(record),
+            legacy_fill: None,
+        }
+    }
+
+    fn test_economic(
+        condition: &str,
+        source_receipt: AppendReceipt,
+        complete_bound_receipt: AppendReceipt,
+    ) -> EconomicPrepared {
+        let price = Price::new(dec!(0.5)).unwrap();
+        let shares = ShareAmount::from_whole(2).unwrap();
+        let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
+        EconomicPrepared {
+            version: ECONOMIC_PREPARED_VERSION,
+            market: MarketSelection {
+                condition_id: PolymarketConditionId(condition.to_owned()),
+                outcome_index: 0,
+                token_id: PolymarketTokenId(format!("{condition}-token")),
+                side: Side::Buy,
+                market_id: condition.to_owned(),
+            },
+            admission: LiveAdmissionArtifactAudit {
+                market: LiveMarketEvidenceAudit {
+                    condition_id: PolymarketConditionId(condition.to_owned()),
+                    ordered_outcome_token_ids: [
+                        PolymarketTokenId(format!("{condition}-token")),
+                        PolymarketTokenId(format!("{condition}-other")),
+                    ],
+                    neg_risk: false,
+                    minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                    minimum_order_size: shares,
+                    observed_at_unix: 1,
+                    schema_version: 1,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                },
+                settlement: VenueSettlementRecord {
+                    schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+                    condition_id: PolymarketConditionId(condition.to_owned()),
+                    status: VenueResolutionStatus::Unresolved,
+                    raw_evidence_hash: "settlement".to_owned(),
+                    source_timestamp_unix: Some(1),
+                    observed_at_unix: 1,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                },
+                fee_schedule: CompactFeeSchedule::Zero,
+                scheduled_end_unix: Some(100),
+                receipts: AdmissionReceipts {
+                    gamma: test_receipt(1_001),
+                    clob_long: test_receipt(1_002),
+                    clob_compact: test_receipt(1_003),
+                },
+            },
+            ladder: LadderPlanAudit {
+                used_asks: vec![LadderAskAudit { price, shares }],
+                best_ask: price,
+                limit_price: price,
+                minimum_shares: shares,
+                principal,
+            },
+            book_receipt: test_receipt(1_004),
+            observation: Some(ObservationEvidence {
+                source_receipt,
+                complete_bound_receipt,
+                observed_unix_ms: 1_000,
+                provenance: "activity_ws".to_owned(),
+            }),
+            sizing: SizingAudit {
+                mode: SizingModeAudit::Kelly {
+                    fraction: KellyFraction::new(dec!(0.25)).unwrap(),
+                    probability: Probability::new(dec!(0.6)).unwrap(),
+                },
+                budget: principal,
+                principal,
+                minimum_shares: shares,
+                expected_shares: shares,
+                expected_vwap: price,
+                all_in_price: price,
+                slippage_rate: Decimal::ZERO,
+            },
+            fee: FeeAudit {
+                schedule: CompactFeeSchedule::Zero,
+                expected_fee: CollateralAmount::ZERO,
+                reserve: CollateralAmount::ZERO,
+            },
+            risk: RiskAudit {
+                snapshot: RiskSnapshot {
+                    leader_exposure_bps: BasisPoints::ZERO,
+                    market_exposure_bps: BasisPoints::ZERO,
+                    family_exposure_bps: BasisPoints::ZERO,
+                    total_copy_exposure_bps: BasisPoints::ZERO,
+                    intraday_pnl_bps: BasisPoints::ZERO,
+                    rolling_7d_pnl_bps: BasisPoints::ZERO,
+                    absolute_pnl_bps: BasisPoints::ZERO,
+                    copy_latency_kill_switch_active: false,
+                    proposed_trade_bps: BasisPoints(10),
+                    per_trade_cap_bps: 25,
+                    concentration_caps: None,
+                },
+                decision: RiskDecisionAudit::Approved,
+                price_receipts: Vec::new(),
+                evaluated_at_unix_ms: 1_000,
+            },
+            balance: BalanceAudit {
+                cash_before: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+                worst_case_debit: principal,
+                price_impact_cap_bps: 100,
+                chase_ceiling: price,
+                band_floor: Price::ZERO,
+                band_ceiling_exclusive: Price::ONE,
+            },
+            applied_configuration_hash: "config".to_owned(),
         }
     }
 
@@ -3335,16 +3505,22 @@ mod tests {
         }
     }
 
+    /// PASS: a pre-cutoff websocket fill remains causal when its complete page and Final arrive
+    /// after the boundary, while a resolution first received after the cutoff leaves it open.
     #[test]
-    fn causal_mark_state_excludes_receipts_at_or_after_the_cutoff() {
+    fn causal_mark_uses_observation_membership_and_leaves_post_cutoff_resolution_open() {
         let cutoff = 172_800;
         let receipt_before = AppendReceipt {
             sequence: EventSeq(1),
             this_hash: blake3::hash(b"before"),
         };
-        let receipt_at = AppendReceipt {
-            sequence: EventSeq(2),
-            this_hash: blake3::hash(b"at"),
+        let late_complete = AppendReceipt {
+            sequence: EventSeq(3),
+            this_hash: blake3::hash(b"late-complete"),
+        };
+        let late_resolution = AppendReceipt {
+            sequence: EventSeq(4),
+            this_hash: blake3::hash(b"late-resolution"),
         };
         let timestamp = |unix| OffsetDateTime::from_unix_timestamp(unix).unwrap();
         let source = BTreeMap::from([
@@ -3355,7 +3531,7 @@ mod tests {
                     observed_at: SourceTimestamp(timestamp(cutoff - 1)),
                     received_at: ReceivedAt(timestamp(cutoff - 1)),
                     received_unix_ms: (cutoff - 1) * 1_000,
-                    source_id: "resolution".to_owned(),
+                    source_id: "activity_ws".to_owned(),
                     schema_version: 1,
                     parser_version: 1,
                     content_type: ContentType::Json,
@@ -3363,12 +3539,26 @@ mod tests {
                 },
             ),
             (
-                2,
+                3,
                 SourceObservation {
-                    receipt: receipt_at,
-                    observed_at: SourceTimestamp(timestamp(cutoff)),
-                    received_at: ReceivedAt(timestamp(cutoff)),
-                    received_unix_ms: cutoff * 1_000,
+                    receipt: late_complete,
+                    observed_at: SourceTimestamp(timestamp(cutoff + 1)),
+                    received_at: ReceivedAt(timestamp(cutoff + 1)),
+                    received_unix_ms: (cutoff + 1) * 1_000,
+                    source_id: "activity_page".to_owned(),
+                    schema_version: 1,
+                    parser_version: 1,
+                    content_type: ContentType::Json,
+                    payload: Vec::new(),
+                },
+            ),
+            (
+                4,
+                SourceObservation {
+                    receipt: late_resolution,
+                    observed_at: SourceTimestamp(timestamp(cutoff + 1)),
+                    received_at: ReceivedAt(timestamp(cutoff + 1)),
+                    received_unix_ms: (cutoff + 1) * 1_000,
                     source_id: "resolution".to_owned(),
                     schema_version: 1,
                     parser_version: 1,
@@ -3377,29 +3567,51 @@ mod tests {
                 },
             ),
         ]);
-        let fact = |prepared, receipt| CompletedFinancialFact {
-            prepared_receipt: AppendReceipt {
-                sequence: EventSeq(prepared),
-                this_hash: blake3::hash(&prepared.to_be_bytes()),
+        let condition = "condition-open";
+        let fill = CompletedFinancialFact {
+            prepared_receipt: test_receipt(10),
+            final_receipt: test_receipt(11),
+            payload: FinancialPayload::Fill {
+                operation: crate::paper_recovery::PaperFillOperationIdentity {
+                    leader_wallet: started("hot").membership[0],
+                    source_trade_id: SourceTradeId(format!("g2:{}", "a".repeat(64))),
+                    observed_at_bucket: cutoff - 1,
+                },
+                economic: test_economic(condition, receipt_before, late_complete),
             },
+            result: FinancialResult::Fill {
+                canonical: crate::paper_recovery::CanonicalFillResult {
+                    outcome: "applied".to_owned(),
+                    bankroll: dec!(99),
+                    applied_prepared_seq: EventSeq(10),
+                    quantity: ShareAmount::from_whole(2).unwrap(),
+                    principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                    fee: CollateralAmount::ZERO,
+                    fill_price: Price::new(dec!(0.5)).unwrap(),
+                },
+            },
+        };
+        let resolution = CompletedFinancialFact {
+            prepared_receipt: test_receipt(12),
+            final_receipt: test_receipt(13),
             payload: FinancialPayload::Resolution {
-                condition_id: pe_core_types::PolymarketConditionId(format!("condition-{prepared}")),
+                condition_id: PolymarketConditionId(condition.to_owned()),
                 payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
-                resolution_source_receipt: receipt,
+                resolution_source_receipt: late_resolution,
             },
             result: FinancialResult::Resolution {
                 canonical: crate::paper_recovery::CanonicalResolutionResult {
                     outcome: "applied".to_owned(),
-                    bankroll: dec!(100),
-                    applied_prepared_seq: EventSeq(prepared),
-                    credit: CollateralAmount::ZERO,
-                    settled_at_unix: cutoff,
+                    bankroll: dec!(101),
+                    applied_prepared_seq: EventSeq(12),
+                    credit: CollateralAmount::from_decimal_exact(dec!(2)).unwrap(),
+                    settled_at_unix: cutoff + 1,
                 },
             },
         };
         let mark = PortfolioMark {
             boundary_receipt: AppendReceipt {
-                sequence: EventSeq(3),
+                sequence: EventSeq(2),
                 this_hash: blake3::hash(b"boundary"),
             },
             cutoff_unix: cutoff,
@@ -3410,19 +3622,191 @@ mod tests {
             },
             financial_prefix_seq: Some(EventSeq(10)),
             prices: Vec::new(),
-            cash: dec!(100),
+            cash: dec!(99),
             equity: dec!(100),
             invalid: None,
         };
-        let replayed = causal_financial_state(
-            dec!(100),
-            &[fact(10, receipt_before), fact(11, receipt_at)],
-            &mark,
-            &source,
-        )
-        .unwrap();
+        let replayed =
+            causal_financial_state(dec!(100), &[fill, resolution], &mark, &source).unwrap();
         assert_eq!(replayed.last_completed, Some(EventSeq(10)));
-        assert_eq!(replayed.cash, dec!(100));
+        assert_eq!(replayed.cash, dec!(99));
+        assert_eq!(replayed.positions.len(), 1);
+        assert_eq!(replayed.positions[0].condition_id, condition);
+        assert_eq!(replayed.completed_prepared, HashSet::from([EventSeq(10)]));
+        assert!(replayed.closed_fill_final_conditions.is_empty());
+    }
+
+    /// PASS: boundary C supplies day 30 but a ninetieth Resolution Final excluded from C's causal
+    /// financial state does not complete the close threshold.
+    #[test]
+    fn post_cutoff_resolution_does_not_complete_qualification() {
+        let start = started("hot");
+        let start_receipt = test_receipt(1);
+        let mut frames = vec![test_frame(
+            1,
+            1,
+            PaperLogRecord::QualificationStarted(Box::new(start.clone())),
+        )];
+        let mut sequence = 2u64;
+        let push_mark = |frames: &mut Vec<ScannedPaperFrame>, sequence: u64, cutoff_unix: i64| {
+            frames.push(test_frame(
+                sequence,
+                cutoff_unix,
+                PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
+                    boundary_receipt: test_receipt(10_000 + sequence),
+                    cutoff_unix,
+                    source_tail: TailBinding {
+                        physical_tail: 0,
+                        last_sequence: Some(EventSeq(10_000 + sequence)),
+                        last_hash: test_receipt(10_000 + sequence)
+                            .this_hash
+                            .to_hex()
+                            .to_string(),
+                    },
+                    financial_prefix_seq: None,
+                    prices: Vec::new(),
+                    cash: dec!(100),
+                    equity: dec!(100),
+                    invalid: None,
+                })),
+            ));
+        };
+        push_mark(&mut frames, sequence, 86_400);
+        sequence += 1;
+
+        let mut causal_prepared = HashSet::new();
+        for ordinal in 0..90u64 {
+            let condition = format!("condition-{ordinal}");
+            let source = test_receipt(20_000 + ordinal * 2);
+            let complete = test_receipt(20_001 + ordinal * 2);
+            let fill_prepared = test_receipt(sequence);
+            frames.push(test_frame(
+                sequence,
+                100,
+                PaperLogRecord::FinancialPrepared {
+                    expected_authority: crate::paper_recovery::ExpectedAuthority {
+                        qualification_start_receipt: start_receipt,
+                        prior_completed_prepared_sequence: None,
+                    },
+                    payload: FinancialPayload::Fill {
+                        operation: crate::paper_recovery::PaperFillOperationIdentity {
+                            leader_wallet: start.membership[0],
+                            source_trade_id: SourceTradeId(format!("g2:{:064x}", ordinal + 1)),
+                            observed_at_bucket: 100,
+                        },
+                        economic: test_economic(&condition, source, complete),
+                    },
+                },
+            ));
+            causal_prepared.insert(fill_prepared.sequence);
+            sequence += 1;
+            frames.push(test_frame(
+                sequence,
+                100,
+                PaperLogRecord::FinancialFinal {
+                    prepared_receipt: fill_prepared,
+                    result: FinancialResult::Fill {
+                        canonical: crate::paper_recovery::CanonicalFillResult {
+                            outcome: "applied".to_owned(),
+                            bankroll: dec!(99),
+                            applied_prepared_seq: fill_prepared.sequence,
+                            quantity: ShareAmount::from_whole(2).unwrap(),
+                            principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                            fee: CollateralAmount::ZERO,
+                            fill_price: Price::new(dec!(0.5)).unwrap(),
+                        },
+                    },
+                },
+            ));
+            sequence += 1;
+            if ordinal < 89 {
+                let resolution_prepared = test_receipt(sequence);
+                frames.push(test_frame(
+                    sequence,
+                    101,
+                    PaperLogRecord::FinancialPrepared {
+                        expected_authority: crate::paper_recovery::ExpectedAuthority {
+                            qualification_start_receipt: start_receipt,
+                            prior_completed_prepared_sequence: Some(fill_prepared.sequence),
+                        },
+                        payload: FinancialPayload::Resolution {
+                            condition_id: PolymarketConditionId(condition),
+                            payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
+                            resolution_source_receipt: test_receipt(30_000 + ordinal),
+                        },
+                    },
+                ));
+                causal_prepared.insert(resolution_prepared.sequence);
+                sequence += 1;
+                frames.push(test_frame(
+                    sequence,
+                    101,
+                    PaperLogRecord::FinancialFinal {
+                        prepared_receipt: resolution_prepared,
+                        result: FinancialResult::Resolution {
+                            canonical: crate::paper_recovery::CanonicalResolutionResult {
+                                outcome: "applied".to_owned(),
+                                bankroll: dec!(101),
+                                applied_prepared_seq: resolution_prepared.sequence,
+                                credit: CollateralAmount::from_decimal_exact(dec!(2)).unwrap(),
+                                settled_at_unix: 101,
+                            },
+                        },
+                    },
+                ));
+                sequence += 1;
+            }
+        }
+
+        for day in 2..=30i64 {
+            push_mark(&mut frames, sequence, day * 86_400);
+            sequence += 1;
+        }
+        let noncausal_resolution = test_receipt(sequence);
+        frames.push(test_frame(
+            sequence,
+            31 * 86_400 + 1,
+            PaperLogRecord::FinancialPrepared {
+                expected_authority: crate::paper_recovery::ExpectedAuthority {
+                    qualification_start_receipt: start_receipt,
+                    prior_completed_prepared_sequence: None,
+                },
+                payload: FinancialPayload::Resolution {
+                    condition_id: PolymarketConditionId("condition-89".to_owned()),
+                    payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
+                    resolution_source_receipt: test_receipt(40_000),
+                },
+            },
+        ));
+        sequence += 1;
+        frames.push(test_frame(
+            sequence,
+            31 * 86_400 + 1,
+            PaperLogRecord::FinancialFinal {
+                prepared_receipt: noncausal_resolution,
+                result: FinancialResult::Resolution {
+                    canonical: crate::paper_recovery::CanonicalResolutionResult {
+                        outcome: "applied".to_owned(),
+                        bankroll: dec!(101),
+                        applied_prepared_seq: noncausal_resolution.sequence,
+                        credit: CollateralAmount::from_decimal_exact(dec!(2)).unwrap(),
+                        settled_at_unix: 31 * 86_400 + 1,
+                    },
+                },
+            },
+        ));
+        sequence += 1;
+        push_mark(&mut frames, sequence, 31 * 86_400);
+        let era = PaperEra {
+            start: Some((start_receipt, start)),
+            frames,
+        };
+
+        let completion = qualification_completion_for_causal_facts(&era, &causal_prepared)
+            .expect("causal completion");
+        assert_eq!(completion.complete_days, 30);
+        assert_eq!(completion.causal_closes, 89);
+        assert!(!completion.is_complete());
     }
 
     #[test]

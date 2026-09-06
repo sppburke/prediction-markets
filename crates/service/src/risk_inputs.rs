@@ -198,9 +198,6 @@ pub fn completed_prepared_before_boundary(
         else {
             continue;
         };
-        if frame.envelope.received_at.0.unix_timestamp() >= cutoff_unix {
-            continue;
-        }
         let payload = prepared
             .get(&prepared_receipt.sequence)
             .ok_or(RiskInputsUnavailable::UnmatchedPrepared)?;

@@ -1215,7 +1215,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 crate::paper_recovery::scan_paper_log(&paper_log_path)
                     .map_err(|error| error.to_string())?,
             );
-            crate::qualification::qualification_completion(&era)
+            crate::qualification::qualification_completion_for_causal_facts(&era, &completed)
         } else {
             None
         };
