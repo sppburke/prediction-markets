@@ -658,79 +658,132 @@ fn parse_account_state(
     evidence: Vec<RawEvidence>,
     neg_risk: bool,
 ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
-    if evidence
-        .iter()
-        .any(|item| matches!(item, RawEvidence::HttpTransportFailure(_)))
-    {
-        return Err(account_read_error(
-            LiveAccountReadFailure::Transport,
-            evidence,
-        ));
-    }
-    let response = |kind: &str| {
-        evidence.iter().find_map(|item| match item {
-            RawEvidence::HttpResponse(response) if response.endpoint_kind == kind => Some(response),
-            RawEvidence::HttpResponse(_)
-            | RawEvidence::HttpTransportFailure(_)
-            | RawEvidence::Artifact(_) => None,
-        })
-    };
-    let geoblock = response("geoblock")
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let closed_only_response = response("closed-only")
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let balance = response("balance-allowance")
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    if [geoblock, closed_only_response, balance]
-        .iter()
-        .any(|response| response.status == 401 || response.status == 403)
-    {
-        return Err(account_read_error(
-            LiveAccountReadFailure::Authentication,
-            evidence,
-        ));
-    }
-    let geoblock_json = response_json(geoblock)
-        .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let closed_json = response_json(closed_only_response)
-        .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let balance_json = response_json(balance)
-        .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let blocked = geoblock_json
-        .get("blocked")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let country = geoblock_json
-        .get("country")
-        .and_then(Value::as_str)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let geoblocked = blocked && !matches!(country, "IE" | "JP" | "MT" | "NL");
-    let closed_only = closed_json
-        .get("closed_only")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let collateral_balance = atomic_amount(balance_json.get("balance"))
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
     let selected_spender = if neg_risk {
         CanaryV2Client::negrisk_spender()
     } else {
         CanaryV2Client::standard_spender()
     }
     .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
+    classify_account_responses(
+        evidence.into_iter().filter_map(raw_attempt).collect(),
+        selected_spender,
+    )
+}
+
+/// Classify the retained, credential-free account responses into the one canonical live state.
+pub(crate) fn classify_account_responses(
+    evidence: Vec<RawHttpAttempt>,
+    selected_spender: String,
+) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
+    if evidence
+        .iter()
+        .any(|item| matches!(item, RawHttpAttempt::TransportFailure(_)))
+    {
+        return Err(classified_account_error(
+            LiveAccountReadFailure::Transport,
+            evidence,
+        ));
+    }
+    if evidence.len() != 3
+        || !is_known_account_spender(&selected_spender)
+        || ["geoblock", "closed-only", "balance-allowance"]
+            .into_iter()
+            .any(|kind| response_by_kind(&evidence, kind).is_none())
+    {
+        return Err(classified_account_error(
+            LiveAccountReadFailure::Protocol,
+            evidence,
+        ));
+    }
+    let response = |kind: &str| {
+        response_by_kind(&evidence, kind).ok_or_else(|| {
+            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+        })
+    };
+    let geoblock = response("geoblock")?;
+    let closed_only_response = response("closed-only")?;
+    let balance = response("balance-allowance")?;
+    if [geoblock, closed_only_response, balance]
+        .iter()
+        .any(|response| response.status == 401 || response.status == 403)
+    {
+        return Err(classified_account_error(
+            LiveAccountReadFailure::Authentication,
+            evidence,
+        ));
+    }
+    if !valid_account_response(geoblock, "geoblock", "/api/geoblock", &[])
+        || !valid_account_response(
+            closed_only_response,
+            "closed-only",
+            "/auth/ban-status/closed-only",
+            &[],
+        )
+        || !valid_account_response(
+            balance,
+            "balance-allowance",
+            "/balance-allowance",
+            &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
+        )
+    {
+        return Err(classified_account_error(
+            LiveAccountReadFailure::Protocol,
+            evidence,
+        ));
+    }
+    let geoblock_json = response_json(geoblock).map_err(|_| {
+        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+    })?;
+    let closed_json = response_json(closed_only_response).map_err(|_| {
+        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+    })?;
+    let balance_json = response_json(balance).map_err(|_| {
+        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+    })?;
+    let blocked = geoblock_json
+        .get("blocked")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+        })?;
+    let country = geoblock_json
+        .get("country")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+        })?;
+    let geoblocked = blocked && !matches!(country, "IE" | "JP" | "MT" | "NL");
+    let closed_only = closed_json
+        .get("closed_only")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+        })?;
+    let collateral_balance = atomic_amount(balance_json.get("balance")).ok_or_else(|| {
+        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+    })?;
     let allowances = balance_json
         .get("allowances")
         .and_then(Value::as_object)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let allowance = allowances
+        .ok_or_else(|| {
+            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+        })?;
+    let allowance = match allowances
         .iter()
         .find(|(spender, _)| spender.eq_ignore_ascii_case(&selected_spender))
-        .and_then(|(_, value)| atomic_amount(Some(value)))
-        .unwrap_or(CollateralAmount::ZERO);
+    {
+        Some((_, value)) => atomic_amount(Some(value)).ok_or_else(|| {
+            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+        })?,
+        None => CollateralAmount::ZERO,
+    };
     let observed_at = [geoblock, closed_only_response, balance]
         .iter()
         .map(|response| response.observed_at)
         .min()
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
+        .ok_or_else(|| {
+            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
+        })?;
     Ok(LiveVenueAccountState {
         observed_at,
         closed_only,
@@ -743,8 +796,64 @@ fn parse_account_state(
         reconciled_free_collateral: collateral_balance,
         schema_version: 1,
         parser_version: 1,
-        evidence: evidence.into_iter().filter_map(raw_attempt).collect(),
+        evidence,
     })
+}
+
+fn response_by_kind<'a>(
+    evidence: &'a [RawHttpAttempt],
+    endpoint_kind: &str,
+) -> Option<&'a RawHttpResponse> {
+    let mut matches = evidence.iter().filter_map(|attempt| match attempt {
+        RawHttpAttempt::Response(response) if response.endpoint_kind == endpoint_kind => {
+            Some(response)
+        }
+        RawHttpAttempt::Response(_) | RawHttpAttempt::TransportFailure(_) => None,
+    });
+    let response = matches.next()?;
+    matches.next().is_none().then_some(response)
+}
+
+fn is_known_account_spender(selected_spender: &str) -> bool {
+    [
+        CanaryV2Client::standard_spender(),
+        CanaryV2Client::negrisk_spender(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|spender| spender == selected_spender)
+}
+
+fn valid_account_response(
+    response: &RawHttpResponse,
+    endpoint_kind: &str,
+    path: &str,
+    ordered_query: &[(&str, &str)],
+) -> bool {
+    let query_matches = response.ordered_query.len() == ordered_query.len()
+        && response.ordered_query.iter().zip(ordered_query).all(
+            |((actual_name, actual_value), (name, value))| {
+                actual_name == name && actual_value == value
+            },
+        );
+    response.source_id == "polymarket-clob-v2"
+        && response.endpoint_kind == endpoint_kind
+        && response.method == "GET"
+        && response.path == path
+        && query_matches
+        && (200..300).contains(&response.status)
+        && response.attempt_ordinal == 1
+        && response.received_at >= response.observed_at
+        && response.schema_version == 1
+        && response.parser_version == 1
+        && response.adapter_version == pe_venue_polymarket::SDK_VERSION
+}
+
+fn classified_account_error(
+    kind: LiveAccountReadFailure,
+    evidence: Vec<RawHttpAttempt>,
+) -> LiveVenueAccountReadError {
+    LiveVenueAccountReadError { kind, evidence }
 }
 
 fn account_read_error(
