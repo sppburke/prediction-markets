@@ -90,6 +90,9 @@ pub struct MidPriceCache<F: PageFetcher = ReqwestFetcher> {
     /// even though the underlying [`ReqwestFetcher`] (rate-limit `Mutex`) is not `Clone`.
     client: Arc<GammaMarketsClient<F>>,
     source_log: Option<SourceLogHandle>,
+    /// Stamps every appended page and the strict evaluation instant: one origin for observation
+    /// time and freshness (wall clock in production; the injected clock in scenarios).
+    clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
 
 // Manual Clone: the `Arc`s clone regardless of whether `F: Clone` (`ReqwestFetcher` is not — it
@@ -100,6 +103,7 @@ impl<F: PageFetcher> Clone for MidPriceCache<F> {
             inner: self.inner.clone(),
             client: self.client.clone(),
             source_log: self.source_log.clone(),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -121,7 +125,16 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             inner: Arc::new(Mutex::new(HashMap::new())),
             client: Arc::new(GammaMarketsClient::new(gamma_base_url, fetcher)),
             source_log: None,
+            clock: Arc::new(OffsetDateTime::now_utc),
         }
+    }
+
+    /// Replace the wall clock (scenario seam): the same clock stamps pages and freezes the strict
+    /// evaluation instant, so a scenario clock never disagrees with its own observations.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Bind the service's sole source-log coordinator. Every subsequent successful Gamma page is
@@ -159,7 +172,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     /// [`TTL`] and otherwise fetched concurrently through the rate gate. Markets
     /// whose fetch fails or lacks `outcomePrices` are omitted from the result.
     pub async fn fetch_mids(&self, market_ids: &[MarketId]) -> HashMap<MarketId, Vec<Decimal>> {
-        self.ensure_entries(market_ids, OffsetDateTime::now_utc)
+        self.ensure_entries(market_ids, &*self.clock)
             .await
             .into_iter()
             .map(|(id, entry)| (id, entry.mids))
@@ -176,7 +189,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         &self,
         market_ids: &[MarketId],
     ) -> HashMap<MarketId, MidMarketSnapshot> {
-        self.ensure_entries(market_ids, OffsetDateTime::now_utc)
+        self.ensure_entries(market_ids, &*self.clock)
             .await
             .into_iter()
             .map(|(id, entry)| (id, entry.snapshot))
@@ -196,8 +209,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         &self,
         ids: &[MarketOutcomeId],
     ) -> StrictMidPriceAttempt {
-        self.fetch_mids_strict_with_clock(ids, OffsetDateTime::now_utc)
-            .await
+        self.fetch_mids_strict_with_clock(ids, &*self.clock).await
     }
 
     pub(crate) async fn fetch_mids_strict_with_clock<C>(

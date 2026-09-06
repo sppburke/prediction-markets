@@ -1735,7 +1735,17 @@ async fn golden_source_stream_replays_exact_economic_core() {
         Arc::clone(&paper),
         leader_ledger,
         new_shared_health_with_ws(false, true, 90),
-        golden_mid_cache(anchor_cutoff),
+        golden_mid_cache(anchor_cutoff).with_clock({
+            let hooks = hooks.clone();
+            Arc::new(move || {
+                OffsetDateTime::from_unix_timestamp(
+                    hooks
+                        .financial_clock_unix
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                )
+                .unwrap()
+            })
+        }),
         control_rx,
         None,
         authority.clone(),

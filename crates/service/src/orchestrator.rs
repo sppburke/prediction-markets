@@ -904,9 +904,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map(|position| MarketOutcomeId::new(position.market_id.clone(), position.outcome_id))
             .collect::<Vec<_>>();
         let mid_price_cache = self.mid_price_cache.clone();
-        let price_attempt = mid_price_cache
-            .fetch_mids_strict_with_clock(&ids, || self.financial_now())
-            .await;
+        let price_attempt = mid_price_cache.fetch_mids_strict_attempt(&ids).await;
         attempt
             .price_receipts
             .clone_from(&price_attempt.price_receipts);
