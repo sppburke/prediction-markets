@@ -6,13 +6,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pe_core_types::WalletAddress;
-use pe_event_log::AppendReceipt;
+use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_paper_state::{PaperStateDb, WalletCoverage};
 use pe_trader_index::WatchlistEntry;
+use serde::Serialize;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
+use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::bucket_commit::AnchorInstallError;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::MembershipChange;
@@ -21,6 +23,16 @@ use crate::position_seeder::{
 };
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
+const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
+const CAPACITY_CONFIG_SCHEMA_VERSION: u32 = 1;
+const CAPACITY_CONFIG_PARSER_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityConfigObservation {
+    generation: u64,
+    target: u64,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
@@ -46,6 +58,14 @@ pub enum AdmissionError {
     PaperState(#[from] pe_paper_state::PaperStateError),
     #[error("anchor refresh requires a causal position validator")]
     PositionValidatorUnavailable,
+    #[error("capacity publication requires the synchronized source-log handle")]
+    CapacitySourceLogUnavailable,
+    #[error("encode accepted capacity configuration: {0}")]
+    CapacityConfigEncoding(#[source] serde_json::Error),
+    #[error("accepted capacity target {target} cannot be represented durably")]
+    CapacityTargetOverflow { target: usize },
+    #[error("record accepted capacity configuration: {0}")]
+    CapacitySourceLog(#[from] SourceLogHandleError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +90,7 @@ pub fn anchor_refresh_due(coverage: &WalletCoverage, now_unix: i64, refresh_secs
 #[derive(Clone)]
 pub struct AdmissionPreparer {
     inner: Arc<Preparer>,
+    source_log: Option<SourceLogHandle>,
 }
 
 struct Preparer {
@@ -91,6 +112,7 @@ impl AdmissionPreparer {
                 attempt: Mutex::new(()),
                 validator: None,
             }),
+            source_log: None,
         }
     }
 
@@ -107,7 +129,16 @@ impl AdmissionPreparer {
                 attempt: Mutex::new(()),
                 validator: Some(validator),
             }),
+            source_log: None,
         }
+    }
+
+    /// Install the process-wide synchronized source-log handle used to retain accepted
+    /// capacity-change inputs before their structural membership publication.
+    #[must_use]
+    pub fn with_source_log(mut self, source_log: SourceLogHandle) -> Self {
+        self.source_log = Some(source_log);
+        self
     }
 
     /// Prove Lane C's durable prerequisites, then hand ownership to the
@@ -144,6 +175,39 @@ impl AdmissionPreparer {
             .await
             .map_err(|_| AdmissionError::AcknowledgementClosed)?
             .map_err(AdmissionError::PublicationRejected)
+    }
+
+    /// Durably retain the exact accepted capacity request before its membership record can
+    /// reference the returned immutable source-log receipt.
+    pub async fn record_capacity_config(
+        &self,
+        generation: u64,
+        target: usize,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        let source_log = self
+            .source_log
+            .as_ref()
+            .ok_or(AdmissionError::CapacitySourceLogUnavailable)?;
+        let durable_target =
+            u64::try_from(target).map_err(|_| AdmissionError::CapacityTargetOverflow { target })?;
+        let payload = serde_json::to_vec(&CapacityConfigObservation {
+            generation,
+            target: durable_target,
+        })
+        .map_err(AdmissionError::CapacityConfigEncoding)?;
+        let now = time::OffsetDateTime::now_utc();
+        source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(CAPACITY_CONFIG_SOURCE_ID.to_owned()),
+                schema_version: CAPACITY_CONFIG_SCHEMA_VERSION,
+                parser_version: CAPACITY_CONFIG_PARSER_VERSION,
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                content_type: ContentType::Json,
+                payload,
+            })
+            .await
+            .map_err(AdmissionError::from)
     }
 
     /// Re-anchor one due wallet under the shared bracket mutex.

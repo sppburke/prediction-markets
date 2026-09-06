@@ -547,9 +547,9 @@ struct RiskReplayContext<'a> {
     financial_semantic_version: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum SealedMembershipEvidence {
+pub(crate) enum SealedMembershipEvidence {
     FullRerank {
         replacement_entries: Vec<WatchlistEntry>,
     },
@@ -567,15 +567,15 @@ enum SealedMembershipEvidence {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SealedKnockoutEvidence {
+pub(crate) struct SealedKnockoutEvidence {
     wallet: pe_core_types::WalletAddress,
     reason: String,
     statistic: SealedDemotionStatistic,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum SealedDemotionStatistic {
     Inactivity {
@@ -633,6 +633,96 @@ impl SealedDemotionStatistic {
                     && Decimal::from_str_exact(upper_cb).is_ok_and(|value| value < Decimal::ZERO)
             }
         }
+    }
+}
+
+impl SealedKnockoutEvidence {
+    #[must_use]
+    pub(crate) fn inactivity(
+        wallet: pe_core_types::WalletAddress,
+        evaluated_at_unix: i64,
+        last_trade_unix: i64,
+        threshold_secs: u64,
+    ) -> Self {
+        Self {
+            wallet,
+            reason: "inactive>72h".to_owned(),
+            statistic: SealedDemotionStatistic::Inactivity {
+                evaluated_at_unix,
+                last_trade_unix,
+                threshold_secs,
+            },
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn inactivity_hard_cap(
+        wallet: pe_core_types::WalletAddress,
+        evaluated_at_unix: i64,
+        last_trade_unix: i64,
+        threshold_secs: u64,
+    ) -> Self {
+        Self {
+            wallet,
+            reason: "inactive>7d (hard cap)".to_owned(),
+            statistic: SealedDemotionStatistic::InactivityHardCap {
+                evaluated_at_unix,
+                last_trade_unix,
+                threshold_secs,
+            },
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn underperformance(
+        wallet: pe_core_types::WalletAddress,
+        settled_count: usize,
+        minimum_settled_count: usize,
+        windowed_pnl: Decimal,
+        upper_cb: Decimal,
+    ) -> Self {
+        Self {
+            wallet,
+            reason: "upper_cb_edge<0 & windowed_pnl<0".to_owned(),
+            statistic: SealedDemotionStatistic::Underperformance {
+                settled_count,
+                minimum_settled_count,
+                windowed_pnl: windowed_pnl.to_string(),
+                upper_cb: upper_cb.to_string(),
+            },
+        }
+    }
+}
+
+impl SealedMembershipEvidence {
+    pub(crate) fn full_rerank(
+        replacement_entries: Vec<WatchlistEntry>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::FullRerank {
+            replacement_entries,
+        })
+    }
+
+    pub(crate) fn knockout_backfill(
+        evictions: Vec<SealedKnockoutEvidence>,
+        replacement_entries: Vec<WatchlistEntry>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::KnockoutBackfill {
+            evictions,
+            replacement_entries,
+        })
+    }
+
+    pub(crate) fn capacity_change(
+        generation: u64,
+        config_receipt: AppendReceipt,
+        replacement_entries: Vec<WatchlistEntry>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::CapacityChange {
+            generation,
+            config_receipt,
+            replacement_entries,
+        })
     }
 }
 
@@ -1795,6 +1885,34 @@ fn verify_membership_change_evidence(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn verify_published_membership_change(
+    record: &PaperLogRecord,
+    source_log: &Path,
+) -> Result<(), QualificationError> {
+    let PaperLogRecord::MembershipChanged {
+        reason,
+        removed,
+        added,
+        ranking_batch_id,
+        evidence,
+        ..
+    } = record
+    else {
+        return insufficient("published record is not MembershipChanged");
+    };
+    let source_prefix = TailBinding::from(&Scanner::verify(source_log)?);
+    let source = source_observations(source_log, &source_prefix)?;
+    verify_membership_change_evidence(
+        *reason,
+        removed,
+        added,
+        *ranking_batch_id,
+        evidence,
+        &source,
+    )
 }
 
 fn verify_decision_source_inputs(

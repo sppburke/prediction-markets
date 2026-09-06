@@ -18,6 +18,7 @@ use tracing::info;
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
 use crate::paper_recovery::MembershipReason;
+use crate::qualification::SealedMembershipEvidence;
 use crate::runtime_config::AppliedWatchlistCapacity;
 use crate::supabase_reader::{self, SupabaseError};
 use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
@@ -43,6 +44,8 @@ enum CapacityError {
     UnpreparedAdmission { missing: usize },
     #[error("apply ranked membership: {0}")]
     Membership(#[from] MembershipApplyError),
+    #[error("encode capacity membership evidence: {0}")]
+    Evidence(#[from] serde_json::Error),
 }
 
 /// Production capacity applier used by the 30-second `service_config` poller.
@@ -127,6 +130,15 @@ impl SupabaseWatchlistCapacity {
                 missing: missing_ready,
             });
         }
+        let config_receipt = self
+            .preparer
+            .record_capacity_config(request.generation, request.target)
+            .await?;
+        let evidence = SealedMembershipEvidence::capacity_change(
+            request.generation,
+            config_receipt,
+            incoming.entries.clone(),
+        )?;
         let (actual, dropped) = apply_ranked_membership_locked(
             &self.live,
             &self.paper_state,
@@ -134,11 +146,7 @@ impl SupabaseWatchlistCapacity {
             MembershipPublication {
                 reason: MembershipReason::CapacityChange,
                 ranking_batch_id: None,
-                evidence: serde_json::json!({
-                    "kind": "capacity_change",
-                    "generation": request.generation,
-                    "replacement_entries": incoming.entries,
-                }),
+                evidence,
             },
             &incoming.entries,
             &incoming_last_trade,
@@ -219,14 +227,44 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::activity_ingest::{ActivityIngest, SourceLogHandle};
     use crate::config_poller::capacity_request_channel;
+    use crate::health::new_shared_health_with_ws;
     use crate::orchestrator_control::OrchestratorControl;
+    use crate::source_event_sink::SourceEventSink;
     use axum::{Json, Router, routing::get};
     use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
     use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
     use tempfile::TempDir;
     use tokio::sync::Notify;
     use tokio::sync::mpsc;
+
+    struct TestSourceLog {
+        handle: SourceLogHandle,
+        path: std::path::PathBuf,
+        task: tokio::task::JoinHandle<()>,
+        _triggers: mpsc::Receiver<crate::activity_ingest::ReconciliationTrigger>,
+    }
+
+    fn test_source_log(temp: &TempDir) -> TestSourceLog {
+        let path = temp.path().join("source.log");
+        let sink = SourceEventSink::open(&path).unwrap();
+        let (handle, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, triggers) = mpsc::channel(1);
+        let ingest = ActivityIngest::poll_only(
+            sink,
+            source_rx,
+            trigger_tx,
+            new_shared_health_with_ws(false, false, 1),
+        );
+        let task = tokio::spawn(ingest.run());
+        TestSourceLog {
+            handle,
+            path,
+            task,
+            _triggers: triggers,
+        }
+    }
 
     fn entry(wallet: WalletAddress) -> WatchlistEntry {
         WatchlistEntry {
@@ -261,6 +299,77 @@ mod tests {
 
         let distinct = vec![entry(WalletAddress([7; 20])), entry(WalletAddress([8; 20]))];
         assert!(validate_unique_ranking(&distinct).is_ok());
+    }
+
+    #[tokio::test]
+    async fn capacity_publication_round_trips_membership_verifier() {
+        let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
+        let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let verifier_source_log = source_log.path.clone();
+        let control = tokio::spawn(async move {
+            let command = control_rx.recv().await.unwrap();
+            let OrchestratorControl::PublishMembership {
+                change,
+                acknowledged,
+                ..
+            } = command
+            else {
+                panic!("capacity publisher sent a non-publication command");
+            };
+            let result = crate::qualification::verify_published_membership_change(
+                &change.into_record(),
+                &verifier_source_log,
+            )
+            .map(|()| pe_event_log::AppendReceipt {
+                sequence: pe_core_types::EventSeq(1),
+                this_hash: blake3::hash(b"capacity-round-trip"),
+            })
+            .map_err(|error| error.to_string());
+            acknowledged.send(result).unwrap();
+        });
+        let preparer = AdmissionPreparer::new(control_tx, paper_state)
+            .with_source_log(source_log.handle.clone());
+        let generation = 1;
+        let target = 2;
+        let config_receipt = preparer
+            .record_capacity_config(generation, target)
+            .await
+            .unwrap();
+        let evidence =
+            SealedMembershipEvidence::capacity_change(generation, config_receipt, Vec::new())
+                .unwrap();
+        preparer
+            .publish_membership(
+                crate::paper_recovery::MembershipChange {
+                    reason: MembershipReason::CapacityChange,
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                    capacity: target,
+                    ranking_batch_id: None,
+                    evidence,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        control.await.unwrap();
+
+        let source_records = pe_event_log::Reader::replay(&source_log.path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(source_records.len(), 1);
+        assert_eq!(
+            source_records[0].1.source_id.0,
+            "pe-service.watchlist-capacity-config"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&source_records[0].1.payload).unwrap(),
+            serde_json::json!({"generation": generation, "target": target})
+        );
+        source_log.task.abort();
     }
 
     #[tokio::test]
@@ -307,6 +416,7 @@ mod tests {
 
         let live = LiveWatchlist::new(watchlist(vec![entry(existing), entry(departing)]));
         let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
         for wallet in [departing, newcomer] {
             paper_state
@@ -331,6 +441,7 @@ mod tests {
             let live = live.clone();
             let prepared_sets = Arc::clone(&prepared_sets);
             let fake_paper_state = Arc::clone(&paper_state);
+            let verifier_source_log = source_log.path.clone();
             tokio::spawn(async move {
                 let mut attempts = 0;
                 while let Some(command) = control_rx.recv().await {
@@ -359,6 +470,15 @@ mod tests {
                             replacements,
                             acknowledged,
                         } => {
+                            if let Err(error) =
+                                crate::qualification::verify_published_membership_change(
+                                    &change.clone().into_record(),
+                                    &verifier_source_log,
+                                )
+                            {
+                                acknowledged.send(Err(error.to_string())).unwrap();
+                                continue;
+                            }
                             let removed = change.removed.into_iter().collect::<HashSet<_>>();
                             live.replace(&removed, &replacements, change.capacity);
                             acknowledged
@@ -374,7 +494,8 @@ mod tests {
             })
         };
 
-        let preparer = AdmissionPreparer::new(control_tx, Arc::clone(&paper_state));
+        let preparer = AdmissionPreparer::new(control_tx, Arc::clone(&paper_state))
+            .with_source_log(source_log.handle.clone());
         let applier = SupabaseWatchlistCapacity::new(
             live.clone(),
             Arc::clone(&paper_state),
@@ -411,6 +532,7 @@ mod tests {
             vec![vec![newcomer], vec![departing, newcomer]]
         );
         control.abort();
+        source_log.task.abort();
         server.abort();
     }
 
@@ -466,6 +588,7 @@ mod tests {
 
         let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
         let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
         paper_state
             .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
@@ -487,6 +610,7 @@ mod tests {
         let fake_paper_state = Arc::clone(&paper_state);
         let prepared_task = Arc::clone(&prepared);
         let release_task = Arc::clone(&release_ack);
+        let verifier_source_log = source_log.path.clone();
         let control = tokio::spawn(async move {
             while let Some(command) = control_rx.recv().await {
                 match command {
@@ -513,6 +637,13 @@ mod tests {
                         replacements,
                         acknowledged,
                     } => {
+                        if let Err(error) = crate::qualification::verify_published_membership_change(
+                            &change.clone().into_record(),
+                            &verifier_source_log,
+                        ) {
+                            acknowledged.send(Err(error.to_string())).unwrap();
+                            continue;
+                        }
                         let removed = change.removed.into_iter().collect::<HashSet<_>>();
                         live_at_control.replace(&removed, &replacements, change.capacity);
                         acknowledged
@@ -536,7 +667,8 @@ mod tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        let preparer = AdmissionPreparer::new(control_tx, Arc::clone(&paper_state));
+        let preparer = AdmissionPreparer::new(control_tx, Arc::clone(&paper_state))
+            .with_source_log(source_log.handle.clone());
         let applier = SupabaseWatchlistCapacity::new(
             live.clone(),
             Arc::clone(&paper_state),
@@ -568,6 +700,20 @@ mod tests {
             paper_state.cursor(&newcomer).unwrap(),
             Some(newcomer_last_trade)
         );
+        let source_records = pe_event_log::Reader::replay(&source_log.path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(source_records.len(), 1);
+        assert_eq!(
+            source_records[0].1.source_id.0,
+            "pe-service.watchlist-capacity-config"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&source_records[0].1.payload).unwrap(),
+            serde_json::json!({"generation": request.generation, "target": request.target})
+        );
+        source_log.task.abort();
         server.abort();
     }
 }
