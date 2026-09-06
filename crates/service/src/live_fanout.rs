@@ -7840,6 +7840,10 @@ mod tests {
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = now.unix_timestamp().saturating_mul(1_000);
         prepared.economic.risk.price_receipts.clear();
+        // The fake venue returns this prepared order verbatim; the resume path requires it to
+        // match the request derived from the admission (ladder debit and identity hashes).
+        prepared.prepared.worst_case_debit = prepared.prepared.maker_collateral;
+        prepared.prepared.metadata_hashes = prepared.identity.evidence_hashes.clone();
         append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
         let pending = verified_recovery_inventory(state)
             .unwrap()
