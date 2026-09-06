@@ -264,27 +264,44 @@ scripts/deploy/rehearsal545.sh --dry-run <reviewed-40-hex>
 scripts/deploy/rehearsal545.sh <reviewed-40-hex>
 ```
 
-The harness reads the active generation from `/home/sean/pe-activation.json`, checkpoints its SQLite
-database, all three framed logs, and the captured legacy-history input, then runs the staged binary
-against real first-party venue endpoints. The rehearsal environment must put the same publishable
-Supabase key in both credential slots; `rehearsal_preflight.sh` runs before the service starts.
+The harness requires `/home/sean/pe-activation.json` to be `verified`, reads the active generation
+from it, and checkpoints its SQLite database, all three framed logs, and the captured legacy-history
+input. A new or reused checkpoint must have the exact six-entry `copied.sha256` inventory and pass
+`sha256sum --strict -c` before use. `PE_REHEARSAL_BIND` is mandatory and must be a numeric loopback
+address with a nonzero port different from the installed service's port; the harness passes it to
+the child as `PE_BIND`, derives the readiness URL from it, and runs against real first-party venue
+endpoints.
+
+The rehearsal environment must put the same publishable Supabase key in both credential slots. It
+may be a modern `sb_publishable_*` key or a legacy JWT whose payload has `role=anon`; a modern secret
+key, service-role JWT, malformed key, or mismatched slots fails before any HTTP request.
+`rehearsal_preflight.sh` runs in a separate sanitized process, passes the database-admin URL only to
+sanitized `psql` children, and removes its marker rows on every exit. The service then starts under
+`env -i` with only the explicit `ServiceConfig` environment allowlist and fixed rehearsal overrides;
+`SUPABASE_DB_URL`, `PGDATABASE`, `CREDENTIALS_DIRECTORY`, and unrelated inherited variables cannot
+reach it.
 
 Path and cadence overrides are environment variables, not flags:
 `PE_REHEARSAL_ROOT`, `PE_ACTIVATION_MANIFEST`, `PE_REHEARSAL_RELEASE_ROOT`,
 `PE_REHEARSAL_BINARY`, `PE_REHEARSAL_CONFIG`, `PE_REHEARSAL_ENV`,
-`PE_REHEARSAL_COPY_DIR`, `PE_REHEARSAL_TIMEOUT_SECS`, `PE_REHEARSAL_POLL_SECS`, and
-`PE_REHEARSAL_EVIDENCE_HASH_FILE`.
+`PE_REHEARSAL_COPY_DIR`, `PE_REHEARSAL_BIND`, `PE_REHEARSAL_TIMEOUT_SECS`,
+`PE_REHEARSAL_POLL_SECS`, and `PE_REHEARSAL_EVIDENCE_HASH_FILE`.
 
 The four concurrent observers are the status-file poller, reader-drop classifier, fence/anchor
-census, and write-refusal counter. The run stops at the first complete same-invocation proof, the
-first unsafe observation, process exit, or its bound. PASS requires the reviewed revision, a complete
-ordinary poll after start, successful re-anchor, healthy critical owners, accounts off and unarmed,
-and no credit loss, unexpected fence/error, or successful database write. The harness prints
+census, and write-refusal counter. Each decision pass also queries the staged process's real
+`/health/ready` endpoint at the dedicated loopback bind and requires HTTP success plus
+`ready: true` with no reported issues (the empty `issues` field may be omitted); status freshness
+and critical-task assertions remain independent requirements. The run stops at the first complete
+same-invocation proof, the first unsafe
+observation, process exit, or its bound. PASS requires the reviewed revision, a complete ordinary
+poll after start, successful re-anchor, real readiness, healthy critical owners, accounts off and
+unarmed, and no credit loss, unexpected fence/error, or successful database write. The harness prints
 `REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
 file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, and the rehearsed
 binary's revision, embedded BLAKE3 identity, and file SHA-256. Preserve and review the JSON file and
-its result manifest; the financial driver binds both before entering `prepared` and revalidates them
-from disk before entering `guarded`.
+its result manifest, which also binds the validated copy-manifest digest and the real readiness
+response digest; the financial driver binds both before entering `prepared` and revalidates them from
+disk before entering `guarded`.
 
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
