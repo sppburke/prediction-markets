@@ -403,9 +403,12 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         }
 
         // Ordered admission check 2: both artifact halves and the frozen quote/ladder.
-        if let Err(reason) = validate_artifact_and_ladder(&request, now) {
-            return self.refuse(&request, now, economic, None, Vec::new(), reason);
-        }
+        let required = match validate_artifact_and_ladder(&request, now) {
+            Ok(required) => required,
+            Err(reason) => {
+                return self.refuse(&request, now, economic, None, Vec::new(), reason);
+            }
+        };
 
         let account = match self
             .venue
@@ -449,7 +452,6 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         }
 
         // Ordered check 5: balance and selected-spender allowance.
-        let required = request.ladder.worst_case_debit;
         if account.collateral_balance < required {
             return self.refuse(
                 &request,
@@ -905,7 +907,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
 fn validate_artifact_and_ladder(
     request: &LiveOrderRequest,
     now: OffsetDateTime,
-) -> Result<(), LiveAdmissionRefusal> {
+) -> Result<CollateralAmount, LiveAdmissionRefusal> {
     let market = &request.admission.market;
     if market.schema_version != LIVE_MARKET_SCHEMA_VERSION
         || market.parser_version != LIVE_MARKET_PARSER_VERSION
@@ -956,7 +958,15 @@ fn validate_artifact_and_ladder(
         &request.ladder,
         market.minimum_tick_size,
         market.minimum_order_size,
-    )
+    )?;
+    let required = request
+        .economic
+        .worst_case_all_in_debit()
+        .map_err(|_| LiveAdmissionRefusal::LadderInvalid)?;
+    if request.economic.balance.worst_case_debit != required {
+        return Err(LiveAdmissionRefusal::LadderInvalid);
+    }
+    Ok(required)
 }
 
 fn validate_ladder(
@@ -1675,6 +1685,67 @@ mod tests {
         let account_id = AccountId::new("account").unwrap();
         let mut input = request(&account_id);
         input.ladder.used_asks.clear();
+        assert_refusal(input, account_state(), LiveAdmissionRefusal::LadderInvalid).await;
+    }
+
+    #[test]
+    fn improved_ladder_accepts_expected_quantity_above_signed_minimum() {
+        let plan = LadderPlan {
+            used_asks: vec![
+                AskLevel {
+                    price: Price::new(dec!(0.49)).unwrap(),
+                    shares: ShareAmount::from_decimal_exact(dec!(2)).unwrap(),
+                },
+                AskLevel {
+                    price: Price::new(dec!(0.50)).unwrap(),
+                    shares: ShareAmount::from_decimal_exact(dec!(3.02)).unwrap(),
+                },
+            ],
+            best_ask: Price::new(dec!(0.49)).unwrap(),
+            limit_price: Price::new(dec!(0.50)).unwrap(),
+            shares: ShareAmount::from_decimal_exact(dec!(4.9999)).unwrap(),
+            worst_case_debit: CollateralAmount::from_decimal_exact(dec!(2.50)).unwrap(),
+        };
+        assert!(
+            validate_ladder(
+                &plan,
+                Price::new(dec!(0.01)).unwrap(),
+                ShareAmount::from_whole(1).unwrap(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_gates_require_principal_plus_fee_reserve() {
+        let account_id = AccountId::new("account").unwrap();
+        let mut input = request(&account_id);
+        let reserve = CollateralAmount::from_atomic(120);
+        input.economic.fee.reserve = reserve;
+        input.economic.balance.worst_case_debit = input
+            .economic
+            .sizing
+            .principal
+            .checked_add(reserve)
+            .unwrap();
+        let mut account = account_state();
+        account.collateral_balance = input.economic.sizing.principal;
+        assert_refusal(
+            input,
+            account,
+            LiveAdmissionRefusal::InsufficientBalance {
+                required: CollateralAmount::from_atomic(2_500_120),
+                available: CollateralAmount::from_atomic(2_500_000),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn balance_audit_must_equal_derived_all_in_requirement() {
+        let account_id = AccountId::new("account").unwrap();
+        let mut input = request(&account_id);
+        input.economic.fee.reserve = CollateralAmount::from_atomic(120);
         assert_refusal(input, account_state(), LiveAdmissionRefusal::LadderInvalid).await;
     }
 

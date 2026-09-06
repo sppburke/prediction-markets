@@ -201,3 +201,56 @@ fn receipt_failure_classes_are_typed() {
         Err(ReceiptError::OrderIdentityMismatch)
     );
 }
+
+/// PASS: reuse of a raw log identity conflicts before an unrelated order hash can be filtered.
+#[test]
+fn filtered_unrelated_log_identity_collision_is_rejected() {
+    let mut receipt: serde_json::Value = serde_json::from_slice(STANDARD).unwrap();
+    let mut conflicting = receipt["result"]["logs"][0].clone();
+    conflicting["topics"][1] = serde_json::json!(format!("0x{}", "ff".repeat(32)));
+    receipt["result"]["logs"]
+        .as_array_mut()
+        .unwrap()
+        .push(conflicting);
+
+    assert_eq!(
+        parse_receipt_response(
+            &serde_json::to_vec(&receipt).unwrap(),
+            &format!("0x{}", "11".repeat(32)),
+        ),
+        Err(ReceiptError::LogIdentityConflict)
+    );
+}
+
+/// PASS: direct requested-transaction and checked-256-bit amount violations are typed.
+#[test]
+fn requested_transaction_and_high_amount_words_are_rejected() {
+    assert_eq!(
+        parse_receipt_response(STANDARD, &format!("0x{}", "12".repeat(32))),
+        Err(ReceiptError::TransactionMismatch)
+    );
+
+    let mut receipt: serde_json::Value = serde_json::from_slice(STANDARD).unwrap();
+    let data = receipt["result"]["logs"][0]["data"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("0x")
+        .unwrap();
+    let mut words = data
+        .as_bytes()
+        .chunks_exact(64)
+        .map(|word| std::str::from_utf8(word).unwrap().to_owned())
+        .collect::<Vec<_>>();
+    words[2] = format!("{:064x}", alloy_primitives::U256::from(1u64) << 64);
+    receipt["result"]["logs"][0]["data"] = serde_json::json!(format!("0x{}", words.concat()));
+    let parsed = parse_receipt_response(
+        &serde_json::to_vec(&receipt).unwrap(),
+        &format!("0x{}", "11".repeat(32)),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        decode_order_fills(&parsed, &prepared(false)),
+        Err(ReceiptError::AmountOverflow)
+    );
+}

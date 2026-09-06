@@ -3,6 +3,7 @@
 //! Transport stays service-owned. This module accepts retained response bytes and validates only
 //! the exact V2 exchange/order identity frozen by [`PreparedPolymarketBuy`].
 
+use std::collections::BTreeMap;
 use std::str::FromStr as _;
 
 use alloy_primitives::{Address, B256, U256, address, b256};
@@ -81,6 +82,8 @@ pub enum ReceiptError {
     Reverted,
     #[error("receipt or log block identity is inconsistent")]
     BlockIdentityMismatch,
+    #[error("a receipt log identity is reused with different raw content")]
+    LogIdentityConflict,
     #[error("an OrderFilled log was removed")]
     RemovedLog,
     #[error("an OrderFilled log has a malformed ABI shape")]
@@ -151,6 +154,7 @@ pub fn parse_receipt_response(
     let block_number = parse_quantity(&wire.block_number)?;
     let block_hash = canonical_b256(&wire.block_hash)?;
     let mut logs = Vec::with_capacity(wire.logs.len());
+    let mut raw_log_identities = BTreeMap::<(String, u64), String>::new();
     for raw in wire.logs {
         let raw_bytes = serde_json::to_vec(&raw).map_err(|_| ReceiptError::MalformedRpc)?;
         let raw_hash = blake3::hash(&raw_bytes).to_hex().to_string();
@@ -158,17 +162,26 @@ pub fn parse_receipt_response(
         let log_transaction_hash = canonical_b256(&item.transaction_hash)?;
         let log_block_number = parse_quantity(&item.block_number)?;
         let log_block_hash = canonical_b256(&item.block_hash)?;
+        let log_index = parse_quantity(&item.log_index)?;
         if log_transaction_hash != transaction_hash
             || log_block_number != block_number
             || log_block_hash != block_hash
         {
             return Err(ReceiptError::BlockIdentityMismatch);
         }
+        let raw_identity = (log_transaction_hash.clone(), log_index);
+        if let Some(existing_hash) = raw_log_identities.get(&raw_identity) {
+            if existing_hash != &raw_hash {
+                return Err(ReceiptError::LogIdentityConflict);
+            }
+        } else {
+            raw_log_identities.insert(raw_identity, raw_hash.clone());
+        }
         logs.push(ReceiptLog {
             transaction_hash: log_transaction_hash,
             block_number: log_block_number,
             block_hash: log_block_hash,
-            log_index: parse_quantity(&item.log_index)?,
+            log_index,
             address: Address::from_str(&item.address).map_err(|_| ReceiptError::MalformedHex)?,
             topics: item
                 .topics
@@ -220,7 +233,7 @@ pub fn decode_order_fills(
     };
     if prepared.exchange_domain_version != 2
         || expected_exchange != supported_exchange
-        || !prepared.side.eq_ignore_ascii_case("buy")
+        || prepared.side != "BUY"
     {
         return Err(ReceiptError::OrderIdentityMismatch);
     }

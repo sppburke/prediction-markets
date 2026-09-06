@@ -969,9 +969,7 @@ pub(crate) fn http_attempt_hash(attempt: &RawHttpAttempt) -> Result<String, Live
     hash_serializable(&("prediction-edge/live-http-attempt/v1", attempt))
 }
 
-pub(crate) fn http_attempt_hashes(
-    attempts: &[RawHttpAttempt],
-) -> Result<Vec<String>, LiveJournalError> {
+pub fn http_attempt_hashes(attempts: &[RawHttpAttempt]) -> Result<Vec<String>, LiveJournalError> {
     attempts.iter().map(http_attempt_hash).collect()
 }
 
@@ -1230,15 +1228,130 @@ mod tests {
                 payload: serde_json::to_vec(&prepared).unwrap(),
             })
             .unwrap();
+        let reconciliation = legacy_v1::LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 2,
+            timestamp: at,
+            payload: legacy_v1::LiveJournalPayload::OrderReconciled(Box::new(
+                LiveOrderReconciliationAudit {
+                    identity: identity("legacy-prepared"),
+                    order_hash: "order".to_owned(),
+                    source: LiveReconciliationSource::OrderHashLookupAndCancel,
+                    outcome: LiveJournalOrderOutcome::Matched {
+                        venue_order_id: "venue-order".to_owned(),
+                        transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+                        executed: None,
+                    },
+                    evidence: Vec::new(),
+                    evidence_hashes: Vec::new(),
+                },
+            )),
+        };
+        let redemption_identity = RedemptionAttemptIdentity {
+            account_id: account_id.clone(),
+            condition_id: PolymarketConditionId("condition".to_owned()),
+            adapter: "adapter".to_owned(),
+            custody_wallet: "custody".to_owned(),
+        };
+        let legacy_redemption = [
+            legacy_v1::LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 3,
+                timestamp: at,
+                payload: legacy_v1::LiveJournalPayload::RedemptionRequested(Box::new(
+                    RedemptionRequestedAudit {
+                        identity: redemption_identity.clone(),
+                        attempt_count: 1,
+                        redeemable_balance: amount,
+                        request: RedemptionRequestAudit {
+                            call_to: "adapter".to_owned(),
+                            calldata: vec![1],
+                            condition_id: PolymarketConditionId("condition".to_owned()),
+                            neg_risk: false,
+                            custody: RedemptionCustodyAudit::DepositWallet,
+                            signer_address: "signer".to_owned(),
+                            custody_wallet: "custody".to_owned(),
+                            deadline_unix: Some(1),
+                            metadata_hash: "metadata".to_owned(),
+                            request_hash: "request".to_owned(),
+                            schema_version: 1,
+                            parser_version: 1,
+                            adapter_version: "adapter-v1".to_owned(),
+                        },
+                    },
+                )),
+            },
+            legacy_v1::LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 4,
+                timestamp: at,
+                payload: legacy_v1::LiveJournalPayload::RedemptionTransactionIdentified(Box::new(
+                    RedemptionTransactionAudit {
+                        identity: redemption_identity.clone(),
+                        attempt_count: 1,
+                        transaction_id: "transaction".to_owned(),
+                        submit_body_hash: "body".to_owned(),
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                )),
+            },
+            legacy_v1::LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 5,
+                timestamp: at,
+                payload: legacy_v1::LiveJournalPayload::RedemptionReceiptTransition(Box::new(
+                    RedemptionReceiptAudit {
+                        identity: redemption_identity,
+                        attempt_count: 1,
+                        transaction_id: "transaction".to_owned(),
+                        transaction_hash: Some(format!("0x{}", "22".repeat(32))),
+                        status: RedemptionReceiptStatusAudit::Confirmed,
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                )),
+            },
+        ];
+        for event in std::iter::once(reconciliation).chain(legacy_redemption) {
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(LIVE_JOURNAL_SOURCE.to_owned()),
+                    schema_version: 1,
+                    parser_version: LIVE_JOURNAL_PARSER_VERSION,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&event).unwrap(),
+                })
+                .unwrap();
+        }
         drop(writer);
 
         let replayed = replay_account(&path, &account_id).unwrap();
-        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed.len(), 6);
         assert!(
-            replayed
+            replayed[..2]
                 .iter()
                 .all(|event| matches!(event.payload, LiveJournalPayload::LegacyV1(_)))
         );
+        assert!(matches!(
+            &replayed[2].payload,
+            LiveJournalPayload::OrderReconciled(audit)
+                if matches!(audit.outcome, LiveJournalOrderOutcome::Matched { .. })
+        ));
+        assert!(matches!(
+            replayed[3].payload,
+            LiveJournalPayload::RedemptionRequested(_)
+        ));
+        assert!(matches!(
+            replayed[4].payload,
+            LiveJournalPayload::RedemptionTransactionIdentified(_)
+        ));
+        assert!(matches!(
+            replayed[5].payload,
+            LiveJournalPayload::RedemptionReceiptTransition(_)
+        ));
     }
 
     #[test]

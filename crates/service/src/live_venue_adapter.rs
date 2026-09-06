@@ -483,9 +483,7 @@ fn classify_order_post_response(
 fn post_transaction_hashes(response: &RawHttpResponse) -> Result<Vec<String>, LivePostParseError> {
     let value: Value =
         serde_json::from_slice(&response.body).map_err(|_| LivePostParseError::InvalidResponse)?;
-    let hashes = value
-        .get("transactionHashes")
-        .or_else(|| value.get("transaction_hashes"));
+    let hashes = value.get("transactionHashes");
     let Some(hashes) = hashes else {
         return Ok(Vec::new());
     };
@@ -579,11 +577,7 @@ fn classify_reconciliation(
             .to_owned();
         let mut transaction_hashes = BTreeSet::new();
         for trade in &matching_trades {
-            let Some(raw) = trade
-                .get("transaction_hash")
-                .or_else(|| trade.get("transactionHash"))
-                .and_then(Value::as_str)
-            else {
+            let Some(raw) = trade.get("transaction_hash").and_then(Value::as_str) else {
                 continue;
             };
             if raw.trim().is_empty()

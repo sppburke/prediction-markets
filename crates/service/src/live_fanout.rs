@@ -25,15 +25,15 @@ use pe_execution_core::{
     LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveVenueReconciledOutcome,
     MarkKind, MatchedLogIdentity, OrderFillFinalizedAudit, RedemptionAttempt,
     RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput, RiskAudit,
-    RiskDecisionAudit, SizingModeAudit, reconstruct_redemption_attempts, redemption_posture,
-    replay_account, run_redemption_pass,
+    RiskDecisionAudit, SizingModeAudit, http_attempt_hashes, reconstruct_redemption_attempts,
+    redemption_posture, replay_account, run_redemption_pass,
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ActivityAssetMapping, BinaryPayoutVector, ClassifiedPricesHistory, ClobPayoutResolution,
-    ClobPricesHistoryClient, FixtureFetcher, HttpRequestContext, ReconciliationFetcher,
+    ClobPricesHistoryClient, FixtureFetcher, HttpRequestContext, PricePoint, ReconciliationFetcher,
     ReqwestFetcher, fetch_complete_positions, parse_clob_market,
 };
 use pe_strategy_winner_follow::{
@@ -478,11 +478,35 @@ fn classify_order_finality(
 ) -> OrderFinalityResult {
     let identity = order.prepared.identity.clone();
     let order_hash = order.prepared.prepared.order_hash.clone();
-    let all_evidence = || {
+    let order_evidence = || {
+        let relevant_heights = order
+            .transaction_hashes
+            .iter()
+            .filter_map(|hash| receipts.get(hash))
+            .filter_map(|observation| match &observation.parsed {
+                Ok(Some(receipt))
+                    if receipt.block_number < head.as_ref().map_or(0, |h| h.number) =>
+                {
+                    Some(receipt.block_number)
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
         std::iter::once(chain_attempt.clone())
-            .chain(receipts.values().map(|item| item.attempt.clone()))
+            .chain(
+                order
+                    .transaction_hashes
+                    .iter()
+                    .filter_map(|hash| receipts.get(hash))
+                    .map(|item| item.attempt.clone()),
+            )
             .chain(std::iter::once(head_attempt.clone()))
-            .chain(blocks.values().map(|item| item.attempt.clone()))
+            .chain(
+                relevant_heights
+                    .iter()
+                    .filter_map(|height| blocks.get(height))
+                    .map(|item| item.attempt.clone()),
+            )
             .collect::<Vec<_>>()
     };
     let pending = |reason: String| OrderFinalityResult {
@@ -490,7 +514,7 @@ fn classify_order_finality(
         order_hash: order_hash.clone(),
         disposition: OrderFinalityDisposition::Pending {
             reason,
-            evidence: all_evidence(),
+            evidence: order_evidence(),
         },
     };
     let conflict = |reason: String| OrderFinalityResult {
@@ -498,7 +522,7 @@ fn classify_order_finality(
         order_hash: order_hash.clone(),
         disposition: OrderFinalityDisposition::Conflict {
             reason,
-            evidence: all_evidence(),
+            evidence: order_evidence(),
         },
     };
 
@@ -678,13 +702,7 @@ pub fn append_order_finality_result(
             FinalityJournalEffect::Finalized,
         ),
         OrderFinalityDisposition::Pending { reason, evidence } => {
-            let evidence_hashes = evidence
-                .iter()
-                .map(|attempt| {
-                    serde_json::to_vec(&("prediction-edge/live-http-attempt/v1", attempt))
-                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let evidence_hashes = http_attempt_hashes(&evidence)?;
             (
                 LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
                     identity: result.identity,
@@ -698,13 +716,7 @@ pub fn append_order_finality_result(
             )
         }
         OrderFinalityDisposition::Conflict { reason, evidence } => {
-            let evidence_hashes = evidence
-                .iter()
-                .map(|attempt| {
-                    serde_json::to_vec(&("prediction-edge/live-http-attempt/v1", attempt))
-                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let evidence_hashes = http_attempt_hashes(&evidence)?;
             (
                 LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
                     identity: result.identity,
@@ -822,7 +834,7 @@ async fn run_recovery_pass(
         .paper_state
         .unfinalized_ready_dispatch_seeds()?;
     for seed in &seeds {
-        let signal = parse_frozen_signal(&seed)?;
+        let signal = parse_frozen_signal(seed)?;
         for target in state
             .config
             .paper_state
@@ -830,7 +842,7 @@ async fn run_recovery_pass(
             .into_iter()
             .filter(|target| target.state == "submitted" || target.state == "ambiguous")
         {
-            if process_target(state, &seed, &target, &signal, now).await? == PassControl::FreezePass
+            if process_target(state, seed, &target, &signal, now).await? == PassControl::FreezePass
             {
                 freeze = true;
             }
@@ -1093,15 +1105,13 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
     };
-    let intent = match strategy.evaluate_at_price(
+    let intent = match evaluate_live_candidate_at_price(
+        &strategy,
         signal,
         best_ask,
         probability,
         initial_risk.snapshot,
         account_state.reconciled_free_collateral.to_decimal(),
-        ExecutionMode::LiveTiny,
-        None,
-        Some(best_ask),
     ) {
         Ok(intent) => intent,
         Err(error) => {
@@ -1237,15 +1247,13 @@ async fn process_target(
         applied_configuration_hash: identity.config_hash.clone(),
     })
     .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    if let Err(decline) = strategy.evaluate_at_price(
+    if let Err(decline) = evaluate_live_candidate_at_price(
+        &strategy,
         signal,
         economic.sizing.all_in_price,
         probability,
         economic.risk.snapshot.clone(),
         account_state.reconciled_free_collateral.to_decimal(),
-        ExecutionMode::LiveTiny,
-        None,
-        Some(economic.sizing.all_in_price),
     ) {
         terminalize(state, target, winner_follow_terminal_reason(&decline), now)?;
         return Ok(PassControl::Continue);
@@ -1359,6 +1367,28 @@ fn probability_for(live: &LiveWatchlist, signal: &LeaderSignal) -> Probability {
         .unwrap_or(0)
         .clamp(0, 10_000);
     Probability::new(Decimal::from(bps) / Decimal::from(10_000i32)).unwrap_or(Probability::ZERO)
+}
+
+/// Sole live adapter around the strategy sizing API. The LEAF integration changes only this
+/// helper when removing the lane-B cap arguments from `evaluate_at_price`.
+fn evaluate_live_candidate_at_price(
+    strategy: &WinnerFollowStrategy,
+    signal: &LeaderSignal,
+    all_in_price: Price,
+    probability: Probability,
+    risk: RiskSnapshot,
+    bankroll: Decimal,
+) -> Result<pe_venue_core::OrderIntent, WinnerFollowError> {
+    strategy.evaluate_at_price(
+        signal,
+        all_in_price,
+        probability,
+        risk,
+        bankroll,
+        ExecutionMode::LiveTiny,
+        None,
+        Some(all_in_price),
+    )
 }
 
 async fn live_risk_audit(
@@ -1757,12 +1787,61 @@ pub(crate) enum ProjectionReducerError {
     CustodyInventoryMismatch,
     #[error("authenticated collateral disagrees with economic cash and receivable")]
     CashMismatch,
+    #[error("custody reconciliation has no matching confirmed redemption attempt")]
+    CustodyWithoutConfirmedRedemption,
     #[error("portfolio mark prices are missing, duplicated, or inconsistent")]
     InvalidMarkPrices,
     #[error("portfolio mark equity disagrees with finalized economics")]
     InvalidMarkEquity,
     #[error("a Daily portfolio mark repeats a cutoff in the same account era")]
     DuplicateDailyMark,
+    #[error("a Daily portfolio mark is not a causal UTC-midnight observation")]
+    InvalidDailyMark,
+}
+
+enum PreparedOrderFact<'a> {
+    Posted(&'a pe_execution_core::LiveOrderPostAudit),
+    Reconciled(&'a LiveOrderReconciliationAudit),
+    Finalized(&'a OrderFillFinalizedAudit),
+}
+
+/// Exact shared binding between an OrderPrepared record and every later order fact. The account
+/// envelope is checked by each caller before invoking this matcher.
+fn prepared_order_fact_matches(
+    prepared_seq: u64,
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    fact: PreparedOrderFact<'_>,
+) -> bool {
+    match fact {
+        PreparedOrderFact::Posted(posted) => {
+            posted.identity == prepared.identity
+                && posted.order_hash == prepared.prepared.order_hash
+        }
+        PreparedOrderFact::Reconciled(reconciled) => {
+            let source_matches_outcome = matches!(
+                (&reconciled.source, &reconciled.outcome),
+                (
+                    LiveReconciliationSource::PostResponse
+                        | LiveReconciliationSource::OrderHashLookupAndCancel,
+                    LiveJournalOrderOutcome::Matched { .. }
+                        | LiveJournalOrderOutcome::Killed { .. }
+                        | LiveJournalOrderOutcome::Rejected { .. }
+                        | LiveJournalOrderOutcome::Ambiguous { .. }
+                ) | (
+                    LiveReconciliationSource::PolygonFinality,
+                    LiveJournalOrderOutcome::FinalityPending { .. }
+                        | LiveJournalOrderOutcome::FinalityConflict { .. }
+                )
+            );
+            reconciled.identity == prepared.identity
+                && reconciled.order_hash == prepared.prepared.order_hash
+                && source_matches_outcome
+        }
+        PreparedOrderFact::Finalized(finalized) => {
+            finalized.identity == prepared.identity
+                && finalized.prepared_journal_seq == prepared_seq
+        }
+    }
 }
 
 pub(crate) fn derive_projection_rows(
@@ -1783,8 +1862,15 @@ pub(crate) fn derive_projection_rows(
     let mut baseline_equity = None;
     let mut baseline_cutoff_unix = None;
     let mut realized_closes = Vec::new();
+    let mut custody_facts = HashMap::<
+        RedemptionAttemptIdentity,
+        pe_execution_core::RedemptionCustodyReconciledAudit,
+    >::new();
 
-    for event in events {
+    for (event_index, event) in events.iter().enumerate() {
+        if event.account_id != *account_id {
+            return Err(ProjectionReducerError::IdentityConflict);
+        }
         if let LiveJournalPayload::AccountPortfolioMarked(mark) = &event.payload
             && mark.kind == MarkKind::Baseline
         {
@@ -1825,18 +1911,40 @@ pub(crate) fn derive_projection_rows(
                     prepared_orders.insert(key, (event.seq, order.clone(), false));
                 }
             }
+            LiveJournalPayload::OrderPosted(posted) => {
+                let Some((prepared_seq, prepared, _)) =
+                    prepared_orders.get(&posted.identity.idempotency_key)
+                else {
+                    return Err(ProjectionReducerError::MissingPrepared);
+                };
+                if !prepared_order_fact_matches(
+                    *prepared_seq,
+                    prepared,
+                    PreparedOrderFact::Posted(posted),
+                ) {
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
+            }
             LiveJournalPayload::OrderReconciled(reconciled) => {
+                let Some((prepared_seq, prepared, terminal)) =
+                    prepared_orders.get_mut(&reconciled.identity.idempotency_key)
+                else {
+                    return Err(ProjectionReducerError::MissingPrepared);
+                };
+                if !prepared_order_fact_matches(
+                    *prepared_seq,
+                    prepared,
+                    PreparedOrderFact::Reconciled(reconciled),
+                ) {
+                    return Err(ProjectionReducerError::IdentityConflict);
+                }
                 if matches!(
                     reconciled.outcome,
                     LiveJournalOrderOutcome::Killed { .. }
                         | LiveJournalOrderOutcome::Rejected { .. }
                 ) {
                     reservations.remove(&reconciled.identity.idempotency_key);
-                    if let Some((_, _, terminal)) =
-                        prepared_orders.get_mut(&reconciled.identity.idempotency_key)
-                    {
-                        *terminal = true;
-                    }
+                    *terminal = true;
                 }
             }
             LiveJournalPayload::OrderFillFinalized(finalized) => {
@@ -1845,7 +1953,11 @@ pub(crate) fn derive_projection_rows(
                 else {
                     return Err(ProjectionReducerError::MissingPrepared);
                 };
-                if *prepared_seq != finalized.prepared_journal_seq {
+                if !prepared_order_fact_matches(
+                    *prepared_seq,
+                    prepared_audit,
+                    PreparedOrderFact::Finalized(finalized),
+                ) {
                     return Err(ProjectionReducerError::PreparedSequenceMismatch);
                 }
                 let unique_logs = finalized
@@ -1857,8 +1969,7 @@ pub(crate) fn derive_projection_rows(
                     (&pair[0].transaction_hash, pair[0].log_index)
                         < (&pair[1].transaction_hash, pair[1].log_index)
                 });
-                if finalized.identity != prepared_audit.identity
-                    || (*terminal && !fills.contains_key(&key))
+                if (*terminal && !fills.contains_key(&key))
                     || finalized.chain_id != pe_venue_polymarket::FINALIZED_CHAIN_ID
                     || finalized.principal != prepared_audit.economic.sizing.principal
                     || finalized.principal != prepared_audit.prepared.maker_collateral
@@ -1978,6 +2089,21 @@ pub(crate) fn derive_projection_rows(
                 resolutions.insert(condition, resolution.as_ref().clone());
             }
             LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
+                if let Some(existing) = custody_facts.get(&custody.identity) {
+                    if existing != custody.as_ref() {
+                        return Err(ProjectionReducerError::IdentityConflict);
+                    }
+                    continue;
+                }
+                let attempts = reconstruct_redemption_attempts(&events[..event_index]);
+                if !matches!(
+                    attempts
+                        .get(&custody.identity)
+                        .map(|attempt| &attempt.state),
+                    Some(RedemptionAttemptState::ConfirmedAwaitingBalance { .. })
+                ) {
+                    return Err(ProjectionReducerError::CustodyWithoutConfirmedRedemption);
+                }
                 let condition = custody.identity.condition_id.0.clone();
                 if !resolutions.contains_key(&condition) {
                     return Err(ProjectionReducerError::IdentityConflict);
@@ -2001,11 +2127,38 @@ pub(crate) fn derive_projection_rows(
                 latest_free_collateral =
                     Some(custody.account_state.collateral_balance.to_decimal());
                 latest_reconciled_at = format_observed_at(custody.account_state.observed_at);
+                custody_facts.insert(custody.identity.clone(), custody.as_ref().clone());
             }
             LiveJournalPayload::AccountPortfolioMarked(mark) if mark.kind == MarkKind::Daily => {
-                if daily_marks.insert(mark.cutoff_unix, mark.equity).is_some() {
+                if daily_marks.contains_key(&mark.cutoff_unix) {
                     return Err(ProjectionReducerError::DuplicateDailyMark);
                 }
+                if mark.cutoff_unix.rem_euclid(86_400) != 0
+                    || daily_marks
+                        .last_key_value()
+                        .is_some_and(|(prior, _)| *prior >= mark.cutoff_unix)
+                {
+                    return Err(ProjectionReducerError::InvalidDailyMark);
+                }
+                for price in &mark.prices {
+                    let classified = ClassifiedPricesHistory::Points(vec![PricePoint {
+                        t: price.observed_unix,
+                        price: price.price.0,
+                    }]);
+                    let validated = crate::risk_inputs::historical_mark_price(
+                        &classified,
+                        mark.cutoff_unix,
+                        price.receipt,
+                    )
+                    .map_err(|_| ProjectionReducerError::InvalidDailyMark)?;
+                    if validated.price != price.price
+                        || validated.sample_unix != price.observed_unix
+                        || validated.receipt != price.receipt
+                    {
+                        return Err(ProjectionReducerError::InvalidDailyMark);
+                    }
+                }
+                daily_marks.insert(mark.cutoff_unix, mark.equity);
                 let expected = derive_custody_positions(
                     &prepared_orders,
                     &fills,
@@ -2028,7 +2181,6 @@ pub(crate) fn derive_projection_rows(
             }
             LiveJournalPayload::AdmissionEvaluated(_)
             | LiveJournalPayload::OrderPreparationFailed(_)
-            | LiveJournalPayload::OrderPosted(_)
             | LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::RedemptionRequested(_)
             | LiveJournalPayload::RedemptionTransactionIdentified(_)
@@ -2433,6 +2585,11 @@ fn recovered_prepared(
     let events = replay_live_account(state, &account_id)?;
     let mut recovered = None;
     for event in events {
+        if event.account_id != account_id {
+            return Err(FanoutError::Signal(
+                "live order fact belongs to the wrong account envelope".to_owned(),
+            ));
+        }
         match event.payload {
             LiveJournalPayload::OrderPrepared(prepared)
                 if prepared.identity.dispatch_id == target.dispatch_id && recovered.is_some() =>
@@ -2444,6 +2601,13 @@ fn recovered_prepared(
             LiveJournalPayload::OrderPrepared(prepared)
                 if prepared.identity.dispatch_id == target.dispatch_id =>
             {
+                if prepared.frozen_binding.version != target.credential_bundle_version
+                    || prepared.frozen_binding.key_id != target.credential_key_id
+                {
+                    return Err(FanoutError::Signal(
+                        "prepared order does not match the target account binding".to_owned(),
+                    ));
+                }
                 recovered = Some(RecoveredPrepared {
                     journal_seq: event.seq,
                     audit: prepared,
@@ -2451,29 +2615,66 @@ fn recovered_prepared(
                     finalized: false,
                 });
             }
+            LiveJournalPayload::OrderPosted(posted)
+                if posted.identity.dispatch_id == target.dispatch_id =>
+            {
+                let Some(prepared) = recovered.as_ref() else {
+                    return Err(FanoutError::Signal(
+                        "posted order precedes its prepared record".to_owned(),
+                    ));
+                };
+                if !prepared_order_fact_matches(
+                    prepared.journal_seq,
+                    &prepared.audit,
+                    PreparedOrderFact::Posted(&posted),
+                ) {
+                    return Err(FanoutError::Signal(
+                        "posted order does not match its prepared record".to_owned(),
+                    ));
+                }
+            }
             LiveJournalPayload::OrderReconciled(reconciled)
                 if reconciled.identity.dispatch_id == target.dispatch_id =>
             {
+                let Some(prepared) = recovered.as_mut() else {
+                    return Err(FanoutError::Signal(
+                        "reconciled order precedes its prepared record".to_owned(),
+                    ));
+                };
+                if !prepared_order_fact_matches(
+                    prepared.journal_seq,
+                    &prepared.audit,
+                    PreparedOrderFact::Reconciled(&reconciled),
+                ) {
+                    return Err(FanoutError::Signal(
+                        "reconciled order does not match its prepared record".to_owned(),
+                    ));
+                }
                 if let LiveJournalOrderOutcome::Matched {
                     transaction_hashes, ..
                 } = reconciled.outcome
-                    && let Some(recovered) = recovered.as_mut()
                 {
-                    recovered.transaction_hashes.extend(transaction_hashes);
+                    prepared.transaction_hashes.extend(transaction_hashes);
                 }
             }
             LiveJournalPayload::OrderFillFinalized(finalized)
                 if finalized.identity.dispatch_id == target.dispatch_id =>
             {
-                if let Some(recovered) = recovered.as_mut() {
-                    if finalized.prepared_journal_seq != recovered.journal_seq {
-                        return Err(FanoutError::Signal(
-                            "finalized fill references the wrong prepared journal sequence"
-                                .to_owned(),
-                        ));
-                    }
-                    recovered.finalized = true;
+                let Some(prepared) = recovered.as_mut() else {
+                    return Err(FanoutError::Signal(
+                        "finalized fill precedes its prepared record".to_owned(),
+                    ));
+                };
+                if !prepared_order_fact_matches(
+                    prepared.journal_seq,
+                    &prepared.audit,
+                    PreparedOrderFact::Finalized(&finalized),
+                ) {
+                    return Err(FanoutError::Signal(
+                        "finalized fill does not match its prepared record".to_owned(),
+                    ));
                 }
+                prepared.finalized = true;
             }
             _ => {}
         }
@@ -2631,10 +2832,7 @@ async fn recover_target(
             error.evidence,
         ),
     };
-    let evidence_hashes = evidence
-        .iter()
-        .map(|attempt| hash_json(&("prediction-edge/live-http-attempt/v1", attempt)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let evidence_hashes = http_attempt_hashes(&evidence)?;
     state.config.journal.append(
         account_id,
         now,
@@ -5070,6 +5268,56 @@ mod tests {
         })
     }
 
+    /// PASS: a terminal reconciliation cannot release a reservation unless every Prepared
+    /// identity field, order hash, account envelope, and source/outcome pairing match.
+    #[test]
+    fn terminal_reconciliation_requires_the_exact_prepared_fact() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let mut wrong_identity = prepared.identity.clone();
+        wrong_identity.quote_id = "different-quote".to_owned();
+        let events = vec![
+            baseline_event(&account_id, 1),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 3,
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                payload: LiveJournalPayload::OrderReconciled(Box::new(
+                    LiveOrderReconciliationAudit {
+                        identity: wrong_identity,
+                        order_hash: prepared.prepared.order_hash.clone(),
+                        source: LiveReconciliationSource::PostResponse,
+                        outcome: LiveJournalOrderOutcome::Killed {
+                            venue_order_id: None,
+                        },
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                )),
+            },
+        ];
+        assert!(matches!(
+            derive_projection_rows(&account_id, &events),
+            Err(ProjectionReducerError::IdentityConflict)
+        ));
+
+        let mut wrong_pair = events;
+        if let LiveJournalPayload::OrderReconciled(reconciled) = &mut wrong_pair[2].payload {
+            reconciled.identity = prepared.identity.clone();
+            reconciled.source = LiveReconciliationSource::PolygonFinality;
+        }
+        assert!(matches!(
+            derive_projection_rows(&account_id, &wrong_pair),
+            Err(ProjectionReducerError::IdentityConflict)
+        ));
+    }
+
     struct FakePolygonRpc {
         calls: Mutex<Vec<(String, Option<u64>)>>,
         finalized_head: u64,
@@ -5666,6 +5914,67 @@ mod tests {
         ));
     }
 
+    /// PASS: Daily replay rejects non-monotonic cutoffs and stale/future price evidence.
+    #[test]
+    fn daily_marks_require_causal_midnight_evidence() {
+        let account_id = AccountId::new("account").unwrap();
+        let mut first = baseline_event(&account_id, 2);
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut first.payload {
+            mark.kind = MarkKind::Daily;
+            mark.cutoff_unix = 86_400;
+        }
+        let mut earlier = first.clone();
+        earlier.seq = 3;
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut earlier.payload {
+            mark.cutoff_unix = 0;
+        }
+        assert!(matches!(
+            derive_projection_rows(
+                &account_id,
+                &[baseline_event(&account_id, 1), first.clone(), earlier]
+            ),
+            Err(ProjectionReducerError::InvalidDailyMark)
+        ));
+
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut first.payload {
+            mark.prices.push(pe_execution_core::MarkPrice {
+                condition_id: PolymarketConditionId(format!("0x{}", "77".repeat(32))),
+                outcome_index: 0,
+                price: Price::new(dec!(0.5)).unwrap(),
+                receipt: AppendReceipt {
+                    sequence: EventSeq(3),
+                    this_hash: blake3::Hash::from_bytes([3; 32]),
+                },
+                observed_unix: 86_401,
+            });
+        }
+        assert!(matches!(
+            derive_projection_rows(&account_id, &[baseline_event(&account_id, 1), first]),
+            Err(ProjectionReducerError::InvalidDailyMark)
+        ));
+    }
+
+    /// PASS: unexplained authenticated cash movement blocks the strict live posture.
+    #[test]
+    fn cash_drift_is_rejected_at_one_atomic_unit() {
+        assert!(
+            require_cash_reconciliation(
+                CollateralAmount::from_atomic(7_000_000),
+                dec!(10),
+                CollateralAmount::from_atomic(3_000_000),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            require_cash_reconciliation(
+                CollateralAmount::from_atomic(7_000_001),
+                dec!(10),
+                CollateralAmount::from_atomic(3_000_000),
+            ),
+            Err(ProjectionReducerError::CashMismatch)
+        ));
+    }
+
     fn finalized_fill_event(
         account_id: &AccountId,
         prepared: &pe_execution_core::LiveOrderPreparedAudit,
@@ -5714,6 +6023,63 @@ mod tests {
         }
     }
 
+    /// PASS: live resolution floors an aggregate half payout once and credits a losing outcome zero.
+    #[test]
+    fn live_resolution_half_payout_and_loser_are_exact() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let mut half_fill = finalized_fill_event(&account_id, &prepared, 3, 2);
+        if let LiveJournalPayload::OrderFillFinalized(fill) = &mut half_fill.payload {
+            fill.quantity = ShareAmount::from_atomic(3_125_001);
+        }
+        let mut half_resolution = resolution_event(&account_id, 4);
+        if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut half_resolution.payload {
+            resolution.payout_by_outcome_index_json =
+                BinaryPayoutVector::fifty_fifty().canonical_json();
+        }
+        let half = derive_projection_rows(
+            &account_id,
+            &[
+                baseline_event(&account_id, 1),
+                LiveJournalEvent {
+                    account_id: account_id.clone(),
+                    seq: 2,
+                    timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
+                    payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                },
+                half_fill,
+                half_resolution,
+            ],
+        )
+        .unwrap();
+        assert_eq!(half.receivable, dec!(1.562500));
+        assert_eq!(half.economic_cash, Some(dec!(9.062380)));
+
+        let mut losing_resolution = resolution_event(&account_id, 4);
+        if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut losing_resolution.payload
+        {
+            resolution.payout_by_outcome_index_json =
+                BinaryPayoutVector::winner(1).unwrap().canonical_json();
+        }
+        let losing = derive_projection_rows(
+            &account_id,
+            &[
+                baseline_event(&account_id, 1),
+                LiveJournalEvent {
+                    account_id: account_id.clone(),
+                    seq: 2,
+                    timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
+                    payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                },
+                finalized_fill_event(&account_id, &prepared, 3, 2),
+                losing_resolution,
+            ],
+        )
+        .unwrap();
+        assert_eq!(losing.receivable, Decimal::ZERO);
+        assert_eq!(losing.economic_cash, Some(dec!(7.499880)));
+    }
+
     /// PASS: resolution changes economics once; custody reconciliation changes no equity.
     #[test]
     fn finalized_resolution_and_custody_replay_converge_once() {
@@ -5758,36 +6124,90 @@ mod tests {
         );
 
         let reconciled_cash = CollateralAmount::from_decimal_exact(dec!(10.624880)).unwrap();
+        let redemption_identity = RedemptionAttemptIdentity {
+            account_id: account_id.clone(),
+            condition_id: PolymarketConditionId(format!("0x{}", "77".repeat(32))),
+            adapter: "adapter".to_owned(),
+            custody_wallet: "custody".to_owned(),
+        };
+        let custody_audit = pe_execution_core::RedemptionCustodyReconciledAudit {
+            identity: redemption_identity.clone(),
+            account_state: pe_execution_core::LiveAccountStateAudit {
+                observed_at: OffsetDateTime::from_unix_timestamp(30).unwrap(),
+                closed_only: false,
+                geoblocked: false,
+                selected_spender: "spender".to_owned(),
+                collateral_balance: reconciled_cash,
+                allowance: reconciled_cash,
+                reconciled_free_collateral: reconciled_cash,
+                schema_version: 1,
+                parser_version: 1,
+                evidence: Vec::new(),
+                evidence_hashes: Vec::new(),
+            },
+            venue_positions: Vec::new(),
+            venue_position_receipts: Vec::new(),
+        };
         events.push(LiveJournalEvent {
             account_id: account_id.clone(),
             seq: 7,
             timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
             payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
-                pe_execution_core::RedemptionCustodyReconciledAudit {
-                    identity: RedemptionAttemptIdentity {
-                        account_id: account_id.clone(),
-                        condition_id: PolymarketConditionId(format!("0x{}", "77".repeat(32))),
-                        adapter: "adapter".to_owned(),
-                        custody_wallet: "custody".to_owned(),
-                    },
-                    account_state: pe_execution_core::LiveAccountStateAudit {
-                        observed_at: OffsetDateTime::from_unix_timestamp(30).unwrap(),
-                        closed_only: false,
-                        geoblocked: false,
-                        selected_spender: "spender".to_owned(),
-                        collateral_balance: reconciled_cash,
-                        allowance: reconciled_cash,
-                        reconciled_free_collateral: reconciled_cash,
-                        schema_version: 1,
-                        parser_version: 1,
+                custody_audit.clone(),
+            )),
+        });
+        assert!(matches!(
+            derive_projection_rows(&account_id, &events),
+            Err(ProjectionReducerError::CustodyWithoutConfirmedRedemption)
+        ));
+        events.pop();
+        events.extend([
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 7,
+                timestamp: OffsetDateTime::from_unix_timestamp(28).unwrap(),
+                payload: LiveJournalPayload::RedemptionTransactionIdentified(Box::new(
+                    pe_execution_core::RedemptionTransactionAudit {
+                        identity: redemption_identity.clone(),
+                        attempt_count: 1,
+                        transaction_id: "tx-1".to_owned(),
+                        submit_body_hash: "body".to_owned(),
                         evidence: Vec::new(),
                         evidence_hashes: Vec::new(),
                     },
-                    venue_positions: Vec::new(),
-                    venue_position_receipts: Vec::new(),
-                },
-            )),
-        });
+                )),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 8,
+                timestamp: OffsetDateTime::from_unix_timestamp(29).unwrap(),
+                payload: LiveJournalPayload::RedemptionReceiptTransition(Box::new(
+                    pe_execution_core::RedemptionReceiptAudit {
+                        identity: redemption_identity,
+                        attempt_count: 1,
+                        transaction_id: "tx-1".to_owned(),
+                        transaction_hash: Some(format!("0x{}", "99".repeat(32))),
+                        status: pe_execution_core::RedemptionReceiptStatusAudit::Confirmed,
+                        evidence: Vec::new(),
+                        evidence_hashes: Vec::new(),
+                    },
+                )),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 9,
+                timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
+                payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+                    custody_audit.clone(),
+                )),
+            },
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 10,
+                timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
+                payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(custody_audit)),
+            },
+        ]);
         let custody = derive_projection_rows(&account_id, &events).unwrap();
         assert_eq!(custody.economic_cash, resolved.economic_cash);
         assert_eq!(custody.receivable, Decimal::ZERO);

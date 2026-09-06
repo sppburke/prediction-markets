@@ -533,11 +533,17 @@ impl ActivityAssetMapping {
             }
             return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
         }
-        if self.by_asset.iter().any(|(existing_asset, identity)| {
+        let outcome_is_reused = self.by_asset.iter().any(|(existing_asset, identity)| {
             existing_asset != &asset
                 && identity.condition_id == condition_id
                 && identity.outcome == outcome
-        }) {
+        }) || self.unresolved.iter().any(|(existing_asset, identities)| {
+            existing_asset != &asset
+                && identities.iter().any(|identity| {
+                    identity.condition_id == condition_id && identity.outcome == outcome
+                })
+        });
+        if outcome_is_reused {
             return Err(PositionReadError::ConflictingOutcomeMapping {
                 condition_id: condition_id.0,
                 outcome: outcome.0,
@@ -1056,6 +1062,36 @@ mod tests {
                 }
             ),
             Err(PositionReadError::ConflictingActivityMapping { .. })
+        ));
+    }
+
+    /// PASS: verified insertion rejects condition/outcome reuse still held by unresolved assets.
+    #[test]
+    fn verified_ordinary_inserter_checks_unresolved_reverse_identity() {
+        let condition = PolymarketConditionId("condition-1".to_owned());
+        let unresolved_asset = PolymarketTokenId("asset-unresolved".to_owned());
+        let mut mapping = ActivityAssetMapping {
+            by_asset: HashMap::new(),
+            unresolved: BTreeMap::from([(
+                unresolved_asset,
+                vec![ActivityAssetIdentity {
+                    condition_id: condition.clone(),
+                    outcome: OutcomeId(0),
+                    classification: PositionClassification::Ordinary,
+                    verified: false,
+                }],
+            )]),
+            classification_by_asset: HashMap::new(),
+            journal_verified_assets: HashSet::new(),
+        };
+
+        assert!(matches!(
+            mapping.insert_verified_ordinary(
+                PolymarketTokenId("asset-new".to_owned()),
+                condition,
+                OutcomeId(0),
+            ),
+            Err(PositionReadError::ConflictingOutcomeMapping { .. })
         ));
     }
 

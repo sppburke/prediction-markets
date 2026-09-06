@@ -52,7 +52,8 @@ pub use live_journal::{
     LiveReconciliationSource, MarkKind, MarkPrice, MatchedLogIdentity, OrderFillFinalizedAudit,
     RedemptionAttemptIdentity, RedemptionCustodyAudit, RedemptionCustodyReconciledAudit,
     RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
-    RedemptionRequestedAudit, RedemptionTransactionAudit, ResolutionFinalizedAudit, replay_account,
+    RedemptionRequestedAudit, RedemptionTransactionAudit, ResolutionFinalizedAudit,
+    http_attempt_hashes, replay_account,
 };
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,
