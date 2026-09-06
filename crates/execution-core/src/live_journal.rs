@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use pe_core_types::{
     AccountId, CollateralAmount, EventSeq, PolymarketConditionId, PolymarketTokenId, Price,
-    RawHttpAttempt, ReceivedAt, ShareAmount, SourceId, SourceTimestamp,
+    RawHttpAttempt, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress,
 };
 use pe_event_log::{
     AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer,
@@ -33,6 +33,46 @@ const LIVE_JOURNAL_PARSER_VERSION: u32 = 1;
 pub struct CredentialBindingIdentity {
     pub version: i64,
     pub key_id: String,
+}
+
+/// Nonsecret identity of the credentialed account read that produced a financial fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveAccountBindingAudit {
+    pub account_id: AccountId,
+    pub credential: CredentialBindingIdentity,
+    pub custody_wallet: String,
+    pub credential_fingerprint: String,
+}
+
+impl LiveAccountBindingAudit {
+    #[must_use]
+    pub fn new(
+        account_id: AccountId,
+        credential: CredentialBindingIdentity,
+        custody_wallet: WalletAddress,
+        credential_fingerprint: String,
+    ) -> Self {
+        let custody_wallet = custody_wallet.to_string();
+        Self {
+            account_id,
+            credential,
+            custody_wallet,
+            credential_fingerprint,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid_for(&self, account_id: &AccountId) -> bool {
+        &self.account_id == account_id
+            && WalletAddress::from_hex(&self.custody_wallet)
+                .is_ok_and(|wallet| wallet.to_string() == self.custody_wallet)
+            && self.credential_fingerprint.len() == blake3::OUT_LEN * 2
+            && self
+                .credential_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
 }
 
 /// Immutable metadata needed to rebuild a matched fill projection from the journal alone.
@@ -576,6 +616,22 @@ pub struct CanonicalPositionAudit {
     pub redeemable: bool,
 }
 
+/// One retained complete-position page bound to the exact request that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LivePositionPageAudit {
+    pub request_identity: String,
+    pub receipt: pe_event_log::AppendReceipt,
+}
+
+/// Complete-position evidence for one explicitly requested custody wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LivePositionEvidenceAudit {
+    pub requested_wallet: String,
+    pub pages: Vec<LivePositionPageAudit>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedemptionCustodyReconciledAudit {
@@ -607,9 +663,13 @@ pub struct MarkPrice {
 pub struct AccountPortfolioMarkedAudit {
     pub kind: MarkKind,
     pub cutoff_unix: i64,
+    pub account_binding: LiveAccountBindingAudit,
     pub account_state: LiveAccountStateAudit,
+    /// Inventory observed by the current complete-position account pass.
     pub venue_positions: Vec<CanonicalPositionAudit>,
-    pub venue_position_receipts: Vec<pe_event_log::AppendReceipt>,
+    pub venue_position_evidence: LivePositionEvidenceAudit,
+    /// Journal-derived inventory at `cutoff_unix`; distinct from the current venue observation.
+    pub marked_positions: Vec<CanonicalPositionAudit>,
     pub prices: Vec<MarkPrice>,
     pub equity: CollateralAmount,
 }
@@ -895,6 +955,7 @@ struct OpenOrderState {
     prepared: Option<Box<LiveOrderPreparedAudit>>,
     transaction_hashes: BTreeSet<String>,
     terminal: bool,
+    finality_conflict: bool,
 }
 
 fn insert_open_order(
@@ -921,14 +982,16 @@ fn insert_open_order(
             prepared,
             transaction_hashes: BTreeSet::new(),
             terminal: false,
+            finality_conflict: false,
         },
     );
     Ok(())
 }
 
 /// Replay the verified global journal once and return every Prepared order without a terminal fact.
-/// `Killed`, `Rejected`, and `OrderFillFinalized` are terminal; matched, ambiguous, pending, and
-/// conflicting-finality observations remain open for recovery.
+/// `Killed`, `Rejected`, `FinalityConflict`, and `OrderFillFinalized` are terminal. A finality
+/// conflict deliberately preserves the reservation while removing the order from automated
+/// recovery; only an operator may resolve the frozen journal state.
 pub fn open_order_inventory(
     path: impl AsRef<Path>,
 ) -> Result<Vec<OpenOrderInventoryEntry>, LiveJournalError> {
@@ -994,6 +1057,9 @@ pub fn recovery_inventory(
                 let order = orders
                     .get_mut(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
+                if order.finality_conflict {
+                    return Err(LiveJournalError::OrderFactConflict);
+                }
                 if !prepared_order_fact_matches(
                     order.entry.prepared_journal_seq,
                     &order.entry.identity,
@@ -1017,6 +1083,13 @@ pub fn recovery_inventory(
                 ) {
                     order.terminal = true;
                 }
+                if matches!(
+                    reconciled.outcome,
+                    LiveJournalOrderOutcome::FinalityConflict { .. }
+                ) {
+                    order.terminal = true;
+                    order.finality_conflict = true;
+                }
             }
             LiveJournalPayload::OrderFillFinalized(finalized) => {
                 let key = (event.account_id, finalized.identity.idempotency_key.clone());
@@ -1029,6 +1102,9 @@ pub fn recovery_inventory(
                     &order.order_hash,
                     PreparedOrderFact::Finalized(&finalized),
                 ) {
+                    return Err(LiveJournalError::OrderFactConflict);
+                }
+                if order.terminal || order.finality_conflict {
                     return Err(LiveJournalError::OrderFactConflict);
                 }
                 order.terminal = true;
