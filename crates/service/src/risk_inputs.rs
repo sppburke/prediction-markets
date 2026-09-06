@@ -681,6 +681,105 @@ fn source_receipt_received_millis(
     Err(RiskInputsUnavailable::PriceMissing)
 }
 
+/// Reconstruct the paper exposure base for one proposal from the completed financial prefix.
+///
+/// Completed resolutions remove every earlier fill in that market. The caller supplies only the
+/// proposed trade facts that are not owned by the prefix; PnL, marks, and latency are composed by
+/// [`build_paper_risk_snapshot`]. Runtime and offline qualification use this same pure reducer.
+pub fn build_paper_risk_base(
+    era: &PaperEra,
+    leader_wallet: pe_core_types::WalletAddress,
+    market_id: &str,
+    proposed_debit: pe_core_types::CollateralAmount,
+    per_trade_cap_bps: i32,
+) -> Result<RiskSnapshot, RiskInputsUnavailable> {
+    let completed = era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                prepared_receipt, ..
+            }) => Some(prepared_receipt.sequence),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let resolved = era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                payload: FinancialPayload::Resolution { condition_id, .. },
+                ..
+            }) if completed.contains(&frame.receipt.sequence) => Some(condition_id.0.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    let mut leader_exposure = pe_core_types::CollateralAmount::ZERO;
+    let mut market_exposure = pe_core_types::CollateralAmount::ZERO;
+    let mut total_exposure = pe_core_types::CollateralAmount::ZERO;
+    for frame in &era.frames {
+        let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+            payload:
+                FinancialPayload::Fill {
+                    operation,
+                    economic,
+                },
+            ..
+        }) = &frame.frame
+        else {
+            continue;
+        };
+        if !completed.contains(&frame.receipt.sequence)
+            || resolved.contains(&economic.market.market_id)
+        {
+            continue;
+        }
+        let debit = economic
+            .sizing
+            .principal
+            .checked_add(economic.fee.expected_fee)
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        total_exposure = total_exposure
+            .checked_add(debit)
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if economic.market.market_id == market_id {
+            market_exposure = market_exposure
+                .checked_add(debit)
+                .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        }
+        if operation.leader_wallet == leader_wallet {
+            leader_exposure = leader_exposure
+                .checked_add(debit)
+                .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        }
+    }
+
+    let bankroll = era
+        .start
+        .as_ref()
+        .map(|(_, start)| start.starting_bankroll)
+        .ok_or(RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+    let exposure = |amount| {
+        pe_risk_engine::exposure_bps_ceil(amount, bankroll).ok_or(RiskInputsUnavailable::Overflow)
+    };
+    Ok(RiskSnapshot {
+        leader_exposure_bps: exposure(leader_exposure)?,
+        market_exposure_bps: exposure(market_exposure)?,
+        // No durable market-family identity exists in the paper protocol. The market value is
+        // the conservative available family exposure rather than a fabricated zero.
+        family_exposure_bps: exposure(market_exposure)?,
+        total_copy_exposure_bps: exposure(total_exposure)?,
+        intraday_pnl_bps: pe_core_types::BasisPoints::ZERO,
+        rolling_7d_pnl_bps: pe_core_types::BasisPoints::ZERO,
+        absolute_pnl_bps: pe_core_types::BasisPoints::ZERO,
+        copy_latency_kill_switch_active: false,
+        proposed_trade_bps: exposure(proposed_debit)?,
+        per_trade_cap_bps,
+        concentration_caps: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
