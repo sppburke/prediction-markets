@@ -9,7 +9,10 @@ use pe_core_types::{CollateralAmount, Price, ShareAmount};
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::canary_market::AskLevel;
-use crate::fee::{CompactFeeSchedule, FeeError, fee_reserve, principal_for_budget, taker_fee};
+use crate::fee::{
+    CompactFeeSchedule, FeeError, fee_reserve, principal_for_budget, principal_implied_shares,
+    taker_fee,
+};
 
 const ATOMICS_PER_SHARE: u64 = 1_000_000;
 
@@ -208,7 +211,6 @@ pub fn plan_sized_buy(
     let reserve = fee_reserve(
         schedule,
         ladder.worst_case_debit,
-        ladder.shares,
         ladder.best_ask,
         ladder.limit_price,
     )?;
@@ -658,10 +660,8 @@ fn shares_for_principal(
         return Err(LadderError::Amount);
     }
     ShareAmount::from_decimal_exact(
-        principal
-            .to_decimal()
-            .checked_div(price.0)
-            .ok_or(LadderError::Amount)?
+        principal_implied_shares(principal, price)
+            .map_err(|_| LadderError::Amount)?
             .round_dp_with_strategy(scale, RoundingStrategy::ToNegativeInfinity),
     )
     .map_err(|_| LadderError::Amount)

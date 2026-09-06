@@ -196,16 +196,26 @@ class RankAndPushScenario(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             "from pathlib import Path\n"
-            "import json\n"
+            "import hashlib, json\n"
             "a = sys.argv[1:]\n"
             'open("push.log", "a").write(" ".join(a) + "\\n")\n'
+            'if "--validate-request" in a:\n'
+            '    payload = json.load(open(a[a.index("--validate-request") + 1]))\n'
+            '    identity = {"batch": payload["batch"], "entries": payload["entries"]}\n'
+            '    activation = payload.get("cache_activation")\n'
+            '    if activation is not None: identity["cache_activation"] = activation\n'
+            '    expected = hashlib.sha256(json.dumps(identity, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()\n'
+            '    if payload.get("publish_key") != expected: raise SystemExit(1)\n'
+            '    if activation is not None:\n'
+            '        for key in ("side_path", "fixed_path", "prior_cache_backup_path", "expected_sha256"): print(activation[key])\n'
+            '    raise SystemExit(0)\n'
             'if "--snapshot-current" in a:\n'
             '    Path(a[a.index("--snapshot-current") + 1]).write_text("[]\\n")\n'
             '    raise SystemExit(0)\n'
             'if "--request-file" in a:\n'
             '    request = Path(a[a.index("--request-file") + 1])\n'
             '    request.parent.mkdir(parents=True, exist_ok=True)\n'
-            '    payload = {}\n'
+            '    payload = {"version": 1, "batch": {}, "entries": [{"rank": 1, "wallet_hex": "0xabc"}], "keep_batches": 1080}\n'
             '    if "--cache-side-db" in a:\n'
             '        stage = json.load(open(a[a.index("--cache-stage-record") + 1]))\n'
             '        payload["cache_activation"] = {\n'
@@ -214,6 +224,9 @@ class RankAndPushScenario(unittest.TestCase):
             '            "prior_cache_backup_path": a[a.index("--prior-cache-backup") + 1],\n'
             '            "expected_sha256": stage["cache_sha256"],\n'
             '        }\n'
+            '    identity = {"batch": payload["batch"], "entries": payload["entries"]}\n'
+            '    if "cache_activation" in payload: identity["cache_activation"] = payload["cache_activation"]\n'
+            '    payload["publish_key"] = hashlib.sha256(json.dumps(identity, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()\n'
             '    request.write_text(json.dumps(payload) + "\\n")\n'
             'if "--pending-file" in a:\n'
             '    pending = Path(a[a.index("--pending-file") + 1])\n'
@@ -943,7 +956,8 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("--snapshot-current", push_lines[0])
         self.assertIn("--prepare-only", push_lines[1])
         self.assertIn("--cache-stage-record", push_lines[1])
-        self.assertIn("--resume-request", push_lines[2])
+        self.assertIn("--validate-request", push_lines[2])
+        self.assertIn("--resume-request", push_lines[3])
         bootstrap = (self._log("pe_bootstrap.log") or "").splitlines()
         operations = [line.split()[0] for line in bootstrap]
         self.assertEqual(
@@ -1039,6 +1053,46 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse(
             (self.root / "data" / "eval-results" / ".rank_and_push.lock").exists()
         )
+
+    def test_resume_rejects_tampered_request_before_cache_activation(self):
+        """PASS: the publisher validates publish_key before the wrapper invokes activation.
+        FAIL: a modified activation tuple reaches pe-bootstrap."""
+        request_dir = self.root / "data" / "eval-results" / "cron-tampered"
+        request_dir.mkdir()
+        request = request_dir / "ranking_publish_request.json"
+        activation = {
+            "side_path": "data/side.db",
+            "fixed_path": "data/wallet_cache.db",
+            "prior_cache_backup_path": "data/prior.db",
+            "expected_sha256": "a" * 64,
+        }
+        identity = {
+            "batch": {},
+            "entries": [{"rank": 1, "wallet_hex": "0xabc"}],
+            "cache_activation": activation,
+        }
+        payload = {
+            "version": 1,
+            "batch": identity["batch"],
+            "entries": identity["entries"],
+            "keep_batches": 1080,
+            "cache_activation": activation,
+            "publish_key": __import__("hashlib").sha256(
+                json.dumps(identity, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest(),
+        }
+        payload["cache_activation"]["side_path"] = "data/tampered.db"
+        request.write_text(json.dumps(payload) + "\n")
+        pending = self.root / "data" / "eval-results" / "rank_and_push.pending"
+        pending.write_text(
+            "data/eval-results/cron-tampered/ranking_publish_request.json\n"
+        )
+
+        result = self._run("--resume-pending")
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIsNone(self._log("pe_bootstrap.log"))
+        self.assertTrue(pending.is_file())
+        print("PASS: tampered pending request is rejected before activation")
 
     def test_default_half_life_threaded_to_both_passes(self):
         r = self._run()
