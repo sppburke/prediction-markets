@@ -48,6 +48,10 @@ do $$ begin
   if not exists (select 1 from pg_roles where rolname = 'service_role') then
     create role service_role nologin bypassrls;
   end if;
+  -- Reruns on a reused server must still model Supabase's role attributes exactly.
+  alter role anon nobypassrls;
+  alter role authenticated nobypassrls;
+  alter role service_role bypassrls;
 end $$;
 SQL
 psql_admin -v ON_ERROR_STOP=1 -c 'create database pe_legacy_545;'
