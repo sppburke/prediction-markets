@@ -859,7 +859,9 @@ fn rewrite_paper_for_source(
         );
         let mut record: PaperLogRecord = serde_json::from_value(record_value).unwrap();
         if let PaperLogRecord::QualificationSealed(seal) = &mut record {
-            seal.source_prefix = source.tail.clone();
+            // `remap_receipts` already rebound `source_prefix` to the rewritten record at the
+            // original sealed sequence; the corpus continues past the seal, so the whole-log
+            // tail would widen the sealed range.
             seal.financial_prefix = previous_binding.clone().unwrap();
             if let Some(digest) = decision_evidence_digest {
                 seal.decision_evidence_digest = digest.to_owned();
@@ -951,13 +953,19 @@ fn rewrite_state_receipts(
     }
 }
 
-fn decision_evidence_digest(
-    paper_path: &std::path::Path,
-    state_path: &std::path::Path,
-    source_tail: &TailBinding,
-) -> String {
+fn decision_evidence_digest(paper_path: &std::path::Path, state_path: &std::path::Path) -> String {
     let era = paper_era(scan_paper_log(paper_path).unwrap());
     let (_, start) = era.start.as_ref().unwrap();
+    let sealed_source_prefix = era
+        .frames
+        .iter()
+        .find_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => {
+                Some(seal.source_prefix.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
     let state = PaperStateDb::open(state_path).unwrap();
     // Only terminal documents are seal evidence; the post-seal fixture row is still open.
     let rows = state.decision_pending_history().unwrap();
@@ -970,7 +978,7 @@ fn decision_evidence_digest(
         .seal_decision_evidence_for_source_prefix(
             &keys,
             start.source_prefix.last_sequence,
-            source_tail.last_sequence,
+            sealed_source_prefix.last_sequence,
         )
         .unwrap();
     blake3::hash(&evidence).to_hex().to_string()
@@ -1058,7 +1066,7 @@ fn assert_source_preimage_rejected(
         &paper_prefixes,
         target,
     );
-    let digest = decision_evidence_digest(&cloned_paper, &cloned_state, &source.tail);
+    let digest = decision_evidence_digest(&cloned_paper, &cloned_state);
     std::fs::remove_file(&cloned_paper).unwrap();
     let (cloned_seal, _, _) =
         rewrite_paper_for_source(paper_path, &cloned_paper, &source, target, Some(&digest));
