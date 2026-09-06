@@ -174,8 +174,16 @@ async fn run_once(
     ));
     let (trigger_tx, trigger_rx) = mpsc::channel(4);
     let health = new_shared_health_with_ws(false, true, 90);
-    let ingest =
-        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
+    // Production replays the source receipt index from the on-disk log before the ingest starts
+    // (`main.rs`); a restart against a non-empty log must do the same or every synchronized
+    // append is refused as non-contiguous.
+    let source_receipt_millis =
+        pe_service::risk_inputs::SourceReceiptMillisIndex::replay(source_log_path).unwrap();
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
+            .with_source_receipt_millis_index(source_receipt_millis)
+            .run(),
+    );
     let (control_tx, mut control_rx) = mpsc::channel(2);
     let control_paper = paper_state.clone();
     let control_source_log = source_log_path.to_owned();
