@@ -63,9 +63,8 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
-# Keep the credential-bearing libpq URL out of argv and /proc/<pid>/cmdline. PGDATABASE accepts
-# either a database name or a PostgreSQL connection URI, so the existing SUPABASE_DB_URL contract
-# remains unchanged while every caller supplies only non-secret psql options on the command line.
+# Keep the credential-bearing libpq URL out of argv and /proc/<pid>/cmdline; split it into libpq
+# component variables while every caller supplies only non-secret psql options on the command line.
 # libpq does not expand a connection URL placed in PGDATABASE (verified against PostgreSQL 16:
 # it dials the local socket instead). `pg_url_env VARIABLE_NAME` reads the URL from the named
 # environment variable inside the parser itself and prints shell-quoted `export` assignments for
