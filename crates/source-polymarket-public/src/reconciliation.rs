@@ -757,9 +757,13 @@ impl<'de> Deserialize<'de> for ExactDecimal {
     }
 }
 
-/// Fetch and union independently complete `redeemable=false` and `true`
-/// partitions. Partition layout and page provenance are excluded from semantic
-/// equality; duplicate assets across either walk reject the read.
+/// Fetch and union independently complete `redeemable=false` and `true` partitions.
+///
+/// Every accepted row must carry a boolean `negativeRisk`; omission returns
+/// [`PositionReadError::MissingField`] and produces no proof. Partition membership and
+/// `negativeRisk` are semantic because redemption selection and submission consume them.
+/// Page layout, response presentation, and page provenance are non-semantic; duplicate assets
+/// across either walk reject the read.
 pub async fn fetch_complete_positions(
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
@@ -1018,7 +1022,8 @@ mod tests {
                     "asset": "asset-1",
                     "conditionId": format!("0x{}", "88".repeat(32)),
                     "outcomeIndex": 0,
-                    "size": "1.25"
+                    "size": "1.25",
+                    "negativeRisk": false
                 }]))
                 .unwrap())
             })

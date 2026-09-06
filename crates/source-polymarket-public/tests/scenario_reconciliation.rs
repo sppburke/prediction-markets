@@ -153,23 +153,27 @@ fn activity_url(start: Option<i64>, end: i64, offset: u32) -> String {
 async fn one_position_read(
     activity_rows: Vec<Value>,
     position_rows: Vec<Value>,
+    partition: PositionPartition,
 ) -> pe_source_polymarket_public::CompletePositionsRead {
     let activity = verified_mapping(activity_rows);
+    let body = serde_json::to_vec(&position_rows).unwrap();
+    let (not_redeemable, redeemable) = match partition {
+        PositionPartition::NotRedeemable => (body, b"[]".to_vec()),
+        PositionPartition::Redeemable => (b"[]".to_vec(), body),
+    };
     let fetcher = FixtureFetcher::new(HashMap::from([
         (
             position_url(PositionPartition::NotRedeemable, 0),
-            serde_json::to_vec(&position_rows).unwrap(),
+            not_redeemable,
         ),
-        (
-            position_url(PositionPartition::Redeemable, 0),
-            b"[]".to_vec(),
-        ),
+        (position_url(PositionPartition::Redeemable, 0), redeemable),
     ]));
     fetch_complete_positions(&fetcher, BASE, wallet(), &activity)
         .await
         .unwrap()
 }
 
+/// PASS: the captured redeemable row retains exact size, partition, and redemption adapter data.
 #[tokio::test]
 async fn captured_partition_row_uses_exact_size_and_activity_combo_identity() {
     let captured = include_bytes!("fixtures/positions_partition_true_w0_trimmed.json").to_vec();
@@ -209,11 +213,14 @@ async fn captured_partition_row_uses_exact_size_and_activity_combo_identity() {
         PositionClassification::Ordinary,
         "negativeRisk=true in the positions fixture must not define combo identity"
     );
+    assert!(read.positions[0].redeemable);
+    assert!(read.positions[0].neg_risk);
     assert_eq!(read.pages.len(), 2);
 }
 
+/// PASS: response presentation is non-semantic, while redemption partition membership is semantic.
 #[tokio::test]
-async fn partition_layout_and_presentation_do_not_change_semantic_proof() {
+async fn presentation_does_not_change_semantic_proof_but_partition_does() {
     let activity = verified_mapping(vec![activity_row(
         100,
         "0xactivity".to_owned(),
@@ -234,7 +241,7 @@ async fn partition_layout_and_presentation_do_not_change_semantic_proof() {
       {"title":"changed", "cashPnl":-999, "outcomeIndex":0,
        "size":"1.25", "conditionId":"0xcondition0", "asset":"asset-1",
        "proxyWallet":"0xfd9b763674cb096cacec059fcfe60ae82aae09e8",
-       "negativeRisk":false}
+       "negativeRisk":true}
     ]"#
     .to_vec();
     let first = FixtureFetcher::new(HashMap::from([
@@ -247,9 +254,12 @@ async fn partition_layout_and_presentation_do_not_change_semantic_proof() {
     let second = FixtureFetcher::new(HashMap::from([
         (
             position_url(PositionPartition::NotRedeemable, 0),
+            presented.clone(),
+        ),
+        (
+            position_url(PositionPartition::Redeemable, 0),
             b"[]".to_vec(),
         ),
-        (position_url(PositionPartition::Redeemable, 0), presented),
     ]));
     let left = fetch_complete_positions(&first, BASE, wallet(), &activity)
         .await
@@ -260,8 +270,22 @@ async fn partition_layout_and_presentation_do_not_change_semantic_proof() {
     assert!(left.semantically_equal(&right));
     assert_eq!(left.semantic_hash(), right.semantic_hash());
     assert_ne!(left.pages, right.pages);
+
+    let moved = FixtureFetcher::new(HashMap::from([
+        (
+            position_url(PositionPartition::NotRedeemable, 0),
+            b"[]".to_vec(),
+        ),
+        (position_url(PositionPartition::Redeemable, 0), presented),
+    ]));
+    let moved = fetch_complete_positions(&moved, BASE, wallet(), &activity)
+        .await
+        .unwrap();
+    assert!(!left.semantically_equal(&moved));
+    assert_ne!(left.semantic_hash(), moved.semantic_hash());
 }
 
+/// PASS: changing any position field consumed by inventory or redemption changes its proof.
 #[tokio::test]
 async fn every_position_semantic_field_changes_the_proof() {
     let base_activity = activity_row(100, "0xbase".to_owned(), "asset-1".to_owned(), 0);
@@ -271,8 +295,14 @@ async fn every_position_semantic_field_changes_the_proof() {
         "conditionId": "0xcondition0",
         "size": "1.000000",
         "outcomeIndex": 0,
+        "negativeRisk": false,
     });
-    let baseline = one_position_read(vec![base_activity], vec![base_position]).await;
+    let baseline = one_position_read(
+        vec![base_activity],
+        vec![base_position.clone()],
+        PositionPartition::NotRedeemable,
+    )
+    .await;
 
     let mut cases = Vec::new();
     cases.push((
@@ -283,6 +313,7 @@ async fn every_position_semantic_field_changes_the_proof() {
             "conditionId": "0xcondition0",
             "size": "1.000000",
             "outcomeIndex": 0,
+            "negativeRisk": false,
         }),
     ));
     let mut condition_activity =
@@ -296,6 +327,7 @@ async fn every_position_semantic_field_changes_the_proof() {
             "conditionId": "0xchanged-condition",
             "size": "1.000000",
             "outcomeIndex": 0,
+            "negativeRisk": false,
         }),
     ));
     let mut outcome_activity = activity_row(100, "0xoutcome".to_owned(), "asset-1".to_owned(), 1);
@@ -308,6 +340,7 @@ async fn every_position_semantic_field_changes_the_proof() {
             "conditionId": "0xcondition0",
             "size": "1.000000",
             "outcomeIndex": 1,
+            "negativeRisk": false,
         }),
     ));
     let mut combo_activity = activity_row(100, "0xcombo".to_owned(), "asset-1".to_owned(), 0);
@@ -331,16 +364,48 @@ async fn every_position_semantic_field_changes_the_proof() {
             "conditionId": "0xcondition0",
             "size": "2.000000",
             "outcomeIndex": 0,
+            "negativeRisk": false,
+        }),
+    ));
+    cases.push((
+        activity_row(100, "0xneg-risk".to_owned(), "asset-1".to_owned(), 0),
+        json!({
+            "proxyWallet": WALLET,
+            "asset": "asset-1",
+            "conditionId": "0xcondition0",
+            "size": "1.000000",
+            "outcomeIndex": 0,
+            "negativeRisk": true,
         }),
     ));
 
     for (activity, position) in cases {
-        let changed = one_position_read(vec![activity], vec![position]).await;
+        let changed = one_position_read(
+            vec![activity],
+            vec![position],
+            PositionPartition::NotRedeemable,
+        )
+        .await;
         assert!(!baseline.semantically_equal(&changed));
         assert_ne!(baseline.semantic_hash(), changed.semantic_hash());
     }
+
+    let moved = one_position_read(
+        vec![activity_row(
+            100,
+            "0xredeemable".to_owned(),
+            "asset-1".to_owned(),
+            0,
+        )],
+        vec![base_position],
+        PositionPartition::Redeemable,
+    )
+    .await;
+    assert!(!baseline.semantically_equal(&moved));
+    assert_ne!(baseline.semantic_hash(), moved.semantic_hash());
 }
 
+/// PASS: the same asset in both complete partitions is rejected as overlapping inventory.
 #[tokio::test]
 async fn duplicate_asset_across_explicit_partitions_rejects() {
     let activity = verified_mapping(vec![activity_row(
@@ -354,7 +419,8 @@ async fn duplicate_asset_across_explicit_partitions_rejects() {
         "asset": "asset-1",
         "conditionId": "0xcondition0",
         "size": "1",
-        "outcomeIndex": 0
+        "outcomeIndex": 0,
+        "negativeRisk": false
     })])
     .unwrap();
     let fetcher = FixtureFetcher::new(HashMap::from([
@@ -370,6 +436,37 @@ async fn duplicate_asset_across_explicit_partitions_rejects() {
     assert!(matches!(error, PositionReadError::DuplicateAsset { .. }));
 }
 
+/// PASS: an otherwise valid position without `negativeRisk` returns the typed missing-field error.
+#[tokio::test]
+async fn missing_negative_risk_rejects_the_complete_position_read() {
+    let activity = verified_mapping(vec![activity_row(
+        100,
+        "0xactivity".to_owned(),
+        "asset-1".to_owned(),
+        0,
+    )]);
+    let body = serde_json::to_vec(&vec![json!({
+        "proxyWallet": WALLET,
+        "asset": "asset-1",
+        "conditionId": "0xcondition0",
+        "size": "1",
+        "outcomeIndex": 0
+    })])
+    .unwrap();
+    let fetcher = FixtureFetcher::new(HashMap::from([(
+        position_url(PositionPartition::NotRedeemable, 0),
+        body,
+    )]));
+
+    assert!(matches!(
+        fetch_complete_positions(&fetcher, BASE, wallet(), &activity).await,
+        Err(PositionReadError::MissingField {
+            row_index: 0,
+            field: "negativeRisk",
+        })
+    ));
+}
+
 #[tokio::test]
 async fn missing_and_unverified_activity_mapping_rejects() {
     let activity = mapping(Vec::new());
@@ -378,7 +475,8 @@ async fn missing_and_unverified_activity_mapping_rejects() {
         "asset": "asset-1",
         "conditionId": "0xcondition0",
         "size": "1",
-        "outcomeIndex": 0
+        "outcomeIndex": 0,
+        "negativeRisk": false
     })])
     .unwrap();
     let fetcher = FixtureFetcher::new(HashMap::from([(
@@ -401,7 +499,8 @@ async fn missing_and_unverified_activity_mapping_rejects() {
         "asset": "asset-1",
         "conditionId": "0xcondition0",
         "size": "1",
-        "outcomeIndex": 0
+        "outcomeIndex": 0,
+        "negativeRisk": false
     })])
     .unwrap();
     let fetcher = FixtureFetcher::new(HashMap::from([(
@@ -430,7 +529,8 @@ async fn missing_and_unverified_activity_mapping_rejects() {
         "asset": "asset-1",
         "conditionId": "0xcondition0",
         "size": "1",
-        "outcomeIndex": 0
+        "outcomeIndex": 0,
+        "negativeRisk": false
     })])
     .unwrap();
     let fetcher = FixtureFetcher::new(HashMap::from([(
@@ -574,6 +674,7 @@ fn incomplete_split_identity_does_not_override_a_complete_activity_mapping() {
     );
 }
 
+/// PASS: metadata wins over an untrusted position stamp without losing row redemption metadata.
 #[tokio::test]
 async fn metadata_identity_overrides_disagreeing_position_stamp() {
     let mut activity = activity_row(100, "0xactivity".to_owned(), "asset-1".to_owned(), 1);
@@ -585,7 +686,8 @@ async fn metadata_identity_overrides_disagreeing_position_stamp() {
         "asset": "asset-1",
         "conditionId": "0xposition-misstamp",
         "size": "1",
-        "outcomeIndex": 1
+        "outcomeIndex": 1,
+        "negativeRisk": false
     })])
     .unwrap();
     let fetcher = FixtureFetcher::new(HashMap::from([
@@ -622,6 +724,7 @@ async fn metadata_identity_overrides_disagreeing_position_stamp() {
     assert_eq!(read.positions[0].outcome, OutcomeId(0));
 }
 
+/// PASS: invalid exact size and mismatched wallet evidence each fail closed before proof creation.
 #[tokio::test]
 async fn exact_position_precision_and_wallet_identity_fail_closed() {
     let activity = verified_mapping(vec![activity_row(
@@ -643,7 +746,8 @@ async fn exact_position_precision_and_wallet_identity_fail_closed() {
             "asset": "asset-1",
             "conditionId": "0xcondition0",
             "size": size,
-            "outcomeIndex": 0
+            "outcomeIndex": 0,
+            "negativeRisk": false
         })])
         .unwrap();
         let fetcher = FixtureFetcher::new(HashMap::from([(
@@ -660,6 +764,7 @@ async fn exact_position_precision_and_wallet_identity_fail_closed() {
     }
 }
 
+/// PASS: a complete terminal positions page at the documented maximum offset is typed incomplete.
 #[tokio::test]
 async fn saturated_positions_terminal_offset_is_typed_incomplete() {
     let total = 10_500_u32;
@@ -681,6 +786,7 @@ async fn saturated_positions_terminal_offset_is_typed_incomplete() {
                     "conditionId": format!("0xcondition{index}"),
                     "size": "1.000000",
                     "outcomeIndex": 0,
+                    "negativeRisk": false,
                 })
             })
             .collect::<Vec<_>>();
@@ -731,6 +837,7 @@ async fn oversized_activity_and_position_pages_are_typed_incomplete() {
                 "conditionId": format!("0xcondition{index}"),
                 "size": "1.000000",
                 "outcomeIndex": 0,
+                "negativeRisk": false,
             })
         })
         .collect::<Vec<_>>();
