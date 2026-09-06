@@ -1585,6 +1585,13 @@ async fn live_risk_audit(
     let to_bps = |amount| {
         pe_risk_engine::exposure_bps_ceil(amount, baseline).ok_or(RiskInputsUnavailable::Overflow)
     };
+    let latency_owner = RiskHaltOwner::LiveAccount(account.account_id.clone());
+    let latency_era = paper_era(
+        scan_paper_log(&state.config.paper_log_path)
+            .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?,
+    );
+    let latency_seed = crate::risk_inputs::latency_hysteresis_seed(&latency_era, &latency_owner)?;
+    let copy_latency_kill_switch_active = live_latency_switch(&events, now, latency_seed)?;
     let snapshot = RiskSnapshot {
         leader_exposure_bps: to_bps(leader)?,
         market_exposure_bps: to_bps(market)?,
@@ -1595,7 +1602,7 @@ async fn live_risk_audit(
         intraday_pnl_bps: pnl.intraday,
         rolling_7d_pnl_bps: pnl.rolling_7d,
         absolute_pnl_bps: pnl.absolute,
-        copy_latency_kill_switch_active: live_latency_switch(&events, now),
+        copy_latency_kill_switch_active,
         proposed_trade_bps: to_bps(proposed_debit)?,
         per_trade_cap_bps,
         concentration_caps: None,
@@ -1702,47 +1709,12 @@ fn sorted_price_receipts(
     Ok(receipts)
 }
 
-fn live_latency_switch(events: &[LiveJournalEvent], now: OffsetDateTime) -> bool {
-    let latest_completed_hour = now.unix_timestamp().div_euclid(3_600) * 3_600 - 3_600;
-    let mut samples = BTreeMap::<i64, Vec<u64>>::new();
-    for event in events {
-        let LiveJournalPayload::OrderPosted(posted) = &event.payload else {
-            continue;
-        };
-        let RawHttpAttempt::Response(response) = &posted.evidence else {
-            continue;
-        };
-        let hour = response.received_at.unix_timestamp().div_euclid(3_600) * 3_600;
-        if hour > latest_completed_hour {
-            continue;
-        }
-        let elapsed = response.received_at - response.observed_at;
-        if let Ok(value) = u64::try_from(elapsed.whole_milliseconds()) {
-            samples.entry(hour).or_default().push(value);
-        }
-    }
-    let hourly = samples
-        .into_iter()
-        .filter_map(|(hour, values)| {
-            pe_risk_engine::nearest_rank_p95(&values).map(|p95| (hour, p95))
-        })
-        .collect::<Vec<_>>();
-    let mut active = false;
-    let mut previous = None;
-    for (hour, value) in hourly {
-        if active {
-            active = pe_risk_engine::latency_switch(true, None, Some(value));
-        } else {
-            let adjacent = previous.filter(|(prior_hour, _)| *prior_hour == hour - 3_600);
-            active = pe_risk_engine::latency_switch(
-                false,
-                adjacent.map(|(_, prior)| prior),
-                Some(value),
-            );
-        }
-        previous = Some((hour, value));
-    }
-    active
+fn live_latency_switch(
+    events: &[LiveJournalEvent],
+    now: OffsetDateTime,
+    seed: crate::risk_inputs::LatencyHysteresisSeed,
+) -> Result<bool, RiskInputsUnavailable> {
+    crate::risk_inputs::replayed_live_latency_switch(events, now.unix_timestamp(), seed)
 }
 
 fn build_order_identity(
@@ -5212,12 +5184,63 @@ mod tests {
             latency_posted_event(0, 3_601_000, 3_001),
             latency_posted_event(1, 7_201_000, 3_001),
         ];
+        let unseeded = crate::risk_inputs::LatencyHysteresisSeed {
+            active: false,
+            transitioned_at_unix_ms: None,
+        };
         let after_two_hours = OffsetDateTime::from_unix_timestamp(3 * 3_600 + 1).unwrap();
-        assert!(live_latency_switch(&events, after_two_hours));
+        assert!(live_latency_switch(&events, after_two_hours, unseeded).unwrap());
 
         events.push(latency_posted_event(2, 10_801_000, 2_000));
         let after_release_hour = OffsetDateTime::from_unix_timestamp(4 * 3_600 + 1).unwrap();
-        assert!(!live_latency_switch(&events, after_release_hour));
+        assert!(!live_latency_switch(&events, after_release_hour, unseeded).unwrap());
+    }
+
+    /// PASS: a synchronized manual release checkpoints the old high pair, so the first pass and
+    /// first new high hour stay released; only a second adjacent post-release high hour re-engages.
+    #[test]
+    fn live_post_latency_release_survives_restart_without_old_pair_reengagement() {
+        let mut events = vec![
+            latency_posted_event(0, 3_601_000, 3_001),
+            latency_posted_event(1, 7_201_000, 3_001),
+        ];
+        let owner = RiskHaltOwner::LiveAccount(AccountId::new("latency-account").unwrap());
+        let released_at = OffsetDateTime::from_unix_timestamp(7_202).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let paper_log = dir.path().join("paper.log");
+        let mut writer = pe_event_log::Writer::open(&paper_log).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION_V2,
+                parser_version: 1,
+                observed_at: SourceTimestamp(released_at),
+                received_at: ReceivedAt(released_at),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(
+                    &crate::paper_recovery::PaperLogRecord::RiskHaltChanged {
+                        owner: owner.clone(),
+                        cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                        state: HaltState::Released,
+                        evidence: serde_json::json!({}),
+                    },
+                )
+                .unwrap(),
+            })
+            .unwrap();
+        drop(writer);
+        let restarted_era = paper_era(scan_paper_log(&paper_log).unwrap());
+        let released = crate::risk_inputs::latency_hysteresis_seed(&restarted_era, &owner).unwrap();
+        let first_post_release_pass = OffsetDateTime::from_unix_timestamp(3 * 3_600 + 1).unwrap();
+        assert!(!live_latency_switch(&events, first_post_release_pass, released).unwrap());
+
+        events.push(latency_posted_event(2, 10_801_000, 3_001));
+        let after_one_new_hour = OffsetDateTime::from_unix_timestamp(4 * 3_600 + 1).unwrap();
+        assert!(!live_latency_switch(&events, after_one_new_hour, released).unwrap());
+
+        events.push(latency_posted_event(3, 14_401_000, 3_001));
+        let after_two_new_hours = OffsetDateTime::from_unix_timestamp(5 * 3_600 + 1).unwrap();
+        assert!(live_latency_switch(&events, after_two_new_hours, released).unwrap());
     }
 
     /// PASS: live risk evidence is sequence-sorted, deduplicates one receipt shared by outcomes,

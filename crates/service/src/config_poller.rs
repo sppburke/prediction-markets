@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use crate::health::SharedHealth;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{HaltState, active_risk_halts, paper_era, scan_paper_log};
-use crate::risk_inputs::{audited_halt_release, paper_latency_samples};
+use crate::risk_inputs::{audited_halt_release, live_latency_samples, paper_latency_samples};
 use crate::runtime_config::{
     AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RISK_HALT_RELEASE_HASH_KEY,
     RuntimeConfigStatus, WatchlistCapacityEpoch, parse_config,
@@ -168,6 +168,7 @@ pub enum ConfigPollError {
 pub struct RiskHaltReleaseHandle {
     paper_log_path: PathBuf,
     source_log_path: PathBuf,
+    live_journal_path: PathBuf,
     control: mpsc::Sender<OrchestratorControl>,
 }
 
@@ -208,9 +209,15 @@ impl RiskHaltReleaseHandle {
         source_log_path: PathBuf,
         control: mpsc::Sender<OrchestratorControl>,
     ) -> Self {
+        let live_journal_path = paper_log_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("live_journal.log");
         Self {
             paper_log_path,
             source_log_path,
+            live_journal_path,
             control,
         }
     }
@@ -219,16 +226,45 @@ impl RiskHaltReleaseHandle {
         let era =
             paper_era(scan_paper_log(&self.paper_log_path).map_err(|error| error.to_string())?);
         let active = active_risk_halts(&era);
-        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-        let latest_latency_p95_ms = paper_latency_samples(&era, &self.source_log_path, now_unix)
-            .map_err(|error| format!("derive release latency evidence: {error}"))?
-            .latest
-            .p95_ms;
-        let Some(release) =
-            audited_halt_release(&era, &active, release_hash, latest_latency_p95_ms)
-        else {
+        let Some(release) = audited_halt_release(&era, &active, release_hash) else {
             return Ok(());
         };
+        let latest_latency_p95_ms = if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency {
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            owner_latest_latency_p95(
+                &release.owner,
+                || {
+                    paper_latency_samples(&era, &self.source_log_path, now_unix)
+                        .map(|samples| samples.latest.p95_ms)
+                        .map_err(|error| format!("derive paper release latency evidence: {error}"))
+                },
+                |account_id| {
+                    let mut events =
+                        pe_execution_core::replay_account(&self.live_journal_path, account_id)
+                            .map_err(|error| {
+                                format!("derive live release latency evidence: {error}")
+                            })?;
+                    if let Some((_, start)) = &era.start {
+                        events.retain(|event| {
+                            start
+                                .live_prefix
+                                .last_sequence
+                                .is_none_or(|last| event.seq > last.0)
+                        });
+                    }
+                    live_latency_samples(&events, now_unix)
+                        .map(|samples| samples.latest.p95_ms)
+                        .map_err(|error| format!("derive live release latency evidence: {error}"))
+                },
+            )?
+        } else {
+            None
+        };
+        if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency
+            && latest_latency_p95_ms.is_some()
+        {
+            return Ok(());
+        }
         let (acknowledged, response) = tokio::sync::oneshot::channel();
         self.control
             .send(OrchestratorControl::RiskHaltChange {
@@ -248,6 +284,21 @@ impl RiskHaltReleaseHandle {
             .await
             .map_err(|_| "orchestrator dropped risk release acknowledgement".to_owned())?
             .map(|_| ())
+    }
+}
+
+fn owner_latest_latency_p95<Paper, Live>(
+    owner: &crate::paper_recovery::RiskHaltOwner,
+    paper: Paper,
+    live: Live,
+) -> Result<Option<u64>, String>
+where
+    Paper: FnOnce() -> Result<Option<u64>, String>,
+    Live: FnOnce(&pe_core_types::AccountId) -> Result<Option<u64>, String>,
+{
+    match owner {
+        crate::paper_recovery::RiskHaltOwner::Paper => paper(),
+        crate::paper_recovery::RiskHaltOwner::LiveAccount(account_id) => live(account_id),
     }
 }
 
@@ -775,6 +826,35 @@ mod tests {
                 .is_ok()
             );
         }
+    }
+
+    /// PASS: paper and live latency evidence are selected only after the matched owner is known;
+    /// a sampled live owner cannot borrow paper starvation, and a starved live owner ignores a
+    /// populated paper hour.
+    #[test]
+    fn latency_release_evidence_is_owner_local_including_starved_live() {
+        let live_owner = crate::paper_recovery::RiskHaltOwner::LiveAccount(
+            pe_core_types::AccountId::new("live-a").unwrap(),
+        );
+        assert_eq!(
+            owner_latest_latency_p95(&live_owner, || Ok(None), |_| Ok(Some(3_001))),
+            Ok(Some(3_001)),
+            "live evidence wins when paper is starved"
+        );
+        assert_eq!(
+            owner_latest_latency_p95(&live_owner, || Ok(Some(3_001)), |_| Ok(None)),
+            Ok(None),
+            "starved live release ignores populated paper evidence"
+        );
+        assert_eq!(
+            owner_latest_latency_p95(
+                &crate::paper_recovery::RiskHaltOwner::Paper,
+                || Ok(Some(1_000)),
+                |_| Ok(Some(3_001)),
+            ),
+            Ok(Some(1_000)),
+            "paper evidence is independent of live disagreement"
+        );
     }
 
     #[tokio::test]

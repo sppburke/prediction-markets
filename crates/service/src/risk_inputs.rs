@@ -105,15 +105,14 @@ pub struct AuditedHaltRelease {
     pub engaged_receipt: AppendReceipt,
 }
 
-/// Match an incident-row hash only to its own currently active absolute-loss cause, or to a
-/// latency cause whose latest completed hour is unavailable. Stale, already-consumed,
-/// mismatched-cause, non-starved latency, and unknown hashes produce `None`.
+/// Match an incident-row hash only to its own currently active absolute-loss or latency cause.
+/// The caller resolves owner-local latency evidence only after this match identifies the owner.
+/// Stale, already-consumed, mismatched-cause, and unknown hashes produce `None`.
 #[must_use]
 pub fn audited_halt_release(
     era: &PaperEra,
     active: &HashSet<(RiskHaltOwner, RiskHaltCause)>,
     release_hash: &str,
-    latest_latency_p95_ms: Option<u64>,
 ) -> Option<AuditedHaltRelease> {
     era.frames.iter().enumerate().find_map(|(index, frame)| {
         if frame.receipt.this_hash.to_hex().as_str() != release_hash {
@@ -132,7 +131,6 @@ pub fn audited_halt_release(
             cause,
             RiskHaltCause::AbsoluteLoss | RiskHaltCause::CopyLatency
         ) || !active.contains(&(owner.clone(), *cause))
-            || (*cause == RiskHaltCause::CopyLatency && latest_latency_p95_ms.is_some())
             || era.frames[index.saturating_add(1)..]
                 .iter()
                 .any(|later| match &later.frame {
@@ -397,6 +395,53 @@ impl LatencySamples {
     }
 }
 
+/// Replayed owner/cause state from which live latency hysteresis resumes.
+///
+/// A synchronized risk-halt transition is a cross-log checkpoint: order responses at or before
+/// it have already contributed to the recorded state and must not be folded through it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LatencyHysteresisSeed {
+    pub active: bool,
+    pub transitioned_at_unix_ms: Option<i64>,
+}
+
+/// Rebuild the latest synchronized live-owner latency transition from the financial-era log.
+pub(crate) fn latency_hysteresis_seed(
+    era: &PaperEra,
+    owner: &RiskHaltOwner,
+) -> Result<LatencyHysteresisSeed, RiskInputsUnavailable> {
+    let transition = era.frames.iter().rev().find_map(|frame| {
+        let PaperLogFrame::Record(PaperLogRecord::RiskHaltChanged {
+            owner: recorded_owner,
+            cause: RiskHaltCause::CopyLatency,
+            state,
+            ..
+        }) = &frame.frame
+        else {
+            return None;
+        };
+        (recorded_owner == owner).then_some((frame, *state))
+    });
+    let Some((frame, state)) = transition else {
+        return Ok(LatencyHysteresisSeed {
+            active: false,
+            transitioned_at_unix_ms: None,
+        });
+    };
+    let transitioned_at_unix_ms = frame
+        .envelope
+        .received_at
+        .0
+        .unix_timestamp_nanos()
+        .checked_div(1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    Ok(LatencyHysteresisSeed {
+        active: state == HaltState::Engaged,
+        transitioned_at_unix_ms: Some(transitioned_at_unix_ms),
+    })
+}
+
 /// Derive paper latency from each Fill Final envelope's `received_at` minus its Prepared
 /// observation timestamp. Completion belongs to the hour containing the Final endpoint.
 pub fn paper_latency_samples(
@@ -419,6 +464,101 @@ pub fn paper_latency_samples(
         previous: latency_hour(&all_samples, previous_start)?,
         latest: latency_hour(&all_samples, latest_start)?,
     })
+}
+
+/// Derive the last two completed owner-local live latency hours from successful transports.
+pub(crate) fn live_latency_samples(
+    events: &[pe_execution_core::LiveJournalEvent],
+    now_unix: i64,
+) -> Result<LatencySamples, RiskInputsUnavailable> {
+    let latest_end = now_unix
+        .div_euclid(SECONDS_PER_HOUR)
+        .checked_mul(SECONDS_PER_HOUR)
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let latest_start = latest_end
+        .checked_sub(SECONDS_PER_HOUR)
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let previous_start = latest_start
+        .checked_sub(SECONDS_PER_HOUR)
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let all_samples = live_latency_endpoint_samples(events, None)?;
+    Ok(LatencySamples {
+        previous: latency_hour(&all_samples, previous_start)?,
+        latest: latency_hour(&all_samples, latest_start)?,
+    })
+}
+
+/// Fold owner-local live latency forward from its last synchronized halt transition.
+pub(crate) fn replayed_live_latency_switch(
+    events: &[pe_execution_core::LiveJournalEvent],
+    now_unix: i64,
+    seed: LatencyHysteresisSeed,
+) -> Result<bool, RiskInputsUnavailable> {
+    let latest_completed_hour = now_unix
+        .div_euclid(SECONDS_PER_HOUR)
+        .checked_mul(SECONDS_PER_HOUR)
+        .and_then(|value| value.checked_sub(SECONDS_PER_HOUR))
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let samples = live_latency_endpoint_samples(events, seed.transitioned_at_unix_ms)?;
+    let hourly = samples
+        .into_iter()
+        .filter(|(endpoint, _)| {
+            endpoint.div_euclid(SECONDS_PER_HOUR) * SECONDS_PER_HOUR <= latest_completed_hour
+        })
+        .fold(
+            BTreeMap::<i64, Vec<u64>>::new(),
+            |mut by_hour, (endpoint, value)| {
+                let hour = endpoint.div_euclid(SECONDS_PER_HOUR) * SECONDS_PER_HOUR;
+                by_hour.entry(hour).or_default().push(value);
+                by_hour
+            },
+        )
+        .into_iter()
+        .filter_map(|(hour, values)| nearest_rank_p95(&values).map(|p95| (hour, p95)));
+
+    let mut active = seed.active;
+    let mut previous = None;
+    for (hour, value) in hourly {
+        if active {
+            active = latency_switch(true, None, Some(value));
+        } else {
+            let adjacent =
+                previous.filter(|(prior_hour, _)| *prior_hour == hour - SECONDS_PER_HOUR);
+            active = latency_switch(false, adjacent.map(|(_, prior)| prior), Some(value));
+        }
+        previous = Some((hour, value));
+    }
+    Ok(active)
+}
+
+fn live_latency_endpoint_samples(
+    events: &[pe_execution_core::LiveJournalEvent],
+    after_unix_ms: Option<i64>,
+) -> Result<Vec<(i64, u64)>, RiskInputsUnavailable> {
+    let mut samples = Vec::new();
+    for event in events {
+        let pe_execution_core::LiveJournalPayload::OrderPosted(posted) = &event.payload else {
+            continue;
+        };
+        let pe_core_types::RawHttpAttempt::Response(response) = &posted.evidence else {
+            continue;
+        };
+        let endpoint_ms = response
+            .received_at
+            .unix_timestamp_nanos()
+            .checked_div(1_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(RiskInputsUnavailable::Overflow)?;
+        if after_unix_ms.is_some_and(|checkpoint| endpoint_ms <= checkpoint) {
+            continue;
+        }
+        let latency_ms = (response.received_at - response.observed_at)
+            .whole_milliseconds()
+            .try_into()
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        samples.push((response.received_at.unix_timestamp(), latency_ms));
+    }
+    Ok(samples)
 }
 
 fn latency_hour(
@@ -884,62 +1024,93 @@ mod tests {
         };
         let active = active_risk_halts(&era);
         assert!(
-            audited_halt_release(
-                &era,
-                &active,
-                stale.receipt.this_hash.to_hex().as_str(),
-                None,
-            )
-            .is_none()
+            audited_halt_release(&era, &active, stale.receipt.this_hash.to_hex().as_str())
+                .is_none()
         );
         assert!(
-            audited_halt_release(
-                &era,
-                &active,
-                intraday.receipt.this_hash.to_hex().as_str(),
-                None,
-            )
-            .is_none()
+            audited_halt_release(&era, &active, intraday.receipt.this_hash.to_hex().as_str())
+                .is_none()
         );
         assert!(
-            audited_halt_release(
-                &era,
-                &active,
-                absolute.receipt.this_hash.to_hex().as_str(),
-                None,
-            )
-            .is_none()
+            audited_halt_release(&era, &active, absolute.receipt.this_hash.to_hex().as_str())
+                .is_none()
         );
         assert_eq!(
             audited_halt_release(
                 &era,
                 &active,
                 newer_absolute.receipt.this_hash.to_hex().as_str(),
-                Some(2_500),
             )
             .unwrap()
             .cause,
             RiskHaltCause::AbsoluteLoss
         );
-        assert!(
-            audited_halt_release(
-                &era,
-                &active,
-                starved_latency.receipt.this_hash.to_hex().as_str(),
-                Some(2_500),
-            )
-            .is_none()
-        );
-        assert_eq!(
-            audited_halt_release(
-                &era,
-                &active,
-                starved_latency.receipt.this_hash.to_hex().as_str(),
-                None,
-            )
-            .unwrap()
-            .cause,
-            RiskHaltCause::CopyLatency
-        );
+        let latency_release = audited_halt_release(
+            &era,
+            &active,
+            starved_latency.receipt.this_hash.to_hex().as_str(),
+        )
+        .unwrap();
+        assert_eq!(latency_release.cause, RiskHaltCause::CopyLatency);
+        assert_eq!(latency_release.owner, account());
+    }
+
+    /// PASS: restart reconstructs the latest synchronized latency checkpoint independently for
+    /// each owner and ignores later transitions for other causes.
+    #[test]
+    fn latency_hysteresis_seed_replays_latest_owner_cause_transition() {
+        let owner = account();
+        let other = RiskHaltOwner::LiveAccount(AccountId::new("live-b").unwrap());
+        let era = PaperEra {
+            start: None,
+            frames: vec![
+                frame(
+                    1,
+                    7_200,
+                    PaperLogRecord::RiskHaltChanged {
+                        owner: owner.clone(),
+                        cause: RiskHaltCause::CopyLatency,
+                        state: HaltState::Engaged,
+                        evidence: serde_json::json!({}),
+                    },
+                ),
+                frame(
+                    2,
+                    7_201,
+                    PaperLogRecord::RiskHaltChanged {
+                        owner: other,
+                        cause: RiskHaltCause::CopyLatency,
+                        state: HaltState::Released,
+                        evidence: serde_json::json!({}),
+                    },
+                ),
+                frame(
+                    3,
+                    7_202,
+                    PaperLogRecord::RiskHaltChanged {
+                        owner: owner.clone(),
+                        cause: RiskHaltCause::CopyLatency,
+                        state: HaltState::Released,
+                        evidence: serde_json::json!({}),
+                    },
+                ),
+                frame(
+                    4,
+                    7_203,
+                    PaperLogRecord::RiskHaltChanged {
+                        owner: owner.clone(),
+                        cause: RiskHaltCause::AbsoluteLoss,
+                        state: HaltState::Engaged,
+                        evidence: serde_json::json!({}),
+                    },
+                ),
+            ],
+        };
+        let expected = LatencyHysteresisSeed {
+            active: false,
+            transitioned_at_unix_ms: Some(7_202_000),
+        };
+        assert_eq!(latency_hysteresis_seed(&era, &owner).unwrap(), expected);
+        assert_eq!(latency_hysteresis_seed(&era, &owner).unwrap(), expected);
     }
 }
