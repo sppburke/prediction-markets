@@ -221,16 +221,18 @@ pub struct OrchestratorConfig {
     pub watchlist_writer_lock: Option<Arc<Mutex<()>>>,
 }
 
-/// Scenario-only deterministic seams (#546): fixed admission-clock instants consumed in
-/// order by each copy-budget check, and one-shot faults immediately before the two durable
-/// writes whose rollback the fan-in acceptance suite must prove. Compiled only with the
-/// `scenario` feature; production has no clock injection and no fault path.
+/// Scenario-only deterministic seams (#546): fixed admission-clock instants and historical mark
+/// results consumed in order, plus one-shot faults immediately before the two durable writes whose
+/// rollback the fan-in acceptance suite must prove. Compiled only with the `scenario` feature;
+/// production has no clock/result injection and no fault path.
 #[cfg(feature = "scenario")]
 #[derive(Debug, Default)]
 pub struct ScenarioHooks {
     pub age_clock: std::sync::Mutex<std::collections::VecDeque<OffsetDateTime>>,
     pub admission_artifacts:
         std::sync::Mutex<std::collections::VecDeque<pe_execution_core::LiveAdmissionArtifact>>,
+    pub boundary_mark_prices:
+        std::sync::Mutex<std::collections::VecDeque<crate::risk_inputs::HistoricalMarkPrice>>,
     pub financial_clock_unix: std::sync::atomic::AtomicI64,
     pub fail_next_stage_seed: std::sync::atomic::AtomicBool,
     pub fail_next_no_copy_commit: std::sync::atomic::AtomicBool,
@@ -1093,7 +1095,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 });
                 continue;
             };
-            match mark_fetcher.fetch(token_id, cutoff_unix).await {
+            #[cfg(feature = "scenario")]
+            let scenario_mark = self
+                .scenario_hooks
+                .as_ref()
+                .and_then(|hooks| hooks.boundary_mark_prices.lock().ok()?.pop_front());
+            #[cfg(not(feature = "scenario"))]
+            let scenario_mark = None;
+            let fetched = match scenario_mark {
+                Some(mark) => Ok(mark),
+                None => mark_fetcher.fetch(token_id, cutoff_unix).await,
+            };
+            match fetched {
                 Ok(mark) => {
                     let net = position.long.checked_sub(position.short).map_err(|_| {
                         "daily boundary encountered a net-short paper position".to_owned()

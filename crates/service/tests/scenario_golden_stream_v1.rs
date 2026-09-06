@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 
 use pe_copy_signal_engine::SignalConfig;
 use pe_core_types::{
-    AccountId, BasisPoints, CollateralAmount, EventSeq, OutcomeId, PolymarketConditionId,
+    AccountId, BasisPoints, CollateralAmount, EventSeq, OutcomeId, PolymarketConditionId, Price,
     ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Scanner, Writer};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Scanner, Writer};
 use pe_execution_core::{
     AdmissionReceipts, CredentialBindingIdentity, EconomicPrepared, FrozenLiveTarget,
     LiveAdmissionArtifact, LiveControlMode, LiveExecutor, LiveJournal, LiveModeSnapshot,
@@ -36,11 +36,9 @@ use pe_resolver_card::{
 };
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
-use pe_service::bucket_commit::{
-    BucketDecisionContext, DecisionContinuationError, DecisionContinuationV3, PageOccurrence,
-};
+use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext, PageOccurrence};
 use pe_service::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
-use pe_service::decision_replay::replay_decision_pending;
+use pe_service::decision_replay::{DecisionPostBoundaryEvidence, replay_decision_pending};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_venue_adapter::LiveAdmissionBuilder;
@@ -51,15 +49,16 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{
     CanonicalFillResult, CanonicalResolutionResult, FINANCIAL_SEMANTIC_VERSION,
-    PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, QualificationStarted, SealReason,
-    TailBinding, paper_era, scan_paper_log,
+    PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, SealReason, TailBinding, paper_era,
+    scan_paper_log,
 };
 use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
 use pe_service::qualification::{
-    QualificationReport, QualificationVerdict, qualification_completion,
+    FinancialEraCommand, FinancialEraManifest, FinancialEraPaths, FinancialEraPreparation,
+    QualificationReport, QualificationVerdict, qualification_completion, run_financial_era,
 };
 use pe_service::risk_inputs::SourceReceiptMillisIndex;
-use pe_service::runtime_config::RuntimeConfig;
+use pe_service::runtime_config::{ConfigRow, RuntimeConfig};
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::supabase_sink::SupabaseFillRow;
 use pe_service::supabase_state::{
@@ -136,57 +135,26 @@ async fn append_source_at(
         .unwrap()
 }
 
-fn append_source_direct(
+fn append_qualification_start(
     writer: &mut Writer,
-    source_id: &str,
-    payload: &[u8],
-    received_at_unix: i64,
-) -> AppendReceipt {
-    let timestamp = OffsetDateTime::from_unix_timestamp(received_at_unix).unwrap();
-    let version = if source_id == "polymarket.clob.market" {
-        CLOB_RESOLUTION_SCHEMA_VERSION
-    } else if matches!(
-        source_id,
-        "polymarket-activity-ws" | "polymarket-public.activity-reconciliation"
-    ) {
-        2
-    } else {
-        1
-    };
-    writer
-        .append_synced(EnvelopeIn {
-            source_id: SourceId(source_id.to_owned()),
-            schema_version: version,
-            parser_version: version,
-            observed_at: SourceTimestamp(timestamp),
-            received_at: ReceivedAt(timestamp),
-            content_type: ContentType::Json,
-            payload: payload.to_vec(),
-        })
-        .unwrap()
-}
-
-fn append_paper_record(
-    writer: &mut Writer,
-    record: &PaperLogRecord,
+    start: &pe_service::paper_recovery::QualificationStarted,
     received_at_unix: i64,
 ) -> AppendReceipt {
     let timestamp = OffsetDateTime::from_unix_timestamp(received_at_unix).unwrap();
     writer
         .append_synced(EnvelopeIn {
-            source_id: SourceId("pe-service.paper".to_owned()),
+            source_id: SourceId("pe-service.qualification".to_owned()),
             schema_version: PAPER_LOG_SCHEMA_VERSION,
-            parser_version: 1,
+            parser_version: start.parser_version,
             observed_at: SourceTimestamp(timestamp),
             received_at: ReceivedAt(timestamp),
             content_type: ContentType::Json,
-            payload: serde_json::to_vec(record).unwrap(),
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+                start.clone(),
+            )))
+            .unwrap(),
         })
         .unwrap()
-}
-
-fn empty_tail(path: &std::path::Path) -> TailBinding {
-    TailBinding::from(&Scanner::verify(path).unwrap())
 }
 
 fn golden_source_unix(anchor_cutoff: i64, index: usize) -> i64 {
@@ -221,6 +189,15 @@ struct GoldenAdmissionBodies<'a> {
     clob: &'a [u8],
     compact: &'a [u8],
     book: &'a [u8],
+}
+
+struct GoldenRecordedTrade {
+    bodies: GoldenTradeBodies,
+    websocket_receipt: AppendReceipt,
+    page_receipt: AppendReceipt,
+    admission: LiveAdmissionArtifact,
+    book: OrderBook,
+    resolution_receipt: AppendReceipt,
 }
 
 fn golden_trade_bodies(index: usize, source_unix: i64) -> GoldenTradeBodies {
@@ -714,6 +691,700 @@ fn run_qualify_cli(
         .unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum PreimageMutation {
+    Delete,
+    Tamper,
+}
+
+impl PreimageMutation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Delete => "deleted",
+            Self::Tamper => "tampered",
+        }
+    }
+}
+
+type ReceiptMap = HashMap<(u64, String), AppendReceipt>;
+type PrefixMap = HashMap<(u64, String), TailBinding>;
+
+struct RewrittenSource {
+    tail: TailBinding,
+    receipts: ReceiptMap,
+    prefixes: PrefixMap,
+}
+
+fn receipt_map_key(receipt: AppendReceipt) -> (u64, String) {
+    (receipt.sequence.0, receipt.this_hash.to_hex().to_string())
+}
+
+fn rewrite_source_preimage(
+    source_path: &std::path::Path,
+    destination: &std::path::Path,
+    target: AppendReceipt,
+    mutation: PreimageMutation,
+) -> RewrittenSource {
+    let mut writer = Writer::open(destination).unwrap();
+    let mut found = false;
+    let mut receipts = ReceiptMap::new();
+    let mut prefixes = PrefixMap::new();
+    for item in Reader::replay(source_path).unwrap() {
+        let (_, envelope) = item.unwrap();
+        let original_receipt = AppendReceipt {
+            sequence: envelope.seq,
+            this_hash: envelope.this_hash,
+        };
+        let mut payload = envelope.payload;
+        if envelope.seq == target.sequence {
+            assert_eq!(envelope.this_hash, target.this_hash);
+            found = true;
+            match mutation {
+                PreimageMutation::Delete => payload.clear(),
+                PreimageMutation::Tamper => {
+                    let byte = payload.last_mut().unwrap();
+                    *byte ^= 1;
+                }
+            }
+        }
+        let rewritten_receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: envelope.source_id,
+                schema_version: envelope.schema_version,
+                parser_version: envelope.parser_version,
+                observed_at: envelope.observed_at,
+                received_at: envelope.received_at,
+                content_type: envelope.content_type,
+                payload,
+            })
+            .unwrap();
+        let physical_tail = std::fs::metadata(destination).unwrap().len();
+        receipts.insert(receipt_map_key(original_receipt), rewritten_receipt);
+        prefixes.insert(
+            receipt_map_key(original_receipt),
+            TailBinding {
+                physical_tail,
+                last_sequence: Some(rewritten_receipt.sequence),
+                last_hash: rewritten_receipt.this_hash.to_hex().to_string(),
+            },
+        );
+    }
+    assert!(found);
+    drop(writer);
+    RewrittenSource {
+        tail: TailBinding::from(&Scanner::verify(destination).unwrap()),
+        receipts,
+        prefixes,
+    }
+}
+
+fn remap_receipts(
+    value: &mut serde_json::Value,
+    receipt_maps: &[&ReceiptMap],
+    prefix_maps: &[&PrefixMap],
+    preserved_source_receipt: Option<AppendReceipt>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remap_receipts(value, receipt_maps, prefix_maps, preserved_source_receipt);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object.len() == 2
+                && object.contains_key("sequence")
+                && object.contains_key("this_hash")
+            {
+                let receipt: AppendReceipt =
+                    serde_json::from_value(serde_json::Value::Object(object.clone())).unwrap();
+                if Some(receipt) != preserved_source_receipt {
+                    let key = receipt_map_key(receipt);
+                    if let Some(rewritten) = receipt_maps.iter().find_map(|map| map.get(&key)) {
+                        *value = serde_json::to_value(rewritten).unwrap();
+                    }
+                }
+                return;
+            }
+            if object.len() == 3
+                && object.contains_key("physical_tail")
+                && object.contains_key("last_sequence")
+                && object.contains_key("last_hash")
+            {
+                let binding: TailBinding =
+                    serde_json::from_value(serde_json::Value::Object(object.clone())).unwrap();
+                if let Some(sequence) = binding.last_sequence {
+                    let key = (sequence.0, binding.last_hash);
+                    if let Some(rewritten) = prefix_maps.iter().find_map(|map| map.get(&key)) {
+                        *value = serde_json::to_value(rewritten).unwrap();
+                    }
+                }
+                return;
+            }
+            for nested in object.values_mut() {
+                remap_receipts(nested, receipt_maps, prefix_maps, preserved_source_receipt);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_paper_for_source(
+    paper_path: &std::path::Path,
+    destination: &std::path::Path,
+    source: &RewrittenSource,
+    preserved_source_receipt: AppendReceipt,
+    decision_evidence_digest: Option<&str>,
+) -> (AppendReceipt, ReceiptMap, PrefixMap) {
+    let mut writer = Writer::open(destination).unwrap();
+    let mut seal_receipt = None;
+    let mut receipts = ReceiptMap::new();
+    let mut prefixes = PrefixMap::new();
+    let mut previous_binding = None;
+    for item in Reader::replay(paper_path).unwrap() {
+        let (_, envelope) = item.unwrap();
+        let original_receipt = AppendReceipt {
+            sequence: envelope.seq,
+            this_hash: envelope.this_hash,
+        };
+        let mut record_value: serde_json::Value =
+            serde_json::from_slice(&envelope.payload).unwrap();
+        remap_receipts(
+            &mut record_value,
+            &[&source.receipts, &receipts],
+            &[&source.prefixes, &prefixes],
+            Some(preserved_source_receipt),
+        );
+        let mut record: PaperLogRecord = serde_json::from_value(record_value).unwrap();
+        if let PaperLogRecord::QualificationSealed(seal) = &mut record {
+            seal.source_prefix = source.tail.clone();
+            seal.financial_prefix = previous_binding.clone().unwrap();
+            if let Some(digest) = decision_evidence_digest {
+                seal.decision_evidence_digest = digest.to_owned();
+            }
+        }
+        let is_seal = matches!(record, PaperLogRecord::QualificationSealed(_));
+        let receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: envelope.source_id,
+                schema_version: envelope.schema_version,
+                parser_version: envelope.parser_version,
+                observed_at: envelope.observed_at,
+                received_at: envelope.received_at,
+                content_type: envelope.content_type,
+                payload: serde_json::to_vec(&record).unwrap(),
+            })
+            .unwrap();
+        let binding = TailBinding {
+            physical_tail: std::fs::metadata(destination).unwrap().len(),
+            last_sequence: Some(receipt.sequence),
+            last_hash: receipt.this_hash.to_hex().to_string(),
+        };
+        receipts.insert(receipt_map_key(original_receipt), receipt);
+        prefixes.insert(receipt_map_key(original_receipt), binding.clone());
+        previous_binding = Some(binding);
+        if is_seal {
+            seal_receipt = Some(receipt);
+        }
+    }
+    (seal_receipt.unwrap(), receipts, prefixes)
+}
+
+fn rewrite_state_receipts(
+    state_path: &std::path::Path,
+    source_receipts: &ReceiptMap,
+    paper_receipts: &ReceiptMap,
+    source_prefixes: &PrefixMap,
+    paper_prefixes: &PrefixMap,
+    preserved_source_receipt: AppendReceipt,
+) {
+    let connection = rusqlite::Connection::open(state_path).unwrap();
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT source_trade_id, frozen_inputs_json, post_commit_inputs_json \
+                 FROM decision_pending",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for (source_trade_id, frozen, post_commit) in rows {
+        let mut frozen: serde_json::Value = serde_json::from_str(&frozen).unwrap();
+        let mut post_commit: serde_json::Value = serde_json::from_str(&post_commit).unwrap();
+        for value in [&mut frozen, &mut post_commit] {
+            remap_receipts(
+                value,
+                &[source_receipts, paper_receipts],
+                &[source_prefixes, paper_prefixes],
+                Some(preserved_source_receipt),
+            );
+        }
+        let post_commit_evidence: DecisionPostBoundaryEvidence =
+            serde_json::from_value(post_commit).unwrap();
+        let post_commit = serde_json::to_value(
+            DecisionPostBoundaryEvidence::from_body(post_commit_evidence.body).unwrap(),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "UPDATE decision_pending SET frozen_inputs_json = ?2, \
+                 post_commit_inputs_json = ?3 WHERE source_trade_id = ?1",
+                rusqlite::params![
+                    source_trade_id,
+                    serde_json::to_string(&frozen).unwrap(),
+                    serde_json::to_string(&post_commit).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+}
+
+fn decision_evidence_digest(
+    paper_path: &std::path::Path,
+    state_path: &std::path::Path,
+    source_tail: &TailBinding,
+) -> String {
+    let era = paper_era(scan_paper_log(paper_path).unwrap());
+    let (_, start) = era.start.as_ref().unwrap();
+    let state = PaperStateDb::open(state_path).unwrap();
+    let rows = state.decision_pending_history().unwrap();
+    let keys = rows
+        .into_iter()
+        .map(|row| (row.source_trade_id, row.semantic_revision))
+        .collect::<Vec<_>>();
+    let evidence = state
+        .seal_decision_evidence_for_source_prefix(
+            &keys,
+            start.source_prefix.last_sequence,
+            source_tail.last_sequence,
+        )
+        .unwrap();
+    blake3::hash(&evidence).to_hex().to_string()
+}
+
+fn assert_qualify_insufficient(
+    paper_path: &std::path::Path,
+    source_path: &std::path::Path,
+    state_path: &std::path::Path,
+    seal_receipt: AppendReceipt,
+    output_path: &std::path::Path,
+    expected_reason: &str,
+) {
+    let output = run_qualify_cli(
+        paper_path,
+        source_path,
+        state_path,
+        seal_receipt,
+        output_path,
+    );
+    assert!(
+        output.status.success(),
+        "pe-service --qualify stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("verdict=InsufficientEvidence"));
+    let report: QualificationReport =
+        serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(report.verdict, QualificationVerdict::InsufficientEvidence);
+    assert!(!report.replay.exact);
+    assert_eq!(
+        report.reasons,
+        [format!(
+            "insufficient qualification evidence: {expected_reason}"
+        )]
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_source_preimage_rejected(
+    root: &std::path::Path,
+    class: &str,
+    mutation: PreimageMutation,
+    paper_path: &std::path::Path,
+    source_path: &std::path::Path,
+    state_path: &std::path::Path,
+    live_path: &std::path::Path,
+    target: AppendReceipt,
+    expected_reason: &str,
+) {
+    let case = root.join(format!("{class}-{}", mutation.label()));
+    std::fs::create_dir(&case).unwrap();
+    let cloned_source = case.join("source.log");
+    let cloned_paper = case.join("paper.log");
+    let cloned_state = case.join("paper.db");
+    let cloned_live = case.join("live_journal.log");
+    std::fs::copy(state_path, &cloned_state).unwrap();
+    std::fs::copy(live_path, &cloned_live).unwrap();
+    let source = rewrite_source_preimage(source_path, &cloned_source, target, mutation);
+    let (_, paper_receipts, paper_prefixes) =
+        rewrite_paper_for_source(paper_path, &cloned_paper, &source, target, None);
+    rewrite_state_receipts(
+        &cloned_state,
+        &source.receipts,
+        &paper_receipts,
+        &source.prefixes,
+        &paper_prefixes,
+        target,
+    );
+    let digest = decision_evidence_digest(&cloned_paper, &cloned_state, &source.tail);
+    std::fs::remove_file(&cloned_paper).unwrap();
+    let (cloned_seal, _, _) =
+        rewrite_paper_for_source(paper_path, &cloned_paper, &source, target, Some(&digest));
+    assert_qualify_insufficient(
+        &cloned_paper,
+        &cloned_source,
+        &cloned_state,
+        cloned_seal,
+        &case.join("qualification.json"),
+        expected_reason,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_decision_preimage_rejected(
+    root: &std::path::Path,
+    mutation: PreimageMutation,
+    paper_path: &std::path::Path,
+    source_path: &std::path::Path,
+    state_path: &std::path::Path,
+    live_path: &std::path::Path,
+    seal_receipt: AppendReceipt,
+    source_trade_id: &pe_core_types::SourceTradeId,
+    semantic_revision: &str,
+) {
+    let case = root.join(format!("decision-{}", mutation.label()));
+    std::fs::create_dir(&case).unwrap();
+    let cloned_source = case.join("source.log");
+    let cloned_paper = case.join("paper.log");
+    let cloned_state = case.join("paper.db");
+    let cloned_live = case.join("live_journal.log");
+    std::fs::copy(source_path, &cloned_source).unwrap();
+    std::fs::copy(paper_path, &cloned_paper).unwrap();
+    std::fs::copy(state_path, &cloned_state).unwrap();
+    std::fs::copy(live_path, &cloned_live).unwrap();
+    let connection = rusqlite::Connection::open(&cloned_state).unwrap();
+    let expected_reason = match mutation {
+        PreimageMutation::Delete => {
+            assert_eq!(
+                connection
+                    .execute(
+                        "DELETE FROM decision_pending WHERE source_trade_id = ?1",
+                        rusqlite::params![source_trade_id.0],
+                    )
+                    .unwrap(),
+                1
+            );
+            format!(
+                "parsed source trade {source_trade_id}/{semantic_revision} has no decision_pending row"
+            )
+        }
+        PreimageMutation::Tamper => {
+            let frozen: String = connection
+                .query_row(
+                    "SELECT frozen_inputs_json FROM decision_pending WHERE source_trade_id = ?1",
+                    rusqlite::params![source_trade_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut bytes = frozen.into_bytes();
+            let marker = br#""this_hash":""#;
+            let start = bytes
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .unwrap()
+                + marker.len();
+            bytes[start] = if bytes[start] == b'a' { b'b' } else { b'a' };
+            let tampered = String::from_utf8(bytes).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?2 \
+                         WHERE source_trade_id = ?1",
+                        rusqlite::params![source_trade_id.0, tampered],
+                    )
+                    .unwrap(),
+                1
+            );
+            "decision source receipt does not match the sealed source prefix".to_owned()
+        }
+    };
+    drop(connection);
+    assert_qualify_insufficient(
+        &cloned_paper,
+        &cloned_source,
+        &cloned_state,
+        seal_receipt,
+        &case.join("qualification.json"),
+        &expected_reason,
+    );
+}
+
+fn golden_config_rows(runtime: &RuntimeConfig) -> Vec<ConfigRow> {
+    let mut rows = vec![
+        (
+            "active_watchlist_size",
+            runtime.active_watchlist_size.to_string(),
+            "integer",
+        ),
+        ("mode", runtime.mode.clone(), "text"),
+        (
+            "max_fill_price",
+            runtime.max_fill_price.normalize().to_string(),
+            "decimal",
+        ),
+        (
+            "min_fill_price",
+            runtime.min_fill_price.normalize().to_string(),
+            "decimal",
+        ),
+        (
+            "min_resolution_horizon_secs",
+            runtime.min_resolution_horizon_secs.to_string(),
+            "integer",
+        ),
+        (
+            "max_resolution_horizon_secs",
+            runtime.max_resolution_horizon_secs.to_string(),
+            "integer",
+        ),
+        (
+            "price_impact_cap_bps",
+            runtime.price_impact_cap_bps.to_string(),
+            "integer",
+        ),
+        (
+            "flip_human_approved",
+            runtime.flip_human_approved.to_string(),
+            "bool",
+        ),
+        (
+            "kelly_fraction_above_default_human_approved",
+            runtime
+                .kelly_fraction_above_default_human_approved
+                .to_string(),
+            "bool",
+        ),
+        (
+            "per_trade_cap",
+            match runtime.per_trade_cap {
+                PerTradeCap::ModeDefault => "mode_default".to_owned(),
+                PerTradeCap::Unlimited => "unlimited".to_owned(),
+                PerTradeCap::Bps(value) => format!("bps:{value}"),
+            },
+            "text",
+        ),
+        (
+            "slippage_rate",
+            runtime.slippage_rate.normalize().to_string(),
+            "decimal",
+        ),
+        (
+            "sizing_mode",
+            match runtime.sizing_mode {
+                SizingMode::Kelly => "kelly",
+                SizingMode::Dollar { .. } => "dollar",
+                SizingMode::Contract { .. } => "contract",
+            }
+            .to_owned(),
+            "text",
+        ),
+        (
+            "sizing_dollar_usd",
+            runtime.sizing_dollar_usd.normalize().to_string(),
+            "decimal",
+        ),
+        (
+            "sizing_contracts",
+            runtime.sizing_contracts.to_string(),
+            "integer",
+        ),
+    ];
+    if let Some(fraction) = runtime.kelly_fraction_override {
+        rows.push((
+            "kelly_fraction_override",
+            fraction.0.normalize().to_string(),
+            "decimal",
+        ));
+    }
+    rows.into_iter()
+        .map(|(key, value, value_type)| ConfigRow {
+            key: key.to_owned(),
+            value,
+            value_type: value_type.to_owned(),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_golden_start(
+    dir: &std::path::Path,
+    paper_path: &std::path::Path,
+    source_path: &std::path::Path,
+    live_path: &std::path::Path,
+    state_path: &std::path::Path,
+    start_unix: i64,
+    wallets: &[WalletAddress],
+    runtime: &RuntimeConfig,
+) -> FinancialEraPreparation {
+    let status_path = dir.join("status.json");
+    std::fs::write(
+        &status_path,
+        br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}"#,
+    )
+    .unwrap();
+    let rows_path = dir.join("financial-config.json");
+    std::fs::write(
+        &rows_path,
+        serde_json::to_vec(&golden_config_rows(runtime)).unwrap(),
+    )
+    .unwrap();
+    let manifest = FinancialEraManifest {
+        kind: "financial-era-v1".to_owned(),
+        state: "prepared".to_owned(),
+        activation_id: "golden-stream-v1".to_owned(),
+        generation: "golden-stream-v1".to_owned(),
+        fresh_bankroll: CollateralAmount::from_decimal_exact(STARTING_BANKROLL).unwrap(),
+        target_revision: "1".repeat(40),
+        artifact_blake3: "a".repeat(64),
+        static_config_hash: "b".repeat(64),
+        ranking_batch_id: 545,
+        membership: wallets.to_vec(),
+        schema_version: 2,
+        parser_version: 1,
+        financial_semantic_version: FINANCIAL_SEMANTIC_VERSION,
+        start_unix,
+        paths: FinancialEraPaths {
+            paper_log: paper_path.to_path_buf(),
+            source_log: source_path.to_path_buf(),
+            live_journal: live_path.to_path_buf(),
+            paper_state: state_path.to_path_buf(),
+        },
+        old_artifact_sha256: "d".repeat(64),
+        target_artifact_sha256: "e".repeat(64),
+        old_config_sha256: "f".repeat(64),
+        target_config_sha256: "0".repeat(64),
+        old_environment_sha256: "1".repeat(64),
+        target_environment_sha256: "2".repeat(64),
+        preparation: None,
+        stop_invoked: false,
+        service_was_active: None,
+        backup: None,
+        remote_census: None,
+        guarded_logs: None,
+        start_receipt: None,
+        started_unix: None,
+    };
+    let manifest_path = dir.join("financial-era.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut config = pe_service::config::ServiceConfig {
+        event_log_path: paper_path.to_path_buf(),
+        source_event_log_path: source_path.to_path_buf(),
+        ..pe_service::config::ServiceConfig::default()
+    };
+    config.paper_state_db_path = state_path.to_path_buf();
+    config.status_path = status_path;
+    config.supabase_authoritative = true;
+    config.supabase_url = "https://unused.invalid".to_owned();
+    config.supabase_secret_key = "golden-not-a-secret".to_owned();
+    let preparation = run_financial_era(
+        FinancialEraCommand::Prepare,
+        &manifest_path,
+        &config,
+        Some(&rows_path),
+    )
+    .unwrap();
+    serde_json::from_str(&preparation).unwrap()
+}
+
+fn restore_golden_membership_validations(
+    state_path: &std::path::Path,
+    paper: &PaperStateDb,
+    wallets: &[WalletAddress],
+    recorded_at_unix: i64,
+) {
+    let connection = rusqlite::Connection::open(state_path).unwrap();
+    for wallet in wallets {
+        let anchor = paper.position_anchors(wallet).unwrap().pop().unwrap();
+        connection
+            .execute(
+                "INSERT INTO position_validations \
+                     (wallet_hex, ledger_hash, positions_proof_hash, activity_bounds_json, \
+                      source_log_generation, proof_json, recorded_at_unix) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(wallet_hex) DO UPDATE SET \
+                    ledger_hash = excluded.ledger_hash, \
+                    positions_proof_hash = excluded.positions_proof_hash, \
+                    activity_bounds_json = excluded.activity_bounds_json, \
+                    source_log_generation = excluded.source_log_generation, \
+                    proof_json = excluded.proof_json, \
+                    recorded_at_unix = excluded.recorded_at_unix",
+                rusqlite::params![
+                    wallet.to_string(),
+                    anchor.ledger_hash_after,
+                    format!("golden-empty-{wallet}"),
+                    "[]",
+                    "golden-stream-v1",
+                    anchor.proof_json,
+                    recorded_at_unix,
+                ],
+            )
+            .unwrap();
+    }
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(busy, 0);
+    assert_eq!(log_frames, checkpointed_frames);
+}
+
+async fn resolve_golden_trade(
+    control_tx: &mpsc::Sender<OrchestratorControl>,
+    hooks: &ScenarioHooks,
+    bodies: &GoldenTradeBodies,
+    resolution_receipt: AppendReceipt,
+    expected_shares: ShareAmount,
+    expected_credit: CollateralAmount,
+    resolution_unix: i64,
+) {
+    let parsed_resolution =
+        pe_source_polymarket_public::parse_clob_market(&bodies.resolution).unwrap();
+    assert_eq!(
+        parsed_resolution.condition_id.as_deref(),
+        Some(bodies.condition.0.as_str())
+    );
+    let payout = BinaryPayoutVector::winner(0).unwrap();
+    let binary_payout = BinaryPayout::new(payout.decimals()[0], payout.decimals()[1]).unwrap();
+    assert_eq!(
+        aggregate_resolution_credit(&[(0, expected_shares)], &binary_payout).unwrap(),
+        expected_credit
+    );
+    hooks
+        .financial_clock_unix
+        .store(resolution_unix, std::sync::atomic::Ordering::SeqCst);
+    let (resolved, resolution_acknowledgement) = oneshot::channel();
+    control_tx
+        .send(OrchestratorControl::ResolutionCandidate {
+            condition: bodies.condition.clone(),
+            payout_by_outcome_index_json: payout.canonical_json(),
+            receipt: resolution_receipt,
+            acknowledged: resolved,
+        })
+        .await
+        .unwrap();
+    resolution_acknowledgement.await.unwrap().unwrap();
+}
+
 /// I16-GOLDEN-SOURCE-ECONOMIC-V1
 ///
 /// Preconditions: the checked-in v1 corpus seeds one deterministic 30-day future stream; every
@@ -727,12 +1398,11 @@ fn run_qualify_cli(
 ///
 /// I16-GOLDEN-PREIMAGE-V1
 ///
-/// Preconditions: the first admitted continuation is replayed once with exactly its activity-page
-/// envelope omitted and once with that one raw page changed at the same sequence.
-/// PASS: omission returns `SourceReceiptMissing` with the exact sequence/reason and mutation returns
-/// `SourceReceiptMismatch` with the exact sequence/reason; both altered logs also produce
-/// `InsufficientEvidence` with inexact replay through the real `pe-service --qualify` command.
-/// FAIL: either incomplete source log replays, returns an untyped error, or names another reason.
+/// Preconditions: independent clones of the completed corpus delete or one-byte-tamper one
+/// admission, book, price, decision-continuation, and resolution preimage.
+/// PASS: every clone reaches the real `pe-service --qualify` command and returns the exact
+/// class-specific `InsufficientEvidence` reason with inexact replay.
+/// FAIL: any altered corpus passes, reports another class, or bypasses the offline verifier.
 #[tokio::test]
 async fn golden_source_stream_replays_exact_economic_core() {
     let scenario_started = Instant::now();
@@ -741,7 +1411,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("source.log");
     let paper_path = dir.path().join("paper.log");
-    let live_path = dir.path().join("live.log");
+    let live_path = dir.path().join("live_journal.log");
     let state_path = dir.path().join("paper.db");
     drop(Writer::open(&source_path).unwrap());
     drop(Writer::open(&paper_path).unwrap());
@@ -769,32 +1439,66 @@ async fn golden_source_stream_replays_exact_economic_core() {
         })
         .collect::<Vec<_>>();
 
-    let start = QualificationStarted {
-        starting_bankroll: CollateralAmount::from_decimal_exact(STARTING_BANKROLL).unwrap(),
-        paper_prefix: empty_tail(&paper_path),
-        source_prefix: empty_tail(&source_path),
-        live_prefix: empty_tail(&live_path),
-        artifact_blake3: "golden-artifact-v1".to_owned(),
-        static_config_hash: "golden-static-v1".to_owned(),
-        hot_config_hash: applied_configuration_hash.clone(),
-        generation: "golden-stream-v1".to_owned(),
-        activation_id: "golden-stream-v1".to_owned(),
-        ranking_batch_id: 545,
-        membership: wallets.clone(),
-        membership_proofs_hash: "golden-membership-v1".to_owned(),
-        schema_version: 2,
-        parser_version: 1,
-        financial_semantic_version: FINANCIAL_SEMANTIC_VERSION,
-    };
-    let mut paper_writer = Writer::open(&paper_path).unwrap();
-    let start_receipt = append_paper_record(
-        &mut paper_writer,
-        &PaperLogRecord::QualificationStarted(Box::new(start)),
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    for wallet in &wallets {
+        paper.set_cursor(wallet, 0).unwrap();
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet: *wallet,
+                complete: true,
+                proof_json: format!("{{\"fixture\":\"golden_stream_v1\",\"wallet\":\"{wallet}\"}}"),
+                updated_at_unix: start_unix,
+            })
+            .unwrap();
+    }
+    let mut seed_engine =
+        BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
+    let installs = wallets
+        .iter()
+        .map(|wallet| {
+            let captured = ledger_capture(seed_engine.ledger(), &paper, *wallet).unwrap();
+            AnchorInstall {
+                wallet: *wallet,
+                balances: Vec::new(),
+                cutoff: 0,
+                proof: AnchorProof {
+                    positions_proof_hash: format!("golden-empty-{wallet}"),
+                    activity_bounds_json: "[]".to_owned(),
+                    source_log_generation: "golden-stream-v1".to_owned(),
+                    document: format!(
+                        "{{\"fixture\":\"golden_stream_v1\",\"wallet\":\"{wallet}\"}}"
+                    ),
+                    recorded_at_unix: start_unix,
+                },
+                expected: AnchorExpectation {
+                    ledger_hash: captured.hash,
+                    cursor: captured.cursor,
+                    anchor_seq: captured.anchor_seq,
+                    coverage_generation: captured.coverage_generation,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    seed_engine.install_anchors(&installs).unwrap();
+    let leader_ledger = seed_engine.into_ledger();
+    let preparation = derive_golden_start(
+        dir.path(),
+        &paper_path,
+        &source_path,
+        &live_path,
+        &state_path,
         start_unix,
+        &wallets,
+        &runtime_config,
     );
+    let start = preparation.start;
+    assert_eq!(start.hot_config_hash, applied_configuration_hash);
+    assert_ne!(start.membership_proofs_hash, "golden-membership-v1");
+    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let start_receipt = append_qualification_start(&mut paper_writer, &start, start_unix);
+    assert_eq!(start_receipt, preparation.expected_receipt);
     drop(paper_writer);
 
-    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
     paper
         .reset_financial_era(
             start_receipt,
@@ -804,6 +1508,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let authority = GoldenAuthority::new(start_receipt);
 
     let source_sink = SourceEventSink::open(&source_path).unwrap();
+    let source_receipt_millis = SourceReceiptMillisIndex::replay(&source_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(64);
     let (trigger_tx, _trigger_rx) = mpsc::channel(1);
     let coordinator = tokio::spawn(
@@ -813,6 +1518,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             trigger_tx,
             new_shared_health_with_ws(false, true, 90),
         )
+        .with_source_receipt_millis_index(source_receipt_millis.clone())
         .run(),
     );
 
@@ -829,34 +1535,88 @@ async fn golden_source_stream_replays_exact_economic_core() {
     )
     .await;
 
-    for wallet in &wallets {
-        paper.set_cursor(wallet, 0).unwrap();
+    let preimage_append_started = Instant::now();
+    let mut recorded_trades = Vec::with_capacity(QUALIFICATION_DAYS * COPIES_PER_DAY);
+    for index in 0..QUALIFICATION_DAYS * COPIES_PER_DAY {
+        let source_unix = golden_source_unix(anchor_cutoff, index);
+        let bodies = golden_trade_bodies(index, source_unix);
+        let websocket_receipt = append_source_at(
+            &source_log,
+            "polymarket-activity-ws",
+            &bodies.websocket,
+            source_unix,
+        )
+        .await;
+        let page_receipt = append_source_at(
+            &source_log,
+            "polymarket-public.activity-reconciliation",
+            &bodies.activity,
+            source_unix,
+        )
+        .await;
+        let gamma_receipt = append_source_at(
+            &source_log,
+            "polymarket.gamma.markets",
+            &bodies.gamma,
+            source_unix,
+        )
+        .await;
+        let clob_receipt = append_source_at(
+            &source_log,
+            "polymarket.clob.markets",
+            &bodies.clob_long,
+            source_unix,
+        )
+        .await;
+        let compact_receipt = append_source_at(
+            &source_log,
+            "polymarket.clob.compact-market",
+            &bodies.compact,
+            source_unix,
+        )
+        .await;
+        let book_receipt = append_source_at(
+            &source_log,
+            "polymarket.clob.book",
+            &bodies.book,
+            source_unix,
+        )
+        .await;
+        let receipts = AdmissionReceipts {
+            gamma: gamma_receipt,
+            clob_long: clob_receipt,
+            clob_compact: compact_receipt,
+        };
+        let (admission, book) = admission_and_book(
+            &bodies.condition,
+            source_unix,
+            GoldenAdmissionBodies {
+                gamma: &bodies.gamma,
+                clob: &bodies.clob_long,
+                compact: &bodies.compact,
+                book: &bodies.book,
+            },
+            receipts,
+            book_receipt,
+        );
+        let resolution_receipt = append_source_at(
+            &source_log,
+            "polymarket.clob.market",
+            &bodies.resolution,
+            source_unix + 1,
+        )
+        .await;
+        recorded_trades.push(GoldenRecordedTrade {
+            bodies,
+            websocket_receipt,
+            page_receipt,
+            admission,
+            book,
+            resolution_receipt,
+        });
     }
-    let leader_ledger = PositionLedger::new();
-    let installs = wallets
-        .iter()
-        .map(|wallet| {
-            let captured = ledger_capture(&leader_ledger, &paper, *wallet).unwrap();
-            AnchorInstall {
-                wallet: *wallet,
-                balances: Vec::new(),
-                cutoff: 0,
-                proof: AnchorProof {
-                    positions_proof_hash: format!("golden-empty-{wallet}"),
-                    activity_bounds_json: "[]".to_owned(),
-                    source_log_generation: "golden-stream-v1".to_owned(),
-                    document: "{}".to_owned(),
-                    recorded_at_unix: start_unix,
-                },
-                expected: AnchorExpectation {
-                    ledger_hash: captured.hash,
-                    cursor: captured.cursor,
-                    anchor_seq: captured.anchor_seq,
-                    coverage_generation: captured.coverage_generation,
-                },
-            }
-        })
-        .collect::<Vec<_>>();
+    let preimage_append_elapsed = preimage_append_started.elapsed();
+
     let hooks = Arc::new(ScenarioHooks::default());
     hooks
         .financial_clock_unix
@@ -909,19 +1669,10 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 "http://unused.invalid",
                 source_log.clone(),
             )),
-            SourceReceiptMillisIndex::replay(&source_path).unwrap(),
+            source_receipt_millis,
         )
         .unwrap();
     let control = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
-    let (installed, installation) = oneshot::channel();
-    control_tx
-        .send(OrchestratorControl::InstallAnchors {
-            installs,
-            acknowledged: installed,
-        })
-        .await
-        .unwrap();
-    installation.await.unwrap().unwrap();
     let (marked, mark_acknowledgement) = oneshot::channel();
     control_tx
         .send(OrchestratorControl::DailyBoundary {
@@ -938,8 +1689,10 @@ async fn golden_source_stream_replays_exact_economic_core() {
         Decimal::from_str_exact(expected["payout_credit"].as_str().unwrap()).unwrap(),
     )
     .unwrap();
-    let mut first_source_trade_id = None;
-    let mut first_bodies = None;
+    let expected_credit = CollateralAmount::from_decimal_exact(
+        Decimal::from_str_exact(expected["payout_credit"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
     let mut first_admission = None;
 
     eprintln!(
@@ -948,86 +1701,26 @@ async fn golden_source_stream_replays_exact_economic_core() {
         scenario_started.elapsed()
     );
     let stream_started = Instant::now();
-    let mut source_append_elapsed = Duration::ZERO;
     let mut bucket_commit_elapsed = Duration::ZERO;
     let mut financial_commit_elapsed = Duration::ZERO;
     let mut mark_elapsed = Duration::ZERO;
+    let mut first_day_resolutions = Vec::new();
 
     for day in 0..QUALIFICATION_DAYS {
         for within_day in 0..COPIES_PER_DAY {
             let index = day * COPIES_PER_DAY + within_day;
             let source_unix = golden_source_unix(anchor_cutoff, index);
-            let bodies = golden_trade_bodies(index, source_unix);
+            let recorded = &recorded_trades[index];
+            let bodies = &recorded.bodies;
             let now = OffsetDateTime::from_unix_timestamp(source_unix).unwrap();
-            let source_append_started = Instant::now();
-            let websocket_receipt = append_source_at(
-                &source_log,
-                "polymarket-activity-ws",
-                &bodies.websocket,
-                source_unix,
-            )
-            .await;
-            let page_receipt = append_source_at(
-                &source_log,
-                "polymarket-public.activity-reconciliation",
-                &bodies.activity,
-                source_unix,
-            )
-            .await;
-            let gamma_receipt = append_source_at(
-                &source_log,
-                "polymarket.gamma.markets",
-                &bodies.gamma,
-                source_unix,
-            )
-            .await;
-            let clob_receipt = append_source_at(
-                &source_log,
-                "polymarket.clob.markets",
-                &bodies.clob_long,
-                source_unix,
-            )
-            .await;
-            let compact_receipt = append_source_at(
-                &source_log,
-                "polymarket.clob.compact-market",
-                &bodies.compact,
-                source_unix,
-            )
-            .await;
-            let book_receipt = append_source_at(
-                &source_log,
-                "polymarket.clob.book",
-                &bodies.book,
-                source_unix,
-            )
-            .await;
-            source_append_elapsed += source_append_started.elapsed();
-            let receipts = AdmissionReceipts {
-                gamma: gamma_receipt,
-                clob_long: clob_receipt,
-                clob_compact: compact_receipt,
-            };
-            let (admission, book) = admission_and_book(
-                &bodies.condition,
-                source_unix,
-                GoldenAdmissionBodies {
-                    gamma: &bodies.gamma,
-                    clob: &bodies.clob_long,
-                    compact: &bodies.compact,
-                    book: &bodies.book,
-                },
-                receipts,
-                book_receipt,
-            );
             hooks
                 .admission_artifacts
                 .lock()
                 .unwrap()
-                .push_back(admission.clone());
+                .push_back(recorded.admission.clone());
             book_fetcher.insert(
-                admission.market.ordered_outcome_token_ids[0].to_string(),
-                book,
+                recorded.admission.market.ordered_outcome_token_ids[0].to_string(),
+                recorded.book.clone(),
             );
             hooks
                 .financial_clock_unix
@@ -1047,9 +1740,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                     .remove(0);
             let source_trade_id = aggregate.group_id.key().clone();
             if index == 0 {
-                first_source_trade_id = Some(source_trade_id.clone());
-                first_bodies = Some(bodies.clone());
-                first_admission = Some(admission.clone());
+                first_admission = Some(recorded.admission.clone());
             }
             let context = BucketDecisionContext {
                 applied_configuration: runtime_config.clone(),
@@ -1059,11 +1750,11 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 page_occurrences: vec![PageOccurrence {
                     request_url: format!("fixture://golden_stream_v1/activity_page/{index}"),
                     raw_hash: blake3::hash(&bodies.activity).to_hex().to_string(),
-                    receipt: page_receipt,
+                    receipt: recorded.page_receipt,
                 }],
                 observed_source_receipts: HashMap::from([(
                     source_trade_id.clone(),
-                    websocket_receipt,
+                    recorded.websocket_receipt,
                 )]),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                 signal_config: Default::default(),
@@ -1097,54 +1788,36 @@ async fn golden_source_stream_replays_exact_economic_core() {
             assert_eq!(result.dispositions[&source_trade_id.0], "decision_pending");
             assert!(!paper.is_decision_pending_open(&source_trade_id).unwrap());
             let after_fill = paper.financial_snapshot(source_unix).unwrap();
-            assert_eq!(after_fill.positions.len(), 1);
-            assert_eq!(after_fill.positions[0].long, expected_shares);
-
-            let resolution_unix = source_unix + 1;
-            let resolution_receipt = append_source_at(
-                &source_log,
-                "polymarket.clob.market",
-                &bodies.resolution,
-                resolution_unix,
-            )
-            .await;
-            let parsed_resolution =
-                pe_source_polymarket_public::parse_clob_market(&bodies.resolution).unwrap();
-            assert_eq!(
-                parsed_resolution.condition_id.as_deref(),
-                Some(bodies.condition.0.as_str())
-            );
-            let payout = BinaryPayoutVector::winner(0).unwrap();
-            let payout_json = payout.canonical_json();
-            let binary_payout =
-                BinaryPayout::new(payout.decimals()[0], payout.decimals()[1]).unwrap();
-            let payout_credit =
-                aggregate_resolution_credit(&[(0, expected_shares)], &binary_payout).unwrap();
-            assert_eq!(
-                payout_credit.to_decimal().normalize().to_string(),
-                expected["payout_credit"].as_str().unwrap()
-            );
-            hooks
-                .financial_clock_unix
-                .store(resolution_unix, std::sync::atomic::Ordering::SeqCst);
-            let (resolved, resolution_acknowledgement) = oneshot::channel();
-            control_tx
-                .send(OrchestratorControl::ResolutionCandidate {
-                    condition: bodies.condition.clone(),
-                    payout_by_outcome_index_json: payout_json,
-                    receipt: resolution_receipt,
-                    acknowledged: resolved,
-                })
-                .await
-                .unwrap();
-            resolution_acknowledgement.await.unwrap().unwrap();
             assert!(
-                paper
-                    .financial_snapshot(resolution_unix)
-                    .unwrap()
+                after_fill
                     .positions
-                    .is_empty()
+                    .iter()
+                    .any(|position| position.long == expected_shares),
+                "golden fill index {index}"
             );
+
+            if index == COPIES_PER_DAY - 1 {
+                first_day_resolutions.push(index);
+            } else {
+                let resolution_unix = source_unix + 1;
+                resolve_golden_trade(
+                    &control_tx,
+                    &hooks,
+                    bodies,
+                    recorded.resolution_receipt,
+                    expected_shares,
+                    expected_credit,
+                    resolution_unix,
+                )
+                .await;
+                assert!(
+                    paper
+                        .financial_snapshot(resolution_unix)
+                        .unwrap()
+                        .positions
+                        .is_empty()
+                );
+            }
             financial_commit_elapsed += financial_commit_started.elapsed();
         }
 
@@ -1163,7 +1836,32 @@ async fn golden_source_stream_replays_exact_economic_core() {
         )
         .await;
         let snapshot = paper.financial_snapshot(cutoff).unwrap();
-        assert!(snapshot.positions.is_empty());
+        if day == 0 {
+            assert!(!snapshot.positions.is_empty());
+            let mut prices: serde_json::Value =
+                serde_json::from_slice(fixture("prices_history")).unwrap();
+            prices["history"][0]["t"] = (cutoff - 60).into();
+            prices["history"][1]["t"] = cutoff.into();
+            let price_body = serde_json::to_vec(&prices).unwrap();
+            for _ in &snapshot.positions {
+                let receipt = append_source_at(
+                    &source_log,
+                    "pe-service.clob-prices-history",
+                    &price_body,
+                    cutoff,
+                )
+                .await;
+                hooks.boundary_mark_prices.lock().unwrap().push_back(
+                    pe_service::risk_inputs::HistoricalMarkPrice {
+                        price: Price::new(dec!(0.50)).unwrap(),
+                        sample_unix: cutoff,
+                        receipt,
+                    },
+                );
+            }
+        } else {
+            assert!(snapshot.positions.is_empty());
+        }
         hooks
             .financial_clock_unix
             .store(cutoff, std::sync::atomic::Ordering::SeqCst);
@@ -1178,12 +1876,37 @@ async fn golden_source_stream_replays_exact_economic_core() {
             .unwrap();
         mark_acknowledgement.await.unwrap().unwrap();
         mark_elapsed += mark_started.elapsed();
+
+        if day == 0 {
+            let resolution_started = Instant::now();
+            for (offset, bodies) in first_day_resolutions.drain(..).enumerate() {
+                let recorded = &recorded_trades[bodies];
+                resolve_golden_trade(
+                    &control_tx,
+                    &hooks,
+                    &recorded.bodies,
+                    recorded.resolution_receipt,
+                    expected_shares,
+                    expected_credit,
+                    cutoff + 1 + i64::try_from(offset).unwrap(),
+                )
+                .await;
+            }
+            assert!(
+                paper
+                    .financial_snapshot(cutoff + i64::try_from(COPIES_PER_DAY).unwrap())
+                    .unwrap()
+                    .positions
+                    .is_empty()
+            );
+            financial_commit_elapsed += resolution_started.elapsed();
+        }
     }
 
     eprintln!(
         "PERF golden_stream phase=stream wall={:?} source_append={:?} bucket_commit={:?} financial_commit={:?} marks={:?} total={:?}",
         stream_started.elapsed(),
-        source_append_elapsed,
+        preimage_append_elapsed,
         bucket_commit_elapsed,
         financial_commit_elapsed,
         mark_elapsed,
@@ -1195,6 +1918,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     control.await.unwrap();
     drop(source_log);
     coordinator.await.unwrap();
+    restore_golden_membership_validations(&state_path, &paper, &wallets, start_unix);
     assert!(paper.open_decision_pending().unwrap().is_empty());
     let sealed_era = paper_era(scan_paper_log(&paper_path).unwrap());
     let completion = qualification_completion(&sealed_era).unwrap();
@@ -1212,14 +1936,6 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 && decision.post_boundary.body.terminal.final_receipt.is_some()
         })
     }));
-    let first_source_trade_id = first_source_trade_id.unwrap();
-    let first_continuation = DecisionContinuationV3::from_durable(
-        decision_rows
-            .iter()
-            .find(|row| row.source_trade_id == first_source_trade_id)
-            .unwrap(),
-    )
-    .unwrap();
     let prepared_fills = sealed_era
         .frames
         .iter()
@@ -1437,117 +2153,78 @@ async fn golden_source_stream_replays_exact_economic_core() {
         expected["wrapper_hashes_differ"].as_bool().unwrap()
     );
 
-    let continuation = first_continuation;
-    let first_bodies = first_bodies.unwrap();
     let tamper_started = Instant::now();
-    let missing_path = dir.path().join("missing-source.log");
-    let mut missing_writer = Writer::open(&missing_path).unwrap();
-    append_source_direct(
-        &mut missing_writer,
-        "pe-service.boundary",
-        &initial_boundary_payload,
-        anchor_cutoff,
-    );
-    append_source_direct(
-        &mut missing_writer,
-        "polymarket-activity-ws",
-        &first_bodies.websocket,
-        FIXED_UNIX,
-    );
-    drop(missing_writer);
-    let missing_error = continuation
-        .observation_from_source_log(&missing_path)
-        .unwrap_err();
-    assert!(matches!(
-        missing_error,
-        DecisionContinuationError::SourceReceiptMissing { sequence }
-            if sequence == continuation.page_occurrences[0].receipt.sequence.0
-    ));
-    assert_eq!(
-        missing_error.to_string(),
-        format!(
-            "source receipt sequence {} is absent",
-            continuation.page_occurrences[0].receipt.sequence.0
-        )
-    );
-    let missing_output_path = dir.path().join("missing-qualification.json");
-    let missing_output = run_qualify_cli(
-        &paper_path,
-        &missing_path,
-        &state_path,
-        seal_receipt,
-        &missing_output_path,
-    );
-    assert!(missing_output.status.success());
-    assert!(
-        String::from_utf8_lossy(&missing_output.stdout).contains("verdict=InsufficientEvidence")
-    );
-    let missing_report: QualificationReport =
-        serde_json::from_slice(&std::fs::read(missing_output_path).unwrap()).unwrap();
-    assert_eq!(
-        missing_report.verdict,
-        QualificationVerdict::InsufficientEvidence
-    );
-    assert!(!missing_report.replay.exact);
-
-    let tampered_path = dir.path().join("tampered-source.log");
-    let mut tampered_writer = Writer::open(&tampered_path).unwrap();
-    append_source_direct(
-        &mut tampered_writer,
-        "pe-service.boundary",
-        &initial_boundary_payload,
-        anchor_cutoff,
-    );
-    append_source_direct(
-        &mut tampered_writer,
-        "polymarket-activity-ws",
-        &first_bodies.websocket,
-        FIXED_UNIX,
-    );
-    let mut tampered_activity: serde_json::Value =
-        serde_json::from_slice(&first_bodies.activity).unwrap();
-    tampered_activity[0]["price"] = "0.51".into();
-    append_source_direct(
-        &mut tampered_writer,
-        "polymarket-public.activity-reconciliation",
-        &serde_json::to_vec(&tampered_activity).unwrap(),
-        FIXED_UNIX,
-    );
-    drop(tampered_writer);
-    let tampered_error = continuation
-        .observation_from_source_log(&tampered_path)
-        .unwrap_err();
-    assert!(matches!(
-        tampered_error,
-        DecisionContinuationError::SourceReceiptMismatch { sequence }
-            if sequence == continuation.page_occurrences[0].receipt.sequence.0
-    ));
-    assert_eq!(
-        tampered_error.to_string(),
-        format!(
-            "source receipt sequence {} does not match its frozen evidence",
-            continuation.page_occurrences[0].receipt.sequence.0
-        )
-    );
-    let tampered_output_path = dir.path().join("tampered-qualification.json");
-    let tampered_output = run_qualify_cli(
-        &paper_path,
-        &tampered_path,
-        &state_path,
-        seal_receipt,
-        &tampered_output_path,
-    );
-    assert!(tampered_output.status.success());
-    assert!(
-        String::from_utf8_lossy(&tampered_output.stdout).contains("verdict=InsufficientEvidence")
-    );
-    let tampered_report: QualificationReport =
-        serde_json::from_slice(&std::fs::read(tampered_output_path).unwrap()).unwrap();
-    assert_eq!(
-        tampered_report.verdict,
-        QualificationVerdict::InsufficientEvidence
-    );
-    assert!(!tampered_report.replay.exact);
+    let tamper_root = dir.path().join("preimage-corpora");
+    std::fs::create_dir(&tamper_root).unwrap();
+    let last_recorded = recorded_trades.last().unwrap();
+    let last_decision = decision_rows.last().unwrap();
+    let price_receipt = sealed_era
+        .frames
+        .iter()
+        .find_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => {
+                mark.prices.first().and_then(|price| price.receipt)
+            }
+            _ => None,
+        })
+        .unwrap();
+    for mutation in [PreimageMutation::Delete, PreimageMutation::Tamper] {
+        assert_source_preimage_rejected(
+            &tamper_root,
+            "admission",
+            mutation,
+            &paper_path,
+            &source_path,
+            &state_path,
+            &live_path,
+            last_recorded.admission.receipts.gamma,
+            "polymarket.gamma.markets receipt is absent from the sealed source prefix",
+        );
+        assert_source_preimage_rejected(
+            &tamper_root,
+            "book",
+            mutation,
+            &paper_path,
+            &source_path,
+            &state_path,
+            &live_path,
+            last_recorded.book.source_receipt.unwrap(),
+            "polymarket.clob.book receipt is absent from the sealed source prefix",
+        );
+        assert_source_preimage_rejected(
+            &tamper_root,
+            "price",
+            mutation,
+            &paper_path,
+            &source_path,
+            &state_path,
+            &live_path,
+            price_receipt,
+            "PortfolioMark receipt is absent from sealed source prefix",
+        );
+        assert_source_preimage_rejected(
+            &tamper_root,
+            "resolution",
+            mutation,
+            &paper_path,
+            &source_path,
+            &state_path,
+            &live_path,
+            last_recorded.resolution_receipt,
+            "resolution receipt is absent from the sealed source prefix",
+        );
+        assert_decision_preimage_rejected(
+            &tamper_root,
+            mutation,
+            &paper_path,
+            &source_path,
+            &state_path,
+            &live_path,
+            seal_receipt,
+            &last_decision.source_trade_id,
+            &last_decision.semantic_revision,
+        );
+    }
 
     assert!(!fixture("prices_history").is_empty());
     assert_eq!(LIVE_MARKET_SCHEMA_VERSION, 1);
@@ -1564,7 +2241,6 @@ async fn golden_source_stream_replays_exact_economic_core() {
         report.replay.decisions, report.replay.fills, report.complete_days
     );
     println!(
-        "PASS: I16-GOLDEN-PREIMAGE-V1 — missing and tampered sequence {} fail with exact typed reasons",
-        continuation.page_occurrences[0].receipt.sequence.0
+        "PASS: I16-GOLDEN-PREIMAGE-V1 — deleted and one-byte-tampered preimages fail with exact typed reasons"
     );
 }
