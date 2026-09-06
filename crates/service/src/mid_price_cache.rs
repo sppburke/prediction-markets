@@ -159,7 +159,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     /// [`TTL`] and otherwise fetched concurrently through the rate gate. Markets
     /// whose fetch fails or lacks `outcomePrices` are omitted from the result.
     pub async fn fetch_mids(&self, market_ids: &[MarketId]) -> HashMap<MarketId, Vec<Decimal>> {
-        self.ensure_entries(market_ids)
+        self.ensure_entries(market_ids, OffsetDateTime::now_utc)
             .await
             .into_iter()
             .map(|(id, entry)| (id, entry.mids))
@@ -176,7 +176,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         &self,
         market_ids: &[MarketId],
     ) -> HashMap<MarketId, MidMarketSnapshot> {
-        self.ensure_entries(market_ids)
+        self.ensure_entries(market_ids, OffsetDateTime::now_utc)
             .await
             .into_iter()
             .map(|(id, entry)| (id, entry.snapshot))
@@ -206,15 +206,16 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         clock: C,
     ) -> StrictMidPriceAttempt
     where
-        C: FnOnce() -> OffsetDateTime,
+        C: Fn() -> OffsetDateTime,
     {
         let mut markets = ids.iter().map(|id| id.market().clone()).collect::<Vec<_>>();
         markets.sort_by_key(ToString::to_string);
         markets.dedup();
-        let _ = self.ensure_entries(&markets).await;
+        let _ = self.ensure_entries(&markets, &clock).await;
 
-        // The response pages are durably appended by `ensure_entries`. Take the one risk clock
-        // only after that await so a newly fetched observation cannot be newer than its validator.
+        // The response pages are durably appended by `ensure_entries` and stamped from the same
+        // clock; the one risk clock is taken only after that await so a newly fetched observation
+        // cannot be newer than its validator.
         let evaluated_at = clock();
         let map = self.inner.lock().await;
         let mut price_receipts = ids
@@ -282,7 +283,16 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     /// multi-market dashboard call (`paper_api`) instead drops every stale market for that tick,
     /// self-healing on the next [`TTL`] refresh. A market that is unknown, in a 4xx chunk, or lacks
     /// `outcomePrices` is omitted, so the caller marks its unrealized P&L null.
-    async fn ensure_entries(&self, market_ids: &[MarketId]) -> HashMap<MarketId, CachedEntry> {
+    /// `clock` stamps every page appended by this call, so observation time and any later
+    /// freshness validation share one origin (wall clock in production, the injected clock in tests).
+    async fn ensure_entries<C>(
+        &self,
+        market_ids: &[MarketId],
+        clock: C,
+    ) -> HashMap<MarketId, CachedEntry>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
         let mut out: HashMap<MarketId, CachedEntry> = HashMap::new();
         let mut stale: Vec<MarketId> = Vec::new();
 
@@ -314,14 +324,15 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         {
             Ok(fetched) => fetched,
             Err(error) => {
-                if self.record_pages(&error.pages).await.is_err() {
+                if self.record_pages(&error.pages, clock()).await.is_err() {
                     warn!("mid-cache: source log closed while recording rejected Gamma pages");
                 }
                 warn!(error = %error, stale = stale.len(), "mid-cache: batch fetch error, omitting this tick");
                 return out;
             }
         };
-        let receipts = match self.record_pages(&fetched.pages).await {
+        let observed = clock();
+        let receipts = match self.record_pages(&fetched.pages, observed).await {
             Ok(receipts) => receipts,
             Err(()) => {
                 warn!("mid-cache: source log closed, omitting unrecorded Gamma prices");
@@ -355,16 +366,12 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                 strict_mids: m.strict_outcome_prices.clone(),
                 snapshot,
                 at: now,
-                observed_at: fetched
-                    .condition_page_hashes
-                    .get(&id.to_string())
-                    .and_then(|hash| receipts.get(hash))
-                    .map_or_else(OffsetDateTime::now_utc, |(_, observed)| *observed),
+                observed_at: observed,
                 receipt: fetched
                     .condition_page_hashes
                     .get(&id.to_string())
                     .and_then(|hash| receipts.get(hash))
-                    .map(|(receipt, _)| *receipt),
+                    .copied(),
                 conflicting: conflicts.contains(&id.to_string()),
             };
             map.insert(id.clone(), entry.clone());
@@ -376,13 +383,13 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     async fn record_pages(
         &self,
         pages: &[(MetadataPageEvidence, Vec<u8>)],
-    ) -> Result<HashMap<String, (AppendReceipt, OffsetDateTime)>, ()> {
+        observed: OffsetDateTime,
+    ) -> Result<HashMap<String, AppendReceipt>, ()> {
         let Some(source_log) = &self.source_log else {
             return Ok(HashMap::new());
         };
         let mut receipts = HashMap::new();
         for (evidence, payload) in pages {
-            let observed = evidence.received_at.0;
             let receipt = source_log
                 .append(EnvelopeIn {
                     source_id: pe_core_types::SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
@@ -395,7 +402,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                 })
                 .await
                 .map_err(|_| ())?;
-            receipts.insert(evidence.raw_page_hash.clone(), (receipt, observed));
+            receipts.insert(evidence.raw_page_hash.clone(), receipt);
         }
         Ok(receipts)
     }
