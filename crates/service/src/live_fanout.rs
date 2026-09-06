@@ -10659,7 +10659,7 @@ mod tests {
         prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
         prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
-        prepared.economic.risk.evaluated_at_unix_ms = now.unix_timestamp().saturating_mul(1_000);
+        prepared.economic.risk.evaluated_at_unix_ms = unix_millis_i64(now);
         prepared.economic.risk.price_receipts.clear();
         if let Some(price_receipt) = risk_price_receipt {
             let (events, derived) =
@@ -10683,7 +10683,7 @@ mod tests {
             let mids = replay_live_risk_prices(
                 &derived.positions,
                 &[price_receipt],
-                now.unix_timestamp().saturating_mul(1_000),
+                unix_millis_i64(now),
                 &sources,
                 Some(&state.config.source_receipts),
             )
@@ -10695,8 +10695,7 @@ mod tests {
                 &state.config.journal_path,
                 &events,
                 &derived,
-                &paper_era_at_evaluation(&paper_frames, now.unix_timestamp().saturating_mul(1_000))
-                    .unwrap(),
+                &paper_era_at_evaluation(&paper_frames, unix_millis_i64(now)).unwrap(),
                 &mids,
                 &[price_receipt],
                 now,
@@ -14222,7 +14221,7 @@ mod tests {
             },
             decision: RiskDecisionAudit::Approved,
             price_receipts: Vec::new(),
-            evaluated_at_unix_ms: now.unix_timestamp().saturating_mul(1_000),
+            evaluated_at_unix_ms: unix_millis_i64(now),
         };
     }
 
