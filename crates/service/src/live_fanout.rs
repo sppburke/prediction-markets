@@ -1607,7 +1607,11 @@ async fn live_risk_audit(
         scan_paper_log(&state.config.paper_log_path)
             .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?,
     );
-    let latency_seed = crate::risk_inputs::latency_hysteresis_seed(&latency_era, &latency_owner)?;
+    let latency_seed = crate::risk_inputs::latency_hysteresis_seed(
+        &latency_era,
+        &latency_owner,
+        &state.config.journal_path,
+    )?;
     let copy_latency_kill_switch_active = live_latency_switch(&events, now, latency_seed)?;
     let snapshot = RiskSnapshot {
         leader_exposure_bps: to_bps(leader)?,
@@ -6118,7 +6122,12 @@ mod tests {
             .unwrap();
         drop(writer);
         let restarted_era = paper_era(scan_paper_log(&paper_log).unwrap());
-        let released = crate::risk_inputs::latency_hysteresis_seed(&restarted_era, &owner).unwrap();
+        let released = crate::risk_inputs::latency_hysteresis_seed(
+            &restarted_era,
+            &owner,
+            &dir.path().join("unused-live.log"),
+        )
+        .unwrap();
         let first_post_release_pass = OffsetDateTime::from_unix_timestamp(3 * 3_600 + 1).unwrap();
         assert!(!live_latency_switch(&events, first_post_release_pass, released).unwrap());
 
@@ -6136,14 +6145,29 @@ mod tests {
     /// adjacent post-tail high hour therefore re-engage the live latency halt.
     #[test]
     fn live_post_latency_release_counts_response_appended_after_tail() {
-        let mut events = vec![
-            latency_posted_event(0, 3_601_000, 3_001),
-            latency_posted_event(1, 7_201_000, 3_001),
-        ];
-        let owner = RiskHaltOwner::LiveAccount(AccountId::new("latency-account").unwrap());
-        let released_at = OffsetDateTime::from_unix_timestamp(18_002).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let paper_log = dir.path().join("paper.log");
+        let live_journal_path = dir.path().join("live.log");
+        let journal = pe_execution_core::LiveJournal::open(&live_journal_path).unwrap();
+        let mut events = Vec::new();
+        for event in [
+            latency_posted_event(0, 3_601_000, 3_001),
+            latency_posted_event(1, 7_201_000, 3_001),
+        ] {
+            events.push(
+                journal
+                    .append(event.account_id, event.timestamp, event.payload)
+                    .unwrap(),
+            );
+        }
+        let account_id = AccountId::new("latency-account").unwrap();
+        let owner = RiskHaltOwner::LiveAccount(account_id.clone());
+        let (_, tail) = pe_execution_core::live_journal::replay_account_with_tail(
+            &live_journal_path,
+            &account_id,
+        )
+        .unwrap();
+        let released_at = OffsetDateTime::from_unix_timestamp(18_002).unwrap();
         let mut writer = pe_event_log::Writer::open(&paper_log).unwrap();
         writer
             .append_synced(EnvelopeIn {
@@ -6159,10 +6183,7 @@ mod tests {
                         cause: pe_risk_engine::RiskHaltCause::CopyLatency,
                         state: HaltState::Released,
                         evidence: serde_json::json!({
-                            "live_journal_tail": {
-                                "last_sequence": EventSeq(1),
-                                "last_hash": "11".repeat(32),
-                            },
+                            "live_journal_tail": crate::risk_inputs::LiveLatencyJournalTailEvidence::from(tail),
                         }),
                     },
                 )
@@ -6171,17 +6192,23 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        events.push(latency_posted_event_appended_at(
-            2, 10_801_000, 3_001, 18_003_000,
-        ));
-        events.push(latency_posted_event_appended_at(
-            3, 14_401_000, 3_001, 18_004_000,
-        ));
+        for event in [
+            latency_posted_event_appended_at(2, 10_801_000, 3_001, 18_003_000),
+            latency_posted_event_appended_at(3, 14_401_000, 3_001, 18_004_000),
+        ] {
+            events.push(
+                journal
+                    .append(event.account_id, event.timestamp, event.payload)
+                    .unwrap(),
+            );
+        }
         let restarted_era = paper_era(scan_paper_log(&paper_log).unwrap());
-        let released = crate::risk_inputs::latency_hysteresis_seed(&restarted_era, &owner).unwrap();
+        let released =
+            crate::risk_inputs::latency_hysteresis_seed(&restarted_era, &owner, &live_journal_path)
+                .unwrap();
         assert_eq!(
             released.checkpoint,
-            Some(crate::risk_inputs::LatencyReplayCheckpoint::LiveJournalTail(Some(EventSeq(1))))
+            Some(crate::risk_inputs::LatencyReplayCheckpoint::LiveJournalTail(tail))
         );
         let after_both_delayed_hours = OffsetDateTime::from_unix_timestamp(6 * 3_600 + 1).unwrap();
         assert!(live_latency_switch(&events, after_both_delayed_hours, released).unwrap());
