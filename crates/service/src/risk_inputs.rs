@@ -259,7 +259,6 @@ pub fn completed_prepared_before_boundary(
 /// This deliberately cannot be passed to `evaluate_risk`; only this module can turn it into the
 /// complete [`RiskSnapshot`] that includes causal PnL and latency state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(not(feature = "scenario"))]
 pub(crate) struct PaperExposureBase {
     pub(crate) leader_exposure_bps: pe_core_types::BasisPoints,
     pub(crate) market_exposure_bps: pe_core_types::BasisPoints,
@@ -267,81 +266,6 @@ pub(crate) struct PaperExposureBase {
     pub(crate) total_copy_exposure_bps: pe_core_types::BasisPoints,
     pub(crate) proposed_trade_bps: pe_core_types::BasisPoints,
     pub(crate) per_trade_cap_bps: i32,
-}
-
-/// Scenario-only compatibility alias for the golden fixture's historical complete-snapshot input.
-/// The exposure builder remains crate-private in this configuration.
-#[cfg(feature = "scenario")]
-pub(crate) type PaperExposureBase = RiskSnapshot;
-
-/// Compose exact paper PnL/latency with the exposure proposal. The only returned
-/// [`RiskSnapshot`] is complete and ready for risk evaluation.
-#[cfg(not(feature = "scenario"))]
-pub(crate) fn build_paper_risk_snapshot(
-    base: &PaperExposureBase,
-    snapshot: &FinancialSnapshot,
-    era: &PaperEra,
-    current_prices: &HashMap<(MarketId, OutcomeId), Price>,
-    source_log_path: &Path,
-    now_unix: i64,
-    latency_was_active: bool,
-) -> Result<RiskSnapshot, RiskInputsUnavailable> {
-    build_paper_risk_snapshot_for_base(
-        base,
-        snapshot,
-        era,
-        current_prices,
-        source_log_path,
-        now_unix,
-        latency_was_active,
-    )
-}
-
-/// Scenario adapter for the golden fixture's historical complete-snapshot input.
-#[cfg(feature = "scenario")]
-pub fn build_paper_risk_snapshot(
-    base: &RiskSnapshot,
-    snapshot: &FinancialSnapshot,
-    era: &PaperEra,
-    current_prices: &HashMap<(MarketId, OutcomeId), Price>,
-    source_log_path: &Path,
-    now_unix: i64,
-    latency_was_active: bool,
-) -> Result<RiskSnapshot, RiskInputsUnavailable> {
-    build_paper_risk_snapshot_for_base(
-        base,
-        snapshot,
-        era,
-        current_prices,
-        source_log_path,
-        now_unix,
-        latency_was_active,
-    )
-}
-
-fn build_paper_risk_snapshot_for_base(
-    base: &PaperExposureBase,
-    snapshot: &FinancialSnapshot,
-    era: &PaperEra,
-    current_prices: &HashMap<(MarketId, OutcomeId), Price>,
-    source_log_path: &Path,
-    now_unix: i64,
-    latency_was_active: bool,
-) -> Result<RiskSnapshot, RiskInputsUnavailable> {
-    let source_receipts = paper_fill_source_receipts(era)?;
-    let received_millis =
-        source_receipt_millis_index(source_log_path, source_receipts.into_iter())?;
-    let latency = paper_latency_samples_from_source_receipts(era, now_unix, &|receipt| {
-        source_receipt_received_millis(&received_millis, receipt)
-    })?;
-    compose_paper_risk_snapshot(
-        base,
-        snapshot,
-        era,
-        current_prices,
-        now_unix,
-        latency.switch_active(latency_was_active),
-    )
 }
 
 /// Compose paper risk from a source prefix that the caller has already replayed and verified.
@@ -846,6 +770,7 @@ fn paper_latency_endpoint_samples(
     Ok(samples)
 }
 
+#[cfg(test)]
 fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, RiskInputsUnavailable> {
     let prepared = era
         .frames
@@ -1026,7 +951,8 @@ fn source_receipt_received_millis(
 ///
 /// Completed resolutions remove every earlier fill in that market. The caller supplies only the
 /// proposed trade facts that are not owned by the prefix; PnL, marks, and latency are composed by
-/// [`build_paper_risk_snapshot`]. Runtime and offline qualification use this same pure reducer.
+/// [`build_paper_risk_snapshot_from_source_receipts`]. Runtime and offline qualification use this
+/// same pure reducer.
 pub(crate) fn build_paper_risk_base(
     era: &PaperEra,
     leader_wallet: pe_core_types::WalletAddress,
@@ -1108,36 +1034,16 @@ pub(crate) fn build_paper_risk_base(
     let market_exposure_bps = exposure(market_exposure)?;
     let total_copy_exposure_bps = exposure(total_exposure)?;
     let proposed_trade_bps = exposure(proposed_debit)?;
-    #[cfg(not(feature = "scenario"))]
-    {
-        Ok(PaperExposureBase {
-            leader_exposure_bps,
-            market_exposure_bps,
-            // No durable market-family identity exists in the paper protocol. The market value is
-            // the conservative available family exposure rather than a fabricated zero.
-            family_exposure_bps: market_exposure_bps,
-            total_copy_exposure_bps,
-            proposed_trade_bps,
-            per_trade_cap_bps,
-        })
-    }
-    #[cfg(feature = "scenario")]
-    {
-        Ok(RiskSnapshot {
-            leader_exposure_bps,
-            market_exposure_bps,
-            // Scenario compatibility only: production uses the exposure-only struct above.
-            family_exposure_bps: market_exposure_bps,
-            total_copy_exposure_bps,
-            intraday_pnl_bps: pe_core_types::BasisPoints::ZERO,
-            rolling_7d_pnl_bps: pe_core_types::BasisPoints::ZERO,
-            absolute_pnl_bps: pe_core_types::BasisPoints::ZERO,
-            copy_latency_kill_switch_active: false,
-            proposed_trade_bps,
-            per_trade_cap_bps,
-            concentration_caps: None,
-        })
-    }
+    Ok(PaperExposureBase {
+        leader_exposure_bps,
+        market_exposure_bps,
+        // No durable market-family identity exists in the paper protocol. The market value is
+        // the conservative available family exposure rather than a fabricated zero.
+        family_exposure_bps: market_exposure_bps,
+        total_copy_exposure_bps,
+        proposed_trade_bps,
+        per_trade_cap_bps,
+    })
 }
 
 #[cfg(test)]

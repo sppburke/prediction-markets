@@ -3,7 +3,7 @@
 //! This module deliberately owns no HTTP client. It consumes only verified framed logs and the
 //! read-only paper-state projection, and emits canonical compact JSON with a trailing line feed.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -758,6 +758,11 @@ async fn verify_qualification(
     verify_recorded_prefix(&options.source_log, &seal.source_prefix)?;
     verify_recorded_prefix(&options.paper_log, &seal.financial_prefix)?;
     verify_start_prefix(&frames[start_index], &start)?;
+    verify_tail_extension(&start.live_prefix, &seal.live_prefix, "live journal")?;
+    if let Some(live_journal) = options.live_journal.as_deref() {
+        verify_recorded_prefix(live_journal, &start.live_prefix)?;
+        verify_recorded_prefix(live_journal, &seal.live_prefix)?;
+    }
     if let SealReason::InsufficientEvidence(reason) = &seal.reason {
         return Ok(insufficient_seal_report(
             &start,
@@ -1203,6 +1208,7 @@ async fn verify_qualification(
         options.live_journal.as_deref(),
         &options.source_log,
         &seal.source_prefix,
+        &seal.live_prefix,
         &start,
         &frames[start_index + 1..=financial_prefix_index],
     )?;
@@ -1415,8 +1421,8 @@ fn insufficient_seal_report(
             hot_config_hash: Some(start.hot_config_hash.clone()),
             financial_semantic_version: Some(start.financial_semantic_version),
             economic_core_hashes: Vec::new(),
-            live_prefix_hash: None,
-            live_journal_hash: None,
+            live_prefix_hash: Some(start.live_prefix.last_hash.clone()),
+            live_journal_hash: Some(seal.live_prefix.last_hash.clone()),
             live_wrapper_facts: Vec::new(),
         },
         replay: QualificationReplayReport {
@@ -1531,6 +1537,7 @@ fn verify_live_wrappers(
     live_journal: Option<&Path>,
     source_log: &Path,
     source_prefix: &TailBinding,
+    live_prefix: &TailBinding,
     start: &QualificationStarted,
     paper_frames: &[ScannedPaperFrame],
 ) -> Result<VerifiedLiveEvidence, QualificationError> {
@@ -1538,35 +1545,21 @@ fn verify_live_wrappers(
         return Ok(VerifiedLiveEvidence::default());
     };
 
-    verify_recorded_prefix(live_journal, &start.live_prefix)?;
-    let journal_tail =
-        pe_execution_core::LiveJournal::verified_tail(live_journal).map_err(|error| {
-            QualificationError::InsufficientEvidence(format!(
-                "live journal verification failed: {error}"
-            ))
-        })?;
+    let sealed_events = replay_live_prefix(live_journal, &start.live_prefix, live_prefix)?;
     let source_envelopes = sealed_source_envelopes(source_log, source_prefix)?;
     let paper_bases = paper_live_wrapper_bases(paper_frames)?;
-    let inventory = pe_execution_core::recovery_inventory(live_journal).map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "live journal strict replay failed: {error}"
-        ))
-    })?;
     let mut wrapper_facts = Vec::new();
 
-    for account_id in inventory.account_ids {
-        let mut events =
-            pe_execution_core::replay_account(live_journal, &account_id).map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "live journal account replay failed for {account_id}: {error}"
-                ))
-            })?;
-        events.retain(|event| {
-            start
-                .live_prefix
-                .last_sequence
-                .is_none_or(|last| event.seq > last.0)
-        });
+    let account_ids = sealed_events
+        .iter()
+        .map(|event| event.account_id.clone())
+        .collect::<BTreeSet<_>>();
+    for account_id in account_ids {
+        let events = sealed_events
+            .iter()
+            .filter(|event| event.account_id == account_id)
+            .cloned()
+            .collect::<Vec<_>>();
         crate::live_fanout::derive_projection_rows_with_sources(
             &account_id,
             &events,
@@ -1703,20 +1696,63 @@ fn verify_live_wrappers(
         }
     }
 
-    let after = pe_execution_core::LiveJournal::verified_tail(live_journal).map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "live journal verification failed: {error}"
-        ))
-    })?;
-    if after != journal_tail {
-        return insufficient("live journal changed during qualification verification");
-    }
-
     Ok(VerifiedLiveEvidence {
         prefix_hash: Some(start.live_prefix.last_hash.clone()),
-        journal_hash: Some(journal_tail.last_hash.to_hex().to_string()),
+        journal_hash: Some(live_prefix.last_hash.clone()),
         wrapper_facts,
     })
+}
+
+fn replay_live_prefix(
+    live_journal: &Path,
+    start_prefix: &TailBinding,
+    sealed_prefix: &TailBinding,
+) -> Result<Vec<pe_execution_core::LiveJournalEvent>, QualificationError> {
+    let Some(sealed_sequence) = sealed_prefix.last_sequence else {
+        return Ok(Vec::new());
+    };
+    let start_hash = tail_hash(start_prefix)?;
+    let sealed_hash = tail_hash(sealed_prefix)?;
+    let mut events = Vec::new();
+    for item in Reader::replay(live_journal)? {
+        let (sequence, envelope) = item?;
+        if sequence > sealed_sequence {
+            break;
+        }
+        if start_prefix.last_sequence == Some(sequence) && envelope.this_hash != start_hash {
+            return insufficient("live journal replay differs from its Start prefix");
+        }
+        if sequence == sealed_sequence && envelope.this_hash != sealed_hash {
+            return insufficient("live journal replay differs from its sealed prefix");
+        }
+        if start_prefix
+            .last_sequence
+            .is_some_and(|start_sequence| sequence <= start_sequence)
+        {
+            continue;
+        }
+        let event: pe_execution_core::LiveJournalEvent = serde_json::from_slice(&envelope.payload)
+            .map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "live journal event decode failed at sequence {sequence}: {error}"
+                ))
+            })?;
+        if event.seq != sequence.0 || event.timestamp != envelope.observed_at.0 {
+            return insufficient(format!(
+                "live journal event identity differs at sequence {sequence}"
+            ));
+        }
+        events.push(event);
+    }
+    if events
+        .last()
+        .map(|event| EventSeq(event.seq))
+        .or(start_prefix.last_sequence)
+        != Some(sealed_sequence)
+    {
+        return insufficient("live journal replay does not reach its sealed prefix");
+    }
+    Ok(events)
 }
 
 fn receipt_key(receipt: AppendReceipt) -> (u64, String) {
@@ -1839,6 +1875,31 @@ fn verify_recorded_prefix(path: &Path, recorded: &TailBinding) -> Result<(), Qua
         last_hash: tail_hash(recorded)?,
     };
     Scanner::verify_prefix(&expected)?;
+    Ok(())
+}
+
+fn verify_tail_extension(
+    start: &TailBinding,
+    sealed: &TailBinding,
+    label: &str,
+) -> Result<(), QualificationError> {
+    tail_hash(start)?;
+    tail_hash(sealed)?;
+    let sequence_extends = match (start.last_sequence, sealed.last_sequence) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(start), Some(sealed)) => sealed >= start,
+    };
+    if sealed.physical_tail < start.physical_tail || !sequence_extends {
+        return insufficient(format!(
+            "QualificationSealed {label} prefix precedes its Start prefix"
+        ));
+    }
+    if start.last_sequence == sealed.last_sequence && start != sealed {
+        return insufficient(format!(
+            "QualificationSealed {label} prefix changes its Start boundary"
+        ));
+    }
     Ok(())
 }
 
@@ -4710,6 +4771,45 @@ mod tests {
         }
     }
 
+    /// PASS: a sealed live tail may extend the Start tail, while regression and a changed binding
+    /// at the same sequence both fail closed before live-wrapper replay.
+    #[test]
+    fn sealed_live_tail_must_extend_the_exact_start_boundary() {
+        let start = TailBinding {
+            physical_tail: 100,
+            last_sequence: Some(EventSeq(4)),
+            last_hash: blake3::hash(b"start").to_hex().to_string(),
+        };
+        let extension = TailBinding {
+            physical_tail: 140,
+            last_sequence: Some(EventSeq(5)),
+            last_hash: blake3::hash(b"seal").to_hex().to_string(),
+        };
+        verify_tail_extension(&start, &extension, "live journal").unwrap();
+
+        let preceding = TailBinding {
+            physical_tail: 90,
+            last_sequence: Some(EventSeq(3)),
+            last_hash: blake3::hash(b"preceding").to_hex().to_string(),
+        };
+        assert!(matches!(
+            verify_tail_extension(&start, &preceding, "live journal"),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("precedes its Start prefix")
+        ));
+
+        let changed_boundary = TailBinding {
+            physical_tail: start.physical_tail,
+            last_sequence: start.last_sequence,
+            last_hash: blake3::hash(b"changed").to_hex().to_string(),
+        };
+        assert!(matches!(
+            verify_tail_extension(&start, &changed_boundary, "live journal"),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("changes its Start boundary")
+        ));
+    }
+
     fn activity_observation(sequence: u64, payload: &[u8]) -> SourceObservation {
         let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
         SourceObservation {
@@ -5939,6 +6039,7 @@ mod tests {
                 start_receipt,
                 source_prefix: TailBinding::from(&sealed_source_tail),
                 financial_prefix: TailBinding::from(&sealed_financial_tail),
+                live_prefix: TailBinding::from(&empty_source_prefix),
                 decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
                 sealed_cutoff_unix: cutoff_unix,
                 reason: SealReason::Complete,
