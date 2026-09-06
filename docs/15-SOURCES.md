@@ -164,10 +164,12 @@
 | https://docs.polymarket.com/concepts/resolution | 2026-09-01 | 2026-10-31 |
 | https://docs.polygon.technology/pos/reference/rpc-endpoints | 2026-09-05 | 2026-12-04 |
 | https://docs.polygon.technology/pos/concepts/finality/finality | 2026-09-05 | 2026-12-04 |
+| https://polygon.publicnode.com (`eth_chainId`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`) | 2026-09-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
+| https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-05 | 2026-11-04 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-09-01 | 2026-10-31 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-07-18 | 2026-09-16 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
@@ -251,6 +253,11 @@ Treat as research inspiration; not a production decision input unless an authori
   evidence is required before a live Fill Final; pending or conflicting evidence remains a recorded
   reconciliation outcome. Primary references are the Polymarket fee/compact-market documentation,
   Polygon RPC/finality documentation, and CTF Exchange v2 source at commit `ccc0596`.
+  Paper and live daily marks share the recorded CLOB `/prices-history` request with `fidelity=1`;
+  the successful response is appended before the latest at-or-before-cutoff sample is classified.
+  Ordinary-live fill finality reads `eth_chainId`, each distinct `eth_getTransactionReceipt`, the
+  finalized block, and any required canonical receipt-height block through the configured Polygon
+  JSON-RPC endpoint before decoding supported V2 `OrderFilled` logs.
 
 - 2026-09-03: Re-verified `/positions` size precision for issue #557 against an incident wallet.
   The current-position size was `34.0795`; the same wallet's incident REDEEM activity size was

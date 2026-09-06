@@ -216,9 +216,12 @@ Action eligibility:
 | `Flip` | block | The current first-entry gate blocks it; any future copy profile must also require `flip_human_approved = true` |
 | `Unknown` | block | Always |
 
-The classifier, strategy types, and paper executor retain generic SELL/reduction support for replay
-and a future inventory-backed exit profile. That lower-layer support does not make SELL reachable
-from the current production orchestrator.
+The classifier and strategy types retain generic SELL/reduction shapes for replay and a future
+inventory-backed exit profile. That lower-layer support does not make SELL reachable from the
+current production orchestrator. In the financial era, the orchestrator-owned paper writer is the
+sole serializer of `FinancialPrepared`/`FinancialFinal`: it synchronizes Prepared, applies the
+authority result and local projection, and synchronizes Final; recovery redrives the oldest unmatched
+Prepared through that same serialized writer before later financial work proceeds.
 
 Idempotency key: `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` where `observed_at_bucket = floor(observed_at_ms / 1_000)` (1-second buckets).
 

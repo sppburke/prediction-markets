@@ -16,8 +16,10 @@
 //!   returns 200. [`GAMMA_BROWSER_UA`] is therefore a defensive, self-identifying UA, not a
 //!   correctness requirement.
 //!
-//! The client is **pure fetch + parse + demux**. Cache writes, TTL, skip-sets, and
-//! resolution/`yes_won` logic stay at each call site.
+//! The client is **pure fetch + parse + demux**. Cache writes, TTL, skip-sets, and non-financial
+//! Gamma outcome-price consumers stay at each call site. Winner-Follow payout evidence does not use
+//! this client: paper and ordinary-live resolution record and parse CLOB
+//! `/markets/{condition_id}` responses.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -70,9 +72,9 @@ impl MarketFilter {
 
 /// A demuxed Gamma `/markets` row.
 ///
-/// Carries the fields the bootstrap schedule/liquidity passes and the paper-pnl resolution poller
-/// need (issue #382 Phase 2/3a), plus the service mid-price cache + WS2 liquidity-snapshot fields
-/// (`volume` / `clob_token_ids`, added in Phase 3b).
+/// Carries the fields used by bootstrap schedule/liquidity enrichment, service asset identity and
+/// mid-price caching, and the WS2 liquidity snapshot (`volume` / `clob_token_ids`). It is not a
+/// payout-evidence row; the shared CLOB `/markets/{condition_id}` parser owns that contract.
 #[derive(Clone, Debug)]
 pub struct GammaMarket {
     /// The market's condition id (the demux key — echoed by Gamma as `conditionId`).
@@ -88,12 +90,14 @@ pub struct GammaMarket {
     /// Current order-book depth indicator (USD). `None` when Gamma omits the field or sends an
     /// unparseable value (lenient decode — a bad scalar never fails the row).
     pub liquidity: Option<Decimal>,
-    /// Whether Gamma reports the market as resolved (`closed`). `false` when the field is omitted.
+    /// Whether Gamma reports the market as closed. `false` when the field is omitted. This metadata
+    /// is not Winner-Follow payout evidence.
     pub closed: bool,
     /// Outcome prices indexed by `outcome_id`, parsed from Gamma's `outcomePrices` JSON-string array
-    /// via [`parse_outcome_prices`] — resolved markets give `[1,0]`/`[0,1]`, open markets give live
-    /// mids. `None` when Gamma omits the field or the array is malformed. Individual non-decimal
-    /// entries fall back to `0` (the lenient paper-pnl semantic, issue #382 Q7).
+    /// via [`parse_outcome_prices`] — closed markets can show `[1,0]`/`[0,1]`, while open markets
+    /// provide live mids. `None` when Gamma omits the field or the array is malformed. Individual
+    /// non-decimal entries fall back to `0` only for legacy/non-financial consumers; they never form
+    /// a financial payout vector.
     pub outcome_prices: Option<Vec<Decimal>>,
     /// Strict financial projection of `outcomePrices`; malformed, out-of-range, or non-decimal
     /// entries make the whole vector unavailable instead of becoming zero.

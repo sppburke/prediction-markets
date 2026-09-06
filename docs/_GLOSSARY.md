@@ -457,7 +457,7 @@ restart-owned `ServiceConfig` TOML/environment contracts where they still exist:
 `supabase_sink_reconcile_interval_secs`. It also deletes the retired keys
 `entry_gate_fail_closed`, `position_page_limit`, `position_reseed_interval_secs`,
 `position_size_threshold`, `wallet_market_history_path`,
-`clob_best_ask_fallback_haircut_bps`, and `trade_poll_interval_secs`. Any database key outside
+and `trade_poll_interval_secs`. Any database key outside
 the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` before mutation.
 
 | Key | Default | Meaning |
