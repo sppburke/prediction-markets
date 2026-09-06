@@ -17,6 +17,7 @@ use pe_risk_engine::{
 };
 use pe_source_polymarket_public::ClassifiedPricesHistory;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use crate::paper_recovery::active_risk_halts;
@@ -547,12 +548,35 @@ impl LatencySamples {
 
 /// Replayed owner/cause state from which live latency hysteresis resumes.
 ///
-/// A synchronized risk-halt transition is a cross-log checkpoint: order responses at or before
-/// it have already contributed to the recorded state and must not be folded through it again.
+/// New manual releases bind to the exact journal prefix scanned. Historical transitions retain the
+/// former response-time checkpoint so already-recorded logs remain replayable after upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LatencyHysteresisSeed {
     pub active: bool,
-    pub transitioned_at_unix_ms: Option<i64>,
+    pub checkpoint: Option<LatencyReplayCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LatencyReplayCheckpoint {
+    LiveJournalTail(Option<EventSeq>),
+    LegacyResponseTime(i64),
+}
+
+/// Audited sequence/hash identity of the live-journal prefix used by a manual release scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveLatencyJournalTailEvidence {
+    pub last_sequence: Option<EventSeq>,
+    pub last_hash: String,
+}
+
+impl From<pe_execution_core::live_journal::LiveJournalTail> for LiveLatencyJournalTailEvidence {
+    fn from(tail: pe_execution_core::live_journal::LiveJournalTail) -> Self {
+        Self {
+            last_sequence: tail.last_sequence,
+            last_hash: tail.last_hash.to_hex().to_string(),
+        }
+    }
 }
 
 /// Rebuild the latest synchronized live-owner latency transition from the financial-era log.
@@ -565,30 +589,45 @@ pub(crate) fn latency_hysteresis_seed(
             owner: recorded_owner,
             cause: RiskHaltCause::CopyLatency,
             state,
-            ..
+            evidence,
         }) = &frame.frame
         else {
             return None;
         };
-        (recorded_owner == owner).then_some((frame, *state))
+        (recorded_owner == owner).then_some((frame, *state, evidence))
     });
-    let Some((frame, state)) = transition else {
+    let Some((frame, state, evidence)) = transition else {
         return Ok(LatencyHysteresisSeed {
             active: false,
-            transitioned_at_unix_ms: None,
+            checkpoint: None,
         });
     };
-    let transitioned_at_unix_ms = frame
-        .envelope
-        .received_at
-        .0
-        .unix_timestamp_nanos()
-        .checked_div(1_000_000)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let checkpoint = match evidence.get("live_journal_tail") {
+        Some(value) => {
+            let tail: LiveLatencyJournalTailEvidence = serde_json::from_value(value.clone())
+                .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+            let hash = blake3::Hash::from_hex(&tail.last_hash)
+                .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+            if tail.last_sequence.is_none() && hash != blake3::Hash::from_bytes([0; 32]) {
+                return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
+            }
+            LatencyReplayCheckpoint::LiveJournalTail(tail.last_sequence)
+        }
+        None => {
+            let transitioned_at_unix_ms = frame
+                .envelope
+                .received_at
+                .0
+                .unix_timestamp_nanos()
+                .checked_div(1_000_000)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or(RiskInputsUnavailable::Overflow)?;
+            LatencyReplayCheckpoint::LegacyResponseTime(transitioned_at_unix_ms)
+        }
+    };
     Ok(LatencyHysteresisSeed {
         active: state == HaltState::Engaged,
-        transitioned_at_unix_ms: Some(transitioned_at_unix_ms),
+        checkpoint: Some(checkpoint),
     })
 }
 
@@ -662,7 +701,7 @@ pub(crate) fn replayed_live_latency_switch(
         .checked_mul(SECONDS_PER_HOUR)
         .and_then(|value| value.checked_sub(SECONDS_PER_HOUR))
         .ok_or(RiskInputsUnavailable::Overflow)?;
-    let samples = live_latency_endpoint_samples(events, seed.transitioned_at_unix_ms)?;
+    let samples = live_latency_endpoint_samples(events, seed.checkpoint)?;
     let hourly = samples
         .into_iter()
         .filter(|(endpoint, _)| {
@@ -696,10 +735,17 @@ pub(crate) fn replayed_live_latency_switch(
 
 fn live_latency_endpoint_samples(
     events: &[pe_execution_core::LiveJournalEvent],
-    after_unix_ms: Option<i64>,
+    checkpoint: Option<LatencyReplayCheckpoint>,
 ) -> Result<Vec<(i64, u64)>, RiskInputsUnavailable> {
     let mut samples = Vec::new();
     for event in events {
+        if matches!(
+            checkpoint,
+            Some(LatencyReplayCheckpoint::LiveJournalTail(Some(last_sequence)))
+                if event.seq <= last_sequence.0
+        ) {
+            continue;
+        }
         let pe_execution_core::LiveJournalPayload::OrderPosted(posted) = &event.payload else {
             continue;
         };
@@ -712,7 +758,11 @@ fn live_latency_endpoint_samples(
             .checked_div(1_000_000)
             .and_then(|value| i64::try_from(value).ok())
             .ok_or(RiskInputsUnavailable::Overflow)?;
-        if after_unix_ms.is_some_and(|checkpoint| endpoint_ms <= checkpoint) {
+        if matches!(
+            checkpoint,
+            Some(LatencyReplayCheckpoint::LegacyResponseTime(transitioned_at_unix_ms))
+                if endpoint_ms <= transitioned_at_unix_ms
+        ) {
             continue;
         }
         let latency_ms = (response.received_at - response.observed_at)
@@ -1802,9 +1852,38 @@ mod tests {
         };
         let expected = LatencyHysteresisSeed {
             active: false,
-            transitioned_at_unix_ms: Some(7_202_000),
+            checkpoint: Some(LatencyReplayCheckpoint::LegacyResponseTime(7_202_000)),
         };
         assert_eq!(latency_hysteresis_seed(&era, &owner).unwrap(), expected);
         assert_eq!(latency_hysteresis_seed(&era, &owner).unwrap(), expected);
+    }
+
+    /// PASS: malformed journal-tail evidence fails closed instead of silently falling back to a
+    /// wall-clock checkpoint that could discard a delayed live response.
+    #[test]
+    fn latency_hysteresis_seed_rejects_malformed_live_tail() {
+        let owner = account();
+        let era = PaperEra {
+            start: None,
+            frames: vec![frame(
+                1,
+                7_200,
+                PaperLogRecord::RiskHaltChanged {
+                    owner: owner.clone(),
+                    cause: RiskHaltCause::CopyLatency,
+                    state: HaltState::Released,
+                    evidence: serde_json::json!({
+                        "live_journal_tail": {
+                            "last_sequence": EventSeq(4),
+                            "last_hash": "not-a-hash",
+                        },
+                    }),
+                },
+            )],
+        };
+        assert_eq!(
+            latency_hysteresis_seed(&era, &owner),
+            Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
+        );
     }
 }
