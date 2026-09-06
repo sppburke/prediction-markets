@@ -329,7 +329,7 @@ set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
 case "$*" in
   *--verify-staged-identity*)
-    echo 'prediction-edge revision=1111111111111111111111111111111111111111 artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    echo 'pe-service 0.1.0 revision=1111111111111111111111111111111111111111 config_identity=runtime-applied artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     ;;
   *--financial-era=prepare*)
     cat <<'JSON'
@@ -461,7 +461,7 @@ db.commit(); db.close()' "$generation/paper_state.db"
 #!/bin/bash
 set -euo pipefail
 if [[ "$*" == *--verify-staged-identity* ]]; then
-  echo 'prediction-edge revision=1111111111111111111111111111111111111111 artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  echo 'pe-service 0.1.0 revision=1111111111111111111111111111111111111111 config_identity=runtime-applied artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
   exit 0
 fi
 /usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" <<'PY'

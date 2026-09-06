@@ -256,7 +256,7 @@ psql_service_db -v ON_ERROR_STOP=1 -Atc \
 
 staged_identity=$(run_pe_service --verify-staged-identity)
 mapfile -t staged_identity_parts < <(python3 -c 'import re,sys
-match=re.fullmatch(r"prediction-edge revision=([0-9a-f]{40}) artifact_blake3=([0-9a-f]{64})\n?",sys.argv[1])
+match=re.fullmatch(r"pe-service \S+ revision=([0-9a-f]{40}) config_identity=\S+ artifact_blake3=([0-9a-f]{64})\n?",sys.argv[1])
 if match is None: raise SystemExit("pe-service staged identity is malformed")
 print(match.group(1)); print(match.group(2))' "$staged_identity")
 [[ ${#staged_identity_parts[@]} -eq 2 ]] || die "pe-service staged identity is incomplete"
