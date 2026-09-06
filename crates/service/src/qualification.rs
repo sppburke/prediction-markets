@@ -45,7 +45,7 @@ use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::bucket_commit::DecisionContinuationV2;
+use crate::bucket_commit::DecisionContinuationV3;
 use crate::config::ServiceConfig;
 use crate::decision_replay::replay_decision_pending;
 use crate::paper_recovery::{
@@ -415,7 +415,10 @@ async fn verify_qualification(
         let observation =
             verify_decision_source_inputs(decision, &source_observations, &options.source_log)?;
         if decision_observations
-            .insert(decision.continuation.source_trade_id.clone(), observation)
+            .insert(
+                decision.continuation.prior.source_trade_id.clone(),
+                observation,
+            )
             .is_some()
         {
             return insufficient("sealed decision evidence repeats a source trade identity");
@@ -1243,7 +1246,7 @@ fn decision_rows_from_source_observations(
     };
     let mut selected = Vec::new();
     for row in state.decision_pending_history()? {
-        let continuation = DecisionContinuationV2::from_durable(&row).map_err(|error| {
+        let continuation = DecisionContinuationV3::from_durable(&row).map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
                 "decision source receipt link is invalid: {error}"
             ))
@@ -1286,6 +1289,7 @@ fn verify_decision_source_inputs(
     source_log_path: &Path,
 ) -> Result<pe_execution_core::ObservationEvidence, QualificationError> {
     let continuation = &decision.continuation;
+    let frozen = &continuation.prior;
     let observation = continuation
         .observation_from_source_log(source_log_path)
         .map_err(|error| {
@@ -1331,7 +1335,7 @@ fn verify_decision_source_inputs(
         }
         let window = parse_activity_response(
             &source.payload,
-            continuation.wallet,
+            frozen.wallet,
             &ActivityParseContext {
                 source_id: SourceId(source.source_id.clone()),
                 observed_at: source.observed_at.clone(),
@@ -1353,7 +1357,7 @@ fn verify_decision_source_inputs(
     })?;
     let mut matching = aggregates
         .iter()
-        .filter(|aggregate| aggregate.group_id.key() == &continuation.source_trade_id);
+        .filter(|aggregate| aggregate.group_id.key() == &frozen.source_trade_id);
     let aggregate = matching.next().ok_or_else(|| {
         QualificationError::InsufficientEvidence(
             "decision activity aggregate is absent from its raw pages".to_owned(),
@@ -1364,22 +1368,22 @@ fn verify_decision_source_inputs(
     }
     let components = aggregate.group_id.components();
     if components.activity_type != ActivityType::Trade
-        || components.wallet != continuation.wallet
-        || components.transaction_hash != continuation.transaction_hash
+        || components.wallet != frozen.wallet
+        || components.transaction_hash != frozen.transaction_hash
         || components
             .condition_id
             .as_ref()
-            .is_none_or(|condition| condition.0 != continuation.market_id.0.0)
-        || components.outcome != Some(continuation.outcome_id)
-        || components.side != Some(continuation.side)
-        || aggregate.share_sum != continuation.share_amount
+            .is_none_or(|condition| condition.0 != frozen.market_id.0.0)
+        || components.outcome != Some(frozen.outcome_id)
+        || components.side != Some(frozen.side)
+        || aggregate.share_sum != frozen.share_amount
         || aggregate.volume_weighted_price().map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
                 "decision aggregate price replay failed: {error}"
             ))
-        })? != continuation.price
-        || aggregate.source_time.0.unix_timestamp() != continuation.source_epoch
-        || aggregate.semantic_revision.as_str() != continuation.semantic_revision
+        })? != frozen.price
+        || aggregate.source_time.0.unix_timestamp() != frozen.source_epoch
+        || aggregate.semantic_revision.as_str() != frozen.semantic_revision
     {
         return insufficient("decision continuation differs from its raw activity aggregate");
     }
@@ -2414,7 +2418,7 @@ fn complete_day_growth(
     Ok(growth)
 }
 
-/// Scenario compatibility helper for fixtures whose entire financial era is already causal.
+/// Scenario helper for fixtures whose entire financial era is already causal.
 #[cfg(feature = "scenario")]
 #[must_use]
 pub fn qualification_completion(
@@ -2554,7 +2558,7 @@ fn bind_final_receipts(
         let final_receipt = terminal.final_receipt.ok_or_else(|| {
             QualificationError::InsufficientEvidence(format!(
                 "fill decision {} has no FinancialFinal receipt",
-                decision.continuation.source_trade_id
+                decision.continuation.prior.source_trade_id
             ))
         })?;
         let mut candidates = fills
@@ -2563,14 +2567,14 @@ fn bind_final_receipts(
         let fill = candidates.next().ok_or_else(|| {
             QualificationError::InsufficientEvidence(format!(
                 "fill decision {} references no FinancialFinal",
-                decision.continuation.source_trade_id
+                decision.continuation.prior.source_trade_id
             ))
         })?;
         if candidates.next().is_some() || !matched_finals.insert(receipt_key(final_receipt)) {
             return insufficient("multiple fill decisions bind the same FinancialFinal");
         }
 
-        let continuation = &decision.continuation;
+        let continuation = &decision.continuation.prior;
         let decision_key = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
             &TraderId(continuation.wallet).to_string(),
             &continuation.source_trade_id.0,
@@ -4384,8 +4388,6 @@ mod tests {
                 bankroll: dec!(100),
             },
             decision_inputs: serde_json::json!({"post_seal": true}),
-            observed_source_receipt: None,
-            page_occurrences: Vec::new(),
         };
         let terminal = crate::decision_replay::TerminalDispositionEvidence::no_copy("post_seal");
         let terminal_disposition = terminal.disposition.clone();

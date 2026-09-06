@@ -469,7 +469,7 @@ fn plan_principal_buy_with_scale(
     Ok(plan)
 }
 
-/// Exact-share compatibility adapter used by the isolated canary.
+/// Exact-share entry point used by the isolated canary.
 pub(crate) fn plan_exact_shares(
     asks: &[AskLevel],
     requested_shares: ShareAmount,

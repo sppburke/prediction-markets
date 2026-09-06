@@ -25,7 +25,7 @@ use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::bucket_commit::DecisionContinuationV2;
+use crate::bucket_commit::DecisionContinuationV3;
 use crate::decision_replay::{
     AuthorityEvidence, DecisionEvidenceAccumulator, TerminalDispositionEvidence,
 };
@@ -34,7 +34,6 @@ use crate::position_seeder::ledger_capture;
 use crate::supabase_sink::supabase_fill_from;
 
 pub const PAPER_LOG_SCHEMA_VERSION: u32 = 2;
-pub use PAPER_LOG_SCHEMA_VERSION as PAPER_LOG_SCHEMA_VERSION_V2;
 /// Current paper financial meaning. A changed value seals the active qualification before use.
 pub const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
 
@@ -1298,7 +1297,7 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
         if let (Some(source_trade_id), Some(pending_row)) =
             (source_trade_id.as_ref(), pending_row.as_ref())
         {
-            let continuation = DecisionContinuationV2::from_durable(pending_row)
+            let continuation = DecisionContinuationV3::from_durable(pending_row)
                 .context("decode pending paper-log continuation")?;
             let evidence = DecisionEvidenceAccumulator::from_pending_checkpoint(pending_row)
                 .context("decode pending paper-log evidence checkpoint")?;
@@ -1307,9 +1306,9 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
                 .context("load pending paper-log leader mirror")?
                 .into_iter()
                 .find(|leader| {
-                    leader.wallet == continuation.wallet
-                        && leader.market_id == continuation.market_id
-                        && leader.outcome_id == continuation.outcome_id
+                    leader.wallet == continuation.prior.wallet
+                        && leader.market_id == continuation.prior.market_id
+                        && leader.outcome_id == continuation.prior.outcome_id
                 })
                 .context("pending paper-log continuation has no leader mirror")?;
             let fill_pending = render_pending_evidence(

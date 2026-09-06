@@ -45,7 +45,7 @@ use crate::decision_replay::{
 use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pending_evidence};
 use crate::paper_recovery::{
     CanonicalFillResult, CanonicalResolutionResult, ExpectedAuthority, FinancialPayload,
-    FinancialResult, PAPER_LOG_SCHEMA_VERSION_V2, PaperFillOperationIdentity, PaperLogFrame,
+    FinancialResult, PAPER_LOG_SCHEMA_VERSION, PaperFillOperationIdentity, PaperLogFrame,
     PaperLogRecord, paper_era, scan_paper_log,
 };
 use crate::supabase_reader::auth_token;
@@ -1133,7 +1133,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
         let final_receipt = writer
             .append_synced(EnvelopeIn {
                 source_id: SourceId("pe-service.paper".to_owned()),
-                schema_version: PAPER_LOG_SCHEMA_VERSION_V2,
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
                 parser_version: 1,
                 observed_at: SourceTimestamp(now),
                 received_at: ReceivedAt(now),
@@ -1904,7 +1904,7 @@ mod tests {
         };
         let start = append_test_record(
             &mut writer,
-            PAPER_LOG_SCHEMA_VERSION_V2,
+            PAPER_LOG_SCHEMA_VERSION,
             &PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
                 starting_bankroll: CollateralAmount::from_decimal_exact(Decimal::from(100u32))
                     .unwrap(),
@@ -1927,7 +1927,7 @@ mod tests {
         );
         let prepared = append_test_record(
             &mut writer,
-            PAPER_LOG_SCHEMA_VERSION_V2,
+            PAPER_LOG_SCHEMA_VERSION,
             &PaperLogRecord::FinancialPrepared {
                 expected_authority: ExpectedAuthority {
                     qualification_start_receipt: start,
