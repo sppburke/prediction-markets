@@ -67,7 +67,10 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
 use crate::activity_ingest::SourceLogHandle;
-use crate::clob_book::{ClobBookFetcher, ReqwestClobBookFetcher};
+use crate::clob_book::{
+    CLOB_BOOK_PARSER_VERSION, CLOB_BOOK_SCHEMA_VERSION, CLOB_BOOK_SOURCE_ID, ClobBookFetcher,
+    ReqwestClobBookFetcher,
+};
 use crate::live_accounts::{AccountContext, LiveAccounts};
 use crate::live_credentials::{
     CredentialBinding, CredentialError, LiveAccountCredentials, decrypt_bundle,
@@ -80,6 +83,7 @@ use crate::live_projections::{
     LiveAccountStateRow, LiveFillRow, LivePositionRow, LiveProjectionWriter,
 };
 use crate::live_venue_adapter::{
+    CLOB_COMPACT_MARKET_SOURCE_ID, CLOB_LONG_MARKET_SOURCE_ID, LIVE_MARKET_FRESHNESS_SECS,
     LiveAdmissionBuilder, LiveRedemptionAdapter, LiveVenueAdapterError, PolygonReceiptReader,
     PolygonReceiptRpc, PolymarketLiveVenue,
 };
@@ -188,7 +192,10 @@ fn replay_live_account(
     if let Some(prefix) = &state.config.era_live_prefix {
         events.retain(|event| prefix.last_sequence.is_none_or(|last| event.seq > last.0));
     }
-    Ok(events)
+    let baseline_index =
+        pe_execution_core::live_journal::first_account_baseline_index(&events, account_id)
+            .unwrap_or(events.len());
+    Ok(events.split_off(baseline_index))
 }
 
 fn derive_projection_rows_for_state(
@@ -2901,11 +2908,6 @@ pub(crate) fn replay_source_backed_economic<L>(
 where
     L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
 {
-    const CLOB_LONG_SOURCE_ID: &str = "polymarket.clob.markets";
-    const CLOB_COMPACT_SOURCE_ID: &str = "polymarket.clob.compact-market";
-    const CLOB_BOOK_SOURCE_ID: &str = "polymarket.clob.book";
-    const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
-
     let receipts = economic.admission.receipts;
     if [
         receipts.gamma.sequence,
@@ -2932,7 +2934,7 @@ where
     )?;
     let clob_long = exact_economic_source(
         receipts.clob_long,
-        CLOB_LONG_SOURCE_ID,
+        CLOB_LONG_MARKET_SOURCE_ID,
         LIVE_MARKET_SCHEMA_VERSION,
         LIVE_MARKET_PARSER_VERSION,
         evidence_cutoff_unix_ms,
@@ -2940,7 +2942,7 @@ where
     )?;
     let clob_compact = exact_economic_source(
         receipts.clob_compact,
-        CLOB_COMPACT_SOURCE_ID,
+        CLOB_COMPACT_MARKET_SOURCE_ID,
         LIVE_MARKET_SCHEMA_VERSION,
         LIVE_MARKET_PARSER_VERSION,
         evidence_cutoff_unix_ms,
@@ -2949,19 +2951,21 @@ where
     let book_observation = exact_economic_source(
         economic.book_receipt,
         CLOB_BOOK_SOURCE_ID,
-        1,
-        1,
+        CLOB_BOOK_SCHEMA_VERSION,
+        CLOB_BOOK_PARSER_VERSION,
         evidence_cutoff_unix_ms,
         &mut lookup,
     )?;
+    let market_observed_at_unix = gamma
+        .received_unix_ms
+        .max(clob_long.received_unix_ms)
+        .div_euclid(1_000);
+    let settlement_observed_at_unix = clob_long.received_unix_ms.div_euclid(1_000);
     if economic.admission.market.freshness_window_secs != LIVE_MARKET_FRESHNESS_SECS
-        || economic.admission.market.observed_at_unix < 0
-        || economic
-            .admission
-            .market
-            .observed_at_unix
-            .checked_mul(1_000)
-            .is_none_or(|observed| observed > gamma.received_unix_ms)
+        || market_observed_at_unix < 0
+        || settlement_observed_at_unix < 0
+        || economic.admission.market.observed_at_unix != market_observed_at_unix
+        || economic.admission.settlement.observed_at_unix != settlement_observed_at_unix
     {
         return Err(economic_replay_error(
             "economic admission clock or freshness contract is invalid",
@@ -2971,7 +2975,7 @@ where
         &gamma.payload,
         &clob_long.payload,
         &economic.market.condition_id,
-        economic.admission.market.observed_at_unix,
+        market_observed_at_unix,
         LIVE_MARKET_FRESHNESS_SECS,
     )
     .map_err(|error| {
@@ -3000,7 +3004,7 @@ where
             status: pe_resolver_card::VenueResolutionStatus::Unresolved,
             raw_evidence_hash: blake3::hash(&clob_long.payload).to_hex().to_string(),
             source_timestamp_unix: None,
-            observed_at_unix: market.observed_at_unix,
+            observed_at_unix: settlement_observed_at_unix,
             parser_version: 1,
             freshness_window_secs: LIVE_MARKET_FRESHNESS_SECS,
         },
@@ -3012,8 +3016,14 @@ where
             clob_compact: receipts.clob_compact,
         },
     };
-    let book = crate::clob_book::OrderBook::from_book_json(&book_observation.payload)
+    let book = crate::clob_book::OrderBook::from_book_json_with_identity(&book_observation.payload)
         .map_err(|error| economic_replay_error(format!("economic book replay failed: {error}")))?;
+    book.validate_identity(
+        &economic.market.token_id.0,
+        Some(&economic.market.condition_id.0),
+    )
+    .map_err(|error| economic_replay_error(format!("economic book replay failed: {error}")))?;
+    let book = book.into_order_book();
     let asks = book
         .ladder()
         .ok_or_else(|| economic_replay_error("economic book cannot form the production ladder"))?;
@@ -7980,10 +7990,12 @@ mod tests {
         let paper_frames = scan_paper_log(&paper_path).unwrap();
 
         let account_id = AccountId::new("account").unwrap();
-        let prior = finality_prepared();
+        let mut prior = finality_prepared();
+        prior.economic.admission.market.observed_at_unix = now.unix_timestamp();
+        prior.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         let events = vec![
             baseline_event(&account_id, 0),
-            approved_admission_event(&account_id, &prior, 1, OffsetDateTime::UNIX_EPOCH),
+            approved_admission_event(&account_id, &prior, 1, now),
             LiveJournalEvent {
                 account_id: account_id.clone(),
                 seq: 2,
@@ -8239,8 +8251,12 @@ mod tests {
         let mut substituted_book_sources = sources.clone();
         substituted_book_sources.push(source_envelope(
             substituted_book_receipt,
-            "polymarket.clob.book",
-            br#"{"asks":[{"price":"0.81","size":"3.125"}]}"#.to_vec(),
+            CLOB_BOOK_SOURCE_ID,
+            format!(
+                r#"{{"market":"{}","asset_id":"123","asks":[{{"price":"0.81","size":"3.125"}}]}}"#,
+                admission.economic.market.condition_id.0
+            )
+            .into_bytes(),
             OffsetDateTime::from_unix_timestamp(20).unwrap(),
         ));
         let mut substituted_book = admission.clone();
@@ -8256,6 +8272,124 @@ mod tests {
             ),
             Err(ProjectionReducerError::InvalidRiskEvidence)
         ));
+    }
+
+    /// PASS: an otherwise byte-equivalent economic ladder carrying a different token identity is
+    /// rejected before strict live replay can accept or project it.
+    /// FAIL: changing only `asset_id` leaves the recorded admission replayable.
+    #[test]
+    fn strict_live_economic_rejects_book_asset_identity_substitution() {
+        let (dir, account_id, events, mut sources, paper_frames, admission) =
+            reconstructed_live_risk_fixture();
+        let journal_path = dir.path().join("live.journal");
+        let book = sources
+            .iter_mut()
+            .find(|source| {
+                source.seq == admission.economic.book_receipt.sequence
+                    && source.this_hash == admission.economic.book_receipt.this_hash
+            })
+            .unwrap();
+        book.payload = format!(
+            r#"{{"market":"{}","asset_id":"substituted-token","asks":[{{"price":"0.80","size":"3.125"}}]}}"#,
+            admission.economic.market.condition_id.0
+        )
+        .into_bytes();
+
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &admission,
+                &sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+    }
+
+    fn replay_economic_with_clocks(
+        gamma_received_unix_ms: i64,
+        clob_long_received_unix_ms: i64,
+        recorded_market_unix: i64,
+        recorded_settlement_unix: i64,
+    ) -> Result<SourceBackedEconomicReplay, EconomicReplayError> {
+        let mut economic = finality_prepared().economic.clone();
+        economic.admission.market.observed_at_unix = recorded_market_unix;
+        economic.admission.settlement.observed_at_unix = recorded_settlement_unix;
+        economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        let payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let receipts = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ];
+        let source_ids = [
+            GAMMA_MARKETS_SOURCE_ID,
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
+        ];
+        let received_unix_ms = [
+            gamma_received_unix_ms,
+            clob_long_received_unix_ms,
+            clob_long_received_unix_ms,
+            clob_long_received_unix_ms,
+        ];
+        let observations = receipts
+            .into_iter()
+            .zip(source_ids)
+            .zip(payloads)
+            .zip(received_unix_ms)
+            .map(|(((receipt, source_id), payload), received_unix_ms)| {
+                (
+                    receipt,
+                    RecordedEconomicSource {
+                        payload,
+                        received_unix_ms,
+                        source_id: source_id.to_owned(),
+                        schema_version: 1,
+                        parser_version: 1,
+                        content_type: ContentType::Json,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        replay_source_backed_economic(
+            &economic,
+            clob_long_received_unix_ms.saturating_add(10_000),
+            CollateralAmount::from_atomic(10_000_000),
+            |receipt| {
+                observations
+                    .iter()
+                    .find(|(candidate, _)| *candidate == receipt)
+                    .map(|(_, observation)| observation.clone())
+                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+            },
+        )
+    }
+
+    /// PASS: the source-backed owner used by live and qualification replay accepts receipt clocks
+    /// within one UTC second and derives that second for both market and settlement evidence.
+    #[test]
+    fn strict_live_economic_clock_accepts_same_second_receipts() {
+        replay_economic_with_clocks(20_100, 20_999, 20, 20).unwrap();
+    }
+
+    /// PASS: the source-backed owner used by live and qualification replay derives the market
+    /// second from the later CLOB-long receipt when Gamma and CLOB straddle a second boundary.
+    #[test]
+    fn strict_live_economic_clock_accepts_second_straddling_receipts() {
+        replay_economic_with_clocks(20_999, 21_001, 21, 21).unwrap();
+    }
+
+    /// PASS: strict replay rejects either recorded clock when it copies another receipt's second
+    /// instead of equaling the independently derived market and settlement clocks.
+    #[test]
+    fn strict_live_economic_clock_rejects_copied_clock_tamper() {
+        assert!(replay_economic_with_clocks(20_999, 21_001, 20, 21).is_err());
+        assert!(replay_economic_with_clocks(20_999, 21_001, 21, 20).is_err());
     }
 
     /// PASS: payloads that conflict with the copied admission or ladder fail even when presented
@@ -9656,7 +9790,10 @@ mod tests {
             r#"{{"c":"{condition_id}","t":[{{"t":"123","o":"Yes"}},{{"t":"124","o":"No"}}],"mts":0.01,"mos":1,"nr":false,"fd":{{"r":0.00024,"e":1,"to":true}}}}"#
         )
         .into_bytes();
-        let book = br#"{"asks":[{"price":"0.80","size":"3.125"}]}"#.to_vec();
+        let book = format!(
+            r#"{{"market":"{condition_id}","asset_id":"123","asks":[{{"price":"0.80","size":"3.125"}}]}}"#
+        )
+        .into_bytes();
         [gamma, clob_long, clob_compact, book]
     }
 
@@ -9680,9 +9817,9 @@ mod tests {
         ];
         let source_ids = [
             GAMMA_MARKETS_SOURCE_ID,
-            "polymarket.clob.markets",
-            "polymarket.clob.compact-market",
-            "polymarket.clob.book",
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
         ];
         receipts
             .into_iter()
@@ -9705,9 +9842,9 @@ mod tests {
         );
         let source_ids = [
             GAMMA_MARKETS_SOURCE_ID,
-            "polymarket.clob.markets",
-            "polymarket.clob.compact-market",
-            "polymarket.clob.book",
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
         ];
         let mut receipts = Vec::new();
         for (source_id, payload) in source_ids.into_iter().zip(payloads.iter()) {
@@ -9734,6 +9871,8 @@ mod tests {
             clob_compact: receipts[2],
         };
         economic.book_receipt = receipts[3];
+        economic.admission.market.observed_at_unix = received_at.unix_timestamp();
+        economic.admission.settlement.observed_at_unix = received_at.unix_timestamp();
         economic.admission.settlement.raw_evidence_hash =
             blake3::hash(&payloads[1]).to_hex().to_string();
     }
@@ -12757,6 +12896,102 @@ mod tests {
             this_hash: resolution.source_append_receipt.this_hash,
             payload,
         }
+    }
+
+    /// PASS: a finalized fill entirely before the account's first Baseline causes no resolution
+    /// GET and appends no current-era `ResolutionFinalized` fact, even when the loopback endpoint
+    /// would report the market resolved.
+    /// FAIL: resolution discovery observes the pre-Baseline fill, reaches the loopback server, or
+    /// grows the journal.
+    #[tokio::test]
+    async fn redemption_recovery_ignores_pre_baseline_fills() {
+        async fn resolved_market(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "active": false,
+                "closed": true,
+                "condition_id": format!("0x{}", "77".repeat(32)),
+                "tokens": [
+                    {"token_id":"123", "outcome":"Yes", "price":"1", "winner":true},
+                    {"token_id":"124", "outcome":"No", "price":"0", "winner":false}
+                ]
+            }))
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(get(resolved_market))
+            .with_state(Arc::clone(&hits));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let snapshot = LiveAccountsSnapshot::from_rows(Vec::new(), &[]);
+        let mut state = fanout_state(&dir, db, snapshot, "http://127.0.0.1:9", None);
+        state.config.clob_base_url = format!("http://{address}");
+        let account_id = AccountId::new("pre-baseline-redemption").unwrap();
+        let prepared = finality_prepared();
+        let prepared_event = state
+            .config
+            .journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::from_unix_timestamp(1).unwrap(),
+                LiveJournalPayload::OrderPrepared(prepared.clone()),
+            )
+            .unwrap();
+        let finalized = finalized_fill_event(
+            &account_id,
+            &prepared,
+            prepared_event.seq.saturating_add(1),
+            prepared_event.seq,
+        );
+        state
+            .config
+            .journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::from_unix_timestamp(2).unwrap(),
+                finalized.payload,
+            )
+            .unwrap();
+        append_recovery_baseline(
+            &state,
+            &account_id,
+            OffsetDateTime::from_unix_timestamp(3).unwrap(),
+            CollateralAmount::from_atomic(10_000_000),
+        )
+        .await;
+        let before = replay_account(&state.config.journal_path, &account_id)
+            .unwrap()
+            .len();
+        let events = replay_live_account(&state, &account_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].payload,
+            LiveJournalPayload::AccountPortfolioMarked(_)
+        ));
+
+        discover_live_resolutions(
+            &state,
+            &account_id,
+            &events,
+            &mut BTreeMap::new(),
+            OffsetDateTime::from_unix_timestamp(4).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            replay_account(&state.config.journal_path, &account_id)
+                .unwrap()
+                .len(),
+            before
+        );
+        server.abort();
     }
 
     /// PASS: live resolution floors an aggregate half payout once and credits a losing outcome zero.
