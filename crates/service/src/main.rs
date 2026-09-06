@@ -51,8 +51,8 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::runtime_config::{
-    AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, RuntimeConfigStatus,
-    load_initial_runtime_config,
+    AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, MAX_ACTIVE_WATCHLIST_SIZE,
+    RuntimeConfigStatus, load_initial_runtime_config,
 };
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
@@ -360,85 +360,83 @@ async fn main() -> Result<()> {
     let runtime_config_status = RuntimeConfigStatus::new(&initial_runtime_config);
     let live_runtime_config = LiveRuntimeConfig::new(initial_runtime_config.clone());
 
-    // Bootstrap the initial wallet set from Supabase `latest_ranking` — the sole wallet
-    // source (#339, #370). The fetch also returns the last-trade side-map (#357): each
-    // wallet's real last on-chain trade time, used below to seed the poll cursor (the
-    // inactivity clock). There is no leaderboard/seed fallback — the service hard-fails fast
-    // if Supabase is empty or unreachable at boot, chosen over running an unvalidated set.
-    // Deploy precondition: the authoritative `rank_and_push` cron must already be populating
-    // `latest_ranking`.
-    // Record the ranking batch observed at boot BEFORE fetching the watchlist, so a batch
-    // landing in between reads as a transition on the first maintenance tick (full_rerank
-    // then swaps immediately) rather than being pinned as already-seen. Best-effort: `None`
-    // makes the first full-rerank tick apply whatever batch it observes (#542).
-    let boot_batch_marker = supabase_reader::fetch_latest_batch_id(
-        &reqwest::Client::new(),
-        &cfg.supabase_url,
-        &cfg.supabase_anon_key,
-        &cfg.supabase_secret_key,
-    )
-    .await
-    .unwrap_or_default();
-
+    // A financial Start makes the synchronized paper prefix the structural membership owner.
+    // Its initial entries come from the exact ranking batch named by Start; subsequent additions
+    // come from each durable MembershipChanged replacement evidence. Therefore a newer published
+    // batch with no synchronized membership record remains a transition for the first maintenance
+    // tick instead of changing (or invalidating) the boot generation.
     let initial_watchlist_size = live_runtime_config.snapshot().active_watchlist_size;
-    let (mut initial_watchlist, mut bootstrap_last_trade): (Watchlist, HashMap<_, _>) =
-        supabase_reader::fetch(
-            &reqwest::Client::new(),
+    let ranking_client = reqwest::Client::new();
+    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker): (
+        Watchlist,
+        HashMap<_, _>,
+        Option<i64>,
+    ) = if let Some((_, start)) = &financial_start_record {
+        let (start_batch, mut start_last_trade) = supabase_reader::fetch_batch(
+            &ranking_client,
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+            start.ranking_batch_id,
+            MAX_ACTIVE_WATCHLIST_SIZE,
+        )
+        .await
+        .context("fetch QualificationStarted ranking batch")?;
+        let era = financial_era
+            .as_ref()
+            .context("QualificationStarted is missing its financial era")?;
+        let replayed = replay_membership(era, start_batch)
+            .context("replay Start-bound structural membership")?
+            .context("QualificationStarted is missing from its financial era")?;
+        let restored = replayed
+            .watchlist
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>();
+        start_last_trade.retain(|wallet, _| restored.contains(wallet));
+        (
+            replayed.watchlist,
+            start_last_trade,
+            Some(replayed.last_ranking_batch_id),
+        )
+    } else {
+        // Before a financial Start, `latest_ranking` remains the boot owner. Read its marker first
+        // so a batch landing between the two reads is applied on the first maintenance tick. A
+        // failed marker read becomes `None`, which also forces the first full-rerank tick (#542).
+        let marker = supabase_reader::fetch_latest_batch_id(
+            &ranking_client,
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        )
+        .await
+        .unwrap_or_default();
+        let (watchlist, last_trade) = supabase_reader::fetch(
+            &ranking_client,
             &cfg.supabase_url,
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
             initial_watchlist_size,
         )
         .await
-        .context("bootstrap watchlist from Supabase (the sole wallet source)")?;
-    if let Some(restored_membership) = financial_era
-        .as_ref()
-        .map(replay_membership)
-        .transpose()
-        .context("replay Start-bound structural membership")?
-        .flatten()
-    {
-        let restored = restored_membership.into_iter().collect::<HashSet<_>>();
-        let available = initial_watchlist
-            .entries
-            .iter()
-            .map(|entry| entry.wallet)
-            .collect::<HashSet<_>>();
-        let mut missing = restored.difference(&available).copied().collect::<Vec<_>>();
-        missing.sort_unstable_by_key(|wallet| wallet.0);
-        anyhow::ensure!(
-            missing.is_empty(),
-            "Start-bound membership cannot be reconstructed from current ranking entries: {missing:?}"
-        );
-        initial_watchlist
-            .entries
-            .retain(|entry| restored.contains(&entry.wallet));
-        bootstrap_last_trade.retain(|wallet, _| restored.contains(wallet));
-        initial_watchlist.active_count = initial_watchlist
-            .entries
-            .iter()
-            .filter(|entry| entry.tier == pe_trader_index::WatchlistTier::Active)
-            .count();
-        initial_watchlist.incubator_count = initial_watchlist
-            .entries
-            .len()
-            .saturating_sub(initial_watchlist.active_count);
-    }
+        .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;
+        (watchlist, last_trade, marker)
+    };
     info!(
         active = initial_watchlist.active_count,
         total = initial_watchlist.entries.len(),
-        "watchlist bootstrapped from supabase"
+        batch_id = ?boot_batch_marker,
+        durable = financial_start.is_some(),
+        "watchlist membership rebuilt"
     );
 
-    // Fail fast if Supabase returned no wallets — there is no fallback source (#370). The read is
-    // survivor-filtered (#518), so "empty" now has two causes: `latest_ranking` itself is empty
-    // (the authoritative `rank_and_push` cron has not populated it), or the newest batch carries
-    // no surviving rows (no verdict recorded, or the ranker endorsed nobody). Both fail closed:
-    // refuse to boot rather than run with an empty watchlist.
+    // Fail fast if the selected Supabase batch returned no durable members — there is no fallback
+    // source (#370). Both the pre-Start moving read and the Start-pinned read are survivor-filtered
+    // (#518), so a batch with no surviving rows fails closed rather than running an empty set.
     anyhow::ensure!(
         !initial_watchlist.entries.is_empty(),
-        "no wallets to copy: Supabase `latest_ranking` returned no SURVIVING rows \
-         (is rank_and_push populating it, and does the newest batch carry `survives` verdicts?)"
+        "no wallets to copy: the boot membership generation contains no SURVIVING rows"
     );
 
     let (projection_dirty, projection_dirty_rx) = projection_dirty_channel();
