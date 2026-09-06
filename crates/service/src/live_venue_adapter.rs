@@ -14,10 +14,11 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use pe_core_types::{
-    CollateralAmount, Price, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
-    ReceivedAt, SourceId, SourceTimestamp, TransportErrorClass,
+    AccountId, CollateralAmount, Price, RawEvidence, RawHttpAttempt, RawHttpResponse,
+    RawTransportFailure, ReceivedAt, SourceId, SourceTimestamp, TransportErrorClass, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
+use pe_execution_core::live_journal::LiveAccountBindingAudit;
 use pe_execution_core::{
     AdmissionReceipts, LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact,
     LiveExecutedAmounts, LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification,
@@ -267,6 +268,12 @@ pub enum LiveVenueAdapterError {
 /// Concrete per-account V2 order venue. Constructed only after the account bundle decrypts.
 pub struct PolymarketLiveVenue {
     client: CanaryV2Client,
+    account_binding: LiveAccountBindingAudit,
+}
+
+pub(crate) struct BoundLiveVenueAccountState {
+    pub state: LiveVenueAccountState,
+    pub binding: LiveAccountBindingAudit,
 }
 
 impl PolymarketLiveVenue {
@@ -288,7 +295,23 @@ impl PolymarketLiveVenue {
         // Authentication/version observations belong to the first real read, not to a later
         // unrelated operation. The composite reconciliation call captures its own responses.
         let _ = client.take_observations();
-        Ok(Self { client })
+        let account_id = AccountId::new(&credentials.account_id)
+            .map_err(|error| LiveVenueAdapterError::Client(error.to_string()))?;
+        let custody_wallet = WalletAddress::from_hex(&credentials.deposit_wallet)
+            .map_err(|error| LiveVenueAdapterError::Client(error.to_string()))?;
+        let account_binding = LiveAccountBindingAudit::new(
+            account_id,
+            pe_execution_core::CredentialBindingIdentity {
+                version: credentials.bundle_version,
+                key_id: credentials.key_id.clone(),
+            },
+            custody_wallet,
+            live_account_credential_fingerprint(credentials),
+        );
+        Ok(Self {
+            client,
+            account_binding,
+        })
     }
 
     #[must_use]
@@ -299,6 +322,11 @@ impl PolymarketLiveVenue {
     #[must_use]
     pub fn owner_signer(&self) -> String {
         self.client.owner_signer()
+    }
+
+    #[must_use]
+    pub(crate) fn account_binding(&self) -> &LiveAccountBindingAudit {
+        &self.account_binding
     }
 
     async fn account_state(
@@ -319,7 +347,8 @@ impl PolymarketLiveVenue {
 
     pub(crate) async fn account_states(
         &self,
-    ) -> Result<(LiveVenueAccountState, LiveVenueAccountState), LiveVenueAccountReadError> {
+    ) -> Result<(BoundLiveVenueAccountState, BoundLiveVenueAccountState), LiveVenueAccountReadError>
+    {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
         let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
@@ -331,8 +360,31 @@ impl PolymarketLiveVenue {
         }
         let standard = parse_account_state(evidence.clone(), false)?;
         let neg_risk = parse_account_state(evidence, true)?;
-        Ok((standard, neg_risk))
+        Ok((
+            BoundLiveVenueAccountState {
+                state: standard,
+                binding: self.account_binding.clone(),
+            },
+            BoundLiveVenueAccountState {
+                state: neg_risk,
+                binding: self.account_binding.clone(),
+            },
+        ))
     }
+}
+
+fn live_account_credential_fingerprint(credentials: &LiveAccountCredentials) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for component in [
+        b"ordinary-live-account-read-credential-v1".as_slice(),
+        credentials.private_key.as_bytes(),
+        credentials.api_key.as_bytes(),
+        credentials.api_secret.as_bytes(),
+        credentials.api_passphrase.as_bytes(),
+    ] {
+        hasher.update(blake3::hash(component).as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 impl LiveOrderVenue for PolymarketLiveVenue {
