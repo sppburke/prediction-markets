@@ -10514,6 +10514,7 @@ mod tests {
 
     /// PASS: the fan-out recovery inventory excludes an Approved admission at or before the
     /// verified QualificationStarted live prefix.
+    /// FAIL: recovery lists, prepares, or posts an admission recorded at or before that prefix.
     #[tokio::test]
     async fn approved_recovery_excludes_pre_start_live_prefix() {
         let dir = tempdir().unwrap();
@@ -12142,6 +12143,8 @@ mod tests {
 
     /// PASS: fresh current off/missing evidence terminalizes Approved-only work, stale or closed
     /// evidence pauses it, and only the fresh armed case reaches exactly one loopback POST.
+    /// FAIL: any non-armed, stale, closed, or missing account case reaches a loopback POST, or
+    /// the armed case posts more than once.
     #[tokio::test]
     async fn recovery_approved_admission_requires_current_armed_account() {
         let posts = Arc::new(AtomicUsize::new(0));
@@ -12337,6 +12340,7 @@ mod tests {
 
     /// PASS: resolving the owner shutdown future leaves an Approved-but-unprepared admission
     /// pending and reaches zero loopback order POSTs.
+    /// FAIL: shutdown prepares, posts, or terminalizes the unprepared admission.
     #[tokio::test]
     async fn shutdown_does_not_submit_unprepared_admission() {
         let posts = Arc::new(AtomicUsize::new(0));
