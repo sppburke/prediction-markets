@@ -18,7 +18,8 @@ use crate::health::SharedHealth;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{HaltState, active_risk_halts, paper_era, scan_paper_log};
 use crate::risk_inputs::{
-    SourceReceiptMillisIndex, audited_halt_release, live_latency_samples, paper_latency_samples,
+    LiveLatencyJournalTailEvidence, SourceReceiptMillisIndex, audited_halt_release,
+    live_latency_samples, paper_latency_samples,
 };
 use crate::runtime_config::{
     AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RISK_HALT_RELEASE_HASH_KEY,
@@ -231,6 +232,7 @@ impl RiskHaltReleaseHandle {
         let Some(release) = audited_halt_release(&era, &active, release_hash) else {
             return Ok(());
         };
+        let mut live_journal_tail = None;
         let latest_latency_p95_ms = if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency {
             let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
             owner_latest_latency_p95(
@@ -241,11 +243,15 @@ impl RiskHaltReleaseHandle {
                         .map_err(|error| format!("derive paper release latency evidence: {error}"))
                 },
                 |account_id| {
-                    let mut events =
-                        pe_execution_core::replay_account(&self.live_journal_path, account_id)
-                            .map_err(|error| {
-                                format!("derive live release latency evidence: {error}")
-                            })?;
+                    let (mut events, tail) =
+                        pe_execution_core::live_journal::replay_account_with_tail(
+                            &self.live_journal_path,
+                            account_id,
+                        )
+                        .map_err(|error| {
+                            format!("derive live release latency evidence: {error}")
+                        })?;
+                    live_journal_tail = Some(LiveLatencyJournalTailEvidence::from(tail));
                     if let Some((_, start)) = &era.start {
                         events.retain(|event| {
                             start
@@ -277,6 +283,7 @@ impl RiskHaltReleaseHandle {
                     "engaged_receipt": release.engaged_receipt,
                     "release_hash": release_hash,
                     "latest_latency_p95_ms": latest_latency_p95_ms,
+                    "live_journal_tail": live_journal_tail,
                 }),
                 acknowledged,
             })
@@ -857,6 +864,86 @@ mod tests {
             Ok(Some(1_000)),
             "paper evidence is independent of live disagreement"
         );
+    }
+
+    /// PASS: a starved live latency release carries the exact empty account-journal tail in the
+    /// synchronized `RiskHaltChanged` evidence handed to the paper-log owner.
+    #[tokio::test]
+    async fn live_latency_release_audits_account_journal_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper_log_path = dir.path().join("paper.log");
+        let live_journal_path = dir.path().join("live_journal.log");
+        drop(pe_execution_core::LiveJournal::open(&live_journal_path).unwrap());
+        let account_id = pe_core_types::AccountId::new("live-a").unwrap();
+        let at = time::macros::datetime!(2026-09-06 00:00 UTC);
+        let mut writer = pe_event_log::Writer::open(&paper_log_path).unwrap();
+        let engaged = writer
+            .append_synced(pe_event_log::EnvelopeIn {
+                source_id: pe_core_types::SourceId("pe-service.paper".to_owned()),
+                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: pe_core_types::SourceTimestamp(at),
+                received_at: pe_core_types::ReceivedAt(at),
+                content_type: pe_event_log::ContentType::Json,
+                payload: serde_json::to_vec(
+                    &crate::paper_recovery::PaperLogRecord::RiskHaltChanged {
+                        owner: crate::paper_recovery::RiskHaltOwner::LiveAccount(
+                            account_id.clone(),
+                        ),
+                        cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                        state: HaltState::Engaged,
+                        evidence: serde_json::json!({}),
+                    },
+                )
+                .unwrap(),
+            })
+            .unwrap();
+        drop(writer);
+
+        let (control, mut controls) = mpsc::channel(1);
+        let handle = RiskHaltReleaseHandle::new(
+            paper_log_path,
+            SourceReceiptMillisIndex::default(),
+            control,
+        );
+        let release_hash = engaged.this_hash.to_hex().to_string();
+        let apply = handle.apply(&release_hash);
+        let acknowledge = async {
+            let message = controls
+                .recv()
+                .await
+                .ok_or("release control channel closed")?;
+            let OrchestratorControl::RiskHaltChange {
+                owner,
+                cause,
+                state,
+                evidence,
+                acknowledged,
+            } = message
+            else {
+                return Err("release emitted the wrong control message");
+            };
+            assert_eq!(
+                owner,
+                crate::paper_recovery::RiskHaltOwner::LiveAccount(account_id)
+            );
+            assert_eq!(cause, pe_risk_engine::RiskHaltCause::CopyLatency);
+            assert_eq!(state, HaltState::Released);
+            assert_eq!(
+                evidence.get("live_journal_tail"),
+                Some(&serde_json::json!({
+                    "last_sequence": null,
+                    "last_hash": "00".repeat(32),
+                }))
+            );
+            acknowledged
+                .send(Ok(engaged))
+                .map_err(|_| "release acknowledgement receiver dropped")?;
+            Ok::<(), &'static str>(())
+        };
+        let (result, acknowledgement) = tokio::join!(apply, acknowledge);
+        assert_eq!(result, Ok(()));
+        assert_eq!(acknowledgement, Ok(()));
     }
 
     #[tokio::test]

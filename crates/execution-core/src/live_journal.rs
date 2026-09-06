@@ -11,10 +11,12 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use pe_core_types::{
-    AccountId, CollateralAmount, PolymarketConditionId, PolymarketTokenId, Price, RawHttpAttempt,
-    ReceivedAt, ShareAmount, SourceId, SourceTimestamp,
+    AccountId, CollateralAmount, EventSeq, PolymarketConditionId, PolymarketTokenId, Price,
+    RawHttpAttempt, ReceivedAt, ShareAmount, SourceId, SourceTimestamp,
 };
-use pe_event_log::{ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer};
+use pe_event_log::{
+    AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer,
+};
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
 use pe_venue_polymarket::{CompactFeeSchedule, LadderPlan, PreparedPolymarketBuy};
@@ -652,6 +654,13 @@ pub struct LiveJournalEvent {
     pub payload: LiveJournalPayload,
 }
 
+/// Sequence/hash identity of the final account event used by one verified account replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveJournalTail {
+    pub last_sequence: Option<EventSeq>,
+    pub last_hash: blake3::Hash,
+}
+
 /// One prepared ordinary-live order that has no matching terminal journal fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenOrderInventoryEntry {
@@ -807,6 +816,30 @@ pub fn replay_account(
             .filter(|event| &event.account_id == account_id)
             .collect()
     })
+}
+
+/// Replay one account and bind that projection to its final event in the verified journal scan.
+pub fn replay_account_with_tail(
+    path: impl AsRef<Path>,
+    account_id: &AccountId,
+) -> Result<(Vec<LiveJournalEvent>, LiveJournalTail), LiveJournalError> {
+    let mut tail = LiveJournalTail {
+        last_sequence: None,
+        last_hash: blake3::Hash::from_bytes([0; 32]),
+    };
+    let events = replay_all_with_receipts(path)?
+        .into_iter()
+        .filter_map(|(event, receipt)| {
+            (&event.account_id == account_id).then(|| {
+                tail = LiveJournalTail {
+                    last_sequence: Some(receipt.sequence),
+                    last_hash: receipt.this_hash,
+                };
+                event
+            })
+        })
+        .collect();
+    Ok((events, tail))
 }
 
 /// A journal fact whose identity must match an earlier `OrderPrepared` exactly.
@@ -1187,6 +1220,13 @@ mod legacy_v1 {
 }
 
 fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJournalError> {
+    replay_all_with_receipts(path)
+        .map(|events| events.into_iter().map(|(event, _receipt)| event).collect())
+}
+
+fn replay_all_with_receipts(
+    path: impl AsRef<Path>,
+) -> Result<Vec<(LiveJournalEvent, AppendReceipt)>, LiveJournalError> {
     let mut events = Vec::new();
     for item in Reader::replay(path)? {
         let (seq, envelope) = item?;
@@ -1209,7 +1249,13 @@ fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJourn
         if seq.0 != expected || event.seq != expected || event.timestamp != envelope.observed_at.0 {
             return Err(LiveJournalError::SequenceMismatch);
         }
-        events.push(event);
+        events.push((
+            event,
+            AppendReceipt {
+                sequence: seq,
+                this_hash: envelope.this_hash,
+            },
+        ));
     }
     Ok(events)
 }
@@ -1237,7 +1283,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use pe_core_types::{BasisPoints, EventSeq, Side};
-    use pe_event_log::AppendReceipt;
     use pe_risk_engine::RiskSnapshot;
     use tempfile::tempdir;
     use time::macros::datetime;
@@ -1625,7 +1670,7 @@ mod tests {
             .unwrap();
         journal
             .append(
-                second,
+                second.clone(),
                 at,
                 LiveJournalPayload::OrderPreparationFailed(Box::new(
                     LiveOrderPreparationFailedAudit {
@@ -1647,9 +1692,33 @@ mod tests {
                 )),
             )
             .unwrap();
+        journal
+            .append(
+                second,
+                at,
+                LiveJournalPayload::OrderPreparationFailed(Box::new(
+                    LiveOrderPreparationFailedAudit {
+                        identity: identity("d3"),
+                        failure: LiveOrderPreparationFailure::Venue,
+                    },
+                )),
+            )
+            .unwrap();
         drop(journal);
 
-        assert_eq!(replay_account(&path, &first).unwrap(), vec![event0, event2]);
+        assert_eq!(
+            replay_account(&path, &first).unwrap(),
+            vec![event0.clone(), event2.clone()]
+        );
+        let (_, account_tail_envelope) = Reader::replay(&path).unwrap().nth(2).unwrap().unwrap();
+        let (events, tail) = replay_account_with_tail(&path, &first).unwrap();
+        assert_eq!(events, vec![event0, event2]);
+        assert_eq!(tail.last_sequence, Some(EventSeq(2)));
+        assert_eq!(tail.last_hash, account_tail_envelope.this_hash);
+        assert_eq!(
+            LiveJournal::verified_tail(&path).unwrap().last_sequence,
+            Some(EventSeq(3))
+        );
     }
 
     #[test]
