@@ -33,10 +33,19 @@ pub enum WinnerFollowError {
     KellySizing(#[from] KellyError),
 }
 
-/// Fail-closed reasons an entry cannot obtain a replayable risk snapshot (#545).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[serde(rename_all = "snake_case")]
-pub enum RiskInputsUnavailable {
+/// Non-durable diagnostic for evidence that could not produce a replayable risk snapshot (#545).
+///
+/// The detail is intentionally opaque outside this crate. Durable decision evidence records only
+/// [`WinnerFollowDeclineAudit::RiskInputsUnavailable`], so adding a service diagnostic cannot
+/// change the audit schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{detail}")]
+pub struct RiskInputsUnavailable {
+    detail: RiskInputsUnavailableDetail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum RiskInputsUnavailableDetail {
     #[error("financial snapshot sequence does not match the completed paper-log prefix")]
     SnapshotSequenceMismatch,
     #[error("the paper log has an unmatched FinancialPrepared record")]
@@ -61,6 +70,43 @@ pub enum RiskInputsUnavailable {
     Overflow,
 }
 
+#[allow(non_upper_case_globals)]
+impl RiskInputsUnavailable {
+    pub const SnapshotSequenceMismatch: Self = Self {
+        detail: RiskInputsUnavailableDetail::SnapshotSequenceMismatch,
+    };
+    pub const UnmatchedPrepared: Self = Self {
+        detail: RiskInputsUnavailableDetail::UnmatchedPrepared,
+    };
+    pub const PriceMissing: Self = Self {
+        detail: RiskInputsUnavailableDetail::PriceMissing,
+    };
+    pub const PriceStale: Self = Self {
+        detail: RiskInputsUnavailableDetail::PriceStale,
+    };
+    pub const PriceFuture: Self = Self {
+        detail: RiskInputsUnavailableDetail::PriceFuture,
+    };
+    pub const PriceConflict: Self = Self {
+        detail: RiskInputsUnavailableDetail::PriceConflict,
+    };
+    pub const MarkMissing: Self = Self {
+        detail: RiskInputsUnavailableDetail::MarkMissing,
+    };
+    pub const MarkDuplicate: Self = Self {
+        detail: RiskInputsUnavailableDetail::MarkDuplicate,
+    };
+    pub const MarkInvalid: Self = Self {
+        detail: RiskInputsUnavailableDetail::MarkInvalid,
+    };
+    pub const BaselineNonPositive: Self = Self {
+        detail: RiskInputsUnavailableDetail::BaselineNonPositive,
+    };
+    pub const Overflow: Self = Self {
+        detail: RiskInputsUnavailableDetail::Overflow,
+    };
+}
+
 /// Durable, replay-safe projection of an entry refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
@@ -69,7 +115,7 @@ pub enum WinnerFollowDeclineAudit {
     FlipNotApproved,
     NoEdge,
     Blocked(RiskBlock),
-    RiskInputsUnavailable(RiskInputsUnavailable),
+    RiskInputsUnavailable,
     KellySizing(KellyErrorAudit),
 }
 
@@ -90,9 +136,7 @@ impl From<&WinnerFollowError> for WinnerFollowDeclineAudit {
             WinnerFollowError::FlipNotApproved => Self::FlipNotApproved,
             WinnerFollowError::NoEdge => Self::NoEdge,
             WinnerFollowError::Blocked(reason) => Self::Blocked(*reason),
-            WinnerFollowError::RiskInputsUnavailable(reason) => {
-                Self::RiskInputsUnavailable(*reason)
-            }
+            WinnerFollowError::RiskInputsUnavailable(_) => Self::RiskInputsUnavailable,
             WinnerFollowError::KellySizing(error) => Self::KellySizing(match error {
                 KellyError::InvalidProbability { value } => {
                     KellyErrorAudit::InvalidProbability { value: *value }
@@ -144,5 +188,18 @@ mod tests {
                 audit
             );
         }
+
+        assert_eq!(
+            WinnerFollowDeclineAudit::from(&WinnerFollowError::RiskInputsUnavailable(
+                RiskInputsUnavailable::PriceMissing,
+            )),
+            WinnerFollowDeclineAudit::from(&WinnerFollowError::RiskInputsUnavailable(
+                RiskInputsUnavailable::PriceStale,
+            ))
+        );
+        assert_eq!(
+            serde_json::to_value(WinnerFollowDeclineAudit::RiskInputsUnavailable).unwrap(),
+            serde_json::json!({ "kind": "risk_inputs_unavailable" })
+        );
     }
 }

@@ -109,6 +109,30 @@ impl QualificationThresholds {
     }
 }
 
+/// Current evidence counts used by both automatic sealing and the offline verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualificationCompletion {
+    pub complete_days: usize,
+    pub causal_closes: usize,
+}
+
+impl QualificationCompletion {
+    #[must_use]
+    pub fn complete_days_met(self) -> bool {
+        self.complete_days >= MINIMUM_COMPLETE_DAYS
+    }
+
+    #[must_use]
+    pub fn causal_closes_met(self) -> bool {
+        self.causal_closes >= MINIMUM_CLOSED_COPIES
+    }
+
+    #[must_use]
+    pub fn is_complete(self) -> bool {
+        self.complete_days_met() && self.causal_closes_met()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationMarkReport {
@@ -741,6 +765,16 @@ fn verify_qualification(
         })
         .collect::<Vec<_>>();
     closed.sort_by_key(|fill| fill.final_receipt.sequence.0);
+    let completion =
+        qualification_completion(&paper_era(frames[..=financial_prefix_index].to_vec()))
+            .ok_or_else(|| {
+                QualificationError::InsufficientEvidence(
+                    "qualification completion inputs are invalid".to_owned(),
+                )
+            })?;
+    if completion.complete_days != growth.len() || completion.causal_closes != closed.len() {
+        return insufficient("qualification completion differs from verified replay");
+    }
     let delays = closed.iter().map(|fill| fill.delay_ms).collect::<Vec<_>>();
     let p95 = nearest_rank_p95(&delays);
     let absolute_pnl = valid_marks.last().and_then(|(_, mark)| {
@@ -750,18 +784,16 @@ fn verify_qualification(
 
     let thresholds = QualificationThresholds::canonical();
     let mut failures = Vec::new();
-    if growth.len() < thresholds.minimum_complete_days {
+    if !completion.complete_days_met() {
         failures.push(format!(
             "complete days {} < {}",
-            growth.len(),
-            thresholds.minimum_complete_days
+            completion.complete_days, thresholds.minimum_complete_days
         ));
     }
-    if closed.len() < thresholds.minimum_closed_copies {
+    if !completion.causal_closes_met() {
         failures.push(format!(
             "closed copies {} < {}",
-            closed.len(),
-            thresholds.minimum_closed_copies
+            completion.causal_closes, thresholds.minimum_closed_copies
         ));
     }
     if lcb.is_none_or(|value| value <= Decimal::ZERO) {
@@ -816,8 +848,8 @@ fn verify_qualification(
         sealed_cutoff_unix: Some(seal.sealed_cutoff_unix),
         first_valid_mark_unix: valid_marks.first().map(|(_, mark)| mark.cutoff_unix),
         promotion_anchor_mark_unix: Some(anchor_cutoff),
-        complete_days: growth.len(),
-        closed_copies: closed.len(),
+        complete_days: completion.complete_days,
+        closed_copies: completion.causal_closes,
         paper_p95_delay_ms: p95,
         delay_samples_ms: delays,
         complete_day_log_equity_growth: growth,
@@ -1731,6 +1763,102 @@ fn complete_day_growth(
         growth.push(ratio);
     }
     Ok(growth)
+}
+
+/// Derive the completion inputs from the active financial era.
+///
+/// A close is causal only when its Fill Final follows the current promotion anchor and a matching
+/// Resolution Final follows that fill. Invalid or non-daily marks cannot trigger an automatic
+/// seal. The offline verifier invokes this same calculation against its verified sealed prefix.
+#[must_use]
+pub fn qualification_completion(
+    era: &crate::paper_recovery::PaperEra,
+) -> Option<QualificationCompletion> {
+    era.start.as_ref()?;
+
+    let mut waiting_for_anchor_mark = true;
+    let mut anchor_sequence = None;
+    let mut promotion_marks = Vec::new();
+    let mut fill_prepared = HashMap::<(u64, String), String>::new();
+    let mut resolution_prepared = HashMap::<(u64, String), String>::new();
+    let mut fill_finals = Vec::<(u64, String)>::new();
+    let mut resolution_finals = HashMap::<String, Vec<u64>>::new();
+
+    for frame in &era.frames {
+        let PaperLogFrame::Record(record) = &frame.frame else {
+            return None;
+        };
+        match record {
+            PaperLogRecord::MembershipChanged { reason, .. } if reason_moves_anchor(*reason) => {
+                waiting_for_anchor_mark = true;
+                anchor_sequence = None;
+                promotion_marks.clear();
+            }
+            PaperLogRecord::PortfolioMark(mark) => {
+                if mark.invalid.is_some() || mark.equity <= Decimal::ZERO {
+                    return None;
+                }
+                if waiting_for_anchor_mark {
+                    anchor_sequence = Some(frame.receipt.sequence.0);
+                    waiting_for_anchor_mark = false;
+                }
+                promotion_marks.push(QualificationMarkReport {
+                    cutoff_unix: mark.cutoff_unix,
+                    cash: mark.cash,
+                    equity: mark.equity,
+                });
+            }
+            PaperLogRecord::FinancialPrepared { payload, .. } => match payload {
+                FinancialPayload::Fill { economic, .. } => {
+                    fill_prepared.insert(
+                        receipt_key(frame.receipt),
+                        economic.market.condition_id.0.clone(),
+                    );
+                }
+                FinancialPayload::Resolution { condition_id, .. } => {
+                    resolution_prepared.insert(receipt_key(frame.receipt), condition_id.0.clone());
+                }
+            },
+            PaperLogRecord::FinancialFinal {
+                prepared_receipt,
+                result,
+            } => match result {
+                FinancialResult::Fill { .. } => {
+                    let condition = fill_prepared.get(&receipt_key(*prepared_receipt))?;
+                    fill_finals.push((frame.receipt.sequence.0, condition.clone()));
+                }
+                FinancialResult::Resolution { .. } => {
+                    let condition = resolution_prepared.get(&receipt_key(*prepared_receipt))?;
+                    resolution_finals
+                        .entry(condition.clone())
+                        .or_default()
+                        .push(frame.receipt.sequence.0);
+                }
+            },
+            PaperLogRecord::QualificationStarted(_)
+            | PaperLogRecord::QualificationSealed(_)
+            | PaperLogRecord::RiskHaltChanged { .. }
+            | PaperLogRecord::MembershipChanged { .. } => {}
+        }
+    }
+
+    let anchor_sequence = anchor_sequence?;
+    let complete_days = complete_day_growth(&promotion_marks).ok()?.len();
+    let causal_closes = fill_finals
+        .iter()
+        .filter(|(fill_sequence, condition)| {
+            *fill_sequence > anchor_sequence
+                && resolution_finals.get(condition).is_some_and(|resolutions| {
+                    resolutions
+                        .iter()
+                        .any(|resolution_sequence| resolution_sequence > fill_sequence)
+                })
+        })
+        .count();
+    Some(QualificationCompletion {
+        complete_days,
+        causal_closes,
+    })
 }
 
 fn reason_moves_anchor(reason: MembershipReason) -> bool {

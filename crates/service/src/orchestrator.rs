@@ -1067,6 +1067,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         .map_err(|error| error.to_string())
     }
 
+    fn automatic_completion_seal_reason(
+        mark_is_valid: bool,
+        completion: Option<crate::qualification::QualificationCompletion>,
+    ) -> Option<SealReason> {
+        (mark_is_valid && completion.is_some_and(|value| value.is_complete()))
+            .then_some(SealReason::Complete)
+    }
+
     /// Build and synchronize the one paper mark for an acknowledged source boundary.
     async fn mark_at_boundary(
         &mut self,
@@ -1200,7 +1208,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             equity,
             invalid,
         };
+        let mark_is_valid = mark.invalid.is_none();
         self.append_paper_record(&PaperLogRecord::PortfolioMark(Box::new(mark)))?;
+        let completion = if mark_is_valid {
+            let era = crate::paper_recovery::paper_era(
+                crate::paper_recovery::scan_paper_log(&paper_log_path)
+                    .map_err(|error| error.to_string())?,
+            );
+            crate::qualification::qualification_completion(&era)
+        } else {
+            None
+        };
+        if let Some(reason) = Self::automatic_completion_seal_reason(mark_is_valid, completion) {
+            self.seal_qualification(reason, cutoff_unix)?;
+        }
         Ok(())
     }
 
@@ -3303,9 +3324,10 @@ mod tests {
         ConcentrationCaps, RiskBlock, RiskDecision, RiskHaltCause, RiskSnapshot, evaluate_risk,
     };
 
-    use crate::paper_recovery::RiskHaltOwner;
+    use crate::paper_recovery::{RiskHaltOwner, SealReason};
+    use crate::qualification::QualificationCompletion;
 
-    use super::{apply_global_risk_halts, check_resolution_horizon};
+    use super::{Orchestrator, apply_global_risk_halts, check_resolution_horizon};
 
     const NOW: i64 = 1_700_000_000;
 
@@ -3341,6 +3363,50 @@ mod tests {
         assert_eq!(
             evaluate_risk(&snapshot),
             RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
+        );
+    }
+
+    /// PASS: the first valid boundary that reaches both canonical completion counts requests the
+    /// existing Complete seal; an invalid mark or either below-threshold count requests no seal.
+    /// FAIL: the boundary can seal early, seal invalid evidence, or misses the first valid mark.
+    #[test]
+    fn daily_boundary_requests_automatic_complete_seal_at_exact_threshold() {
+        type TestOrchestrator = Orchestrator<
+            pe_source_polymarket_public::FixtureFetcher,
+            crate::clob_book::FixtureClobBookFetcher,
+        >;
+        let exact = QualificationCompletion {
+            complete_days: 30,
+            causal_closes: 90,
+        };
+
+        assert_eq!(
+            TestOrchestrator::automatic_completion_seal_reason(true, Some(exact)),
+            Some(SealReason::Complete)
+        );
+        assert_eq!(
+            TestOrchestrator::automatic_completion_seal_reason(false, Some(exact)),
+            None
+        );
+        assert_eq!(
+            TestOrchestrator::automatic_completion_seal_reason(
+                true,
+                Some(QualificationCompletion {
+                    complete_days: 29,
+                    causal_closes: 90,
+                }),
+            ),
+            None
+        );
+        assert_eq!(
+            TestOrchestrator::automatic_completion_seal_reason(
+                true,
+                Some(QualificationCompletion {
+                    complete_days: 30,
+                    causal_closes: 89,
+                }),
+            ),
+            None
         );
     }
 
