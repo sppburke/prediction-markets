@@ -5712,9 +5712,13 @@ mod tests {
             }],
         )
         .await;
-        let exact = match results.pop().unwrap().disposition {
-            OrderFinalityDisposition::Finalized(finalized) => finalized,
-            other => panic!("expected exact multi-level finality, got {other:?}"),
+        let disposition = results.pop().unwrap().disposition;
+        assert!(
+            matches!(disposition, OrderFinalityDisposition::Finalized(_)),
+            "expected exact multi-level finality, got {disposition:?}"
+        );
+        let OrderFinalityDisposition::Finalized(exact) = disposition else {
+            return;
         };
         assert_eq!(exact.quantity.to_decimal(), dec!(3.25));
         assert_eq!(exact.principal.to_decimal(), dec!(2.5));

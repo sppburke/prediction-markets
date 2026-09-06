@@ -34,22 +34,40 @@ use std::collections::HashMap;
 type SettledEntry = (Decimal, Vec<Decimal>, i64);
 use std::sync::Mutex;
 
-use pe_core_types::{ContractQty, ReceivedAt, SourceId, SourceTimestamp, StrategyId};
+use pe_core_types::{
+    BasisPoints, CollateralAmount, ContractQty, KellyFraction, PolymarketConditionId,
+    PolymarketTokenId, Probability, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, StrategyId,
+};
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{ContentType, EnvelopeIn, Writer};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
+use pe_execution_core::{
+    AdmissionReceipts, BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
+    LadderAskAudit, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit,
+    MarketSelection, RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
+};
 use pe_paper_pnl::ResolutionStore;
-use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
+use pe_paper_state::{FillRecord, FillRow, FinancialFillRecord, LeaderPositionRow, PaperStateDb};
+use pe_resolver_card::{
+    VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+};
+use pe_risk_engine::RiskSnapshot;
+use pe_service::paper_recovery::{
+    CanonicalFillResult, CanonicalResolutionResult, ExpectedAuthority, FinancialPayload,
+    FinancialResult, PaperFillOperationIdentity, PaperLogFrame, PaperLogRecord,
+    QualificationStarted, TailBinding, scan_paper_log,
+};
 use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
 use pe_service::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 use pe_service::supabase_state::{
     AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, PreparedFillRequest,
     PreparedResolutionRequest, ResolutionV2Outcome, SupabaseBootTrait, SupabaseStateError,
     SupabaseStateTrait, apply_resolution_authoritative, commit_fill_authoritative,
-    resolve_event_frames, supabase_authoritative_boot,
+    reconcile_active_financial_frames, resolve_event_frames, supabase_authoritative_boot,
 };
 use pe_venue_core::OrderIntent;
+use pe_venue_polymarket::CompactFeeSchedule;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
@@ -148,6 +166,16 @@ struct FakeSupabaseState {
     apply_then_error_seq: Option<i64>,
     fail_resolution: bool,
     fail_boot_positions: bool,
+    prepared: Mutex<PreparedAuthority>,
+}
+
+#[derive(Default)]
+struct PreparedAuthority {
+    start: Option<AppendReceipt>,
+    last_prepared: Option<EventSeq>,
+    fills: HashMap<String, (PreparedFillRequest, CanonicalFillResult)>,
+    resolutions: HashMap<String, (PreparedResolutionRequest, CanonicalResolutionResult)>,
+    mutations: usize,
 }
 
 impl FakeSupabaseState {
@@ -165,6 +193,16 @@ impl FakeSupabaseState {
             .lock()
             .unwrap()
             .insert(market.to_string(), (Decimal::ZERO, vec![], 0));
+    }
+
+    fn prepared(initial: Decimal, start: AppendReceipt) -> Self {
+        let state = Self::new(initial);
+        state.prepared.lock().unwrap().start = Some(start);
+        state
+    }
+
+    fn prepared_mutations(&self) -> usize {
+        self.prepared.lock().unwrap().mutations
     }
 
     /// The v1-arithmetic apply (insert gate + netting + clamped debit), returning the row.
@@ -205,22 +243,105 @@ impl FakeSupabaseState {
 impl SupabaseStateTrait for FakeSupabaseState {
     async fn commit_prepared_fill(
         &self,
-        _request: &PreparedFillRequest,
-    ) -> Result<pe_service::paper_recovery::CanonicalFillResult, SupabaseStateError> {
-        Err(SupabaseStateError::Status(
-            503,
-            "active financial protocol is outside this legacy fixture".to_owned(),
-        ))
+        request: &PreparedFillRequest,
+    ) -> Result<CanonicalFillResult, SupabaseStateError> {
+        let mut prepared = self.prepared.lock().unwrap();
+        if prepared.start != Some(request.expected_authority.qualification_start_receipt) {
+            return Err(SupabaseStateError::Conflict {
+                reason: "financial Start differs".to_owned(),
+            });
+        }
+        if let Some((stored_request, stored_result)) = prepared.fills.get(&request.idempotency_key)
+        {
+            if stored_request != request
+                || prepared.last_prepared != Some(request.prepared_receipt.sequence)
+            {
+                return Err(SupabaseStateError::Conflict {
+                    reason: "fill retry identity or economics changed".to_owned(),
+                });
+            }
+            let mut result = stored_result.clone();
+            result.outcome = "existing".to_owned();
+            return Ok(result);
+        }
+        if prepared.last_prepared != request.expected_authority.prior_completed_prepared_sequence {
+            return Err(SupabaseStateError::Conflict {
+                reason: "fill predecessor differs".to_owned(),
+            });
+        }
+        let debit = request
+            .principal
+            .checked_add(request.fee)
+            .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?
+            .to_decimal();
+        let mut bankroll = self.bankroll.lock().unwrap();
+        *bankroll = bankroll
+            .checked_sub(debit)
+            .filter(|value| *value >= Decimal::ZERO)
+            .ok_or_else(|| SupabaseStateError::Conflict {
+                reason: "fill debit exceeds bankroll".to_owned(),
+            })?;
+        let result = CanonicalFillResult {
+            outcome: "applied".to_owned(),
+            bankroll: *bankroll,
+            applied_prepared_seq: request.prepared_receipt.sequence,
+            quantity: request.quantity,
+            principal: request.principal,
+            fee: request.fee,
+            fill_price: request.fill_price,
+        };
+        prepared.fills.insert(
+            request.idempotency_key.clone(),
+            (request.clone(), result.clone()),
+        );
+        prepared.last_prepared = Some(request.prepared_receipt.sequence);
+        prepared.mutations += 1;
+        Ok(result)
     }
 
     async fn apply_prepared_resolution(
         &self,
-        _request: &PreparedResolutionRequest,
-    ) -> Result<pe_service::paper_recovery::CanonicalResolutionResult, SupabaseStateError> {
-        Err(SupabaseStateError::Status(
-            503,
-            "active financial protocol is outside this legacy fixture".to_owned(),
-        ))
+        request: &PreparedResolutionRequest,
+    ) -> Result<CanonicalResolutionResult, SupabaseStateError> {
+        let mut prepared = self.prepared.lock().unwrap();
+        if prepared.start != Some(request.expected_authority.qualification_start_receipt) {
+            return Err(SupabaseStateError::Conflict {
+                reason: "financial Start differs".to_owned(),
+            });
+        }
+        if let Some((stored_request, stored_result)) =
+            prepared.resolutions.get(&request.condition.0)
+        {
+            if stored_request != request
+                || prepared.last_prepared != Some(request.prepared_receipt.sequence)
+            {
+                return Err(SupabaseStateError::Conflict {
+                    reason: "resolution retry identity or economics changed".to_owned(),
+                });
+            }
+            let mut result = stored_result.clone();
+            result.outcome = "existing".to_owned();
+            return Ok(result);
+        }
+        if prepared.last_prepared != request.expected_authority.prior_completed_prepared_sequence {
+            return Err(SupabaseStateError::Conflict {
+                reason: "resolution predecessor differs".to_owned(),
+            });
+        }
+        let result = CanonicalResolutionResult {
+            outcome: "applied".to_owned(),
+            bankroll: self.bankroll(),
+            applied_prepared_seq: request.prepared_receipt.sequence,
+            credit: CollateralAmount::ZERO,
+            settled_at_unix: request.settled_at_unix,
+        };
+        prepared.resolutions.insert(
+            request.condition.0.clone(),
+            (request.clone(), result.clone()),
+        );
+        prepared.last_prepared = Some(request.prepared_receipt.sequence);
+        prepared.mutations += 1;
+        Ok(result)
     }
 
     async fn commit_fill_v2(
@@ -929,4 +1050,461 @@ async fn ac_dispatch_flip_rides_the_local_mirror_transaction() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].paper_outcome.as_deref(), Some("fill"));
     println!("PASS: AC-FLIP — dispatch flip rides the convergence transaction");
+}
+
+fn active_receipt(sequence: u64, byte: u8) -> AppendReceipt {
+    AppendReceipt {
+        sequence: EventSeq(sequence),
+        this_hash: blake3::Hash::from_bytes([byte; 32]),
+    }
+}
+
+fn empty_tail() -> TailBinding {
+    TailBinding {
+        physical_tail: 5,
+        last_sequence: None,
+        last_hash: "00".repeat(32),
+    }
+}
+
+fn active_start_record() -> PaperLogRecord {
+    PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+        starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+        paper_prefix: empty_tail(),
+        source_prefix: empty_tail(),
+        live_prefix: empty_tail(),
+        artifact_blake3: "artifact".to_owned(),
+        static_config_hash: "static".to_owned(),
+        hot_config_hash: "config".to_owned(),
+        generation: "golden".to_owned(),
+        activation_id: "golden".to_owned(),
+        ranking_batch_id: 545,
+        policy_hash: "policy".to_owned(),
+        membership: vec![WalletAddress::from_hex(wallet_hex()).unwrap()],
+        membership_proofs_hash: "proof".to_owned(),
+        schema_version: 3,
+        parser_version: 1,
+        financial_semantic_version: 1,
+    }))
+}
+
+fn active_economic() -> EconomicPrepared {
+    let price = Price::new(dec!(0.5)).unwrap();
+    let shares = ShareAmount::from_whole(2).unwrap();
+    let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
+    EconomicPrepared {
+        version: ECONOMIC_PREPARED_VERSION,
+        market: MarketSelection {
+            condition_id: PolymarketConditionId("condition".to_owned()),
+            outcome_index: 0,
+            token_id: PolymarketTokenId("token-0".to_owned()),
+            side: Side::Buy,
+            market_id: "condition".to_owned(),
+        },
+        admission: LiveAdmissionArtifactAudit {
+            market: LiveMarketEvidenceAudit {
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                ordered_outcome_token_ids: [
+                    PolymarketTokenId("token-0".to_owned()),
+                    PolymarketTokenId("token-1".to_owned()),
+                ],
+                neg_risk: false,
+                minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                minimum_order_size: shares,
+                observed_at_unix: 1_800_000_000,
+                schema_version: 1,
+                parser_version: 1,
+                freshness_window_secs: 60,
+            },
+            settlement: VenueSettlementRecord {
+                schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                status: VenueResolutionStatus::Unresolved,
+                raw_evidence_hash: "settlement".to_owned(),
+                source_timestamp_unix: Some(1_800_000_000),
+                observed_at_unix: 1_800_000_000,
+                parser_version: 1,
+                freshness_window_secs: 60,
+            },
+            fee_schedule: CompactFeeSchedule::Zero,
+            scheduled_end_unix: Some(1_800_003_600),
+            receipts: AdmissionReceipts {
+                gamma: active_receipt(1, 1),
+                clob_long: active_receipt(2, 2),
+                clob_compact: active_receipt(3, 3),
+            },
+        },
+        ladder: LadderPlanAudit {
+            used_asks: vec![LadderAskAudit { price, shares }],
+            best_ask: price,
+            limit_price: price,
+            minimum_shares: shares,
+            principal,
+        },
+        book_receipt: active_receipt(4, 4),
+        observation: None,
+        sizing: SizingAudit {
+            mode: SizingModeAudit::Kelly {
+                fraction: KellyFraction::new(dec!(0.25)).unwrap(),
+                probability: Probability::new(dec!(0.6)).unwrap(),
+            },
+            budget: principal,
+            principal,
+            minimum_shares: shares,
+            expected_shares: shares,
+            expected_vwap: price,
+            all_in_price: price,
+            slippage_rate: Decimal::ZERO,
+        },
+        fee: FeeAudit {
+            schedule: CompactFeeSchedule::Zero,
+            expected_fee: CollateralAmount::ZERO,
+            reserve: CollateralAmount::ZERO,
+        },
+        risk: RiskAudit {
+            snapshot: RiskSnapshot {
+                leader_exposure_bps: BasisPoints::ZERO,
+                market_exposure_bps: BasisPoints::ZERO,
+                family_exposure_bps: BasisPoints::ZERO,
+                total_copy_exposure_bps: BasisPoints::ZERO,
+                intraday_pnl_bps: BasisPoints::ZERO,
+                rolling_7d_pnl_bps: BasisPoints::ZERO,
+                absolute_pnl_bps: BasisPoints::ZERO,
+                copy_latency_kill_switch_active: false,
+                proposed_trade_bps: BasisPoints(1_000),
+                per_trade_cap_bps: 1_000,
+                concentration_caps: None,
+            },
+            decision: RiskDecisionAudit::Approved,
+            price_receipts: Vec::new(),
+            evaluated_at_unix_ms: 1_800_000_000_000,
+        },
+        balance: BalanceAudit {
+            cash_before: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+            worst_case_debit: principal,
+            price_impact_cap_bps: 100,
+            chase_ceiling: price,
+            band_floor: Price::ZERO,
+            band_ceiling_exclusive: Price::ONE,
+        },
+        applied_configuration_hash: "config".to_owned(),
+    }
+}
+
+fn append_active_record(writer: &mut Writer, record: &PaperLogRecord) -> AppendReceipt {
+    let timestamp = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(timestamp),
+            received_at: ReceivedAt(timestamp),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(record).unwrap(),
+        })
+        .unwrap()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FillCrashSeam {
+    PreparedAppend,
+    AuthorityResponse,
+    LocalProjection,
+    FinalAppend,
+}
+
+/// I16-C8-CRASH-MATRIX
+///
+/// Preconditions: each case starts from the same synchronized Start and Prepared fill, then stops
+/// after Prepared append, authority response, local projection, or Final append.
+/// PASS: boot recovery converges each case to one authority mutation, one exact local fill, and one
+/// FinancialFinal; a second restart is a no-op.
+/// FAIL: money is applied twice, more than one Final exists, or any seam remains unmatched.
+#[tokio::test]
+async fn active_fill_crash_matrix_converges_once() {
+    for seam in [
+        FillCrashSeam::PreparedAppend,
+        FillCrashSeam::AuthorityResponse,
+        FillCrashSeam::LocalProjection,
+        FillCrashSeam::FinalAppend,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let paper_log = dir.path().join("active-paper.log");
+        let source_log = dir.path().join("active-source.log");
+        drop(Writer::open(&source_log).unwrap());
+        let mut writer = Writer::open(&paper_log).unwrap();
+        let start = append_active_record(&mut writer, &active_start_record());
+        let state = PaperStateDb::open(&dir.path().join("active-paper.db")).unwrap();
+        state
+            .reset_financial_era(
+                start,
+                CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+            )
+            .unwrap();
+        let authority = FakeSupabaseState::prepared(dec!(10), start);
+        let expected = ExpectedAuthority {
+            qualification_start_receipt: start,
+            prior_completed_prepared_sequence: None,
+        };
+        let operation = PaperFillOperationIdentity {
+            leader_wallet: WalletAddress::from_hex(wallet_hex()).unwrap(),
+            source_trade_id: SourceTradeId("g2:golden-fill".to_owned()),
+            observed_at_bucket: 1_800_000_000,
+        };
+        let payload = FinancialPayload::Fill {
+            operation: operation.clone(),
+            economic: active_economic(),
+        };
+        let prepared_receipt = append_active_record(
+            &mut writer,
+            &PaperLogRecord::FinancialPrepared {
+                expected_authority: expected.clone(),
+                payload: payload.clone(),
+            },
+        );
+        let request = PreparedFillRequest::from_prepared(
+            expected.clone(),
+            prepared_receipt,
+            &operation,
+            match &payload {
+                FinancialPayload::Fill { economic, .. } => economic,
+                FinancialPayload::Resolution { .. } => unreachable!(),
+            },
+        );
+
+        let prior_result = if matches!(
+            seam,
+            FillCrashSeam::AuthorityResponse
+                | FillCrashSeam::LocalProjection
+                | FillCrashSeam::FinalAppend
+        ) {
+            Some(authority.commit_prepared_fill(&request).await.unwrap())
+        } else {
+            None
+        };
+        if matches!(
+            seam,
+            FillCrashSeam::LocalProjection | FillCrashSeam::FinalAppend
+        ) {
+            let canonical = prior_result.as_ref().unwrap();
+            state
+                .apply_financial_fill(
+                    start,
+                    None,
+                    prepared_receipt.sequence,
+                    &FinancialFillRecord {
+                        idempotency_key: request.idempotency_key.clone(),
+                        market_id: MarketId(VenueMarketId(request.market_id.clone())),
+                        outcome_id: OutcomeId(request.outcome_id),
+                        side: request.side,
+                        quantity: request.quantity,
+                        fill_price: request.fill_price,
+                        principal: request.principal,
+                        fee: request.fee,
+                    },
+                    canonical.bankroll,
+                )
+                .unwrap();
+        }
+        if matches!(seam, FillCrashSeam::FinalAppend) {
+            append_active_record(
+                &mut writer,
+                &PaperLogRecord::FinancialFinal {
+                    prepared_receipt,
+                    result: FinancialResult::Fill {
+                        canonical: prior_result.clone().unwrap(),
+                    },
+                },
+            );
+        }
+
+        let appended = reconcile_active_financial_frames(
+            &authority,
+            &state,
+            &paper_log,
+            &source_log,
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            appended,
+            usize::from(!matches!(seam, FillCrashSeam::FinalAppend)),
+            "unexpected recovered Final count at {seam:?}"
+        );
+        assert_eq!(authority.prepared_mutations(), 1, "seam {seam:?}");
+        assert_eq!(state.list_financial_fills().unwrap().len(), 1);
+        assert_eq!(
+            state.financial_snapshot(1_800_000_001).unwrap().cash,
+            dec!(9)
+        );
+        let frames = scan_paper_log(&paper_log).unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(
+                    frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialFinal { .. })
+                ))
+                .count(),
+            1,
+            "seam {seam:?}"
+        );
+        assert_eq!(
+            reconcile_active_financial_frames(
+                &authority,
+                &state,
+                &paper_log,
+                &source_log,
+                &mut writer,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(authority.prepared_mutations(), 1);
+    }
+}
+
+fn assert_authority_conflict<T>(result: Result<T, SupabaseStateError>, field: &str) {
+    assert!(
+        matches!(result, Err(SupabaseStateError::Conflict { .. })),
+        "changed {field} must return the typed authority conflict"
+    );
+}
+
+/// I16-C8-CONFLICT-AUTHORITY
+///
+/// Preconditions: the fake authority has accepted one exact fill and one exact resolution.
+/// PASS: every changed fill identity/economic input and resolution condition/payout/time/era/
+/// sequence input returns `SupabaseStateError::Conflict` without another mutation.
+/// FAIL: a changed retry is reported existing/applied or changes the authority mutation count.
+#[tokio::test]
+async fn prepared_authority_changed_field_conflict_matrix() {
+    let start = active_receipt(10, 10);
+    let authority = FakeSupabaseState::prepared(dec!(10), start);
+    let expected = ExpectedAuthority {
+        qualification_start_receipt: start,
+        prior_completed_prepared_sequence: None,
+    };
+    let operation = PaperFillOperationIdentity {
+        leader_wallet: WalletAddress::from_hex(wallet_hex()).unwrap(),
+        source_trade_id: SourceTradeId("g2:authority-fill".to_owned()),
+        observed_at_bucket: 1_800_000_000,
+    };
+    let economic = active_economic();
+    let request =
+        PreparedFillRequest::from_prepared(expected, active_receipt(11, 11), &operation, &economic);
+    authority.commit_prepared_fill(&request).await.unwrap();
+    assert_eq!(authority.prepared_mutations(), 1);
+    assert_eq!(
+        authority
+            .commit_prepared_fill(&request)
+            .await
+            .unwrap()
+            .outcome,
+        "existing"
+    );
+
+    let mut fill_retries = Vec::new();
+    macro_rules! changed_fill {
+        ($field:literal, $change:expr) => {{
+            let mut changed = request.clone();
+            $change(&mut changed);
+            fill_retries.push(($field, changed));
+        }};
+    }
+    changed_fill!("idempotency_key", |value: &mut PreparedFillRequest| value
+        .idempotency_key =
+        "different".to_owned());
+    changed_fill!("leader_wallet", |value: &mut PreparedFillRequest| value
+        .leader_wallet =
+        WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",).unwrap());
+    changed_fill!("source_trade_id", |value: &mut PreparedFillRequest| value
+        .source_trade_id =
+        SourceTradeId("g2:different".to_owned()));
+    changed_fill!("market_id", |value: &mut PreparedFillRequest| value
+        .market_id =
+        "different".to_owned());
+    changed_fill!("outcome_id", |value: &mut PreparedFillRequest| value
+        .outcome_id =
+        1);
+    changed_fill!("side", |value: &mut PreparedFillRequest| value.side =
+        Side::Sell);
+    changed_fill!("quantity", |value: &mut PreparedFillRequest| value
+        .quantity =
+        ShareAmount::from_decimal_exact(dec!(2.000001)).unwrap());
+    changed_fill!("fill_price", |value: &mut PreparedFillRequest| value
+        .fill_price =
+        Price::new(dec!(0.500001)).unwrap());
+    changed_fill!("principal", |value: &mut PreparedFillRequest| value
+        .principal =
+        CollateralAmount::from_decimal_exact(dec!(1.000001)).unwrap());
+    changed_fill!("fee", |value: &mut PreparedFillRequest| value.fee =
+        CollateralAmount::from_decimal_exact(dec!(0.000001)).unwrap());
+    changed_fill!("entry_unix", |value: &mut PreparedFillRequest| value
+        .entry_unix +=
+        1);
+    changed_fill!("era", |value: &mut PreparedFillRequest| value
+        .expected_authority
+        .qualification_start_receipt =
+        active_receipt(10, 99));
+    changed_fill!("prior_sequence", |value: &mut PreparedFillRequest| value
+        .expected_authority
+        .prior_completed_prepared_sequence =
+        Some(EventSeq(9)));
+    changed_fill!("prepared_sequence", |value: &mut PreparedFillRequest| {
+        value.prepared_receipt = active_receipt(12, 12)
+    });
+    for (field, changed) in fill_retries {
+        assert_authority_conflict(authority.commit_prepared_fill(&changed).await, field);
+    }
+
+    let resolution = PreparedResolutionRequest {
+        expected_authority: ExpectedAuthority {
+            qualification_start_receipt: start,
+            prior_completed_prepared_sequence: Some(EventSeq(11)),
+        },
+        prepared_receipt: active_receipt(12, 12),
+        condition: PolymarketConditionId("condition".to_owned()),
+        payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
+        settled_at_unix: 1_800_000_100,
+    };
+    authority
+        .apply_prepared_resolution(&resolution)
+        .await
+        .unwrap();
+    assert_eq!(authority.prepared_mutations(), 2);
+    assert_eq!(
+        authority
+            .apply_prepared_resolution(&resolution)
+            .await
+            .unwrap()
+            .outcome,
+        "existing"
+    );
+    let mut resolution_retries = Vec::new();
+    let mut changed = resolution.clone();
+    changed.condition = PolymarketConditionId("different".to_owned());
+    resolution_retries.push(("condition", changed));
+    let mut changed = resolution.clone();
+    changed.payout_by_outcome_index_json = "[\"0\",\"1\"]".to_owned();
+    resolution_retries.push(("payout", changed));
+    let mut changed = resolution.clone();
+    changed.settled_at_unix += 1;
+    resolution_retries.push(("settled_at_unix", changed));
+    let mut changed = resolution.clone();
+    changed.expected_authority.qualification_start_receipt = active_receipt(10, 99);
+    resolution_retries.push(("era", changed));
+    let mut changed = resolution.clone();
+    changed.expected_authority.prior_completed_prepared_sequence = None;
+    resolution_retries.push(("prior_sequence", changed));
+    let mut changed = resolution.clone();
+    changed.prepared_receipt = active_receipt(13, 13);
+    resolution_retries.push(("prepared_sequence", changed));
+    for (field, changed) in resolution_retries {
+        assert_authority_conflict(authority.apply_prepared_resolution(&changed).await, field);
+    }
+    assert_eq!(authority.prepared_mutations(), 2);
 }

@@ -100,8 +100,7 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
 
 fn make_writer(dir: &TempDir) -> Writer {
     let paper_path = dir.path().join("paper.log");
-    let paper_writer = Writer::open(&paper_path).unwrap();
-    paper_writer
+    Writer::open(&paper_path).unwrap()
 }
 
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {

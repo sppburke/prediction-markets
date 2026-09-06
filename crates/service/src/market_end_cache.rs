@@ -80,6 +80,16 @@ impl MarketEndCache {
         }
     }
 
+    /// Seed one immutable resolution row for deterministic service scenarios without HTTP.
+    #[cfg(feature = "scenario")]
+    pub async fn seed_scenario_resolution(
+        &self,
+        market_id: MarketId,
+        resolution: MarketResolution,
+    ) {
+        self.inner.lock().await.insert(market_id, resolution);
+    }
+
     /// Resolution timing for `market_id`, fetching from Gamma if not yet seen.
     pub async fn resolution(&self, market_id: &MarketId) -> MarketResolution {
         // Fast path: already cached.
