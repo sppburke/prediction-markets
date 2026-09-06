@@ -488,45 +488,46 @@ mod tests {
         let prepared_task = Arc::clone(&prepared);
         let release_task = Arc::clone(&release_ack);
         let control = tokio::spawn(async move {
-            let command = control_rx.recv().await.unwrap();
-            match command {
-                OrchestratorControl::PrepareAdmissions {
-                    wallets,
-                    acknowledged,
-                } => {
-                    assert_eq!(live_at_control.snapshot().entries.len(), 1);
-                    assert_eq!(wallets, vec![newcomer]);
-                    fake_install_anchors(&fake_paper_state, &wallets, newcomer_last_trade);
-                    prepared_task.notify_one();
-                    release_task.notified().await;
-                    acknowledged.send(()).unwrap();
-                }
-                OrchestratorControl::CommitActivityBucket { .. } => {
-                    panic!("capacity transition sent an activity bucket")
-                }
-                OrchestratorControl::InstallAnchors { .. }
-                | OrchestratorControl::CaptureAdmissionLedger { .. } => {
-                    panic!("legacy admission test sent a causal-bracket command")
-                }
-                OrchestratorControl::PublishMembership {
-                    change,
-                    replacements,
-                    acknowledged,
-                } => {
-                    let removed = change.removed.into_iter().collect::<HashSet<_>>();
-                    live_at_control.replace(&removed, &replacements, change.capacity);
-                    acknowledged
-                        .send(Ok(pe_event_log::AppendReceipt {
-                            sequence: pe_core_types::EventSeq(1),
-                            this_hash: blake3::hash(b"test-capacity"),
-                        }))
-                        .unwrap();
-                }
-                OrchestratorControl::ResolutionCandidate { .. }
-                | OrchestratorControl::RiskHaltChange { .. }
-                | OrchestratorControl::DailyBoundary { .. }
-                | OrchestratorControl::SealCheck { .. } => {
-                    panic!("capacity transition sent an unrelated financial control")
+            while let Some(command) = control_rx.recv().await {
+                match command {
+                    OrchestratorControl::PrepareAdmissions {
+                        wallets,
+                        acknowledged,
+                    } => {
+                        assert_eq!(live_at_control.snapshot().entries.len(), 1);
+                        assert_eq!(wallets, vec![newcomer]);
+                        fake_install_anchors(&fake_paper_state, &wallets, newcomer_last_trade);
+                        prepared_task.notify_one();
+                        release_task.notified().await;
+                        acknowledged.send(()).unwrap();
+                    }
+                    OrchestratorControl::CommitActivityBucket { .. } => {
+                        panic!("capacity transition sent an activity bucket")
+                    }
+                    OrchestratorControl::InstallAnchors { .. }
+                    | OrchestratorControl::CaptureAdmissionLedger { .. } => {
+                        panic!("legacy admission test sent a causal-bracket command")
+                    }
+                    OrchestratorControl::PublishMembership {
+                        change,
+                        replacements,
+                        acknowledged,
+                    } => {
+                        let removed = change.removed.into_iter().collect::<HashSet<_>>();
+                        live_at_control.replace(&removed, &replacements, change.capacity);
+                        acknowledged
+                            .send(Ok(pe_event_log::AppendReceipt {
+                                sequence: pe_core_types::EventSeq(1),
+                                this_hash: blake3::hash(b"test-capacity"),
+                            }))
+                            .unwrap();
+                    }
+                    OrchestratorControl::ResolutionCandidate { .. }
+                    | OrchestratorControl::RiskHaltChange { .. }
+                    | OrchestratorControl::DailyBoundary { .. }
+                    | OrchestratorControl::SealCheck { .. } => {
+                        panic!("capacity transition sent an unrelated financial control")
+                    }
                 }
             }
         });
