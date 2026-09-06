@@ -217,21 +217,24 @@ pub struct DecisionPostBoundaryEvidenceBody {
 pub struct DecisionPostBoundaryEvidence {
     #[serde(flatten)]
     pub body: DecisionPostBoundaryEvidenceBody,
+    pub financial_semantic_version: u32,
     pub document_blake3: String,
 }
 
 impl DecisionPostBoundaryEvidence {
     /// Seal one post-boundary evidence body with its canonical BLAKE3 identity.
     pub fn from_body(body: DecisionPostBoundaryEvidenceBody) -> Result<Self, serde_json::Error> {
-        let document_blake3 = body_hash(&body)?;
+        let financial_semantic_version = crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION;
+        let document_blake3 = body_hash(&body, financial_semantic_version)?;
         Ok(Self {
             body,
+            financial_semantic_version,
             document_blake3,
         })
     }
 
     fn validate_hash(&self) -> Result<(), ReplayDecisionError> {
-        let actual = body_hash(&self.body)?;
+        let actual = body_hash(&self.body, self.financial_semantic_version)?;
         if actual != self.document_blake3 {
             return Err(ReplayDecisionError::DocumentHash {
                 expected: self.document_blake3.clone(),
@@ -242,8 +245,11 @@ impl DecisionPostBoundaryEvidence {
     }
 }
 
-fn body_hash(body: &DecisionPostBoundaryEvidenceBody) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(body)?;
+fn body_hash(
+    body: &DecisionPostBoundaryEvidenceBody,
+    financial_semantic_version: u32,
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(&(financial_semantic_version, body))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -263,11 +269,15 @@ struct DecisionEvidenceCheckpointBody {
 struct DecisionEvidenceCheckpoint {
     #[serde(flatten)]
     body: DecisionEvidenceCheckpointBody,
+    financial_semantic_version: u32,
     document_blake3: String,
 }
 
-fn checkpoint_hash(body: &DecisionEvidenceCheckpointBody) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(body)?;
+fn checkpoint_hash(
+    body: &DecisionEvidenceCheckpointBody,
+    financial_semantic_version: u32,
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(&(financial_semantic_version, body))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -351,9 +361,11 @@ impl DecisionEvidenceAccumulator {
             book: self.book.clone(),
             clocks: self.clocks.clone(),
         };
-        let document_blake3 = checkpoint_hash(&body)?;
+        let financial_semantic_version = crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION;
+        let document_blake3 = checkpoint_hash(&body, financial_semantic_version)?;
         serde_json::to_string(&DecisionEvidenceCheckpoint {
             body,
+            financial_semantic_version,
             document_blake3,
         })
     }
@@ -376,14 +388,16 @@ impl DecisionEvidenceAccumulator {
         {
             return Err(ReplayDecisionError::Owners);
         }
-        let actual = checkpoint_hash(&checkpoint.body)?;
+        let actual = checkpoint_hash(&checkpoint.body, checkpoint.financial_semantic_version)?;
         if actual != checkpoint.document_blake3 {
             return Err(ReplayDecisionError::DocumentHash {
                 expected: checkpoint.document_blake3,
                 actual,
             });
         }
-        if checkpoint.body.source_trade_id != frozen.source_trade_id
+        if checkpoint.financial_semantic_version
+            != crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION
+            || checkpoint.body.source_trade_id != frozen.source_trade_id
             || checkpoint.body.applied_configuration_hash != frozen.applied_configuration_hash
         {
             return Err(ReplayDecisionError::FrozenMismatch);
@@ -479,7 +493,8 @@ pub fn replay_decision_pending(
         return Err(ReplayDecisionError::Owners);
     }
     post_boundary.validate_hash()?;
-    if post_boundary.body.source_trade_id != frozen.source_trade_id
+    if post_boundary.financial_semantic_version != crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION
+        || post_boundary.body.source_trade_id != frozen.source_trade_id
         || post_boundary.body.applied_configuration_hash != frozen.applied_configuration_hash
         || frozen.applied_configuration.canonical_hash() != frozen.applied_configuration_hash
     {

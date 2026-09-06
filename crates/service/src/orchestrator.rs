@@ -535,7 +535,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .collect::<Vec<_>>();
         let decision_evidence = self
             .paper_state
-            .seal_decision_evidence(&decision_keys)
+            .seal_decision_evidence_for_source_prefix(
+                &decision_keys,
+                started.source_prefix.last_sequence,
+                sealed_source_prefix.last_sequence,
+            )
             .map_err(|error| error.to_string())?;
         let financial_prefix =
             Scanner::verify(paper_log_path).map_err(|error| error.to_string())?;

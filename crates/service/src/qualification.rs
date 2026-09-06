@@ -45,10 +45,10 @@ use pe_source_polymarket_public::{
     ClobPricesHistoryClient, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, LIVE_MARKET_PARSER_VERSION,
     LIVE_MARKET_SCHEMA_VERSION, MarketFilter, PageFetcher, aggregate_activity_rows,
-    parse_activity_response, parse_activity_trade_observation, parse_clob_market,
-    validate_live_market,
+    parse_activity_response, parse_activity_row, parse_activity_trade_observation,
+    parse_clob_market, validate_live_market,
 };
-use pe_trader_index::score::lcb_5pct_decimal;
+use pe_trader_index::{WatchlistEntry, score::lcb_5pct_decimal};
 use pe_venue_polymarket::{BuySizing, LadderError, parse_compact_market, plan_sized_buy};
 use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
@@ -58,9 +58,10 @@ use crate::bucket_commit::DecisionContinuationV3;
 use crate::config::ServiceConfig;
 use crate::decision_replay::replay_decision_pending;
 use crate::paper_recovery::{
-    FinancialPayload, FinancialResult, MembershipReason, PAPER_LOG_SCHEMA_VERSION, PaperLogFrame,
-    PaperLogRecord, PortfolioMark, QualificationSealed, QualificationStarted, RiskHaltOwner,
-    ScannedPaperFrame, SealReason, TailBinding, active_risk_halts, paper_era, scan_paper_log,
+    FINANCIAL_SEMANTIC_VERSION, FinancialPayload, FinancialResult, MembershipReason,
+    PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, PortfolioMark, QualificationSealed,
+    QualificationStarted, RiskHaltOwner, ScannedPaperFrame, SealReason, TailBinding,
+    active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::risk_inputs::{
     PaperExposureBase, RiskInputsUnavailable, build_paper_risk_base,
@@ -542,6 +543,97 @@ struct RiskReplayContext<'a> {
     paper_prefix: &'a [ScannedPaperFrame],
     source: &'a BTreeMap<u64, SourceObservation>,
     prepared_received_unix_ms: i64,
+    start_hot_config_hash: &'a str,
+    financial_semantic_version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SealedMembershipEvidence {
+    FullRerank {
+        replacement_entries: Vec<WatchlistEntry>,
+    },
+    RankerRotation {
+        replacement_entries: Vec<WatchlistEntry>,
+    },
+    KnockoutBackfill {
+        evictions: Vec<SealedKnockoutEvidence>,
+        replacement_entries: Vec<WatchlistEntry>,
+    },
+    CapacityChange {
+        generation: u64,
+        config_receipt: AppendReceipt,
+        replacement_entries: Vec<WatchlistEntry>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedKnockoutEvidence {
+    wallet: pe_core_types::WalletAddress,
+    reason: String,
+    statistic: SealedDemotionStatistic,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SealedDemotionStatistic {
+    Inactivity {
+        evaluated_at_unix: i64,
+        last_trade_unix: i64,
+        threshold_secs: u64,
+    },
+    InactivityHardCap {
+        evaluated_at_unix: i64,
+        last_trade_unix: i64,
+        threshold_secs: u64,
+    },
+    Underperformance {
+        settled_count: usize,
+        minimum_settled_count: usize,
+        windowed_pnl: String,
+        upper_cb: String,
+    },
+}
+
+impl SealedDemotionStatistic {
+    fn proves(&self, reason: &str) -> bool {
+        match self {
+            Self::Inactivity {
+                evaluated_at_unix,
+                last_trade_unix,
+                threshold_secs,
+            } => {
+                reason == "inactive>72h"
+                    && i64::try_from(*threshold_secs).is_ok_and(|threshold| {
+                        evaluated_at_unix.saturating_sub(*last_trade_unix) >= threshold
+                    })
+            }
+            Self::InactivityHardCap {
+                evaluated_at_unix,
+                last_trade_unix,
+                threshold_secs,
+            } => {
+                reason == "inactive>7d (hard cap)"
+                    && i64::try_from(*threshold_secs).is_ok_and(|threshold| {
+                        evaluated_at_unix.saturating_sub(*last_trade_unix) >= threshold
+                    })
+            }
+            Self::Underperformance {
+                settled_count,
+                minimum_settled_count,
+                windowed_pnl,
+                upper_cb,
+            } => {
+                reason == "upper_cb_edge<0 & windowed_pnl<0"
+                    && settled_count >= minimum_settled_count
+                    && *minimum_settled_count > 0
+                    && Decimal::from_str_exact(windowed_pnl)
+                        .is_ok_and(|value| value < Decimal::ZERO)
+                    && Decimal::from_str_exact(upper_cb).is_ok_and(|value| value < Decimal::ZERO)
+            }
+        }
+    }
 }
 
 async fn verify_qualification(
@@ -569,6 +661,7 @@ async fn verify_qualification(
 
     let source_observations = source_observations(&options.source_log, &seal.source_prefix)?;
     let state = PaperStateDb::open_read_only(&options.paper_state)?;
+    verify_initial_membership(&state, &start)?;
     let decisions = decision_rows_from_source_observations(
         &state,
         &start.source_prefix,
@@ -588,6 +681,7 @@ async fn verify_qualification(
         .map_err(|error| {
             QualificationError::InsufficientEvidence(format!("decision replay mismatch: {error}"))
         })?;
+    verify_decision_configurations(&replayed_decisions, &start)?;
     let mut decision_observations = HashMap::new();
     for decision in &replayed_decisions {
         let observation = verify_decision_source_inputs(decision, &source_observations)?;
@@ -606,7 +700,11 @@ async fn verify_qualification(
         .iter()
         .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
         .collect::<Vec<_>>();
-    let decision_bytes = state.seal_decision_evidence(&decision_keys)?;
+    let decision_bytes = state.seal_decision_evidence_for_source_prefix(
+        &decision_keys,
+        start.source_prefix.last_sequence,
+        seal.source_prefix.last_sequence,
+    )?;
     let decision_digest = blake3::hash(&decision_bytes).to_hex().to_string();
     if decision_digest != seal.decision_evidence_digest {
         return insufficient(format!(
@@ -667,6 +765,8 @@ async fn verify_qualification(
                                 paper_prefix: &frames[start_index..frame_index],
                                 source: &source_observations,
                                 prepared_received_unix_ms: received_unix_ms(&frame.envelope)?,
+                                start_hot_config_hash: &start.hot_config_hash,
+                                financial_semantic_version: start.financial_semantic_version,
                             },
                         )
                         .await?;
@@ -914,12 +1014,6 @@ async fn verify_qualification(
                 evidence,
             } => {
                 if *reason == MembershipReason::Initial
-                    || !evidence.is_object()
-                    || evidence.as_object().is_none_or(serde_json::Map::is_empty)
-                    || matches!(
-                        *reason,
-                        MembershipReason::FullRerank | MembershipReason::RankerRotation
-                    ) && ranking_batch_id.is_none()
                     || removed.iter().collect::<HashSet<_>>().len() != removed.len()
                     || added.iter().collect::<HashSet<_>>().len() != added.len()
                     || removed.iter().any(|wallet| added.contains(wallet))
@@ -928,6 +1022,14 @@ async fn verify_qualification(
                 {
                     return insufficient("MembershipChanged structural evidence is invalid");
                 }
+                verify_membership_change_evidence(
+                    *reason,
+                    removed,
+                    added,
+                    *ranking_batch_id,
+                    evidence,
+                    &source_observations,
+                )?;
                 for wallet in removed {
                     membership.remove(wallet);
                 }
@@ -986,6 +1088,7 @@ async fn verify_qualification(
         &replayed_decisions,
         &completed_fills,
         &decision_observations,
+        &start,
     )?;
     let anchor_sequence = anchor_mark_sequence.ok_or_else(|| {
         QualificationError::InsufficientEvidence(
@@ -1421,7 +1524,15 @@ fn decision_rows_from_source_observations(
     let Some(sealed_sequence) = sealed_prefix.last_sequence else {
         return Ok(Vec::new());
     };
-    let mut selected = Vec::new();
+    let required =
+        decision_keys_from_source_observations(start_sequence, sealed_sequence, observations)?;
+    let required_by_trade = required
+        .iter()
+        .map(|(_, source_trade_id, semantic_revision)| {
+            (source_trade_id.clone(), semantic_revision.clone())
+        })
+        .collect::<HashMap<_, _>>();
+    let mut selected_by_trade = HashMap::new();
     for row in state.decision_pending_history()? {
         let continuation = DecisionContinuationV3::from_durable(&row).map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
@@ -1451,13 +1562,239 @@ fn decision_rows_from_source_observations(
         }) {
             return insufficient("decision source receipt does not match the sealed source prefix");
         }
-        selected.push(row);
+        if required_by_trade.get(&row.source_trade_id) != Some(&row.semantic_revision) {
+            return insufficient(format!(
+                "decision_pending row {}/{} is additional to the parsed source prefix",
+                row.source_trade_id, row.semantic_revision
+            ));
+        }
+        if selected_by_trade
+            .insert(row.source_trade_id.clone(), row)
+            .is_some()
+        {
+            return insufficient("sealed decision evidence repeats a source trade identity");
+        }
     }
-    selected.sort_by(|left, right| {
-        (left.source_epoch, &left.source_trade_id.0)
-            .cmp(&(right.source_epoch, &right.source_trade_id.0))
-    });
-    Ok(selected)
+    required
+        .into_iter()
+        .map(|(_, source_trade_id, semantic_revision)| {
+            selected_by_trade.remove(&source_trade_id).ok_or_else(|| {
+                QualificationError::InsufficientEvidence(format!(
+                    "parsed source trade {source_trade_id}/{semantic_revision} has no decision_pending row"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Parse the immutable post-Start activity-page prefix before consulting SQLite. Each accepted
+/// trade aggregate contributes exactly one composite decision key at the first receipt where it
+/// was observed. Repeated identical observations are idempotent; a second semantic revision is
+/// ambiguous evidence and fails closed.
+fn decision_keys_from_source_observations(
+    start_sequence: Option<EventSeq>,
+    sealed_sequence: EventSeq,
+    observations: &BTreeMap<u64, SourceObservation>,
+) -> Result<Vec<(u64, pe_core_types::SourceTradeId, String)>, QualificationError> {
+    let mut by_trade = HashMap::<pe_core_types::SourceTradeId, (u64, String)>::new();
+    for observation in observations.values().filter(|observation| {
+        start_sequence.is_none_or(|start| observation.receipt.sequence > start)
+            && observation.receipt.sequence <= sealed_sequence
+            && observation.source_id == crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+    }) {
+        if observation.schema_version != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+            || observation.parser_version != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+            || observation.content_type != ContentType::Json
+        {
+            return insufficient("post-Start activity observation has the wrong source contract");
+        }
+        let raw_rows: Vec<Box<serde_json::value::RawValue>> =
+            serde_json::from_slice(&observation.payload).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "post-Start activity observation JSON failed: {error}"
+                ))
+            })?;
+        let context = ActivityParseContext {
+            source_id: SourceId(observation.source_id.clone()),
+            observed_at: observation.observed_at.clone(),
+            received_at: observation.received_at.clone(),
+            transport: ActivityTransport::Replay,
+        };
+        let rows = raw_rows
+            .iter()
+            .map(|raw| parse_activity_row(raw.get().as_bytes(), None, &context))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "post-Start activity observation parse failed: {error}"
+                ))
+            })?;
+        for aggregate in aggregate_activity_rows(&rows).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "post-Start activity observation aggregate failed: {error}"
+            ))
+        })? {
+            if aggregate.group_id.components().activity_type != ActivityType::Trade {
+                continue;
+            }
+            let source_trade_id = aggregate.group_id.key().clone();
+            let semantic_revision = aggregate.semantic_revision.as_str().to_owned();
+            match by_trade.entry(source_trade_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((observation.receipt.sequence.0, semantic_revision));
+                }
+                std::collections::hash_map::Entry::Occupied(entry)
+                    if entry.get().1 != semantic_revision =>
+                {
+                    return insufficient(format!(
+                        "source trade {source_trade_id} has multiple semantic revisions in the sealed prefix"
+                    ));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    let mut ordered = by_trade
+        .into_iter()
+        .map(|(source_trade_id, (receipt_sequence, semantic_revision))| {
+            (receipt_sequence, source_trade_id, semantic_revision)
+        })
+        .collect::<Vec<_>>();
+    ordered
+        .sort_by(|left, right| (left.0, &left.1.0, &left.2).cmp(&(right.0, &right.1.0, &right.2)));
+    Ok(ordered)
+}
+
+fn verify_initial_membership(
+    state: &PaperStateDb,
+    start: &QualificationStarted,
+) -> Result<(), QualificationError> {
+    if start.financial_semantic_version != FINANCIAL_SEMANTIC_VERSION {
+        return insufficient(format!(
+            "QualificationStarted financial semantic version {} differs from verifier version {FINANCIAL_SEMANTIC_VERSION}",
+            start.financial_semantic_version
+        ));
+    }
+    let rederived = derive_membership_proofs_hash(state, &start.membership)?;
+    if rederived != start.membership_proofs_hash {
+        return insufficient(format!(
+            "QualificationStarted membership proofs differ from sealed state: recorded {}, rederived {rederived}",
+            start.membership_proofs_hash
+        ));
+    }
+    Ok(())
+}
+
+fn verify_decision_configurations(
+    decisions: &[crate::decision_replay::ReplayedDecision],
+    start: &QualificationStarted,
+) -> Result<(), QualificationError> {
+    for decision in decisions {
+        if decision.continuation.prior.applied_configuration_hash != start.hot_config_hash
+            || decision.post_boundary.financial_semantic_version != start.financial_semantic_version
+        {
+            return insufficient(format!(
+                "decision {} configuration or financial semantics differ from QualificationStarted",
+                decision.continuation.prior.source_trade_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_membership_change_evidence(
+    reason: MembershipReason,
+    removed: &[pe_core_types::WalletAddress],
+    added: &[pe_core_types::WalletAddress],
+    ranking_batch_id: Option<i64>,
+    evidence: &serde_json::Value,
+    source: &BTreeMap<u64, SourceObservation>,
+) -> Result<(), QualificationError> {
+    let evidence: SealedMembershipEvidence =
+        serde_json::from_value(evidence.clone()).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "MembershipChanged evidence schema is invalid: {error}"
+            ))
+        })?;
+    let replacement_entries = match (&evidence, reason) {
+        (
+            SealedMembershipEvidence::FullRerank {
+                replacement_entries,
+            },
+            MembershipReason::FullRerank,
+        )
+        | (
+            SealedMembershipEvidence::RankerRotation {
+                replacement_entries,
+            },
+            MembershipReason::RankerRotation,
+        ) => {
+            if ranking_batch_id.is_none() {
+                return insufficient("ranking membership change lacks a ranking batch identity");
+            }
+            replacement_entries
+        }
+        (
+            SealedMembershipEvidence::KnockoutBackfill {
+                evictions,
+                replacement_entries,
+            },
+            MembershipReason::KnockoutInactivity
+            | MembershipReason::KnockoutInactivityHardCap
+            | MembershipReason::KnockoutUnderperformance,
+        ) => {
+            let mut proved = HashSet::new();
+            for eviction in evictions {
+                if !removed.contains(&eviction.wallet)
+                    || !eviction.statistic.proves(&eviction.reason)
+                    || !proved.insert(eviction.wallet)
+                {
+                    return insufficient(
+                        "MembershipChanged knockout evidence does not prove its removed wallets",
+                    );
+                }
+            }
+            if proved.len() != removed.len() {
+                return insufficient(
+                    "MembershipChanged knockout evidence omits a removed wallet statistic",
+                );
+            }
+            replacement_entries
+        }
+        (
+            SealedMembershipEvidence::CapacityChange {
+                generation,
+                config_receipt,
+                replacement_entries,
+            },
+            MembershipReason::CapacityChange,
+        ) => {
+            if *generation == 0
+                || source
+                    .get(&config_receipt.sequence.0)
+                    .is_none_or(|observation| observation.receipt != *config_receipt)
+            {
+                return insufficient(
+                    "MembershipChanged capacity evidence lacks its exact config receipt",
+                );
+            }
+            replacement_entries
+        }
+        _ => return insufficient("MembershipChanged evidence kind does not match its reason"),
+    };
+    let entry_wallets = replacement_entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    if entry_wallets.len() != replacement_entries.len()
+        || added.iter().any(|wallet| !entry_wallets.contains(wallet))
+        || removed.iter().any(|wallet| entry_wallets.contains(wallet))
+    {
+        return insufficient(
+            "MembershipChanged ranking/admission evidence disagrees with its wallet mutation",
+        );
+    }
+    Ok(())
 }
 
 fn verify_decision_source_inputs(
@@ -2288,11 +2625,32 @@ fn replayed_risk_base(
     })
 }
 
+fn verify_economic_configuration(
+    economic: &EconomicPrepared,
+    start_hot_config_hash: &str,
+    financial_semantic_version: u32,
+) -> Result<(), QualificationError> {
+    if economic.applied_configuration_hash != start_hot_config_hash {
+        return insufficient("EconomicPrepared configuration differs from QualificationStarted");
+    }
+    if u32::from(economic.version) != financial_semantic_version {
+        return insufficient(
+            "EconomicPrepared version differs from QualificationStarted financial semantics",
+        );
+    }
+    Ok(())
+}
+
 async fn verify_economic(
     operation: &crate::paper_recovery::PaperFillOperationIdentity,
     economic: &EconomicPrepared,
     context: &RiskReplayContext<'_>,
 ) -> Result<(), QualificationError> {
+    verify_economic_configuration(
+        economic,
+        context.start_hot_config_hash,
+        context.financial_semantic_version,
+    )?;
     let cash_before = CollateralAmount::from_decimal_exact(context.cash).map_err(|error| {
         QualificationError::InsufficientEvidence(format!(
             "replayed cash cannot be represented exactly: {error}"
@@ -2419,7 +2777,7 @@ async fn verify_economic(
         chase_ceiling: economic.balance.chase_ceiling,
         band_floor: economic.balance.band_floor,
         band_ceiling_exclusive: economic.balance.band_ceiling_exclusive,
-        applied_configuration_hash: economic.applied_configuration_hash.clone(),
+        applied_configuration_hash: context.start_hot_config_hash.to_owned(),
     })
     .map_err(|error| {
         QualificationError::InsufficientEvidence(format!(
@@ -2981,6 +3339,7 @@ fn bind_final_receipts(
         pe_core_types::SourceTradeId,
         pe_execution_core::ObservationEvidence,
     >,
+    started: &QualificationStarted,
 ) -> Result<(), QualificationError> {
     let mut matched_finals = HashSet::new();
     for decision in decisions {
@@ -3032,9 +3391,12 @@ fn bind_final_receipts(
             || continuation.outcome_id.0 != fill.outcome_id
             || continuation.side != fill.side
             || decision_observations.get(&continuation.source_trade_id) != Some(&fill.observation)
+            || continuation.applied_configuration_hash != fill.economic.applied_configuration_hash
+            || continuation.applied_configuration_hash != started.hot_config_hash
+            || u32::from(fill.economic.version) != started.financial_semantic_version
         {
             return insufficient(
-                "fill decision, Prepared operation, and FinancialFinal identity disagree",
+                "fill decision, Prepared economics, and FinancialFinal identity/configuration disagree",
             );
         }
         verify_winner_follow_fill_decision(&decision.continuation, fill)?;
@@ -3882,6 +4244,24 @@ mod tests {
         }
     }
 
+    fn activity_observation(sequence: u64, payload: &[u8]) -> SourceObservation {
+        let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        SourceObservation {
+            receipt: AppendReceipt {
+                sequence: EventSeq(sequence),
+                this_hash: blake3::hash(payload),
+            },
+            observed_at: SourceTimestamp(at),
+            received_at: ReceivedAt(at),
+            received_unix_ms: 1_700_000_100_000,
+            source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        }
+    }
+
     fn append_paper_record_at(
         writer: &mut Writer,
         record: &PaperLogRecord,
@@ -4364,6 +4744,118 @@ mod tests {
         assert!(matches!(
             seal_if_semantic_drift(&start, "different"),
             Some(SealReason::InsufficientEvidence(_))
+        ));
+    }
+
+    /// PASS: the immutable activity payload independently requires its composite decision key;
+    /// deleting the terminal SQLite row therefore returns typed insufficient evidence.
+    #[test]
+    fn parsed_source_trade_cannot_disappear_with_deleted_decision_row() {
+        let payload = br#"[{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","usdcSize":"2.5","price":"0.5","timestamp":"1700000100","transactionHash":"0xabc","outcomeIndex":"0"}]"#;
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let start = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+        let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        let source_receipt = source_writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type: ContentType::Json,
+                payload: payload.to_vec(),
+            })
+            .unwrap();
+        drop(source_writer);
+        let sealed = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+        let observation = activity_observation(source_receipt.sequence.0, payload);
+        let observation = SourceObservation {
+            receipt: source_receipt,
+            ..observation
+        };
+        let observations = BTreeMap::from([(0, observation.clone())]);
+        let keys = decision_keys_from_source_observations(None, EventSeq(0), &observations)
+            .expect("valid activity observation derives one decision key");
+        assert_eq!(keys.len(), 1);
+
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO decision_pending
+                    (source_trade_id, semantic_revision, wallet_hex, source_epoch,
+                     frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition,
+                     updated_at_unix)
+                 VALUES (?1, ?2, ?3, 1700000100, '{}', '{\"decline\":\"no_edge\"}',
+                         'terminal', 'no_fill', 1700000101)",
+                rusqlite::params![
+                    keys[0].1.0,
+                    keys[0].2,
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ],
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM decision_pending", [])
+            .unwrap();
+        assert!(matches!(
+            decision_rows_for_source_prefix(&state, &source_path, &start, &sealed),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("has no decision_pending row")
+        ));
+    }
+
+    /// PASS: a self-consistent economic record made under H2 cannot qualify Start H1.
+    #[test]
+    fn economic_configuration_must_equal_start_configuration() {
+        let economic = risk_economic(
+            "market",
+            CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+        );
+        assert!(matches!(
+            verify_economic_configuration(&economic, "different-start-hash", 1),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("configuration differs")
+        ));
+        assert!(matches!(
+            verify_economic_configuration(&economic, "config", 2),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("financial semantics")
+        ));
+    }
+
+    /// PASS: an arbitrary nonempty object is not typed membership evidence.
+    #[test]
+    fn arbitrary_membership_evidence_is_insufficient() {
+        assert!(matches!(
+            verify_membership_change_evidence(
+                MembershipReason::FullRerank,
+                &[],
+                &[],
+                Some(7),
+                &serde_json::json!({"x": 1}),
+                &BTreeMap::new(),
+            ),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("evidence schema is invalid")
+        ));
+    }
+
+    /// PASS: the verifier rederives even an empty initial-membership proof instead of trusting
+    /// the caller-provided label.
+    #[test]
+    fn initial_membership_label_is_not_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        let mut start = started("config");
+        start.membership.clear();
+        start.membership_proofs_hash = "not-a-proof".to_owned();
+        assert!(matches!(
+            verify_initial_membership(&state, &start),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("membership proofs differ")
         ));
     }
 
@@ -4931,7 +5423,11 @@ mod tests {
         let empty_source_prefix = Scanner::verify(&source_log).unwrap();
         let cutoff_unix = 86_400;
         let start_unix = cutoff_unix - 100;
+        let state = PaperStateDb::open(&paper_state).unwrap();
         let mut start = started("hot");
+        let decision_wallet = start.membership[0];
+        start.membership.clear();
+        start.membership_proofs_hash = derive_membership_proofs_hash(&state, &[]).unwrap();
         start.paper_prefix = TailBinding::from(&empty_paper_prefix);
         start.source_prefix = TailBinding::from(&empty_source_prefix);
         start.live_prefix = TailBinding::from(&empty_source_prefix);
@@ -4971,9 +5467,7 @@ mod tests {
             cutoff_unix,
         );
         let sealed_financial_tail = Scanner::verify(&paper_log).unwrap();
-        let state = PaperStateDb::open(&paper_state).unwrap();
         let decision_evidence = state.seal_decision_evidence(&[]).unwrap();
-        drop(state);
         let seal_receipt = append_paper_record_at(
             &mut paper_writer,
             &PaperLogRecord::QualificationSealed(Box::new(QualificationSealed {
@@ -5016,7 +5510,7 @@ mod tests {
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v3".to_owned(),
             transaction_hash: "0xpost-seal".to_owned(),
-            wallet: start.membership[0],
+            wallet: decision_wallet,
             source_epoch: cutoff_unix - 1,
             market_id: MarketId(VenueMarketId("market-post-seal".to_owned())),
             outcome_id: OutcomeId(0),
@@ -5067,7 +5561,7 @@ mod tests {
                 rusqlite::params![
                     source_trade_id.0,
                     "semantic-v3",
-                    start.membership[0].to_string(),
+                    decision_wallet.to_string(),
                     cutoff_unix - 1,
                     frozen_inputs_json,
                     post_commit_inputs_json,
