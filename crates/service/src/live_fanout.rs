@@ -8026,6 +8026,8 @@ mod tests {
         .unwrap();
 
         let mut candidate = finality_prepared();
+        candidate.economic.admission.market.observed_at_unix = now.unix_timestamp();
+        candidate.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         candidate.identity = projection_identity("risk-candidate");
         candidate.economic.balance.cash_before =
             CollateralAmount::from_decimal_exact(derived.economic_cash.unwrap()).unwrap();
