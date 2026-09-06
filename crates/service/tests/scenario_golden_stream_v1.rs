@@ -29,7 +29,7 @@ use pe_execution_core::{
     LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
     LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared, RiskDecisionAudit,
 };
-use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{DecisionPendingState, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
@@ -959,9 +959,11 @@ fn decision_evidence_digest(
     let era = paper_era(scan_paper_log(paper_path).unwrap());
     let (_, start) = era.start.as_ref().unwrap();
     let state = PaperStateDb::open(state_path).unwrap();
+    // Only terminal documents are seal evidence; the post-seal fixture row is still open.
     let rows = state.decision_pending_history().unwrap();
     let keys = rows
         .into_iter()
+        .filter(|row| row.state == DecisionPendingState::Terminal)
         .map(|row| (row.source_trade_id, row.semantic_revision))
         .collect::<Vec<_>>();
     let evidence = state
