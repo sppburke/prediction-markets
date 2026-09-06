@@ -33,9 +33,9 @@ use pe_execution_core::{
     LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit,
     LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome,
     LiveOrderReconciliationAudit, LiveOrderVenue, LivePrepareResult, LiveReconciliationSource,
-    LiveRecoveryInventory, LiveVenueReconciledOutcome, MarkKind, OrderFillFinalizedAudit,
-    PreparedOrderFact, RedemptionAttempt, RedemptionAttemptIdentity, RedemptionAttemptState,
-    RedemptionPassInput, RiskAudit, RiskDecisionAudit, SizingModeAudit,
+    LiveRecoveryInventory, LiveVenueReconciledOutcome, MarkKind, ObservationEvidence,
+    OrderFillFinalizedAudit, PreparedOrderFact, RedemptionAttempt, RedemptionAttemptIdentity,
+    RedemptionAttemptState, RedemptionPassInput, RiskAudit, RiskDecisionAudit, SizingModeAudit,
     TerminalAdmissionRecoveryOutcome, http_attempt_hashes, prepared_order_fact_matches,
     reconstruct_redemption_attempts, recovery_inventory, redemption_posture, replay_account,
     run_redemption_pass,
@@ -232,6 +232,12 @@ fn source_envelopes_for_live_events(
                     admission.economic.book_receipt,
                 ]);
                 receipts.extend(admission.economic.risk.price_receipts.iter().copied());
+                if let Some(observation) = &admission.economic.observation {
+                    receipts.extend([
+                        observation.source_receipt,
+                        observation.complete_bound_receipt,
+                    ]);
+                }
             }
             LiveJournalPayload::ResolutionFinalized(resolution) => {
                 receipts.push(resolution.source_append_receipt);
@@ -957,7 +963,7 @@ async fn run_dispatch_pass(state: &mut FanoutState) -> Result<(), FanoutError> {
         return Ok(());
     }
     for seed in seeds {
-        let signal = parse_frozen_signal(&seed)?;
+        let frozen = parse_frozen_signal(&seed)?;
         let targets = state
             .config
             .paper_state
@@ -966,8 +972,15 @@ async fn run_dispatch_pass(state: &mut FanoutState) -> Result<(), FanoutError> {
             if target.state == "terminal" {
                 continue;
             }
-            let control =
-                process_target(state, &seed, &target, &signal, OffsetDateTime::now_utc()).await?;
+            let control = process_target(
+                state,
+                &seed,
+                &target,
+                &frozen.signal,
+                frozen.observation.as_ref(),
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
             match control {
                 PassControl::Continue => {}
                 // A transient refusal cannot be overtaken by a younger seed. Resume this exact
@@ -1521,6 +1534,18 @@ where
 {
     let journal = state.config.journal.clone();
     let executor = LiveExecutor::new(venue_context.venue, journal.as_ref());
+    let preparation_check_at = clock();
+    if economic_book_receipt_is_stale(state, &pending.admission.economic, preparation_check_at)? {
+        terminalize_unprepared_recovery(
+            state,
+            target,
+            pending.admission.identity.clone(),
+            pe_execution_core::LiveOrderPreparationFailure::PrePostLadderExpired,
+            "recovery_ladder_expired",
+            preparation_check_at,
+        )?;
+        return Ok(false);
+    }
     match executor
         .resume_approved_admission_with_clock(
             pending.account_id,
@@ -1631,6 +1656,16 @@ where
                 persist_outcome(state, target, &outcome, failed_at)?;
                 return Ok(false);
             }
+            let final_post_check_at = clock();
+            if prepared_ladder_is_stale(state, prepared.audit(), final_post_check_at)? {
+                let outcome = executor.terminalize_prepared(
+                    prepared,
+                    final_post_check_at,
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostLadderExpired,
+                )?;
+                persist_outcome(state, target, &outcome, final_post_check_at)?;
+                return Ok(false);
+            }
             state.config.paper_state.set_dispatch_target_state(
                 &target.dispatch_id,
                 &target.account_id,
@@ -1650,15 +1685,24 @@ where
 struct FrozenSignal {
     schema_version: u16,
     signal: LeaderSignal,
+    #[serde(default)]
+    observation: Option<ObservationEvidence>,
 }
 
-fn parse_frozen_signal(seed: &DispatchSeedRow) -> Result<LeaderSignal, FanoutError> {
+fn parse_frozen_signal(seed: &DispatchSeedRow) -> Result<FrozenSignal, FanoutError> {
     let frozen: FrozenSignal = serde_json::from_str(&seed.signal_json)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
     if frozen.schema_version != 1 {
         return Err(FanoutError::Signal("unsupported schema version".to_owned()));
     }
-    Ok(frozen.signal)
+    Ok(frozen)
+}
+
+/// Canonical ordinary-live entry point to the shared economic composer.
+pub fn compose_live_economic(
+    inputs: EconomicInputs<'_>,
+) -> Result<EconomicPrepared, pe_execution_core::EconomicError> {
+    EconomicPrepared::compose(inputs)
 }
 
 async fn process_target(
@@ -1666,6 +1710,7 @@ async fn process_target(
     seed: &DispatchSeedRow,
     target: &DispatchTargetRow,
     signal: &LeaderSignal,
+    observation: Option<&ObservationEvidence>,
     now: OffsetDateTime,
 ) -> Result<PassControl, FanoutError> {
     let accounts = state.config.live_accounts.snapshot();
@@ -2038,7 +2083,7 @@ async fn process_target(
         SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },
         SizingMode::Contract { contracts } => SizingModeAudit::Contract { contracts },
     };
-    let economic = EconomicPrepared::compose(EconomicInputs {
+    let economic = compose_live_economic(EconomicInputs {
         market: pe_execution_core::MarketSelection {
             condition_id: admission.market.condition_id.clone(),
             outcome_index,
@@ -2049,7 +2094,7 @@ async fn process_target(
         admission: &admission,
         plan: &plan,
         book_receipt,
-        observation: None,
+        observation: observation.cloned(),
         sizing_mode,
         budget: sized.budget,
         slippage_rate: strategy_config.slippage_rate,
@@ -2165,6 +2210,10 @@ async fn process_target(
         warn!(account_id = %target.account_id, "risk evidence expired during the boundary refresh; seed paused");
         return Ok(PassControl::StopSeed);
     }
+    if economic_book_receipt_is_stale(state, &request.economic, final_prepare_check_at)? {
+        warn!(account_id = %target.account_id, "ladder evidence expired before preparation; seed paused");
+        return Ok(PassControl::StopSeed);
+    }
     let journal = state.config.journal.clone();
     let executor = LiveExecutor::new(&venue, journal.as_ref());
     match executor
@@ -2207,6 +2256,15 @@ async fn process_target(
                 return Ok(PassControl::StopSeed);
             }
             let post_check_at = OffsetDateTime::now_utc();
+            if prepared_ladder_is_stale(state, prepared.audit(), post_check_at)? {
+                let outcome = executor.terminalize_prepared(
+                    prepared,
+                    post_check_at,
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostLadderExpired,
+                )?;
+                persist_outcome(state, target, &outcome, post_check_at)?;
+                return Ok(PassControl::StopSeed);
+            }
             let risk_price_expired =
                 prepared_risk_price_expired(state, prepared.audit(), post_check_at)?;
             let risk_day_changed = prepared_risk_day_changed(prepared.audit(), post_check_at);
@@ -2295,6 +2353,41 @@ fn prepared_risk_day_changed(
     now: OffsetDateTime,
 ) -> bool {
     risk_day_changed(&prepared.economic.risk, now)
+}
+
+fn prepared_ladder_is_stale(
+    state: &FanoutState,
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    now: OffsetDateTime,
+) -> Result<bool, FanoutError> {
+    economic_book_receipt_is_stale(state, &prepared.economic, now)
+}
+
+fn economic_book_receipt_is_stale(
+    state: &FanoutState,
+    economic: &EconomicPrepared,
+    now: OffsetDateTime,
+) -> Result<bool, FanoutError> {
+    Ok(state
+        .config
+        .source_receipts
+        .received_millis(economic.book_receipt)
+        .map_or(true, |observed_unix_ms| {
+            ladder_observation_is_stale(unix_millis_i64(now), observed_unix_ms)
+        }))
+}
+
+fn ladder_observation_is_stale(now_unix_ms: i64, observed_unix_ms: i64) -> bool {
+    let (Ok(now_ms), Ok(observed_ms)) =
+        (u64::try_from(now_unix_ms), u64::try_from(observed_unix_ms))
+    else {
+        return true;
+    };
+    pe_venue_polymarket::ladder_is_stale(now_ms, observed_ms)
+}
+
+fn unix_millis_i64(now: OffsetDateTime) -> i64 {
+    i64::try_from(now.unix_timestamp_nanos().div_euclid(1_000_000)).unwrap_or(i64::MIN)
 }
 
 fn risk_day_changed(risk: &RiskAudit, now: OffsetDateTime) -> bool {
@@ -2896,6 +2989,65 @@ where
     Ok(observation)
 }
 
+fn validate_economic_observation<L>(
+    observation: &ObservationEvidence,
+    evidence_cutoff_unix_ms: i64,
+    lookup: &mut L,
+) -> Result<(), EconomicReplayError>
+where
+    L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
+{
+    if observation.source_receipt.sequence > observation.complete_bound_receipt.sequence {
+        return Err(economic_replay_error(
+            "economic observation receipt is after its complete-read bound",
+        ));
+    }
+    let complete_bound = exact_economic_source(
+        observation.complete_bound_receipt,
+        crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+        pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+        pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+        evidence_cutoff_unix_ms,
+        lookup,
+    )?;
+    let selected = match observation.provenance.as_str() {
+        "rest_poll" => {
+            if observation.source_receipt != observation.complete_bound_receipt {
+                return Err(economic_replay_error(
+                    "rest-poll observation does not equal its complete-read bound",
+                ));
+            }
+            complete_bound.clone()
+        }
+        "activity_ws" => {
+            if observation.source_receipt.sequence >= observation.complete_bound_receipt.sequence {
+                return Err(economic_replay_error(
+                    "activity-websocket observation is not before its complete-read bound",
+                ));
+            }
+            exact_economic_source(
+                observation.source_receipt,
+                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                evidence_cutoff_unix_ms,
+                lookup,
+            )?
+        }
+        _ => {
+            return Err(economic_replay_error(
+                "economic observation provenance is unsupported",
+            ));
+        }
+    };
+    if selected.received_unix_ms != observation.observed_unix_ms {
+        return Err(economic_replay_error(
+            "economic observation receive clock is inconsistent with its receipts",
+        ));
+    }
+    Ok(())
+}
+
 /// Rebuild admission, compact fee authority, and the signed `/book` ladder from four exact
 /// receipts. Qualification supplies its sealed-prefix lookup; live replay supplies its scoped
 /// source-index lookup. No copied fee, reserve, quantity, or ladder field is trusted here.
@@ -2908,6 +3060,9 @@ pub(crate) fn replay_source_backed_economic<L>(
 where
     L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
 {
+    if let Some(observation) = &economic.observation {
+        validate_economic_observation(observation, evidence_cutoff_unix_ms, &mut lookup)?;
+    }
     let receipts = economic.admission.receipts;
     if [
         receipts.gamma.sequence,
@@ -7446,6 +7601,26 @@ mod tests {
         assert!(!prepared_admission_is_approved_at(&prepared, stale));
     }
 
+    /// PASS: the shared ladder-age classifier accepts ages 1,999 and 2,000 ms and rejects
+    /// 2,001 ms, preserving the venue owner's strict-greater-than expiry contract.
+    /// FAIL: either inclusive boundary is stale or the first over-age millisecond is fresh.
+    #[test]
+    fn ladder_age_classifier_preserves_millisecond_boundary() {
+        let observed_unix_ms = 1_700_000_000_000;
+        assert!(!ladder_observation_is_stale(
+            observed_unix_ms + 1_999,
+            observed_unix_ms
+        ));
+        assert!(!ladder_observation_is_stale(
+            observed_unix_ms + 2_000,
+            observed_unix_ms
+        ));
+        assert!(ladder_observation_is_stale(
+            observed_unix_ms + 2_001,
+            observed_unix_ms
+        ));
+    }
+
     #[test]
     fn applied_mode_transition_reason_is_typed_for_the_journal() {
         assert_eq!(
@@ -7836,9 +8011,9 @@ mod tests {
     }
 
     /// PASS: receipt-scoped live source collection retains the three admission responses, exact
-    /// `/book`, and risk-price evidence referenced by an `AdmissionEvaluated` record.
-    /// FAIL: any of the five receipt classes referenced by the record is absent from the scoped
-    /// collection.
+    /// `/book`, risk-price evidence, and both observation receipts referenced by an
+    /// `AdmissionEvaluated` record.
+    /// FAIL: any referenced economic receipt is absent from the scoped collection.
     #[test]
     fn live_source_scope_includes_all_economic_receipts() {
         let dir = tempdir().unwrap();
@@ -7846,7 +8021,7 @@ mod tests {
         let mut writer = pe_event_log::Writer::open(&path).unwrap();
         let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
         let mut receipts = Vec::new();
-        for ordinal in 0..5 {
+        for ordinal in 0..7 {
             receipts.push(
                 writer
                     .append_synced(EnvelopeIn {
@@ -7871,6 +8046,12 @@ mod tests {
         };
         prepared.economic.book_receipt = receipts[3];
         prepared.economic.risk.price_receipts = vec![receipts[4]];
+        prepared.economic.observation = Some(ObservationEvidence {
+            source_receipt: receipts[5],
+            complete_bound_receipt: receipts[6],
+            observed_unix_ms: 20_000,
+            provenance: "activity_ws".to_owned(),
+        });
         let account_id = AccountId::new("source-scope").unwrap();
         let events = [approved_admission_event(&account_id, &prepared, 0, now)];
 
@@ -8394,6 +8575,207 @@ mod tests {
         assert!(replay_economic_with_clocks(20_999, 21_001, 21, 20).is_err());
     }
 
+    /// PASS: the live composer preserves both `None` and receipt-bearing observations, and the
+    /// observation changes the canonical economic core hash.
+    /// FAIL: live composition drops the observation or produces the same hash for both inputs.
+    #[test]
+    fn live_composer_preserves_optional_observation() {
+        let replayed = replay_economic_with_clocks(20_100, 20_999, 20, 20).unwrap();
+        let template = finality_prepared().economic;
+        let observation = ObservationEvidence {
+            source_receipt: fixture_receipt(5),
+            complete_bound_receipt: fixture_receipt(6),
+            observed_unix_ms: 20_000,
+            provenance: "activity_ws".to_owned(),
+        };
+        let compose = |observation| {
+            compose_live_economic(EconomicInputs {
+                market: template.market.clone(),
+                admission: &replayed.admission,
+                plan: &replayed.sized.ladder,
+                book_receipt: template.book_receipt,
+                observation,
+                sizing_mode: template.sizing.mode,
+                budget: replayed.sized.budget,
+                slippage_rate: template.sizing.slippage_rate,
+                risk: template.risk.clone(),
+                cash_before: replayed.cash_before,
+                price_impact_cap_bps: template.balance.price_impact_cap_bps,
+                chase_ceiling: template.balance.chase_ceiling,
+                band_floor: template.balance.band_floor,
+                band_ceiling_exclusive: template.balance.band_ceiling_exclusive,
+                applied_configuration_hash: template.applied_configuration_hash.clone(),
+            })
+            .unwrap()
+        };
+
+        let without = compose(None);
+        let with = compose(Some(observation.clone()));
+        assert_eq!(without.observation, None);
+        assert_eq!(with.observation, Some(observation));
+        assert_ne!(without.core_hash().unwrap(), with.core_hash().unwrap());
+    }
+
+    fn observation_replay_fixture() -> (
+        EconomicPrepared,
+        Vec<(AppendReceipt, RecordedEconomicSource)>,
+    ) {
+        let mut economic = finality_prepared().economic;
+        economic.admission.market.observed_at_unix = 20;
+        economic.admission.settlement.observed_at_unix = 20;
+        economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        economic.risk.evaluated_at_unix_ms = 30_000;
+        let source_receipt = fixture_receipt(5);
+        let complete_bound_receipt = fixture_receipt(6);
+        economic.observation = Some(ObservationEvidence {
+            source_receipt,
+            complete_bound_receipt,
+            observed_unix_ms: 19_000,
+            provenance: "activity_ws".to_owned(),
+        });
+        let payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let receipts = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ];
+        let source_ids = [
+            GAMMA_MARKETS_SOURCE_ID,
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
+        ];
+        let mut sources = receipts
+            .into_iter()
+            .zip(source_ids)
+            .zip(payloads)
+            .map(|((receipt, source_id), payload)| {
+                (
+                    receipt,
+                    RecordedEconomicSource {
+                        payload,
+                        received_unix_ms: 20_000,
+                        source_id: source_id.to_owned(),
+                        schema_version: 1,
+                        parser_version: 1,
+                        content_type: ContentType::Json,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        sources.extend([
+            (
+                source_receipt,
+                RecordedEconomicSource {
+                    payload: br#"{"event":"trade"}"#.to_vec(),
+                    received_unix_ms: 19_000,
+                    source_id: crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned(),
+                    schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                    parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                    content_type: ContentType::Json,
+                },
+            ),
+            (
+                complete_bound_receipt,
+                RecordedEconomicSource {
+                    payload: br#"[]"#.to_vec(),
+                    received_unix_ms: 20_000,
+                    source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
+                    schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                    parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                    content_type: ContentType::Json,
+                },
+            ),
+        ]);
+        (economic, sources)
+    }
+
+    fn replay_observation_fixture(
+        economic: &EconomicPrepared,
+        sources: &[(AppendReceipt, RecordedEconomicSource)],
+    ) -> Result<SourceBackedEconomicReplay, EconomicReplayError> {
+        replay_source_backed_economic(
+            economic,
+            economic.risk.evaluated_at_unix_ms,
+            CollateralAmount::from_atomic(10_000_000),
+            |receipt| {
+                sources
+                    .iter()
+                    .find(|(candidate, _)| *candidate == receipt)
+                    .map(|(_, source)| source.clone())
+                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+            },
+        )
+    }
+
+    /// PASS: strict economic replay resolves both observation receipts, their ordered receive
+    /// clocks, source contracts, and websocket provenance before accepting the economic record.
+    /// FAIL: either the websocket or REST observation provenance cannot replay from valid inputs.
+    #[test]
+    fn strict_live_economic_validates_observation_receipts() {
+        let (economic, sources) = observation_replay_fixture();
+        replay_observation_fixture(&economic, &sources).unwrap();
+
+        let mut rest_poll = economic.clone();
+        let observation = rest_poll.observation.as_mut().unwrap();
+        observation.source_receipt = observation.complete_bound_receipt;
+        observation.observed_unix_ms = 20_000;
+        observation.provenance = "rest_poll".to_owned();
+        replay_observation_fixture(&rest_poll, &sources).unwrap();
+    }
+
+    /// PASS: removing either observation receipt, changing its source contract or provenance,
+    /// or changing the copied observation clock causes strict replay to fail closed.
+    /// FAIL: any missing, future, or tampered observation evidence remains replayable.
+    #[test]
+    fn strict_live_economic_rejects_absent_or_tampered_observation_receipts() {
+        let (economic, sources) = observation_replay_fixture();
+        let observation = economic.observation.as_ref().unwrap();
+        for missing_receipt in [
+            observation.source_receipt,
+            observation.complete_bound_receipt,
+        ] {
+            let missing = sources
+                .iter()
+                .filter(|(receipt, _)| *receipt != missing_receipt)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(replay_observation_fixture(&economic, &missing).is_err());
+        }
+
+        let mut wrong_contract = sources.clone();
+        wrong_contract
+            .iter_mut()
+            .find(|(receipt, _)| *receipt == observation.complete_bound_receipt)
+            .unwrap()
+            .1
+            .source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
+        assert!(replay_observation_fixture(&economic, &wrong_contract).is_err());
+
+        let mut wrong_provenance = economic.clone();
+        wrong_provenance.observation.as_mut().unwrap().provenance = "rest_poll".to_owned();
+        assert!(replay_observation_fixture(&wrong_provenance, &sources).is_err());
+
+        let mut wrong_clock = economic.clone();
+        wrong_clock.observation.as_mut().unwrap().observed_unix_ms += 1;
+        assert!(replay_observation_fixture(&wrong_clock, &sources).is_err());
+
+        for future_receipt in [
+            observation.source_receipt,
+            observation.complete_bound_receipt,
+        ] {
+            let mut future_source = sources.clone();
+            future_source
+                .iter_mut()
+                .find(|(receipt, _)| *receipt == future_receipt)
+                .unwrap()
+                .1
+                .received_unix_ms = economic.risk.evaluated_at_unix_ms + 1;
+            assert!(replay_observation_fixture(&economic, &future_source).is_err());
+        }
+    }
+
     /// PASS: payloads that conflict with the copied admission or ladder fail even when presented
     /// under the journal's referenced receipt identity.
     /// FAIL: a conflicting payload under the referenced receipt identity is accepted.
@@ -8760,6 +9142,66 @@ mod tests {
                 &state,
                 &risk,
                 observed_at + time::Duration::milliseconds(60_000),
+            )
+            .unwrap()
+        );
+    }
+
+    /// PASS: a dispatch boundary that resumes after an awaited operation re-resolves the book
+    /// receipt and rejects the ladder once the sampled action time is 2,001 ms after receipt.
+    /// FAIL: the pre-await freshness result is reused after the modeled awaited delay.
+    #[tokio::test]
+    async fn dispatch_rechecks_ladder_after_awaited_boundary() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let state = fanout_state(
+            &dir,
+            db,
+            LiveAccountsSnapshot::default(),
+            "http://127.0.0.1:9",
+            None,
+        );
+        let observed_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let book_receipt = state
+            .config
+            .source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(CLOB_BOOK_SOURCE_ID.to_owned()),
+                schema_version: CLOB_BOOK_SCHEMA_VERSION,
+                parser_version: CLOB_BOOK_PARSER_VERSION,
+                observed_at: SourceTimestamp(observed_at),
+                received_at: ReceivedAt(observed_at),
+                content_type: ContentType::Json,
+                payload: br#"{"asks":[]}"#.to_vec(),
+            })
+            .await
+            .unwrap();
+        let mut economic = finality_prepared().economic;
+        economic.book_receipt = book_receipt;
+        let observed_unix_ms = unix_millis_i64(observed_at);
+        let action_clock = AtomicI64::new(observed_unix_ms + 1_999);
+
+        assert!(
+            !economic_book_receipt_is_stale(
+                &state,
+                &economic,
+                OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(action_clock.load(Ordering::SeqCst)) * 1_000_000,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        );
+        tokio::task::yield_now().await;
+        action_clock.store(observed_unix_ms + 2_001, Ordering::SeqCst);
+        assert!(
+            economic_book_receipt_is_stale(
+                &state,
+                &economic,
+                OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(action_clock.load(Ordering::SeqCst)) * 1_000_000,
+                )
+                .unwrap(),
             )
             .unwrap()
         );
@@ -14068,7 +14510,7 @@ mod tests {
         let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
         let (price_receipt, _) = append_recovery_risk_price(&state, observed_at).await;
         let (pending, prepared) =
-            stage_recoverable_approved(&mut state, observed_at, Some(price_receipt)).await;
+            stage_recoverable_approved(&mut state, pass_started_at, Some(price_receipt)).await;
         let current_account_state =
             venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
         let account_binding = account_binding_fixture(
@@ -14145,6 +14587,176 @@ mod tests {
                         == pe_execution_core::LiveOrderPreparationFailure::PrePostRiskPriceExpired
             ) && event.timestamp == after_preparation
         }));
+    }
+
+    /// PASS: a ladder aged 1,999 ms before venue preparation is rechecked after preparation
+    /// advances the action clock by 2 ms, terminalizing Prepared with zero POST attempts.
+    /// FAIL: recovery reuses the pre-prepare freshness result or reaches the POST boundary.
+    #[tokio::test]
+    async fn recovery_rechecks_ladder_after_slow_preparation() {
+        let app = Router::new().route("/positions", get(empty_positions));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let pass_started_at = observed_at + time::Duration::milliseconds(1_999);
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(pass_started_at.unix_timestamp());
+        let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+        state.config.data_base_url = format!("http://{address}");
+        let (pending, prepared) = stage_recoverable_approved(&mut state, observed_at, None).await;
+        let current_account_state =
+            venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+        let account_binding = account_binding_fixture(
+            &pending.account_id,
+            "0x1111111111111111111111111111111111111111",
+        );
+        let clock_millis = Arc::new(AtomicI64::new(
+            i64::try_from(pass_started_at.unix_timestamp_nanos() / 1_000_000).unwrap(),
+        ));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let venue = RecoveryPostVenue {
+            client: reqwest::Client::new(),
+            order_url: "http://127.0.0.1:9/order".to_owned(),
+            prepared,
+            observed_at: pass_started_at,
+            prepare_clock_millis: Some(clock_millis.clone()),
+            prepare_advance_millis: 2,
+            post_attempts: Some(posts.clone()),
+            account_state: Some(current_account_state.clone()),
+            prepare_barrier: None,
+            prepare_release: None,
+        };
+        let sampled_clock = clock_millis.clone();
+        let clock = move || {
+            OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(sampled_clock.load(Ordering::SeqCst)) * 1_000_000,
+            )
+            .unwrap()
+        };
+        let venue_context = RecoveryVenueContext {
+            venue: &venue,
+            account_binding: &account_binding,
+            custody_wallet: "0x1111111111111111111111111111111111111111",
+        };
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+
+        assert!(
+            !resume_approved_with_venue(
+                &mut state,
+                &target,
+                pending,
+                RecoveryExecutionState {
+                    mode: LiveModeSnapshot {
+                        requested: LiveControlMode::LiveTiny,
+                        effective: LiveControlMode::LiveTiny,
+                    },
+                    account_state: current_account_state,
+                    binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
+                },
+                &venue_context,
+                &clock,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        let after_preparation = pass_started_at + time::Duration::milliseconds(2);
+        let events = replay_live_account(&state, &AccountId::new("acct").unwrap()).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(event.payload, LiveJournalPayload::OrderPrepared(_))
+                && event.timestamp == after_preparation
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                LiveJournalPayload::OrderPreparationFailed(failed)
+                    if failed.failure
+                        == pe_execution_core::LiveOrderPreparationFailure::PrePostLadderExpired
+            ) && event.timestamp == after_preparation
+        }));
+    }
+
+    /// PASS: crash recovery sampled three seconds after the recorded book receipt terminalizes
+    /// the Approved admission before venue preparation and reaches zero POST attempts.
+    /// FAIL: recovery prepares or posts from the expired ladder, or leaves the target pending.
+    #[tokio::test]
+    async fn recovery_rejects_three_second_old_ladder_before_preparation() {
+        let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let recovery_at = observed_at + time::Duration::seconds(3);
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(recovery_at.unix_timestamp());
+        let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+        let (pending, prepared) = stage_recoverable_approved(&mut state, observed_at, None).await;
+        let current_account_state =
+            venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+        let account_binding = account_binding_fixture(
+            &pending.account_id,
+            "0x1111111111111111111111111111111111111111",
+        );
+        let posts = Arc::new(AtomicUsize::new(0));
+        let venue = RecoveryPostVenue {
+            client: reqwest::Client::new(),
+            order_url: "http://127.0.0.1:9/order".to_owned(),
+            prepared,
+            observed_at: recovery_at,
+            prepare_clock_millis: None,
+            prepare_advance_millis: 0,
+            post_attempts: Some(posts.clone()),
+            account_state: Some(current_account_state.clone()),
+            prepare_barrier: None,
+            prepare_release: None,
+        };
+        let venue_context = RecoveryVenueContext {
+            venue: &venue,
+            account_binding: &account_binding,
+            custody_wallet: "0x1111111111111111111111111111111111111111",
+        };
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+
+        assert!(
+            !resume_approved_with_venue(
+                &mut state,
+                &target,
+                pending,
+                RecoveryExecutionState {
+                    mode: LiveModeSnapshot {
+                        requested: LiveControlMode::LiveTiny,
+                        effective: LiveControlMode::LiveTiny,
+                    },
+                    account_state: current_account_state,
+                    binding: CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
+                },
+                &venue_context,
+                || recovery_at,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        assert_eq!(target.state, "terminal");
+        assert_eq!(
+            target.terminal_reason.as_deref(),
+            Some("recovery_ladder_expired")
+        );
+        let events = replay_live_account(&state, &AccountId::new("acct").unwrap()).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            LiveJournalPayload::OrderPreparationFailed(failed)
+                if failed.failure
+                    == pe_execution_core::LiveOrderPreparationFailure::PrePostLadderExpired
+        )));
     }
 
     /// PASS: StopProducers reached while venue preparation is parked prevents the POST and
@@ -14382,7 +14994,7 @@ mod tests {
         );
         let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
         let target = db.dispatch_targets(&seed.dispatch_id).unwrap().remove(0);
-        let control = process_target(&mut state, &seed, &target, &projection_signal(), now)
+        let control = process_target(&mut state, &seed, &target, &projection_signal(), None, now)
             .await
             .unwrap();
         assert_eq!(control, PassControl::StopSeed);
@@ -14434,7 +15046,7 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
         let target = db.dispatch_targets(&seed.dispatch_id).unwrap().remove(0);
-        let control = process_target(&mut state, &seed, &target, &projection_signal(), now)
+        let control = process_target(&mut state, &seed, &target, &projection_signal(), None, now)
             .await
             .unwrap();
         assert_eq!(control, PassControl::FreezePass, "dispatch stays frozen");
@@ -14516,6 +15128,7 @@ mod tests {
             &seed,
             &target,
             &projection_signal(),
+            None,
             OffsetDateTime::from_unix_timestamp(20).unwrap(),
         )
         .await
