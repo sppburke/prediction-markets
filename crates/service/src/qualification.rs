@@ -1354,18 +1354,6 @@ fn verify_live_wrappers(
     paper_frames: &[ScannedPaperFrame],
 ) -> Result<VerifiedLiveEvidence, QualificationError> {
     let wrapper_events = replay_live_prefix(live_journal, &start.live_prefix, live_prefix)?;
-    let sealed_events = match live_prefix.last_sequence {
-        Some(sealed_sequence) => {
-            pe_execution_core::LiveJournal::replay_prefix(live_journal, sealed_sequence).map_err(
-                |error| {
-                    QualificationError::InsufficientEvidence(format!(
-                        "live journal canonical replay failed: {error}"
-                    ))
-                },
-            )?
-        }
-        None => Vec::new(),
-    };
     let source_envelopes = sealed_source_envelopes(source_log, source_prefix)?;
     let paper_bases = paper_live_wrapper_bases(paper_frames)?;
     let mut wrapper_facts = Vec::new();
@@ -1375,7 +1363,10 @@ fn verify_live_wrappers(
         .map(|event| event.account_id.clone())
         .collect::<BTreeSet<_>>();
     for account_id in account_ids {
-        let events = sealed_events
+        // QualificationStarted is the financial-era boundary. Pre-Start live facts remain bound
+        // by `start.live_prefix` but cannot authorize a wrapper or seed ordinary account state;
+        // a post-Start Baseline is the reducer's sole Baseline for this era.
+        let events = wrapper_events
             .iter()
             .filter(|event| event.account_id == account_id)
             .cloned()
@@ -5712,9 +5703,10 @@ fn start_envelope(
 mod tests {
     use pe_core_types::{
         BasisPoints, KellyFraction, LeaderAction, PolymarketConditionId, PolymarketTokenId,
-        Probability, ProbabilityPpm, SourceTradeId, WalletAddress,
+        Probability, ProbabilityPpm, RawHttpAttempt, RawHttpResponse, SourceTradeId, WalletAddress,
     };
     use pe_event_log::EventEnvelope;
+    use pe_execution_core::live_journal::{LivePositionEvidenceAudit, LivePositionPageAudit};
     use pe_execution_core::{
         BalanceAudit, ECONOMIC_PREPARED_VERSION, FeeAudit, LadderAskAudit, LadderPlanAudit,
         LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
@@ -5722,7 +5714,9 @@ mod tests {
         LiveMarketEvidenceAudit, LiveOrderIdentity, LiveOrderPreparedAudit, MarketSelection,
         ObservationEvidence, SizingAudit,
     };
-    use pe_venue_polymarket::{CompactFeeSchedule, PreparedPolymarketBuy};
+    use pe_venue_polymarket::{
+        CanaryV2Client, CompactFeeSchedule, PreparedPolymarketBuy, SDK_VERSION,
+    };
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -7584,6 +7578,183 @@ mod tests {
         RelabeledAdmission,
         RefusedAdmission,
         TamperedEconomic,
+        PreStartAdmission,
+        PreStartBaseline,
+    }
+
+    fn boundary_baseline(
+        account_id: &AccountId,
+        binding: &pe_execution_core::CredentialBindingIdentity,
+        account_state: &LiveAccountStateAudit,
+        cutoff_unix: i64,
+    ) -> LiveJournalPayload {
+        let account_binding = pe_execution_core::live_journal::LiveAccountBindingAudit::new(
+            account_id.clone(),
+            binding.clone(),
+            WalletAddress([1; 20]),
+            "11".repeat(32),
+        );
+        LiveJournalPayload::AccountPortfolioMarked(Box::new(
+            pe_execution_core::AccountPortfolioMarkedAudit {
+                kind: pe_execution_core::MarkKind::Baseline,
+                cutoff_unix,
+                account_binding: account_binding.clone(),
+                account_state: account_state.clone(),
+                venue_positions: Vec::new(),
+                venue_position_evidence:
+                    pe_execution_core::live_journal::LivePositionEvidenceAudit {
+                        requested_wallet: account_binding.custody_wallet,
+                        pages: Vec::new(),
+                    },
+                marked_positions: Vec::new(),
+                prices: Vec::new(),
+                equity: account_state.collateral_balance,
+            },
+        ))
+    }
+
+    fn authenticated_boundary_state(
+        account_id: &AccountId,
+        binding: &pe_execution_core::CredentialBindingIdentity,
+        observed_at: OffsetDateTime,
+    ) -> LiveAccountStateAudit {
+        let account_binding = pe_execution_core::live_journal::LiveAccountBindingAudit::new(
+            account_id.clone(),
+            binding.clone(),
+            WalletAddress([1; 20]),
+            "11".repeat(32),
+        );
+        let spender = CanaryV2Client::standard_spender().unwrap();
+        let collateral = CollateralAmount::from_atomic(10_000_000);
+        let response = |endpoint_kind: &str,
+                        path: &str,
+                        ordered_query: Vec<(String, String)>,
+                        body: Vec<u8>| {
+            RawHttpAttempt::Response(RawHttpResponse {
+                source_id: "polymarket-clob-v2".to_owned(),
+                endpoint_kind: endpoint_kind.to_owned(),
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                ordered_query,
+                status: 200,
+                headers: Vec::new(),
+                body,
+                attempt_ordinal: 1,
+                source_at: None,
+                observed_at,
+                received_at: observed_at,
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: SDK_VERSION.to_owned(),
+            })
+        };
+        let evidence = vec![
+            response(
+                "geoblock",
+                "/api/geoblock",
+                Vec::new(),
+                br#"{"blocked":false,"country":"US"}"#.to_vec(),
+            ),
+            response(
+                "closed-only",
+                "/auth/ban-status/closed-only",
+                Vec::new(),
+                br#"{"closed_only":false}"#.to_vec(),
+            ),
+            response(
+                "balance-allowance",
+                "/balance-allowance",
+                vec![
+                    ("asset_type".to_owned(), "COLLATERAL".to_owned()),
+                    ("signature_type".to_owned(), "3".to_owned()),
+                ],
+                serde_json::to_vec(&serde_json::json!({
+                    "balance": collateral.atomic().to_string(),
+                    "allowances": { spender.clone(): collateral.atomic().to_string() },
+                }))
+                .unwrap(),
+            ),
+        ];
+        let request_descriptor_hashes = evidence
+            .iter()
+            .map(|attempt| {
+                pe_execution_core::live_journal::request_descriptor_hash(
+                    &account_binding.request_descriptor_for_attempt(attempt),
+                )
+                .unwrap()
+            })
+            .collect();
+        LiveAccountStateAudit {
+            observed_at,
+            closed_only: false,
+            geoblocked: false,
+            selected_spender: spender,
+            collateral_balance: collateral,
+            allowance: collateral,
+            reconciled_free_collateral: collateral,
+            schema_version: 1,
+            parser_version: 1,
+            evidence_hashes: pe_execution_core::http_attempt_hashes(&evidence).unwrap(),
+            evidence,
+            request_descriptor_hashes,
+        }
+    }
+
+    fn append_empty_position_sources(
+        writer: &mut Writer,
+        binding: &pe_execution_core::live_journal::LiveAccountBindingAudit,
+        observed_at: OffsetDateTime,
+    ) -> LivePositionEvidenceAudit {
+        let pages = [false, true]
+            .into_iter()
+            .map(|redeemable| {
+                let ordered_query = vec![
+                    ("user".to_owned(), binding.custody_wallet.clone()),
+                    ("sizeThreshold".to_owned(), "0".to_owned()),
+                    ("includeArchived".to_owned(), "true".to_owned()),
+                    ("limit".to_owned(), "500".to_owned()),
+                    ("sortBy".to_owned(), "TOKENS".to_owned()),
+                    ("sortDirection".to_owned(), "ASC".to_owned()),
+                    ("redeemable".to_owned(), redeemable.to_string()),
+                    ("offset".to_owned(), "0".to_owned()),
+                ];
+                let request_identity = format!(
+                    "/positions?user={}&sizeThreshold=0&includeArchived=true&limit=500&sortBy=TOKENS&sortDirection=ASC&redeemable={redeemable}&offset=0",
+                    binding.custody_wallet
+                );
+                let request = binding.request_descriptor(
+                    "GET",
+                    "/positions",
+                    format!("redeemable={redeemable}"),
+                    0,
+                    ordered_query,
+                );
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "request": request,
+                    "body": b"[]".to_vec(),
+                }))
+                .unwrap();
+                let receipt = writer
+                    .append_synced(EnvelopeIn {
+                        source_id: SourceId("polymarket.data.complete-positions".to_owned()),
+                        schema_version: 2,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(observed_at),
+                        received_at: ReceivedAt(observed_at),
+                        content_type: ContentType::Json,
+                        payload,
+                    })
+                    .unwrap();
+                LivePositionPageAudit {
+                    request_identity,
+                    receipt,
+                }
+            })
+            .collect();
+        LivePositionEvidenceAudit {
+            requested_wallet: binding.custody_wallet.clone(),
+            pages,
+        }
     }
 
     fn verify_paper_wrapper_case(
@@ -7596,7 +7767,6 @@ mod tests {
         drop(Writer::open(&source_path).unwrap());
         let source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
         let mut start = started("hot");
-        start.live_prefix = TailBinding::from(&LiveJournal::verified_tail(&live_path).unwrap());
 
         let account_id = AccountId::new("paper-account").unwrap();
         let operation = crate::paper_recovery::PaperFillOperationIdentity {
@@ -7693,11 +7863,11 @@ mod tests {
         let mut admission = LiveAdmissionEvaluationAudit {
             identity,
             frozen_binding: binding.clone(),
-            current_binding: binding,
+            current_binding: binding.clone(),
             requested_mode: LiveControlMode::LiveTiny,
             effective_mode: LiveControlMode::LiveTiny,
             economic: economic.clone(),
-            account_state: Some(account_state),
+            account_state: Some(account_state.clone()),
             account_read_failure_evidence: Vec::new(),
             account_read_failure_request_descriptor_hashes: Vec::new(),
             account_read_failure_evidence_hashes: Vec::new(),
@@ -7711,7 +7881,29 @@ mod tests {
                 pe_execution_core::LiveAdmissionRefusal::ModeNotArmed,
             );
         }
-        if !matches!(case, PaperWrapperCase::MissingAdmission) {
+        if matches!(case, PaperWrapperCase::PreStartAdmission) {
+            journal
+                .append(
+                    account_id.clone(),
+                    observed_at,
+                    LiveJournalPayload::AdmissionEvaluated(Box::new(admission.clone())),
+                )
+                .unwrap();
+        }
+        if matches!(case, PaperWrapperCase::PreStartBaseline) {
+            journal
+                .append(
+                    account_id.clone(),
+                    observed_at,
+                    boundary_baseline(&account_id, &binding, &account_state, 1),
+                )
+                .unwrap();
+        }
+        start.live_prefix = TailBinding::from(&LiveJournal::verified_tail(&live_path).unwrap());
+        if !matches!(
+            case,
+            PaperWrapperCase::MissingAdmission | PaperWrapperCase::PreStartAdmission
+        ) {
             journal
                 .append(
                     account_id.clone(),
@@ -7769,6 +7961,91 @@ mod tests {
     fn qualification_accepts_paper_wrapper_without_baseline() {
         let verified = verify_paper_wrapper_case(PaperWrapperCase::Valid).unwrap();
         assert_eq!(verified.wrapper_facts.len(), 1);
+        let retained_pre_start_baseline =
+            verify_paper_wrapper_case(PaperWrapperCase::PreStartBaseline).unwrap();
+        assert_eq!(retained_pre_start_baseline.wrapper_facts.len(), 1);
+    }
+
+    /// PASS: a retained pre-Start Baseline is excluded while a later post-Start Baseline remains
+    /// available as the sole ordinary-account era boundary.
+    #[test]
+    fn qualification_live_slice_retains_only_post_start_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let live_path = temp.path().join("live.log");
+        let journal = LiveJournal::open(&live_path).unwrap();
+        let account_id = AccountId::new("baseline-boundary").unwrap();
+        let binding = pe_execution_core::CredentialBindingIdentity {
+            version: 1,
+            key_id: "key".to_owned(),
+        };
+        let account_state = authenticated_boundary_state(
+            &account_id,
+            &binding,
+            OffsetDateTime::from_unix_timestamp(1).unwrap(),
+        );
+        let account_binding = pe_execution_core::live_journal::LiveAccountBindingAudit::new(
+            account_id.clone(),
+            binding.clone(),
+            WalletAddress([1; 20]),
+            "11".repeat(32),
+        );
+        let source_path = temp.path().join("source.log");
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let position_evidence = append_empty_position_sources(
+            &mut source_writer,
+            &account_binding,
+            OffsetDateTime::from_unix_timestamp(1).unwrap(),
+        );
+        journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::from_unix_timestamp(1).unwrap(),
+                boundary_baseline(&account_id, &binding, &account_state, 1),
+            )
+            .unwrap();
+        let start_prefix = TailBinding::from(&LiveJournal::verified_tail(&live_path).unwrap());
+        let mut post_start_baseline = boundary_baseline(
+            &AccountId::new("baseline-boundary").unwrap(),
+            &binding,
+            &account_state,
+            2,
+        );
+        let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut post_start_baseline else {
+            unreachable!();
+        };
+        mark.venue_position_evidence = position_evidence;
+        journal
+            .append(
+                account_id,
+                OffsetDateTime::from_unix_timestamp(2).unwrap(),
+                post_start_baseline,
+            )
+            .unwrap();
+        drop(journal);
+        drop(source_writer);
+        let sealed_prefix = TailBinding::from(&LiveJournal::verified_tail(&live_path).unwrap());
+
+        let events = replay_live_prefix(&live_path, &start_prefix, &sealed_prefix).unwrap();
+        assert_eq!(events.len(), 1);
+        let LiveJournalPayload::AccountPortfolioMarked(mark) = &events[0].payload else {
+            unreachable!();
+        };
+        assert_eq!(mark.kind, pe_execution_core::MarkKind::Baseline);
+        assert_eq!(mark.cutoff_unix, 2);
+
+        let source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+        let mut start = started("hot");
+        start.live_prefix = start_prefix;
+        let verified = verify_live_wrappers(
+            &live_path,
+            &source_path,
+            &source_prefix,
+            &sealed_prefix,
+            &start,
+            &[],
+        )
+        .unwrap();
+        assert!(verified.wrapper_facts.is_empty());
     }
 
     /// PASS: missing, duplicate, relabeled, refused, and economically tampered paper admissions
@@ -7782,6 +8059,7 @@ mod tests {
                 "multiple AdmissionEvaluated",
             ),
             (PaperWrapperCase::RelabeledAdmission, "identity differs"),
+            (PaperWrapperCase::PreStartAdmission, "no AdmissionEvaluated"),
             (
                 PaperWrapperCase::RefusedAdmission,
                 "verdict is not Approved",
