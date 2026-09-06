@@ -56,7 +56,10 @@ done
 for command in python3 sha256sum flock systemctl psql mktemp curl; do
   command -v "$command" >/dev/null || die "$command not installed"
 done
-: "${SUPABASE_DB_URL:?SUPABASE_DB_URL must be exported for financial-era activation}"
+export SUPABASE_DB_URL
+python3 -c 'import os,sys
+raise SystemExit(0 if os.environ.get(sys.argv[1]) else 1)' SUPABASE_DB_URL ||
+  die "SUPABASE_DB_URL must be exported for financial-era activation"
 
 acquire_deploy_lock
 [[ -f "$IDENTITY_MANIFEST" ]] || die "#557 activation identity is absent: $IDENTITY_MANIFEST"
@@ -142,19 +145,13 @@ print(hashlib.sha256(b"prediction-edge/effective-static-config-v1\0"+payload).he
 target_artifact_sha256=$(sha256_file "$target_binary")
 
 validate_target_environment_key_class() {
-  local secret_key
-  secret_key=$(env -i HOME="${HOME:-/}" PATH="$PATH" /bin/bash -c '
-set -euo pipefail
-set -a
-# shellcheck disable=SC1090
-source "$1"
-set +a
-printf "%s" "${PE_SUPABASE_SECRET_KEY-}"
-' bash "$target_environment") || die "could not load the reviewed production target environment"
-  python3 - "$secret_key" <<'PY' || die "reviewed production target secret slot is not secret/service-role class"
+  env_file_values "$target_environment" PE_SUPABASE_SECRET_KEY | python3 -c '
 import base64, json, re, sys
 
-key = sys.argv[1]
+parts = [part for part in sys.stdin.buffer.read().split(b"\0") if part]
+if len(parts) != 1 or not parts[0].startswith(b"PE_SUPABASE_SECRET_KEY="):
+    raise SystemExit("production secret slot is absent")
+key = parts[0].split(b"=", 1)[1].decode("utf-8")
 if key.startswith("sb_secret_") and len(key) > len("sb_secret_"):
     raise SystemExit(0)
 if key.startswith("sb_publishable_"):
@@ -168,7 +165,7 @@ except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
     raise SystemExit("production secret slot has a malformed legacy JWT") from error
 if not isinstance(payload, dict) or payload.get("role") != "service_role":
     raise SystemExit("production legacy JWT role is not service_role")
-PY
+' || die "reviewed production target secret slot is not secret/service-role class"
 }
 
 # The reviewed file is later adopted as the production service environment. Prove its authority
@@ -279,16 +276,18 @@ print(json.dumps({"path":sys.argv[1],"sha256":sys.argv[2]},sort_keys=True,separa
 }
 
 installed_readiness_url() {
-  local installed_bind
-  installed_bind=$(env -i HOME="${HOME:-/}" PATH="$PATH" /bin/bash -c '
-set -eo pipefail
-set +u
-set -a
-# shellcheck disable=SC1090
-source "$1"
-set +a
-printf "%s" "${PE_BIND-}"
-' bash "$SERVICE_ENV") || return 1
+  local installed_bind='' assignment
+  local -a parsed_bind
+  mapfile -d '' -t parsed_bind < <(
+    env_file_values "$SERVICE_ENV" PE_BIND && printf '__PE_ENV_FILE_PARSED__\0'
+  )
+  ((${#parsed_bind[@]} >= 1)) || return 1
+  [[ ${parsed_bind[-1]} == __PE_ENV_FILE_PARSED__ ]] || return 1
+  unset 'parsed_bind[-1]'
+  for assignment in "${parsed_bind[@]}"; do
+    [[ $assignment == PE_BIND=* ]] || return 1
+    installed_bind=${assignment#*=}
+  done
   if [[ -z "$installed_bind" ]]; then
     installed_bind=$(python3 -c 'import sys,tomllib
 with open(sys.argv[1],"rb") as source: value=tomllib.load(source).get("bind","127.0.0.1:8080")
@@ -319,13 +318,16 @@ run_target_offline() {
     preserved+=("PE_ACTIVATION_TESTING=1" "PE_ACTIVATION_TEST_ROOT=$PE_ACTIVATION_TEST_ROOT")
   fi
   env -i "${preserved[@]}" /bin/bash -c '
-set -a
-# shellcheck disable=SC1090
-source "$1"
-set +a
-shift
+parsed=0
+while IFS= read -r -d "" assignment <&3; do
+  if [[ $assignment == __PE_ENV_FILE_PARSED__ ]]; then parsed=1; break; fi
+  export "$assignment"
+done
+exec 3<&-
+[[ $parsed == 1 ]] || exit 96
 exec "$@"
-' bash "$target_environment" "$target_binary" "$target_config" "$@"
+' bash "$target_binary" "$target_config" "$@" \
+    3< <(env_file_values "$target_environment" && printf '__PE_ENV_FILE_PARSED__\0')
 }
 
 manifest_complete_start() {
@@ -858,17 +860,20 @@ if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise S
   fi
   if ! manifest_flag target_config_adopted; then
     manifest_patch_boundary target-config-adopt-intent '{"target_config_adopt_intent":true}'
-    atomic_adopt "$target_config" "$SERVICE_CONFIG" 0644 financial-config-adopted
+    atomic_adopt "$target_config" "$SERVICE_CONFIG" 0644 financial-config-adopted \
+      "$(manifest_get target_config_sha256)"
     manifest_patch_boundary target-config-adopted '{"target_config_adopted":true}'
   fi
   if ! manifest_flag target_environment_adopted; then
     manifest_patch_boundary target-environment-adopt-intent '{"target_environment_adopt_intent":true}'
-    atomic_adopt "$target_environment" "$SERVICE_ENV" 0600 financial-environment-adopted
+    atomic_adopt "$target_environment" "$SERVICE_ENV" 0600 financial-environment-adopted \
+      "$(manifest_get target_environment_sha256)"
     manifest_patch_boundary target-environment-adopted '{"target_environment_adopted":true}'
   fi
   if ! manifest_flag target_binary_adopted; then
     manifest_patch_boundary target-binary-adopt-intent '{"target_binary_adopt_intent":true}'
-    atomic_adopt "$target_binary" "$SERVICE_BINARY" 0755 financial-binary-adopted
+    atomic_adopt "$target_binary" "$SERVICE_BINARY" 0755 financial-binary-adopted \
+      "$(manifest_get target_artifact_sha256)"
     manifest_patch_boundary target-binary-adopted '{"target_binary_adopted":true}'
   fi
   service_active=$(systemctl_active_state pe-service)

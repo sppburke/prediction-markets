@@ -143,16 +143,17 @@ hashes are bound in the manifest. The driver never parses `ExecStart`, `Environm
 text. Instead it proves ownership from the running `MainPID`: `/proc/<pid>/exe` matches the installed
 binary; `/proc/<pid>/cwd` equals the service root and owns normalization of the relative config argv; argv
 is exactly `<installed-binary> <installed-config>`; and every variable the installed environment file
-defines (evaluated with the unit's own `set -a; source` semantics) is present with an equal value. Any
+defines under the shared strict data parser is present with an equal value. Any
 process variable not defined by that file must be one of exactly `CREDENTIALS_DIRECTORY`, `HOME`,
 `INVOCATION_ID`, `JOURNAL_STREAM`, `LANG`, `LOGNAME`, `MEMORY_PRESSURE_WATCH`,
 `MEMORY_PRESSURE_WRITE`, `PATH`, `SHELL`, `SYSTEMD_EXEC_PID`, `USER`, or the wrapper-owned
 `PWD`, `SHLVL`, `OLDPWD`, or `_`. `CREDENTIALS_DIRECTORY` must equal
 `/run/credentials/pe-service.service`; every other extra is refused. `LD_PRELOAD` and
 `LD_LIBRARY_PATH` are refused even when the installed environment file defines the same value.
-The clean-shell comparison uses `set -a; source "$1"; set +a`, rejects either loader variable by
-set/unset presence, then `exec env -0`. This matches real exec behavior: exported scalars and
-`BASH_FUNC_*` functions cross the boundary, while arrays do not. The wrapper-owned `PWD`, `SHLVL`,
+Environment files are data, never shell: blank lines and leading `#`/`;` comments are ignored;
+optional leading `export` and unquoted, single-quoted, or double-quoted `NAME=VALUE` assignments are
+accepted without expansion or continuation; every other physical line is refused with its line
+number. The wrapper-owned `PWD`, `SHLVL`,
 `OLDPWD`, and `_` names are stripped from the expected set because they do not affect the binary;
 `/proc/<pid>/cwd` proves the working directory separately.
 One systemd snapshot supplies `ActiveState`, `MainPID`, `InvocationID`, and `ActiveEnterTimestamp` before
@@ -291,12 +292,18 @@ paths need not equal any #557 staged path, and the harness hashes their bytes di
 `PE_REHEARSAL_CONFIG` or `PE_REHEARSAL_ENV` is present, it must resolve to the corresponding explicit
 target path; an arbitrary override is refused.
 
+The reviewed binary and config are copied first into a private, read-only rehearsal artifact
+directory. Their copied bytes are hashed, self-validated, evidenced, and executed; later replacement
+of either supplied target path cannot change the rehearsal invocation.
 The reviewed production environment must carry a publishable/anon-class value in
 `PE_SUPABASE_ANON_KEY` and a distinct secret/service-role-class value in
 `PE_SUPABASE_SECRET_KEY`. The harness deterministically creates its own mode-`0600` sanitized
 derivative by replacing only those two assignments with the publishable value; each assignment must
-occur exactly once. It passes only that derivative to `rehearsal_preflight.sh` and to the service
-child. The preflight accepts a modern `sb_publishable_*` key or a legacy JWT with `role=anon` and
+occur exactly once. The shared strict data parser validates both the target and derivative without
+executing either. Preflight requests only the URL and two Supabase service variables, so target-file
+`SUPABASE_DB_URL` and `PG*` assignments never enter its shell. It passes only that derivative to
+`rehearsal_preflight.sh` and to the service child. The preflight accepts a modern
+`sb_publishable_*` key or a legacy JWT with `role=anon` and
 rejects a modern secret key, service-role JWT, malformed key, or mismatched slots before any HTTP
 request. It receives the database-admin URL through an fd-backed environment handoff in a separate
 sanitized process, passes it only to sanitized `psql` children, and removes its marker rows on every
@@ -372,7 +379,10 @@ the binary/config/environment SHA-256 values to the rehearsal evidence. A #545 t
 path-equal nor revision-equal to the inherited #557 artifacts. Before it creates the financial
 manifest or can approach Start, the driver also requires the reviewed production
 `PE_SUPABASE_SECRET_KEY` to be a modern `sb_secret_*` key or a legacy JWT with `role=service_role`;
-the publishable-only rehearsal derivative is never adopted as production. The Start hot-config
+the validator reads that value through the data parser rather than argv. The publishable-only
+rehearsal derivative is never adopted as production. After Start, each artifact adoption hashes the
+copied temporary file and compares it with the manifest's reviewed digest before the destination
+rename; drift refuses without replacing the installed file. The Start hot-config
 identity is not an operator assertion:
 while the service is inert, the driver exports the database rows that the 17→15 migration retains to
 a mode-private temporary file. The database helper reads the credential-bearing URL from its named
@@ -482,7 +492,7 @@ It emits canonical compact JSON plus one trailing newline and reports its BLAKE3
 |---|---|
 | VPS | `82.22.32.225`, user `sean` (`ssh -i ~/.ssh/id_personal sean@82.22.32.225` — never root) |
 | unit | systemd **system** unit `pe-service` (`/etc/systemd/system/pe-service.service` + drop-in `pe-service.service.d/age-identity.conf`); `WantedBy=multi-user.target`, `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2` (SIGINT — the binary's shutdown signal, so a restart drains buffered trades). Start/stop/restart need root: run [`scripts/vps_grant_pe_service_sudo.sh`](../scripts/vps_grant_pe_service_sudo.sh) once as root to grant the deploy user passwordless, command-scoped `systemctl` control of the pe-service units (verified with `sudo -n -l`); until then use `ssh -t … 'sudo systemctl restart pe-service'` |
-| binary path | `ExecStart` runs `/bin/bash -c 'set -a; source /home/sean/prediction-markets/.env; set +a; exec /home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml'` with `WorkingDirectory=/home/sean/prediction-markets` (verified 2026-08-31) |
+| binary path | `ExecStart` runs `/home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml` with `EnvironmentFile=/home/sean/prediction-markets/.env` and `WorkingDirectory=/home/sean/prediction-markets`; environment contents use data-file semantics and are never shell-sourced |
 | backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
 | env | `.env` on the VPS (REST URL plus both credential identities: publishable/anon-class `PE_SUPABASE_ANON_KEY` and secret/service-role-class `PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). The #545 rehearsal derives its publishable-only file from this reviewed production target and never installs the derivative. `PE_SUPABASE_AUTHORITATIVE` defaults to `false` but must be `true` in the #545 production target. `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
 | build box | the VPS has no cargo — build on the dev box and `scp`. Release-like builds derive the full revision directly from the checked-out Git object and reject a dirty, unknown, or invalid checkout; no environment override is accepted. Dev/test builds use the explicit `dev-dirty` sentinel when needed. |

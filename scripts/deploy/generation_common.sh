@@ -63,6 +63,63 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+# Parse a systemd EnvironmentFile-compatible data subset without invoking a shell. With requested
+# names, emit only those final assignments; without names, emit every final assignment. Output is
+# NUL-delimited so values retain whitespace and cannot be reinterpreted as shell syntax.
+env_file_values() {
+  [[ $# -ge 1 ]] || die "env_file_values requires an environment file"
+  python3 -c '
+import os, re, sys
+
+path, *requested = sys.argv[1:]
+name_pattern = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+for name in requested:
+    if name_pattern.fullmatch(name) is None:
+        raise SystemExit(f"invalid requested environment name: {name}")
+
+try:
+    raw = open(path, "rb").read()
+except OSError as error:
+    raise SystemExit(f"cannot read environment file {path}: {error}") from error
+if b"\0" in raw:
+    raise SystemExit(f"{path}: environment file contains NUL")
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError as error:
+    line_number = raw.count(b"\n", 0, error.start) + 1
+    raise SystemExit(f"{path}:{line_number}: environment file is not UTF-8") from error
+
+assignments = {}
+assignment = re.compile(
+    r"[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*?)[ \t]*"
+)
+for line_number, physical_line in enumerate(text.splitlines(), 1):
+    line = physical_line[:-1] if physical_line.endswith("\r") else physical_line
+    if not line.strip(" \t") or line.lstrip(" \t").startswith(("#", ";")):
+        continue
+    match = assignment.fullmatch(line)
+    if match is None:
+        raise SystemExit(f"{path}:{line_number}: invalid environment assignment")
+    name, encoded = match.groups()
+    if encoded.startswith(("\"", "\x27")):
+        quote = encoded[0]
+        if len(encoded) < 2 or encoded[-1] != quote or quote in encoded[1:-1]:
+            raise SystemExit(f"{path}:{line_number}: invalid quoted environment value")
+        value = encoded[1:-1]
+    else:
+        if "\"" in encoded or "\x27" in encoded:
+            raise SystemExit(f"{path}:{line_number}: invalid environment value")
+        value = encoded
+    assignments[name] = value
+
+names = requested if requested else assignments.keys()
+output = sys.stdout.buffer
+for name in names:
+    if name in assignments:
+        output.write(name.encode("ascii") + b"=" + assignments[name].encode("utf-8") + b"\0")
+' "$@"
+}
+
 # Keep the credential-bearing libpq URL out of argv and /proc/<pid>/cmdline; split it into libpq
 # component variables while every caller supplies only non-secret psql options on the command line.
 # libpq does not expand a connection URL placed in PGDATABASE (verified against PostgreSQL 16:
@@ -95,7 +152,10 @@ psql_url() {
 }
 
 psql_service_db() {
-  : "${SUPABASE_DB_URL:?SUPABASE_DB_URL is required}"
+  export SUPABASE_DB_URL
+  python3 -c 'import os,sys
+raise SystemExit(0 if os.environ.get(sys.argv[1]) else 1)' SUPABASE_DB_URL ||
+    die "SUPABASE_DB_URL is required"
   psql_url SUPABASE_DB_URL "$@"
 }
 
@@ -165,8 +225,13 @@ print(json.dumps(value, sort_keys=True, separators=(",",":")))' "$MANIFEST" "$pa
 }
 
 atomic_adopt() {
-  local source=$1 destination=$2 mode=$3 boundary=$4 expected actual
-  expected=$(sha256_file "$source")
+  local source=$1 destination=$2 mode=$3 boundary=$4 expected=${5:-} actual enforce_expected=false
+  if [[ -z "$expected" ]]; then
+    expected=$(sha256_file "$source")
+  else
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "invalid expected hash for $destination"
+    enforce_expected=true
+  fi
   if [[ -f "$destination" ]]; then
     actual=$(sha256_file "$destination")
     if [[ "$actual" == "$expected" && "$(stat -c '%a' "$destination")" == "${mode#0}" ]]; then
@@ -174,17 +239,26 @@ atomic_adopt() {
     fi
   fi
   mkdir -p "$(dirname "$destination")"
-  python3 -c 'import os,shutil,sys
-source,destination,mode=sys.argv[1:]
+  python3 -c 'import hashlib,os,shutil,sys
+source,destination,mode,expected,enforce_expected=sys.argv[1:]
 parent=os.path.dirname(destination) or "."
 tmp=os.path.join(parent, ".pe-adopt.tmp.%d" % os.getpid())
-shutil.copyfile(source, tmp)
-os.chmod(tmp, int(mode, 8))
-with open(tmp, "rb") as handle: os.fsync(handle.fileno())
-os.replace(tmp, destination)
+try:
+    shutil.copyfile(source, tmp)
+    with open(tmp, "rb") as handle:
+        actual=hashlib.sha256(handle.read()).hexdigest()
+        if enforce_expected == "true" and actual != expected:
+            raise SystemExit(f"source hash changed before adoption of {destination}")
+        os.fsync(handle.fileno())
+    os.chmod(tmp, int(mode, 8))
+    os.replace(tmp, destination)
+except BaseException:
+    try: os.unlink(tmp)
+    except FileNotFoundError: pass
+    raise
 directory=os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 try: os.fsync(directory)
-finally: os.close(directory)' "$source" "$destination" "$mode"
+finally: os.close(directory)' "$source" "$destination" "$mode" "$expected" "$enforce_expected"
   actual=$(sha256_file "$destination")
   [[ "$actual" == "$expected" ]] || die "adopted hash mismatch for $destination"
   maybe_crash "$boundary"
@@ -193,13 +267,13 @@ finally: os.close(directory)' "$source" "$destination" "$mode"
 process_runs_service() {
   # Ownership of what runs NOW, from the process itself (lossless, no unit-file interpretation):
   #   argv  == exactly `<binary> <config>` (NUL-split; empty elements kept)
-  #   environ: every variable the installed environment file defines (evaluated with the unit's own
-  #   `set -a; source; exec env -0` semantics) is present with an equal value, and every extra name is
+  #   environ: every variable the installed environment file defines under `env_file_values` data
+  #   semantics is present with an equal value, and every extra name is
   #   one of the exact systemd-injected names observed for the production unit or one of the unit's
   #   `bash -c` wrapper's own variables. PWD, SHLVL, OLDPWD, and _ are stripped from the expected set
   #   because they do not affect the binary; cwd is proved independently from /proc/<pid>/cwd.
   local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 pid=$5
-  python3 -c 'import os,subprocess,sys
+  python3 -c 'import os,sys
 expected_binary,expected_config,expected_env,working,pid,proc_root=sys.argv[1:]
 def norm(path):
     return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
@@ -224,22 +298,12 @@ def parse_environment(raw):
     return entries
 with open("%s/%s/environ" % (proc_root, pid), "rb") as handle:
     running=parse_environment(handle.read())
-evaluated=subprocess.run(
-    ["env","-i","/bin/bash","-c","""set -a
-source "$1"
-set +a
-if [[ ${LD_PRELOAD+x} == x || ${LD_LIBRARY_PATH+x} == x ]]; then
-    exit 97
-fi
-exec env -0""","bash",expected_env],
-    check=False,cwd=working,stdout=subprocess.PIPE,
-)
-if evaluated.returncode == 97:
-    raise SystemExit(1)
-if evaluated.returncode != 0:
+raw_expected=b"".join(iter(lambda: os.read(3, 65536), b""))
+parts=raw_expected.split(b"\0")
+if len(parts) < 2 or parts[-2:] != [b"__PE_ENV_FILE_PARSED__", b""]:
     raise SystemExit(1)
 shell_own={b"_",b"PWD",b"SHLVL",b"OLDPWD"}
-evaluated_environment=parse_environment(evaluated.stdout)
+evaluated_environment=parse_environment(b"\0".join(parts[:-2]) + b"\0")
 loader_overrides={b"LD_PRELOAD",b"LD_LIBRARY_PATH"}
 if loader_overrides & (running.keys() | evaluated_environment.keys()):
     raise SystemExit(1)
@@ -253,7 +317,8 @@ injected={
 unknown=[name for name in running if name not in expected and name not in injected]
 credential_ok=running.get(b"CREDENTIALS_DIRECTORY") == b"/run/credentials/pe-service.service"
 raise SystemExit(0 if not missing and not unknown and credential_ok else 1)' \
-    "$expected_binary" "$expected_config" "$expected_env" "$working" "$pid" "$PROC_ROOT"
+    "$expected_binary" "$expected_config" "$expected_env" "$working" "$pid" "$PROC_ROOT" \
+    3< <(env_file_values "$expected_env" && printf '__PE_ENV_FILE_PARSED__\0')
 }
 
 read_service_process_snapshot() {

@@ -83,7 +83,6 @@ if [[ "$dry_run" == 1 ]]; then
   exit 0
 fi
 
-: "${SUPABASE_DB_URL:?SUPABASE_DB_URL must be exported for rehearsal preflight}"
 for required in python3 sqlite3 sha256sum od cp grep awk sed flock curl env realpath mktemp; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "FATAL: required command is unavailable: $required" >&2
@@ -93,12 +92,16 @@ done
 [[ -x "$binary" ]] || { echo "FATAL: staged binary is not executable: $binary" >&2; exit 1; }
 [[ -f "$config" ]] || { echo "FATAL: rehearsal config is missing: $config" >&2; exit 1; }
 [[ -f "$env_file" ]] || { echo "FATAL: rehearsal environment is missing: $env_file" >&2; exit 1; }
-config=$(realpath "$config")
+export SUPABASE_DB_URL
+python3 -c 'import os,sys
+raise SystemExit(0 if os.environ.get(sys.argv[1]) else 1)' SUPABASE_DB_URL ||
+  die "SUPABASE_DB_URL must be exported for rehearsal preflight"
+input_binary=$(realpath "$binary")
+input_config=$(realpath "$config")
 env_file=$(realpath "$env_file")
-config_sha256=$(sha256sum "$config" | awk '{print $1}')
 environment_sha256=$(sha256sum "$env_file" | awk '{print $1}')
-env_file_sha256=$environment_sha256
-if [[ -v PE_REHEARSAL_CONFIG && "$(realpath "$PE_REHEARSAL_CONFIG")" != "$config" ]]; then
+env_file_values "$env_file" >/dev/null
+if [[ -v PE_REHEARSAL_CONFIG && "$(realpath "$PE_REHEARSAL_CONFIG")" != "$input_config" ]]; then
   echo "FATAL: PE_REHEARSAL_CONFIG differs from the reviewed target config" >&2
   exit 1
 fi
@@ -114,6 +117,23 @@ fi
   echo "FATAL: rehearsal timeout and poll cadence must be positive integers" >&2
   exit 1
 }
+
+mkdir -p "$root"
+exec 7<>"$root/.rehearsal545.lock"
+flock -n 7 || { echo "FATAL: another #545 rehearsal is running" >&2; exit 1; }
+artifact_dir="$root/artifacts-$short"
+mkdir -p "$artifact_dir"
+chmod 0700 "$artifact_dir"
+input_artifact_sha256=$(sha256_file "$input_binary")
+input_config_sha256=$(sha256_file "$input_config")
+atomic_adopt "$input_binary" "$artifact_dir/pe-service" 0500 rehearsal-binary-copied \
+  "$input_artifact_sha256"
+atomic_adopt "$input_config" "$artifact_dir/service.toml" 0400 rehearsal-config-copied \
+  "$input_config_sha256"
+binary="$artifact_dir/pe-service"
+config="$artifact_dir/service.toml"
+artifact_sha256=$(sha256_file "$binary")
+config_sha256=$(sha256_file "$config")
 
 staged_identity_output=$("$binary" --verify-staged-identity) || {
   echo "FATAL: rehearsal binary could not derive its own identity" >&2
@@ -134,8 +154,6 @@ print(*match.groups())' <<< "$staged_identity_output") || {
   echo "FATAL: rehearsal binary identity self-verification failed" >&2
   exit 1
 }
-artifact_sha256=$(sha256sum "$binary" | awk '{print $1}')
-
 readarray -t activation < <(python3 - "$activation_manifest" <<'PY'
 import hashlib, json, os, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -206,15 +224,20 @@ for installed in "$installed_config" "$installed_environment"; do
     exit 1
   }
 done
-installed_bind=$(env -i HOME="$HOME" PATH="$PATH" /bin/bash -c '
-set -eo pipefail
-set +u
-set -a
-# shellcheck disable=SC1090
-source "$1"
-set +a
-printf "%s" "${PE_BIND-}"
-' bash "$installed_environment")
+mapfile -d '' -t installed_bind_parts < <(
+  env_file_values "$installed_environment" PE_BIND && printf '__PE_ENV_FILE_PARSED__\0'
+)
+installed_bind=
+last_bind_index=$((${#installed_bind_parts[@]} - 1))
+if ((last_bind_index < 0)) ||
+   [[ ${installed_bind_parts[$last_bind_index]} != __PE_ENV_FILE_PARSED__ ]]; then
+  die "could not parse the installed service environment"
+fi
+unset 'installed_bind_parts[last_bind_index]'
+for assignment in "${installed_bind_parts[@]}"; do
+  [[ $assignment == PE_BIND=* ]] || die "installed environment returned an unexpected name"
+  installed_bind=${assignment#*=}
+done
 if [[ -z "$installed_bind" ]]; then
   installed_bind=$(python3 - "$installed_config" <<'PY'
 import sys, tomllib
@@ -276,9 +299,7 @@ for name in paper.log source_events.log live_journal.log; do
   }
 done
 
-mkdir -p "$root" "$copy_dir"
-exec 7<>"$root/.rehearsal545.lock"
-flock -n 7 || { echo "FATAL: another #545 rehearsal is running" >&2; exit 1; }
+mkdir -p "$copy_dir"
 copy_manifest="$copy_dir/copied.sha256"
 source_identity="$copy_dir/source.identity"
 [[ ! -L "$copy_manifest" && ! -L "$source_identity" ]] || {
@@ -365,32 +386,19 @@ else
 fi
 copy_manifest_sha256=$(sha256sum "$copy_manifest" | awk '{print $1}')
 
-[[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$environment_sha256" ]] || {
-  echo "FATAL: reviewed production environment changed before sanitization" >&2
-  exit 1
-}
-mapfile -d '' -t publishable_parts < <(
-  env -i HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" /bin/bash -c '
-set -euo pipefail
-set -a
-# shellcheck disable=SC1090
-source "$1"
-set +a
-printf "%s\0__TARGET_ENV_LOADED__\0" "${PE_SUPABASE_ANON_KEY-}"
-' bash "$env_file"
-)
-[[ ${#publishable_parts[@]} -eq 2 && ${publishable_parts[1]} == __TARGET_ENV_LOADED__ &&
-   -n ${publishable_parts[0]} ]] || {
-  echo "FATAL: reviewed production environment has no Supabase publishable key" >&2
-  exit 1
-}
-publishable_key=${publishable_parts[0]}
 rehearsal_env_file="$root/environment-$short.rehearsal.env"
 rehearsal_env_stage=$(mktemp "$root/.environment-$short.rehearsal.XXXXXX")
-python3 - "$env_file" "$rehearsal_env_stage" "$publishable_key" <<'PY'
-import base64, json, re, shlex, sys
+python3 - "$env_file" "$rehearsal_env_stage" "$environment_sha256" 3< <(
+  env_file_values "$env_file" PE_SUPABASE_ANON_KEY
+) <<'PY'
+import base64, hashlib, json, os, re, shlex, sys
 
-source_path, destination_path, publishable = sys.argv[1:]
+source_path, destination_path, expected_digest = sys.argv[1:]
+parsed = b"".join(iter(lambda: os.read(3, 65536), b""))
+parts = [part for part in parsed.split(b"\0") if part]
+if len(parts) != 1 or not parts[0].startswith(b"PE_SUPABASE_ANON_KEY="):
+    raise SystemExit("reviewed production environment has no Supabase publishable key")
+publishable = parts[0].split(b"=", 1)[1].decode("utf-8")
 if publishable.startswith("sb_publishable_") and len(publishable) > len("sb_publishable_"):
     pass
 else:
@@ -408,8 +416,11 @@ assignment = re.compile(
     r"^([ \t]*(?:export[ \t]+)?(PE_SUPABASE_(?:ANON|SECRET)_KEY)[ \t]*=).*(\r?\n)?$"
 )
 counts = {"PE_SUPABASE_ANON_KEY": 0, "PE_SUPABASE_SECRET_KEY": 0}
-with open(source_path, encoding="utf-8", newline="") as source:
-    lines = source.readlines()
+with open(source_path, "rb") as source:
+    raw = source.read()
+if hashlib.sha256(raw).hexdigest() != expected_digest:
+    raise SystemExit("reviewed production environment changed before sanitization")
+lines = raw.decode("utf-8").splitlines(keepends=True)
 output = []
 for line in lines:
     match = assignment.fullmatch(line)
@@ -425,20 +436,20 @@ if counts != {"PE_SUPABASE_ANON_KEY": 1, "PE_SUPABASE_SECRET_KEY": 1}:
 with open(destination_path, "w", encoding="utf-8", newline="") as destination:
     destination.writelines(output)
 PY
-atomic_adopt "$rehearsal_env_stage" "$rehearsal_env_file" 0600 sanitized-rehearsal-environment
+env_file_values "$rehearsal_env_stage" >/dev/null
+rehearsal_environment_sha256=$(sha256_file "$rehearsal_env_stage")
+atomic_adopt "$rehearsal_env_stage" "$rehearsal_env_file" 0600 sanitized-rehearsal-environment \
+  "$rehearsal_environment_sha256"
 rm -f "$rehearsal_env_stage"
-rehearsal_environment_sha256=$(sha256sum "$rehearsal_env_file" | awk '{print $1}')
 
 env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" /bin/bash -c '
 eval "$(cat <&3)"
 exec 3<&-
 exec /bin/bash "$@"
 ' bash "$release_root/scripts/deploy/rehearsal_preflight.sh" "$rehearsal_env_file" \
-  3< <(printf 'export SUPABASE_DB_URL=%q\n' "$SUPABASE_DB_URL")
-[[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$env_file_sha256" ]] || {
-  echo "FATAL: reviewed production environment changed during privileged preflight" >&2
-  exit 1
-}
+  3< <(python3 -c 'import os,shlex,sys
+name=sys.argv[1]
+print(f"export {name}={shlex.quote(os.environ[name])}")' SUPABASE_DB_URL)
 [[ "$(sha256sum "$rehearsal_env_file" | awk '{print $1}')" == "$rehearsal_environment_sha256" ]] || {
   echo "FATAL: sanitized rehearsal environment changed during privileged preflight" >&2
   exit 1
@@ -464,30 +475,22 @@ service_env_allowlist=(
   PE_SUPABASE_SINK_RECONCILE_INTERVAL_SECS PE_SUPABASE_AUTHORITATIVE
   PE_BANKROLL_USD PE_MODE PE_STRATEGY PE_POLYGON_RECEIPT_RPC_URL
 )
-mapfile -d '' -t service_child_env < <(
-  env -i HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" /bin/bash -c '
-set -euo pipefail
-set -a
-# shellcheck disable=SC1090
-source "$1"
-set +a
-shift
-for name in "$@"; do
-  if [[ -v $name ]]; then printf "%s=%s\0" "$name" "${!name}"; fi
-done
-printf "__REHEARSAL_ENV_LOADED__\0"
-' bash "$rehearsal_env_file" "${service_env_allowlist[@]}"
-)
-last_env_index=$((${#service_child_env[@]} - 1))
-if ((last_env_index < 0)) || [[ "${service_child_env[$last_env_index]}" != __REHEARSAL_ENV_LOADED__ ]]; then
-  echo "FATAL: could not load the allowlisted rehearsal environment" >&2
-  exit 1
-fi
-unset 'service_child_env[last_env_index]'
-[[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$env_file_sha256" ]] || {
-  echo "FATAL: reviewed production environment changed while constructing the service environment" >&2
-  exit 1
-}
+python3 -c 'import os,sys
+raw=b"".join(iter(lambda: os.read(3,65536),b""))
+parts=raw.split(b"\0")
+if len(parts) < 2 or parts[-2:] != [b"__PE_ENV_FILE_PARSED__",b""]:
+    raise SystemExit("could not parse the allowlisted rehearsal environment")
+values={}
+for part in parts[:-2]:
+    name,separator,value=part.partition(b"=")
+    if not separator or name in values: raise SystemExit("invalid parsed rehearsal environment")
+    values[name]=value
+anon=values.get(b"PE_SUPABASE_ANON_KEY")
+secret=values.get(b"PE_SUPABASE_SECRET_KEY")
+if not anon or not secret: raise SystemExit("both rehearsal Supabase credential slots are required")
+if anon != secret: raise SystemExit("the publishable key must occupy both Supabase credential slots")' \
+  3< <(env_file_values "$rehearsal_env_file" PE_SUPABASE_ANON_KEY PE_SUPABASE_SECRET_KEY &&
+    printf '__PE_ENV_FILE_PARSED__\0')
 [[ "$(sha256sum "$rehearsal_env_file" | awk '{print $1}')" == "$rehearsal_environment_sha256" ]] || {
   echo "FATAL: sanitized rehearsal environment changed while constructing the service environment" >&2
   exit 1
@@ -496,26 +499,10 @@ unset 'service_child_env[last_env_index]'
   echo "FATAL: rehearsal config changed while constructing the service environment" >&2
   exit 1
 }
-anon_key=
-secret_key=
-for assignment in "${service_child_env[@]}"; do
-  case "$assignment" in
-    PE_SUPABASE_ANON_KEY=*) anon_key=${assignment#*=} ;;
-    PE_SUPABASE_SECRET_KEY=*) secret_key=${assignment#*=} ;;
-  esac
-done
-[[ -n "$anon_key" && -n "$secret_key" ]] || {
-  echo "FATAL: both rehearsal Supabase credential slots are required" >&2
-  exit 1
-}
-[[ "$anon_key" == "$secret_key" ]] || {
-  echo "FATAL: the publishable key must occupy both Supabase credential slots" >&2
-  exit 1
-}
 
 # Force the copied process onto the real first-party venue endpoints even when
 # the staged static config was previously used with a local fixture.
-service_child_env+=(
+service_child_env=(
   "PE_POLYMARKET_BASE_URL=https://data-api.polymarket.com"
   "PE_POLYMARKET_CLOB_BASE_URL=https://clob.polymarket.com"
   "PE_GAMMA_BASE_URL=https://gamma-api.polymarket.com"
@@ -625,7 +612,20 @@ observe_database_final() {
             (select count(*) from wallet_fences where cause not in ('order_dependent_equal_second','position_underflow'));"
 }
 
-env -i "${service_child_env[@]}" "$binary" "$config" > "$service_log" 2>&1 &
+env -i "${service_child_env[@]}" python3 -c '
+import os,sys
+environment=dict(os.environ)
+raw=b"".join(iter(lambda: os.read(3,65536),b""))
+parts=raw.split(b"\0")
+if len(parts) < 2 or parts[-2:] != [b"__PE_ENV_FILE_PARSED__",b""]:
+    raise SystemExit("could not parse the allowlisted rehearsal environment")
+for part in parts[:-2]:
+    name,separator,value=part.partition(b"=")
+    if not separator: raise SystemExit("invalid parsed rehearsal environment")
+    environment[name.decode("ascii")]=value.decode("utf-8")
+os.execve(sys.argv[1],sys.argv[1:],environment)' "$binary" "$config" \
+  3< <(env_file_values "$rehearsal_env_file" "${service_env_allowlist[@]}" &&
+    printf '__PE_ENV_FILE_PARSED__\0') > "$service_log" 2>&1 &
 service_pid=$!
 service_invocation_pid=$service_pid
 started_at=$(date +%s)
