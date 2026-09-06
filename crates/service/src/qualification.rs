@@ -7,9 +7,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use pe_copy_signal_engine::{LeaderSignal, PositionState, SignalConfig};
 use pe_core_types::{
-    AccountId, CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ReceivedAt, ShareAmount,
-    Side, SourceId, SourceTimestamp, TraderId, VenueMarketId,
+    AccountId, CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, Price,
+    ProbabilityPpm, ReceivedAt, ShareAmount, Side, SourceId, SourceTimestamp, TraderId, VenueId,
+    VenueMarketId,
 };
 use pe_event_log::envelope::{HashInput, compute_hashes};
 use pe_event_log::{
@@ -24,11 +26,16 @@ use pe_paper_state::{
     DecisionPendingRow, DecisionPendingState, FillRow, FinancialSnapshot, PaperPositionRow,
     PaperStateDb, SettledMarketRow,
 };
+use pe_position_ledger::{
+    AppliedEffect, LedgerMutation, PositionLedger, SecondVerdict, classify_complete_second,
+};
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
+#[cfg(test)]
+use pe_risk_engine::RiskSnapshot;
 use pe_risk_engine::{
-    BinaryPayout, KILL_SWITCH_DRAWDOWN_BPS, RiskDecision, RiskHaltCause, RiskSnapshot,
+    BinaryPayout, KILL_SWITCH_DRAWDOWN_BPS, RiskDecision, RiskHaltCause,
     aggregate_resolution_credit, evaluate_risk, nearest_rank_p95,
 };
 use pe_source_polymarket_public::ClassifiedPricesHistory;
@@ -56,8 +63,8 @@ use crate::paper_recovery::{
     ScannedPaperFrame, SealReason, TailBinding, active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::risk_inputs::{
-    RiskInputsUnavailable, build_paper_risk_base, build_paper_risk_snapshot_from_source_receipts,
-    historical_mark_price,
+    PaperExposureBase, RiskInputsUnavailable, build_paper_risk_base,
+    build_paper_risk_snapshot_from_source_receipts, historical_mark_price,
 };
 use crate::runtime_config::{
     ConfigEra, ConfigRow, RISK_HALT_RELEASE_HASH_KEY, RuntimeConfig, parse_config,
@@ -447,6 +454,7 @@ struct CompletedFill {
     condition_id: String,
     delay_ms: u64,
     observation: pe_execution_core::ObservationEvidence,
+    economic: EconomicPrepared,
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +541,7 @@ async fn verify_qualification(
     let mut decision_observations = HashMap::new();
     for decision in &replayed_decisions {
         let observation = verify_decision_source_inputs(decision, &source_observations)?;
+        verify_decision_classification(&state, decision)?;
         if decision_observations
             .insert(
                 decision.continuation.prior.source_trade_id.clone(),
@@ -728,6 +737,7 @@ async fn verify_qualification(
                                 )
                             })?,
                             observation: observation.clone(),
+                            economic: economic.clone(),
                         });
                     }
                     (
@@ -1500,6 +1510,262 @@ fn verify_decision_source_inputs(
     Ok(observation)
 }
 
+/// Rebuild the exact pre-second leader ledger from its latest causal position anchor and the
+/// append-only applied activity effects, then invoke the same complete-second classifier as the
+/// runtime bucket owner. The entry-history arguments cannot affect `TradeDecision::action`; the
+/// durable continuation exists only for a gate-admitted entry, so this verifier compares the
+/// classifier-owned action and immutable trade facts rather than trusting that recorded label.
+fn verify_decision_classification(
+    state: &PaperStateDb,
+    decision: &crate::decision_replay::ReplayedDecision,
+) -> Result<(), QualificationError> {
+    let frozen = &decision.continuation.prior;
+    let anchors = state.position_anchors(&frozen.wallet)?;
+    let anchor = anchors
+        .iter()
+        .rev()
+        .find(|anchor| anchor.activity_cutoff_unix < frozen.source_epoch)
+        .ok_or_else(|| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision {} has no causal position anchor",
+                frozen.source_trade_id
+            ))
+        })?;
+    let balances: Vec<(String, u16, ShareAmount)> = serde_json::from_str(&anchor.balances_json)
+        .map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision {} position anchor is malformed: {error}",
+                frozen.source_trade_id
+            ))
+        })?;
+    let mut positions = HashMap::new();
+    for (market_id, outcome_id, long_contracts) in balances {
+        if positions
+            .insert(
+                MarketOutcomeId::new(MarketId(VenueMarketId(market_id)), OutcomeId(outcome_id)),
+                PositionState {
+                    long_contracts,
+                    short_contracts: ShareAmount::ZERO,
+                },
+            )
+            .is_some()
+        {
+            return insufficient(format!(
+                "decision {} position anchor repeats a market outcome",
+                frozen.source_trade_id
+            ));
+        }
+    }
+    let mut ledger = PositionLedger::new();
+    ledger.replace_wallet_snapshot(frozen.wallet, positions);
+    let capture =
+        crate::position_seeder::ledger_capture(&ledger, state, frozen.wallet).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision {} position anchor hash failed: {error}",
+                frozen.source_trade_id
+            ))
+        })?;
+    if capture.hash != anchor.ledger_hash_after {
+        return insufficient(format!(
+            "decision {} position anchor hash differs from its balances",
+            frozen.source_trade_id
+        ));
+    }
+
+    let groups = state.activity_groups_after(&frozen.wallet, anchor.activity_cutoff_unix)?;
+    let mut bucket_start = 0usize;
+    while let Some(first) = groups.get(bucket_start) {
+        if first.source_epoch > frozen.source_epoch {
+            break;
+        }
+        let mut bucket_end = bucket_start.saturating_add(1);
+        while groups
+            .get(bucket_end)
+            .is_some_and(|group| group.source_epoch == first.source_epoch)
+        {
+            bucket_end = bucket_end.saturating_add(1);
+        }
+        let (mutations, expected) = recorded_applied_bucket(
+            frozen.wallet,
+            first.source_epoch,
+            &groups[bucket_start..bucket_end],
+        )?;
+        if first.source_epoch < frozen.source_epoch {
+            let actual = ledger.apply_all_or_none(&mutations).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "decision {} causal ledger replay failed: {error}",
+                    frozen.source_trade_id
+                ))
+            })?;
+            if actual != expected {
+                return insufficient(format!(
+                    "decision {} causal ledger effects differ from the durable history",
+                    frozen.source_trade_id
+                ));
+            }
+        } else {
+            return verify_complete_second_action(
+                &ledger,
+                &decision.continuation,
+                &mutations,
+                &expected,
+            );
+        }
+        bucket_start = bucket_end;
+    }
+    insufficient(format!(
+        "decision {} is absent from its causal activity second",
+        frozen.source_trade_id
+    ))
+}
+
+fn recorded_applied_bucket(
+    wallet: pe_core_types::WalletAddress,
+    source_epoch: i64,
+    groups: &[pe_paper_state::ActivityGroupRow],
+) -> Result<(Vec<LedgerMutation>, Vec<AppliedEffect>), QualificationError> {
+    let source_time = OffsetDateTime::from_unix_timestamp(source_epoch).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "causal activity bucket has invalid source epoch: {error}"
+        ))
+    })?;
+    let mut mutations = Vec::new();
+    let mut expected = Vec::new();
+    for group in groups {
+        if !recorded_group_was_applied(&group.source_trade_id, &group.disposition)? {
+            continue;
+        }
+        let applied = AppliedEffect::from_document(&group.proof_json).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "causal activity group {} effect document is invalid: {error}",
+                group.source_trade_id
+            ))
+        })?;
+        mutations.push(LedgerMutation {
+            source_trade_id: group.source_trade_id.clone(),
+            // The classifier does not consume transaction hashes. The durable semantic effect is
+            // the replay owner, matching the service's restart reconstruction.
+            transaction_hash: group.source_trade_id.0.clone(),
+            wallet,
+            source_time: SourceTimestamp(source_time),
+            effect: applied.effect.clone(),
+        });
+        expected.push(applied);
+    }
+    Ok((mutations, expected))
+}
+
+fn recorded_group_was_applied(
+    source_trade_id: &pe_core_types::SourceTradeId,
+    disposition: &str,
+) -> Result<bool, QualificationError> {
+    if matches!(
+        disposition,
+        "applied"
+            | "wallet_fenced_applied"
+            | "decision_pending"
+            | "not_copy_eligible"
+            | "not_an_entry"
+            | "not_first_entry"
+            | "not_buy"
+            | "wallet_history_incomplete"
+            | "ambiguous_first_entry_same_second"
+            | "order_dependent_equal_second_action"
+            | "stale_fallback_past_copy_budget"
+            | "stale_activity_ws_past_copy_budget"
+    ) {
+        return Ok(true);
+    }
+    if matches!(
+        disposition,
+        "raw_only"
+            | "reanchor_required_redemption"
+            | "reanchor_required_late_group"
+            | "anchor_covered"
+            | "anchor_covered_late"
+            | "wallet_fenced"
+            | "revised_applied_aggregate"
+            | "late_group_after_bucket_commit"
+            | "invalid_mapping"
+            | "position_underflow"
+            | "position_overflow"
+            | "conversion_unknown_conditions"
+            | "unknown_activity_effect"
+            | "order_dependent_equal_second"
+    ) {
+        return Ok(false);
+    }
+    insufficient(format!(
+        "causal activity group {source_trade_id} has unknown disposition {disposition}"
+    ))
+}
+
+fn verify_complete_second_action(
+    ledger: &PositionLedger,
+    continuation: &DecisionContinuationV3,
+    mutations: &[LedgerMutation],
+    expected: &[AppliedEffect],
+) -> Result<(), QualificationError> {
+    let frozen = &continuation.prior;
+    let verdict = classify_complete_second(
+        ledger,
+        frozen.wallet,
+        mutations,
+        frozen.reconstruction_quality,
+        &SignalConfig::default(),
+        true,
+        &|_| false,
+    )
+    .map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "decision {} complete-second classification failed: {error}",
+            frozen.source_trade_id
+        ))
+    })?;
+    let SecondVerdict::OrderIndependent {
+        applied, decisions, ..
+    } = verdict
+    else {
+        return insufficient(format!(
+            "decision {} complete second is order-dependent",
+            frozen.source_trade_id
+        ));
+    };
+    if applied != expected {
+        return insufficient(format!(
+            "decision {} complete-second effects differ from durable history",
+            frozen.source_trade_id
+        ));
+    }
+    let mut matching = decisions
+        .iter()
+        .filter(|candidate| candidate.source_trade_id == frozen.source_trade_id);
+    let classified = matching.next().ok_or_else(|| {
+        QualificationError::InsufficientEvidence(format!(
+            "decision {} is absent from complete-second classification",
+            frozen.source_trade_id
+        ))
+    })?;
+    let expected_confidence =
+        ProbabilityPpm(u32::from(frozen.reconstruction_quality.get()).saturating_mul(10_000));
+    if matching.next().is_some()
+        || classified.market_id != frozen.market_id
+        || classified.outcome_id != frozen.outcome_id
+        || classified.side != frozen.side
+        || classified.amount != frozen.share_amount
+        || classified.price != frozen.price
+        || classified.action != frozen.pre_bucket_action
+        || classified.action_order_dependent
+        || frozen.action_confidence_ppm != expected_confidence
+    {
+        return insufficient(format!(
+            "decision {} classification differs from complete-second replay",
+            frozen.source_trade_id
+        ));
+    }
+    Ok(())
+}
+
 fn received_unix_ms(envelope: &pe_event_log::EventEnvelope) -> Result<i64, QualificationError> {
     let millis = envelope.received_at.0.unix_timestamp_nanos() / 1_000_000;
     i64::try_from(millis).map_err(|_| {
@@ -1958,7 +2224,7 @@ fn replayed_risk_base(
     proposed_debit: CollateralAmount,
     per_trade_cap_bps: i32,
     era: &crate::paper_recovery::PaperEra,
-) -> Result<RiskSnapshot, QualificationError> {
+) -> Result<PaperExposureBase, QualificationError> {
     build_paper_risk_base(
         era,
         leader_wallet,
@@ -2722,9 +2988,95 @@ fn bind_final_receipts(
                 "fill decision, Prepared operation, and FinancialFinal identity disagree",
             );
         }
+        verify_winner_follow_fill_decision(&decision.continuation, fill)?;
     }
     if matched_finals.len() != fills.len() {
         return insufficient("a FinancialFinal has no identical terminal fill decision");
+    }
+    Ok(())
+}
+
+fn verify_winner_follow_fill_decision(
+    continuation: &DecisionContinuationV3,
+    fill: &CompletedFill,
+) -> Result<(), QualificationError> {
+    let frozen = &continuation.prior;
+    let economic = &fill.economic;
+    let configuration = &frozen.applied_configuration;
+    let mode =
+        crate::runtime_config::parse_execution_mode(&configuration.mode).ok_or_else(|| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision {} has an invalid frozen execution mode",
+                frozen.source_trade_id
+            ))
+        })?;
+    if economic.applied_configuration_hash != frozen.applied_configuration_hash
+        || economic.market.market_id != frozen.market_id.0.0
+        || u16::from(economic.market.outcome_index) != frozen.outcome_id.0
+        || economic.market.side != frozen.side
+    {
+        return insufficient(format!(
+            "decision {} economic inputs differ from its frozen strategy basis",
+            frozen.source_trade_id
+        ));
+    }
+
+    let incoming = continuation.incoming_trade().map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "decision {} cannot reconstruct its strategy signal: {error}",
+            frozen.source_trade_id
+        ))
+    })?;
+    let signal = LeaderSignal {
+        leader: TraderId(incoming.wallet),
+        venue: VenueId::polymarket(),
+        market_id: incoming.market_id,
+        outcome_id: incoming.outcome_id,
+        action: frozen.pre_bucket_action,
+        leader_side: incoming.side,
+        leader_price: incoming.price,
+        leader_size: incoming.contracts,
+        observed_at: incoming.observed_at,
+        received_at: incoming.received_at,
+        reconstruction_quality: frozen.reconstruction_quality,
+        source_trade_id: incoming.source_trade_id,
+        action_confidence_ppm: frozen.action_confidence_ppm,
+    };
+    let intent =
+        pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config())
+            .evaluate_at_price(
+                &signal,
+                economic.sizing.all_in_price,
+                frozen.frozen_basis.win_rate_p,
+                economic.risk.snapshot.clone(),
+                frozen.frozen_basis.bankroll,
+                mode,
+            )
+            .map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "decision {} recorded a fill but Winner-Follow replay declined: {:?}",
+                    frozen.source_trade_id,
+                    pe_strategy_winner_follow::WinnerFollowDeclineAudit::from(&error)
+                ))
+            })?;
+    if intent.market_id != frozen.market_id
+        || intent.outcome_id != frozen.outcome_id
+        || intent.side != frozen.side
+        || intent.limit_price != frozen.price
+        || intent.idempotency_key
+            != pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                &TraderId(frozen.wallet).to_string(),
+                &frozen.source_trade_id.0,
+                &frozen.market_id.0.0,
+                frozen.outcome_id.0,
+                frozen.side,
+                frozen.source_epoch,
+            )
+    {
+        return insufficient(format!(
+            "decision {} Winner-Follow intent differs from durable fill economics",
+            frozen.source_trade_id
+        ));
     }
     Ok(())
 }
@@ -3661,6 +4013,134 @@ mod tests {
             frame: PaperLogFrame::Record(record),
             legacy_fill: None,
         }
+    }
+
+    fn classification_fixture() -> (DecisionContinuationV3, LedgerMutation) {
+        let wallet = WalletAddress::from_hex(&format!("0x{}", "a".repeat(40))).unwrap();
+        let source_trade_id = SourceTradeId("g2:classification-fixture".to_owned());
+        let market_id = MarketId(VenueMarketId("classification-market".to_owned()));
+        let source_epoch = 1_700_000_000;
+        let configuration =
+            crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
+        let continuation = DecisionContinuationV3 {
+            prior: crate::bucket_commit::DecisionContinuationV2 {
+                version: 3,
+                source_trade_id: source_trade_id.clone(),
+                semantic_revision: "semantic-v3".to_owned(),
+                transaction_hash: "0xclassification".to_owned(),
+                wallet,
+                source_epoch,
+                market_id: market_id.clone(),
+                outcome_id: OutcomeId(0),
+                side: Side::Buy,
+                price: Price::new(dec!(0.5)).unwrap(),
+                share_amount: ShareAmount::from_whole(1).unwrap(),
+                provenance: pe_copy_signal_engine::TradeProvenance::RestPoll,
+                pre_bucket_action: LeaderAction::Entry,
+                reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+                action_confidence_ppm: ProbabilityPpm(1_000_000),
+                gate_result: "admitted".to_owned(),
+                applied_configuration_hash: configuration.canonical_hash(),
+                applied_configuration: configuration,
+                frozen_basis: crate::bucket_commit::FrozenDecisionBasis {
+                    win_rate_p: Probability::new(dec!(0.6)).unwrap(),
+                    bankroll: dec!(100),
+                },
+                decision_inputs: serde_json::json!({"fixture": "classification"}),
+            },
+            observed_source_receipt: None,
+            page_occurrences: Vec::new(),
+        };
+        let mutation = LedgerMutation {
+            source_trade_id,
+            transaction_hash: "0xclassification".to_owned(),
+            wallet,
+            source_time: SourceTimestamp(
+                OffsetDateTime::from_unix_timestamp(source_epoch).unwrap(),
+            ),
+            effect: pe_position_ledger::LedgerEffect::Trade {
+                market_id,
+                outcome_id: OutcomeId(0),
+                side: Side::Buy,
+                amount: ShareAmount::from_whole(1).unwrap(),
+                price: Price::new(dec!(0.5)).unwrap(),
+            },
+        };
+        (continuation, mutation)
+    }
+
+    /// PASS: the verifier accepts a recorded Entry only when the shared complete-second
+    /// classifier independently derives Entry from the causal ledger.
+    #[test]
+    fn complete_second_replay_accepts_matching_entry_classification() {
+        let (continuation, mutation) = classification_fixture();
+        let ledger = PositionLedger::new();
+        let (_, expected) = ledger
+            .simulate_all_or_none(std::slice::from_ref(&mutation))
+            .unwrap();
+
+        verify_complete_second_action(&ledger, &continuation, &[mutation], &expected).unwrap();
+    }
+
+    /// PASS: a continuation that records Entry is insufficient evidence when the causal ledger
+    /// makes the same BUY an Add.
+    #[test]
+    fn complete_second_replay_rejects_wrong_recorded_entry_classification() {
+        let (continuation, mutation) = classification_fixture();
+        let frozen = &continuation.prior;
+        let mut ledger = PositionLedger::new();
+        ledger.replace_wallet_snapshot(
+            frozen.wallet,
+            HashMap::from([(
+                MarketOutcomeId::new(frozen.market_id.clone(), frozen.outcome_id),
+                PositionState {
+                    long_contracts: ShareAmount::from_whole(1).unwrap(),
+                    short_contracts: ShareAmount::ZERO,
+                },
+            )]),
+        );
+        let (_, expected) = ledger
+            .simulate_all_or_none(std::slice::from_ref(&mutation))
+            .unwrap();
+
+        assert!(matches!(
+            verify_complete_second_action(&ledger, &continuation, &[mutation], &expected),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("classification differs")
+        ));
+    }
+
+    /// PASS: the frozen configuration, probability, bankroll, all-in price, and risk snapshot
+    /// reproduce the successful Winner-Follow outcome used by the golden stream.
+    #[test]
+    fn winner_follow_replay_accepts_golden_compatible_positive_outcome() {
+        let (continuation, _) = classification_fixture();
+        let frozen = &continuation.prior;
+        let mut economic = risk_economic(&frozen.market_id.0.0, CollateralAmount::from_atomic(1));
+        economic.applied_configuration_hash = frozen.applied_configuration_hash.clone();
+        let observation = ObservationEvidence {
+            source_receipt: test_receipt(20),
+            complete_bound_receipt: test_receipt(21),
+            observed_unix_ms: frozen.source_epoch * 1_000,
+            provenance: "rest_poll".to_owned(),
+        };
+        let fill = CompletedFill {
+            final_receipt: test_receipt(22),
+            operation: crate::paper_recovery::PaperFillOperationIdentity {
+                leader_wallet: frozen.wallet,
+                source_trade_id: frozen.source_trade_id.clone(),
+                observed_at_bucket: frozen.source_epoch,
+            },
+            market_id: frozen.market_id.0.0.clone(),
+            outcome_id: frozen.outcome_id.0,
+            side: frozen.side,
+            condition_id: frozen.market_id.0.0.clone(),
+            delay_ms: 0,
+            observation,
+            economic,
+        };
+
+        verify_winner_follow_fill_decision(&continuation, &fill).unwrap();
     }
 
     fn test_economic(
