@@ -1611,11 +1611,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .is_some_and(|h| select(h).swap(false, std::sync::atomic::Ordering::SeqCst))
     }
 
-    /// Run the dispatch loop until the trade channel closes OR until the
-    /// provided `shutdown` future resolves.
-    ///
-    /// On shutdown, remaining trades already buffered in the channel are drained
-    /// and processed before returning — no in-flight fills are lost.
+    /// Resume every open durable continuation before producers or the control loop start.
+    /// Continuations run in causal boot order; uncertain paper durability aborts recovery.
     pub async fn resume_pending_before_producers(&mut self) -> Result<(), anyhow::Error> {
         // Production boot recovery runs before either producer receiver is polled.
         // `handle_trade` detects the durable pending owner and skips ledger/gate/history.
@@ -1660,8 +1657,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
     }
 
-    /// Supervised production loop. Once `shutdown` resolves this owner drains both accepted input
-    /// channels before returning. A channel closure before coordinated shutdown is a typed
+    /// Supervised production loop. Once `shutdown` resolves this owner drains accepted control
+    /// input before returning. Control-channel closure before coordinated shutdown is a typed
     /// critical failure.
     pub async fn run_coordinated(
         mut self,

@@ -1,6 +1,6 @@
 //! BTC up/down market enumeration via the Polymarket Gamma API, built over the
-//! reusable [`PageFetcher`] abstraction (mirrors `pe-paper-pnl`'s
-//! `GammaResolutionFetcher<F>` / `pe-bootstrap`'s `GammaFetcher<F>`).
+//! reusable [`PageFetcher`] abstraction shared with the surviving
+//! [`GammaMarketsClient`](pe_source_polymarket_public::GammaMarketsClient) owner.
 //!
 //! Production wires a `ReqwestFetcher`; tests inject a `FixtureFetcher` for
 //! deterministic, no-live-network coverage.
