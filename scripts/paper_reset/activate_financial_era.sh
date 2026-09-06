@@ -141,6 +141,40 @@ print(hashlib.sha256(b"prediction-edge/effective-static-config-v1\0"+payload).he
   die "derive effective staged configuration identity"
 target_artifact_sha256=$(sha256_file "$target_binary")
 
+validate_target_environment_key_class() {
+  local secret_key
+  secret_key=$(env -i HOME="${HOME:-/}" PATH="$PATH" /bin/bash -c '
+set -euo pipefail
+set -a
+# shellcheck disable=SC1090
+source "$1"
+set +a
+printf "%s" "${PE_SUPABASE_SECRET_KEY-}"
+' bash "$target_environment") || die "could not load the reviewed production target environment"
+  python3 - "$secret_key" <<'PY' || die "reviewed production target secret slot is not secret/service-role class"
+import base64, json, re, sys
+
+key = sys.argv[1]
+if key.startswith("sb_secret_") and len(key) > len("sb_secret_"):
+    raise SystemExit(0)
+if key.startswith("sb_publishable_"):
+    raise SystemExit("production secret slot contains a publishable key")
+parts = key.split(".")
+if len(parts) != 3 or not all(re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts):
+    raise SystemExit("production secret slot is neither sb_secret_* nor a legacy service-role JWT")
+try:
+    payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise SystemExit("production secret slot has a malformed legacy JWT") from error
+if not isinstance(payload, dict) or payload.get("role") != "service_role":
+    raise SystemExit("production legacy JWT role is not service_role")
+PY
+}
+
+# The reviewed file is later adopted as the production service environment. Prove its authority
+# credential class before creating a transition manifest or reaching any Start boundary.
+validate_target_environment_key_class
+
 financial_config_rows_dir=
 financial_config_rows_file=
 financial_readiness_response=
@@ -179,7 +213,7 @@ try:
     with open(evidence_path,encoding="utf-8") as source: evidence=json.load(source)
 except (OSError,ValueError):
     refuse("malformed_evidence_file")
-expected_keys={"kind","result","evidence_sha256","manifest_path","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256"}
+expected_keys={"kind","result","evidence_sha256","manifest_path","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256","rehearsal_environment_sha256"}
 if not isinstance(evidence,dict) or set(evidence) != expected_keys or evidence.get("kind") != "rehearsal545-evidence-v1":
     refuse("malformed_evidence_file")
 digest=evidence.get("evidence_sha256")
@@ -201,7 +235,7 @@ try:
             rows[key]=value
 except (OSError,UnicodeError):
     refuse("malformed_result_manifest")
-for key in ("result","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256"):
+for key in ("result","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256","rehearsal_environment_sha256"):
     if rows.get(key) != evidence.get(key): refuse("evidence_identity_mismatch")
 if rows.get("sha") != evidence.get("target_revision"): refuse("reviewed_revision_mismatch")
 if evidence.get("target_revision") != expected_revision or evidence.get("artifact_blake3") != expected_artifact or evidence.get("artifact_sha256") != expected_artifact_sha:
@@ -212,10 +246,12 @@ if not isinstance(evidence_generation,str) or not os.path.isabs(evidence_generat
     refuse("generation_identity_mismatch")
 if evidence.get("config_sha256") != expected_config_sha: refuse("config_identity_mismatch")
 if evidence.get("environment_sha256") != expected_environment_sha: refuse("environment_identity_mismatch")
-for key in ("copy_manifest_sha256","readiness_sha256"):
+for key in ("copy_manifest_sha256","readiness_sha256","rehearsal_environment_sha256"):
     value=evidence.get(key)
     if not isinstance(value,str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
         refuse(key.removesuffix("_sha256")+"_identity_mismatch")
+if evidence.get("rehearsal_environment_sha256") == expected_environment_sha:
+    refuse("rehearsal_environment_identity_mismatch")
 bound={
     "path":os.path.realpath(evidence_path),
     "manifest_path":os.path.realpath(manifest_path),
@@ -229,6 +265,7 @@ bound={
     "readiness_sha256":evidence["readiness_sha256"],
     "config_sha256":evidence["config_sha256"],
     "environment_sha256":evidence["environment_sha256"],
+    "rehearsal_environment_sha256":evidence["rehearsal_environment_sha256"],
 }
 print(json.dumps(bound,sort_keys=True,separators=(",",":")))' \
     "$rehearsal_evidence" "$target_revision" "$artifact_blake3" "$target_artifact_sha256" \

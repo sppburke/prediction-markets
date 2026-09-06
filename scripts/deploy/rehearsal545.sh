@@ -7,25 +7,43 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
 
 usage() {
-  echo "usage: $0 [--dry-run] --target-config PATH --target-environment PATH 40_HEX_GIT_SHA" >&2
+  echo "usage: $0 --dry-run [--target-config PATH --target-environment PATH] 40_HEX_GIT_SHA" >&2
+  echo "       $0 --target-config PATH --target-environment PATH 40_HEX_GIT_SHA" >&2
   exit 2
 }
 
 dry_run=0
 target_config=
 target_environment=
+target_config_supplied=0
+target_environment_supplied=0
 while (($#)); do
   case "$1" in
     --dry-run) dry_run=1; shift ;;
-    --target-config) [[ $# -ge 2 ]] || usage; target_config=$2; shift 2 ;;
-    --target-environment) [[ $# -ge 2 ]] || usage; target_environment=$2; shift 2 ;;
+    --target-config)
+      [[ $# -ge 2 ]] || usage
+      target_config=$2
+      target_config_supplied=1
+      shift 2
+      ;;
+    --target-environment)
+      [[ $# -ge 2 ]] || usage
+      target_environment=$2
+      target_environment_supplied=1
+      shift 2
+      ;;
     --) shift; break ;;
     -*) usage ;;
     *) break ;;
   esac
 done
 [[ $# -eq 1 ]] || usage
-[[ -n "$target_config" && -n "$target_environment" ]] || usage
+if ((target_config_supplied || target_environment_supplied)); then
+  ((target_config_supplied && target_environment_supplied)) || usage
+  [[ -n "$target_config" && -n "$target_environment" ]] || usage
+elif [[ "$dry_run" != 1 ]]; then
+  usage
+fi
 sha=$1
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || usage
 short=${sha:0:7}
@@ -34,8 +52,8 @@ root=${PE_REHEARSAL_ROOT:-"$HOME/rehearsal545"}
 activation_manifest=${PE_ACTIVATION_MANIFEST:-"$HOME/pe-activation.json"}
 release_root=${PE_REHEARSAL_RELEASE_ROOT:-"$HOME/releases/pe-545-$short"}
 binary=${PE_REHEARSAL_BINARY:-"$release_root/target/release/pe-service"}
-config=$target_config
-env_file=$target_environment
+config=${target_config:-not-supplied}
+env_file=${target_environment:-not-supplied}
 copy_dir=${PE_REHEARSAL_COPY_DIR:-"$root/gen-$short"}
 rehearsal_bind=${PE_REHEARSAL_BIND:-}
 timeout_secs=${PE_REHEARSAL_TIMEOUT_SECS:-10800}
@@ -55,7 +73,7 @@ if [[ "$dry_run" == 1 ]]; then
     "config_override=${PE_REHEARSAL_CONFIG:-bound-to-target-config}" \
     "environment_override=${PE_REHEARSAL_ENV:-bound-to-target-environment}" \
     "rehearsal_bind=${rehearsal_bind:-required}" \
-    "credential_slots=PE_SUPABASE_ANON_KEY,PE_SUPABASE_SECRET_KEY(equal)" \
+    "credential_slots=production-secret/service-role,sanitized-rehearsal-publishable" \
     "logs=paper.log,source_events.log,live_journal.log" \
     "observers=status_file_poller,health_ready_query,reader_drop_classifier,fence_anchor_census,write_refusal_counter" \
     "proof=exact-revision,poll-after-start,reanchor,real-readiness,critical-health,accounts-off-unarmed,no-unsafe-evidence" \
@@ -65,6 +83,7 @@ if [[ "$dry_run" == 1 ]]; then
   exit 0
 fi
 
+: "${SUPABASE_DB_URL:?SUPABASE_DB_URL must be exported for rehearsal preflight}"
 for required in python3 sqlite3 sha256sum od cp grep awk sed flock curl env realpath mktemp; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "FATAL: required command is unavailable: $required" >&2
@@ -76,6 +95,9 @@ done
 [[ -f "$env_file" ]] || { echo "FATAL: rehearsal environment is missing: $env_file" >&2; exit 1; }
 config=$(realpath "$config")
 env_file=$(realpath "$env_file")
+config_sha256=$(sha256sum "$config" | awk '{print $1}')
+environment_sha256=$(sha256sum "$env_file" | awk '{print $1}')
+env_file_sha256=$environment_sha256
 if [[ -v PE_REHEARSAL_CONFIG && "$(realpath "$PE_REHEARSAL_CONFIG")" != "$config" ]]; then
   echo "FATAL: PE_REHEARSAL_CONFIG differs from the reviewed target config" >&2
   exit 1
@@ -114,62 +136,69 @@ print(*match.groups())' <<< "$staged_identity_output") || {
 }
 artifact_sha256=$(sha256sum "$binary" | awk '{print $1}')
 
-readarray -t activation < <(python3 - "$activation_manifest" "$config" "$env_file" <<'PY'
+readarray -t activation < <(python3 - "$activation_manifest" <<'PY'
 import hashlib, json, os, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     value = json.load(source)
+required = {
+    "activation_id", "state", "generation_dir", "merge_commit", "bankroll",
+    "source_v1_main", "legacy_history", "artifacts", "old_installed_artifacts",
+    "destinations", "old_paths",
+}
+if not required <= set(value):
+    raise SystemExit("#557 activation manifest lacks its production schema")
 if value.get("state") != "verified":
     raise SystemExit("activation manifest state is not verified")
 generation = value.get("generation_dir")
 activation_id = value.get("activation_id")
 destinations = value.get("destinations")
 artifacts = value.get("artifacts")
-if not isinstance(generation, str) or not os.path.isabs(generation):
+if (not isinstance(generation, str) or not os.path.isabs(generation)
+        or not os.path.isdir(generation) or os.path.realpath(generation) != generation):
     raise SystemExit("activation manifest has no absolute generation_dir")
-if not isinstance(activation_id, str) or not activation_id:
+if (not isinstance(activation_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]+", activation_id) is None):
     raise SystemExit("activation manifest has no activation_id")
-if not isinstance(destinations, dict):
+if not isinstance(destinations, dict) or set(destinations) != {"binary", "config", "environment"}:
     raise SystemExit("activation manifest has no installed artifact authority")
-if not isinstance(artifacts, dict):
+if (not isinstance(artifacts, dict)
+        or set(artifacts) != {"seed_main", "binary", "config", "environment",
+                             "rehearsal_config", "rehearsal_environment"}):
     raise SystemExit("activation manifest has no reviewed artifact authority")
-installed_config = destinations.get("config")
-installed_environment = destinations.get("environment")
-if not all(isinstance(path, str) and os.path.isabs(path)
-           for path in (installed_config, installed_environment)):
-    raise SystemExit("activation manifest has non-absolute installed artifact paths")
 
-def verify_artifact(name, supplied):
+def verify_installed_artifact(name):
     row = artifacts.get(name)
     if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
-        raise SystemExit(f"activation manifest has invalid reviewed {name} artifact")
+        raise SystemExit(f"activation manifest has invalid inherited {name} artifact")
     path, digest = row["path"], row["sha256"]
-    if not isinstance(path, str) or os.path.realpath(path) != os.path.realpath(supplied):
-        raise SystemExit(f"reviewed target {name} path differs from activation authority")
+    if not isinstance(path, str) or not os.path.isabs(path):
+        raise SystemExit(f"activation manifest has invalid inherited {name} path")
     if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-        raise SystemExit(f"activation manifest has invalid reviewed {name} digest")
-    with open(supplied, "rb") as source:
+        raise SystemExit(f"activation manifest has invalid inherited {name} digest")
+    installed = destinations.get(name)
+    if (not isinstance(installed, str) or not os.path.isabs(installed)
+            or not os.path.isfile(installed) or os.path.islink(installed)):
+        raise SystemExit(f"activation manifest has invalid installed {name} destination")
+    with open(installed, "rb") as source:
         actual = hashlib.sha256(source.read()).hexdigest()
     if actual != digest:
-        raise SystemExit(f"reviewed target {name} bytes differ from activation authority")
-    return actual
+        raise SystemExit(f"installed old {name} differs from #557 artifact authority")
+    return os.path.realpath(installed)
 
-config_sha256 = verify_artifact("config", sys.argv[2])
-environment_sha256 = verify_artifact("environment", sys.argv[3])
+verify_installed_artifact("binary")
+installed_config = verify_installed_artifact("config")
+installed_environment = verify_installed_artifact("environment")
 print(os.path.realpath(generation))
 print(activation_id)
 print(installed_config)
 print(installed_environment)
-print(config_sha256)
-print(environment_sha256)
 PY
 )
-[[ ${#activation[@]} -eq 6 ]] || { echo "FATAL: malformed activation manifest" >&2; exit 1; }
+[[ ${#activation[@]} -eq 4 ]] || { echo "FATAL: malformed activation manifest" >&2; exit 1; }
 active_generation=${activation[0]}
 activation_id=${activation[1]}
 installed_config=${activation[2]}
 installed_environment=${activation[3]}
-config_sha256=${activation[4]}
-environment_sha256=${activation[5]}
 
 for installed in "$installed_config" "$installed_environment"; do
   [[ -f "$installed" && ! -L "$installed" ]] || {
@@ -336,11 +365,82 @@ else
 fi
 copy_manifest_sha256=$(sha256sum "$copy_manifest" | awk '{print $1}')
 
-env_file_sha256=$environment_sha256
-env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" \
-  /bin/bash "$release_root/scripts/deploy/rehearsal_preflight.sh" "$env_file"
+[[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$environment_sha256" ]] || {
+  echo "FATAL: reviewed production environment changed before sanitization" >&2
+  exit 1
+}
+mapfile -d '' -t publishable_parts < <(
+  env -i HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" /bin/bash -c '
+set -euo pipefail
+set -a
+# shellcheck disable=SC1090
+source "$1"
+set +a
+printf "%s\0__TARGET_ENV_LOADED__\0" "${PE_SUPABASE_ANON_KEY-}"
+' bash "$env_file"
+)
+[[ ${#publishable_parts[@]} -eq 2 && ${publishable_parts[1]} == __TARGET_ENV_LOADED__ &&
+   -n ${publishable_parts[0]} ]] || {
+  echo "FATAL: reviewed production environment has no Supabase publishable key" >&2
+  exit 1
+}
+publishable_key=${publishable_parts[0]}
+rehearsal_env_file="$root/environment-$short.rehearsal.env"
+rehearsal_env_stage=$(mktemp "$root/.environment-$short.rehearsal.XXXXXX")
+python3 - "$env_file" "$rehearsal_env_stage" "$publishable_key" <<'PY'
+import base64, json, re, shlex, sys
+
+source_path, destination_path, publishable = sys.argv[1:]
+if publishable.startswith("sb_publishable_") and len(publishable) > len("sb_publishable_"):
+    pass
+else:
+    parts = publishable.split(".")
+    if len(parts) != 3 or not all(re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts):
+        raise SystemExit("production anon slot is neither sb_publishable_* nor a legacy anon JWT")
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise SystemExit("production anon slot has a malformed legacy JWT") from error
+    if not isinstance(payload, dict) or payload.get("role") != "anon":
+        raise SystemExit("production anon slot is not publishable/anon class")
+
+assignment = re.compile(
+    r"^([ \t]*(?:export[ \t]+)?(PE_SUPABASE_(?:ANON|SECRET)_KEY)[ \t]*=).*(\r?\n)?$"
+)
+counts = {"PE_SUPABASE_ANON_KEY": 0, "PE_SUPABASE_SECRET_KEY": 0}
+with open(source_path, encoding="utf-8", newline="") as source:
+    lines = source.readlines()
+output = []
+for line in lines:
+    match = assignment.fullmatch(line)
+    if match is None:
+        output.append(line)
+        continue
+    name = match.group(2)
+    counts[name] += 1
+    newline = match.group(3) or ""
+    output.append(match.group(1) + shlex.quote(publishable) + newline)
+if counts != {"PE_SUPABASE_ANON_KEY": 1, "PE_SUPABASE_SECRET_KEY": 1}:
+    raise SystemExit("production environment must assign each Supabase credential slot exactly once")
+with open(destination_path, "w", encoding="utf-8", newline="") as destination:
+    destination.writelines(output)
+PY
+atomic_adopt "$rehearsal_env_stage" "$rehearsal_env_file" 0600 sanitized-rehearsal-environment
+rm -f "$rehearsal_env_stage"
+rehearsal_environment_sha256=$(sha256sum "$rehearsal_env_file" | awk '{print $1}')
+
+env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" /bin/bash -c '
+eval "$(cat <&3)"
+exec 3<&-
+exec /bin/bash "$@"
+' bash "$release_root/scripts/deploy/rehearsal_preflight.sh" "$rehearsal_env_file" \
+  3< <(printf 'export SUPABASE_DB_URL=%q\n' "$SUPABASE_DB_URL")
 [[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$env_file_sha256" ]] || {
-  echo "FATAL: rehearsal environment changed during privileged preflight" >&2
+  echo "FATAL: reviewed production environment changed during privileged preflight" >&2
+  exit 1
+}
+[[ "$(sha256sum "$rehearsal_env_file" | awk '{print $1}')" == "$rehearsal_environment_sha256" ]] || {
+  echo "FATAL: sanitized rehearsal environment changed during privileged preflight" >&2
   exit 1
 }
 [[ "$(sha256sum "$config" | awk '{print $1}')" == "$config_sha256" ]] || {
@@ -376,7 +476,7 @@ for name in "$@"; do
   if [[ -v $name ]]; then printf "%s=%s\0" "$name" "${!name}"; fi
 done
 printf "__REHEARSAL_ENV_LOADED__\0"
-' bash "$env_file" "${service_env_allowlist[@]}"
+' bash "$rehearsal_env_file" "${service_env_allowlist[@]}"
 )
 last_env_index=$((${#service_child_env[@]} - 1))
 if ((last_env_index < 0)) || [[ "${service_child_env[$last_env_index]}" != __REHEARSAL_ENV_LOADED__ ]]; then
@@ -385,7 +485,11 @@ if ((last_env_index < 0)) || [[ "${service_child_env[$last_env_index]}" != __REH
 fi
 unset 'service_child_env[last_env_index]'
 [[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$env_file_sha256" ]] || {
-  echo "FATAL: rehearsal environment changed while constructing the service environment" >&2
+  echo "FATAL: reviewed production environment changed while constructing the service environment" >&2
+  exit 1
+}
+[[ "$(sha256sum "$rehearsal_env_file" | awk '{print $1}')" == "$rehearsal_environment_sha256" ]] || {
+  echo "FATAL: sanitized rehearsal environment changed while constructing the service environment" >&2
   exit 1
 }
 [[ "$(sha256sum "$config" | awk '{print $1}')" == "$config_sha256" ]] || {
@@ -722,9 +826,10 @@ observer_pids=()
 trap - EXIT TERM INT
 manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
 {
-  printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
+  printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nrehearsal_environment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
     "$result" "$reason" "$sha" "$target_revision" "$artifact_blake3" "$artifact_sha256" \
     "$activation_id" "$active_generation" "$config_sha256" "$environment_sha256" \
+    "$rehearsal_environment_sha256" \
     "$service_invocation_pid" "$rehearsal_bind" "$rehearsal_port" "$installed_bind" \
     "$readiness_base_url" "$wallet" "$anchor_before"
   printf 'final=%s\n' "$last"
@@ -744,7 +849,7 @@ mkdir -p "$(dirname "$evidence_hash_file")"
 evidence_stage=$(mktemp "$(dirname "$evidence_hash_file")/.rehearsal-evidence.XXXXXX")
 python3 -c 'import json,os,sys
 (path,result,digest,manifest,revision,artifact,artifact_sha,activation,generation,copy_digest,
- readiness_digest,config_digest,environment_digest)=sys.argv[1:]
+ readiness_digest,config_digest,environment_digest,rehearsal_environment_digest)=sys.argv[1:]
 value={
     "kind":"rehearsal545-evidence-v1",
     "result":result,
@@ -759,13 +864,15 @@ value={
     "readiness_sha256":readiness_digest,
     "config_sha256":config_digest,
     "environment_sha256":environment_digest,
+    "rehearsal_environment_sha256":rehearsal_environment_digest,
 }
 with open(path,"w",encoding="utf-8") as output:
     json.dump(value,output,sort_keys=True,separators=(",",":"))
     output.write("\n")' \
   "$evidence_stage" "$result" "$hash" "$manifest" "$target_revision" \
   "$artifact_blake3" "$artifact_sha256" "$activation_id" "$active_generation" \
-  "$copy_manifest_sha256" "$readiness_sha256" "$config_sha256" "$environment_sha256"
+  "$copy_manifest_sha256" "$readiness_sha256" "$config_sha256" "$environment_sha256" \
+  "$rehearsal_environment_sha256"
 atomic_adopt "$evidence_stage" "$evidence_hash_file" 0600 rehearsal-evidence-json
 rm -f "$evidence_stage"
 printf 'REHEARSAL545_%s reason=%s evidence_sha256=%s evidence_file=%s\n' \
