@@ -39,7 +39,8 @@ impl Reader {
         ReplayIter::open(path.as_ref(), None)
     }
 
-    /// Read and verify the frame at an already scanner-proven byte offset.
+    /// Read and verify the frame at an already scanner-proven byte offset, returning the byte
+    /// immediately after that frame.
     ///
     /// The expected sequence and preceding chain hash bind this isolated read to the verified
     /// metadata retained by the caller, without rescanning or retaining the rest of a large log.
@@ -48,7 +49,7 @@ impl Reader {
         byte_offset: u64,
         expected_sequence: EventSeq,
         expected_previous_hash: Hash,
-    ) -> Result<EventEnvelope, LogError> {
+    ) -> Result<(EventEnvelope, u64), LogError> {
         let path = path.as_ref();
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -56,7 +57,7 @@ impl Reader {
         reader.seek(SeekFrom::Start(byte_offset))?;
         let mut state = ScanState::at_frame(expected_sequence, expected_previous_hash, byte_offset);
         match read_verified_frame(&mut reader, &mut state)? {
-            ScanStep::Frame(envelope) => Ok(envelope),
+            ScanStep::Frame(envelope) => Ok((envelope, state.physical_tail())),
             ScanStep::Eof => Err(LogError::Truncated {
                 at: expected_sequence,
                 byte_offset,
@@ -196,9 +197,10 @@ mod tests {
         assert_eq!(replayed[0].1, first.sequence);
         assert_eq!(replayed[1].1, second.sequence);
 
-        let isolated =
+        let (isolated, frame_end) =
             Reader::read_at(&path, replayed[1].0, second.sequence, first.this_hash).unwrap();
         assert_eq!(isolated.payload, b"second");
         assert_eq!(isolated.this_hash, second.this_hash);
+        assert_eq!(frame_end, std::fs::metadata(&path).unwrap().len());
     }
 }

@@ -55,11 +55,11 @@ use time::OffsetDateTime;
 use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::live_credentials::LiveAccountCredentials;
 
-const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
+pub(crate) const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
 const MARKET_REQUEST_TIMEOUT_SECS: u64 = 10;
 const RECONCILIATION_TIMEOUT_SECS: u64 = 30;
-const CLOB_LONG_MARKET_SOURCE_ID: &str = "polymarket.clob.markets";
-const CLOB_COMPACT_MARKET_SOURCE_ID: &str = "polymarket.clob.compact-market";
+pub(crate) const CLOB_LONG_MARKET_SOURCE_ID: &str = "polymarket.clob.markets";
+pub(crate) const CLOB_COMPACT_MARKET_SOURCE_ID: &str = "polymarket.clob.compact-market";
 const POLYGON_RECEIPT_RPC_SCHEMA_VERSION: u16 = 1;
 const POLYGON_RECEIPT_RPC_PARSER_VERSION: u16 = 1;
 
@@ -1314,6 +1314,8 @@ mod tests {
             })
         } else if path == "/book" {
             json!({
+                "market": ADMISSION_CONDITION,
+                "asset_id": "11",
                 "asks": [{"price":"0.50","size":"5"}],
                 "bids": []
             })

@@ -1044,32 +1044,32 @@ impl SourceReceiptIndex {
                     }),
             )
         };
+        let verified_tail = std::fs::metadata(path.as_ref())
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+            .len();
+        if verified_tail < next_byte_offset {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
         let mut previous_hash = indexed_last_hash;
         let mut recovered = Vec::new();
-        for item in Reader::replay_with_offsets(path.as_ref())
-            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
-        {
-            let (byte_offset, sequence, envelope) =
-                item.map_err(|_| RiskInputsUnavailable::PriceConflict)?;
-            if byte_offset < next_byte_offset {
-                continue;
-            }
-            if recovered.is_empty() && byte_offset != next_byte_offset {
-                return Err(RiskInputsUnavailable::PriceConflict);
-            }
+        let mut byte_offset = next_byte_offset;
+        while byte_offset < verified_tail {
             let expected_sequence = indexed_len
                 .checked_add(recovered.len())
                 .and_then(|index| u64::try_from(index).ok())
                 .map(EventSeq)
                 .ok_or(RiskInputsUnavailable::Overflow)?;
-            if sequence != expected_sequence
-                || envelope.seq != expected_sequence
-                || envelope.prev_hash != previous_hash
-            {
+            let (envelope, frame_end) =
+                Reader::read_at(path.as_ref(), byte_offset, expected_sequence, previous_hash)
+                    .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+            if frame_end <= byte_offset || frame_end > verified_tail {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            if envelope.seq != expected_sequence || envelope.prev_hash != previous_hash {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
             let receipt = AppendReceipt {
-                sequence,
+                sequence: envelope.seq,
                 this_hash: envelope.this_hash,
             };
             let received_millis = received_at_millis(&envelope.received_at)?;
@@ -1079,11 +1079,9 @@ impl SourceReceiptIndex {
                 received_millis,
                 byte_offset: Some(byte_offset),
             });
+            byte_offset = frame_end;
         }
-        let verified_tail = std::fs::metadata(path.as_ref())
-            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
-            .len();
-        if verified_tail < next_byte_offset {
+        if byte_offset != verified_tail {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
 
@@ -1159,8 +1157,9 @@ impl SourceReceiptIndex {
         let byte_offset = metadata
             .byte_offset
             .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let envelope = Reader::read_at(path.as_ref(), byte_offset, receipt.sequence, previous_hash)
-            .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        let (envelope, _) =
+            Reader::read_at(path.as_ref(), byte_offset, receipt.sequence, previous_hash)
+                .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
         if envelope.this_hash != receipt.this_hash
             || received_at_millis(&envelope.received_at)? != metadata.received_millis
         {
@@ -1394,6 +1393,8 @@ pub(crate) fn build_paper_risk_base(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    use std::io::{Read as _, Seek as _, Write as _};
 
     use pe_core_types::{
         AccountId, BasisPoints, CollateralAmount, KellyFraction, PolymarketConditionId,
@@ -2061,6 +2062,67 @@ mod tests {
             second.payload
         );
         assert_eq!(source_receipts.snapshot().len(), 2);
+    }
+
+    /// PASS: synchronization catch-up reads only from the retained next-frame offset, so damage
+    /// deliberately injected into an already indexed frame makes full replay fail but does not
+    /// prevent the independently hash-bound new tail frame from being indexed.
+    #[test]
+    fn source_receipt_index_catch_up_never_rereads_indexed_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let at = OffsetDateTime::from_unix_timestamp(10).unwrap();
+        let make_envelope = |payload: &[u8]| EnvelopeIn {
+            source_id: SourceId("catch-up-source".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at),
+            received_at: ReceivedAt(at),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        };
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(make_envelope(b"first")).unwrap();
+        writer.append_synced(make_envelope(b"second")).unwrap();
+        drop(writer);
+
+        let first_frame_offset = pe_event_log::Reader::replay_with_offsets(&source_path)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .0;
+        let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let mut writer = Writer::open(&source_path).unwrap();
+        let tail_receipt = writer.append_synced(make_envelope(b"tail")).unwrap();
+        drop(writer);
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(first_frame_offset))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        file.seek(std::io::SeekFrom::Start(first_frame_offset))
+            .unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert!(pe_event_log::Reader::replay(&source_path).is_err());
+        source_receipts.catch_up_verified_tail().unwrap();
+        assert_eq!(source_receipts.snapshot().len(), 3);
+        assert_eq!(
+            source_receipts
+                .source_envelope(tail_receipt)
+                .unwrap()
+                .payload,
+            b"tail"
+        );
     }
 
     /// PASS: replay folds each owner/cause independently and any active cause blocks entries.
