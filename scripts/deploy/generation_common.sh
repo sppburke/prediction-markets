@@ -63,9 +63,34 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
-# Parse a systemd EnvironmentFile-compatible data subset without invoking a shell. With requested
-# names, emit only those final assignments; without names, emit every final assignment. Output is
-# NUL-delimited so values retain whitespace and cannot be reinterpreted as shell syntax.
+# Tier-1 allowlist: the environment names accepted by `crates/service/src/config.rs::load`, plus the
+# two Rust diagnostics. Every service-binary child selects target-file assignments through this one
+# shared owner; callers may then apply fixed, workflow-specific overrides.
+readonly -a SERVICE_ENV_ALLOWLIST=(
+  RUST_LOG RUST_BACKTRACE
+  PE_BIND PE_POLYMARKET_BASE_URL PE_POLYMARKET_CHANNEL_CAPACITY
+  PE_TRADE_POLL_INTERVAL_SECS PE_EVENT_LOG_PATH PE_POLYMARKET_ACTIVITY_WS_ENABLED
+  PE_SOURCE_EVENT_LOG_PATH PE_COPY_LATENCY_BUDGET_SECS PE_JSONL_LOG_PATH PE_STATUS_PATH
+  PE_STATUS_INTERVAL_SECS PE_LOG_RETENTION_DAYS PE_PAPER_STATE_DB_PATH
+  PE_LEGACY_WALLET_HISTORY_PATH PE_GAMMA_BASE_URL
+  PE_GAMMA_RESOLUTION_POLL_INTERVAL_SECS PE_MAX_RESOLUTION_HORIZON_SECS
+  PE_MIN_RESOLUTION_HORIZON_SECS PE_MAX_FILL_PRICE PE_MIN_FILL_PRICE
+  PE_WATCHLIST_MEMBERSHIP_MODE PE_SUPABASE_URL PE_SUPABASE_ANON_KEY
+  PE_SUPABASE_SECRET_KEY PE_SUPABASE_REFRESH_INTERVAL_SECS
+  PE_SUPABASE_SINK_ENABLED PE_SUPABASE_SINK_CHANNEL_CAPACITY
+  PE_SUPABASE_SINK_RECONCILE_INTERVAL_SECS PE_SUPABASE_AUTHORITATIVE
+  PE_BANKROLL_USD PE_MODE PE_STRATEGY PE_POLYMARKET_CLOB_BASE_URL
+  PE_POLYGON_RECEIPT_RPC_URL
+)
+
+# Parse only one-line environment assignments whose systemd EnvironmentFile interpretation is
+# identical to ours, without invoking a shell. Blank lines and lines whose first non-whitespace
+# character is `#` or `;` are ignored. Every other physical line must be exactly `NAME=value`: no
+# `export`, no leading name whitespace, no whitespace adjacent to `=`, and no backslash anywhere.
+# A value may be unquoted (including interior spaces, but no leading/trailing whitespace or quotes),
+# or wholly single/double quoted with no backslash or matching quote inside. With requested names,
+# emit only those final assignments; without names, emit every final assignment. Output is
+# NUL-delimited so values retain interior whitespace and cannot be reinterpreted as shell syntax.
 env_file_values() {
   [[ $# -ge 1 ]] || die "env_file_values requires an environment file"
   python3 -c '
@@ -90,24 +115,28 @@ except UnicodeDecodeError as error:
     raise SystemExit(f"{path}:{line_number}: environment file is not UTF-8") from error
 
 assignments = {}
-assignment = re.compile(
-    r"[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*?)[ \t]*"
-)
+assignment = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)")
+forbidden = {"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"}
 for line_number, physical_line in enumerate(text.splitlines(), 1):
     line = physical_line[:-1] if physical_line.endswith("\r") else physical_line
+    if "\\" in line:
+        raise SystemExit(f"{path}:{line_number}: backslash is forbidden in environment files")
     if not line.strip(" \t") or line.lstrip(" \t").startswith(("#", ";")):
         continue
     match = assignment.fullmatch(line)
     if match is None:
         raise SystemExit(f"{path}:{line_number}: invalid environment assignment")
     name, encoded = match.groups()
+    if name in forbidden:
+        raise SystemExit(f"{path}:{line_number}: forbidden environment assignment: {name}")
     if encoded.startswith(("\"", "\x27")):
         quote = encoded[0]
         if len(encoded) < 2 or encoded[-1] != quote or quote in encoded[1:-1]:
             raise SystemExit(f"{path}:{line_number}: invalid quoted environment value")
         value = encoded[1:-1]
     else:
-        if "\"" in encoded or "\x27" in encoded:
+        if (encoded.startswith((" ", "\t")) or encoded.endswith((" ", "\t"))
+                or "\"" in encoded or "\x27" in encoded):
             raise SystemExit(f"{path}:{line_number}: invalid environment value")
         value = encoded
     assignments[name] = value
@@ -313,7 +342,7 @@ if len(parts) < 2 or parts[-2:] != [b"__PE_ENV_FILE_PARSED__", b""]:
     raise SystemExit(1)
 shell_own={b"_",b"PWD",b"SHLVL",b"OLDPWD"}
 evaluated_environment=parse_environment(b"\0".join(parts[:-2]) + b"\0")
-loader_overrides={b"LD_PRELOAD",b"LD_LIBRARY_PATH"}
+loader_overrides={b"LD_PRELOAD",b"LD_LIBRARY_PATH",b"LD_AUDIT"}
 if loader_overrides & (running.keys() | evaluated_environment.keys()):
     raise SystemExit(1)
 expected={name:value for name,value in evaluated_environment.items() if name not in shell_own}

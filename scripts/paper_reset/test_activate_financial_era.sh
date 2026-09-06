@@ -403,16 +403,28 @@ insert into position_anchors values("0x0000000000000000000000000000000000000545"
 #!/usr/bin/env bash
 set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:-}/test-state
+record_offline_environment() {
+  local operation=$1
+  /usr/bin/python3 - "$state/offline-$operation.environment" <<'PY'
+import os, sys
+
+with open(sys.argv[1], "wb") as output:
+    for name, value in sorted(os.environb.items()):
+        output.write(name + b"=" + value + b"\0")
+PY
+}
 case "$*" in
   *--verify-staged-identity*)
     echo 'pe-service 0.1.0 revision=1111111111111111111111111111111111111111 config_identity=runtime-applied artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     ;;
   *--financial-era=prepare*)
+    record_offline_environment prepare
     cat <<'JSON'
 {"start":{"starting_bankroll":10000000000,"paper_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"source_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"live_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"artifact_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","static_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","hot_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"g557","activation_id":"act-545","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"],"membership_proofs_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","schema_version":3,"parser_version":1,"financial_semantic_version":1},"expected_receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
 JSON
     ;;
   *--financial-era=start*)
+    record_offline_environment start
     python3 -c 'import sqlite3,sys
 db=sqlite3.connect(sys.argv[1]);
 for table in ("fills","positions","settled_markets","fill_market_snapshots"): db.execute("delete from "+table)
@@ -428,6 +440,7 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
     echo '{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     ;;
   *--financial-era=rollback-check*)
+    record_offline_environment rollback-check
     if [[ -f "$state/complete-start" ]]; then
       echo '{"complete_start":true,"receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}'
     else
@@ -442,6 +455,13 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
       echo "rehearsal child received a privileged credential" >&2
       exit 97
     }
+    case "$PE_STATUS_PATH" in
+      */rehearsal/copy/status.json)
+        fixture_root=${PE_STATUS_PATH%/rehearsal/copy/status.json}
+        /usr/bin/mkdir -p "$fixture_root/proc/$$"
+        /usr/bin/ln -s "$0" "$fixture_root/proc/$$/exe"
+        ;;
+    esac
     /usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" <<'PY'
 import datetime,json,os,sqlite3,sys
 status,database=sys.argv[1:]
@@ -559,6 +579,10 @@ psql_url SUPABASE_DB_URL -Atc 'select 1' >/dev/null
 if [[ -f "$fixture_root/test-state/replace-rehearsal-target-binary" ]]; then
   mv "$fixture_root/target/pe-service.next" "$fixture_root/target/pe-service"
 fi
+if [[ -f "$fixture_root/test-state/replace-rehearsal-private-binary" ]]; then
+  mv "$fixture_root/target/pe-service.next" \
+    "$fixture_root/rehearsal/artifacts-1111111/pe-service"
+fi
 SH
   chmod +x "$release/scripts/deploy/rehearsal_preflight.sh"
   cat > "$root/bin/curl" <<'SH'
@@ -613,6 +637,7 @@ SH
 
 run_rehearsal_fixture() {
   local root=$1
+  PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" \
   PATH="$root/bin:$PATH" \
   PE_ACTIVATION_MANIFEST="$root/pe-activation.json" \
   PE_REHEARSAL_ROOT="$root/rehearsal" \
@@ -677,6 +702,7 @@ if offending:
 
 run_rehearsal_traced() {
   local root=$1
+  PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" PROC_ROOT="$root/proc" \
   PATH="$root/bin:$PATH" \
   PE_ACTIVATION_MANIFEST="$root/pe-activation.json" \
   PE_REHEARSAL_ROOT="$root/rehearsal" \
@@ -706,6 +732,9 @@ root=$TEST_TMP/rehearsal-bindings
 setup_rehearsal_fixture "$root" true none
 output=$(run_rehearsal_fixture "$root" 2>&1)
 [[ "$output" == *REHEARSAL545_PASS* ]] || fail "bound rehearsal did not pass: $output"
+grep -Fq "PROCESS_EXE expected=$root/rehearsal/artifacts-1111111/pe-service resolved=$root/rehearsal/artifacts-1111111/pe-service matches=true" \
+  "$root/rehearsal/watch-1111111.log" ||
+  fail "rehearsal watch log did not bind the running private executable"
 python3 -c 'import hashlib,json,os,re,stat,sys
 evidence_path,activation_path,config,environment,rehearsal_environment,copy_manifest,readiness,target_binary=sys.argv[1:]
 e=json.load(open(evidence_path,encoding="utf-8"))
@@ -823,7 +852,7 @@ set +e
 output=$(run_rehearsal_fixture "$root" 2>&1)
 status=$?
 set -e
-[[ $status -ne 0 && "$output" == *'service.env:7: invalid environment assignment'* ]] ||
+[[ $status -ne 0 && "$output" == *'service.env:7:'* ]] ||
   fail "rehearsal did not fail closed on shell syntax: $output"
 [[ ! -e "$root/exfiltrated-url" ]] || fail "rehearsal executed the target environment"
 driver_args "$root"
@@ -831,7 +860,7 @@ set +e
 output=$(run_driver "$root" 2>&1)
 status=$?
 set -e
-[[ $status -ne 0 && "$output" == *'service.env:7: invalid environment assignment'* ]] ||
+[[ $status -ne 0 && "$output" == *'service.env:7:'* ]] ||
   fail "financial driver did not fail closed on shell syntax: $output"
 [[ ! -e "$root/exfiltrated-url" && ! -e "$root/pe-financial-era.json" ]] ||
   fail "target environment shell syntax crossed the financial prepared boundary"
@@ -848,6 +877,63 @@ output=$(run_rehearsal_fixture "$root" 2>&1)
 write_shims "$root"
 driver_args "$root"
 drive_to_verified "$root" || fail "target database override redirected the financial driver"
+
+# Scenario FE-OFFLINE-ENV-ALLOWLIST-06A
+# Preconditions: the reviewed target carries one service setting plus unrelated and non-forbidden
+# LD-prefixed assignments. PASS: rollback-check, prepare, and Start receive only names selected by the
+# shared service allowlist (plus the driver's execution controls), and receive no LD-prefixed name.
+# FAIL: any target-file unrequested or LD-prefixed assignment reaches an offline target execution.
+root=$TEST_TMP/offline-environment-allowlist
+setup_fixture "$root"
+printf '%s\n' 'PE_MODE=paper' 'UNREQUESTED_OFFLINE=hidden' 'LD_DEBUG=libs' \
+  >> "$root/target/service.env"
+write_rehearsal_evidence "$root"
+driver_args "$root"
+run_driver "$root" >/dev/null
+mapfile -t shared_service_env_allowlist < <(
+  bash -c 'source "$1"; printf "%s\n" "${SERVICE_ENV_ALLOWLIST[@]}"' bash "$COMMON"
+)
+for operation in rollback-check prepare start; do
+  environment_dump="$root/test-state/offline-$operation.environment"
+  [[ -s "$environment_dump" ]] || fail "$operation did not dump its offline environment"
+  if ! python3 - "$environment_dump" "${shared_service_env_allowlist[@]}" <<'PY'
+import sys
+
+path, *allowlisted = sys.argv[1:]
+parts = [part for part in open(path, "rb").read().split(b"\0") if part]
+environment = dict(part.split(b"=", 1) for part in parts)
+names = {name.decode("ascii") for name in environment}
+controls = {
+    "PATH", "HOME", "PE_ACTIVATION_TESTING", "PE_ACTIVATION_TEST_ROOT",
+    "LC_CTYPE", "PWD", "SHLVL", "OLDPWD", "_",
+}
+assert names - controls <= set(allowlisted), sorted(names - controls - set(allowlisted))
+assert environment[b"PE_MODE"] == b"paper"
+assert environment[b"PE_SUPABASE_SECRET_KEY"] == b"sb_secret_test_service_role"
+assert b"UNREQUESTED_OFFLINE" not in environment
+assert not any(name.startswith("LD_") for name in names), sorted(names)
+PY
+  then
+    fail "$operation offline environment escaped the shared service allowlist"
+  fi
+done
+
+# Scenario FE-LOADER-ENV-REFUSAL-06B
+# Preconditions: an otherwise reviewed production environment assigns LD_AUDIT.
+# PASS: the physical line is rejected before a financial manifest or service stop exists.
+# FAIL: a loader-audit control reaches prepared or any mutation boundary.
+root=$TEST_TMP/loader-environment-refusal
+setup_fixture "$root"
+printf '%s\n' 'LD_AUDIT=/tmp/review-audit.so' >> "$root/target/service.env"
+driver_args "$root"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'service.env:6: forbidden environment assignment: LD_AUDIT'* ]] ||
+  fail "LD_AUDIT target assignment was not explicitly refused: $output"
+[[ ! -e "$root/pe-financial-era.json" && ! -e "$root/test-state/stop-count" ]] ||
+  fail "LD_AUDIT target assignment crossed the pre-manifest mutation boundary"
 
 # Scenario REHEARSAL-REVIEWED-BYTES-07
 # Preconditions: the target binary is copied, then preflight atomically replaces its original path.
@@ -869,6 +955,25 @@ assert e["artifact_sha256"] == sys.argv[2]
 assert hashlib.sha256(open(sys.argv[3],"rb").read()).hexdigest() != sys.argv[2]' \
   "$root/rehearsal/evidence.json" "$reviewed_sha" "$root/target/pe-service" ||
   fail "rehearsal evidence did not bind the copied binary"
+
+# Scenario REHEARSAL-PRIVATE-BINARY-07A
+# Preconditions: privileged preflight replaces the private copied binary after identity validation.
+# PASS: the final binary rehash refuses before service execution and the replacement marker is absent.
+# FAIL: the replacement executes or the rehearsal records PASS for different bytes.
+root=$TEST_TMP/rehearsal-private-binary
+setup_rehearsal_fixture "$root" true none
+printf '%s\n' '#!/usr/bin/env bash' ": > '$root/private-replacement-executed'" 'exit 97' \
+  > "$root/target/pe-service.next"
+chmod +x "$root/target/pe-service.next"
+touch "$root/test-state/replace-rehearsal-private-binary"
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'rehearsal binary changed while constructing the service environment'* ]] ||
+  fail "rehearsal did not refuse private binary drift: $output"
+[[ ! -e "$root/private-replacement-executed" ]] ||
+  fail "rehearsal executed the drifted private binary"
 
 # Scenario FE-ADOPT-REVIEWED-BYTES-08
 # Preconditions: the target process atomically replaces its source path after Start but before adopt.
@@ -1452,4 +1557,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
 done
 
-echo "PASS: FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"

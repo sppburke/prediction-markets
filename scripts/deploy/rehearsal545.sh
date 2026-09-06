@@ -456,22 +456,6 @@ print(f"export {name}={shlex.quote(os.environ[name])}")' SUPABASE_DB_URL)
   exit 1
 }
 
-# Tier-1 allowlist: these are the environment names accepted by
-# `crates/service/src/config.rs::load`, plus the two Rust diagnostics. Path,
-# endpoint, and bind owners are appended below as fixed rehearsal overrides.
-service_env_allowlist=(
-  RUST_LOG RUST_BACKTRACE
-  PE_POLYMARKET_CHANNEL_CAPACITY PE_TRADE_POLL_INTERVAL_SECS
-  PE_POLYMARKET_ACTIVITY_WS_ENABLED PE_COPY_LATENCY_BUDGET_SECS
-  PE_STATUS_INTERVAL_SECS PE_LOG_RETENTION_DAYS
-  PE_GAMMA_RESOLUTION_POLL_INTERVAL_SECS PE_MAX_RESOLUTION_HORIZON_SECS
-  PE_MIN_RESOLUTION_HORIZON_SECS PE_MAX_FILL_PRICE PE_MIN_FILL_PRICE
-  PE_WATCHLIST_MEMBERSHIP_MODE PE_SUPABASE_URL PE_SUPABASE_ANON_KEY
-  PE_SUPABASE_SECRET_KEY PE_SUPABASE_REFRESH_INTERVAL_SECS
-  PE_SUPABASE_SINK_ENABLED PE_SUPABASE_SINK_CHANNEL_CAPACITY
-  PE_SUPABASE_SINK_RECONCILE_INTERVAL_SECS PE_SUPABASE_AUTHORITATIVE
-  PE_BANKROLL_USD PE_MODE PE_STRATEGY PE_POLYGON_RECEIPT_RPC_URL
-)
 python3 -c 'import os,sys
 raw=b"".join(iter(lambda: os.read(3,65536),b""))
 parts=raw.split(b"\0")
@@ -494,6 +478,10 @@ if anon != secret: raise SystemExit("the publishable key must occupy both Supaba
 }
 [[ "$(sha256sum "$config" | awk '{print $1}')" == "$config_sha256" ]] || {
   echo "FATAL: rehearsal config changed while constructing the service environment" >&2
+  exit 1
+}
+[[ "$(sha256sum "$binary" | awk '{print $1}')" == "$artifact_sha256" ]] || {
+  echo "FATAL: rehearsal binary changed while constructing the service environment" >&2
   exit 1
 }
 
@@ -611,7 +599,8 @@ observe_database_final() {
 
 env -i "${service_child_env[@]}" python3 -c '
 import os,sys
-environment=dict(os.environ)
+overrides=dict(os.environ)
+environment={}
 raw=b"".join(iter(lambda: os.read(3,65536),b""))
 parts=raw.split(b"\0")
 if len(parts) < 2 or parts[-2:] != [b"__PE_ENV_FILE_PARSED__",b""]:
@@ -620,8 +609,9 @@ for part in parts[:-2]:
     name,separator,value=part.partition(b"=")
     if not separator: raise SystemExit("invalid parsed rehearsal environment")
     environment[name.decode("ascii")]=value.decode("utf-8")
+environment.update(overrides)
 os.execve(sys.argv[1],sys.argv[1:],environment)' "$binary" "$config" \
-  3< <(env_file_values "$rehearsal_env_file" "${service_env_allowlist[@]}" &&
+  3< <(env_file_values "$rehearsal_env_file" "${SERVICE_ENV_ALLOWLIST[@]}" &&
     printf '__PE_ENV_FILE_PARSED__\0') > "$service_log" 2>&1 &
 service_pid=$!
 service_invocation_pid=$service_pid
@@ -773,6 +763,23 @@ PY
     break
   fi
   if (( status_fresh == 1 && endpoint_ready == 1 && revision_ok == 1 && polled == 1 && healthy == 1 && accounts_safe == 1 && anchored == 1 )); then
+    private_binary_path=$(realpath "$binary")
+    if service_executable_path=$(realpath "$PROC_ROOT/$service_pid/exe" 2>/dev/null); then
+      executable_matches=false
+      [[ "$service_executable_path" != "$private_binary_path" ]] || executable_matches=true
+      printf '%s PROCESS_EXE expected=%s resolved=%s matches=%s\n' \
+        "$(date -u +%FT%TZ)" "$private_binary_path" "$service_executable_path" \
+        "$executable_matches" >> "$watch_log"
+      if [[ "$executable_matches" != true ]]; then
+        reason=process_executable_mismatch
+        break
+      fi
+    else
+      printf '%s PROCESS_EXE expected=%s resolved=unreadable matches=false\n' \
+        "$(date -u +%FT%TZ)" "$private_binary_path" >> "$watch_log"
+      reason=process_executable_unreadable
+      break
+    fi
     # Quiesce the exact invocation before the final observation. Its shutdown path is part of the
     # scanned evidence, and no later service append or database write can race the PASS decision.
     stop_all
