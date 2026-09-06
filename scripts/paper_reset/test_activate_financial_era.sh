@@ -147,7 +147,9 @@ cat > "$bin/psql" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
-[[ "${PGDATABASE:-}" == fake ]] || exit 91
+# The driver must reach psql through parsed libpq variables (never a URL in an argument).
+[[ "${PGHOST:-}" == 127.0.0.1 && "${PGPORT:-}" == 1 && "${PGUSER:-}" == harness && "${PGPASSWORD:-}" == harness && "${PGDATABASE:-}" == harness ]] || exit 91
+for argument in "$@"; do [[ "$argument" != *://* ]] || exit 91; done
 [[ " $* " != *" fake "* ]] || exit 92
 file= sql= stdin=
 while (($#)); do
