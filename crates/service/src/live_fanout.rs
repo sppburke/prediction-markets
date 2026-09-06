@@ -67,7 +67,7 @@ use crate::live_projections::{
 };
 use crate::live_venue_adapter::{
     LiveAdmissionBuilder, LiveRedemptionAdapter, LiveVenueAdapterError, PolygonReceiptReader,
-    PolygonReceiptRpc, PolymarketLiveVenue,
+    PolygonReceiptRpc, PolymarketLiveVenue, classify_account_responses,
 };
 use crate::live_watchlist::LiveWatchlist;
 use crate::mark_prices::HistoricalMarkAdapter;
@@ -2502,137 +2502,18 @@ fn verify_account_state(
 ) -> Result<(), ProjectionReducerError> {
     let evidence_hashes = http_attempt_hashes(&account.evidence)
         .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    if evidence_hashes != account.evidence_hashes || account.schema_version != 1 {
+    if evidence_hashes != account.evidence_hashes {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
-    let [
-        RawHttpAttempt::Response(geoblock),
-        RawHttpAttempt::Response(closed_only),
-        RawHttpAttempt::Response(balance),
-    ] = account.evidence.as_slice()
-    else {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    };
-    require_account_response(geoblock, "geoblock", "/api/geoblock", &[])?;
-    require_account_response(
-        closed_only,
-        "closed-only",
-        "/auth/ban-status/closed-only",
-        &[],
-    )?;
-    require_account_response(
-        balance,
-        "balance-allowance",
-        "/balance-allowance",
-        &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
-    )?;
-
-    let geoblock_json: serde_json::Value = serde_json::from_slice(&geoblock.body)
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    let closed_only_json: serde_json::Value = serde_json::from_slice(&closed_only.body)
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    let balance_json: serde_json::Value = serde_json::from_slice(&balance.body)
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    let blocked = geoblock_json
-        .get("blocked")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-    let country = geoblock_json
-        .get("country")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-    let parsed_closed_only = closed_only_json
-        .get("closed_only")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-    let collateral_balance = parse_atomic_collateral(balance_json.get("balance"))?;
-    let standard_spender = pe_venue_polymarket::CanaryV2Client::standard_spender()
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    let negrisk_spender = pe_venue_polymarket::CanaryV2Client::negrisk_spender()
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
-    let selected_spender = if account.selected_spender == standard_spender {
-        standard_spender
-    } else if account.selected_spender == negrisk_spender {
-        negrisk_spender
-    } else {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    };
-    let allowances = balance_json
-        .get("allowances")
-        .and_then(serde_json::Value::as_object)
-        .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-    let allowance = allowances
-        .iter()
-        .find(|(spender, _)| spender.eq_ignore_ascii_case(&selected_spender))
-        .map(|(_, value)| value)
-        .map(|value| parse_atomic_collateral(Some(value)))
-        .transpose()?
-        .unwrap_or(CollateralAmount::ZERO);
-    let observed_at = [geoblock, closed_only, balance]
-        .into_iter()
-        .map(|response| response.observed_at)
-        .min()
-        .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-    let expected = pe_execution_core::LiveAccountStateAudit {
-        observed_at,
-        closed_only: parsed_closed_only,
-        geoblocked: blocked && !matches!(country, "IE" | "JP" | "MT" | "NL"),
-        selected_spender,
-        collateral_balance,
-        allowance,
-        reconciled_free_collateral: collateral_balance,
-        schema_version: 1,
-        parser_version: 1,
-        evidence: account.evidence.clone(),
-        evidence_hashes,
-    };
+    let expected =
+        classify_account_responses(account.evidence.clone(), account.selected_spender.clone())
+            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?
+            .audit()
+            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     if *account != expected {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
     Ok(())
-}
-
-fn require_account_response(
-    response: &pe_core_types::RawHttpResponse,
-    endpoint_kind: &str,
-    path: &str,
-    ordered_query: &[(&str, &str)],
-) -> Result<(), ProjectionReducerError> {
-    let query_matches = response.ordered_query.len() == ordered_query.len()
-        && response.ordered_query.iter().zip(ordered_query).all(
-            |((actual_name, actual_value), (name, value))| {
-                actual_name == name && actual_value == value
-            },
-        );
-    if response.source_id != "polymarket-clob-v2"
-        || response.endpoint_kind != endpoint_kind
-        || response.method != "GET"
-        || response.path != path
-        || !query_matches
-        || !(200..300).contains(&response.status)
-        || response.attempt_ordinal != 1
-        || response.received_at < response.observed_at
-        || response.schema_version != 1
-        || response.parser_version != 1
-        || response.adapter_version != pe_venue_polymarket::SDK_VERSION
-    {
-        return Err(ProjectionReducerError::InvalidAccountEvidence);
-    }
-    Ok(())
-}
-
-fn parse_atomic_collateral(
-    value: Option<&serde_json::Value>,
-) -> Result<CollateralAmount, ProjectionReducerError> {
-    let value = value.ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
-    let encoded = value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string());
-    encoded
-        .parse::<u64>()
-        .map(CollateralAmount::from_atomic)
-        .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)
 }
 
 struct RetainedPositionFetcher {
@@ -6132,6 +6013,97 @@ mod tests {
             parser_version: 1,
             evidence_hashes: http_attempt_hashes(&evidence).unwrap(),
             evidence,
+        }
+    }
+
+    /// PASS: every runtime-success classification produces an audit accepted by the reducer for
+    /// every response ordering; an absent selected allowance is canonical zero, while a malformed
+    /// selected allowance or absent allowance map fails before an audit can be appended.
+    #[test]
+    fn runtime_account_success_always_round_trips_through_reducer() {
+        #[derive(Clone, Copy)]
+        enum AllowanceShape {
+            Valid,
+            SelectedMissing,
+            SelectedMalformed,
+            MapMissing,
+        }
+
+        let observed_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let spender = pe_venue_polymarket::CanaryV2Client::standard_spender().unwrap();
+        let response_orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let cases = [
+            (
+                AllowanceShape::Valid,
+                Some(CollateralAmount::from_atomic(500_000)),
+            ),
+            (
+                AllowanceShape::SelectedMissing,
+                Some(CollateralAmount::ZERO),
+            ),
+            (AllowanceShape::SelectedMalformed, None),
+            (AllowanceShape::MapMissing, None),
+        ];
+
+        for (shape, expected_allowance) in cases {
+            for order in response_orders {
+                let mut evidence =
+                    account_state_fixture(CollateralAmount::from_atomic(1_000_000), observed_at)
+                        .evidence;
+                let balance = evidence
+                    .iter_mut()
+                    .find_map(|attempt| match attempt {
+                        RawHttpAttempt::Response(response)
+                            if response.endpoint_kind == "balance-allowance" =>
+                        {
+                            Some(response)
+                        }
+                        RawHttpAttempt::Response(_) | RawHttpAttempt::TransportFailure(_) => None,
+                    })
+                    .unwrap();
+                let body = match shape {
+                    AllowanceShape::Valid => serde_json::json!({
+                        "balance": "1000000",
+                        "allowances": { spender.clone(): "500000" },
+                    }),
+                    AllowanceShape::SelectedMissing => serde_json::json!({
+                        "balance": "1000000",
+                        "allowances": {},
+                    }),
+                    AllowanceShape::SelectedMalformed => serde_json::json!({
+                        "balance": "1000000",
+                        "allowances": { spender.clone(): "not-an-integer" },
+                    }),
+                    AllowanceShape::MapMissing => serde_json::json!({
+                        "balance": "1000000",
+                    }),
+                };
+                balance.body = serde_json::to_vec(&body).unwrap();
+                let ordered_evidence = order
+                    .into_iter()
+                    .map(|index| evidence[index].clone())
+                    .collect();
+                let classified = classify_account_responses(ordered_evidence, spender.clone());
+
+                if let Some(expected_allowance) = expected_allowance {
+                    let state = classified.unwrap();
+                    assert_eq!(state.allowance, expected_allowance);
+                    let audit = state.audit().unwrap();
+                    verify_account_state(&audit).unwrap();
+                } else {
+                    assert_eq!(
+                        classified.unwrap_err().kind,
+                        pe_execution_core::LiveAccountReadFailure::Protocol
+                    );
+                }
+            }
         }
     }
 
