@@ -3,17 +3,29 @@
 
 set -euo pipefail
 
+# shellcheck source=generation_common.sh
+source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+
 usage() {
-  echo "usage: $0 [--dry-run] 40_HEX_GIT_SHA" >&2
+  echo "usage: $0 [--dry-run] --target-config PATH --target-environment PATH 40_HEX_GIT_SHA" >&2
   exit 2
 }
 
 dry_run=0
-if [[ "${1:-}" == "--dry-run" ]]; then
-  dry_run=1
-  shift
-fi
+target_config=
+target_environment=
+while (($#)); do
+  case "$1" in
+    --dry-run) dry_run=1; shift ;;
+    --target-config) [[ $# -ge 2 ]] || usage; target_config=$2; shift 2 ;;
+    --target-environment) [[ $# -ge 2 ]] || usage; target_environment=$2; shift 2 ;;
+    --) shift; break ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
 [[ $# -eq 1 ]] || usage
+[[ -n "$target_config" && -n "$target_environment" ]] || usage
 sha=$1
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || usage
 short=${sha:0:7}
@@ -22,8 +34,8 @@ root=${PE_REHEARSAL_ROOT:-"$HOME/rehearsal545"}
 activation_manifest=${PE_ACTIVATION_MANIFEST:-"$HOME/pe-activation.json"}
 release_root=${PE_REHEARSAL_RELEASE_ROOT:-"$HOME/releases/pe-545-$short"}
 binary=${PE_REHEARSAL_BINARY:-"$release_root/target/release/pe-service"}
-config=${PE_REHEARSAL_CONFIG:-"$root/service.toml"}
-env_file=${PE_REHEARSAL_ENV:-"$root/.env"}
+config=$target_config
+env_file=$target_environment
 copy_dir=${PE_REHEARSAL_COPY_DIR:-"$root/gen-$short"}
 rehearsal_bind=${PE_REHEARSAL_BIND:-}
 timeout_secs=${PE_REHEARSAL_TIMEOUT_SECS:-10800}
@@ -38,8 +50,10 @@ if [[ "$dry_run" == 1 ]]; then
     "active_generation=read-from-activation-manifest" \
     "copy_dir=$copy_dir" \
     "binary=$binary" \
-    "config=$config" \
-    "env=$env_file" \
+    "target_config=$config" \
+    "target_environment=$env_file" \
+    "config_override=${PE_REHEARSAL_CONFIG:-bound-to-target-config}" \
+    "environment_override=${PE_REHEARSAL_ENV:-bound-to-target-environment}" \
     "rehearsal_bind=${rehearsal_bind:-required}" \
     "credential_slots=PE_SUPABASE_ANON_KEY,PE_SUPABASE_SECRET_KEY(equal)" \
     "logs=paper.log,source_events.log,live_journal.log" \
@@ -51,7 +65,7 @@ if [[ "$dry_run" == 1 ]]; then
   exit 0
 fi
 
-for required in python3 sqlite3 sha256sum od cp grep awk sed flock curl env; do
+for required in python3 sqlite3 sha256sum od cp grep awk sed flock curl env realpath mktemp; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "FATAL: required command is unavailable: $required" >&2
     exit 1
@@ -60,6 +74,16 @@ done
 [[ -x "$binary" ]] || { echo "FATAL: staged binary is not executable: $binary" >&2; exit 1; }
 [[ -f "$config" ]] || { echo "FATAL: rehearsal config is missing: $config" >&2; exit 1; }
 [[ -f "$env_file" ]] || { echo "FATAL: rehearsal environment is missing: $env_file" >&2; exit 1; }
+config=$(realpath "$config")
+env_file=$(realpath "$env_file")
+if [[ -v PE_REHEARSAL_CONFIG && "$(realpath "$PE_REHEARSAL_CONFIG")" != "$config" ]]; then
+  echo "FATAL: PE_REHEARSAL_CONFIG differs from the reviewed target config" >&2
+  exit 1
+fi
+if [[ -v PE_REHEARSAL_ENV && "$(realpath "$PE_REHEARSAL_ENV")" != "$env_file" ]]; then
+  echo "FATAL: PE_REHEARSAL_ENV differs from the reviewed target environment" >&2
+  exit 1
+fi
 [[ -n "$rehearsal_bind" ]] || {
   echo "FATAL: PE_REHEARSAL_BIND is required" >&2
   exit 1
@@ -90,8 +114,8 @@ print(*match.groups())' <<< "$staged_identity_output") || {
 }
 artifact_sha256=$(sha256sum "$binary" | awk '{print $1}')
 
-readarray -t activation < <(python3 - "$activation_manifest" <<'PY'
-import json, os, sys
+readarray -t activation < <(python3 - "$activation_manifest" "$config" "$env_file" <<'PY'
+import hashlib, json, os, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     value = json.load(source)
 if value.get("state") != "verified":
@@ -99,28 +123,53 @@ if value.get("state") != "verified":
 generation = value.get("generation_dir")
 activation_id = value.get("activation_id")
 destinations = value.get("destinations")
+artifacts = value.get("artifacts")
 if not isinstance(generation, str) or not os.path.isabs(generation):
     raise SystemExit("activation manifest has no absolute generation_dir")
 if not isinstance(activation_id, str) or not activation_id:
     raise SystemExit("activation manifest has no activation_id")
 if not isinstance(destinations, dict):
     raise SystemExit("activation manifest has no installed artifact authority")
+if not isinstance(artifacts, dict):
+    raise SystemExit("activation manifest has no reviewed artifact authority")
 installed_config = destinations.get("config")
 installed_environment = destinations.get("environment")
 if not all(isinstance(path, str) and os.path.isabs(path)
            for path in (installed_config, installed_environment)):
     raise SystemExit("activation manifest has non-absolute installed artifact paths")
-print(generation)
+
+def verify_artifact(name, supplied):
+    row = artifacts.get(name)
+    if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
+        raise SystemExit(f"activation manifest has invalid reviewed {name} artifact")
+    path, digest = row["path"], row["sha256"]
+    if not isinstance(path, str) or os.path.realpath(path) != os.path.realpath(supplied):
+        raise SystemExit(f"reviewed target {name} path differs from activation authority")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise SystemExit(f"activation manifest has invalid reviewed {name} digest")
+    with open(supplied, "rb") as source:
+        actual = hashlib.sha256(source.read()).hexdigest()
+    if actual != digest:
+        raise SystemExit(f"reviewed target {name} bytes differ from activation authority")
+    return actual
+
+config_sha256 = verify_artifact("config", sys.argv[2])
+environment_sha256 = verify_artifact("environment", sys.argv[3])
+print(os.path.realpath(generation))
 print(activation_id)
 print(installed_config)
 print(installed_environment)
+print(config_sha256)
+print(environment_sha256)
 PY
 )
-[[ ${#activation[@]} -eq 4 ]] || { echo "FATAL: malformed activation manifest" >&2; exit 1; }
+[[ ${#activation[@]} -eq 6 ]] || { echo "FATAL: malformed activation manifest" >&2; exit 1; }
 active_generation=${activation[0]}
 activation_id=${activation[1]}
 installed_config=${activation[2]}
 installed_environment=${activation[3]}
+config_sha256=${activation[4]}
+environment_sha256=${activation[5]}
 
 for installed in "$installed_config" "$installed_environment"; do
   [[ -f "$installed" && ! -L "$installed" ]] || {
@@ -267,14 +316,19 @@ else
   for name in paper.log source_events.log live_journal.log wallet_market_history.json; do
     cp -p "$active_generation/$name" "$copy_dir/$name"
   done
+  source_identity_stage=$(mktemp "$root/.source.identity.XXXXXX")
   printf 'activation_id=%s\ngeneration_dir=%s\n' "$activation_id" "$active_generation" \
-    > "$source_identity"
+    > "$source_identity_stage"
+  atomic_adopt "$source_identity_stage" "$source_identity" 0600 rehearsal-source-identity
+  rm -f "$source_identity_stage"
+  copy_manifest_stage=$(mktemp "$root/.copied.sha256.XXXXXX")
   (
     cd "$copy_dir"
     sha256sum paper_state.db paper.log source_events.log live_journal.log \
-      wallet_market_history.json source.identity > copied.sha256.tmp
-    mv copied.sha256.tmp copied.sha256
+      wallet_market_history.json source.identity > "$copy_manifest_stage"
   )
+  atomic_adopt "$copy_manifest_stage" "$copy_manifest" 0600 rehearsal-copy-manifest
+  rm -f "$copy_manifest_stage"
   validate_copy_manifest || {
     echo "FATAL: new rehearsal copy failed recorded hash validation" >&2
     exit 1
@@ -282,11 +336,15 @@ else
 fi
 copy_manifest_sha256=$(sha256sum "$copy_manifest" | awk '{print $1}')
 
-env_file_sha256=$(sha256sum "$env_file" | awk '{print $1}')
+env_file_sha256=$environment_sha256
 env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" \
   /bin/bash "$release_root/scripts/deploy/rehearsal_preflight.sh" "$env_file"
 [[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$env_file_sha256" ]] || {
   echo "FATAL: rehearsal environment changed during privileged preflight" >&2
+  exit 1
+}
+[[ "$(sha256sum "$config" | awk '{print $1}')" == "$config_sha256" ]] || {
+  echo "FATAL: rehearsal config changed during privileged preflight" >&2
   exit 1
 }
 
@@ -328,6 +386,10 @@ fi
 unset 'service_child_env[last_env_index]'
 [[ "$(sha256sum "$env_file" | awk '{print $1}')" == "$env_file_sha256" ]] || {
   echo "FATAL: rehearsal environment changed while constructing the service environment" >&2
+  exit 1
+}
+[[ "$(sha256sum "$config" | awk '{print $1}')" == "$config_sha256" ]] || {
+  echo "FATAL: rehearsal config changed while constructing the service environment" >&2
   exit 1
 }
 anon_key=
@@ -402,6 +464,62 @@ stop_all() {
   for pid in "${observer_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 trap stop_all EXIT TERM INT
+
+scan_service_log_prefix() {
+  python3 - "$service_log" <<'PY'
+import hashlib, json, sys
+
+with open(sys.argv[1], "rb") as source:
+    prefix = source.read()
+drops = credit_loss = unexpected_errors = refused = writes = 0
+for line in prefix.decode("utf-8", errors="replace").splitlines():
+    if "dropping socket" in line:
+        drops += 1
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            credit_loss += 1
+            continue
+        fields = value.get("fields", value)
+        raw = fields.get("last_wire_frame_age_secs")
+        buffered = fields.get("buffered_frame_processed")
+        age = raw if isinstance(raw, int) else None
+        if isinstance(raw, str) and raw.startswith("Some(") and raw.endswith(")"):
+            try:
+                age = int(raw[5:-1])
+            except ValueError:
+                age = None
+        if not (age is not None and age >= 29 and buffered is False):
+            credit_loss += 1
+    if '"level":"ERROR"' in line and not any(
+        marker in line for marker in ("permission denied", "HTTP 401", "HTTP 403")
+    ):
+        unexpected_errors += 1
+    if any(marker in line for marker in (
+        "HTTP 401", "HTTP 403", "permission denied", "projection failed",
+        "apply_resolution failed", "commit_fill",
+    )) and ("commit_fill" not in line or "failed" in line):
+        refused += 1
+    if any(marker in line for marker in (
+        '"message":"fill committed"',
+        '"message":"resolution applied"',
+        '"message":"watchlist projection applied"',
+        '"message":"paper_fill"',
+    )):
+        writes += 1
+print(
+    drops, credit_loss, unexpected_errors, refused, writes, len(prefix),
+    hashlib.sha256(prefix).hexdigest(),
+)
+PY
+}
+
+observe_database_final() {
+  sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
+    "select coalesce((select max(anchor_seq) from position_anchors where wallet_hex='$wallet'),-1),
+            coalesce((select reanchor_required from poll_cursors where wallet_hex='$wallet'),1),
+            (select count(*) from wallet_fences where cause not in ('order_dependent_equal_second','position_underflow'));"
+}
 
 env -i "${service_child_env[@]}" "$binary" "$config" > "$service_log" 2>&1 &
 service_pid=$!
@@ -515,11 +633,16 @@ write_refusal_counter & observer_pids+=("$!")
 result=FAIL
 reason=timeout
 deadline=$((started_at + timeout_secs))
+readiness_sha256=absent
+service_log_prefix_length=absent
+service_log_prefix_sha256=absent
+database_observation=absent
 last="status_fresh=0 endpoint_ready=0 revision_ok=0 polled=0 healthy=0 accounts_safe=0 anchored=0 drops=0 credit_loss=0 errors=0 fences=0 refused=0 writes=0"
 while (( $(date +%s) <= deadline )); do
   if ! kill -0 "$service_pid" 2>/dev/null; then reason=process_exited; break; fi
   status_fresh=0; endpoint_ready=0; revision_ok=0; polled=0; healthy=0; accounts_safe=0; anchored=0
   drops=0; credit_loss=0; errors=0; fences=0; refused=0; writes=0
+  readiness_candidate_sha256=absent
   [[ ! -f "$status_state" ]] || read -r status_fresh revision_ok polled healthy accounts_safe < "$status_state"
   [[ ! -f "$drop_state" ]] || read -r drops credit_loss errors < "$drop_state"
   [[ ! -f "$fence_state" ]] || read -r anchored fences < "$fence_state"
@@ -538,6 +661,7 @@ raise SystemExit(0 if isinstance(value, dict) and value.get("ready") is True
 PY
     then
       endpoint_ready=1
+      readiness_candidate_sha256=$(sha256sum "$readiness_response.tmp" | awk '{print $1}')
     fi
   fi
   [[ ! -f "$readiness_response.tmp" ]] || mv "$readiness_response.tmp" "$readiness_response"
@@ -548,8 +672,45 @@ PY
     break
   fi
   if (( status_fresh == 1 && endpoint_ready == 1 && revision_ok == 1 && polled == 1 && healthy == 1 && accounts_safe == 1 && anchored == 1 )); then
+    # Quiesce the exact invocation before the final observation. Its shutdown path is part of the
+    # scanned evidence, and no later service append or database write can race the PASS decision.
+    stop_all
+    service_pid=""
+    observer_pids=()
+    final_log_scan=$(scan_service_log_prefix) || {
+      reason=final_service_log_scan_failed
+      break
+    }
+    read -r drops credit_loss errors refused writes service_log_prefix_length service_log_prefix_sha256 \
+      <<< "$final_log_scan"
+    if [[ ! "$drops $credit_loss $errors $refused $writes $service_log_prefix_length" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ||
+          ! "$service_log_prefix_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+      reason=final_service_log_scan_failed
+      break
+    fi
+    final_database=$(observe_database_final) || {
+      reason=final_database_observation_failed
+      break
+    }
+    IFS='|' read -r anchor_after reanchor fences <<< "$final_database"
+    if [[ ! "$anchor_after" =~ ^-?[0-9]+$ || ! "$reanchor" =~ ^[01]$ || ! "$fences" =~ ^[0-9]+$ ]]; then
+      reason=final_database_observation_failed
+      break
+    fi
+    anchored=0
+    [[ "$anchor_after" -gt "$anchor_before" && "$reanchor" == 0 ]] && anchored=1
+    database_observation="anchor_after:$anchor_after,reanchor_required:$reanchor,unexpected_fences:$fences"
+    last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy accounts_safe=$accounts_safe anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
+    printf '%s FINAL %s service_log_prefix_length=%s service_log_prefix_sha256=%s database_observation=%s\n' \
+      "$(date -u +%FT%TZ)" "$last" "$service_log_prefix_length" \
+      "$service_log_prefix_sha256" "$database_observation" >> "$watch_log"
+    if (( credit_loss > 0 || errors > 0 || fences > 0 || writes > 0 || anchored != 1 )); then
+      reason=unsafe_evidence
+      break
+    fi
     result=PASS
     reason=evidence_complete
+    readiness_sha256=$readiness_candidate_sha256
     break
   fi
   sleep "$poll_secs"
@@ -559,26 +720,31 @@ stop_all
 service_pid=""
 observer_pids=()
 trap - EXIT TERM INT
-readiness_response_sha256=absent
-if [[ -f "$readiness_response" ]]; then
-  readiness_response_sha256=$(sha256sum "$readiness_response" | awk '{print $1}')
-fi
+manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
 {
-  printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\nactive_generation=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
+  printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
     "$result" "$reason" "$sha" "$target_revision" "$artifact_blake3" "$artifact_sha256" \
-    "$activation_id" "$active_generation" "$service_invocation_pid" "$rehearsal_bind" \
-    "$rehearsal_port" "$installed_bind" "$readiness_base_url" "$wallet" "$anchor_before"
+    "$activation_id" "$active_generation" "$config_sha256" "$environment_sha256" \
+    "$service_invocation_pid" "$rehearsal_bind" "$rehearsal_port" "$installed_bind" \
+    "$readiness_base_url" "$wallet" "$anchor_before"
   printf 'final=%s\n' "$last"
-  printf 'copy_manifest_sha256=%s\nreadiness_response_sha256=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
+  printf 'copy_manifest_sha256=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
     "$copy_manifest_sha256" \
-    "$readiness_response_sha256" \
+    "$readiness_sha256" \
+    "$service_log_prefix_length" \
+    "$service_log_prefix_sha256" \
+    "$database_observation" \
     "$(sha256sum "$watch_log" | awk '{print $1}')" \
     "$(sha256sum "$service_log" | awk '{print $1}')"
-} > "$manifest.tmp"
-mv "$manifest.tmp" "$manifest"
+} > "$manifest_stage"
+atomic_adopt "$manifest_stage" "$manifest" 0600 rehearsal-result-manifest
+rm -f "$manifest_stage"
 hash=$(sha256sum "$manifest" | awk '{print $1}')
+mkdir -p "$(dirname "$evidence_hash_file")"
+evidence_stage=$(mktemp "$(dirname "$evidence_hash_file")/.rehearsal-evidence.XXXXXX")
 python3 -c 'import json,os,sys
-path,result,digest,manifest,revision,artifact,artifact_sha=sys.argv[1:]
+(path,result,digest,manifest,revision,artifact,artifact_sha,activation,generation,copy_digest,
+ readiness_digest,config_digest,environment_digest)=sys.argv[1:]
 value={
     "kind":"rehearsal545-evidence-v1",
     "result":result,
@@ -587,13 +753,21 @@ value={
     "target_revision":revision,
     "artifact_blake3":artifact,
     "artifact_sha256":artifact_sha,
+    "activation_id":activation,
+    "generation_dir":os.path.realpath(generation),
+    "copy_manifest_sha256":copy_digest,
+    "readiness_sha256":readiness_digest,
+    "config_sha256":config_digest,
+    "environment_sha256":environment_digest,
 }
 with open(path,"w",encoding="utf-8") as output:
     json.dump(value,output,sort_keys=True,separators=(",",":"))
     output.write("\n")' \
-  "$evidence_hash_file.tmp" "$result" "$hash" "$manifest" "$target_revision" \
-  "$artifact_blake3" "$artifact_sha256"
-mv "$evidence_hash_file.tmp" "$evidence_hash_file"
+  "$evidence_stage" "$result" "$hash" "$manifest" "$target_revision" \
+  "$artifact_blake3" "$artifact_sha256" "$activation_id" "$active_generation" \
+  "$copy_manifest_sha256" "$readiness_sha256" "$config_sha256" "$environment_sha256"
+atomic_adopt "$evidence_stage" "$evidence_hash_file" 0600 rehearsal-evidence-json
+rm -f "$evidence_stage"
 printf 'REHEARSAL545_%s reason=%s evidence_sha256=%s evidence_file=%s\n' \
   "$result" "$reason" "$hash" "$evidence_hash_file"
 [[ "$result" == PASS ]]

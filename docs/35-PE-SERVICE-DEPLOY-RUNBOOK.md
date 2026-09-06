@@ -256,12 +256,20 @@ manifest.
 
 ### Bounded final-head rehearsal
 
-Run the final-head harness before financial activation. Its only command-line option is `--dry-run`;
-the required positional argument is the reviewed full Git object identity:
+Run the final-head harness before financial activation. Pass the same reviewed `service.toml` and
+complete environment paths that will be supplied to the financial-era driver's `--target-config`
+and `--target-environment`; the required positional argument is the reviewed full Git object
+identity:
 
 ```bash
-scripts/deploy/rehearsal545.sh --dry-run <reviewed-40-hex>
-scripts/deploy/rehearsal545.sh <reviewed-40-hex>
+scripts/deploy/rehearsal545.sh --dry-run \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  <reviewed-40-hex>
+scripts/deploy/rehearsal545.sh \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  <reviewed-40-hex>
 ```
 
 The harness requires `/home/sean/pe-activation.json` to be `verified`, reads the active generation
@@ -271,6 +279,12 @@ input. A new or reused checkpoint must have the exact six-entry `copied.sha256` 
 address with a nonzero port different from the installed service's port; the harness passes it to
 the child as `PE_BIND`, derives the readiness URL from it, and runs against real first-party venue
 endpoints.
+The harness resolves those target paths canonically and requires their paths and SHA-256 values to
+equal the activation manifest's reviewed `config` and `environment` artifacts. If legacy
+`PE_REHEARSAL_CONFIG` or `PE_REHEARSAL_ENV` is present, it must resolve to the corresponding explicit
+target path; an arbitrary override is refused. Their `config_sha256` and `environment_sha256`
+identities are carried in both evidence layers for the financial driver to compare to its target
+arguments.
 
 The rehearsal environment must put the same publishable Supabase key in both credential slots. It
 may be a modern `sb_publishable_*` key or a legacy JWT whose payload has `role=anon`; a modern secret
@@ -283,8 +297,7 @@ reach it.
 
 Path and cadence overrides are environment variables, not flags:
 `PE_REHEARSAL_ROOT`, `PE_ACTIVATION_MANIFEST`, `PE_REHEARSAL_RELEASE_ROOT`,
-`PE_REHEARSAL_BINARY`, `PE_REHEARSAL_CONFIG`, `PE_REHEARSAL_ENV`,
-`PE_REHEARSAL_COPY_DIR`, `PE_REHEARSAL_BIND`, `PE_REHEARSAL_TIMEOUT_SECS`,
+`PE_REHEARSAL_BINARY`, `PE_REHEARSAL_COPY_DIR`, `PE_REHEARSAL_BIND`, `PE_REHEARSAL_TIMEOUT_SECS`,
 `PE_REHEARSAL_POLL_SECS`, and `PE_REHEARSAL_EVIDENCE_HASH_FILE`.
 
 The four concurrent observers are the status-file poller, reader-drop classifier, fence/anchor
@@ -295,13 +308,19 @@ and critical-task assertions remain independent requirements. The run stops at t
 same-invocation proof, the first unsafe
 observation, process exit, or its bound. PASS requires the reviewed revision, a complete ordinary
 poll after start, successful re-anchor, real readiness, healthy critical owners, accounts off and
-unarmed, and no credit loss, unexpected fence/error, or successful database write. The harness prints
+unarmed, and no credit loss, unexpected fence/error, or successful database write. Immediately before
+PASS, the harness synchronously rescans one exact complete service-log prefix and queries the current
+anchor/reanchor/fence database observation. The result binds that prefix's byte length and SHA-256
+plus the database values; unsafe evidence arriving while readiness is in flight therefore fails the
+same invocation. The harness prints
 `REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
 file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, and the rehearsed
-binary's revision, embedded BLAKE3 identity, and file SHA-256. Preserve and review the JSON file and
-its result manifest, which also binds the validated copy-manifest digest and the real readiness
-response digest; the financial driver binds both before entering `prepared` and revalidates them from
-disk before entering `guarded`.
+binary's revision, embedded BLAKE3 identity, file SHA-256, activation ID, canonical generation
+directory, copied-state manifest SHA-256, exact passing readiness-body SHA-256, config SHA-256, and
+environment SHA-256. Preserve and review the JSON file and its result manifest, which binds the same
+identities; the financial driver binds both before entering `prepared` and revalidates them from disk
+before entering `guarded`. The copy manifest, result manifest, and outer JSON are installed with the
+shared durable atomic-write primitive (file sync, rename, then parent-directory sync).
 
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
