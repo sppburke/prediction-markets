@@ -98,8 +98,9 @@ case "$1" in
 root=sys.argv[1]; path=os.path.join(root,"prediction-markets/gen/g557/status.json")
 value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
 "tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,"uptime_secs":1,
-"mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,
+"mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,"oldest_anchor_age_secs":0,
 "last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+"source_health":{"poll_error_streak":0,"copy_admission_blocked":False,"ws_sink_poisoned":False,"poll_last_round_age_secs":0},
 "runtime_config":{"applied_hash":"b"*64,"rejected":None},
 "watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
 "supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
@@ -109,10 +110,12 @@ json.dump(value,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT"
   *) echo "unexpected systemctl command: $*" >&2; exit 97 ;;
 esac
 SH
-  cat > "$bin/psql" <<'SH'
+cat > "$bin/psql" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
+[[ "${PGDATABASE:-}" == fake ]] || exit 91
+[[ " $* " != *" fake "* ]] || exit 92
 file= sql= stdin=
 while (($#)); do
   case "$1" in
@@ -140,6 +143,9 @@ elif [[ "$sql" == *information_schema.columns* ]]; then
   echo 5
 elif [[ "$sql" == *paper_fills_archive* ]]; then
   echo '0 0 0 1 0'
+elif [[ "$sql" == *seed_financial_start* ]]; then
+  echo '{"outcome":"applied","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+  echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
 elif [[ "$sql" == *"'start_seq'"* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
 elif [[ "$sql" == *json_build_object* ]]; then
@@ -158,7 +164,11 @@ setup_fixture() {
   printf '%s\n' old-config > "$service/smoke-test/service.toml"
   printf '%s\n' old-environment > "$service/.env"
   printf '%s\n' target-config > "$target/service.toml"
-  printf '%s\n' target-environment > "$target/service.env"
+  cat > "$target/service.env" <<'ENV'
+PE_SUPABASE_AUTHORITATIVE=true
+PE_SUPABASE_URL=https://example.invalid
+PE_SUPABASE_SECRET_KEY=test-service-role
+ENV
   printf '%s\n' '["0x0000000000000000000000000000000000000545"]' > "$target/membership.json"
   printf 'paper-before\n' > "$service/gen/g557/paper.log"
   printf 'source-before\n' > "$service/gen/g557/source_events.log"
@@ -223,8 +233,6 @@ driver_args() {
     --live-journal "$service/gen/g557/live_journal.log"
     --paper-state "$service/gen/g557/paper_state.db"
     --fresh-bankroll 10000
-    --target-revision 1111111111111111111111111111111111111111
-    --artifact-blake3 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     --hot-config-hash bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     --ranking-batch-id 545
     --policy-hash policy-545
@@ -252,8 +260,11 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
   return 1
 }
 
-# The sole authoritative prepare occurs only after stop/inert and leaves every durable input
-# untouched; no remote archive has begun.
+# Scenario FE-PREP-01
+# Preconditions: active old service; clean paper/source/live logs and local state.
+# Injected boundary: `preparation`, after offline prepare is durable and before `guarded`.
+# PASS: the service is inert, inputs are byte-identical, and no remote archive exists.
+# FAIL: any input changes, archive occurs, or stop is repeated.
 root=$TEST_TMP/prepare
 setup_fixture "$root"
 driver_args "$root"
@@ -269,7 +280,10 @@ after=$(sha256sum "$root/prediction-markets/gen/g557/"{paper.log,source_events.l
 [[ $(<"$root/test-state/stop-count") -eq 1 ]] || fail "prepare did not stop the service exactly once"
 [[ ! -e "$root/test-state/archive-count" ]] || fail "prepare reached the remote archive"
 
-# A failed Start scan is unknown, never equivalent to proven absence and never rollback authority.
+# Scenario FE-START-UNKNOWN-02
+# Preconditions: stopped service with no Start and a completed stop receipt.
+# Injected boundary: `service-stopped`, followed by an unreadable Start scan.
+# PASS: rollback refuses before any restore. FAIL: unknown is treated as no Start or restore runs.
 root=$TEST_TMP/start-unknown
 setup_fixture "$root"
 driver_args "$root"
@@ -287,7 +301,35 @@ set -e
   fail "unknown Start state did not block rollback"
 [[ ! -e "$root/test-state/restore-count" ]] || fail "unknown Start state reached restore"
 
-# Every pre-Start seam restores the complete local backup and stamped remote archive at most once.
+# Scenario FE-ROLLBACK-NOMUT-03
+# Preconditions: guarded service with no remote archive and no local Start attempt.
+# Injected boundary: `guarded` immediately after the durable guard receipt.
+# PASS: rollback restarts the old service without remote/local restore and records no mutation.
+# FAIL: any restore runs, the local database changes, or the old service remains stopped.
+root=$TEST_TMP/guarded-no-mutation
+setup_fixture "$root"
+driver_args "$root"
+local_before=$(sha256sum "$root/prediction-markets/gen/g557/paper_state.db")
+set +e
+run_driver "$root" --simulate-crash-after guarded >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 && ! -e "$root/test-state/archive-count" ]] ||
+  fail "guarded no-mutation boundary was not reached before archive"
+run_driver "$root" --rollback-before-start >/dev/null
+local_after=$(sha256sum "$root/prediction-markets/gen/g557/paper_state.db")
+[[ "$local_before" == "$local_after" && ! -e "$root/test-state/restore-count" ]] ||
+  fail "guarded no-mutation rollback restored state without a mutation receipt"
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1])); assert value["state"]=="rolled_back" and value["no_financial_mutation"] is True' \
+  "$root/pe-financial-era.json" || fail "guarded no-mutation rollback receipt is incomplete"
+[[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "guarded rollback did not restart once"
+
+# Scenario FE-ROLLBACK-ARCHIVE-04
+# Preconditions: activation-stamped remote archive, inert service, unchanged local database.
+# Injected boundary: `remote-archived`.
+# PASS: remote data restores once, local restore is skipped, and old service starts once.
+# FAIL: duplicate restore/start or any unreceipted local restore.
 root=$TEST_TMP/pre-start-rollback
 setup_fixture "$root"
 driver_args "$root"
@@ -302,11 +344,16 @@ run_driver "$root" --rollback-before-start >/dev/null
   fail "pre-Start rollback did not become durable"
 [[ $(<"$root/test-state/restore-count") -eq 1 && $(<"$root/test-state/start-count") -eq 1 ]] ||
   fail "pre-Start rollback did not restore/restart exactly once"
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1])); assert value["local_restore_skipped"] is True' \
+  "$root/pe-financial-era.json" || fail "unchanged local state was restored without a mutation receipt"
 run_driver "$root" --rollback-before-start >/dev/null
 [[ $(<"$root/test-state/restore-count") -eq 1 ]] || fail "rolled-back rerun restored twice"
 
-# A complete Start is discovered from the paper-log command even while the shell manifest still
-# says guarded; rollback must refuse and preserve the stamped archive for roll-forward.
+# Scenario FE-START-FORWARD-05
+# Preconditions: physical Start exists while the shell manifest still says guarded.
+# Injected boundary: `qualification-started`.
+# PASS: rollback refuses and preserves the archive. FAIL: any restore occurs after Start.
 root=$TEST_TMP/complete-start
 setup_fixture "$root"
 driver_args "$root"
@@ -324,8 +371,10 @@ set -e
   fail "complete Start did not force roll-forward"
 [[ ! -e "$root/test-state/restore-count" ]] || fail "complete Start was rolled back"
 
-# A crash after service start but before the started receipt scans the physical Start and rolls
-# forward without repeating the remote archive/reset.
+# Scenario FE-SERVICE-START-06
+# Preconditions: complete Start and adopted target artifacts.
+# Injected boundary: `before-manifest-started`, after systemctl start and its own receipt.
+# PASS: rerun rolls forward without repeating archive/start. FAIL: rollback or duplicate mutation.
 root=$TEST_TMP/post-service-start
 setup_fixture "$root"
 driver_args "$root"
@@ -341,16 +390,20 @@ run_driver "$root" >/dev/null
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
   fail "Start recovery did not durably roll forward to started"
 
-# The first no-wait verification binds Start/reset/log-prefix/ranking/membership/account posture
-# rather than accepting a generic readiness bit.
+# Scenario FE-VERIFY-07
+# Preconditions: first same-invocation status has source poll, anchors, producers, projection, and
+# off/unarmed account evidence, while local/remote financial state is fresh and Start-bound.
+# Injected boundary: none; verification is a single no-wait read.
+# PASS: every named assertion is manifest-bound. FAIL: a generic readiness bit can satisfy it.
 python3 -c 'import datetime,json,sys
 path=sys.argv[1]
 value={
  "revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
  "tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,
- "uptime_secs":1,"mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,
+ "uptime_secs":1,"mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"oldest_anchor_age_secs":0,
  "fills_total":0,"settled_total":0,"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
  "runtime_config":{"applied_hash":"b"*64,"rejected":None},
+ "source_health":{"poll_error_streak":0,"copy_admission_blocked":False,"ws_sink_poisoned":False,"poll_last_round_age_secs":0},
  "watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
  "supabase_rpc_calls":0,
  "live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
@@ -363,46 +416,63 @@ value=json.load(open(sys.argv[1]));
 assert value["state"]=="verified" and value["verified_state_assertions"] is True' \
   "$root/pe-financial-era.json" || fail "verified state did not retain all merged assertions"
 
-# Every executable forward boundary is restartable. The mocked archive and Start retain their own
-# durable identities, so before-receipt crashes cannot duplicate either external transition.
-forward_boundaries=(
-  before-manifest-prepared prepared service-stop-intent before-manifest-service-stopped
-  service-stopped legacy-contract-verified preparation guarded remote-archive-intent
-  before-manifest-remote-archived remote-archived qualification-start-intent
-  before-manifest-qualification-started qualification-started
-  before-manifest-authority-start-seeded authority-start-seeded financial-config-adopted
-  financial-environment-adopted financial-binary-adopted service-start-intent
-  before-manifest-started started before-manifest-verified verified
+# Scenario FE-FORWARD-MATRIX-08
+# Preconditions: fresh fixture at each case; exact staged/environment and Legacy17 guard pass.
+# Injected boundaries: before, at, and after every durable manifest receipt, plus each atomic
+# adoption action after rename and before its manifest receipt.
+# PASS: each case converges with one stop, archive, and start. FAIL: duplicate or stranded action.
+forward_manifest_boundaries=(
+  prepared service-stop-intent service-stopped legacy-contract-verified preparation guarded
+  remote-archive-intent remote-archived qualification-start-intent qualification-started
+  authority-schema-intent authority-schema-installed authority-start-seeded
+  financial-config-migration-intent financial-config-migrated
+  target-config-adopt-intent target-config-adopted
+  target-environment-adopt-intent target-environment-adopted
+  target-binary-adopt-intent target-binary-adopted
+  service-start-intent service-started started verified
 )
+forward_boundaries=(financial-config-adopted financial-environment-adopted financial-binary-adopted)
+for receipt in "${forward_manifest_boundaries[@]}"; do
+  forward_boundaries+=("before-manifest-$receipt" "$receipt" "after-manifest-$receipt")
+done
 for boundary in "${forward_boundaries[@]}"; do
   root="$TEST_TMP/forward-$boundary"
+  [[ ! -e "$root" ]] || fail "duplicate forward fixture path for $boundary"
   setup_fixture "$root"
   driver_args "$root"
-  if [[ "$boundary" == before-manifest-verified || "$boundary" == verified ]]; then
+  if [[ "$boundary" == before-manifest-verified || "$boundary" == verified ||
+        "$boundary" == after-manifest-verified ]]; then
     run_driver "$root" >/dev/null
     touch "$root/prediction-markets/gen/g557/status.json"
   fi
   set +e
-  run_driver "$root" --simulate-crash-after "$boundary" >/dev/null 2>&1
+  output=$(run_driver "$root" --simulate-crash-after "$boundary" 2>&1)
   status=$?
   set -e
-  [[ $status -eq 86 ]] || fail "forward crash boundary $boundary returned $status"
+  [[ $status -eq 86 ]] || fail "forward crash boundary $boundary returned $status: $output"
   drive_to_verified "$root" || fail "forward crash boundary $boundary did not converge"
   [[ $(<"$root/test-state/stop-count") -eq 1 ]] || fail "$boundary stopped the service more than once"
   [[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "$boundary archived the remote book more than once"
   [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the service more than once"
 done
 
-# Every rollback receipt boundary converges without a second archive restore or old-service start.
-rollback_boundaries=(
-  before-manifest-rollback-service-stopped rollback-service-stopped rolling_back
-  rollback-archive-restore-intent
-  before-manifest-archive-restored archive-restored rollback-local-restore-intent
-  before-manifest-local-restored local-restored rollback-old-service-start-intent
-  before-manifest-old-service-started old-service-started rolled_back
+# Scenario FE-ROLLBACK-MATRIX-09
+# Preconditions: stamped archive, deliberately changed local database, inert old service.
+# Injected boundaries: before, at, and after every rollback receipt.
+# PASS: catalog-equal remote restore, byte-equal local restore, and old start each occur once.
+# FAIL: retry restores while active, repeats a transition, or loses an equality proof.
+rollback_manifest_boundaries=(
+  rollback-service-stopped rolling_back rollback-archive-restore-intent archive-restored
+  rollback-local-mutation-observed rollback-local-restore-intent local-restored
+  rollback-old-service-start-intent old-service-started rolled_back
 )
+rollback_boundaries=()
+for receipt in "${rollback_manifest_boundaries[@]}"; do
+  rollback_boundaries+=("before-manifest-$receipt" "$receipt" "after-manifest-$receipt")
+done
 for boundary in "${rollback_boundaries[@]}"; do
   root="$TEST_TMP/rollback-$boundary"
+  [[ ! -e "$root" ]] || fail "duplicate rollback fixture path for $boundary"
   setup_fixture "$root"
   driver_args "$root"
   set +e
@@ -410,15 +480,17 @@ for boundary in "${rollback_boundaries[@]}"; do
   status=$?
   set -e
   [[ $status -eq 86 ]] || fail "rollback setup for $boundary did not reach the archive"
-  if [[ "$boundary" == before-manifest-rollback-service-stopped ||
-        "$boundary" == rollback-service-stopped ]]; then
+  python3 -c 'import sqlite3,sys
+db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\""); db.commit(); db.close()' \
+    "$root/prediction-markets/gen/g557/paper_state.db"
+  if [[ "$boundary" == *rollback-service-stopped* ]]; then
     echo true > "$root/test-state/service.active"
   fi
   set +e
-  run_driver "$root" --rollback-before-start --simulate-crash-after "$boundary" >/dev/null 2>&1
+  output=$(run_driver "$root" --rollback-before-start --simulate-crash-after "$boundary" 2>&1)
   status=$?
   set -e
-  [[ $status -eq 86 ]] || fail "rollback crash boundary $boundary returned $status"
+  [[ $status -eq 86 ]] || fail "rollback crash boundary $boundary returned $status: $output"
   run_driver "$root" --rollback-before-start >/dev/null
   [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == rolled_back ]] ||
     fail "rollback crash boundary $boundary did not converge"
@@ -426,4 +498,4 @@ for boundary in "${rollback_boundaries[@]}"; do
   [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the old service more than once"
 done
 
-echo 'PASS: financial-era driver preserves read-only prepare, restores every pre-Start seam once, forces roll-forward after Start, verifies merged state, shares process proofs, and uses catalog-derived restore equality'
+echo "PASS: FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
