@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr as _;
@@ -24,7 +24,8 @@ use pe_service::paper_migration::{
     validate_migration_authority,
 };
 use pe_service::paper_recovery::{
-    active_risk_halts, build_leader_ledger, paper_era, reconcile_paper_state, scan_paper_log,
+    active_risk_halts, build_leader_ledger, paper_era, reconcile_paper_state, replay_membership,
+    scan_paper_log,
 };
 use pe_service::position_seeder::CausalPositionValidator;
 use pe_source_polymarket_public::{
@@ -41,9 +42,9 @@ use pe_paper_pnl::{PnlLedger, ResolutionStore};
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::config_poller::{
-    CONFIG_POLL_INTERVAL_SECS, RiskHaltReleaseHandle, SupabaseConfigFetcher,
-    capacity_request_channel, fetch_service_config, partition_risk_halt_release_hash,
-    run_capacity_worker, run_config_poll_loop,
+    CONFIG_POLL_INTERVAL_SECS, QualificationSealHandle, RiskHaltReleaseHandle,
+    SupabaseConfigFetcher, capacity_request_channel, fetch_service_config,
+    partition_risk_halt_release_hash, run_capacity_worker, run_config_poll_loop,
 };
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
@@ -226,16 +227,18 @@ async fn main() -> Result<()> {
     // Derive the financial era exactly once, from the verified paper log, before constructing
     // any HTTP client. A Start has no local-authority interpretation: credentials and the
     // Start-bound Supabase protocol are mandatory for every subsequent boot.
-    let (financial_start_record, active_risk_halt_count) = if cfg.event_log_path.exists() {
-        let era = paper_era(
+    let financial_era = if cfg.event_log_path.exists() {
+        Some(paper_era(
             scan_paper_log(&cfg.event_log_path)
                 .context("verify paper log and derive financial era")?,
-        );
-        let halt_count = active_risk_halts(&era).len();
-        (era.start, halt_count)
+        ))
     } else {
-        (None, 0)
+        None
     };
+    let financial_start_record = financial_era.as_ref().and_then(|era| era.start.clone());
+    let active_risk_halt_count = financial_era
+        .as_ref()
+        .map_or(0, |era| active_risk_halts(era).len());
     let financial_start = financial_start_record.as_ref().map(|(receipt, _)| *receipt);
     if financial_start.is_some() {
         anyhow::ensure!(
@@ -357,7 +360,7 @@ async fn main() -> Result<()> {
     .unwrap_or_default();
 
     let initial_watchlist_size = live_runtime_config.snapshot().active_watchlist_size;
-    let (initial_watchlist, bootstrap_last_trade): (Watchlist, HashMap<_, _>) =
+    let (mut initial_watchlist, mut bootstrap_last_trade): (Watchlist, HashMap<_, _>) =
         supabase_reader::fetch(
             &reqwest::Client::new(),
             &cfg.supabase_url,
@@ -367,6 +370,39 @@ async fn main() -> Result<()> {
         )
         .await
         .context("bootstrap watchlist from Supabase (the sole wallet source)")?;
+    if let Some(restored_membership) = financial_era
+        .as_ref()
+        .map(replay_membership)
+        .transpose()
+        .context("replay Start-bound structural membership")?
+        .flatten()
+    {
+        let restored = restored_membership.into_iter().collect::<HashSet<_>>();
+        let available = initial_watchlist
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>();
+        let mut missing = restored.difference(&available).copied().collect::<Vec<_>>();
+        missing.sort_unstable_by_key(|wallet| wallet.0);
+        anyhow::ensure!(
+            missing.is_empty(),
+            "Start-bound membership cannot be reconstructed from current ranking entries: {missing:?}"
+        );
+        initial_watchlist
+            .entries
+            .retain(|entry| restored.contains(&entry.wallet));
+        bootstrap_last_trade.retain(|wallet, _| restored.contains(wallet));
+        initial_watchlist.active_count = initial_watchlist
+            .entries
+            .iter()
+            .filter(|entry| entry.tier == pe_trader_index::WatchlistTier::Active)
+            .count();
+        initial_watchlist.incubator_count = initial_watchlist
+            .entries
+            .len()
+            .saturating_sub(initial_watchlist.active_count);
+    }
     info!(
         active = initial_watchlist.active_count,
         total = initial_watchlist.entries.len(),
@@ -800,6 +836,9 @@ async fn main() -> Result<()> {
             control_tx.clone(),
         )
     });
+    let qualification_seal = financial_start
+        .is_some()
+        .then(|| QualificationSealHandle::new(control_tx.clone()));
     let (producer_start_tx, producer_start_rx) = watch::channel(false);
 
     // Runtime admissions prove durable history and recheck the fence under the shared
@@ -1219,13 +1258,24 @@ async fn main() -> Result<()> {
             .map(|()| TaskExit::CleanShutdown)
             .map_err(TaskFailure::typed)
     });
+    if let Some(handle) = qualification_seal.as_ref() {
+        handle
+            .apply(
+                initial_runtime_config.canonical_hash(),
+                pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("synchronize boot qualification seal check: {error}")
+            })?;
+    }
     if let (Some(handle), Some(release_hash)) =
         (risk_halt_release.as_ref(), initial_release_hash.as_deref())
     {
         handle
             .apply(release_hash)
             .await
-            .context("synchronize boot risk halt release")?;
+            .map_err(|error| anyhow::anyhow!("synchronize boot risk halt release: {error}"))?;
     }
     producer_start_tx
         .send(true)
@@ -1382,6 +1432,7 @@ async fn main() -> Result<()> {
             config_era,
             Some(health.clone()),
             risk_halt_release.clone(),
+            qualification_seal.clone(),
         );
         supervisor.spawn(
             TaskName::RuntimeConfigPoller,

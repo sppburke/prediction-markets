@@ -6652,6 +6652,92 @@ mod tests {
         assert_eq!(settled.fills_for_open_and_7d.len(), 1);
     }
 
+    /// PASS: a resolution committed on a second connection while a snapshot read transaction is
+    /// open cannot expose new cash/version together with old positions (or the inverse).
+    /// FAIL: any field read through the snapshot helpers crosses the transaction boundary.
+    #[test]
+    fn financial_snapshot_transaction_cannot_split_a_concurrent_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-financial-snapshot.db");
+        let reader = PaperStateDb::open(&path).unwrap();
+        reader.init_bankroll(dec!(10)).unwrap();
+        let start = append_receipt(10, 1);
+        reader.seed_financial_start(start).unwrap();
+        let fill = FinancialFillRecord {
+            idempotency_key: "concurrent-fill".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(1).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(0.5)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        reader
+            .apply_financial_fill(start, None, EventSeq(11), &fill, dec!(9.5))
+            .unwrap();
+        let writer = PaperStateDb::open(&path).unwrap();
+
+        let mut connection = reader.lock();
+        let transaction = connection.transaction().unwrap();
+        let cash = tx_read_bankroll(&transaction).unwrap();
+        let snapshot_start = tx_financial_start(&transaction).unwrap();
+        let last_prepared = tx_financial_last_prepared(&transaction).unwrap();
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            let source = append_receipt(40, 2);
+            let result = writer.apply_financial_resolution(
+                start,
+                Some(EventSeq(11)),
+                EventSeq(12),
+                &market(),
+                "[\"1\",\"0\"]",
+                source,
+                999_999,
+                CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                dec!(10.5),
+            );
+            completed_tx.send(result).unwrap();
+        });
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cash, dec!(9.5));
+        assert_eq!(
+            snapshot_start.map(|value| value.sequence),
+            Some(EventSeq(10))
+        );
+        assert_eq!(last_prepared, Some(EventSeq(11)));
+        assert_eq!(
+            read_financial_positions(&transaction, true).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            read_settlements_window(&transaction, 0, 1_000_000)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            read_financial_fills_window(&transaction, 0, 1_000_000)
+                .unwrap()
+                .len(),
+            1
+        );
+        transaction.commit().unwrap();
+        drop(connection);
+        writer_thread.join().unwrap();
+
+        let after = reader.financial_snapshot(1_000_000).unwrap();
+        assert_eq!(after.cash, dec!(10.5));
+        assert_eq!(after.last_prepared_seq, Some(EventSeq(12)));
+        assert!(after.positions.is_empty());
+        assert_eq!(after.settlements_7d.len(), 1);
+    }
+
     #[test]
     fn financial_protocol_rejects_changed_identity_predecessor_and_start() {
         let (_dir, db) = db();

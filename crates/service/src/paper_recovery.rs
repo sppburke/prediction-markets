@@ -35,6 +35,8 @@ use crate::supabase_sink::supabase_fill_from;
 
 pub const PAPER_LOG_SCHEMA_VERSION_V2: u32 = 2;
 pub const PAPER_LOG_SCHEMA_VERSION: u32 = PAPER_LOG_SCHEMA_VERSION_V2;
+/// Current paper financial meaning. A changed value seals the active qualification before use.
+pub const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
 
 /// Schema-one price provenance retained only by the service's legacy decoder.
 #[doc(hidden)]
@@ -231,6 +233,67 @@ pub fn active_risk_halts(era: &PaperEra) -> HashSet<(RiskHaltOwner, RiskHaltCaus
     active
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum MembershipReplayError {
+    #[error("QualificationStarted membership repeats wallet {0}")]
+    DuplicateInitial(WalletAddress),
+    #[error("MembershipChanged removes absent wallet {0}")]
+    MissingRemoval(WalletAddress),
+    #[error("MembershipChanged adds existing wallet {0}")]
+    DuplicateAddition(WalletAddress),
+    #[error("MembershipChanged result {actual} exceeds capacity {capacity}")]
+    Capacity { actual: usize, capacity: usize },
+}
+
+/// Reconstruct the sole structural membership generation from Start and subsequent synchronized
+/// membership records. Score refreshes and durable fence removals remain owned by their existing
+/// projections and therefore do not appear here.
+pub fn replay_membership(
+    era: &PaperEra,
+) -> Result<Option<Vec<WalletAddress>>, MembershipReplayError> {
+    let Some((_, start)) = &era.start else {
+        return Ok(None);
+    };
+    let mut ordered = Vec::with_capacity(start.membership.len());
+    let mut present = HashSet::with_capacity(start.membership.len());
+    for wallet in &start.membership {
+        if !present.insert(*wallet) {
+            return Err(MembershipReplayError::DuplicateInitial(*wallet));
+        }
+        ordered.push(*wallet);
+    }
+    for frame in &era.frames {
+        let PaperLogFrame::Record(PaperLogRecord::MembershipChanged {
+            removed,
+            added,
+            capacity,
+            ..
+        }) = &frame.frame
+        else {
+            continue;
+        };
+        for wallet in removed {
+            if !present.remove(wallet) {
+                return Err(MembershipReplayError::MissingRemoval(*wallet));
+            }
+        }
+        ordered.retain(|wallet| present.contains(wallet));
+        for wallet in added {
+            if !present.insert(*wallet) {
+                return Err(MembershipReplayError::DuplicateAddition(*wallet));
+            }
+            ordered.push(*wallet);
+        }
+        if ordered.len() > *capacity {
+            return Err(MembershipReplayError::Capacity {
+                actual: ordered.len(),
+                capacity: *capacity,
+            });
+        }
+    }
+    Ok(Some(ordered))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationStarted {
@@ -400,15 +463,11 @@ pub fn paper_era(frames: Vec<ScannedPaperFrame>) -> PaperEra {
             _ => None,
         };
         if let Some((receipt, candidate)) = candidate {
-            match &start {
-                None => {
-                    start = Some((receipt, candidate));
-                    era_frames.clear();
-                }
-                // `scan_paper_log` rejects every second physical Start. Preserve the first Start
-                // defensively for callers that construct an era view from already-validated
-                // frames.
-                Some(_) => {}
+            // `scan_paper_log` rejects every second physical Start. Preserve the first Start
+            // defensively for callers that construct an era view from already-validated frames.
+            if start.is_none() {
+                start = Some((receipt, candidate));
+                era_frames.clear();
             }
         }
         era_frames.push(frame);
@@ -957,6 +1016,36 @@ mod paper_log_tests {
         assert!(matches!(frames[1].frame, PaperLogFrame::Record(_)));
         assert_eq!(frames[0].receipt.sequence, EventSeq(0));
         assert_eq!(frames[1].receipt.sequence, EventSeq(1));
+    }
+
+    #[test]
+    fn structural_membership_replays_start_and_later_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("membership.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let initial = wallet();
+        let added = WalletAddress([2; 20]);
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+        );
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::MembershipChanged {
+                reason: MembershipReason::CapacityChange,
+                removed: vec![initial],
+                added: vec![added],
+                capacity: 1,
+                ranking_batch_id: Some(8),
+                evidence: serde_json::json!({"test": true}),
+            },
+        );
+        drop(writer);
+
+        let era = paper_era(scan_paper_log(&path).unwrap());
+        assert_eq!(replay_membership(&era).unwrap(), Some(vec![added]));
     }
 
     #[test]
