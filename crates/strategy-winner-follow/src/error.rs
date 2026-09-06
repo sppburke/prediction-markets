@@ -25,86 +25,12 @@ pub enum WinnerFollowError {
     Blocked(RiskBlock),
 
     /// The durable financial/source evidence required to build a risk snapshot was unavailable.
-    #[error("risk inputs unavailable: {0}")]
-    RiskInputsUnavailable(RiskInputsUnavailable),
+    #[error("risk inputs unavailable")]
+    RiskInputsUnavailable,
 
     /// Underlying Kelly sizing computation failed (invalid inputs).
     #[error("Kelly sizing error: {0}")]
     KellySizing(#[from] KellyError),
-}
-
-/// Non-durable diagnostic for evidence that could not produce a replayable risk snapshot (#545).
-///
-/// The detail is intentionally opaque outside this crate. Durable decision evidence records only
-/// [`WinnerFollowDeclineAudit::RiskInputsUnavailable`], so adding a service diagnostic cannot
-/// change the audit schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("{detail}")]
-pub struct RiskInputsUnavailable {
-    detail: RiskInputsUnavailableDetail,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum RiskInputsUnavailableDetail {
-    #[error("financial snapshot sequence does not match the completed paper-log prefix")]
-    SnapshotSequenceMismatch,
-    #[error("the paper log has an unmatched FinancialPrepared record")]
-    UnmatchedPrepared,
-    #[error("a required position price is missing")]
-    PriceMissing,
-    #[error("a required position price is stale")]
-    PriceStale,
-    #[error("a required position price is from the future")]
-    PriceFuture,
-    #[error("position price evidence conflicts")]
-    PriceConflict,
-    #[error("the immediately preceding midnight mark is missing")]
-    MarkMissing,
-    #[error("the immediately preceding midnight mark is duplicated")]
-    MarkDuplicate,
-    #[error("the immediately preceding midnight mark is invalid")]
-    MarkInvalid,
-    #[error("the fixed qualification baseline is not positive")]
-    BaselineNonPositive,
-    #[error("exact risk arithmetic overflowed")]
-    Overflow,
-}
-
-#[allow(non_upper_case_globals)]
-impl RiskInputsUnavailable {
-    pub const SnapshotSequenceMismatch: Self = Self {
-        detail: RiskInputsUnavailableDetail::SnapshotSequenceMismatch,
-    };
-    pub const UnmatchedPrepared: Self = Self {
-        detail: RiskInputsUnavailableDetail::UnmatchedPrepared,
-    };
-    pub const PriceMissing: Self = Self {
-        detail: RiskInputsUnavailableDetail::PriceMissing,
-    };
-    pub const PriceStale: Self = Self {
-        detail: RiskInputsUnavailableDetail::PriceStale,
-    };
-    pub const PriceFuture: Self = Self {
-        detail: RiskInputsUnavailableDetail::PriceFuture,
-    };
-    pub const PriceConflict: Self = Self {
-        detail: RiskInputsUnavailableDetail::PriceConflict,
-    };
-    pub const MarkMissing: Self = Self {
-        detail: RiskInputsUnavailableDetail::MarkMissing,
-    };
-    pub const MarkDuplicate: Self = Self {
-        detail: RiskInputsUnavailableDetail::MarkDuplicate,
-    };
-    pub const MarkInvalid: Self = Self {
-        detail: RiskInputsUnavailableDetail::MarkInvalid,
-    };
-    pub const BaselineNonPositive: Self = Self {
-        detail: RiskInputsUnavailableDetail::BaselineNonPositive,
-    };
-    pub const Overflow: Self = Self {
-        detail: RiskInputsUnavailableDetail::Overflow,
-    };
 }
 
 /// Durable, replay-safe projection of an entry refusal.
@@ -136,7 +62,7 @@ impl From<&WinnerFollowError> for WinnerFollowDeclineAudit {
             WinnerFollowError::FlipNotApproved => Self::FlipNotApproved,
             WinnerFollowError::NoEdge => Self::NoEdge,
             WinnerFollowError::Blocked(reason) => Self::Blocked(*reason),
-            WinnerFollowError::RiskInputsUnavailable(_) => Self::RiskInputsUnavailable,
+            WinnerFollowError::RiskInputsUnavailable => Self::RiskInputsUnavailable,
             WinnerFollowError::KellySizing(error) => Self::KellySizing(match error {
                 KellyError::InvalidProbability { value } => {
                     KellyErrorAudit::InvalidProbability { value: *value }
@@ -171,7 +97,7 @@ mod tests {
             WinnerFollowError::FlipNotApproved,
             WinnerFollowError::NoEdge,
             WinnerFollowError::Blocked(RiskBlock::CopyLatencyKillSwitch),
-            WinnerFollowError::RiskInputsUnavailable(RiskInputsUnavailable::PriceStale),
+            WinnerFollowError::RiskInputsUnavailable,
             WinnerFollowError::KellySizing(KellyError::InvalidProbability { value: dec!(1.1) }),
             WinnerFollowError::KellySizing(KellyError::InvalidNetPrice { value: dec!(0) }),
             WinnerFollowError::KellySizing(KellyError::InvalidBankroll { value: dec!(-1) }),
@@ -190,16 +116,8 @@ mod tests {
         }
 
         assert_eq!(
-            WinnerFollowDeclineAudit::from(&WinnerFollowError::RiskInputsUnavailable(
-                RiskInputsUnavailable::PriceMissing,
-            )),
-            WinnerFollowDeclineAudit::from(&WinnerFollowError::RiskInputsUnavailable(
-                RiskInputsUnavailable::PriceStale,
-            ))
-        );
-        assert_eq!(
-            serde_json::to_value(WinnerFollowDeclineAudit::RiskInputsUnavailable).unwrap(),
-            serde_json::json!({ "kind": "risk_inputs_unavailable" })
+            serde_json::to_vec(&WinnerFollowDeclineAudit::RiskInputsUnavailable).unwrap(),
+            br#"{"kind":"risk_inputs_unavailable"}"#
         );
     }
 }

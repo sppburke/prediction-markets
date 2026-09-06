@@ -39,13 +39,14 @@ use crate::decision_replay::{
 use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
+use crate::mark_prices::HistoricalMarkAdapter;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
     PAPER_LOG_SCHEMA_VERSION_V2, PaperLogFrame, PaperLogRecord, PaperMarkPrice, PortfolioMark,
     QualificationSealed, SealReason, TailBinding,
 };
-use crate::risk_inputs::{BoundaryMarkError, BoundaryMarkFetcher};
+use crate::risk_inputs::{BoundaryMarkError, RiskInputsUnavailable};
 use crate::runtime_config::{self, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::SinkHandle;
@@ -297,7 +298,7 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     financial_log_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     qualification_start: Option<pe_event_log::AppendReceipt>,
     admission_builder: Option<crate::live_venue_adapter::LiveAdmissionBuilder>,
-    boundary_mark_fetcher: Option<Arc<BoundaryMarkFetcher>>,
+    boundary_mark_fetcher: Option<Arc<HistoricalMarkAdapter>>,
     active_risk_halts: HashSet<(
         crate::paper_recovery::RiskHaltOwner,
         pe_risk_engine::RiskHaltCause,
@@ -806,10 +807,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         signal: &LeaderSignal,
         proposed_debit: CollateralAmount,
         per_trade_cap_bps: i32,
-    ) -> Result<pe_execution_core::RiskAudit, pe_strategy_winner_follow::RiskInputsUnavailable>
-    {
-        use pe_strategy_winner_follow::RiskInputsUnavailable;
-
+    ) -> Result<pe_execution_core::RiskAudit, RiskInputsUnavailable> {
         let (paper_log_path, source_log_path) = self
             .financial_log_paths
             .as_ref()
@@ -1546,7 +1544,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         paper_log_path: std::path::PathBuf,
         source_log_path: std::path::PathBuf,
         admission_builder: crate::live_venue_adapter::LiveAdmissionBuilder,
-        boundary_mark_fetcher: Arc<BoundaryMarkFetcher>,
+        boundary_mark_fetcher: Arc<HistoricalMarkAdapter>,
     ) -> Result<(), crate::paper_recovery::PaperLogScanError> {
         let era = crate::paper_recovery::paper_era(crate::paper_recovery::scan_paper_log(
             &paper_log_path,
@@ -2902,14 +2900,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         {
             Ok(risk) => risk,
             Err(error) => {
-                let decline =
-                    pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable(error);
-                info!(reason = %decline, "signal did not produce order");
+                let decline = pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable;
+                let reason = format!("{decline}: {error}");
+                info!(reason = %reason, "signal did not produce order");
                 self.no_fill_or_rollback(
                     &trade,
                     &leader_row,
                     dispatch_id.as_deref(),
-                    &format!("paper_reject:{decline}"),
+                    &format!("paper_reject:{reason}"),
                     &rb,
                     Some(&signal.market_id),
                     decision_evidence.as_ref(),
