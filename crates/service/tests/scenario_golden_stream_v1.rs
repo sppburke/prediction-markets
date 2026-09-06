@@ -983,6 +983,27 @@ fn assert_qualify_insufficient(
     output_path: &std::path::Path,
     expected_reason: &str,
 ) {
+    let expected_reason = format!("insufficient qualification evidence: {expected_reason}");
+    assert_qualify_reason(
+        paper_path,
+        source_path,
+        live_path,
+        state_path,
+        seal_receipt,
+        output_path,
+        &expected_reason,
+    );
+}
+
+fn assert_qualify_reason(
+    paper_path: &std::path::Path,
+    source_path: &std::path::Path,
+    live_path: &std::path::Path,
+    state_path: &std::path::Path,
+    seal_receipt: AppendReceipt,
+    output_path: &std::path::Path,
+    expected_reason: &str,
+) {
     let output = run_qualify_cli(
         paper_path,
         source_path,
@@ -1001,12 +1022,7 @@ fn assert_qualify_insufficient(
         serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
     assert_eq!(report.verdict, QualificationVerdict::InsufficientEvidence);
     assert!(!report.replay.exact);
-    assert_eq!(
-        report.reasons,
-        [format!(
-            "insufficient qualification evidence: {expected_reason}"
-        )]
-    );
+    assert_eq!(report.reasons, [expected_reason]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1197,8 +1213,6 @@ fn assert_live_wrapper_preimage_rejected(
     state_path: &std::path::Path,
     live_path: &std::path::Path,
     seal_receipt: AppendReceipt,
-    account_id: &AccountId,
-    idempotency_key: &str,
 ) {
     let case = root.join(format!("live-wrapper-{}", mutation.label()));
     std::fs::create_dir(&case).unwrap();
@@ -1211,21 +1225,21 @@ fn assert_live_wrapper_preimage_rejected(
     std::fs::copy(state_path, &cloned_state).unwrap();
     rewrite_live_wrapper_preimage(live_path, &cloned_live, mutation);
     let expected_reason = match mutation {
-        PreimageMutation::Delete => format!(
-            "live wrapper preimage is absent for account {account_id} decision {idempotency_key}"
-        ),
-        PreimageMutation::Tamper => format!(
-            "live wrapper audit differs from approved admission for account {account_id} decision {idempotency_key}"
-        ),
+        PreimageMutation::Delete => {
+            "event log: I/O error: event log is shorter than the recorded migration boundary"
+        }
+        PreimageMutation::Tamper => {
+            "event log: I/O error: event log does not match the recorded migration boundary"
+        }
     };
-    assert_qualify_insufficient(
+    assert_qualify_reason(
         &cloned_paper,
         &cloned_source,
         &cloned_live,
         &cloned_state,
         seal_receipt,
         &case.join("qualification.json"),
-        &expected_reason,
+        expected_reason,
     );
 }
 
@@ -1500,9 +1514,11 @@ async fn resolve_golden_trade(
 /// I16-GOLDEN-PREIMAGE-V1
 ///
 /// Preconditions: independent clones of the completed corpus delete or one-byte-tamper one
-/// admission, book, price, decision-continuation, resolution, and live-wrapper preimage.
+/// admission, book, price, decision-continuation, and resolution preimages, plus the bound live
+/// wrapper prefix.
 /// PASS: every clone reaches the real `pe-service --qualify` command and returns the exact
-/// class-specific `InsufficientEvidence` reason with inexact replay.
+/// class-specific `InsufficientEvidence` reason with inexact replay; live mutations fail at the
+/// seal's recorded journal boundary before semantic wrapper replay.
 /// FAIL: any altered corpus passes, reports another class, or bypasses the offline verifier.
 #[tokio::test]
 async fn golden_source_stream_replays_exact_economic_core() {
@@ -1795,6 +1811,12 @@ async fn golden_source_stream_replays_exact_economic_core() {
     )
     .unwrap();
     let mut first_admission = None;
+    let live_account_id = AccountId::new("golden-account").unwrap();
+    let live_binding = CredentialBindingIdentity {
+        version: 1,
+        key_id: "golden-key".to_owned(),
+    };
+    let mut sealed_live_wrapper = None;
 
     eprintln!(
         "PERF golden_stream phase=start elapsed={:?} total={:?}",
@@ -1966,6 +1988,102 @@ async fn golden_source_stream_replays_exact_economic_core() {
         hooks
             .financial_clock_unix
             .store(cutoff, std::sync::atomic::Ordering::SeqCst);
+        if day + 1 == QUALIFICATION_DAYS {
+            let first_prepared_record = paper_era(scan_paper_log(&paper_path).unwrap())
+                .frames
+                .iter()
+                .find_map(|frame| match &frame.frame {
+                    PaperLogFrame::Record(
+                        record @ PaperLogRecord::FinancialPrepared {
+                            payload: pe_service::paper_recovery::FinancialPayload::Fill { .. },
+                            ..
+                        },
+                    ) => Some(record.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let PaperLogRecord::FinancialPrepared {
+                payload:
+                    pe_service::paper_recovery::FinancialPayload::Fill {
+                        operation: first_operation,
+                        economic: first_economic,
+                    },
+                ..
+            } = &first_prepared_record
+            else {
+                panic!("first production Prepared record was not a fill");
+            };
+            let first_admission = first_admission.as_ref().unwrap();
+            let token_id = first_economic.market.token_id.clone();
+            let live_dispatch_id = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                &first_operation.leader_wallet.to_string(),
+                &first_operation.source_trade_id.0,
+                &first_economic.market.market_id,
+                u16::from(first_economic.market.outcome_index),
+                first_economic.market.side,
+                first_operation.observed_at_bucket,
+            );
+            let live_request = LiveOrderRequest {
+                target: FrozenLiveTarget {
+                    account_id: live_account_id.clone(),
+                    credential_binding: live_binding.clone(),
+                },
+                current_credential_binding: live_binding.clone(),
+                mode: LiveModeSnapshot {
+                    requested: LiveControlMode::LiveTiny,
+                    effective: LiveControlMode::LiveTiny,
+                },
+                identity: LiveOrderIdentity {
+                    dispatch_id: live_dispatch_id.clone(),
+                    idempotency_key: format!("{live_dispatch_id}:{live_account_id}"),
+                    quote_id: "golden-quote".to_owned(),
+                    config_hash: first_economic.applied_configuration_hash.clone(),
+                    decision_hash: "golden-decision".to_owned(),
+                    evidence_hashes: vec![
+                        first_economic
+                            .admission
+                            .settlement
+                            .raw_evidence_hash
+                            .clone(),
+                    ],
+                    fill_projection: Some(Box::new(
+                        pe_execution_core::LiveFillProjectionIdentity {
+                            leader_wallet: first_operation.leader_wallet.to_string(),
+                            source_trade_id: Some(first_operation.source_trade_id.0.clone()),
+                            market_id: first_economic.market.market_id.clone(),
+                            outcome_id: i64::from(u16::from(first_economic.market.outcome_index)),
+                            side: "buy".to_owned(),
+                        },
+                    )),
+                    schema_version: 1,
+                    parser_version: 1,
+                },
+                condition_id: first_economic.market.condition_id.clone(),
+                outcome_id: OutcomeId(u16::from(first_economic.market.outcome_index)),
+                token_id,
+                admission: first_admission.clone(),
+                ladder: ladder_from_economic(first_economic),
+                economic: first_economic.clone(),
+            };
+            let live_now =
+                OffsetDateTime::from_unix_timestamp(first_admission.market.observed_at_unix)
+                    .unwrap();
+            let live_venue = GoldenLiveVenue;
+            let live_executor = LiveExecutor::new(&live_venue, &live_journal);
+            let live_prepared = match live_executor.prepare(live_request, live_now).await.unwrap() {
+                LivePrepareResult::Prepared(prepared) => prepared,
+                LivePrepareResult::Terminal(outcome) => {
+                    panic!("golden live wrapper preparation terminated: {outcome:?}")
+                }
+            };
+            let live_audit: &LiveOrderPreparedAudit = live_prepared.audit();
+            assert_eq!(live_audit.economic, *first_economic);
+            assert_eq!(
+                live_audit.economic.core_hash().unwrap(),
+                first_economic.core_hash().unwrap()
+            );
+            sealed_live_wrapper = Some(serde_json::to_vec(live_audit).unwrap());
+        }
         let (marked, mark_acknowledgement) = oneshot::channel();
         control_tx
             .send(OrchestratorControl::DailyBoundary {
@@ -2103,6 +2221,10 @@ async fn golden_source_stream_replays_exact_economic_core() {
     assert_eq!(seal.sealed_cutoff_unix, sealed_cutoff);
     assert_eq!(seal.reason, SealReason::Complete);
     assert_eq!(
+        seal.live_prefix,
+        TailBinding::from(&LiveJournal::verified_tail(&live_path).unwrap())
+    );
+    assert_eq!(
         sealed_era
             .frames
             .iter()
@@ -2181,7 +2303,6 @@ async fn golden_source_stream_replays_exact_economic_core() {
             .all(|risk| risk.decision == RiskDecisionAudit::Approved)
     );
 
-    let first_admission = first_admission.unwrap();
     let PaperLogRecord::FinancialPrepared {
         payload:
             pe_service::paper_recovery::FinancialPayload::Fill {
@@ -2193,82 +2314,22 @@ async fn golden_source_stream_replays_exact_economic_core() {
     else {
         panic!("first production Prepared record was not a fill");
     };
-    let binding = CredentialBindingIdentity {
-        version: 1,
-        key_id: "golden-key".to_owned(),
-    };
-    let token_id = first_economic.market.token_id.clone();
-    let live_account_id = AccountId::new("golden-account").unwrap();
-    let live_dispatch_id = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
-        &first_operation.leader_wallet.to_string(),
-        &first_operation.source_trade_id.0,
-        &first_economic.market.market_id,
-        u16::from(first_economic.market.outcome_index),
-        first_economic.market.side,
-        first_operation.observed_at_bucket,
-    );
-    let live_request = LiveOrderRequest {
-        target: FrozenLiveTarget {
-            account_id: live_account_id.clone(),
-            credential_binding: binding.clone(),
-        },
-        current_credential_binding: binding,
-        mode: LiveModeSnapshot {
-            requested: LiveControlMode::LiveTiny,
-            effective: LiveControlMode::LiveTiny,
-        },
-        identity: LiveOrderIdentity {
-            dispatch_id: live_dispatch_id.clone(),
-            idempotency_key: format!("{live_dispatch_id}:{live_account_id}"),
-            quote_id: "golden-quote".to_owned(),
-            config_hash: first_economic.applied_configuration_hash.clone(),
-            decision_hash: "golden-decision".to_owned(),
-            evidence_hashes: vec![
-                first_economic
-                    .admission
-                    .settlement
-                    .raw_evidence_hash
-                    .clone(),
-            ],
-            fill_projection: Some(Box::new(pe_execution_core::LiveFillProjectionIdentity {
-                leader_wallet: first_operation.leader_wallet.to_string(),
-                source_trade_id: Some(first_operation.source_trade_id.0.clone()),
-                market_id: first_economic.market.market_id.clone(),
-                outcome_id: i64::from(u16::from(first_economic.market.outcome_index)),
-                side: "buy".to_owned(),
-            })),
-            schema_version: 1,
-            parser_version: 1,
-        },
-        condition_id: first_economic.market.condition_id.clone(),
-        outcome_id: OutcomeId(u16::from(first_economic.market.outcome_index)),
-        token_id,
-        admission: first_admission.clone(),
-        ladder: ladder_from_economic(first_economic),
-        economic: first_economic.clone(),
-    };
-    let live_now =
-        OffsetDateTime::from_unix_timestamp(first_admission.market.observed_at_unix).unwrap();
-    let live_venue = GoldenLiveVenue;
-    let live_executor = LiveExecutor::new(&live_venue, &live_journal);
-    let live_prepared = match live_executor.prepare(live_request, live_now).await.unwrap() {
-        LivePrepareResult::Prepared(prepared) => prepared,
-        LivePrepareResult::Terminal(outcome) => {
-            panic!("golden live wrapper preparation terminated: {outcome:?}")
-        }
-    };
-    let live_audit: &LiveOrderPreparedAudit = live_prepared.audit();
-    assert_eq!(live_audit.economic, *first_economic);
-    assert_eq!(
-        live_audit.economic.core_hash().unwrap(),
-        first_economic.core_hash().unwrap()
-    );
     let paper_wrapper = serde_json::to_vec(&first_prepared_record).unwrap();
-    let live_wrapper = serde_json::to_vec(live_audit).unwrap();
+    let live_wrapper = sealed_live_wrapper.unwrap();
     assert_eq!(
         blake3::hash(&paper_wrapper) != blake3::hash(&live_wrapper),
         expected["wrapper_hashes_differ"].as_bool().unwrap()
     );
+    live_journal
+        .append(
+            live_account_id.clone(),
+            OffsetDateTime::from_unix_timestamp(sealed_cutoff + 1).unwrap(),
+            pe_execution_core::LiveJournalPayload::CredentialBindingMismatch {
+                frozen: live_binding.clone(),
+                current: live_binding,
+            },
+        )
+        .unwrap();
     let output = run_qualify_cli(
         &paper_path,
         &source_path,
@@ -2282,8 +2343,9 @@ async fn golden_source_stream_replays_exact_economic_core() {
         "pe-service --qualify stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let report: QualificationReport =
-        serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+    let repeated_report_bytes = std::fs::read(&output_path).unwrap();
+    assert_eq!(repeated_report_bytes, report_bytes);
+    let report: QualificationReport = serde_json::from_slice(&repeated_report_bytes).unwrap();
     assert_eq!(report.verdict, QualificationVerdict::Pass);
     assert_eq!(report.evidence.live_wrapper_facts.len(), 1);
     let live_fact = report.evidence.live_wrapper_facts.first().unwrap();
@@ -2385,8 +2447,6 @@ async fn golden_source_stream_replays_exact_economic_core() {
             &state_path,
             &live_path,
             seal_receipt,
-            &live_account_id,
-            &live_audit.identity.idempotency_key,
         );
     }
 

@@ -546,11 +546,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map_err(|error| error.to_string())?;
         let financial_prefix =
             Scanner::verify(paper_log_path).map_err(|error| error.to_string())?;
+        let live_prefix = pe_execution_core::LiveJournal::verified_tail(
+            paper_log_path.with_file_name("live_journal.log"),
+        )
+        .map_err(|error| error.to_string())?;
         self.append_paper_record(&PaperLogRecord::QualificationSealed(Box::new(
             QualificationSealed {
                 start_receipt: *start_receipt,
                 source_prefix: sealed_source_prefix,
                 financial_prefix: TailBinding::from(&financial_prefix),
+                live_prefix: TailBinding::from(&live_prefix),
                 decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
                 sealed_cutoff_unix,
                 reason,
