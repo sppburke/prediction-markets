@@ -7287,22 +7287,54 @@ mod tests {
         for (field, changed) in changed_fills {
             assert!(
                 matches!(
-                    db.apply_financial_fill(start, None, EventSeq(2), append_receipt(20, 3), 100, &changed, dec!(9.5)),
+                    db.apply_financial_fill(
+                        start,
+                        None,
+                        EventSeq(2),
+                        append_receipt(20, 3),
+                        100,
+                        &changed,
+                        dec!(9.5)
+                    ),
                     Err(PaperStateError::FinancialConflict(_))
                 ),
                 "changed fill {field} must conflict"
             );
         }
         assert!(matches!(
-            db.apply_financial_fill(start, Some(EventSeq(1)), EventSeq(2), append_receipt(20, 3), 100, &fill, dec!(9.5)),
+            db.apply_financial_fill(
+                start,
+                Some(EventSeq(1)),
+                EventSeq(2),
+                append_receipt(20, 3),
+                100,
+                &fill,
+                dec!(9.5)
+            ),
             Err(PaperStateError::FinancialConflict(_))
         ));
         assert!(matches!(
-            db.apply_financial_fill(start, Some(EventSeq(2)), EventSeq(3), append_receipt(20, 3), 100, &fill, dec!(9.5)),
+            db.apply_financial_fill(
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                append_receipt(20, 3),
+                100,
+                &fill,
+                dec!(9.5)
+            ),
             Err(PaperStateError::FinancialConflict(_))
         ));
         assert!(matches!(
-            db.apply_financial_fill(start, None, EventSeq(2), append_receipt(20, 3), 100, &fill, dec!(9.500001)),
+            db.apply_financial_fill(
+                start,
+                None,
+                EventSeq(2),
+                append_receipt(20, 3),
+                100,
+                &fill,
+                dec!(9.500001)
+            ),
             Err(PaperStateError::FinancialConflict(_))
         ));
         let other_start = append_receipt(3, 3);
