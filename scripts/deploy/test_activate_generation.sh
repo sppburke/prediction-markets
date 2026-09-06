@@ -168,9 +168,12 @@ elif [[ "$file" == *restore_paper_state.sql ]]; then
   count=0; [[ ! -f "$state/restore-count" ]] || count=$(<"$state/restore-count")
   echo $((count + 1)) > "$state/restore-count"
 elif [[ "$sql" == *"anon must exist and must not bypass RLS"* ]]; then
+  # Shared legacy-contract owner (#545): role posture plus the exact callable inventory/grants.
   [[ "$sql" == *"commit_fill_v2(text,text,text,text,integer,text,bigint,text,bigint,bigint)"* ]] || exit 93
   [[ "$sql" == *"service_watchlist_replace_v1(timestamp with time zone,jsonb)"* ]] || exit 93
-  [[ "$sql" == *"live_account_state"* && "$sql" == *"wallet_lifecycle_events"* ]] || exit 93
+  [[ ! -e "$state/preflight-fail" ]] || { echo 'simulated privilege-matrix failure' >&2; exit 94; }
+elif [[ "$sql" == *"has_table_privilege"* && "$sql" == *"live_account_state"* && "$sql" == *"wallet_lifecycle_events"* ]]; then
+  # Preflight table-protection matrix (live tables denied to anon; RLS tables keep platform grants + RLS).
   [[ ! -e "$state/preflight-fail" ]] || { echo 'simulated privilege-matrix failure' >&2; exit 94; }
   : > "$state/preflight-matrix-checked"
 elif [[ "$sql" == *"select max(batch_id)"* ]]; then
