@@ -6027,7 +6027,8 @@ mod tests {
             gamma,
             clob_long,
             &PolymarketConditionId(CONDITION.to_owned()),
-            (EVALUATED_MS - 9_000).div_euclid(1_000),
+            // The recorded market clock is receipt-derived: max(Gamma, CLOB-long) receive time.
+            (EVALUATED_MS - 8_000).div_euclid(1_000),
             60,
         )
         .unwrap();
