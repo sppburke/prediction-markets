@@ -7827,6 +7827,8 @@ mod tests {
 
     /// PASS: receipt-scoped live source collection retains the three admission responses, exact
     /// `/book`, and risk-price evidence referenced by an `AdmissionEvaluated` record.
+    /// FAIL: any of the five receipt classes referenced by the record is absent from the scoped
+    /// collection.
     #[test]
     fn live_source_scope_includes_all_economic_receipts() {
         let dir = tempdir().unwrap();
@@ -8142,6 +8144,8 @@ mod tests {
     /// PASS: strict live replay requires each exact Gamma, CLOB-long, CLOB-compact, and `/book`
     /// receipt; substituting an admission or book receipt with conflicting payload evidence fails
     /// before the admission can enter projection or recovery.
+    /// FAIL: a missing or substituted admission/book receipt is accepted, or the admission
+    /// reaches projection or recovery without all four exact receipts.
     #[test]
     fn strict_live_economic_requires_exact_admission_and_book_receipts() {
         let (dir, account_id, events, sources, paper_frames, admission) =
@@ -8224,6 +8228,7 @@ mod tests {
 
     /// PASS: payloads that conflict with the copied admission or ladder fail even when presented
     /// under the journal's referenced receipt identity.
+    /// FAIL: a conflicting payload under the referenced receipt identity is accepted.
     #[test]
     fn strict_live_economic_rejects_payload_conflicts() {
         let (dir, account_id, events, sources, paper_frames, admission) =
@@ -8259,6 +8264,8 @@ mod tests {
 
     /// PASS: a journal that copies internally consistent zero-fee fields from a nonzero compact
     /// fee source is rejected by source-derived reserve, debit, risk, and canonical recomposition.
+    /// FAIL: the zero-fee copy is accepted, or the source-derived reserve/debit/risk agrees with
+    /// it.
     #[test]
     fn strict_live_economic_rejects_zero_copied_fee_for_nonzero_source_fee() {
         let (dir, account_id, events, sources, paper_frames, mut admission) =
@@ -9066,6 +9073,8 @@ mod tests {
 
     /// PASS: admission, preparation, POST, and reconciliation facts before the first Baseline are
     /// audit-only in both strict projection reduction and execution-core recovery inventory.
+    /// FAIL: either consumer reports recovery work or managed state from a pre-Baseline fact, or
+    /// the two consumers disagree.
     #[test]
     fn recovery_and_reducer_share_the_pre_baseline_slice() {
         let account_id = AccountId::new("account").unwrap();
@@ -10019,6 +10028,8 @@ mod tests {
 
     /// PASS: two Approved facts for one account/dispatch conflict before any recovery
     /// preparation, even when the second carries a different nonempty idempotency key.
+    /// FAIL: recovery prepares or posts for either duplicate, or accepts the second key as a
+    /// distinct dispatch.
     #[tokio::test]
     async fn duplicate_dispatch_admissions_stop_recovery_before_preparation() {
         let dir = tempdir().unwrap();
@@ -13426,6 +13437,8 @@ mod tests {
 
     /// PASS: unknown venue inventory, one-atomic cash drift, insufficient allowance, and a
     /// transient authenticated read all stop Approved recovery before any POST.
+    /// FAIL: any of the four drift/allowance/transient cases reaches a loopback POST, or the
+    /// drift-free armed case posts other than exactly once.
     #[tokio::test]
     async fn recovery_fresh_portfolio_and_allowance_gate_zero_posts() {
         for case in ["unknown_position", "cash_drift", "allowance", "transient"] {
@@ -13638,6 +13651,8 @@ mod tests {
 
     /// PASS: a price receipt aged 59,999 ms at recovery start expires when preparation advances
     /// the injected clock by 2 ms, terminalizing Prepared without reaching the loopback POST.
+    /// FAIL: the Prepared order reaches a loopback POST, or its terminal fact is stamped before
+    /// the post-preparation instant.
     #[tokio::test]
     async fn recovery_rechecks_price_expiry_after_preparation() {
         let posts = Arc::new(AtomicUsize::new(0));
@@ -13748,6 +13763,8 @@ mod tests {
 
     /// PASS: StopProducers reached while venue preparation is parked prevents the POST and
     /// terminalizes the now-durable Prepared capability before it can be consumed.
+    /// FAIL: any loopback POST after StopProducers, or the durable Prepared capability is left
+    /// consumable.
     #[tokio::test]
     async fn recovery_rechecks_shutdown_after_parked_preparation() {
         let dir = tempdir().unwrap();
@@ -13824,6 +13841,8 @@ mod tests {
 
     /// PASS: an off/off transition or rotated binding observed after parked preparation prevents
     /// every POST and records the corresponding terminal preparation failure.
+    /// FAIL: any loopback POST after the off transition or binding rotation, or a missing
+    /// terminal preparation failure.
     #[tokio::test]
     async fn recovery_rechecks_account_control_after_parked_preparation() {
         for case in ["off", "rotated"] {

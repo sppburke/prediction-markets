@@ -2324,6 +2324,8 @@ mod tests {
 
     /// PASS: all three crash seams between synchronized Approved admission and synchronized
     /// Prepared resume the frozen identity without appending a second admission.
+    /// FAIL: any crash seam appends a second Approved admission or resumes under a different
+    /// identity.
     #[tokio::test]
     async fn approved_admission_crash_seams_resume_without_duplicate_admission() {
         let source_dir = tempdir().unwrap();
