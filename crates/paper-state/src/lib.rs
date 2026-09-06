@@ -7254,7 +7254,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            db.apply_financial_fill(start, None, EventSeq(2), append_receipt(20, 3), 100, &fill, dec!(9.5)),
+            db.apply_financial_fill(start, None, EventSeq(2), append_receipt(20, 3), 5, &fill, dec!(9.5)),
             Ok(FinancialApplyOutcome::Existing { cash }) if cash == dec!(9.5)
         ));
 
