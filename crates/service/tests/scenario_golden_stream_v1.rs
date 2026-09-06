@@ -905,7 +905,7 @@ fn rewrite_state_receipts(
         let mut statement = connection
             .prepare(
                 "SELECT source_trade_id, frozen_inputs_json, post_commit_inputs_json \
-                 FROM decision_pending",
+                 FROM decision_pending WHERE state = 'terminal'",
             )
             .unwrap();
         statement
