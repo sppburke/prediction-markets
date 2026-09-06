@@ -446,7 +446,7 @@ mod tests {
 
     /// Reverse direction of the window divergence (intentional): a lifetime LOSER
     /// whose trailing window is flat-or-positive is NOT demoted this tick — the
-    /// windowed conjunct is the sole P&L gate, and it fails open toward keeping.
+    /// windowed conjunct is the sole P&L gate, so the wallet remains when that conjunct is false.
     /// (It stays demotable the moment its window turns red again; inactivity
     /// eviction still applies independently.)
     #[test]

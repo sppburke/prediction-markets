@@ -984,9 +984,10 @@ async fn main() -> Result<()> {
 
     // Supabase analytics sink (issue #343): best-effort dual-write of fills + settlements.
     // Spawned only when enabled and a Supabase URL is configured; otherwise `None` (no-op).
-    // NOT spawned in authoritative mode (issue #397): the `commit_fill`/`apply_resolution`
-    // RPCs are the sole writer of `paper_fills`/`settled_markets`, so a best-effort
-    // `merge-duplicates` upsert from `run_sink` must not race them. With `sink_handle = None`
+    // Not spawned in authoritative mode (issue #397): the Prepared-sequenced
+    // `commit_fill_v2`/`apply_resolution_v2` paths own `paper_fills`/`settled_markets`, so a
+    // best-effort `merge-duplicates` upsert from `run_sink` must not race them. With
+    // `sink_handle = None`
     // the active financial protocol remains the only paper-state writer; the liquidity-snapshot
     // worker (#350) keeps its own gate and stays alive.
     let sink_handle =

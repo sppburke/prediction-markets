@@ -270,16 +270,16 @@ p = calibrated_probability(
     )
 ```
 
-## Per-trade cap configuration
+## Venue-owned cap configuration
 
-After Kelly sizing, the strategy clamps the contract count to a per-trade size cap before the risk gate.
+The strategy returns its configured fixed quantity or monetary allocation unchanged. It does not
+apply a book, depth, or notional cap.
 
 **Owner decision (#508, recorded): the ordinary per-trade bps caps are retired in production.** The
 production `service_config.per_trade_cap` row is `unlimited` after the #508 Phase-A cutover, and the
-**price-impact cap** (`price_impact_cap_bps`, `_GLOSSARY.md`) becomes the sole policy order-size
-limit, below the always-applying available-bankroll affordability bound: an order is automatically
-downsized to what the CLOB ask book absorbs within the band (e.g. a $500 budget with $230 absorbable
-→ a $230 order at the exact ladder VWAP). `sizing_dollar_usd` stays the sizing input, not a cap.
+**price-impact cap** (`price_impact_cap_bps`, `_GLOSSARY.md`) becomes the sole production policy
+order-size limit, below the always-applying available-bankroll affordability bound.
+`sizing_dollar_usd` stays the sizing input, not a cap.
 
 The `PerTradeCap` enum is retained for backtest/research and as the safe boot posture
 (set in `WinnerFollowConfig.per_trade_cap`):
@@ -294,10 +294,11 @@ The service completes and validates the mandatory Supabase hot snapshot before a
 There is no configuration-outage producer posture: production applies the reviewed
 `per_trade_cap=unlimited` together with the mandatory impact cap, or boot fails closed.
 
-The strategy returns its configured fixed quantity or monetary allocation without applying a book or
-notional clamp. The venue planner alone evaluates signed principal plus reserve against the resolved
-per-trade, impact, account, and free-collateral bounds. A fixed Contract request that exceeds one of
-those bounds is declined as `CapExceeded`; it is never silently reduced.
+The venue planner alone evaluates the requested allocation against the current ask ladder, venue
+minimum, and resolved monetary bounds. It returns `InsufficientDepth` when the complete request cannot
+fill inside its price bounds and `CapExceeded` when signed principal plus fee reserve exceeds a
+monetary bound. In particular, Contract mode either plans exactly the configured quantity or declines;
+it never silently reduces an over-cap or under-depth request.
 
 The risk engine retains `PerTradeSizeExceeded` as an independent proposal gate. The proposal supplied
 to it is derived from the exact sized plan rather than from a preliminary strategy-side notional.
@@ -421,7 +422,8 @@ audit evidence and the no-chase ceiling; it cannot substitute for current-book e
 
 The strategy evaluator owns flip, mode, zero-allocation, and risk decisions. The venue planner owns
 book, minimum, and cap decisions. A gate returning `Err(WinnerFollowError::*)` means the evaluator
-does not emit an intent; a planner `CapExceeded` is mapped by the caller to its typed decline audit.
+does not emit an intent; a planner error produces no sized plan. Ordinary live fanout preserves
+`InsufficientDepth` and `CapExceeded` as distinct terminal decline reasons.
 
 | # | Gate | Condition | Source | `WinnerFollowError` | Rationale |
 |---|---|---|---|---|---|
@@ -509,7 +511,7 @@ Organic attempts retain the ordinary eligible `LeaderSignal`, calibrated ranking
 idempotency key, BUY-entry/history/latency/resolution gates, and concentration checks. Their Kelly
 cost is `leader_price × 1.0075`, quantized down to the venue tick, with proven zero fee, canonical
 live Kelly fraction, and the caps above. Operator probes bypass leader/Kelly gates but bind one
-campaign/ordinal, condition/outcome/token, exact whole shares, absolute worst price/debit,
+campaign/ordinal, condition/outcome/token, an exact integer share quantity, absolute worst price/debit,
 resolver hash, and canonical authority hash. Both origins converge on one immutable quote,
 exact-risk, V2 preparation, synced reservation, and exactly-one-POST path.
 

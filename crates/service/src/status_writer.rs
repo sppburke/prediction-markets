@@ -166,7 +166,7 @@ pub struct StatusSnapshot {
     /// Pending/applied serialized watchlist projection and last typed analytics error (#544).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watchlist_projection: Option<WatchlistProjectionStatusSnapshot>,
-    /// Cumulative authoritative RPC calls (`commit_fill` + `apply_resolution`) since boot;
+    /// Cumulative authoritative RPC calls (`commit_fill_v2` + `apply_resolution_v2`) since boot;
     /// `0` when not in authoritative mode. Diff two snapshots for the Supabase write rate.
     pub supabase_rpc_calls: u64,
     /// Per-account live execution block (#508) — additive shape; `None` until the live
