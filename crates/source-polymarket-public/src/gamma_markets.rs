@@ -145,6 +145,9 @@ pub struct GammaMarketsWithPages {
 pub struct GammaConditionMarketsWithPages {
     pub markets: GammaMarkets,
     pub pages: Vec<(MetadataPageEvidence, Vec<u8>)>,
+    /// Requests that reached no usable response page, retained so the caller can durably record
+    /// the exact missing-price observation instead of inferring it from the source-log tail.
+    pub failed_requests: Vec<(String, String)>,
     pub conflicting_condition_ids: Vec<String>,
     pub condition_page_hashes: HashMap<String, String>,
 }
@@ -155,6 +158,8 @@ pub struct GammaConditionMarketsWithPages {
 pub struct GammaConditionMarketsError {
     pub source: GammaMarketsError,
     pub pages: Vec<(MetadataPageEvidence, Vec<u8>)>,
+    /// Exact request URLs that failed before producing a response page.
+    pub failed_requests: Vec<(String, String)>,
 }
 
 /// A token-targeted Gamma failure and any transport-successful page received before it failed.
@@ -293,16 +298,17 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             .map(|chunk| async move {
                 let url = build_batch_url(base, &chunk, closed, limit);
                 let result = fetcher.fetch_page(&url).await;
-                (chunk, result)
+                (chunk, url, result)
             })
             .buffer_unordered(self.concurrency);
 
         let mut out: HashMap<String, GammaMarket> = HashMap::new();
         let mut unfetched: Vec<String> = Vec::new();
         let mut pages = Vec::new();
+        let mut failed_requests = Vec::new();
         let mut conflicting_condition_ids = Vec::new();
         let mut condition_page_hashes = HashMap::new();
-        while let Some((chunk, result)) = stream.next().await {
+        while let Some((chunk, url, result)) = stream.next().await {
             let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
@@ -310,18 +316,21 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                     // path skipped a Fatal id without writing a row. Distinct from a 200 that omits an
                     // id (an unknown market), which the caller treats as the empty-response case.
                     tracing::warn!(chunk_len = chunk.len(), error = %message, "gamma_markets: batch fatal, marking chunk unfetched");
+                    failed_requests.push((url, message));
                     unfetched.extend(chunk);
                     continue;
                 }
                 Err(e) => {
+                    let message = e.to_string();
+                    failed_requests.push((url, message.clone()));
                     return Err(GammaConditionMarketsError {
-                        source: GammaMarketsError::Fetch(e.to_string()),
+                        source: GammaMarketsError::Fetch(message),
                         pages,
+                        failed_requests,
                     });
                 }
             };
 
-            let url = build_batch_url(&self.base_url, &chunk, filter.closed_param(), self.limit);
             let evidence = metadata_page_evidence(&url, &bytes, ReceivedAt::now_utc());
             let markets: Vec<GammaMarketRaw> = match serde_json::from_slice(&bytes) {
                 Ok(markets) => markets,
@@ -330,6 +339,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                     return Err(GammaConditionMarketsError {
                         source: GammaMarketsError::Parse(error.to_string()),
                         pages,
+                        failed_requests,
                     });
                 }
             };
@@ -356,6 +366,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                 unfetched,
             },
             pages,
+            failed_requests,
             conflicting_condition_ids,
             condition_page_hashes,
         })
@@ -1121,6 +1132,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.conflicting_condition_ids, vec!["condition"]);
+    }
+
+    /// PASS: a request rejected before a response page retains its exact URL for the caller-owned
+    /// durable missing-price record.
+    #[tokio::test]
+    async fn condition_batch_retains_failed_request_identity() {
+        let ids = ids(&["condition"]);
+        let url = build_batch_url("https://g", &ids, "", GAMMA_BATCH_LIMIT_PARAM);
+        let result =
+            GammaMarketsClient::new("https://g".to_owned(), FixtureFetcher::new(HashMap::new()))
+                .fetch_markets_with_pages(&ids, MarketFilter::OpenOnly)
+                .await
+                .unwrap();
+
+        assert_eq!(result.markets.unfetched, ids);
+        assert_eq!(
+            result.failed_requests,
+            vec![(url.clone(), format!("no fixture for URL: {url}"))]
+        );
     }
 
     #[test]

@@ -102,11 +102,9 @@ pub struct WinnerFollowRiskInputEvidence {
     /// Exact paper prefix observed before risk construction. `None` preserves an acquisition
     /// failure that occurred before a verified financial prefix was available.
     pub financial_prefix: Option<AppendReceipt>,
-    /// Source receipts consumed while valuing the prefix's open positions.
+    /// Exact set of source pages consulted by the strict price attempt: value-producing cached or
+    /// fetched pages plus request-bound empty, rejected, or transport-failure observations.
     pub price_receipts: Vec<AppendReceipt>,
-    /// Exact source-log prefix observed immediately after the strict price attempt. `None`
-    /// preserves a failure that occurred before the attempt reached its source boundary.
-    pub source_tail: Option<AppendReceipt>,
     /// Clock used for PnL, price freshness, and latency reconstruction.
     pub evaluated_at_unix_ms: i64,
     pub proposed_debit: CollateralAmount,
@@ -937,7 +935,6 @@ mod tests {
             evidence: WinnerFollowRiskInputEvidence {
                 financial_prefix: None,
                 price_receipts: Vec::new(),
-                source_tail: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
                 proposed_debit: CollateralAmount::ZERO,
                 per_trade_cap_bps: 10_000,
