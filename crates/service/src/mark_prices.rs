@@ -12,9 +12,9 @@ use pe_source_polymarket_public::{
 };
 
 use crate::activity_ingest::SourceLogHandle;
-use crate::risk_inputs::{BoundaryMarkError, HistoricalMarkPrice, historical_mark_price};
-
-const MAX_MARK_AGE_SECS: i64 = 120;
+use crate::risk_inputs::{
+    BoundaryMarkError, HistoricalMarkPrice, MAX_HISTORICAL_MARK_AGE_SECS, historical_mark_price,
+};
 
 /// The cadence owns retry timing; one call performs exactly one transport attempt.
 pub struct HistoricalMarkAdapter {
@@ -45,7 +45,7 @@ impl HistoricalMarkAdapter {
         cutoff_unix: i64,
     ) -> Result<HistoricalMarkPrice, BoundaryMarkError> {
         let start_unix = cutoff_unix
-            .checked_sub(MAX_MARK_AGE_SECS)
+            .checked_sub(MAX_HISTORICAL_MARK_AGE_SECS)
             .ok_or_else(|| BoundaryMarkError::Classification("mark cutoff underflow".to_owned()))?;
         let url = format!(
             "{}/prices-history?market={token_id}&startTs={start_unix}&endTs={cutoff_unix}&fidelity=1",
