@@ -34,10 +34,12 @@ use pe_risk_engine::{
 use pe_source_polymarket_public::ClassifiedPricesHistory;
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
+    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
     ClobPricesHistoryClient, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, LIVE_MARKET_PARSER_VERSION,
     LIVE_MARKET_SCHEMA_VERSION, MarketFilter, PageFetcher, aggregate_activity_rows,
-    parse_activity_response, validate_live_market,
+    parse_activity_response, parse_activity_trade_observation, parse_clob_market,
+    validate_live_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
 use pe_venue_polymarket::{BuySizing, LadderError, parse_compact_market, plan_sized_buy};
@@ -53,11 +55,13 @@ use crate::paper_recovery::{
     PaperLogRecord, PortfolioMark, QualificationSealed, QualificationStarted, RiskHaltOwner,
     ScannedPaperFrame, SealReason, TailBinding, active_risk_halts, paper_era, scan_paper_log,
 };
-use crate::risk_inputs::{build_paper_risk_base, build_paper_risk_snapshot, historical_mark_price};
+use crate::risk_inputs::{
+    RiskInputsUnavailable, build_paper_risk_base, build_paper_risk_snapshot_from_source_receipts,
+    historical_mark_price,
+};
 use crate::runtime_config::{
     ConfigEra, ConfigRow, RISK_HALT_RELEASE_HASH_KEY, RuntimeConfig, parse_config,
 };
-use crate::supabase_state::resolution_source_received_at;
 
 const QUALIFICATION_REPORT_VERSION: u16 = 1;
 const FINANCIAL_ERA_KIND: &str = "financial-era-v1";
@@ -316,6 +320,123 @@ struct SourceObservation {
     payload: Vec<u8>,
 }
 
+fn resolution_source_received_at_observation(
+    source: &SourceObservation,
+    condition: &pe_core_types::PolymarketConditionId,
+    payout_json: &str,
+) -> Result<i64, String> {
+    let corrupt = |message: String| format!("corrupt supabase value: {message}");
+    if source.source_id != "polymarket.clob.market" {
+        return Err(corrupt(
+            "resolution receipt does not reference CLOB market evidence".to_owned(),
+        ));
+    }
+    if source.schema_version != CLOB_RESOLUTION_SCHEMA_VERSION
+        || source.parser_version != CLOB_RESOLUTION_PARSER_VERSION
+    {
+        return Err(corrupt(
+            "resolution receipt uses an unsupported CLOB schema or parser version".to_owned(),
+        ));
+    }
+    let market = parse_clob_market(&source.payload).map_err(|error| {
+        corrupt(format!(
+            "parse referenced CLOB resolution evidence: {error}"
+        ))
+    })?;
+    if market.condition_id.as_deref() != Some(condition.0.as_str()) {
+        return Err(corrupt(
+            "referenced CLOB resolution condition differs from Prepared".to_owned(),
+        ));
+    }
+    let ClobPayoutResolution::Resolved(payout) = market.resolution_evidence().payout else {
+        return Err(corrupt("referenced CLOB market is not resolved".to_owned()));
+    };
+    if payout.canonical_json() != payout_json {
+        return Err(corrupt(
+            "referenced CLOB payout differs from Prepared".to_owned(),
+        ));
+    }
+    Ok(source.received_at.0.unix_timestamp())
+}
+
+fn decision_source_receipt(
+    source: &BTreeMap<u64, SourceObservation>,
+    receipt: AppendReceipt,
+) -> Result<&SourceObservation, QualificationError> {
+    let Some(observation) = source.get(&receipt.sequence.0) else {
+        return insufficient(format!(
+            "decision source receipt replay failed: source receipt sequence {} is absent",
+            receipt.sequence.0
+        ));
+    };
+    if observation.receipt != receipt {
+        return insufficient(format!(
+            "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
+            receipt.sequence.0
+        ));
+    }
+    Ok(observation)
+}
+
+fn decision_observation_from_source(
+    continuation: &DecisionContinuationV2,
+    source: &BTreeMap<u64, SourceObservation>,
+) -> Result<Option<pe_execution_core::ObservationEvidence>, QualificationError> {
+    let Some(selected_receipt) = continuation.observation_receipt() else {
+        return Ok(None);
+    };
+    for page in continuation.page_occurrences() {
+        let observation = decision_source_receipt(source, page.receipt)?;
+        if observation.source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+            || observation.schema_version != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+            || observation.parser_version != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+            || blake3::hash(&observation.payload).to_hex().as_str() != page.raw_hash
+        {
+            return insufficient(format!(
+                "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
+                page.receipt.sequence.0
+            ));
+        }
+    }
+    if let Some(websocket_receipt) = continuation.observed_source_receipt {
+        let observation = decision_source_receipt(source, websocket_receipt)?;
+        let activity = parse_activity_trade_observation(&observation.payload).map_err(|_| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
+                websocket_receipt.sequence.0
+            ))
+        })?;
+        if observation.source_id != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+            || observation.schema_version != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+            || observation.parser_version != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+            || activity.wallet != continuation.wallet
+            || activity.group_id.key() != &continuation.source_trade_id
+        {
+            return insufficient(format!(
+                "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
+                websocket_receipt.sequence.0
+            ));
+        }
+    }
+    let selected = decision_source_receipt(source, selected_receipt)?;
+    let complete_bound_receipt = continuation.complete_bound().ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "post-Start decision has no version-three source evidence".to_owned(),
+        )
+    })?;
+    let provenance = if continuation.observed_source_receipt == Some(selected_receipt) {
+        "activity_ws"
+    } else {
+        "rest_poll"
+    };
+    Ok(Some(pe_execution_core::ObservationEvidence {
+        source_receipt: selected_receipt,
+        complete_bound_receipt,
+        observed_unix_ms: selected.received_unix_ms,
+        provenance: provenance.to_owned(),
+    }))
+}
+
 #[derive(Debug, Clone)]
 struct CompletedFill {
     final_receipt: AppendReceipt,
@@ -362,7 +483,6 @@ struct RiskReplayContext<'a> {
     start_receipt: AppendReceipt,
     paper_prefix: &'a [ScannedPaperFrame],
     source: &'a BTreeMap<u64, SourceObservation>,
-    source_log_path: &'a Path,
     prepared_received_unix_ms: i64,
 }
 
@@ -412,8 +532,7 @@ async fn verify_qualification(
         })?;
     let mut decision_observations = HashMap::new();
     for decision in &replayed_decisions {
-        let observation =
-            verify_decision_source_inputs(decision, &source_observations, &options.source_log)?;
+        let observation = verify_decision_source_inputs(decision, &source_observations)?;
         if decision_observations
             .insert(decision.continuation.source_trade_id.clone(), observation)
             .is_some()
@@ -485,7 +604,6 @@ async fn verify_qualification(
                                 start_receipt,
                                 paper_prefix: &frames[start_index..frame_index],
                                 source: &source_observations,
-                                source_log_path: &options.source_log,
                                 prepared_received_unix_ms: received_unix_ms(&frame.envelope)?,
                             },
                         )
@@ -622,17 +740,17 @@ async fn verify_qualification(
                         {
                             return insufficient("Resolution Final authority mismatch");
                         }
-                        if source_observations
+                        let resolution_source = source_observations
                             .get(&resolution_source_receipt.sequence.0)
-                            .is_none_or(|source| source.receipt != *resolution_source_receipt)
-                        {
-                            return insufficient(
-                                "resolution receipt is absent from the sealed source prefix",
-                            );
-                        }
-                        let settled_at_unix = resolution_source_received_at(
-                            &options.source_log,
-                            *resolution_source_receipt,
+                            .filter(|source| source.receipt == *resolution_source_receipt)
+                            .ok_or_else(|| {
+                                QualificationError::InsufficientEvidence(
+                                    "resolution receipt is absent from the sealed source prefix"
+                                        .to_owned(),
+                                )
+                            })?;
+                        let settled_at_unix = resolution_source_received_at_observation(
+                            resolution_source,
                             condition_id,
                             payout_by_outcome_index_json,
                         )
@@ -1283,21 +1401,13 @@ fn decision_rows_from_source_observations(
 fn verify_decision_source_inputs(
     decision: &crate::decision_replay::ReplayedDecision,
     source: &BTreeMap<u64, SourceObservation>,
-    source_log_path: &Path,
 ) -> Result<pe_execution_core::ObservationEvidence, QualificationError> {
     let continuation = &decision.continuation;
-    let observation = continuation
-        .observation_from_source_log(source_log_path)
-        .map_err(|error| {
-            QualificationError::InsufficientEvidence(format!(
-                "decision source receipt replay failed: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "post-Start decision has no version-three source evidence".to_owned(),
-            )
-        })?;
+    let observation = decision_observation_from_source(continuation, source)?.ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "post-Start decision has no version-three source evidence".to_owned(),
+        )
+    })?;
     for receipt in [
         observation.source_receipt,
         observation.complete_bound_receipt,
@@ -1935,12 +2045,20 @@ async fn verify_economic(
         economic.risk.snapshot.per_trade_cap_bps,
         &era,
     )?;
-    let reconstructed = build_paper_risk_snapshot(
+    let reconstructed = build_paper_risk_snapshot_from_source_receipts(
         &base,
         &snapshot,
         &era,
         &current_prices,
-        context.source_log_path,
+        |receipt| {
+            let Some(source) = context.source.get(&receipt.sequence.0) else {
+                return Err(RiskInputsUnavailable::PriceMissing);
+            };
+            if source.receipt != receipt {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            Ok(source.received_unix_ms)
+        },
         evaluated_at_unix,
         latency_was_active,
     )

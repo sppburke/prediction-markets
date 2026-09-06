@@ -212,7 +212,7 @@ pub fn completed_prepared_before_boundary(
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    let mut completed = HashSet::new();
+    let mut causal = Vec::new();
     for frame in &era.frames {
         let PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
             prepared_receipt, ..
@@ -234,13 +234,22 @@ pub fn completed_prepared_before_boundary(
                 ..
             } => *resolution_source_receipt,
         };
-        if source_receipt.sequence <= boundary_receipt.sequence
-            && source_receipt_received_millis(source_log_path, source_receipt)? < cutoff_ms
-        {
-            completed.insert(prepared_receipt.sequence);
+        if source_receipt.sequence <= boundary_receipt.sequence {
+            causal.push((prepared_receipt.sequence, source_receipt));
         }
     }
-    Ok(completed)
+    let received_millis =
+        source_receipt_millis_index(source_log_path, causal.iter().map(|(_, receipt)| *receipt))?;
+    causal
+        .into_iter()
+        .filter_map(|(prepared_sequence, receipt)| {
+            match source_receipt_received_millis(&received_millis, receipt) {
+                Ok(received) if received < cutoff_ms => Some(Ok(prepared_sequence)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
 }
 
 /// Compose exact paper PnL/latency into the existing proposal snapshot. Exposure, proposal, and cap
@@ -253,6 +262,42 @@ pub fn build_paper_risk_snapshot(
     source_log_path: &Path,
     now_unix: i64,
     latency_was_active: bool,
+) -> Result<RiskSnapshot, RiskInputsUnavailable> {
+    let mut composed =
+        build_paper_risk_snapshot_without_latency(base, snapshot, era, current_prices, now_unix)?;
+    let latency = paper_latency_samples(era, source_log_path, now_unix)?;
+    composed.copy_latency_kill_switch_active = latency.switch_active(latency_was_active);
+    Ok(composed)
+}
+
+/// Compose paper risk from a source prefix that the caller has already replayed and verified.
+/// Offline qualification uses this entry point so every Prepared reuses its sealed-prefix view.
+pub(crate) fn build_paper_risk_snapshot_from_source_receipts<F>(
+    base: &RiskSnapshot,
+    snapshot: &FinancialSnapshot,
+    era: &PaperEra,
+    current_prices: &HashMap<(MarketId, OutcomeId), Price>,
+    source_receipt_received_millis: F,
+    now_unix: i64,
+    latency_was_active: bool,
+) -> Result<RiskSnapshot, RiskInputsUnavailable>
+where
+    F: Fn(AppendReceipt) -> Result<i64, RiskInputsUnavailable>,
+{
+    let mut composed =
+        build_paper_risk_snapshot_without_latency(base, snapshot, era, current_prices, now_unix)?;
+    let latency =
+        paper_latency_samples_from_source_receipts(era, now_unix, &source_receipt_received_millis)?;
+    composed.copy_latency_kill_switch_active = latency.switch_active(latency_was_active);
+    Ok(composed)
+}
+
+fn build_paper_risk_snapshot_without_latency(
+    base: &RiskSnapshot,
+    snapshot: &FinancialSnapshot,
+    era: &PaperEra,
+    current_prices: &HashMap<(MarketId, OutcomeId), Price>,
+    now_unix: i64,
 ) -> Result<RiskSnapshot, RiskInputsUnavailable> {
     let Some((start_receipt, start)) = &era.start else {
         return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
@@ -317,13 +362,10 @@ pub fn build_paper_risk_snapshot(
         },
     )
     .map_err(risk_math_error)?;
-    let latency = paper_latency_samples(era, source_log_path, now_unix)?;
-
     let mut composed = base.clone();
     composed.intraday_pnl_bps = pnl.intraday;
     composed.rolling_7d_pnl_bps = pnl.rolling_7d;
     composed.absolute_pnl_bps = pnl.absolute;
-    composed.copy_latency_kill_switch_active = latency.switch_active(latency_was_active);
     Ok(composed)
 }
 
@@ -470,6 +512,22 @@ pub(crate) fn paper_latency_samples(
     source_log_path: &Path,
     now_unix: i64,
 ) -> Result<LatencySamples, RiskInputsUnavailable> {
+    let source_receipts = paper_fill_source_receipts(era)?;
+    let received_millis =
+        source_receipt_millis_index(source_log_path, source_receipts.into_iter())?;
+    paper_latency_samples_from_source_receipts(era, now_unix, &|receipt| {
+        source_receipt_received_millis(&received_millis, receipt)
+    })
+}
+
+fn paper_latency_samples_from_source_receipts<F>(
+    era: &PaperEra,
+    now_unix: i64,
+    source_receipt_received_millis: &F,
+) -> Result<LatencySamples, RiskInputsUnavailable>
+where
+    F: Fn(AppendReceipt) -> Result<i64, RiskInputsUnavailable>,
+{
     let latest_end = now_unix
         .div_euclid(SECONDS_PER_HOUR)
         .checked_mul(SECONDS_PER_HOUR)
@@ -480,7 +538,7 @@ pub(crate) fn paper_latency_samples(
     let previous_start = latest_start
         .checked_sub(SECONDS_PER_HOUR)
         .ok_or(RiskInputsUnavailable::Overflow)?;
-    let all_samples = paper_latency_endpoint_samples(era, source_log_path)?;
+    let all_samples = paper_latency_endpoint_samples(era, source_receipt_received_millis)?;
     Ok(LatencySamples {
         previous: latency_hour(&all_samples, previous_start)?,
         latest: latency_hour(&all_samples, latest_start)?,
@@ -604,7 +662,7 @@ fn latency_hour(
 
 fn paper_latency_endpoint_samples(
     era: &PaperEra,
-    source_log_path: &Path,
+    source_receipt_received_millis: &impl Fn(AppendReceipt) -> Result<i64, RiskInputsUnavailable>,
 ) -> Result<Vec<(i64, u64)>, RiskInputsUnavailable> {
     let prepared = era
         .frames
@@ -644,8 +702,7 @@ fn paper_latency_endpoint_samples(
             .checked_div(1_000_000)
             .and_then(|value| i64::try_from(value).ok())
             .ok_or(RiskInputsUnavailable::Overflow)?;
-        let observed_ms =
-            source_receipt_received_millis(source_log_path, observation.source_receipt)?;
+        let observed_ms = source_receipt_received_millis(observation.source_receipt)?;
         let latency_ms = final_ms
             .checked_sub(observed_ms)
             .and_then(|value| u64::try_from(value).ok())
@@ -655,27 +712,100 @@ fn paper_latency_endpoint_samples(
     Ok(samples)
 }
 
-fn source_receipt_received_millis(
+fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, RiskInputsUnavailable> {
+    let prepared = era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                payload: FinancialPayload::Fill { economic, .. },
+                ..
+            }) => economic
+                .observation
+                .as_ref()
+                .map(|observation| (frame.receipt.sequence, (frame.receipt, observation))),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    era.frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                prepared_receipt,
+                result: FinancialResult::Fill { .. },
+            }) => Some(prepared_receipt),
+            _ => None,
+        })
+        .map(|prepared_receipt| {
+            let Some((known_receipt, observation)) = prepared.get(&prepared_receipt.sequence)
+            else {
+                return Err(RiskInputsUnavailable::UnmatchedPrepared);
+            };
+            if *known_receipt != *prepared_receipt {
+                return Err(RiskInputsUnavailable::UnmatchedPrepared);
+            }
+            Ok(observation.source_receipt)
+        })
+        .collect()
+}
+
+fn source_receipt_millis_index(
     source_log_path: &Path,
-    receipt: AppendReceipt,
-) -> Result<i64, RiskInputsUnavailable> {
+    receipts: impl Iterator<Item = AppendReceipt>,
+) -> Result<BTreeMap<EventSeq, (AppendReceipt, i64)>, RiskInputsUnavailable> {
+    let mut wanted = BTreeMap::<EventSeq, AppendReceipt>::new();
+    for receipt in receipts {
+        if wanted
+            .insert(receipt.sequence, receipt)
+            .is_some_and(|known| known != receipt)
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+    }
+    let Some(max_sequence) = wanted.last_key_value().map(|(sequence, _)| *sequence) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut received_millis = BTreeMap::new();
     for item in Reader::replay(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)? {
         let (_sequence, envelope) = item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-        if envelope.seq != receipt.sequence {
-            continue;
+        if envelope.seq > max_sequence {
+            break;
         }
+        let Some(receipt) = wanted.get(&envelope.seq) else {
+            continue;
+        };
         if envelope.this_hash != receipt.this_hash {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        return envelope
+        let millis = envelope
             .received_at
             .0
             .unix_timestamp_nanos()
             .checked_div(1_000_000)
             .and_then(|value| i64::try_from(value).ok())
-            .ok_or(RiskInputsUnavailable::Overflow);
+            .ok_or(RiskInputsUnavailable::Overflow)?;
+        received_millis.insert(envelope.seq, (*receipt, millis));
+        if envelope.seq == max_sequence {
+            break;
+        }
     }
-    Err(RiskInputsUnavailable::PriceMissing)
+    if received_millis.len() != wanted.len() {
+        return Err(RiskInputsUnavailable::PriceMissing);
+    }
+    Ok(received_millis)
+}
+
+fn source_receipt_received_millis(
+    received_millis: &BTreeMap<EventSeq, (AppendReceipt, i64)>,
+    receipt: AppendReceipt,
+) -> Result<i64, RiskInputsUnavailable> {
+    let Some((known_receipt, received)) = received_millis.get(&receipt.sequence) else {
+        return Err(RiskInputsUnavailable::PriceMissing);
+    };
+    if *known_receipt != receipt {
+        return Err(RiskInputsUnavailable::PriceConflict);
+    }
+    Ok(*received)
 }
 
 /// Reconstruct the paper exposure base for one proposal from the completed financial prefix.
