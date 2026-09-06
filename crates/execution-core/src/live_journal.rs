@@ -97,6 +97,15 @@ impl LiveAccountBindingAudit {
     }
 
     #[must_use]
+    pub fn is_valid_for_frozen_credential(
+        &self,
+        account_id: &AccountId,
+        frozen_credential: &CredentialBindingIdentity,
+    ) -> bool {
+        self.is_valid_for(account_id) && &self.credential == frozen_credential
+    }
+
+    #[must_use]
     pub fn request_descriptor(
         &self,
         method: impl Into<String>,
