@@ -331,7 +331,7 @@ driver_args() {
 
 run_driver() {
   local root=$1; shift
-  PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" SUPABASE_DB_URL=fake \
+  PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" SUPABASE_DB_URL=postgres://harness:harness@127.0.0.1:1/harness \
     PATH="$root/bin:$PATH" "$DRIVER" "${DRIVER_ARGS[@]}" "$@"
 }
 
