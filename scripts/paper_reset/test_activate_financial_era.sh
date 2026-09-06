@@ -43,6 +43,8 @@ require_text "$DRIVER" '--financial-era=prepare'
 require_text "$DRIVER" '--financial-era=start'
 require_text "$DRIVER" '--financial-era=rollback-check'
 require_text "$DRIVER" '--verify-staged-identity'
+require_text "$DRIVER" '--rehearsal-evidence'
+require_text "$DRIVER" 'REHEARSAL_REFUSAL='
 require_text "$DRIVER" 'verify_legacy_service_contract'
 require_text "$DRIVER" 'archive_restored'
 require_text "$DRIVER" 'local_restored'
@@ -155,6 +157,28 @@ SH
   chmod +x "$bin/systemctl" "$bin/psql"
 }
 
+write_rehearsal_evidence() {
+  local root=$1
+  local artifact_sha256=${2:-$(sha256sum "$root/target/pe-service" | awk '{print $1}')}
+  local rehearsal=$root/rehearsal manifest=$root/rehearsal/manifest.txt digest
+  mkdir -p "$rehearsal"
+  printf '%s\n' \
+    'result=PASS' \
+    'reason=evidence_complete' \
+    'sha=1111111111111111111111111111111111111111' \
+    'target_revision=1111111111111111111111111111111111111111' \
+    'artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    "artifact_sha256=$artifact_sha256" > "$manifest"
+  digest=$(sha256sum "$manifest" | awk '{print $1}')
+  python3 -c 'import json,os,sys
+path,manifest,digest,artifact_sha=sys.argv[1:]
+value={"kind":"rehearsal545-evidence-v1","result":"PASS","evidence_sha256":digest,
+"manifest_path":os.path.realpath(manifest),"target_revision":"1"*40,
+"artifact_blake3":"a"*64,"artifact_sha256":artifact_sha}
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
+    "$rehearsal/evidence.json" "$manifest" "$digest" "$artifact_sha256"
+}
+
 setup_fixture() {
   local root=$1 service=$root/prediction-markets target=$root/target state=$root/test-state
   mkdir -p "$service/target/release" "$service/smoke-test" "$service/gen/g557" "$target" "$state"
@@ -219,6 +243,7 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
 esac
 SH
   chmod +x "$target/pe-service"
+  write_rehearsal_evidence "$root"
   write_shims "$root"
 }
 
@@ -233,6 +258,7 @@ driver_args() {
     --live-journal "$service/gen/g557/live_journal.log"
     --paper-state "$service/gen/g557/paper_state.db"
     --fresh-bankroll 10000
+    --rehearsal-evidence "$root/rehearsal/evidence.json"
     --hot-config-hash bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     --ranking-batch-id 545
     --policy-hash policy-545
@@ -259,6 +285,80 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
   done
   return 1
 }
+
+# Scenario FE-REHEARSAL-MISSING-01
+# Preconditions: a durable prepared manifest lacks the rehearsal binding expected by the driver.
+# PASS: the rerun returns the typed unbound-evidence refusal with the service and state untouched.
+# FAIL: the service stops, an archive occurs, or the prepared manifest advances.
+root=$TEST_TMP/rehearsal-missing
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "rehearsal-missing setup did not stop at prepared"
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1])); evidence=value["rehearsal_evidence"]
+assert value["state"] == "prepared" and evidence["sha256"] and evidence["artifact_blake3"] == "a"*64' \
+  "$root/pe-financial-era.json" || fail "prepared manifest did not bind rehearsal evidence"
+python3 -c 'import json,sys
+path=sys.argv[1]; value=json.load(open(path)); del value["rehearsal_evidence"]
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' "$root/pe-financial-era.json"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'REHEARSAL_REFUSAL=prepared_evidence_unbound_or_changed'* ]] ||
+  fail "prepared manifest without a rehearsal binding was not typed-refused: $output"
+[[ $(<"$root/test-state/service.active") == true && ! -e "$root/test-state/stop-count" &&
+   ! -e "$root/test-state/archive-count" ]] ||
+  fail "unbound rehearsal evidence reached a guarded mutation"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == prepared ]] ||
+  fail "unbound rehearsal evidence advanced the prepared manifest"
+
+# Scenario FE-REHEARSAL-ARTIFACT-02
+# Preconditions: PASS evidence is internally hash-consistent but names a different binary artifact.
+# PASS: the typed artifact refusal occurs before the financial manifest or service mutation exists.
+# FAIL: mismatched rehearsal evidence is recorded or the service is stopped.
+root=$TEST_TMP/rehearsal-artifact
+setup_fixture "$root"
+write_rehearsal_evidence "$root" 0000000000000000000000000000000000000000000000000000000000000000
+driver_args "$root"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'REHEARSAL_REFUSAL=artifact_identity_mismatch'* ]] ||
+  fail "mismatched rehearsal artifact was not typed-refused: $output"
+[[ ! -e "$root/pe-financial-era.json" && $(<"$root/test-state/service.active") == true &&
+   ! -e "$root/test-state/stop-count" && ! -e "$root/test-state/archive-count" ]] ||
+  fail "mismatched rehearsal artifact caused a durable mutation"
+
+# Scenario FE-REHEARSAL-MATCH-03
+# Preconditions: PASS evidence hashes its manifest and names the exact staged binary identities.
+# Injected boundaries: prepared, then service-stop-intent on the identical rerun.
+# PASS: the binding remains byte-identical and the rerun may enter the guarded transition.
+# FAIL: the matching rerun rewrites the binding or refuses before stop intent.
+root=$TEST_TMP/rehearsal-match
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "matching rehearsal did not reach prepared"
+binding_before=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["rehearsal_evidence"],sort_keys=True))' "$root/pe-financial-era.json")
+set +e
+run_driver "$root" --simulate-crash-after service-stop-intent >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "identical matching rehearsal rerun did not proceed"
+binding_after=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["rehearsal_evidence"],sort_keys=True))' "$root/pe-financial-era.json")
+[[ "$binding_before" == "$binding_after" ]] || fail "identical rehearsal rerun changed its manifest binding"
+[[ $(<"$root/test-state/service.active") == true && ! -e "$root/test-state/stop-count" &&
+   ! -e "$root/test-state/archive-count" ]] ||
+  fail "matching rehearsal crossed the injected stop-intent boundary"
 
 # Scenario FE-PREP-01
 # Preconditions: active old service; clean paper/source/live logs and local state.
@@ -498,4 +598,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
   [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the old service more than once"
 done
 
-echo "PASS: FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"

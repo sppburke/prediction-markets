@@ -12,7 +12,7 @@ MANIFEST="$DEPLOY_HOME/pe-financial-era.json"
 usage() {
   echo "usage: $0 --target-binary PATH --target-config PATH --target-environment PATH \
 --paper-log PATH --source-log PATH --live-journal PATH --paper-state PATH \
---fresh-bankroll DECIMAL --hot-config-hash HASH \
+--fresh-bankroll DECIMAL --rehearsal-evidence PATH --hot-config-hash HASH \
 --ranking-batch-id ID --policy-hash HASH --membership-json PATH \
 --membership-proofs-hash HASH [--rollback-before-start] [--simulate-crash-after BOUNDARY]" >&2
   exit 2
@@ -22,7 +22,7 @@ target_binary= target_config= target_environment=
 paper_log= source_log= live_journal= paper_state=
 fresh_bankroll= artifact_blake3= hot_config_hash= ranking_batch_id=
 target_revision=
-policy_hash= membership_json= membership_proofs_hash=
+policy_hash= membership_json= membership_proofs_hash= rehearsal_evidence=
 rollback_before_start=false
 while (($#)); do
   case "$1" in
@@ -34,6 +34,7 @@ while (($#)); do
     --live-journal) [[ $# -ge 2 ]] || usage; live_journal=$2; shift 2 ;;
     --paper-state) [[ $# -ge 2 ]] || usage; paper_state=$2; shift 2 ;;
     --fresh-bankroll) [[ $# -ge 2 ]] || usage; fresh_bankroll=$2; shift 2 ;;
+    --rehearsal-evidence) [[ $# -ge 2 ]] || usage; rehearsal_evidence=$2; shift 2 ;;
     --hot-config-hash) [[ $# -ge 2 ]] || usage; hot_config_hash=$2; shift 2 ;;
     --ranking-batch-id) [[ $# -ge 2 ]] || usage; ranking_batch_id=$2; shift 2 ;;
     --policy-hash) [[ $# -ge 2 ]] || usage; policy_hash=$2; shift 2 ;;
@@ -46,7 +47,7 @@ while (($#)); do
 done
 
 for value in target_binary target_config target_environment paper_log source_log live_journal \
-  paper_state fresh_bankroll hot_config_hash ranking_batch_id policy_hash \
+  paper_state fresh_bankroll rehearsal_evidence hot_config_hash ranking_batch_id policy_hash \
   membership_json membership_proofs_hash; do
   [[ -n "${!value}" ]] || usage
 done
@@ -85,6 +86,58 @@ payload=json.dumps({"config_sha256":config_hash,"environment_sha256":environment
 print(hashlib.sha256(b"prediction-edge/effective-static-config-v1\0"+payload).hexdigest())' \
   "$(sha256_file "$target_config")" "$(sha256_file "$target_environment")") ||
   die "derive effective staged configuration identity"
+target_artifact_sha256=$(sha256_file "$target_binary")
+
+read_rehearsal_evidence() {
+  python3 -c 'import hashlib,json,os,sys
+evidence_path,expected_revision,expected_artifact,expected_artifact_sha=sys.argv[1:]
+def refuse(reason):
+    print("REHEARSAL_REFUSAL="+reason,file=sys.stderr)
+    raise SystemExit(1)
+if not os.path.isfile(evidence_path): refuse("missing_evidence_file")
+if os.path.islink(evidence_path): refuse("evidence_file_is_symlink")
+try:
+    with open(evidence_path,encoding="utf-8") as source: evidence=json.load(source)
+except (OSError,ValueError):
+    refuse("malformed_evidence_file")
+expected_keys={"kind","result","evidence_sha256","manifest_path","target_revision","artifact_blake3","artifact_sha256"}
+if not isinstance(evidence,dict) or set(evidence) != expected_keys or evidence.get("kind") != "rehearsal545-evidence-v1":
+    refuse("malformed_evidence_file")
+digest=evidence.get("evidence_sha256")
+if evidence.get("result") != "PASS": refuse("rehearsal_did_not_pass")
+if not isinstance(digest,str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+    refuse("malformed_evidence_hash")
+manifest_path=evidence.get("manifest_path")
+if not isinstance(manifest_path,str) or not os.path.isabs(manifest_path) or not os.path.isfile(manifest_path):
+    refuse("missing_result_manifest")
+if os.path.islink(manifest_path): refuse("result_manifest_is_symlink")
+with open(manifest_path,"rb") as source: actual=hashlib.sha256(source.read()).hexdigest()
+if actual != digest: refuse("evidence_hash_mismatch")
+rows={}
+try:
+    with open(manifest_path,encoding="utf-8") as source:
+        for raw in source:
+            key,separator,value=raw.rstrip("\n").partition("=")
+            if not separator or not key or key in rows: refuse("malformed_result_manifest")
+            rows[key]=value
+except (OSError,UnicodeError):
+    refuse("malformed_result_manifest")
+for key in ("result","target_revision","artifact_blake3","artifact_sha256"):
+    if rows.get(key) != evidence.get(key): refuse("evidence_identity_mismatch")
+if rows.get("sha") != evidence.get("target_revision"): refuse("reviewed_revision_mismatch")
+if evidence.get("target_revision") != expected_revision or evidence.get("artifact_blake3") != expected_artifact or evidence.get("artifact_sha256") != expected_artifact_sha:
+    refuse("artifact_identity_mismatch")
+bound={
+    "path":os.path.realpath(evidence_path),
+    "manifest_path":os.path.realpath(manifest_path),
+    "sha256":digest,
+    "target_revision":evidence["target_revision"],
+    "artifact_blake3":evidence["artifact_blake3"],
+    "artifact_sha256":evidence["artifact_sha256"],
+}
+print(json.dumps(bound,sort_keys=True,separators=(",",":")))' \
+    "$rehearsal_evidence" "$target_revision" "$artifact_blake3" "$target_artifact_sha256"
+}
 
 file_identity_json() {
   python3 -c 'import json,sys
@@ -308,6 +361,8 @@ finish_unmutated_rollback() {
 
 if [[ ! -f "$MANIFEST" ]]; then
   [[ "$rollback_before_start" == false ]] || die "financial-era manifest is absent"
+  rehearsal_evidence_json=$(read_rehearsal_evidence) ||
+    die "financial-era rehearsal evidence was refused"
   old_binary=$(file_identity_json "$SERVICE_BINARY")
   old_config=$(file_identity_json "$SERVICE_CONFIG")
   old_environment=$(file_identity_json "$SERVICE_ENV")
@@ -316,7 +371,7 @@ if [[ ! -f "$MANIFEST" ]]; then
   target_environment_json=$(file_identity_json "$target_environment")
   initial=$(python3 -c 'import decimal,json,sys,time
 (manifest,activation,generation,bankroll,revision,artifact,static,hot,batch,policy,members_path,proofs,
- paper,source,live,state,old_binary,old_config,old_env,target_binary,target_config,target_env)=sys.argv[1:]
+ paper,source,live,state,old_binary,old_config,old_env,target_binary,target_config,target_env,rehearsal)=sys.argv[1:]
 amount=decimal.Decimal(bankroll)
 atomic=amount*decimal.Decimal(1000000)
 if atomic != atomic.to_integral_value(): raise SystemExit("bankroll is not exact")
@@ -332,13 +387,13 @@ value={
  "old_config_sha256":json.loads(old_config)["sha256"],"target_config_sha256":json.loads(target_config)["sha256"],
  "old_environment_sha256":json.loads(old_env)["sha256"],"target_environment_sha256":json.loads(target_env)["sha256"],
  "expected_hot_config_names_hash":hot,"ranking_identity":"batch:"+batch,
- "fresh_bankroll_identity":format(amount,"f"),"preparation":None}
+ "fresh_bankroll_identity":format(amount,"f"),"rehearsal_evidence":json.loads(rehearsal),"preparation":None}
 print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
     "$MANIFEST" "$activation_id" "$generation" "$fresh_bankroll" "$target_revision" \
     "$artifact_blake3" "$static_config_hash" "$hot_config_hash" "$ranking_batch_id" "$policy_hash" "$membership_json" \
     "$membership_proofs_hash" "$paper_log" "$source_log" "$live_journal" "$paper_state" \
     "$old_binary" "$old_config" "$old_environment" "$target_binary_json" \
-    "$target_config_json" "$target_environment_json") || die "construct financial-era manifest"
+    "$target_config_json" "$target_environment_json" "$rehearsal_evidence_json") || die "construct financial-era manifest"
   atomic_manifest_json "$initial" prepared
 fi
 
@@ -370,6 +425,17 @@ if atomic != decimal.Decimal(value["fresh_bankroll"]): raise SystemExit("fresh b
   "$MANIFEST" "$membership_json" "$fresh_bankroll" || die "financial-era membership or bankroll identity changed"
 
 state=$(manifest_get state)
+if [[ "$state" == prepared && "$rollback_before_start" == false ]]; then
+  rehearsal_evidence_json=$(read_rehearsal_evidence) ||
+    die "financial-era rehearsal evidence was refused"
+  python3 -c 'import json,sys
+manifest=json.load(open(sys.argv[1],encoding="utf-8"))
+supplied=json.loads(sys.argv[2])
+if manifest.get("rehearsal_evidence") != supplied:
+    print("REHEARSAL_REFUSAL=prepared_evidence_unbound_or_changed",file=sys.stderr)
+    raise SystemExit(1)' "$MANIFEST" "$rehearsal_evidence_json" ||
+    die "financial-era prepared rehearsal binding was refused"
+fi
 complete_start=false
 if manifest_complete_start; then
   complete_start=true
