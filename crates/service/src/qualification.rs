@@ -557,13 +557,32 @@ struct CompletedFinancialFact {
     result: FinancialResult,
 }
 
+struct FinancialFactState {
+    cash: Decimal,
+    positions: Vec<OpenPosition>,
+    fills: Vec<FillRow>,
+    settlements: Vec<SettledMarketRow>,
+    last_completed: Option<EventSeq>,
+}
+
+impl FinancialFactState {
+    fn new(starting_bankroll: Decimal) -> Self {
+        Self {
+            cash: starting_bankroll,
+            positions: Vec::new(),
+            fills: Vec::new(),
+            settlements: Vec::new(),
+            last_completed: None,
+        }
+    }
+}
+
 struct CausalFinancialState {
     cash: Decimal,
     positions: Vec<OpenPosition>,
     last_completed: Option<EventSeq>,
     completed_prepared: HashSet<EventSeq>,
     closed_fill_final_conditions: HashMap<u64, String>,
-    open_fill_finals: Vec<(u64, String)>,
 }
 
 struct RiskReplayContext<'a> {
@@ -665,18 +684,14 @@ async fn verify_qualification(
         ));
     }
 
-    let mut cash = start.starting_bankroll.to_decimal();
+    let mut financial = FinancialFactState::new(start.starting_bankroll.to_decimal());
     // `scan_paper_log` is the sole Prepared/Final state-machine validator. This map retains only
     // the already-validated payloads needed for the accounting and identity re-execution below.
     let mut prepared = BTreeMap::<(u64, String), &FinancialPayload>::new();
     let mut completed_fills = Vec::new();
-    let mut open_positions: Vec<OpenPosition> = Vec::new();
-    let mut financial_fills = Vec::<FillRow>::new();
-    let mut financial_settlements = Vec::<SettledMarketRow>::new();
     let mut completed_financial_facts = Vec::<CompletedFinancialFact>::new();
     let mut economic_hashes = Vec::new();
     let mut financial_final_count = 0usize;
-    let mut replayed_financial_prefix = None;
     let mut membership = start.membership.iter().copied().collect::<HashSet<_>>();
     if membership.len() != start.membership.len() {
         return insufficient("QualificationStarted membership contains duplicates");
@@ -708,11 +723,11 @@ async fn verify_qualification(
                             operation,
                             economic,
                             &RiskReplayContext {
-                                cash,
-                                positions: &open_positions,
-                                fills: &financial_fills,
-                                settlements: &financial_settlements,
-                                last_completed: replayed_financial_prefix,
+                                cash: financial.cash,
+                                positions: &financial.positions,
+                                fills: &financial.fills,
+                                settlements: &financial.settlements,
+                                last_completed: financial.last_completed,
                                 start_receipt,
                                 paper_prefix: &frames[start_index..frame_index],
                                 source: &source_observations,
@@ -742,6 +757,7 @@ async fn verify_qualification(
                         "FinancialFinal references an unknown Prepared receipt".to_owned(),
                     )
                 })?;
+                let cash_before = financial.cash;
                 match (prepared_payload, result) {
                     (
                         FinancialPayload::Fill {
@@ -766,43 +782,6 @@ async fn verify_qualification(
                                 "Financial Fill Final differs from Prepared economics",
                             );
                         }
-                        cash = cash
-                            .checked_sub(canonical.principal.to_decimal())
-                            .and_then(|value| value.checked_sub(canonical.fee.to_decimal()))
-                            .ok_or_else(|| {
-                                QualificationError::InsufficientEvidence(
-                                    "paper cash underflow while replaying Fill Final".to_owned(),
-                                )
-                            })?;
-                        if canonical.bankroll != cash {
-                            return insufficient("Fill Final bankroll differs from exact replay");
-                        }
-                        apply_fill_position(&mut open_positions, economic, canonical.quantity)?;
-                        let idempotency_key =
-                            pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
-                                &TraderId(operation.leader_wallet).to_string(),
-                                &operation.source_trade_id.0,
-                                &economic.market.market_id,
-                                u16::from(economic.market.outcome_index),
-                                economic.market.side,
-                                operation.observed_at_bucket,
-                            );
-                        financial_fills.push(FillRow {
-                            idempotency_key,
-                            market_id: MarketId(VenueMarketId(economic.market.market_id.clone())),
-                            outcome_id: OutcomeId(u16::from(economic.market.outcome_index)),
-                            side: economic.market.side,
-                            quantity: canonical.quantity,
-                            fill_price: canonical.fill_price,
-                            principal: canonical.principal,
-                            fee: canonical.fee,
-                            event_seq: prepared_receipt.sequence,
-                            prepared_seq: prepared_receipt.sequence,
-                            source_receipt_seq: economic
-                                .observation
-                                .as_ref()
-                                .map(|value| value.source_receipt.sequence),
-                        });
                         let observation = economic.observation.as_ref().ok_or_else(|| {
                             QualificationError::InsufficientEvidence(
                                 "Fill Prepared lacks source observation receipt".to_owned(),
@@ -879,83 +858,44 @@ async fn verify_qualification(
                                 "Resolution Final settlement time differs from its source envelope",
                             );
                         }
-                        let payouts =
-                            BinaryPayoutVector::from_canonical_json(payout_by_outcome_index_json)
-                                .map_err(|error| {
-                                QualificationError::InsufficientEvidence(format!(
-                                    "resolution payout decode: {error}"
-                                ))
-                            })?;
-                        let decimals = payouts.decimals();
-                        let payout =
-                            BinaryPayout::new(decimals[0], decimals[1]).map_err(|error| {
-                                QualificationError::InsufficientEvidence(format!(
-                                    "resolution payout vector: {error}"
-                                ))
-                            })?;
-                        let mut by_outcome = BTreeMap::<u16, ShareAmount>::new();
-                        for position in open_positions
-                            .iter()
-                            .filter(|position| position.condition_id == condition_id.0)
-                        {
-                            let entry = by_outcome
-                                .entry(u16::from(position.outcome_index))
-                                .or_insert(ShareAmount::ZERO);
-                            *entry = entry
-                                .checked_add(ShareAmount::from_atomic(position.shares_atomic))
-                                .map_err(|_| {
-                                    QualificationError::InsufficientEvidence(
-                                        "resolution quantity overflow".to_owned(),
-                                    )
-                                })?;
-                        }
-                        let expected_credit = aggregate_resolution_credit(
-                            &by_outcome.into_iter().collect::<Vec<_>>(),
-                            &payout,
-                        )
-                        .map_err(|error| {
-                            QualificationError::InsufficientEvidence(format!(
-                                "resolution credit arithmetic: {error}"
-                            ))
-                        })?;
-                        if canonical.credit != expected_credit {
-                            return insufficient(
-                                "Resolution Final credit differs from exact replay",
-                            );
-                        }
-                        cash = cash
-                            .checked_add(expected_credit.to_decimal())
-                            .ok_or_else(|| {
-                                QualificationError::InsufficientEvidence(
-                                    "paper cash overflow while replaying Resolution Final"
-                                        .to_owned(),
-                                )
-                            })?;
-                        if canonical.bankroll != cash {
-                            return insufficient(
-                                "Resolution Final bankroll differs from exact replay",
-                            );
-                        }
-                        financial_settlements.push(SettledMarketRow {
-                            market_id: MarketId(VenueMarketId(condition_id.0.clone())),
-                            outcome_prices_json: payout_by_outcome_index_json.clone(),
-                            credit_applied: expected_credit.to_decimal(),
-                            settled_at_unix,
-                            prepared_seq: Some(prepared_receipt.sequence),
-                            source_receipt_seq: Some(resolution_source_receipt.sequence),
-                        });
-                        open_positions.retain(|position| position.condition_id != condition_id.0);
                     }
                     _ => return insufficient("Financial Prepared/Final kinds disagree"),
                 }
-                completed_financial_facts.push(CompletedFinancialFact {
+                let fact = CompletedFinancialFact {
                     prepared_receipt: *prepared_receipt,
                     final_receipt: frame.receipt,
                     payload: prepared_payload.clone(),
                     result: result.clone(),
-                });
+                };
+                financial = reduce_financial_facts(
+                    financial,
+                    std::slice::from_ref(&fact),
+                    |_| true,
+                    |_| Ok(true),
+                )?;
+                match result {
+                    FinancialResult::Fill { canonical } => {
+                        if canonical.bankroll != financial.cash {
+                            return insufficient("Fill Final bankroll differs from exact replay");
+                        }
+                    }
+                    FinancialResult::Resolution { canonical } => {
+                        if cash_before.checked_add(canonical.credit.to_decimal())
+                            != Some(financial.cash)
+                        {
+                            return insufficient(
+                                "Resolution Final credit differs from exact replay",
+                            );
+                        }
+                        if canonical.bankroll != financial.cash {
+                            return insufficient(
+                                "Resolution Final bankroll differs from exact replay",
+                            );
+                        }
+                    }
+                }
+                completed_financial_facts.push(fact);
                 financial_final_count = financial_final_count.saturating_add(1);
-                replayed_financial_prefix = Some(prepared_receipt.sequence);
             }
             PaperLogRecord::MembershipChanged {
                 reason,
@@ -1149,7 +1089,7 @@ async fn verify_qualification(
     if p95.is_none_or(|value| value > thresholds.maximum_p95_delay_ms) {
         failures.push("paper p95 copy delay is absent or above budget".to_owned());
     }
-    if !open_positions.is_empty() {
+    if !financial.positions.is_empty() {
         failures.push("paper positions remain open at the sealed financial prefix".to_owned());
     }
 
@@ -1832,6 +1772,7 @@ fn decision_rows_from_source_observations(
         start_sequence,
         sealed_sequence,
         observations,
+        &source_universe,
         &complete_reads,
     )?;
     let required_by_trade = required
@@ -2344,9 +2285,9 @@ fn decision_keys_from_source_observations(
     start_sequence: Option<EventSeq>,
     sealed_sequence: EventSeq,
     observations: &BTreeMap<u64, SourceObservation>,
+    source_universe: &HashMap<pe_core_types::SourceTradeId, u64>,
     complete_reads: &[CompleteActivityReadScope],
 ) -> Result<Vec<(u64, pe_core_types::SourceTradeId, String)>, QualificationError> {
-    let first_observations = source_trade_universe(sealed_sequence, observations)?;
     let in_prefix = complete_reads
         .iter()
         .filter(|read| {
@@ -2367,7 +2308,7 @@ fn decision_keys_from_source_observations(
                 })
         })
         .collect::<HashSet<_>>();
-    let mut first_observations = first_observations;
+    let mut first_observations = source_universe.clone();
     for read in &in_prefix {
         for (source_trade_id, receipt) in &read.decisions {
             let Some(receipt) = receipt.filter(|receipt| receipt.sequence <= sealed_sequence)
@@ -4008,6 +3949,129 @@ fn apply_fill_position(
     Ok(())
 }
 
+fn reduce_financial_facts(
+    mut state: FinancialFactState,
+    facts: &[CompletedFinancialFact],
+    in_prefix: impl Fn(&CompletedFinancialFact) -> bool,
+    is_causal: impl Fn(&CompletedFinancialFact) -> Result<bool, QualificationError>,
+) -> Result<FinancialFactState, QualificationError> {
+    for fact in facts {
+        if !in_prefix(fact) || !is_causal(fact)? {
+            continue;
+        }
+        match (&fact.payload, &fact.result) {
+            (
+                FinancialPayload::Fill {
+                    operation,
+                    economic,
+                },
+                FinancialResult::Fill { canonical },
+            ) => {
+                state.cash = state
+                    .cash
+                    .checked_sub(canonical.principal.to_decimal())
+                    .and_then(|cash| cash.checked_sub(canonical.fee.to_decimal()))
+                    .ok_or_else(|| {
+                        QualificationError::InsufficientEvidence(
+                            "paper cash underflow while replaying Fill Final".to_owned(),
+                        )
+                    })?;
+                apply_fill_position(&mut state.positions, economic, canonical.quantity)?;
+                state.fills.push(FillRow {
+                    idempotency_key:
+                        pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                            &TraderId(operation.leader_wallet).to_string(),
+                            &operation.source_trade_id.0,
+                            &economic.market.market_id,
+                            u16::from(economic.market.outcome_index),
+                            economic.market.side,
+                            operation.observed_at_bucket,
+                        ),
+                    market_id: MarketId(VenueMarketId(economic.market.market_id.clone())),
+                    outcome_id: OutcomeId(u16::from(economic.market.outcome_index)),
+                    side: economic.market.side,
+                    quantity: canonical.quantity,
+                    fill_price: canonical.fill_price,
+                    principal: canonical.principal,
+                    fee: canonical.fee,
+                    event_seq: fact.prepared_receipt.sequence,
+                    prepared_seq: fact.prepared_receipt.sequence,
+                    source_receipt_seq: economic
+                        .observation
+                        .as_ref()
+                        .map(|observation| observation.source_receipt.sequence),
+                });
+            }
+            (
+                FinancialPayload::Resolution {
+                    condition_id,
+                    payout_by_outcome_index_json,
+                    resolution_source_receipt,
+                },
+                FinancialResult::Resolution { canonical },
+            ) => {
+                let payouts = BinaryPayoutVector::from_canonical_json(payout_by_outcome_index_json)
+                    .map_err(|error| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "resolution payout decode: {error}"
+                        ))
+                    })?;
+                let decimals = payouts.decimals();
+                let payout = BinaryPayout::new(decimals[0], decimals[1]).map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "resolution payout vector: {error}"
+                    ))
+                })?;
+                let mut by_outcome = BTreeMap::<u16, ShareAmount>::new();
+                for position in state
+                    .positions
+                    .iter()
+                    .filter(|position| position.condition_id == condition_id.0)
+                {
+                    let entry = by_outcome
+                        .entry(u16::from(position.outcome_index))
+                        .or_insert(ShareAmount::ZERO);
+                    *entry = entry
+                        .checked_add(ShareAmount::from_atomic(position.shares_atomic))
+                        .map_err(|_| {
+                            QualificationError::InsufficientEvidence(
+                                "resolution quantity overflow".to_owned(),
+                            )
+                        })?;
+                }
+                let credit = aggregate_resolution_credit(
+                    &by_outcome.into_iter().collect::<Vec<_>>(),
+                    &payout,
+                )
+                .map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "resolution credit arithmetic: {error}"
+                    ))
+                })?;
+                state.cash = state.cash.checked_add(credit.to_decimal()).ok_or_else(|| {
+                    QualificationError::InsufficientEvidence(
+                        "paper cash overflow while replaying Resolution Final".to_owned(),
+                    )
+                })?;
+                state.settlements.push(SettledMarketRow {
+                    market_id: MarketId(VenueMarketId(condition_id.0.clone())),
+                    outcome_prices_json: payout_by_outcome_index_json.clone(),
+                    credit_applied: credit.to_decimal(),
+                    settled_at_unix: canonical.settled_at_unix,
+                    prepared_seq: Some(fact.prepared_receipt.sequence),
+                    source_receipt_seq: Some(resolution_source_receipt.sequence),
+                });
+                state
+                    .positions
+                    .retain(|position| position.condition_id != condition_id.0);
+            }
+            _ => return insufficient("Financial Prepared/Final kinds disagree"),
+        }
+        state.last_completed = Some(fact.prepared_receipt.sequence);
+    }
+    Ok(state)
+}
+
 fn causal_financial_state(
     starting_bankroll: Decimal,
     facts: &[CompletedFinancialFact],
@@ -4017,7 +4081,7 @@ fn causal_financial_state(
     let cutoff_ms = mark.cutoff_unix.checked_mul(1_000).ok_or_else(|| {
         QualificationError::InsufficientEvidence("PortfolioMark cutoff overflow".to_owned())
     })?;
-    let is_causal = |receipt: AppendReceipt| -> Result<bool, QualificationError> {
+    let receipt_is_causal = |receipt: AppendReceipt| -> Result<bool, QualificationError> {
         let observation = source
             .get(&receipt.sequence.0)
             .filter(|observation| observation.receipt == receipt)
@@ -4029,15 +4093,7 @@ fn causal_financial_state(
         Ok(receipt.sequence <= mark.boundary_receipt.sequence
             && observation.received_unix_ms < cutoff_ms)
     };
-
-    let mut state = CausalFinancialState {
-        cash: starting_bankroll,
-        positions: Vec::new(),
-        last_completed: None,
-        completed_prepared: HashSet::new(),
-        closed_fill_final_conditions: HashMap::new(),
-        open_fill_finals: Vec::new(),
-    };
+    let mut completed_prepared = HashSet::new();
     for fact in facts {
         let causal = match &fact.payload {
             FinancialPayload::Fill { economic, .. } => {
@@ -4046,106 +4102,57 @@ fn causal_financial_state(
                         "Financial Fill has no causal observation".to_owned(),
                     )
                 })?;
-                is_causal(observation.source_receipt)?
+                receipt_is_causal(observation.source_receipt)?
             }
             FinancialPayload::Resolution {
                 resolution_source_receipt,
                 ..
-            } => is_causal(*resolution_source_receipt)?,
+            } => receipt_is_causal(*resolution_source_receipt)?,
         };
-        if !causal {
-            continue;
+        if causal {
+            completed_prepared.insert(fact.prepared_receipt.sequence);
         }
+    }
+    let financial = reduce_financial_facts(
+        FinancialFactState::new(starting_bankroll),
+        facts,
+        |_| true,
+        |fact| Ok(completed_prepared.contains(&fact.prepared_receipt.sequence)),
+    )?;
+    let mut closed_fill_final_conditions = HashMap::new();
+    let mut open_fill_finals = Vec::new();
+    for fact in facts
+        .iter()
+        .filter(|fact| completed_prepared.contains(&fact.prepared_receipt.sequence))
+    {
         match (&fact.payload, &fact.result) {
-            (FinancialPayload::Fill { economic, .. }, FinancialResult::Fill { canonical }) => {
-                state.cash = state
-                    .cash
-                    .checked_sub(canonical.principal.to_decimal())
-                    .and_then(|cash| cash.checked_sub(canonical.fee.to_decimal()))
-                    .ok_or_else(|| {
-                        QualificationError::InsufficientEvidence(
-                            "causal mark cash underflow while replaying a fill".to_owned(),
-                        )
-                    })?;
-                apply_fill_position(&mut state.positions, economic, canonical.quantity)?;
-                state.open_fill_finals.push((
+            (FinancialPayload::Fill { economic, .. }, FinancialResult::Fill { .. }) => {
+                open_fill_finals.push((
                     fact.final_receipt.sequence.0,
                     economic.market.condition_id.0.clone(),
                 ));
             }
             (
-                FinancialPayload::Resolution {
-                    condition_id,
-                    payout_by_outcome_index_json,
-                    ..
-                },
+                FinancialPayload::Resolution { condition_id, .. },
                 FinancialResult::Resolution { .. },
             ) => {
-                let payouts = BinaryPayoutVector::from_canonical_json(payout_by_outcome_index_json)
-                    .map_err(|error| {
-                        QualificationError::InsufficientEvidence(format!(
-                            "causal mark resolution payout decode: {error}"
-                        ))
-                    })?;
-                let decimals = payouts.decimals();
-                let payout = BinaryPayout::new(decimals[0], decimals[1]).map_err(|error| {
-                    QualificationError::InsufficientEvidence(format!(
-                        "causal mark resolution payout vector: {error}"
-                    ))
-                })?;
-                let mut positions = BTreeMap::<u16, ShareAmount>::new();
-                for position in state
-                    .positions
-                    .iter()
-                    .filter(|position| position.condition_id == condition_id.0)
-                {
-                    let entry = positions
-                        .entry(u16::from(position.outcome_index))
-                        .or_insert(ShareAmount::ZERO);
-                    *entry = entry
-                        .checked_add(ShareAmount::from_atomic(position.shares_atomic))
-                        .map_err(|_| {
-                            QualificationError::InsufficientEvidence(
-                                "causal mark resolution quantity overflow".to_owned(),
-                            )
-                        })?;
-                }
-                let credit = aggregate_resolution_credit(
-                    &positions.into_iter().collect::<Vec<_>>(),
-                    &payout,
-                )
-                .map_err(|error| {
-                    QualificationError::InsufficientEvidence(format!(
-                        "causal mark resolution credit arithmetic: {error}"
-                    ))
-                })?;
-                state.cash = state.cash.checked_add(credit.to_decimal()).ok_or_else(|| {
-                    QualificationError::InsufficientEvidence(
-                        "causal mark resolution cash overflow".to_owned(),
-                    )
-                })?;
-                for (fill_sequence, fill_condition) in &state.open_fill_finals {
+                for (fill_sequence, fill_condition) in &open_fill_finals {
                     if fill_condition == &condition_id.0 {
-                        state
-                            .closed_fill_final_conditions
-                            .insert(*fill_sequence, fill_condition.clone());
+                        closed_fill_final_conditions.insert(*fill_sequence, fill_condition.clone());
                     }
                 }
-                state
-                    .open_fill_finals
-                    .retain(|(_, fill_condition)| fill_condition != &condition_id.0);
-                state
-                    .positions
-                    .retain(|position| position.condition_id != condition_id.0);
+                open_fill_finals.retain(|(_, fill_condition)| fill_condition != &condition_id.0);
             }
             _ => return insufficient("causal mark Prepared/Final kinds disagree"),
         }
-        state.last_completed = Some(fact.prepared_receipt.sequence);
-        state
-            .completed_prepared
-            .insert(fact.prepared_receipt.sequence);
     }
-    Ok(state)
+    Ok(CausalFinancialState {
+        cash: financial.cash,
+        positions: financial.positions,
+        last_completed: financial.last_completed,
+        completed_prepared,
+        closed_fill_final_conditions,
+    })
 }
 
 async fn verify_mark(
@@ -4475,107 +4482,17 @@ struct DeclineReplayContext<'a> {
     start_receipt: AppendReceipt,
 }
 
-struct DeclineFinancialState {
-    cash: Decimal,
-    positions: Vec<OpenPosition>,
-    fills: Vec<FillRow>,
-    settlements: Vec<SettledMarketRow>,
-    last_completed: Option<EventSeq>,
-}
-
 fn decline_financial_state(
     starting_bankroll: Decimal,
     facts: &[CompletedFinancialFact],
     financial_prefix: AppendReceipt,
-) -> Result<DeclineFinancialState, QualificationError> {
-    let mut state = DeclineFinancialState {
-        cash: starting_bankroll,
-        positions: Vec::new(),
-        fills: Vec::new(),
-        settlements: Vec::new(),
-        last_completed: None,
-    };
-    for fact in facts
-        .iter()
-        .filter(|fact| fact.final_receipt.sequence <= financial_prefix.sequence)
-    {
-        match (&fact.payload, &fact.result) {
-            (
-                FinancialPayload::Fill {
-                    operation,
-                    economic,
-                },
-                FinancialResult::Fill { canonical },
-            ) => {
-                state.cash = state
-                    .cash
-                    .checked_sub(canonical.principal.to_decimal())
-                    .and_then(|cash| cash.checked_sub(canonical.fee.to_decimal()))
-                    .ok_or_else(|| {
-                        QualificationError::InsufficientEvidence(
-                            "decline-prefix cash underflow while replaying Fill Final".to_owned(),
-                        )
-                    })?;
-                apply_fill_position(&mut state.positions, economic, canonical.quantity)?;
-                state.fills.push(FillRow {
-                    idempotency_key:
-                        pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
-                            &TraderId(operation.leader_wallet).to_string(),
-                            &operation.source_trade_id.0,
-                            &economic.market.market_id,
-                            u16::from(economic.market.outcome_index),
-                            economic.market.side,
-                            operation.observed_at_bucket,
-                        ),
-                    market_id: MarketId(VenueMarketId(economic.market.market_id.clone())),
-                    outcome_id: OutcomeId(u16::from(economic.market.outcome_index)),
-                    side: economic.market.side,
-                    quantity: canonical.quantity,
-                    fill_price: canonical.fill_price,
-                    principal: canonical.principal,
-                    fee: canonical.fee,
-                    event_seq: fact.prepared_receipt.sequence,
-                    prepared_seq: fact.prepared_receipt.sequence,
-                    source_receipt_seq: economic
-                        .observation
-                        .as_ref()
-                        .map(|observation| observation.source_receipt.sequence),
-                });
-            }
-            (
-                FinancialPayload::Resolution {
-                    condition_id,
-                    payout_by_outcome_index_json,
-                    resolution_source_receipt,
-                },
-                FinancialResult::Resolution { canonical },
-            ) => {
-                state.cash = state
-                    .cash
-                    .checked_add(canonical.credit.to_decimal())
-                    .ok_or_else(|| {
-                        QualificationError::InsufficientEvidence(
-                            "decline-prefix cash overflow while replaying Resolution Final"
-                                .to_owned(),
-                        )
-                    })?;
-                state.settlements.push(SettledMarketRow {
-                    market_id: MarketId(VenueMarketId(condition_id.0.clone())),
-                    outcome_prices_json: payout_by_outcome_index_json.clone(),
-                    credit_applied: canonical.credit.to_decimal(),
-                    settled_at_unix: canonical.settled_at_unix,
-                    prepared_seq: Some(fact.prepared_receipt.sequence),
-                    source_receipt_seq: Some(resolution_source_receipt.sequence),
-                });
-                state
-                    .positions
-                    .retain(|position| position.condition_id != condition_id.0);
-            }
-            _ => return insufficient("decline-prefix Prepared/Final kinds disagree"),
-        }
-        state.last_completed = Some(fact.prepared_receipt.sequence);
-    }
-    Ok(state)
+) -> Result<FinancialFactState, QualificationError> {
+    reduce_financial_facts(
+        FinancialFactState::new(starting_bankroll),
+        facts,
+        |fact| fact.final_receipt.sequence <= financial_prefix.sequence,
+        |_| Ok(true),
+    )
 }
 
 fn decline_paper_prefix<'a>(
@@ -7019,9 +6936,15 @@ mod tests {
             [target_id.clone()],
         );
 
-        let keys =
-            decision_keys_from_source_observations(None, EventSeq(2), &observations, &[read])
-                .unwrap();
+        let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            EventSeq(2),
+            &observations,
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
@@ -7085,9 +7008,15 @@ mod tests {
             [target_id],
         );
 
-        let keys =
-            decision_keys_from_source_observations(None, EventSeq(3), &observations, &[read])
-                .unwrap();
+        let source_universe = source_trade_universe(EventSeq(3), &observations).unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            EventSeq(3),
+            &observations,
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.row_count, 2);
@@ -7133,10 +7062,13 @@ mod tests {
         let target_id = expected.group_id.key().clone();
         let read = read_scope(100, pages, [target_id]);
 
+        let source_universe =
+            source_trade_universe(EventSeq(older_sequence), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
             None,
             EventSeq(older_sequence),
             &observations,
+            &source_universe,
             &[read],
         )
         .unwrap();
@@ -7192,10 +7124,12 @@ mod tests {
             [new_id.clone()],
         );
 
+        let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
             Some(EventSeq(1)),
             EventSeq(2),
             &observations,
+            &source_universe,
             &[pre_read, post_read],
         )
         .unwrap();
@@ -7342,9 +7276,16 @@ mod tests {
             )],
             [target_id.clone()],
         );
-        let keys =
-            decision_keys_from_source_observations(None, EventSeq(0), &observations, &[read])
-                .expect("valid complete activity read derives one decision key");
+        let source_universe = source_trade_universe(EventSeq(0), &observations)
+            .expect("valid source universe derives from the activity row");
+        let keys = decision_keys_from_source_observations(
+            None,
+            EventSeq(0),
+            &observations,
+            &source_universe,
+            &[read],
+        )
+        .expect("valid complete activity read derives one decision key");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
 
