@@ -1,8 +1,8 @@
-//! Durable paper risk evidence reducers and daily-mark validation (#545).
+//! Replayable paper/live risk-input composition and daily-mark validation (#545).
 //!
-//! The financial snapshot-to-`RiskSnapshot` composition is intentionally kept out until the
-//! exact `pe-paper-state::FinancialSnapshot` interface lands. These reducers are the independent
-//! log side of that composition and are usable at boot before producers start.
+//! These reducers combine the active financial snapshot with causal price, mark, PnL, exposure,
+//! and latency evidence. Missing, stale, conflicting, or incoherent evidence fails closed with a
+//! service-private diagnostic before strategy evaluation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -15,7 +15,6 @@ use pe_risk_engine::{
     latency_switch, nearest_rank_p95, pnl_bps,
 };
 use pe_source_polymarket_public::ClassifiedPricesHistory;
-use pe_strategy_winner_follow::RiskInputsUnavailable;
 use rust_decimal::Decimal;
 
 #[cfg(test)]
@@ -29,9 +28,37 @@ const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
 pub(crate) const MAX_HISTORICAL_MARK_AGE_SECS: i64 = 120;
 
+/// Service-private reason that replayable evidence could not produce a risk snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RiskInputsUnavailable {
+    #[error("financial snapshot sequence does not match the completed paper-log prefix")]
+    SnapshotSequenceMismatch,
+    #[error("the paper log has an unmatched FinancialPrepared record")]
+    UnmatchedPrepared,
+    #[error("a required position price is missing")]
+    PriceMissing,
+    #[error("a required position price is stale")]
+    PriceStale,
+    #[error("a required position price is from the future")]
+    PriceFuture,
+    #[error("position price evidence conflicts")]
+    PriceConflict,
+    #[error("the immediately preceding midnight mark is missing")]
+    MarkMissing,
+    #[error("the immediately preceding midnight mark is duplicated")]
+    MarkDuplicate,
+    #[error("the immediately preceding midnight mark is invalid")]
+    MarkInvalid,
+    #[error("the fixed qualification baseline is not positive")]
+    BaselineNonPositive,
+    #[error("exact risk arithmetic overflowed")]
+    Overflow,
+}
+
 /// Compatibility name for the shared live/paper zero-retry adapter.
 pub use crate::mark_prices::HistoricalMarkAdapter as BoundaryMarkFetcher;
 
+#[allow(private_interfaces)]
 #[derive(Debug, thiserror::Error)]
 pub enum BoundaryMarkError {
     #[error("historical mark transport is retryable: {0}")]
@@ -54,7 +81,7 @@ pub struct HistoricalMarkPrice {
 
 /// Select the latest unique sample at-or-before the cutoff from an already-recorded response.
 /// The caller owns transport retries and must append the response before calling this function.
-pub fn historical_mark_price(
+pub(crate) fn historical_mark_price(
     classified: &ClassifiedPricesHistory,
     cutoff_unix: i64,
     receipt: AppendReceipt,
@@ -171,7 +198,7 @@ pub fn latest_completed_prepared(era: &PaperEra) -> Option<EventSeq> {
 
 /// Completed financial facts whose source observation is inside the boundary prefix and was
 /// received strictly before the cutoff. This is the shared causal filter for historical marks.
-pub fn completed_prepared_before_boundary(
+pub(crate) fn completed_prepared_before_boundary(
     era: &PaperEra,
     source_log_path: &Path,
     cutoff_unix: i64,
@@ -226,7 +253,7 @@ pub fn completed_prepared_before_boundary(
 
 /// Compose exact paper PnL/latency into the existing proposal snapshot. Exposure, proposal, and cap
 /// fields are preserved from `base`; zeroed proposal facts are never manufactured here.
-pub fn build_paper_risk_snapshot(
+pub(crate) fn build_paper_risk_snapshot(
     base: &RiskSnapshot,
     snapshot: &FinancialSnapshot,
     era: &PaperEra,
@@ -319,7 +346,7 @@ fn risk_math_error(error: RiskMathError) -> RiskInputsUnavailable {
 
 /// Resolve the immediately preceding required UTC-midnight equity. Before the first completed
 /// midnight following Start, `None` means the fixed starting bankroll is the baseline.
-pub fn preceding_midnight_equity(
+pub(crate) fn preceding_midnight_equity(
     era: &PaperEra,
     now_unix: i64,
 ) -> Result<Option<Decimal>, RiskInputsUnavailable> {
@@ -399,7 +426,7 @@ impl LatencySamples {
 
 /// Derive paper latency from each Fill Final envelope's `received_at` minus its Prepared
 /// observation timestamp. Completion belongs to the hour containing the Final endpoint.
-pub fn paper_latency_samples(
+pub(crate) fn paper_latency_samples(
     era: &PaperEra,
     source_log_path: &Path,
     now_unix: i64,
@@ -650,6 +677,62 @@ mod tests {
         PaperEra {
             start: Some((receipt(1, 1), start)),
             frames,
+        }
+    }
+
+    /// PASS: moving risk-input diagnostics behind the service boundary preserves every display
+    /// string previously carried by the strategy error and embedded in durable decision evidence.
+    #[test]
+    fn risk_input_diagnostic_display_is_stable() {
+        let cases = [
+            (
+                RiskInputsUnavailable::SnapshotSequenceMismatch,
+                "financial snapshot sequence does not match the completed paper-log prefix",
+            ),
+            (
+                RiskInputsUnavailable::UnmatchedPrepared,
+                "the paper log has an unmatched FinancialPrepared record",
+            ),
+            (
+                RiskInputsUnavailable::PriceMissing,
+                "a required position price is missing",
+            ),
+            (
+                RiskInputsUnavailable::PriceStale,
+                "a required position price is stale",
+            ),
+            (
+                RiskInputsUnavailable::PriceFuture,
+                "a required position price is from the future",
+            ),
+            (
+                RiskInputsUnavailable::PriceConflict,
+                "position price evidence conflicts",
+            ),
+            (
+                RiskInputsUnavailable::MarkMissing,
+                "the immediately preceding midnight mark is missing",
+            ),
+            (
+                RiskInputsUnavailable::MarkDuplicate,
+                "the immediately preceding midnight mark is duplicated",
+            ),
+            (
+                RiskInputsUnavailable::MarkInvalid,
+                "the immediately preceding midnight mark is invalid",
+            ),
+            (
+                RiskInputsUnavailable::BaselineNonPositive,
+                "the fixed qualification baseline is not positive",
+            ),
+            (
+                RiskInputsUnavailable::Overflow,
+                "exact risk arithmetic overflowed",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
         }
     }
 

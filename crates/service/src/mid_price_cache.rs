@@ -22,13 +22,13 @@ use pe_source_polymarket_public::{
     GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
     GammaMarketsClient, MarketFilter, MetadataPageEvidence, PageFetcher, ReqwestFetcher,
 };
-use pe_strategy_winner_follow::RiskInputsUnavailable;
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::activity_ingest::SourceLogHandle;
+use crate::risk_inputs::RiskInputsUnavailable;
 
 /// How long a cached mid stays fresh before a refetch.
 const TTL: Duration = Duration::from_secs(60);
@@ -177,7 +177,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
 
     /// Complete, fresh outcome prices for entry risk. Unlike the display methods, this rejects the
     /// entire request when any requested outcome lacks one unambiguous durable observation.
-    pub async fn fetch_mids_strict(
+    pub(crate) async fn fetch_mids_strict(
         &self,
         ids: &[MarketOutcomeId],
     ) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {

@@ -37,7 +37,7 @@ use pe_source_polymarket_public::{
     PricePoint, ReconciliationFetcher, fetch_complete_positions, parse_clob_market,
 };
 use pe_strategy_winner_follow::{
-    ExecutionMode, RiskInputsUnavailable, SizingMode, WinnerFollowError, WinnerFollowStrategy,
+    ExecutionMode, SizingMode, WinnerFollowError, WinnerFollowStrategy,
 };
 use pe_venue_polymarket::{
     BuySizing, CustodyKind, DecodedOrderFill, LadderError, MatchedReceipt, ReceiptError,
@@ -75,6 +75,7 @@ use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
     HaltState, RiskHaltOwner, active_risk_halts, paper_era, scan_paper_log,
 };
+use crate::risk_inputs::RiskInputsUnavailable;
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::supabase_reader::auth_token;
 
@@ -1148,8 +1149,9 @@ async fn process_target(
     {
         Ok(risk) => risk,
         Err(reason) => {
-            let decline = WinnerFollowError::RiskInputsUnavailable(reason);
-            warn!(account_id = %target.account_id, decline = %decline, "live risk inputs unavailable; seed paused");
+            let decline = WinnerFollowError::RiskInputsUnavailable;
+            let report = format!("{decline}: {reason}");
+            warn!(account_id = %target.account_id, decline = %report, "live risk inputs unavailable; seed paused");
             return Ok(PassControl::StopSeed);
         }
     };
@@ -1253,8 +1255,9 @@ async fn process_target(
     {
         Ok(risk) => risk,
         Err(reason) => {
-            let decline = WinnerFollowError::RiskInputsUnavailable(reason);
-            warn!(account_id = %target.account_id, decline = %decline, "live risk inputs unavailable; seed paused");
+            let decline = WinnerFollowError::RiskInputsUnavailable;
+            let report = format!("{decline}: {reason}");
+            warn!(account_id = %target.account_id, decline = %report, "live risk inputs unavailable; seed paused");
             return Ok(PassControl::StopSeed);
         }
     };
@@ -1473,7 +1476,7 @@ fn live_kelly_share_allocator<'a>(
             WinnerFollowError::ShadowMode
             | WinnerFollowError::FlipNotApproved
             | WinnerFollowError::Blocked(_)
-            | WinnerFollowError::RiskInputsUnavailable(_)
+            | WinnerFollowError::RiskInputsUnavailable
             | WinnerFollowError::KellySizing(_) => LadderError::KellySizing,
         })?;
         ShareAmount::from_whole(intent.contracts.0).map_err(|_| LadderError::KellySizing)
@@ -1916,7 +1919,7 @@ fn winner_follow_terminal_reason(error: &WinnerFollowError) -> &'static str {
         WinnerFollowError::FlipNotApproved => "flip_not_approved",
         WinnerFollowError::NoEdge => "no_edge",
         WinnerFollowError::Blocked(_) => "risk_blocked",
-        WinnerFollowError::RiskInputsUnavailable(_) => "risk_inputs_unavailable",
+        WinnerFollowError::RiskInputsUnavailable => "risk_inputs_unavailable",
         WinnerFollowError::KellySizing(_) => "kelly_sizing_invalid",
     }
 }

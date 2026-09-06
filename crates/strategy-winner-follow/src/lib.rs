@@ -13,9 +13,7 @@ pub mod evaluate;
 pub mod mode;
 
 pub use config::{PerTradeCap, SizingMode, WinnerFollowConfig};
-pub use error::{
-    KellyErrorAudit, RiskInputsUnavailable, WinnerFollowDeclineAudit, WinnerFollowError,
-};
+pub use error::{KellyErrorAudit, WinnerFollowDeclineAudit, WinnerFollowError};
 pub use evaluate::{
     OrganicCanaryOrder, OrganicCanaryPolicy, OrganicDecisionProof, WinnerFollowStrategy,
     build_idempotency_key, organic_decision_proof_hash,
