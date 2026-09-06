@@ -21,6 +21,7 @@ use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 #[cfg(test)]
 use pe_source_polymarket_public::GAMMA_BATCH_LIMIT_PARAM;
 use pe_source_polymarket_public::{
+    FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaOpenConditionRequest, MarketFilter,
     MetadataPageEvidence, PageFetcher, ReqwestFetcher,
 };
@@ -181,6 +182,209 @@ pub(crate) fn classify_strict_prices(
         );
     }
     Ok(output)
+}
+
+/// The retained source-log fields needed to replay one strict Gamma price attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedPriceAttempt {
+    pub payload: Vec<u8>,
+    pub received_unix_ms: i64,
+    pub source_id: String,
+    pub schema_version: u32,
+    pub parser_version: u32,
+    pub content_type: ContentType,
+}
+
+/// One typed failure contract shared by qualification and ordinary-live strict price replay.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RiskPriceReplayError {
+    #[error("risk price reconstruction unavailable: {0}")]
+    Unavailable(#[source] RiskInputsUnavailable),
+    #[error("risk price evidence is invalid: {0}")]
+    Insufficient(String),
+}
+
+/// Rebuild strict current-position prices from only the recorded acquisition receipts.
+///
+/// The caller supplies the receipt lookup because qualification owns a sealed in-memory source
+/// prefix while ordinary-live replay reads the handful of referenced frames on demand.
+pub(crate) async fn replay_strict_risk_prices<L>(
+    ids: &[MarketOutcomeId],
+    price_receipts: &[AppendReceipt],
+    evaluated_at_unix_ms: i64,
+    mut lookup: L,
+) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskPriceReplayError>
+where
+    L: FnMut(AppendReceipt) -> Result<RecordedPriceAttempt, RiskPriceReplayError>,
+{
+    if price_receipts
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
+        return Err(RiskPriceReplayError::Insufficient(
+            "risk price receipts are not sorted and deduplicated".to_owned(),
+        ));
+    }
+    if ids.is_empty() {
+        return if price_receipts.is_empty() {
+            Ok(BTreeMap::new())
+        } else {
+            Err(RiskPriceReplayError::Insufficient(
+                "risk snapshot without positions records price receipts".to_owned(),
+            ))
+        };
+    }
+    let wanted = ids
+        .iter()
+        .map(|id| (id.market().clone(), id.outcome()))
+        .collect::<HashSet<_>>();
+    if wanted.len() != ids.len() {
+        return Err(RiskPriceReplayError::Insufficient(
+            "risk snapshot contains duplicate open positions".to_owned(),
+        ));
+    }
+    let wanted_markets = wanted
+        .iter()
+        .map(|(market, _)| market.clone())
+        .collect::<HashSet<_>>();
+    let mut covered_markets = HashSet::new();
+    let mut entries = HashMap::<MarketId, StrictPriceInput>::new();
+    let evaluated_at_unix_ms = i128::from(evaluated_at_unix_ms);
+
+    for receipt in price_receipts {
+        let observation = lookup(*receipt)?;
+        if observation.source_id != GAMMA_MARKETS_SOURCE_ID
+            || observation.schema_version != GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION
+            || observation.parser_version != GAMMA_PRICE_ATTEMPT_PARSER_VERSION
+            || observation.content_type != ContentType::Json
+        {
+            return Err(RiskPriceReplayError::Insufficient(
+                "risk price receipt has the wrong Gamma source contract".to_owned(),
+            ));
+        }
+        classify_strict_price_time(
+            i128::from(observation.received_unix_ms),
+            evaluated_at_unix_ms,
+        )
+        .map_err(RiskPriceReplayError::Unavailable)?;
+        let record = serde_json::from_slice::<GammaPriceAttemptRecord>(&observation.payload)
+            .map_err(|error| {
+                RiskPriceReplayError::Insufficient(format!(
+                    "risk Gamma acquisition record failed to decode: {error}"
+                ))
+            })?;
+        let (request_url, page) = match record {
+            GammaPriceAttemptRecord::Page {
+                evidence,
+                payload,
+                usable,
+            } => {
+                if evidence.source_id.0 != GAMMA_MARKETS_SOURCE_ID
+                    || evidence.schema_version != GAMMA_MARKETS_SCHEMA_VERSION
+                    || evidence.parser_version != GAMMA_MARKETS_PARSER_VERSION
+                    || evidence.raw_page_hash != blake3::hash(&payload).to_hex().to_string()
+                {
+                    return Err(RiskPriceReplayError::Insufficient(
+                        "risk Gamma page metadata does not bind its raw response".to_owned(),
+                    ));
+                }
+                let canonical = serde_json::from_slice::<serde_json::Value>(&payload)
+                    .and_then(|value| serde_json::to_vec(&value))
+                    .unwrap_or_else(|_| payload.clone());
+                if evidence.canonical_page_hash != blake3::hash(&canonical).to_hex().to_string() {
+                    return Err(RiskPriceReplayError::Insufficient(
+                        "risk Gamma page metadata does not bind its canonical response".to_owned(),
+                    ));
+                }
+                (evidence.request_url, usable.then_some(payload))
+            }
+            GammaPriceAttemptRecord::Failure {
+                request_url,
+                error: _,
+            } => (request_url, None),
+        };
+        let request = GammaOpenConditionRequest::parse(&request_url).ok_or_else(|| {
+            RiskPriceReplayError::Insufficient(
+                "risk Gamma acquisition has an invalid request identity".to_owned(),
+            )
+        })?;
+        let covered = request
+            .condition_ids
+            .iter()
+            .filter_map(|condition_id| {
+                let market = MarketId(pe_core_types::VenueMarketId(condition_id.clone()));
+                wanted_markets.contains(&market).then_some(market)
+            })
+            .collect::<Vec<_>>();
+        if covered.is_empty() {
+            return Err(RiskPriceReplayError::Insufficient(
+                "risk price receipt was not consumed by an open position".to_owned(),
+            ));
+        }
+        covered_markets.extend(covered);
+        let Some(payload) = page else {
+            continue;
+        };
+        let replayed = GammaMarketsClient::new(
+            request.base_url,
+            FixtureFetcher::new(HashMap::from([(request_url.clone(), payload.clone())])),
+        )
+        .with_batch_size(request.condition_ids.len())
+        .fetch_markets_with_pages(&request.condition_ids, MarketFilter::OpenOnly)
+        .await
+        .map_err(|error| {
+            RiskPriceReplayError::Insufficient(format!(
+                "risk Gamma production parser could not replay its recorded response: {error}"
+            ))
+        })?;
+        if replayed.pages.len() != 1
+            || replayed.pages[0].0.request_url != request_url
+            || replayed.pages[0].1 != payload
+        {
+            return Err(RiskPriceReplayError::Insufficient(
+                "risk Gamma replay differs from its recorded request and response".to_owned(),
+            ));
+        }
+        let conflicting = replayed
+            .conflicting_condition_ids
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for row in replayed.markets.markets.into_values() {
+            let market = MarketId(pe_core_types::VenueMarketId(row.condition_id.clone()));
+            if !wanted_markets.contains(&market) {
+                continue;
+            }
+            let strict_mids = row.strict_outcome_prices;
+            if let Some(existing) = entries.get_mut(&market) {
+                existing.conflicting = existing.conflicting
+                    || conflicting.contains(&row.condition_id)
+                    || existing.strict_mids != strict_mids;
+                existing.strict_mids = strict_mids;
+                existing.observed_at_unix_ms = i128::from(observation.received_unix_ms);
+                existing.receipt = *receipt;
+            } else {
+                entries.insert(
+                    market,
+                    StrictPriceInput {
+                        strict_mids,
+                        observed_at_unix_ms: i128::from(observation.received_unix_ms),
+                        receipt: *receipt,
+                        conflicting: conflicting.contains(&row.condition_id),
+                    },
+                );
+            }
+        }
+    }
+    if wanted_markets
+        .iter()
+        .any(|market| !covered_markets.contains(market))
+    {
+        return Err(RiskPriceReplayError::Insufficient(
+            "risk price attempt has no consulted page for an open position".to_owned(),
+        ));
+    }
+    classify_strict_prices(ids, evaluated_at_unix_ms, &entries)
+        .map_err(RiskPriceReplayError::Unavailable)
 }
 
 /// One strict price acquisition, including the evidence available when validation fails.

@@ -118,6 +118,14 @@ impl ScanState {
         }
     }
 
+    pub(crate) fn at_frame(sequence: EventSeq, previous_hash: Hash, byte_offset: u64) -> Self {
+        Self {
+            next_sequence: sequence.0,
+            previous_hash,
+            physical_tail: byte_offset,
+        }
+    }
+
     pub(crate) fn physical_tail(&self) -> u64 {
         self.physical_tail
     }
