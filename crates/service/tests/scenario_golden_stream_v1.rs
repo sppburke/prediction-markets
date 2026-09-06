@@ -1420,49 +1420,6 @@ fn derive_golden_start(
     serde_json::from_str(&preparation).unwrap()
 }
 
-fn restore_golden_membership_validations(
-    state_path: &std::path::Path,
-    paper: &PaperStateDb,
-    wallets: &[WalletAddress],
-    recorded_at_unix: i64,
-) {
-    let connection = rusqlite::Connection::open(state_path).unwrap();
-    for wallet in wallets {
-        let anchor = paper.position_anchors(wallet).unwrap().pop().unwrap();
-        connection
-            .execute(
-                "INSERT INTO position_validations \
-                     (wallet_hex, ledger_hash, positions_proof_hash, activity_bounds_json, \
-                      source_log_generation, proof_json, recorded_at_unix) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT(wallet_hex) DO UPDATE SET \
-                    ledger_hash = excluded.ledger_hash, \
-                    positions_proof_hash = excluded.positions_proof_hash, \
-                    activity_bounds_json = excluded.activity_bounds_json, \
-                    source_log_generation = excluded.source_log_generation, \
-                    proof_json = excluded.proof_json, \
-                    recorded_at_unix = excluded.recorded_at_unix",
-                rusqlite::params![
-                    wallet.to_string(),
-                    anchor.ledger_hash_after,
-                    format!("golden-empty-{wallet}"),
-                    "[]",
-                    "golden-stream-v1",
-                    anchor.proof_json,
-                    recorded_at_unix,
-                ],
-            )
-            .unwrap();
-    }
-    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = connection
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .unwrap();
-    assert_eq!(busy, 0);
-    assert_eq!(log_frames, checkpointed_frames);
-}
-
 async fn resolve_golden_trade(
     control_tx: &mpsc::Sender<OrchestratorControl>,
     hooks: &ScenarioHooks,
@@ -2137,7 +2094,6 @@ async fn golden_source_stream_replays_exact_economic_core() {
     control.await.unwrap();
     drop(source_log);
     coordinator.await.unwrap();
-    restore_golden_membership_validations(&state_path, &paper, &wallets, start_unix);
     assert!(paper.open_decision_pending().unwrap().is_empty());
     let sealed_era = paper_era(scan_paper_log(&paper_path).unwrap());
     let completion = qualification_completion(&sealed_era).unwrap();

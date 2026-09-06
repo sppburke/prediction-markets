@@ -17,22 +17,22 @@ use tracing::warn;
 use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::bucket_commit::AnchorInstallError;
 use crate::orchestrator_control::OrchestratorControl;
-use crate::paper_recovery::MembershipChange;
+use crate::paper_recovery::{
+    CapacityMembershipArtifact, KnockoutCausalArtifact, MembershipAdmissionArtifact,
+    MembershipAdmissionReceipt, MembershipChange, MembershipProofManifest, MembershipReason,
+    RankingMembershipArtifact, SealedKnockoutEvidence,
+};
 use crate::position_seeder::{
     AnchorInstall, CausalPositionError, CausalPositionValidator, is_deferred_causal_position_error,
 };
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
-const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
-const CAPACITY_CONFIG_SCHEMA_VERSION: u32 = 1;
-const CAPACITY_CONFIG_PARSER_VERSION: u32 = 1;
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct CapacityConfigObservation {
-    generation: u64,
-    target: u64,
-}
+pub(crate) const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
+pub(crate) const RANKING_MEMBERSHIP_SOURCE_ID: &str = "pe-service.watchlist-ranking";
+pub(crate) const MEMBERSHIP_ADMISSION_SOURCE_ID: &str = "pe-service.watchlist-admission";
+pub(crate) const KNOCKOUT_CAUSAL_SOURCE_ID: &str = "pe-service.watchlist-knockout";
+pub(crate) const MEMBERSHIP_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MEMBERSHIP_ARTIFACT_PARSER_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
@@ -58,14 +58,16 @@ pub enum AdmissionError {
     PaperState(#[from] pe_paper_state::PaperStateError),
     #[error("anchor refresh requires a causal position validator")]
     PositionValidatorUnavailable,
-    #[error("capacity publication requires the synchronized source-log handle")]
-    CapacitySourceLogUnavailable,
-    #[error("encode accepted capacity configuration: {0}")]
-    CapacityConfigEncoding(#[source] serde_json::Error),
+    #[error("membership publication requires the synchronized source-log handle")]
+    MembershipSourceLogUnavailable,
+    #[error("encode immutable membership artifact: {0}")]
+    MembershipArtifactEncoding(#[source] serde_json::Error),
     #[error("accepted capacity target {target} cannot be represented durably")]
     CapacityTargetOverflow { target: usize },
-    #[error("record accepted capacity configuration: {0}")]
-    CapacitySourceLog(#[from] SourceLogHandleError),
+    #[error("record immutable membership artifact: {0}")]
+    MembershipSourceLog(#[from] SourceLogHandleError),
+    #[error("capture immutable membership proof: {0}")]
+    MembershipProof(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,28 +181,102 @@ impl AdmissionPreparer {
 
     /// Durably retain the exact accepted capacity request before its membership record can
     /// reference the returned immutable source-log receipt.
-    pub async fn record_capacity_config(
+    pub(crate) async fn record_capacity_config(
         &self,
         generation: u64,
         target: usize,
+        published_entries: Vec<WatchlistEntry>,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        let durable_target =
+            u64::try_from(target).map_err(|_| AdmissionError::CapacityTargetOverflow { target })?;
+        self.record_artifact(
+            CAPACITY_CONFIG_SOURCE_ID,
+            &CapacityMembershipArtifact {
+                generation,
+                target: durable_target,
+                published_entries,
+            },
+        )
+        .await
+    }
+
+    /// Retain the exact batch-pinned ranking rows used by a full-rerank, or the exact
+    /// candidate rows used by a knockout backfill.
+    pub(crate) async fn record_ranking_membership(
+        &self,
+        batch_id: Option<i64>,
+        entries: Vec<WatchlistEntry>,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        self.record_artifact(
+            RANKING_MEMBERSHIP_SOURCE_ID,
+            &RankingMembershipArtifact { batch_id, entries },
+        )
+        .await
+    }
+
+    /// Snapshot each admitted wallet's installed immutable proof preimages into the source log.
+    pub(crate) async fn record_admission_proofs(
+        &self,
+        additions: &[WalletAddress],
+    ) -> Result<Vec<MembershipAdmissionReceipt>, AdmissionError> {
+        let mut receipts = Vec::with_capacity(additions.len());
+        for wallet in additions {
+            let proof = MembershipProofManifest::capture(&self.inner.paper_state, &[*wallet])
+                .map_err(|error| AdmissionError::MembershipProof(error.to_string()))?;
+            let receipt = self
+                .record_artifact(
+                    MEMBERSHIP_ADMISSION_SOURCE_ID,
+                    &MembershipAdmissionArtifact {
+                        wallet: *wallet,
+                        proof,
+                    },
+                )
+                .await?;
+            receipts.push(MembershipAdmissionReceipt {
+                wallet: *wallet,
+                receipt,
+            });
+        }
+        Ok(receipts)
+    }
+
+    /// Retain each knockout's policy and cursor inputs and return the receipt-bound evidence.
+    pub(crate) async fn record_knockout_inputs(
+        &self,
+        inputs: Vec<(MembershipReason, KnockoutCausalArtifact)>,
+    ) -> Result<Vec<SealedKnockoutEvidence>, AdmissionError> {
+        let mut evidence = Vec::with_capacity(inputs.len());
+        for (reason, input) in inputs {
+            let wallet = input.wallet;
+            let causal_receipt = self
+                .record_artifact(KNOCKOUT_CAUSAL_SOURCE_ID, &input)
+                .await?;
+            evidence.push(SealedKnockoutEvidence {
+                wallet,
+                reason,
+                causal_receipt,
+            });
+        }
+        Ok(evidence)
+    }
+
+    async fn record_artifact<T: Serialize>(
+        &self,
+        source_id: &str,
+        artifact: &T,
     ) -> Result<AppendReceipt, AdmissionError> {
         let source_log = self
             .source_log
             .as_ref()
-            .ok_or(AdmissionError::CapacitySourceLogUnavailable)?;
-        let durable_target =
-            u64::try_from(target).map_err(|_| AdmissionError::CapacityTargetOverflow { target })?;
-        let payload = serde_json::to_vec(&CapacityConfigObservation {
-            generation,
-            target: durable_target,
-        })
-        .map_err(AdmissionError::CapacityConfigEncoding)?;
+            .ok_or(AdmissionError::MembershipSourceLogUnavailable)?;
+        let payload =
+            serde_json::to_vec(artifact).map_err(AdmissionError::MembershipArtifactEncoding)?;
         let now = time::OffsetDateTime::now_utc();
         source_log
             .append(EnvelopeIn {
-                source_id: SourceId(CAPACITY_CONFIG_SOURCE_ID.to_owned()),
-                schema_version: CAPACITY_CONFIG_SCHEMA_VERSION,
-                parser_version: CAPACITY_CONFIG_PARSER_VERSION,
+                source_id: SourceId(source_id.to_owned()),
+                schema_version: MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+                parser_version: MEMBERSHIP_ARTIFACT_PARSER_VERSION,
                 observed_at: SourceTimestamp(now),
                 received_at: ReceivedAt(now),
                 content_type: ContentType::Json,
