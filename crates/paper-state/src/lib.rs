@@ -7237,7 +7237,7 @@ mod tests {
                 Some(EventSeq(99)),
                 EventSeq(2),
                 append_receipt(20, 3),
-                100,
+                5,
                 &fill,
                 dec!(9.5),
             ),
@@ -7248,7 +7248,7 @@ mod tests {
             None,
             EventSeq(2),
             append_receipt(20, 3),
-            100,
+            5,
             &fill,
             dec!(9.5),
         )
@@ -7292,7 +7292,7 @@ mod tests {
                         None,
                         EventSeq(2),
                         append_receipt(20, 3),
-                        100,
+                        5,
                         &changed,
                         dec!(9.5)
                     ),
@@ -7307,7 +7307,7 @@ mod tests {
                 Some(EventSeq(1)),
                 EventSeq(2),
                 append_receipt(20, 3),
-                100,
+                5,
                 &fill,
                 dec!(9.5)
             ),
@@ -7319,7 +7319,7 @@ mod tests {
                 Some(EventSeq(2)),
                 EventSeq(3),
                 append_receipt(20, 3),
-                100,
+                5,
                 &fill,
                 dec!(9.5)
             ),
@@ -7331,7 +7331,7 @@ mod tests {
                 None,
                 EventSeq(2),
                 append_receipt(20, 3),
-                100,
+                5,
                 &fill,
                 dec!(9.500001)
             ),
@@ -7344,7 +7344,7 @@ mod tests {
                 None,
                 EventSeq(2),
                 append_receipt(20, 3),
-                100,
+                5,
                 &fill,
                 dec!(9.5)
             ),
