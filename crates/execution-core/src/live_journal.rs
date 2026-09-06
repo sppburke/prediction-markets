@@ -442,6 +442,12 @@ pub struct LiveAdmissionEvaluationAudit {
 pub enum LiveOrderPreparationFailure {
     Venue,
     PreparedAuditMismatch,
+    RecoveryCredentialChanged,
+    RecoveryAdmissionExpired,
+    PrePostRiskDayChanged,
+    PrePostRiskPriceExpired,
+    PrePostAdmissionExpired,
+    PrePostMarkUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -826,9 +832,18 @@ pub struct OpenOrderRecoveryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One synchronized Approved admission whose venue preparation has no durable outcome yet.
+pub struct ApprovedAdmissionRecoveryEntry {
+    pub account_id: AccountId,
+    pub admission_journal_seq: u64,
+    pub admission: Box<LiveAdmissionEvaluationAudit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Verified journal-owned accounts and nonterminal orders for one recovery pass.
 pub struct LiveRecoveryInventory {
     pub account_ids: Vec<AccountId>,
+    pub approved_admissions: Vec<ApprovedAdmissionRecoveryEntry>,
     pub open_orders: Vec<OpenOrderRecoveryEntry>,
 }
 
@@ -1741,6 +1756,18 @@ fn verify_recovery_admission(
     evaluated_at: OffsetDateTime,
     binding: Option<&LiveAccountBindingAudit>,
 ) -> Result<(), LiveJournalError> {
+    let risk_decision = match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
+        pe_risk_engine::RiskDecision::Approved => crate::RiskDecisionAudit::Approved,
+        pe_risk_engine::RiskDecision::Blocked(reason) => {
+            crate::RiskDecisionAudit::Blocked { reason }
+        }
+    };
+    if admission.economic.risk.decision != risk_decision
+        || (admission.verdict == LiveAdmissionVerdict::Approved
+            && risk_decision != crate::RiskDecisionAudit::Approved)
+    {
+        return Err(LiveJournalError::OrderFactConflict);
+    }
     let classify = |account| {
         classify_live_admission(LiveAdmissionClassificationInput {
             evaluated_at,
@@ -1846,7 +1873,7 @@ pub fn recovery_inventory(
     let mut account_bindings = BTreeMap::<AccountId, LiveAccountBindingAudit>::new();
     let mut evaluated_admissions = BTreeSet::<(AccountId, String)>::new();
     let mut approved_admissions =
-        BTreeMap::<(AccountId, String), Box<LiveAdmissionEvaluationAudit>>::new();
+        BTreeMap::<(AccountId, String), (u64, Box<LiveAdmissionEvaluationAudit>)>::new();
     for event in events {
         account_ids.insert(event.account_id.clone());
         match event.payload {
@@ -1855,7 +1882,7 @@ pub fn recovery_inventory(
                     event.account_id.clone(),
                     prepared.identity.idempotency_key.clone(),
                 );
-                let admission = approved_admissions
+                let (_, admission) = approved_admissions
                     .remove(&admission_key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
                 if admission.identity != prepared.identity
@@ -1890,16 +1917,23 @@ pub fn recovery_inventory(
                     return Err(LiveJournalError::OrderFactConflict);
                 }
                 if admission.verdict == LiveAdmissionVerdict::Approved {
-                    approved_admissions.insert(key, admission);
+                    approved_admissions.insert(key, (event.seq, admission));
                 }
             }
             LiveJournalPayload::OrderPreparationFailed(failed) => {
                 let key = (event.account_id, failed.identity.idempotency_key.clone());
-                let admission = approved_admissions
-                    .remove(&key)
-                    .ok_or(LiveJournalError::OrderFactConflict)?;
-                if admission.identity != failed.identity {
-                    return Err(LiveJournalError::OrderFactConflict);
+                if let Some((_, admission)) = approved_admissions.remove(&key) {
+                    if admission.identity != failed.identity {
+                        return Err(LiveJournalError::OrderFactConflict);
+                    }
+                } else {
+                    let order = orders
+                        .get_mut(&key)
+                        .ok_or(LiveJournalError::OrderFactConflict)?;
+                    if order.entry.identity != failed.identity || order.terminal {
+                        return Err(LiveJournalError::OrderFactConflict);
+                    }
+                    order.terminal = true;
                 }
             }
             LiveJournalPayload::AccountPortfolioMarked(mark) => {
@@ -1927,12 +1961,14 @@ pub fn recovery_inventory(
                 let order = orders
                     .get(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
-                if !prepared_order_fact_matches(
-                    order.entry.prepared_journal_seq,
-                    &order.entry.identity,
-                    &order.order_hash,
-                    PreparedOrderFact::Posted(&posted),
-                ) {
+                if order.terminal
+                    || !prepared_order_fact_matches(
+                        order.entry.prepared_journal_seq,
+                        &order.entry.identity,
+                        &order.order_hash,
+                        PreparedOrderFact::Posted(&posted),
+                    )
+                {
                     return Err(LiveJournalError::OrderFactConflict);
                 }
             }
@@ -2051,8 +2087,20 @@ pub fn recovery_inventory(
         })
         .collect::<Vec<_>>();
     open_orders.sort_by_key(|order| order.inventory.prepared_journal_seq);
+    let mut approved_admissions = approved_admissions
+        .into_iter()
+        .map(|((account_id, _), (admission_journal_seq, admission))| {
+            ApprovedAdmissionRecoveryEntry {
+                account_id,
+                admission_journal_seq,
+                admission,
+            }
+        })
+        .collect::<Vec<_>>();
+    approved_admissions.sort_by_key(|admission| admission.admission_journal_seq);
     Ok(LiveRecoveryInventory {
         account_ids: account_ids.into_iter().collect(),
+        approved_admissions,
         open_orders,
     })
 }
@@ -2920,6 +2968,86 @@ mod tests {
         drop(underfunded_journal);
         assert!(matches!(
             recovery_inventory(&underfunded_path),
+            Err(LiveJournalError::OrderFactConflict)
+        ));
+    }
+
+    /// PASS: a synchronized Approved admission without a preparation outcome is returned as
+    /// recovery work, and its typed failure consumes that work without creating an open order.
+    #[test]
+    fn unmatched_approved_admission_is_recovery_work_until_terminalized() {
+        for seam in [
+            "after-admission-append",
+            "during-venue-preparation",
+            "before-prepared-append",
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join(format!("{seam}.log"));
+            let journal = LiveJournal::open(&path).unwrap();
+            let account_id = AccountId::new("approved-recovery").unwrap();
+            let at = datetime!(2026-08-11 12:00 UTC);
+            let prepared = current_prepared(&account_id, "approved-recovery");
+            journal
+                .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+                .unwrap();
+            let admission_receipt = journal
+                .append(account_id.clone(), at, approved_admission_for(&prepared))
+                .unwrap();
+
+            let recovery = recovery_inventory(&path).unwrap();
+            assert!(recovery.open_orders.is_empty(), "{seam}");
+            assert_eq!(recovery.approved_admissions.len(), 1, "{seam}");
+            assert_eq!(
+                recovery.approved_admissions[0].admission_journal_seq, admission_receipt.seq,
+                "{seam}"
+            );
+            assert_eq!(
+                recovery.approved_admissions[0].admission.identity, prepared.identity,
+                "{seam}"
+            );
+
+            journal
+                .append(
+                    account_id,
+                    at,
+                    LiveJournalPayload::OrderPreparationFailed(Box::new(
+                        LiveOrderPreparationFailedAudit {
+                            identity: prepared.identity.clone(),
+                            failure: LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+                        },
+                    )),
+                )
+                .unwrap();
+            let recovered = recovery_inventory(&path).unwrap();
+            assert!(recovered.approved_admissions.is_empty(), "{seam}");
+            assert!(recovered.open_orders.is_empty(), "{seam}");
+        }
+    }
+
+    /// PASS: recovery recomputes the pure risk decision and rejects a producer-recorded Approved
+    /// decision whose snapshot deterministically trips the absolute-loss kill switch.
+    #[test]
+    fn recovery_rejects_approved_admission_with_blocked_risk_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("risk-recheck").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "risk-recheck");
+        let mut admission_payload = approved_admission_for(&prepared);
+        let LiveJournalPayload::AdmissionEvaluated(admission) = &mut admission_payload else {
+            return;
+        };
+        admission.economic.risk.snapshot.absolute_pnl_bps = pe_core_types::BasisPoints(-1_000);
+        admission.economic.risk.decision = RiskDecisionAudit::Approved;
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
+        journal.append(account_id, at, admission_payload).unwrap();
+        drop(journal);
+
+        assert!(matches!(
+            recovery_inventory(&path),
             Err(LiveJournalError::OrderFactConflict)
         ));
     }

@@ -180,6 +180,52 @@ fn replay_source_envelopes(
         .collect()
 }
 
+fn restamp_admission_from_source_receipts(
+    state: &FanoutState,
+    admission: &mut pe_execution_core::LiveAdmissionArtifact,
+) -> Result<(), FanoutError> {
+    let receipts = [
+        admission.receipts.gamma,
+        admission.receipts.clob_long,
+        admission.receipts.clob_compact,
+    ];
+    let mut observed = BTreeMap::new();
+    let replay = Reader::replay(&state.config.source_log_path)
+        .map_err(|error| FanoutError::Signal(format!("source receipt replay failed: {error}")))?;
+    for item in replay {
+        let (_, envelope) = item.map_err(|error| {
+            FanoutError::Signal(format!("source receipt replay failed: {error}"))
+        })?;
+        if let Some(receipt) = receipts
+            .iter()
+            .find(|receipt| receipt.sequence == envelope.seq)
+        {
+            if receipt.this_hash != envelope.this_hash {
+                return Err(FanoutError::Signal(
+                    "admission source receipt hash mismatch".to_owned(),
+                ));
+            }
+            observed.insert(envelope.seq, envelope.observed_at.0);
+        }
+    }
+    let gamma_at = observed
+        .get(&admission.receipts.gamma.sequence)
+        .copied()
+        .ok_or_else(|| FanoutError::Signal("Gamma admission receipt missing".to_owned()))?;
+    let clob_long_at = observed
+        .get(&admission.receipts.clob_long.sequence)
+        .copied()
+        .ok_or_else(|| FanoutError::Signal("CLOB admission receipt missing".to_owned()))?;
+    if !observed.contains_key(&admission.receipts.clob_compact.sequence) {
+        return Err(FanoutError::Signal(
+            "compact CLOB admission receipt missing".to_owned(),
+        ));
+    }
+    admission.market.observed_at_unix = gamma_at.max(clob_long_at).unix_timestamp();
+    admission.settlement.observed_at_unix = clob_long_at.unix_timestamp();
+    Ok(())
+}
+
 fn derive_projection_rows_for_state(
     state: &FanoutState,
     account_id: &AccountId,
@@ -288,8 +334,8 @@ pub async fn run_live_fanout_until(
                 if let Err(error) = run_recovery_pass(&mut state, now).await {
                     error!(error = %error, "live recovery-first pass failed; fan-out remains frozen");
                 }
-                // A submitted/ambiguous reservation is the only work allowed on this tick.
-                // If reconciliation terminalized it, ordinary work resumes next tick.
+                // Approved/prepared recovery work is the only work allowed on this tick. If it
+                // converges to a durable preparation result, ordinary work resumes next tick.
                 continue;
             }
             Ok(false) => {}
@@ -314,7 +360,7 @@ pub async fn run_live_fanout_until(
             drive_redemptions(&mut state, now).await;
             state.last_redemption_unix = Some(now.unix_timestamp());
         }
-        if let Err(error) = run_dispatch_pass(&mut state, now).await {
+        if let Err(error) = run_dispatch_pass(&mut state).await {
             error!(error = %error, "live fan-out pass failed; retrying from durable state");
         }
         if due(
@@ -355,8 +401,9 @@ pub async fn run_live_fanout_until(
 }
 
 fn recovery_is_pending(state: &FanoutState) -> Result<bool, pe_execution_core::LiveJournalError> {
-    recovery_inventory(&state.config.journal_path)
-        .map(|inventory| !inventory.open_orders.is_empty())
+    recovery_inventory(&state.config.journal_path).map(|inventory| {
+        !inventory.approved_admissions.is_empty() || !inventory.open_orders.is_empty()
+    })
 }
 
 fn due(last: Option<i64>, now: i64, interval: i64) -> bool {
@@ -692,10 +739,7 @@ fn classify_target(
     TargetClass::Dispatch
 }
 
-async fn run_dispatch_pass(
-    state: &mut FanoutState,
-    now: OffsetDateTime,
-) -> Result<(), FanoutError> {
+async fn run_dispatch_pass(state: &mut FanoutState) -> Result<(), FanoutError> {
     let seeds = state
         .config
         .paper_state
@@ -715,7 +759,8 @@ async fn run_dispatch_pass(
             if target.state == "terminal" {
                 continue;
             }
-            let control = process_target(state, &seed, &target, &signal, now).await?;
+            let control =
+                process_target(state, &seed, &target, &signal, OffsetDateTime::now_utc()).await?;
             match control {
                 PassControl::Continue => {}
                 // A transient refusal cannot be overtaken by a younger seed. Resume this exact
@@ -724,10 +769,10 @@ async fn run_dispatch_pass(
                 PassControl::FreezePass => return Ok(()),
             }
         }
-        state
-            .config
-            .paper_state
-            .finalize_dispatch_if_terminal(&seed.dispatch_id, now.unix_timestamp())?;
+        state.config.paper_state.finalize_dispatch_if_terminal(
+            &seed.dispatch_id,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )?;
     }
     Ok(())
 }
@@ -740,6 +785,134 @@ async fn run_recovery_pass(
 ) -> Result<(), FanoutError> {
     let mut freeze = false;
     let initial_inventory = recovery_inventory(&state.config.journal_path)?;
+    for pending in initial_inventory.approved_admissions {
+        let target = DispatchTargetRow {
+            dispatch_id: pending.admission.identity.dispatch_id.clone(),
+            account_id: pending.account_id.as_str().to_owned(),
+            exec_rank: 0,
+            credential_bundle_version: pending.admission.frozen_binding.version,
+            credential_key_id: pending.admission.frozen_binding.key_id.clone(),
+            state: "pending".to_owned(),
+            terminal_reason: None,
+            updated_at_unix: now.unix_timestamp(),
+        };
+        let recovery_price_expired = risk_price_expired(state, &pending.admission.economic.risk)?;
+        let recovery_check_at = OffsetDateTime::now_utc();
+        let recovery_risk_failure =
+            if risk_day_changed(&pending.admission.economic.risk, recovery_check_at) {
+                Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged)
+            } else if recovery_price_expired {
+                Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskPriceExpired)
+            } else {
+                None
+            };
+        if let Some(failure) = recovery_risk_failure {
+            state.config.journal.append(
+                pending.account_id.clone(),
+                OffsetDateTime::now_utc(),
+                LiveJournalPayload::OrderPreparationFailed(Box::new(
+                    pe_execution_core::LiveOrderPreparationFailedAudit {
+                        identity: pending.admission.identity.clone(),
+                        failure,
+                    },
+                )),
+            )?;
+            state.config.paper_state.set_dispatch_target_state(
+                &target.dispatch_id,
+                &target.account_id,
+                "terminal",
+                Some("recovery_risk_evidence_expired"),
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )?;
+            continue;
+        }
+        let credentials = match credentials_for_target(state, &target).await {
+            CredentialLoad::Ready(credentials) => credentials,
+            CredentialLoad::Changed => {
+                state.config.journal.append(
+                    pending.account_id.clone(),
+                    OffsetDateTime::now_utc(),
+                    LiveJournalPayload::OrderPreparationFailed(Box::new(
+                        pe_execution_core::LiveOrderPreparationFailedAudit {
+                            identity: pending.admission.identity.clone(),
+                            failure:
+                                pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged,
+                        },
+                    )),
+                )?;
+                state.config.paper_state.set_dispatch_target_state(
+                    &target.dispatch_id,
+                    &target.account_id,
+                    "terminal",
+                    Some("recovery_credential_changed"),
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                )?;
+                continue;
+            }
+            CredentialLoad::Transient(_) => {
+                freeze = true;
+                continue;
+            }
+        };
+        let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
+            Ok(venue) => venue,
+            Err(_) => {
+                freeze = true;
+                continue;
+            }
+        };
+        let executor = LiveExecutor::new(&venue, state.config.journal.as_ref());
+        match executor
+            .resume_approved_admission_with_clock(
+                pending.account_id,
+                pending.admission,
+                OffsetDateTime::now_utc,
+            )
+            .await?
+        {
+            LivePrepareResult::Terminal(outcome) => {
+                persist_outcome(state, &target, &outcome, OffsetDateTime::now_utc())?;
+            }
+            LivePrepareResult::Prepared(prepared) => {
+                let risk_price_expired = prepared_risk_price_expired(state, prepared.audit())?;
+                let post_check_at = OffsetDateTime::now_utc();
+                let failure = if prepared_risk_day_changed(prepared.audit(), post_check_at) {
+                    Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged)
+                } else if risk_price_expired {
+                    Some(pe_execution_core::LiveOrderPreparationFailure::PrePostRiskPriceExpired)
+                } else if !prepared_admission_is_approved_at(prepared.audit(), post_check_at) {
+                    Some(pe_execution_core::LiveOrderPreparationFailure::PrePostAdmissionExpired)
+                } else {
+                    None
+                };
+                if let Some(failure) = failure {
+                    let outcome = executor.terminalize_prepared(
+                        prepared,
+                        OffsetDateTime::now_utc(),
+                        failure,
+                    )?;
+                    persist_outcome(state, &target, &outcome, OffsetDateTime::now_utc())?;
+                    continue;
+                }
+                let action_at = OffsetDateTime::now_utc();
+                state.config.paper_state.set_dispatch_target_state(
+                    &target.dispatch_id,
+                    &target.account_id,
+                    "submitted",
+                    None,
+                    action_at.unix_timestamp(),
+                )?;
+                let outcome = executor
+                    .submit_with_clock(prepared, OffsetDateTime::now_utc)
+                    .await?;
+                let transition = outcome_transition(&outcome);
+                persist_outcome(state, &target, &outcome, OffsetDateTime::now_utc())?;
+                if transition.freeze {
+                    freeze = true;
+                }
+            }
+        }
+    }
     let snapshot = state.config.live_accounts.snapshot();
     for order in initial_inventory
         .open_orders
@@ -809,10 +982,11 @@ async fn run_recovery_pass(
     }
     let results = collect_order_finality(&state.polygon_receipt_rpc, pending).await;
     for ((account_id, target), result) in finality_targets.into_iter().zip(results) {
+        let result_at = OffsetDateTime::now_utc();
         match append_order_finality_result(
             state.config.journal.as_ref(),
             account_id.clone(),
-            now,
+            result_at,
             result,
         )? {
             FinalityJournalEffect::Pending => {
@@ -822,7 +996,7 @@ async fn run_recovery_pass(
                         &target.account_id,
                         "submitted",
                         None,
-                        now.unix_timestamp(),
+                        result_at.unix_timestamp(),
                     )?;
                 }
             }
@@ -833,14 +1007,14 @@ async fn run_recovery_pass(
                         &target.account_id,
                         "ambiguous",
                         Some("polygon_finality_conflict"),
-                        now.unix_timestamp(),
+                        result_at.unix_timestamp(),
                     )?;
                 }
                 freeze = true;
             }
             FinalityJournalEffect::Finalized => {
                 if let Some(target) = &target {
-                    terminalize(state, target, "filled", now)?;
+                    terminalize(state, target, "filled", result_at)?;
                 }
                 let snapshot = state.config.live_accounts.snapshot();
                 if let Some(account) = snapshot
@@ -848,16 +1022,16 @@ async fn run_recovery_pass(
                     .iter()
                     .find(|account| account.account_id == account_id)
                 {
-                    reconcile_account_projection(state, &account.account_id, now).await;
+                    reconcile_account_projection(state, &account.account_id, result_at).await;
                 }
             }
         }
     }
     for seed in &seeds {
-        state
-            .config
-            .paper_state
-            .finalize_dispatch_if_terminal(&seed.dispatch_id, now.unix_timestamp())?;
+        state.config.paper_state.finalize_dispatch_if_terminal(
+            &seed.dispatch_id,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )?;
     }
     if freeze {
         warn!("one or more live targets remain frozen after recovery");
@@ -911,7 +1085,7 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
         TargetClass::NotArmed => {
-            terminalize(state, target, "not_armed", now)?;
+            terminalize(state, target, "not_armed", OffsetDateTime::now_utc())?;
             return Ok(PassControl::Continue);
         }
         TargetClass::PauseClosed => {
@@ -930,7 +1104,12 @@ async fn process_target(
     let credentials = match credentials_for_target(state, target).await {
         CredentialLoad::Ready(credentials) => credentials,
         CredentialLoad::Changed => {
-            terminalize(state, target, "credential_version_changed", now)?;
+            terminalize(
+                state,
+                target,
+                "credential_version_changed",
+                OffsetDateTime::now_utc(),
+            )?;
             return Ok(PassControl::Continue);
         }
         CredentialLoad::Transient(reason) => {
@@ -947,17 +1126,28 @@ async fn process_target(
     };
 
     let condition_id = PolymarketConditionId(signal.market_id.0.0.clone());
-    let admission = match state.admission.build(&condition_id, now).await {
+    let admission_started_at = OffsetDateTime::now_utc();
+    let mut admission = match state
+        .admission
+        .build(&condition_id, admission_started_at)
+        .await
+    {
         Ok(admission) => admission,
         Err(error) if admission_error_is_transient(&error) => {
             warn!(account_id = %target.account_id, error = %error, "live market evidence unavailable; seed paused");
             return Ok(PassControl::StopSeed);
         }
         Err(error) => {
-            terminalize(state, target, admission_terminal_reason(&error), now)?;
+            terminalize(
+                state,
+                target,
+                admission_terminal_reason(&error),
+                OffsetDateTime::now_utc(),
+            )?;
             return Ok(PassControl::Continue);
         }
     };
+    restamp_admission_from_source_receipts(state, &mut admission)?;
     let token_id = match admission
         .market
         .ordered_outcome_token_ids
@@ -966,7 +1156,12 @@ async fn process_target(
     {
         Some(token) => token,
         None => {
-            terminalize(state, target, "outcome_not_binary", now)?;
+            terminalize(
+                state,
+                target,
+                "outcome_not_binary",
+                OffsetDateTime::now_utc(),
+            )?;
             return Ok(PassControl::Continue);
         }
     };
@@ -994,16 +1189,16 @@ async fn process_target(
         warn!(account_id = %target.account_id, "recorded /book receipt missing; seed paused");
         return Ok(PassControl::StopSeed);
     };
-    let now_ms = unix_ms(now);
+    let now_ms = unix_ms(OffsetDateTime::now_utc());
     if pe_venue_polymarket::ladder_is_stale(now_ms, book.fetched_at_ms) {
         return Ok(PassControl::StopSeed);
     }
     let Some(ladder) = book.ladder() else {
-        terminalize(state, target, "ladder_invalid", now)?;
+        terminalize(state, target, "ladder_invalid", OffsetDateTime::now_utc())?;
         return Ok(PassControl::Continue);
     };
     let Some(best_ask) = ladder.first().map(|ask| ask.price) else {
-        terminalize(state, target, "ladder_empty", now)?;
+        terminalize(state, target, "ladder_empty", OffsetDateTime::now_utc())?;
         return Ok(PassControl::Continue);
     };
     let settings = match fetch_account_settings(state, &target.account_id).await {
@@ -1017,7 +1212,7 @@ async fn process_target(
     let sizing = match settings.sizing_mode(runtime.sizing_mode) {
         Ok(sizing) => sizing,
         Err(reason) => {
-            terminalize(state, target, reason, now)?;
+            terminalize(state, target, reason, OffsetDateTime::now_utc())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -1028,13 +1223,26 @@ async fn process_target(
     let per_trade_cap_bps = strategy_config
         .per_trade_cap
         .resolve_bps(TradingMode::LiveTiny);
+    if ensure_live_portfolio_marks(
+        state,
+        account,
+        &account_state,
+        venue.account_binding(),
+        &venue.deposit_wallet(),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+        != CheckOutcome::Pass
+    {
+        warn!(account_id = %target.account_id, "pre-risk inventory reconciliation failed; seed paused");
+        return Ok(PassControl::StopSeed);
+    }
     let initial_risk = match live_risk_audit(
         state,
         account,
         Some(signal),
         CollateralAmount::ZERO,
         per_trade_cap_bps,
-        now,
     )
     .await
     {
@@ -1057,7 +1265,12 @@ async fn process_target(
         initial_risk.snapshot.clone(),
         account_state.reconciled_free_collateral.to_decimal(),
     ) {
-        terminalize(state, target, winner_follow_terminal_reason(&error), now)?;
+        terminalize(
+            state,
+            target,
+            winner_follow_terminal_reason(&error),
+            OffsetDateTime::now_utc(),
+        )?;
         return Ok(PassControl::Continue);
     }
     let minimum_price = parse_band_price(runtime.min_fill_price, Price::ZERO);
@@ -1065,7 +1278,12 @@ async fn process_target(
     let (minimum_price, maximum_price) = match (minimum_price, maximum_price) {
         (Ok(minimum), Ok(maximum)) => (minimum, maximum),
         _ => {
-            terminalize(state, target, "live_price_band_invalid", now)?;
+            terminalize(
+                state,
+                target,
+                "live_price_band_invalid",
+                OffsetDateTime::now_utc(),
+            )?;
             return Ok(PassControl::Continue);
         }
     };
@@ -1073,7 +1291,12 @@ async fn process_target(
         .ok()
         .filter(|cap| (1..=10_000).contains(cap));
     let Some(cap_bps) = cap_bps else {
-        terminalize(state, target, "live_price_impact_cap_invalid", now)?;
+        terminalize(
+            state,
+            target,
+            "live_price_impact_cap_invalid",
+            OffsetDateTime::now_utc(),
+        )?;
         return Ok(PassControl::Continue);
     };
     let price_impact_cap_bps = i32::try_from(cap_bps)
@@ -1084,7 +1307,12 @@ async fn process_target(
     let ceiling = match Price::new(ceiling_raw) {
         Ok(price) => price,
         Err(_) => {
-            terminalize(state, target, "live_price_impact_cap_invalid", now)?;
+            terminalize(
+                state,
+                target,
+                "live_price_impact_cap_invalid",
+                OffsetDateTime::now_utc(),
+            )?;
             return Ok(PassControl::Continue);
         }
     };
@@ -1125,7 +1353,12 @@ async fn process_target(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            terminalize(state, target, ladder_terminal_reason(&error), now)?;
+            terminalize(
+                state,
+                target,
+                ladder_terminal_reason(&error),
+                OffsetDateTime::now_utc(),
+            )?;
             return Ok(PassControl::Continue);
         }
     };
@@ -1134,13 +1367,38 @@ async fn process_target(
         .worst_case_debit
         .checked_add(sized.reserve)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    let account_state = match venue
+        .read_balance_and_allowance(admission.market.neg_risk)
+        .await
+    {
+        Ok(account_state) => account_state,
+        Err(_) => return Ok(PassControl::StopSeed),
+    };
+    if live_financial_posture(state, account, account_state.collateral_balance, false)
+        != CheckOutcome::Pass
+    {
+        return Ok(PassControl::StopSeed);
+    }
+    if ensure_live_portfolio_marks(
+        state,
+        account,
+        &account_state,
+        venue.account_binding(),
+        &venue.deposit_wallet(),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+        != CheckOutcome::Pass
+    {
+        warn!(account_id = %target.account_id, "pre-prepare inventory reconciliation failed; seed paused");
+        return Ok(PassControl::StopSeed);
+    }
     let risk = match live_risk_audit(
         state,
         account,
         Some(signal),
         proposed_debit,
         per_trade_cap_bps,
-        now,
     )
     .await
     {
@@ -1208,22 +1466,13 @@ async fn process_target(
         economic.risk.snapshot.clone(),
         account_state.reconciled_free_collateral.to_decimal(),
     ) {
-        terminalize(state, target, winner_follow_terminal_reason(&decline), now)?;
+        terminalize(
+            state,
+            target,
+            winner_follow_terminal_reason(&decline),
+            OffsetDateTime::now_utc(),
+        )?;
         return Ok(PassControl::Continue);
-    }
-    if ensure_live_portfolio_marks(
-        state,
-        account,
-        &account_state,
-        venue.account_binding(),
-        &venue.deposit_wallet(),
-        now,
-    )
-    .await
-        != CheckOutcome::Pass
-    {
-        warn!(account_id = %target.account_id, "immediate pre-post inventory reconciliation failed; seed paused");
-        return Ok(PassControl::StopSeed);
     }
     if global_risk_halt_active(state)? {
         return Ok(PassControl::StopSeed);
@@ -1232,7 +1481,7 @@ async fn process_target(
         version: target.credential_bundle_version,
         key_id: target.credential_key_id.clone(),
     };
-    let request = pe_execution_core::LiveOrderRequest {
+    let mut request = pe_execution_core::LiveOrderRequest {
         target: FrozenLiveTarget {
             account_id: account.account_id.clone(),
             credential_binding: binding.clone(),
@@ -1250,14 +1499,83 @@ async fn process_target(
         ladder: plan.clone(),
         economic,
     };
-    let executor = LiveExecutor::new(&venue, state.config.journal.as_ref());
-    match executor.prepare(request, now).await? {
+    let prepare_price_expired = risk_price_expired(state, &request.economic.risk)?;
+    let prepare_check_at = OffsetDateTime::now_utc();
+    if risk_day_changed(&request.economic.risk, prepare_check_at) || prepare_price_expired {
+        if ensure_live_portfolio_marks(
+            state,
+            account,
+            &account_state,
+            venue.account_binding(),
+            &venue.deposit_wallet(),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+            != CheckOutcome::Pass
+        {
+            warn!(account_id = %target.account_id, "boundary refresh inventory reconciliation failed; seed paused");
+            return Ok(PassControl::StopSeed);
+        }
+        let refreshed = match live_risk_audit(
+            state,
+            account,
+            Some(signal),
+            proposed_debit,
+            per_trade_cap_bps,
+        )
+        .await
+        {
+            Ok(risk) => risk,
+            Err(reason) => {
+                warn!(account_id = %target.account_id, decline = %reason, "boundary refresh risk inputs unavailable; seed paused");
+                return Ok(PassControl::StopSeed);
+            }
+        };
+        if sync_live_risk_halts(state, account, &refreshed).await? {
+            return Ok(PassControl::StopSeed);
+        }
+        if let Err(decline) = evaluate_live_candidate_at_price(
+            &strategy,
+            signal,
+            request.economic.sizing.all_in_price,
+            probability,
+            refreshed.snapshot.clone(),
+            account_state.reconciled_free_collateral.to_decimal(),
+        ) {
+            terminalize(
+                state,
+                target,
+                winner_follow_terminal_reason(&decline),
+                OffsetDateTime::now_utc(),
+            )?;
+            return Ok(PassControl::Continue);
+        }
+        request.economic.risk = refreshed;
+    }
+    let final_prepare_price_expired = risk_price_expired(state, &request.economic.risk)?;
+    let final_prepare_check_at = OffsetDateTime::now_utc();
+    if risk_day_changed(&request.economic.risk, final_prepare_check_at)
+        || final_prepare_price_expired
+    {
+        warn!(account_id = %target.account_id, "risk evidence expired during the boundary refresh; seed paused");
+        return Ok(PassControl::StopSeed);
+    }
+    let journal = state.config.journal.clone();
+    let executor = LiveExecutor::new(&venue, journal.as_ref());
+    match executor
+        .prepare_with_observed_account_and_clock(
+            request,
+            account_state.clone(),
+            OffsetDateTime::now_utc,
+        )
+        .await?
+    {
         LivePrepareResult::Terminal(outcome) => {
             if refusal_is_transient(&outcome) {
                 return Ok(PassControl::StopSeed);
             }
             let transition = outcome_transition(&outcome);
-            persist_outcome(state, target, &outcome, now)?;
+            persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
             Ok(if transition.freeze {
                 PassControl::FreezePass
             } else {
@@ -1265,6 +1583,74 @@ async fn process_target(
             })
         }
         LivePrepareResult::Prepared(prepared) => {
+            if ensure_live_portfolio_marks(
+                state,
+                account,
+                &account_state,
+                venue.account_binding(),
+                &venue.deposit_wallet(),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+                != CheckOutcome::Pass
+            {
+                let outcome = executor.terminalize_prepared(
+                    prepared,
+                    OffsetDateTime::now_utc(),
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostMarkUnavailable,
+                )?;
+                persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                return Ok(PassControl::StopSeed);
+            }
+            let risk_price_expired = prepared_risk_price_expired(state, prepared.audit())?;
+            let post_check_at = OffsetDateTime::now_utc();
+            let risk_day_changed = prepared_risk_day_changed(prepared.audit(), post_check_at);
+            let admission_expired =
+                !prepared_admission_is_approved_at(prepared.audit(), post_check_at);
+            if risk_day_changed || risk_price_expired || admission_expired {
+                if risk_day_changed
+                    && ensure_live_portfolio_marks(
+                        state,
+                        account,
+                        &account_state,
+                        venue.account_binding(),
+                        &venue.deposit_wallet(),
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                        != CheckOutcome::Pass
+                {
+                    let outcome = executor.terminalize_prepared(
+                        prepared,
+                        OffsetDateTime::now_utc(),
+                        pe_execution_core::LiveOrderPreparationFailure::PrePostMarkUnavailable,
+                    )?;
+                    persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                    return Ok(PassControl::StopSeed);
+                }
+                let refreshed = live_risk_audit(
+                    state,
+                    account,
+                    Some(signal),
+                    prepared.audit().economic.balance.worst_case_debit,
+                    prepared.audit().economic.risk.snapshot.per_trade_cap_bps,
+                )
+                .await;
+                if let Ok(risk) = refreshed {
+                    let _ = sync_live_risk_halts(state, account, &risk).await?;
+                }
+                let failure = if admission_expired {
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostAdmissionExpired
+                } else if risk_price_expired {
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostRiskPriceExpired
+                } else {
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged
+                };
+                let outcome =
+                    executor.terminalize_prepared(prepared, OffsetDateTime::now_utc(), failure)?;
+                persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                return Ok(PassControl::StopSeed);
+            }
             // The dispatch reservation is durable before the exactly-one POST capability is
             // consumed. Crash recovery reconciles this order hash; it never blindly resubmits.
             state.config.paper_state.set_dispatch_target_state(
@@ -1272,13 +1658,16 @@ async fn process_target(
                 &target.account_id,
                 "submitted",
                 None,
-                now.unix_timestamp(),
+                OffsetDateTime::now_utc().unix_timestamp(),
             )?;
-            let outcome = executor.submit(prepared, now).await?;
+            let outcome = executor
+                .submit_with_clock(prepared, OffsetDateTime::now_utc)
+                .await?;
             let transition = outcome_transition(&outcome);
-            persist_outcome(state, target, &outcome, now)?;
+            persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
             if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
-                reconcile_account_projection(state, &account.account_id, now).await;
+                reconcile_account_projection(state, &account.account_id, OffsetDateTime::now_utc())
+                    .await;
             }
             Ok(if transition.freeze {
                 PassControl::FreezePass
@@ -1295,6 +1684,80 @@ fn mode_value(value: &str) -> LiveControlMode {
     } else {
         LiveControlMode::Off
     }
+}
+
+fn prepared_risk_day_changed(
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    now: OffsetDateTime,
+) -> bool {
+    risk_day_changed(&prepared.economic.risk, now)
+}
+
+fn risk_day_changed(risk: &RiskAudit, now: OffsetDateTime) -> bool {
+    risk.evaluated_at_unix_ms.div_euclid(86_400_000) != now.unix_timestamp().div_euclid(86_400)
+}
+
+fn prepared_risk_price_expired(
+    state: &FanoutState,
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+) -> Result<bool, FanoutError> {
+    risk_price_expired(state, &prepared.economic.risk)
+}
+
+fn risk_price_expired(state: &FanoutState, risk: &RiskAudit) -> Result<bool, FanoutError> {
+    let receipts = &risk.price_receipts;
+    if receipts.is_empty() {
+        return Ok(false);
+    }
+    let mut unmatched = receipts
+        .iter()
+        .map(|receipt| (receipt.sequence, receipt.this_hash))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_at = Vec::new();
+    let replay = Reader::replay(&state.config.source_log_path)
+        .map_err(|error| FanoutError::Signal(format!("risk price replay failed: {error}")))?;
+    for item in replay {
+        let (_, envelope) = item
+            .map_err(|error| FanoutError::Signal(format!("risk price replay failed: {error}")))?;
+        if let Some(expected_hash) = unmatched.get(&envelope.seq) {
+            if *expected_hash != envelope.this_hash {
+                return Ok(true);
+            }
+            observed_at.push(envelope.observed_at.0.unix_timestamp_nanos());
+            unmatched.remove(&envelope.seq);
+        }
+    }
+    if !unmatched.is_empty() {
+        return Ok(true);
+    }
+    let evaluated_at = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    Ok(observed_at.into_iter().any(|observed_at| {
+        crate::mid_price_cache::classify_strict_price_time(observed_at, evaluated_at).is_err()
+    }))
+}
+
+fn prepared_admission_is_approved_at(
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+    evaluated_at: OffsetDateTime,
+) -> bool {
+    matches!(
+        classify_live_admission(LiveAdmissionClassificationInput {
+            evaluated_at,
+            requested_mode: LiveControlMode::LiveTiny,
+            effective_mode: LiveControlMode::LiveTiny,
+            frozen_binding: &prepared.frozen_binding,
+            current_binding: &prepared.frozen_binding,
+            identity: &prepared.identity,
+            condition_id: &prepared.economic.market.condition_id,
+            outcome_id: OutcomeId(u16::from(prepared.economic.market.outcome_index)),
+            token_id: &prepared.economic.market.token_id,
+            admission: &prepared.economic.admission,
+            ladder: &prepared.economic.ladder,
+            economic: &prepared.economic,
+            account: LiveAdmissionAccountEvidence::State(&prepared.account_state),
+        }),
+        Ok(pe_execution_core::LiveAdmissionVerdict::Approved)
+    )
 }
 
 fn unix_ms(now: OffsetDateTime) -> u64 {
@@ -1387,7 +1850,6 @@ async fn live_risk_audit(
     signal: Option<&LeaderSignal>,
     proposed_debit: CollateralAmount,
     per_trade_cap_bps: i32,
-    now: OffsetDateTime,
 ) -> Result<RiskAudit, RiskInputsUnavailable> {
     let events = replay_live_account(state, &account.account_id)
         .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
@@ -1413,7 +1875,13 @@ async fn live_risk_audit(
             ))
         })
         .collect::<Result<Vec<_>, RiskInputsUnavailable>>()?;
-    let mids = state.config.mid_price_cache.fetch_mids_strict(&ids).await?;
+    let price_attempt = state
+        .config
+        .mid_price_cache
+        .fetch_mids_strict_attempt(&ids)
+        .await;
+    let now = price_attempt.evaluated_at;
+    let mids = price_attempt.result?;
     let price_receipts = sorted_price_receipts(&mids)?;
     let marked_positions = derived
         .positions
@@ -1857,6 +2325,10 @@ pub(crate) enum ProjectionReducerError {
     InvalidBaseline,
     #[error("retained authenticated-account evidence is missing, malformed, or inconsistent")]
     InvalidAccountEvidence,
+    #[error(
+        "recorded risk decision disagrees with deterministic risk evaluation or is not approved"
+    )]
+    InvalidRiskDecision,
     #[error("OrderPrepared has no single matching replay-approved admission")]
     MissingApprovedAdmission,
     #[error("retained complete-position evidence is missing, malformed, or inconsistent")]
@@ -2038,25 +2510,35 @@ pub(crate) fn derive_projection_rows_with_sources(
             }
             LiveJournalPayload::OrderPreparationFailed(failed) => {
                 let key = &failed.identity.idempotency_key;
-                let admission = approved_admissions
-                    .remove(key)
-                    .ok_or(ProjectionReducerError::MissingApprovedAdmission)?;
-                if admission.identity != failed.identity {
-                    return Err(ProjectionReducerError::IdentityConflict);
+                if let Some(admission) = approved_admissions.remove(key) {
+                    if admission.identity != failed.identity {
+                        return Err(ProjectionReducerError::IdentityConflict);
+                    }
+                } else {
+                    let (_, prepared, terminal) = prepared_orders
+                        .get_mut(key)
+                        .ok_or(ProjectionReducerError::MissingApprovedAdmission)?;
+                    if prepared.identity != failed.identity || *terminal {
+                        return Err(ProjectionReducerError::IdentityConflict);
+                    }
+                    *terminal = true;
+                    reservations.remove(key);
                 }
             }
             LiveJournalPayload::OrderPosted(posted) => {
-                let Some((prepared_seq, prepared, _)) =
+                let Some((prepared_seq, prepared, terminal)) =
                     prepared_orders.get(&posted.identity.idempotency_key)
                 else {
                     return Err(ProjectionReducerError::MissingPrepared);
                 };
-                if !prepared_order_fact_matches(
-                    *prepared_seq,
-                    &prepared.identity,
-                    &prepared.prepared.order_hash,
-                    PreparedOrderFact::Posted(posted),
-                ) {
+                if *terminal
+                    || !prepared_order_fact_matches(
+                        *prepared_seq,
+                        &prepared.identity,
+                        &prepared.prepared.order_hash,
+                        PreparedOrderFact::Posted(posted),
+                    )
+                {
                     return Err(ProjectionReducerError::IdentityConflict);
                 }
             }
@@ -2614,6 +3096,16 @@ pub(crate) fn verify_admission_account_evidence(
     binding: &LiveAccountBindingAudit,
     evaluated_at: OffsetDateTime,
 ) -> Result<(), ProjectionReducerError> {
+    let risk_decision = match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
+        pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
+        pe_risk_engine::RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
+    };
+    if admission.economic.risk.decision != risk_decision
+        || (admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved
+            && risk_decision != RiskDecisionAudit::Approved)
+    {
+        return Err(ProjectionReducerError::InvalidRiskDecision);
+    }
     let has_failure_evidence = !admission.account_read_failure_evidence.is_empty()
         || !admission
             .account_read_failure_request_descriptor_hashes
@@ -3570,13 +4062,13 @@ async fn recover_in_flight_target(
             return Ok(PassControl::StopSeed);
         }
     };
-    let outcome = recover_target(state, target, &venue, now).await?;
+    let outcome = recover_target(state, target, &venue).await?;
     let transition = outcome_transition(&outcome);
-    persist_outcome(state, target, &outcome, now)?;
+    persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
     if let Some(account) = context
         && matches!(outcome, LiveOrderOutcome::Matched { .. })
     {
-        reconcile_account_projection(state, &account.account_id, now).await;
+        reconcile_account_projection(state, &account.account_id, OffsetDateTime::now_utc()).await;
     }
     Ok(if transition.freeze {
         PassControl::FreezePass
@@ -3589,7 +4081,6 @@ async fn recover_target(
     state: &FanoutState,
     target: &DispatchTargetRow,
     venue: &PolymarketLiveVenue,
-    now: OffsetDateTime,
 ) -> Result<LiveOrderOutcome, FanoutError> {
     let Some(prepared) = recovered_prepared(state, target)? else {
         return Ok(LiveOrderOutcome::Ambiguous {
@@ -3677,9 +4168,10 @@ async fn recover_target(
         ),
     };
     let evidence_hashes = http_attempt_hashes(&evidence)?;
+    let reconciled_at = OffsetDateTime::now_utc();
     state.config.journal.append(
         account_id,
-        now,
+        reconciled_at,
         LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
             identity,
             order_hash,
@@ -4127,7 +4619,7 @@ fn mode_transition_reason(reason: &str) -> LiveModeTransitionReason {
 async fn mode_probe(
     state: &mut FanoutState,
     account: &AccountContext,
-    now: OffsetDateTime,
+    _now: OffsetDateTime,
     polygon: CheckOutcome,
 ) -> (CheckOutcome, StaticProbe) {
     let unavailable = StaticProbe {
@@ -4244,7 +4736,6 @@ async fn mode_probe(
         None,
         CollateralAmount::ZERO,
         runtime.per_trade_cap.resolve_bps(TradingMode::LiveTiny),
-        now,
     )
     .await
     {
@@ -4378,7 +4869,7 @@ async fn ensure_live_portfolio_marks(
     account_state: &pe_execution_core::LiveVenueAccountState,
     account_binding: &LiveAccountBindingAudit,
     custody_wallet: &str,
-    now: OffsetDateTime,
+    _requested_at: OffsetDateTime,
 ) -> CheckOutcome {
     let mut events = match replay_live_account(state, &account.account_id) {
         Ok(events) => events,
@@ -4390,6 +4881,7 @@ async fn ensure_live_portfolio_marks(
             Ok(inventory) => inventory,
             Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
         };
+    let inventory_observed_at = OffsetDateTime::now_utc();
     let expected_credential = account
         .credential_binding
         .as_ref()
@@ -4427,11 +4919,11 @@ async fn ensure_live_portfolio_marks(
             .journal
             .append(
                 account.account_id.clone(),
-                now,
+                inventory_observed_at,
                 LiveJournalPayload::AccountPortfolioMarked(Box::new(
                     pe_execution_core::AccountPortfolioMarkedAudit {
                         kind: MarkKind::Baseline,
-                        cutoff_unix: now.unix_timestamp(),
+                        cutoff_unix: inventory_observed_at.unix_timestamp(),
                         account_binding: account_binding.clone(),
                         account_state: audit,
                         venue_positions: inventory.positions.clone(),
@@ -4486,7 +4978,10 @@ async fn ensure_live_portfolio_marks(
     else {
         return CheckOutcome::PersistentFail("live boundary arithmetic overflow");
     };
-    let completed_cutoff = now.unix_timestamp().div_euclid(86_400) * 86_400;
+    let completed_cutoff = OffsetDateTime::now_utc()
+        .unix_timestamp()
+        .div_euclid(86_400)
+        * 86_400;
     while cutoff <= completed_cutoff {
         let cutoff_is_missing = !derived.daily_marks.contains_key(&cutoff);
         if cutoff_is_missing {
@@ -4565,7 +5060,7 @@ async fn ensure_live_portfolio_marks(
                 .journal
                 .append(
                     account.account_id.clone(),
-                    now,
+                    OffsetDateTime::now_utc(),
                     LiveJournalPayload::AccountPortfolioMarked(Box::new(
                         pe_execution_core::AccountPortfolioMarkedAudit {
                             kind: MarkKind::Daily,
@@ -5705,6 +6200,21 @@ mod tests {
         assert!(due(None, 1_000, 30));
         assert!(!due(Some(990), 1_000, 30));
         assert!(due(Some(970), 1_000, 30));
+    }
+
+    /// PASS: the pre-POST guard detects both a crossed UTC risk day and admission evidence whose
+    /// sixty-second freshness boundary elapsed after preparation.
+    #[test]
+    fn pre_post_guard_detects_day_and_admission_freshness_boundaries() {
+        let prepared = finality_prepared();
+        let fresh = OffsetDateTime::from_unix_timestamp(30).unwrap();
+        assert!(!prepared_risk_day_changed(&prepared, fresh));
+        assert!(prepared_admission_is_approved_at(&prepared, fresh));
+
+        let next_day = OffsetDateTime::from_unix_timestamp(86_400).unwrap();
+        assert!(prepared_risk_day_changed(&prepared, next_day));
+        let stale = OffsetDateTime::from_unix_timestamp(61).unwrap();
+        assert!(!prepared_admission_is_approved_at(&prepared, stale));
     }
 
     #[test]
@@ -8631,6 +9141,87 @@ mod tests {
             derive_with_baseline_evidence(&account_a, &refused_tamper, &[]),
             Err(ProjectionReducerError::InvalidAccountEvidence)
         ));
+    }
+
+    /// PASS: strict reduction recomputes the pure risk decision and rejects a producer-recorded
+    /// Approved decision whose snapshot deterministically trips the absolute-loss kill switch.
+    #[test]
+    fn strict_reducer_rejects_approved_admission_with_blocked_risk_snapshot() {
+        let account_id = AccountId::new("risk-recheck").unwrap();
+        let prepared = finality_prepared();
+        let mut admission = approved_admission(&prepared);
+        admission.economic.risk.snapshot.absolute_pnl_bps = pe_core_types::BasisPoints(-1_000);
+        admission.economic.risk.decision = RiskDecisionAudit::Approved;
+        let events = vec![
+            baseline_event(&account_id, 1),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: OffsetDateTime::from_unix_timestamp(2).unwrap(),
+                payload: LiveJournalPayload::AdmissionEvaluated(admission),
+            },
+        ];
+
+        assert!(matches!(
+            derive_with_baseline_evidence(&account_id, &events, &[]),
+            Err(ProjectionReducerError::InvalidRiskDecision)
+        ));
+    }
+
+    /// PASS: every crash seam after Approved and before Prepared reduces to one pending recovery
+    /// key; resuming with Prepared or terminalizing with a typed failure consumes it exactly once.
+    #[test]
+    fn strict_reducer_converges_unmatched_approved_admission() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let event = |seq, payload| LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp: OffsetDateTime::from_unix_timestamp(i64::try_from(seq).unwrap()).unwrap(),
+            payload,
+        };
+        for _seam in [
+            "after_admission_append",
+            "during_venue_preparation",
+            "before_prepared_append",
+        ] {
+            let prefix = vec![
+                baseline_event(&account_id, 1),
+                event(
+                    2,
+                    LiveJournalPayload::AdmissionEvaluated(approved_admission(&prepared)),
+                ),
+            ];
+            let pending = derive_with_baseline_evidence(&account_id, &prefix, &[]).unwrap();
+            assert_eq!(
+                pending.pending_approved_admission_keys,
+                BTreeSet::from([prepared.identity.idempotency_key.clone()])
+            );
+
+            let mut resumed = prefix.clone();
+            resumed.push(event(
+                3,
+                LiveJournalPayload::OrderPrepared(prepared.clone()),
+            ));
+            let resumed = derive_with_baseline_evidence(&account_id, &resumed, &[]).unwrap();
+            assert!(resumed.pending_approved_admission_keys.is_empty());
+            assert!(resumed.validated_prepared_sequences.contains(&3));
+
+            let mut terminalized = prefix;
+            terminalized.push(event(
+                3,
+                LiveJournalPayload::OrderPreparationFailed(Box::new(
+                    pe_execution_core::LiveOrderPreparationFailedAudit {
+                        identity: prepared.identity.clone(),
+                        failure: pe_execution_core::LiveOrderPreparationFailure::Venue,
+                    },
+                )),
+            ));
+            let terminalized =
+                derive_with_baseline_evidence(&account_id, &terminalized, &[]).unwrap();
+            assert!(terminalized.pending_approved_admission_keys.is_empty());
+            assert!(terminalized.validated_prepared_sequences.is_empty());
+        }
     }
 
     /// PASS: a failed account request consumes exactly one descriptor bound to the active

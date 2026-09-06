@@ -630,6 +630,48 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         request: LiveOrderRequest,
         now: OffsetDateTime,
     ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError> {
+        self.prepare_with_clock(request, move || now).await
+    }
+
+    /// Production prepare path. The clock is sampled at each classification and durable append
+    /// boundary so awaited account and venue I/O cannot backdate later facts.
+    pub async fn prepare_with_clock<C>(
+        &self,
+        request: LiveOrderRequest,
+        clock: C,
+    ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
+        self.prepare_with_optional_account(request, None, clock)
+            .await
+    }
+
+    /// Production prepare path when the caller has just observed the account state through this
+    /// venue. This preserves that exact observation across a service-owned pre-dispatch risk
+    /// check without issuing another asynchronous account read afterward.
+    pub async fn prepare_with_observed_account_and_clock<C>(
+        &self,
+        request: LiveOrderRequest,
+        account: LiveVenueAccountState,
+        clock: C,
+    ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
+        self.prepare_with_optional_account(request, Some(account), clock)
+            .await
+    }
+
+    async fn prepare_with_optional_account<C>(
+        &self,
+        request: LiveOrderRequest,
+        observed_account: Option<LiveVenueAccountState>,
+        clock: C,
+    ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
         let economic = request.economic.clone();
         let admission = LiveAdmissionArtifactAudit::new(
             &request.admission.market,
@@ -638,9 +680,9 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             request.admission.receipts,
         );
         let ladder = LadderPlanAudit::new(&request.ladder);
-        let classify = |account| {
+        let classify = |evaluated_at, account| {
             classify_live_admission(LiveAdmissionClassificationInput {
-                evaluated_at: now,
+                evaluated_at,
                 requested_mode: request.mode.requested,
                 effective_mode: request.mode.effective,
                 frozen_binding: &request.target.credential_binding,
@@ -656,13 +698,14 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             })
         };
 
+        let pre_account_at = clock();
         if let Ok(LiveAdmissionVerdict::Refused(reason)) =
-            classify(LiveAdmissionAccountEvidence::NotRead)
+            classify(pre_account_at, LiveAdmissionAccountEvidence::NotRead)
         {
             if reason == LiveAdmissionRefusal::CredentialVersionChanged {
                 self.journal.append(
                     request.target.account_id.clone(),
-                    now,
+                    pre_account_at,
                     LiveJournalPayload::CredentialBindingMismatch {
                         frozen: request.target.credential_binding.clone(),
                         current: request.current_credential_binding.clone(),
@@ -671,7 +714,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             }
             return self.refuse(
                 &request,
-                now,
+                pre_account_at,
                 economic,
                 None,
                 Vec::new(),
@@ -680,53 +723,64 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             );
         }
 
-        let account = match self
-            .venue
-            .read_balance_and_allowance(request.admission.market.neg_risk)
-            .await
-        {
-            Ok(account) => account,
-            Err(error) => {
-                let verdict = classify(LiveAdmissionAccountEvidence::ReadFailure(error.kind))
+        let account = if let Some(account) = observed_account {
+            account
+        } else {
+            match self
+                .venue
+                .read_balance_and_allowance(request.admission.market.neg_risk)
+                .await
+            {
+                Ok(account) => account,
+                Err(error) => {
+                    let evaluated_at = clock();
+                    let verdict = classify(
+                        evaluated_at,
+                        LiveAdmissionAccountEvidence::ReadFailure(error.kind),
+                    )
                     .unwrap_or(LiveAdmissionVerdict::Refused(
                         LiveAdmissionRefusal::AccountStateUnavailable(
                             LiveAccountReadFailure::Protocol,
                         ),
                     ));
-                let LiveAdmissionVerdict::Refused(reason) = verdict else {
+                    let LiveAdmissionVerdict::Refused(reason) = verdict else {
+                        return self.refuse(
+                            &request,
+                            evaluated_at,
+                            economic,
+                            None,
+                            error.evidence,
+                            error.request_descriptor_hashes,
+                            LiveAdmissionRefusal::AccountStateUnavailable(
+                                LiveAccountReadFailure::Protocol,
+                            ),
+                        );
+                    };
                     return self.refuse(
                         &request,
-                        now,
+                        evaluated_at,
                         economic,
                         None,
                         error.evidence,
                         error.request_descriptor_hashes,
-                        LiveAdmissionRefusal::AccountStateUnavailable(
-                            LiveAccountReadFailure::Protocol,
-                        ),
+                        reason,
                     );
-                };
-                return self.refuse(
-                    &request,
-                    now,
-                    economic,
-                    None,
-                    error.evidence,
-                    error.request_descriptor_hashes,
-                    reason,
-                );
+                }
             }
         };
         let account_audit = account.audit()?;
-        let verdict = classify(LiveAdmissionAccountEvidence::State(&account_audit)).unwrap_or(
-            LiveAdmissionVerdict::Refused(LiveAdmissionRefusal::AccountStateUnavailable(
-                LiveAccountReadFailure::Protocol,
-            )),
-        );
+        let admission_at = clock();
+        let verdict = classify(
+            admission_at,
+            LiveAdmissionAccountEvidence::State(&account_audit),
+        )
+        .unwrap_or(LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountStateUnavailable(LiveAccountReadFailure::Protocol),
+        ));
         if let LiveAdmissionVerdict::Refused(reason) = verdict {
             return self.refuse(
                 &request,
-                now,
+                admission_at,
                 economic,
                 Some(account_audit),
                 Vec::new(),
@@ -737,7 +791,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
 
         self.journal_admission(
             &request,
-            now,
+            admission_at,
             economic.clone(),
             Some(account_audit.clone()),
             Vec::new(),
@@ -759,9 +813,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         let venue_prepared = match self.venue.prepare(venue_request).await {
             Ok(prepared) => prepared,
             Err(_) => {
+                let failed_at = clock();
                 self.journal.append(
                     request.target.account_id.clone(),
-                    now,
+                    failed_at,
                     LiveJournalPayload::OrderPreparationFailed(Box::new(
                         LiveOrderPreparationFailedAudit {
                             identity: request.identity,
@@ -777,9 +832,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             }
         };
         if !prepared_matches_request(venue_prepared.audit(), &request, &account) {
+            let failed_at = clock();
             self.journal.append(
                 request.target.account_id.clone(),
-                now,
+                failed_at,
                 LiveJournalPayload::OrderPreparationFailed(Box::new(
                     LiveOrderPreparationFailedAudit {
                         identity: request.identity,
@@ -802,9 +858,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             account_audit,
             prepared.clone(),
         );
+        let prepared_at = clock();
         self.journal.append(
             request.target.account_id.clone(),
-            now,
+            prepared_at,
             LiveJournalPayload::OrderPrepared(Box::new(prepared_audit.clone())),
         )?;
         Ok(LivePrepareResult::Prepared(PreparedLiveOrder {
@@ -816,12 +873,180 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         }))
     }
 
+    /// Resume a synchronized Approved admission after a crash without emitting a second
+    /// `AdmissionEvaluated`. Expired or no-longer-reproducible frozen evidence is terminalized.
+    pub async fn resume_approved_admission_with_clock<C>(
+        &self,
+        account_id: AccountId,
+        admission: Box<LiveAdmissionEvaluationAudit>,
+        clock: C,
+    ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
+        let evaluated_at = clock();
+        let account_state = admission.account_state.as_ref();
+        let reproduced = account_state.map(|account| {
+            classify_live_admission(LiveAdmissionClassificationInput {
+                evaluated_at,
+                requested_mode: admission.requested_mode,
+                effective_mode: admission.effective_mode,
+                frozen_binding: &admission.frozen_binding,
+                current_binding: &admission.current_binding,
+                identity: &admission.identity,
+                condition_id: &admission.economic.market.condition_id,
+                outcome_id: OutcomeId(u16::from(admission.economic.market.outcome_index)),
+                token_id: &admission.economic.market.token_id,
+                admission: &admission.economic.admission,
+                ladder: &admission.economic.ladder,
+                economic: &admission.economic,
+                account: LiveAdmissionAccountEvidence::State(account),
+            })
+        });
+        if admission.verdict != LiveAdmissionVerdict::Approved
+            || !recorded_risk_is_approved(&admission.economic)
+            || !matches!(reproduced, Some(Ok(LiveAdmissionVerdict::Approved)))
+        {
+            self.terminalize_approved_admission(
+                account_id,
+                admission.identity.clone(),
+                evaluated_at,
+                LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+            )?;
+            return Ok(LivePrepareResult::Terminal(LiveOrderOutcome::Rejected {
+                order_hash: None,
+                venue_order_id: None,
+                kind: LiveOrderRejectKind::PreparationFailed,
+            }));
+        }
+        let account_state = match account_state {
+            Some(account) => account.clone(),
+            None => {
+                self.terminalize_approved_admission(
+                    account_id,
+                    admission.identity.clone(),
+                    evaluated_at,
+                    LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+                )?;
+                return Ok(LivePrepareResult::Terminal(LiveOrderOutcome::Rejected {
+                    order_hash: None,
+                    venue_order_id: None,
+                    kind: LiveOrderRejectKind::PreparationFailed,
+                }));
+            }
+        };
+        let venue_request = venue_request_from_approved_admission(&admission);
+        let venue_prepared = match self.venue.prepare(venue_request).await {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                self.terminalize_approved_admission(
+                    account_id,
+                    admission.identity.clone(),
+                    clock(),
+                    LiveOrderPreparationFailure::Venue,
+                )?;
+                return Ok(LivePrepareResult::Terminal(LiveOrderOutcome::Rejected {
+                    order_hash: None,
+                    venue_order_id: None,
+                    kind: LiveOrderRejectKind::PreparationFailed,
+                }));
+            }
+        };
+        if !prepared_matches_approved_admission(venue_prepared.audit(), &admission, &account_state)
+        {
+            self.terminalize_approved_admission(
+                account_id,
+                admission.identity.clone(),
+                clock(),
+                LiveOrderPreparationFailure::PreparedAuditMismatch,
+            )?;
+            return Ok(LivePrepareResult::Terminal(LiveOrderOutcome::Rejected {
+                order_hash: None,
+                venue_order_id: None,
+                kind: LiveOrderRejectKind::PreparationFailed,
+            }));
+        }
+        let (prepared, submission) = venue_prepared.into_parts();
+        let prepared_audit = LiveOrderPreparedAudit::new(
+            admission.identity.clone(),
+            admission.frozen_binding.clone(),
+            admission.economic.clone(),
+            account_state,
+            prepared.clone(),
+        );
+        self.journal.append(
+            account_id.clone(),
+            clock(),
+            LiveJournalPayload::OrderPrepared(Box::new(prepared_audit.clone())),
+        )?;
+        Ok(LivePrepareResult::Prepared(PreparedLiveOrder {
+            account_id,
+            identity: admission.identity.clone(),
+            order_hash: prepared.order_hash,
+            prepared_audit: Box::new(prepared_audit),
+            submission,
+        }))
+    }
+
+    /// Consume an unmatched Approved admission with a durable typed preparation failure.
+    pub fn terminalize_approved_admission(
+        &self,
+        account_id: AccountId,
+        identity: LiveOrderIdentity,
+        now: OffsetDateTime,
+        failure: LiveOrderPreparationFailure,
+    ) -> Result<(), LiveExecutorError> {
+        self.journal.append(
+            account_id,
+            now,
+            LiveJournalPayload::OrderPreparationFailed(Box::new(LiveOrderPreparationFailedAudit {
+                identity,
+                failure,
+            })),
+        )?;
+        Ok(())
+    }
+
+    /// Drop an unconsumed POST capability and terminalize its durable Prepared record.
+    pub fn terminalize_prepared(
+        &self,
+        prepared: PreparedLiveOrder<V::Submission>,
+        now: OffsetDateTime,
+        failure: LiveOrderPreparationFailure,
+    ) -> Result<LiveOrderOutcome, LiveExecutorError> {
+        let PreparedLiveOrder {
+            account_id,
+            identity,
+            submission: _,
+            ..
+        } = prepared;
+        self.terminalize_approved_admission(account_id, identity, now, failure)?;
+        Ok(LiveOrderOutcome::Rejected {
+            order_hash: None,
+            venue_order_id: None,
+            kind: LiveOrderRejectKind::PreparationFailed,
+        })
+    }
+
     /// Phase two: consume the POST capability exactly once and classify/reconcile its result.
     pub async fn submit(
         &self,
         prepared: PreparedLiveOrder<V::Submission>,
         now: OffsetDateTime,
     ) -> Result<LiveOrderOutcome, LiveExecutorError> {
+        self.submit_with_clock(prepared, move || now).await
+    }
+
+    /// Production POST path. The response and any subsequent reconciliation are stamped only
+    /// after their corresponding I/O completes.
+    pub async fn submit_with_clock<C>(
+        &self,
+        prepared: PreparedLiveOrder<V::Submission>,
+        clock: C,
+    ) -> Result<LiveOrderOutcome, LiveExecutorError>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
         let PreparedLiveOrder {
             account_id,
             identity,
@@ -830,6 +1055,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             ..
         } = prepared;
         let post = self.venue.post_once(submission).await;
+        let posted_at = clock();
         match post {
             Err(failure) => {
                 let kind = if failure.error_class == TransportErrorClass::Timeout {
@@ -838,13 +1064,19 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     LiveOrderAmbiguityKind::Transport
                 };
                 let attempt = RawHttpAttempt::TransportFailure(failure);
-                self.journal_post(&account_id, &identity, &order_hash, now, attempt)?;
-                self.reconcile_ambiguous(account_id, identity, order_hash, now, kind)
+                self.journal_post(&account_id, &identity, &order_hash, posted_at, attempt)?;
+                self.reconcile_ambiguous_with_clock(account_id, identity, order_hash, kind, &clock)
                     .await
             }
             Ok(response) => {
                 let attempt = RawHttpAttempt::Response(response.clone());
-                self.journal_post(&account_id, &identity, &order_hash, now, attempt.clone())?;
+                self.journal_post(
+                    &account_id,
+                    &identity,
+                    &order_hash,
+                    posted_at,
+                    attempt.clone(),
+                )?;
                 match self.venue.classify_post_response(&response) {
                     Ok(LivePostClassification::Matched {
                         venue_order_id,
@@ -860,7 +1092,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                             &account_id,
                             &identity,
                             &order_hash,
-                            now,
+                            posted_at,
                             LiveReconciliationSource::PostResponse,
                             journal_outcome,
                             vec![attempt],
@@ -880,7 +1112,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                             &account_id,
                             &identity,
                             &order_hash,
-                            now,
+                            posted_at,
                             LiveReconciliationSource::PostResponse,
                             journal_outcome,
                             vec![attempt],
@@ -899,7 +1131,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                             &account_id,
                             &identity,
                             &order_hash,
-                            now,
+                            posted_at,
                             LiveReconciliationSource::PostResponse,
                             journal_outcome,
                             vec![attempt],
@@ -911,16 +1143,18 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                         })
                     }
                     Ok(LivePostClassification::Ambiguous { kind }) => {
-                        self.reconcile_ambiguous(account_id, identity, order_hash, now, kind)
-                            .await
+                        self.reconcile_ambiguous_with_clock(
+                            account_id, identity, order_hash, kind, &clock,
+                        )
+                        .await
                     }
                     Err(_) => {
-                        self.reconcile_ambiguous(
+                        self.reconcile_ambiguous_with_clock(
                             account_id,
                             identity,
                             order_hash,
-                            now,
                             LiveOrderAmbiguityKind::UnexpectedResponse,
+                            &clock,
                         )
                         .await
                     }
@@ -1035,18 +1269,22 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         Ok(())
     }
 
-    async fn reconcile_ambiguous(
+    async fn reconcile_ambiguous_with_clock<C>(
         &self,
         account_id: AccountId,
         identity: LiveOrderIdentity,
         order_hash: String,
-        now: OffsetDateTime,
         initial_kind: LiveOrderAmbiguityKind,
-    ) -> Result<LiveOrderOutcome, LiveExecutorError> {
+        clock: &C,
+    ) -> Result<LiveOrderOutcome, LiveExecutorError>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
         let reconciliation = self
             .venue
             .reconcile_and_cancel_by_order_hash(&order_hash)
             .await;
+        let reconciled_at = clock();
         let (outcome, evidence) = match reconciliation {
             Ok(reconciliation) => (reconciliation.outcome, reconciliation.evidence),
             Err(error) => {
@@ -1057,7 +1295,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     &account_id,
                     &identity,
                     &order_hash,
-                    now,
+                    reconciled_at,
                     LiveReconciliationSource::OrderHashLookupAndCancel,
                     journal_outcome,
                     error.evidence,
@@ -1078,7 +1316,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     &account_id,
                     &identity,
                     &order_hash,
-                    now,
+                    reconciled_at,
                     LiveReconciliationSource::OrderHashLookupAndCancel,
                     LiveJournalOrderOutcome::Matched {
                         venue_order_id: venue_order_id.clone(),
@@ -1099,7 +1337,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     &account_id,
                     &identity,
                     &order_hash,
-                    now,
+                    reconciled_at,
                     LiveReconciliationSource::OrderHashLookupAndCancel,
                     LiveJournalOrderOutcome::Killed {
                         venue_order_id: venue_order_id.clone(),
@@ -1116,7 +1354,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     &account_id,
                     &identity,
                     &order_hash,
-                    now,
+                    reconciled_at,
                     LiveReconciliationSource::OrderHashLookupAndCancel,
                     LiveJournalOrderOutcome::Rejected {
                         venue_order_id: venue_order_id.clone(),
@@ -1135,7 +1373,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     &account_id,
                     &identity,
                     &order_hash,
-                    now,
+                    reconciled_at,
                     LiveReconciliationSource::OrderHashLookupAndCancel,
                     LiveJournalOrderOutcome::Ambiguous { kind },
                     evidence,
@@ -1361,6 +1599,59 @@ fn validate_ladder(
         return Err(LiveAdmissionRefusal::LadderInvalid);
     }
     Ok(())
+}
+
+fn recorded_risk_is_approved(economic: &crate::economic::EconomicPrepared) -> bool {
+    let evaluated = match pe_risk_engine::evaluate_risk(&economic.risk.snapshot) {
+        pe_risk_engine::RiskDecision::Approved => crate::RiskDecisionAudit::Approved,
+        pe_risk_engine::RiskDecision::Blocked(reason) => {
+            crate::RiskDecisionAudit::Blocked { reason }
+        }
+    };
+    evaluated == economic.risk.decision && evaluated == crate::RiskDecisionAudit::Approved
+}
+
+fn venue_request_from_approved_admission(
+    admission: &LiveAdmissionEvaluationAudit,
+) -> LiveVenuePrepareRequest {
+    LiveVenuePrepareRequest {
+        condition_id: admission.economic.market.condition_id.clone(),
+        outcome_id: OutcomeId(u16::from(admission.economic.market.outcome_index)),
+        token_id: admission.economic.market.token_id.clone(),
+        neg_risk: admission.economic.admission.market.neg_risk,
+        limit_price: admission.economic.ladder.limit_price,
+        shares: admission.economic.ladder.minimum_shares,
+        maximum_collateral: admission.economic.ladder.principal,
+        tick_size: admission.economic.admission.market.minimum_tick_size,
+        metadata_hashes: admission.identity.evidence_hashes.clone(),
+    }
+}
+
+fn prepared_matches_approved_admission(
+    prepared: &PreparedPolymarketBuy,
+    admission: &LiveAdmissionEvaluationAudit,
+    account: &LiveAccountStateAudit,
+) -> bool {
+    let request = venue_request_from_approved_admission(admission);
+    prepared.condition_id == request.condition_id
+        && prepared.outcome_id == request.outcome_id
+        && prepared.token_id == request.token_id
+        && prepared.neg_risk == request.neg_risk
+        && prepared.side == "BUY"
+        && prepared.order_type == "FOK"
+        && !prepared.post_only
+        && !prepared.defer_exec
+        && prepared.exchange_domain_version == 2
+        && prepared.taker_shares == request.shares
+        && prepared.limit_price == request.limit_price
+        && prepared.minimum_tick_size == request.tick_size
+        && prepared.maker_collateral == request.maximum_collateral
+        && prepared.worst_case_debit == request.maximum_collateral
+        && prepared.spender == account.selected_spender
+        && prepared.verifying_contract == account.selected_spender
+        && prepared.metadata_hashes == request.metadata_hashes
+        && !prepared.order_hash.trim().is_empty()
+        && !prepared.post_body_hash.trim().is_empty()
 }
 
 fn prepared_matches_request(
@@ -1829,6 +2120,154 @@ mod tests {
         assert_eq!(posts, 1);
         assert_eq!(reconciliations, 0);
         assert_common_terminal_evidence(&events);
+    }
+
+    /// PASS: account admission, Prepared, and POST facts sample the injected clock after their
+    /// respective awaited boundaries instead of reusing the tick's first instant.
+    #[tokio::test]
+    async fn durable_execution_facts_use_boundary_clocks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let venue = FixtureVenue::new(LivePostClassification::Killed {
+            venue_order_id: Some("venue-clock".to_owned()),
+        });
+        let executor = LiveExecutor::new(&venue, &journal);
+        let account_id = AccountId::new("clock-account").unwrap();
+        let ticks = AtomicUsize::new(0);
+        let clock = || {
+            now()
+                + time::Duration::seconds(
+                    i64::try_from(ticks.fetch_add(1, Ordering::SeqCst)).unwrap(),
+                )
+        };
+        let prepared = match executor
+            .prepare_with_clock(request(&account_id), &clock)
+            .await
+            .unwrap()
+        {
+            LivePrepareResult::Prepared(prepared) => prepared,
+            LivePrepareResult::Terminal(outcome) => {
+                unreachable!("fixture admission unexpectedly failed: {outcome:?}")
+            }
+        };
+        executor.submit_with_clock(prepared, &clock).await.unwrap();
+
+        let events = replay_account(&path, &account_id).unwrap();
+        assert_eq!(events[0].timestamp, now() + time::Duration::seconds(1));
+        assert_eq!(events[1].timestamp, now() + time::Duration::seconds(2));
+        assert_eq!(events[2].timestamp, now() + time::Duration::seconds(3));
+        assert_eq!(events[3].timestamp, now() + time::Duration::seconds(3));
+    }
+
+    /// PASS: a service-observed account snapshot reaches admission and preparation without a
+    /// second venue read that could age the freshly checked risk evidence.
+    #[tokio::test]
+    async fn observed_account_prepare_has_no_later_account_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let venue = FixtureVenue::new(LivePostClassification::Killed {
+            venue_order_id: None,
+        });
+        *venue.account.lock().unwrap() = Err(LiveVenueAccountReadError {
+            kind: LiveAccountReadFailure::Authentication,
+            evidence: Vec::new(),
+            request_descriptor_hashes: Vec::new(),
+        });
+        let executor = LiveExecutor::new(&venue, &journal);
+        let account_id = AccountId::new("observed-account").unwrap();
+
+        assert!(matches!(
+            executor
+                .prepare_with_observed_account_and_clock(
+                    request(&account_id),
+                    account_state(),
+                    now,
+                )
+                .await
+                .unwrap(),
+            LivePrepareResult::Prepared(_)
+        ));
+    }
+
+    /// PASS: all three crash seams between synchronized Approved admission and synchronized
+    /// Prepared resume the frozen identity without appending a second admission.
+    #[tokio::test]
+    async fn approved_admission_crash_seams_resume_without_duplicate_admission() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("source.log");
+        let source_journal = LiveJournal::open(&source_path).unwrap();
+        let source_venue = FixtureVenue::new(LivePostClassification::Killed {
+            venue_order_id: None,
+        });
+        let source_executor = LiveExecutor::new(&source_venue, &source_journal);
+        let account_id = AccountId::new("resume-account").unwrap();
+        let _ = source_executor
+            .prepare(request(&account_id), now())
+            .await
+            .unwrap();
+        let source_events = replay_account(&source_path, &account_id).unwrap();
+        let admission = source_events
+            .iter()
+            .find_map(|event| match &event.payload {
+                LiveJournalPayload::AdmissionEvaluated(admission) => Some(admission.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        for seam in [
+            "after-admission-append",
+            "during-venue-preparation",
+            "before-prepared-append",
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join(format!("{seam}.log"));
+            let journal = LiveJournal::open(&path).unwrap();
+            journal
+                .append(
+                    account_id.clone(),
+                    now(),
+                    LiveJournalPayload::AdmissionEvaluated(admission.clone()),
+                )
+                .unwrap();
+            let venue = FixtureVenue::new(LivePostClassification::Killed {
+                venue_order_id: None,
+            });
+            let executor = LiveExecutor::new(&venue, &journal);
+            assert!(matches!(
+                executor
+                    .resume_approved_admission_with_clock(
+                        account_id.clone(),
+                        admission.clone(),
+                        now,
+                    )
+                    .await
+                    .unwrap(),
+                LivePrepareResult::Prepared(_)
+            ));
+            let events = replay_account(&path, &account_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        matches!(&event.payload, LiveJournalPayload::AdmissionEvaluated(_))
+                    })
+                    .count(),
+                1,
+                "{seam}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        matches!(&event.payload, LiveJournalPayload::OrderPrepared(_))
+                    })
+                    .count(),
+                1,
+                "{seam}"
+            );
+        }
     }
 
     #[tokio::test]
