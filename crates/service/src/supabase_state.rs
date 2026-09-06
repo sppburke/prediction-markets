@@ -10,11 +10,13 @@
 //! write-through and is the read cache; `seen_trades`/`leader_positions`/`poll_cursors`/
 //! `meta` stay local-only.
 //!
-//! The two write-through paths are exposed as the free functions
-//! [`commit_fill_authoritative`] and [`apply_resolution_authoritative`] (RPC first, SQLite
-//! mirror second), generic over [`SupabaseStateTrait`] so scenario tests drive them with an
-//! in-memory fake and inject RPC failures with no live network — mirroring the
-//! [`crate::supabase_sink`] `SinkWriter` seam.
+//! Financial-era mutations flow through the Prepared-sequenced write-through paths
+//! ([`commit_prepared_fill`](SupabaseStateTrait::commit_prepared_fill) and
+//! [`apply_prepared_resolution`](SupabaseStateTrait::apply_prepared_resolution)); the legacy
+//! `commit_fill_v2` shape survives only for the pre-Start migration frame walk. Everything is
+//! generic over [`SupabaseStateTrait`] so scenario tests drive it with an in-memory fake and
+//! inject RPC failures with no live network — mirroring the [`crate::supabase_sink`]
+//! `SinkWriter` seam.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -27,10 +29,7 @@ use pe_core_types::{
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Writer};
 use pe_execution_core::EconomicPrepared;
-use pe_paper_pnl::ResolutionStore;
-use pe_paper_state::{
-    FillRecord, FillRow, LeaderPositionRow, PaperPositionRow, PaperStateDb, PaperStateError,
-};
+use pe_paper_state::{FillRecord, FillRow, PaperPositionRow, PaperStateDb, PaperStateError};
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_source_polymarket_public::{
     BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
@@ -223,15 +222,6 @@ pub trait SupabaseStateTrait: Send + Sync {
         &self,
         row: &SupabaseFillRow,
     ) -> impl Future<Output = Result<FillV2Outcome, SupabaseStateError>> + Send;
-    /// Apply a resolution via the authoritative `apply_resolution_v2` RPC (#511): the
-    /// credit is computed server-side under the bankroll lock.
-    fn apply_resolution_v2(
-        &self,
-        market_id: &MarketId,
-        outcome_prices: &[Decimal],
-        settled_at_unix: i64,
-    ) -> impl Future<Output = Result<ResolutionV2Outcome, SupabaseStateError>> + Send;
-
     /// #545 Start-bound, Prepared-sequenced exact fill mutation.
     fn commit_prepared_fill(
         &self,
@@ -555,15 +545,6 @@ struct FillV2RowJson {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResolutionV2Resp {
-    outcome: String,
-    credit: String,
-    outcome_prices: Vec<String>,
-    settled_at_unix: i64,
-    bankroll: String,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedFillResp {
     outcome: String,
@@ -750,45 +731,6 @@ impl SupabaseStateTrait for SupabaseStateClient {
                 row.is_some()
             ))),
         }
-    }
-
-    async fn apply_resolution_v2(
-        &self,
-        market_id: &MarketId,
-        outcome_prices: &[Decimal],
-        settled_at_unix: i64,
-    ) -> Result<ResolutionV2Outcome, SupabaseStateError> {
-        // `outcome_prices` as a jsonb array of text decimals — matches the sink's
-        // `settled_markets.outcome_prices` shape (so `wallet_live_stats` reads agree).
-        let prices: Vec<String> = outcome_prices.iter().map(|d| d.to_string()).collect();
-        let body = serde_json::json!({
-            "p_market_id": market_id.0.0,
-            "p_outcome_prices": prices,
-            "p_settled_at_unix": settled_at_unix,
-        });
-        let value = self.post_rpc_json("apply_resolution_v2", &body).await?;
-        let resp: ResolutionV2Resp = serde_json::from_value(value)
-            .map_err(|e| SupabaseStateError::Corrupt(format!("apply_resolution_v2 shape: {e}")))?;
-        let applied = match resp.outcome.as_str() {
-            "applied" => true,
-            "existing" => false,
-            other => {
-                return Err(SupabaseStateError::Corrupt(format!(
-                    "apply_resolution_v2 outcome {other:?}"
-                )));
-            }
-        };
-        let mut parsed_prices = Vec::with_capacity(resp.outcome_prices.len());
-        for p in &resp.outcome_prices {
-            parsed_prices.push(money(p, "apply_resolution_v2 outcome_price")?);
-        }
-        Ok(ResolutionV2Outcome {
-            applied,
-            credit: money(&resp.credit, "apply_resolution_v2 credit")?,
-            outcome_prices: parsed_prices,
-            settled_at_unix: resp.settled_at_unix,
-            bankroll: bankroll_money(&resp.bankroll, "apply_resolution_v2 bankroll")?,
-        })
     }
 
     async fn commit_prepared_fill(
@@ -985,188 +927,6 @@ struct PositionRow {
 }
 
 // ── Write-through paths (RPC first, SQLite mirror second) ───────────────────────
-
-/// Outcome of an authoritative fill commit (#511): the orchestrator marks the contract
-/// filled only on `Filled`; `RefusedSettled` is terminal (seen + typed flip written).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthoritativeFillOutcome {
-    Filled(Decimal),
-    RefusedSettled(Decimal),
-    /// The authority committed but the local mirror could not converge after
-    /// in-process retries (#544 review): the caller must treat paper durability
-    /// as uncertain — fail readiness and stop producers; the boot frame-walk
-    /// converges from the durable frame on restart. Carries the authority
-    /// bankroll for the final status snapshot only.
-    LocalDurabilityUncertain(Decimal),
-}
-
-/// Authoritative fill commit (#397, reshaped by #511): `commit_fill_v2` FIRST (fail-closed
-/// — an RPC error propagates and the caller runs the frozen-retry protocol; the frame is
-/// durable), then ONE local convergence transaction mirroring the CANONICAL row and the
-/// authority bankroll, then — only after the local transaction commits (#511 R3) — the
-/// successor-gated #510 watermark advance. A settled refusal writes the terminal refused
-/// disposition instead. The RPC `.await` completes before the SQLite mutex is taken.
-#[allow(clippy::too_many_arguments)]
-pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
-    supabase: &S,
-    paper_state: &PaperStateDb,
-    source_trade_id: &SourceTradeId,
-    leader: &LeaderPositionRow,
-    _record: &FillRecord,
-    seq: EventSeq,
-    sup_row: &SupabaseFillRow,
-    flip: Option<pe_paper_state::DispatchFlip<'_>>,
-    pending_decision: Option<&DecisionEvidenceAccumulator>,
-) -> Result<AuthoritativeFillOutcome, SupabaseStateError> {
-    // #510: snapshot the watermark BEFORE the external mutation — a getter failure fails
-    // the fill closed here, never after the RPC has already debited Supabase.
-    let wm_before = paper_state.last_supabase_applied_event_seq()?;
-    let outcome = supabase.commit_fill_v2(sup_row).await?;
-    let pending = match &outcome {
-        FillV2Outcome::Applied { bankroll, row } => render_pending_evidence(
-            pending_decision,
-            AuthorityEvidence::commit_fill_v2("applied", *bankroll),
-            recorded_fill_terminal(&row.record, row.event_seq),
-        ),
-        FillV2Outcome::Existing { bankroll, row } => render_pending_evidence(
-            pending_decision,
-            AuthorityEvidence::commit_fill_v2("existing", *bankroll),
-            recorded_fill_terminal(&row.record, row.event_seq),
-        ),
-        FillV2Outcome::Settled { bankroll } => render_pending_evidence(
-            pending_decision,
-            AuthorityEvidence::commit_fill_v2("settled_refusal", *bankroll),
-            TerminalDispositionEvidence::settled_refusal(),
-        ),
-    }
-    .map_err(|error| {
-        SupabaseStateError::Corrupt(format!(
-            "encode decision_pending authority evidence: {error}"
-        ))
-    })?;
-    // #508 round-4: the local disposition surfaces and retries IN-PROCESS (bounded); the
-    // durable backstop is the boot frame-walk (the frozen watermark marks the frame pending).
-    let mut local = Ok(());
-    for attempt in 1u32..=3 {
-        local = match &outcome {
-            FillV2Outcome::Applied { bankroll, row }
-            | FillV2Outcome::Existing { bankroll, row } => paper_state
-                .commit_fill_canonical_pending(
-                    Some(source_trade_id),
-                    Some(leader),
-                    &row.record,
-                    row.event_seq,
-                    seq,
-                    *bankroll,
-                    flip,
-                    pending.as_ref().map(pending_terminal),
-                ),
-            FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill_pending(
-                source_trade_id,
-                Some(leader),
-                seq,
-                flip.map(|f| pe_paper_state::DispatchFlip {
-                    dispatch_id: f.dispatch_id,
-                    paper_outcome: "no_fill:market_settled",
-                }),
-                pending.as_ref().map(pending_terminal),
-            ),
-        };
-        match &local {
-            Ok(()) => break,
-            Err(e) if attempt < 3 => {
-                tracing::error!(
-                    error = %e,
-                    attempt,
-                    "authoritative fill: local disposition failed; retrying in-process"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Err(_) => {}
-        }
-    }
-    match local {
-        Ok(()) => {
-            // #510 successor-gated runtime advance, AFTER the local disposition (#511 R3:
-            // advancing first would hide an unmirrored frame from the boot frame-walk).
-            // Frames are dense from seq 0; any gap freezes the watermark and the boot
-            // frame-walk — which resolves every frame above it through v2 — heals it.
-            let is_successor = match wm_before {
-                None => seq.0 == 0,
-                Some(wm) => wm.0.checked_add(1) == Some(seq.0),
-            };
-            if is_successor && let Err(e) = paper_state.set_supabase_applied_event_seq(seq) {
-                warn!(
-                    error = %e,
-                    seq = seq.0,
-                    "authoritative fill: watermark advance failed (boot frame-walk re-confirms)"
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                seq = seq.0,
-                "authoritative fill: authority committed but local disposition failed after \
-                 in-process retries; watermark left frozen (boot frame-walk converges)"
-            );
-            // Remote truth advanced without local convergence: surface typed
-            // uncertainty instead of success (#544 review). In-memory financial
-            // state must not advance past durable local state.
-            let bankroll = match outcome {
-                FillV2Outcome::Applied { bankroll, .. }
-                | FillV2Outcome::Existing { bankroll, .. }
-                | FillV2Outcome::Settled { bankroll } => bankroll,
-            };
-            return Ok(AuthoritativeFillOutcome::LocalDurabilityUncertain(bankroll));
-        }
-    }
-    Ok(match outcome {
-        FillV2Outcome::Applied { bankroll, .. } | FillV2Outcome::Existing { bankroll, .. } => {
-            AuthoritativeFillOutcome::Filled(bankroll)
-        }
-        FillV2Outcome::Settled { bankroll } => AuthoritativeFillOutcome::RefusedSettled(bankroll),
-    })
-}
-
-/// Authoritative resolution (#397, reshaped by #511): `apply_resolution_v2` FIRST — the
-/// credit is computed INSIDE the RPC from `paper_positions` under the bankroll lock,
-/// closing the read-then-resolve TOCTOU — then the SQLite mirror applies the RETURNED
-/// canonical values (on `existing`, the originally recorded ones), so a crash-then-retry
-/// converges with no double credit. Fail-closed: an RPC error leaves the market unsettled
-/// for the next tick.
-pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
-    supabase: &S,
-    store: &mut ResolutionStore,
-    market_id: &MarketId,
-    outcome_prices: &[Decimal],
-    settled_at_unix: i64,
-) -> Result<Decimal, SupabaseStateError> {
-    let res = supabase
-        .apply_resolution_v2(market_id, outcome_prices, settled_at_unix)
-        .await?;
-    if let Err(e) = store.settle_and_credit(
-        market_id.clone(),
-        res.outcome_prices.clone(),
-        res.credit,
-        res.settled_at_unix,
-    ) {
-        warn!(
-            error = %e,
-            market = %market_id,
-            "authoritative resolution committed to Supabase but local SQLite mirror failed"
-        );
-        // Typed error instead of silent success (#544 review): the market stays
-        // locally unsettled, the next tick re-drives the idempotent RPC (returns
-        // `existing`), and the mirror converges — the caller retries, it does
-        // not report a settled market it has not durably recorded.
-        return Err(SupabaseStateError::LocalMirrorUncertain {
-            market: market_id.0.0.clone(),
-            error: e.to_string(),
-        });
-    }
-    Ok(res.bankroll)
-}
 
 /// Reconcile the active Start-bound paper protocol before any producer starts.
 ///
@@ -2032,17 +1792,6 @@ mod tests {
         ) -> Result<FillV2Outcome, SupabaseStateError> {
             Err(SupabaseStateError::Corrupt(
                 "legacy fill RPC is outside this fixture".to_owned(),
-            ))
-        }
-
-        async fn apply_resolution_v2(
-            &self,
-            _market_id: &MarketId,
-            _outcome_prices: &[Decimal],
-            _settled_at_unix: i64,
-        ) -> Result<ResolutionV2Outcome, SupabaseStateError> {
-            Err(SupabaseStateError::Corrupt(
-                "legacy resolution RPC is outside this fixture".to_owned(),
             ))
         }
 
