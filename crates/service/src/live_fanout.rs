@@ -430,7 +430,6 @@ std::thread_local! {
 }
 
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
-    let source_envelopes = state.config.source_receipt_millis.source_envelopes();
     let paper_frames = scan_paper_log(&state.config.paper_log_path)
         .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
     let inventory = pe_execution_core::live_journal::recovery_inventory_with_admission_verifier(
@@ -447,6 +446,13 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
                 .filter(|prior| prior.account_id == event.account_id)
                 .cloned()
                 .collect::<Vec<_>>();
+            let mut scoped_events = account_prefix.clone();
+            scoped_events.push(event.clone());
+            let source_envelopes = source_envelopes_for_live_events(
+                &state.config.source_receipt_millis,
+                &scoped_events,
+            )
+            .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
             verify_replayed_live_risk(
                 &event.account_id,
                 &state.config.journal_path,
@@ -477,6 +483,13 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
         .collect::<BTreeSet<_>>();
     for account_id in std::mem::take(&mut recoverable_accounts) {
         let events = replay_live_account(state, &account_id)?;
+        let source_envelopes =
+            source_envelopes_for_live_events(&state.config.source_receipt_millis, &events)
+                .map_err(|error| {
+                    FanoutError::Signal(format!(
+                        "live recovery source evidence for {account_id}: {error}"
+                    ))
+                })?;
         let derived = derive_projection_rows_with_sources(&account_id, &events, &source_envelopes)
             .map_err(|error| {
                 FanoutError::Signal(format!(
@@ -5514,7 +5527,6 @@ async fn ensure_live_portfolio_marks(
         .unix_timestamp()
         .div_euclid(86_400)
         * 86_400;
-    let source_envelopes = state.config.source_receipt_millis.source_envelopes();
     while cutoff <= completed_cutoff {
         let cutoff_is_missing = !derived.daily_marks.contains_key(&cutoff);
         if cutoff_is_missing {
@@ -5523,11 +5535,12 @@ async fn ensure_live_portfolio_marks(
                 .filter(|event| event.timestamp.unix_timestamp() < cutoff)
                 .cloned()
                 .collect::<Vec<_>>();
-            let cutoff_sources = source_envelopes
-                .iter()
-                .filter(|envelope| envelope.received_at.0.unix_timestamp() < cutoff)
-                .cloned()
-                .collect::<Vec<_>>();
+            let Ok(cutoff_sources) = source_envelopes_for_live_events(
+                &state.config.source_receipt_millis,
+                &cutoff_events,
+            ) else {
+                return CheckOutcome::PersistentFail("daily mark source evidence");
+            };
             let cutoff_derived = match derive_projection_rows_with_sources(
                 &account.account_id,
                 &cutoff_events,

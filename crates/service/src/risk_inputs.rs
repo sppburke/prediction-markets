@@ -1076,25 +1076,6 @@ impl SourceReceiptMillisIndex {
         Ok(envelope)
     }
 
-    /// Transitional whole-log reader for reducers not yet migrated to receipt lookups. The index
-    /// itself remains metadata-only; callers should prefer [`Self::source_envelope`].
-    pub(crate) fn source_envelopes(&self) -> Arc<Vec<pe_event_log::EventEnvelope>> {
-        let receipts = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frames
-            .iter()
-            .map(|metadata| metadata.receipt)
-            .collect::<Vec<_>>();
-        Arc::new(
-            receipts
-                .into_iter()
-                .filter_map(|receipt| self.source_envelope(receipt).ok())
-                .collect(),
-        )
-    }
-
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> BTreeMap<EventSeq, (AppendReceipt, i64)> {
         self.state
