@@ -886,7 +886,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 )
             })?;
         attempt.financial_prefix = Some(financial_prefix);
-        let positions = self.paper_state.paper_positions().map_err(|_| {
+        let positions = self.paper_state.open_positions().map_err(|_| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
         let ids = crate::risk_inputs::open_positions(&positions)
