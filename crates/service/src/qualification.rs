@@ -969,7 +969,7 @@ async fn verify_qualification(
                 {
                     return insufficient("MembershipChanged structural evidence is invalid");
                 }
-                verify_membership_change_evidence(
+                drop(verify_membership_change_evidence(
                     *reason,
                     removed,
                     added,
@@ -980,7 +980,7 @@ async fn verify_qualification(
                         source: &source_observations,
                         current_membership: &membership,
                     },
-                )?;
+                )?);
                 for wallet in removed {
                     membership.remove(wallet);
                 }
@@ -2510,7 +2510,7 @@ fn verify_membership_change_evidence(
     ranking_batch_id: Option<i64>,
     evidence: &serde_json::Value,
     context: &MembershipEvidenceContext<'_>,
-) -> Result<(), QualificationError> {
+) -> Result<Vec<pe_trader_index::WatchlistEntry>, QualificationError> {
     let MembershipEvidenceContext {
         source,
         current_membership,
@@ -2521,7 +2521,7 @@ fn verify_membership_change_evidence(
                 "MembershipChanged evidence schema is invalid: {error}"
             ))
         })?;
-    match (&evidence, reason) {
+    let replacements = match (&evidence, reason) {
         (
             SealedMembershipEvidence::FullRerank {
                 ranking_receipt,
@@ -2554,6 +2554,7 @@ fn verify_membership_change_evidence(
                 &artifact.entries,
             )?;
             verify_admission_receipts(added, admission_receipts, source)?;
+            artifact.entries
         }
         (
             SealedMembershipEvidence::KnockoutBackfill {
@@ -2663,6 +2664,7 @@ fn verify_membership_change_evidence(
                 );
             }
             verify_admission_receipts(added, admission_receipts, source)?;
+            candidates
         }
         (
             SealedMembershipEvidence::CapacityChange {
@@ -2695,10 +2697,11 @@ fn verify_membership_change_evidence(
                 &artifact.published_entries,
             )?;
             verify_admission_receipts(added, admission_receipts, source)?;
+            artifact.published_entries
         }
         _ => return insufficient("MembershipChanged evidence kind does not match its reason"),
-    }
-    Ok(())
+    };
+    Ok(replacements)
 }
 
 fn membership_artifact<T: serde::de::DeserializeOwned>(
@@ -2839,12 +2842,13 @@ fn knockout_record_reason(
         .or_else(|| evidence.first().map(|eviction| eviction.reason))
 }
 
-#[cfg(test)]
-pub(crate) fn verify_published_membership_change(
+/// Verify one synchronized production membership record against the current source-log prefix and
+/// return the exact replacement vector retained by its receipt-bound artifact.
+pub(crate) fn replay_published_membership_change(
     record: &PaperLogRecord,
     source_log: &Path,
     current_membership: &HashSet<pe_core_types::WalletAddress>,
-) -> Result<(), QualificationError> {
+) -> Result<Vec<pe_trader_index::WatchlistEntry>, QualificationError> {
     let PaperLogRecord::MembershipChanged {
         reason,
         removed,
@@ -2871,6 +2875,15 @@ pub(crate) fn verify_published_membership_change(
             current_membership,
         },
     )
+}
+
+#[cfg(test)]
+pub(crate) fn verify_published_membership_change(
+    record: &PaperLogRecord,
+    source_log: &Path,
+    current_membership: &HashSet<pe_core_types::WalletAddress>,
+) -> Result<(), QualificationError> {
+    replay_published_membership_change(record, source_log, current_membership).map(drop)
 }
 
 fn verify_knockout_causal_inputs(

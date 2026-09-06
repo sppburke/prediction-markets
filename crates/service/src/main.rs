@@ -361,10 +361,11 @@ async fn main() -> Result<()> {
     let live_runtime_config = LiveRuntimeConfig::new(initial_runtime_config.clone());
 
     // A financial Start makes the synchronized paper prefix the structural membership owner.
-    // Its initial entries come from the exact ranking batch named by Start; subsequent additions
-    // come from each durable MembershipChanged replacement evidence. Therefore a newer published
-    // batch with no synchronized membership record remains a transition for the first maintenance
-    // tick instead of changing (or invalidating) the boot generation.
+    // Its initial entries come from the exact ranking batch named by Start; subsequent replacement
+    // vectors are verified and reconstructed from the source-log artifacts named by each durable
+    // MembershipChanged record. Therefore a newer published batch with no synchronized membership
+    // record remains a transition for the first maintenance tick instead of changing (or
+    // invalidating) the boot generation.
     let initial_watchlist_size = live_runtime_config.snapshot().active_watchlist_size;
     let ranking_client = reqwest::Client::new();
     let (initial_watchlist, bootstrap_last_trade, boot_batch_marker): (
@@ -385,7 +386,7 @@ async fn main() -> Result<()> {
         let era = financial_era
             .as_ref()
             .context("QualificationStarted is missing its financial era")?;
-        let replayed = replay_membership(era, start_batch)
+        let replayed = replay_membership(era, start_batch, &cfg.source_event_log_path)
             .context("replay Start-bound structural membership")?
             .context("QualificationStarted is missing from its financial era")?;
         let restored = replayed
