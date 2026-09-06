@@ -3143,8 +3143,8 @@ fn start_envelope(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use pe_core_types::{
-        KellyFraction, LeaderAction, PolymarketConditionId, PolymarketTokenId, Probability,
-        ProbabilityPpm, SourceTradeId, WalletAddress,
+        BasisPoints, KellyFraction, LeaderAction, PolymarketConditionId, PolymarketTokenId,
+        Probability, ProbabilityPpm, SourceTradeId, WalletAddress,
     };
     use pe_event_log::EventEnvelope;
     use pe_execution_core::{
