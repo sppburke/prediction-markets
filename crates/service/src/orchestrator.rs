@@ -445,6 +445,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             qualification_start_receipt: start,
             prior_completed_prepared_sequence: completed,
         };
+        // Validate and freeze the source-derived settlement time before the irreversible
+        // Prepared append. Recovery repeats this check as corruption detection.
+        let settled_at_unix = resolution_source_received_at(
+            &source_log_path,
+            source_receipt,
+            &condition,
+            &payout_by_outcome_index_json,
+        )
+        .map_err(|error| error.to_string())?;
         let prepared_record = PaperLogRecord::FinancialPrepared {
             expected_authority: expected.clone(),
             payload: crate::paper_recovery::FinancialPayload::Resolution {
@@ -454,13 +463,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             },
         };
         let prepared_receipt = self.append_paper_record(&prepared_record)?;
-        let settled_at_unix = resolution_source_received_at(
-            &source_log_path,
-            source_receipt,
-            &condition,
-            &payout_by_outcome_index_json,
-        )
-        .map_err(|error| error.to_string())?;
         let authority = self
             .supabase_state
             .as_ref()
@@ -505,6 +507,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         economic: pe_execution_core::EconomicPrepared,
         dispatch_id: Option<&str>,
     ) -> Result<pe_event_log::AppendReceipt, String> {
+        if economic.market.outcome_index > 1 {
+            return Err(format!(
+                "active paper fill outcome {} is not binary",
+                economic.market.outcome_index
+            ));
+        }
         let (paper_log_path, source_log_path) = self
             .financial_log_paths
             .clone()
@@ -2341,6 +2349,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
         let sizing_bankroll = match pending.as_ref() {
             Some(continuation) => continuation.frozen_basis.bankroll,
+            None if self.financial_log_paths.is_some() => match self
+                .paper_state
+                .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
+            {
+                Ok(snapshot) => snapshot.cash,
+                Err(error) => {
+                    error!(%error, trade = %trade.source_trade_id, "read active sizing bankroll failed");
+                    self.intake_stopped = true;
+                    return;
+                }
+            },
             None => self.bankroll,
         };
         let gate_evidence = match self
@@ -2706,8 +2725,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         },
                     };
                     let outcome_index = match u8::try_from(signal.outcome_id.0) {
-                        Ok(value) => value,
-                        Err(_) => {
+                        Ok(value) if value <= 1 => value,
+                        _ => {
                             self.intake_stopped = true;
                             return;
                         }
@@ -2740,7 +2759,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                                 return;
                             }
                         };
-                    let cash_before = match CollateralAmount::from_decimal_exact(self.bankroll) {
+                    let cash_before = match CollateralAmount::from_decimal_exact(sizing_bankroll) {
                         Ok(value) => value,
                         Err(_) => {
                             self.intake_stopped = true;

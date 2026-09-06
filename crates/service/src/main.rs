@@ -47,6 +47,7 @@ use pe_service::config_poller::{
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::{LiveWatchlist, projection_dirty_channel};
+use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
@@ -224,18 +225,17 @@ async fn main() -> Result<()> {
     // Derive the financial era exactly once, from the verified paper log, before constructing
     // any HTTP client. A Start has no local-authority interpretation: credentials and the
     // Start-bound Supabase protocol are mandatory for every subsequent boot.
-    let (financial_start, active_risk_halt_count) = if cfg.event_log_path.exists() {
+    let (financial_start_record, active_risk_halt_count) = if cfg.event_log_path.exists() {
         let era = paper_era(
             scan_paper_log(&cfg.event_log_path)
                 .context("verify paper log and derive financial era")?,
         );
-        (
-            era.start.as_ref().map(|(receipt, _)| *receipt),
-            active_risk_halts(&era).len(),
-        )
+        let halt_count = active_risk_halts(&era).len();
+        (era.start, halt_count)
     } else {
         (None, 0)
     };
+    let financial_start = financial_start_record.as_ref().map(|(receipt, _)| *receipt);
     if financial_start.is_some() {
         anyhow::ensure!(
             cfg.supabase_authoritative,
@@ -263,6 +263,17 @@ async fn main() -> Result<()> {
 
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
+    let starting_bankroll = financial_start_record
+        .as_ref()
+        .map_or(configured_bankroll, |(_, start)| {
+            start.starting_bankroll.to_decimal()
+        });
+    if financial_start.is_some() {
+        anyhow::ensure!(
+            configured_bankroll == starting_bankroll,
+            "configured bankroll {configured_bankroll} differs from QualificationStarted baseline {starting_bankroll}"
+        );
+    }
     // (#398 step 8) The boot-time Kelly approval guard was removed: its invariant now lives in
     // `runtime_config::parse_config` and is re-enforced on every poll (and at boot via
     // `load_initial_runtime_config`), so a runtime override change is governed too — not just the
@@ -286,6 +297,13 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(20))
         .build()
         .context("build bounded initial service-config HTTP client")?;
+    // The one injected CLOB-resolution transport shares the boot-owned HTTP client, uses the
+    // canonical 200 ms CLOB gate, and performs no private retry/backoff.
+    let clob_resolution_fetcher = Arc::new(
+        ReqwestFetcher::new(config_http_client.clone())
+            .with_min_interval_ms(200)
+            .with_max_retries(0),
+    );
     let initial_config_rows = fetch_service_config(
         &config_http_client,
         &cfg.supabase_url,
@@ -400,8 +418,17 @@ async fn main() -> Result<()> {
         })?,
     );
     paper_state
-        .init_bankroll(configured_bankroll)
+        .init_bankroll(starting_bankroll)
         .context("initialise paper-state bankroll")?;
+    if financial_start.is_some() {
+        anyhow::ensure!(
+            paper_state
+                .bankroll()
+                .context("read Start-bound local bankroll")?
+                == Some(starting_bankroll),
+            "local bankroll differs from QualificationStarted before authority mutation"
+        );
+    }
     // #511: LEGACY-ONLY blind frame replay. In authoritative mode the boot frame-walk
     // below owns local application — every unresolved frame is decided by the authority
     // (`commit_fill_v2`), so a refused frame can never resurrect locally. The blind
@@ -439,13 +466,23 @@ async fn main() -> Result<()> {
             &cfg.supabase_secret_key,
         );
         if let Some(start) = financial_start {
+            let authoritative_bankroll = client
+                .fetch_bankroll()
+                .await
+                .context("read Start-bound authoritative bankroll")?;
+            anyhow::ensure!(
+                authoritative_bankroll == Some(starting_bankroll),
+                "authoritative bankroll {:?} differs from QualificationStarted baseline {}",
+                authoritative_bankroll,
+                starting_bankroll
+            );
+            paper_state
+                .seed_financial_start(start)
+                .context("seed local financial Start")?;
             client
                 .seed_financial_start(start)
                 .await
                 .context("seed authoritative financial Start")?;
-            paper_state
-                .seed_financial_start(start)
-                .context("seed local financial Start")?;
         } else if migration_boot.session.is_some() {
             supabase_authoritative_boot_observed(
                 &client,
@@ -474,6 +511,28 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Open the sole paper writer and converge the active financial prefix before reading any
+    // bankroll used for sizing or API state.
+    let mut paper_writer = Writer::open(&cfg.event_log_path)
+        .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
+    if financial_start.is_some() {
+        let authority = supabase_state.as_ref().context(
+            "active financial era requires the authoritative client before paper writer boot",
+        )?;
+        let recovered = reconcile_active_financial_frames(
+            authority,
+            &paper_state,
+            &cfg.event_log_path,
+            &cfg.source_event_log_path,
+            &mut paper_writer,
+        )
+        .await
+        .context("recover active paper financial protocol")?;
+        if recovered > 0 {
+            info!(recovered, "completed unmatched paper Prepared records");
+        }
+    }
+
     // #508 Decision 10 (#511: AFTER frame dispositions exist in either mode): resume staged
     // dispatch aggregates — flip seeds whose fill frame reached a disposition, finalize
     // stuck seeds, leave redeliverable seeds pending. Never reconstructs targets.
@@ -482,10 +541,17 @@ async fn main() -> Result<()> {
             .context("resume dispatch seeds")?;
     }
 
-    let bankroll = paper_state
-        .bankroll()
-        .context("read paper-state bankroll")?
-        .unwrap_or(configured_bankroll);
+    let bankroll = if financial_start.is_some() {
+        paper_state
+            .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
+            .context("read recovered active financial snapshot")?
+            .cash
+    } else {
+        paper_state
+            .bankroll()
+            .context("read paper-state bankroll")?
+            .unwrap_or(configured_bankroll)
+    };
     let leader_ledger =
         build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
 
@@ -681,25 +747,7 @@ async fn main() -> Result<()> {
     projection_dirty.mark();
     info!(bankroll = %bankroll, "paper-state opened");
 
-    // Paper event-log writer (opened after reconciliation reads the existing log).
-    let mut paper_writer = Writer::open(&cfg.event_log_path)
-        .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
     if financial_start.is_some() {
-        let authority = supabase_state.as_ref().context(
-            "active financial era requires the authoritative client before paper writer boot",
-        )?;
-        let recovered = reconcile_active_financial_frames(
-            authority,
-            &paper_state,
-            &cfg.event_log_path,
-            &cfg.source_event_log_path,
-            &mut paper_writer,
-        )
-        .await
-        .context("recover active paper financial protocol")?;
-        if recovered > 0 {
-            info!(recovered, "completed unmatched paper Prepared records");
-        }
         pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
             .context("resume active-era dispatch seeds after financial recovery")?;
     }
@@ -852,6 +900,8 @@ async fn main() -> Result<()> {
     });
 
     // Orchestrator.
+    // Dashboard-only end-time projection; active economics uses admission evidence directly.
+    let market_end_cache = MarketEndCache::new(cfg.gamma_base_url.clone());
     // Mid-price cache for marking open dashboard positions to market (own rate gate).
     let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone())
         .with_source_log(orchestrator_source_log.clone());
@@ -1165,6 +1215,7 @@ async fn main() -> Result<()> {
             paper_state.clone(),
             cfg.polymarket_clob_base_url.clone(),
             cfg.clob_resolution_poll_interval_secs,
+            clob_resolution_fetcher.clone(),
             resolution_source_log,
             control_tx.clone(),
             shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
@@ -1177,6 +1228,7 @@ async fn main() -> Result<()> {
             paper_state.clone(),
             cfg.polymarket_clob_base_url.clone(),
             cfg.clob_resolution_poll_interval_secs,
+            clob_resolution_fetcher,
             resolution_source_log,
             sink_handle.clone(),
             supabase_state,
@@ -1344,7 +1396,7 @@ async fn main() -> Result<()> {
     // Shared state for paper API handlers.
     let paper_api_state = Arc::new(PaperApiState {
         paper_state: paper_state.clone(),
-        initial_bankroll: configured_bankroll,
+        initial_bankroll: starting_bankroll,
         market_end_cache,
         mid_price_cache,
     });
@@ -1749,11 +1801,11 @@ async fn run_financial_resolution_poller(
     paper_state: Arc<PaperStateDb>,
     clob_base_url: String,
     poll_interval_secs: u64,
+    fetcher: Arc<ReqwestFetcher>,
     source_log: pe_service::activity_ingest::SourceLogHandle,
     control: mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> TaskResult {
-    let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -1763,7 +1815,7 @@ async fn run_financial_resolution_poller(
         if let Err(error) = tick_financial_resolution(
             &paper_state,
             &clob_base_url,
-            &fetcher,
+            fetcher.as_ref(),
             &source_log,
             &control,
         )
@@ -1792,54 +1844,75 @@ async fn tick_financial_resolution(
         .collect::<std::collections::BTreeSet<_>>();
 
     for condition in conditions.into_iter().map(PolymarketConditionId) {
-        let observed_at = OffsetDateTime::now_utc();
-        let url = format!(
-            "{}/markets/{}",
-            clob_base_url.trim_end_matches('/'),
-            condition.0
-        );
-        let body = fetcher
-            .fetch_page(&url)
-            .await
-            .with_context(|| format!("fetch CLOB resolution {}", condition.0))?;
-        let received_at = OffsetDateTime::now_utc();
-        let receipt = source_log
-            .append(EnvelopeIn {
-                source_id: SourceId("polymarket.clob.market".to_owned()),
-                schema_version: CLOB_RESOLUTION_SCHEMA_VERSION,
-                parser_version: CLOB_RESOLUTION_PARSER_VERSION,
-                observed_at: SourceTimestamp(observed_at),
-                received_at: ReceivedAt(received_at),
-                content_type: ContentType::Json,
-                payload: body.clone(),
-            })
-            .await
-            .context("append CLOB resolution response")?;
-        let parsed = parse_clob_market(&body).context("parse CLOB resolution response")?;
-        anyhow::ensure!(
-            parsed.condition_id.as_deref() == Some(condition.0.as_str()),
-            "CLOB resolution condition differs from request"
-        );
-        let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
-            continue;
-        };
-        let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
-        control
-            .send(
-                pe_service::orchestrator_control::OrchestratorControl::ResolutionCandidate {
-                    condition,
-                    payout_by_outcome_index_json: payout.canonical_json(),
-                    receipt,
-                    acknowledged,
-                },
-            )
-            .await
-            .context("send paper resolution candidate")?;
-        acknowledgement
-            .await
-            .context("paper resolution acknowledgement dropped")?
-            .map_err(anyhow::Error::msg)?;
+        if let Err(error) = resolve_financial_condition(
+            clob_base_url,
+            fetcher,
+            source_log,
+            control,
+            condition.clone(),
+        )
+        .await
+        {
+            warn!(condition = %condition.0, error = %error, "financial resolution condition failed; continuing");
+        }
     }
+    Ok(())
+}
+
+async fn resolve_financial_condition(
+    clob_base_url: &str,
+    fetcher: &ReqwestFetcher,
+    source_log: &pe_service::activity_ingest::SourceLogHandle,
+    control: &mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
+    condition: PolymarketConditionId,
+) -> Result<()> {
+    let observed_at = OffsetDateTime::now_utc();
+    let url = format!(
+        "{}/markets/{}",
+        clob_base_url.trim_end_matches('/'),
+        condition.0
+    );
+    let body = fetcher
+        .fetch_page(&url)
+        .await
+        .with_context(|| format!("fetch CLOB resolution {}", condition.0))?;
+    let received_at = OffsetDateTime::now_utc();
+    let receipt = source_log
+        .append(EnvelopeIn {
+            source_id: SourceId("polymarket.clob.market".to_owned()),
+            schema_version: CLOB_RESOLUTION_SCHEMA_VERSION,
+            parser_version: CLOB_RESOLUTION_PARSER_VERSION,
+            observed_at: SourceTimestamp(observed_at),
+            received_at: ReceivedAt(received_at),
+            content_type: ContentType::Json,
+            payload: body.clone(),
+        })
+        .await
+        .context("append CLOB resolution response")?;
+    let parsed = parse_clob_market(&body).context("parse CLOB resolution response")?;
+    anyhow::ensure!(
+        parsed.condition_id.as_deref() == Some(condition.0.as_str()),
+        "CLOB resolution condition differs from request"
+    );
+    let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
+        return Ok(());
+    };
+    let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
+    control
+        .send(
+            pe_service::orchestrator_control::OrchestratorControl::ResolutionCandidate {
+                condition,
+                payout_by_outcome_index_json: payout.canonical_json(),
+                receipt,
+                acknowledged,
+            },
+        )
+        .await
+        .context("send paper resolution candidate")?;
+    acknowledgement
+        .await
+        .context("paper resolution acknowledgement dropped")?
+        .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -1848,12 +1921,12 @@ async fn run_resolution_poller(
     paper_state: Arc<PaperStateDb>,
     clob_base_url: String,
     poll_interval_secs: u64,
+    fetcher: Arc<ReqwestFetcher>,
     source_log: pe_service::activity_ingest::SourceLogHandle,
     sink: Option<SinkHandle>,
     supabase_state: Option<SupabaseStateClient>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> TaskResult {
-    let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -1863,7 +1936,7 @@ async fn run_resolution_poller(
         if let Err(error) = tick_resolution(
             &paper_state,
             &clob_base_url,
-            &fetcher,
+            fetcher.as_ref(),
             &source_log,
             sink.as_ref(),
             supabase_state.as_ref(),
@@ -1905,6 +1978,7 @@ async fn tick_resolution(
     let mut any_settled = false;
     for market_id in pending {
         let condition = PolymarketConditionId(market_id.0.0.clone());
+        let outcome: Result<Option<Decimal>> = async {
         let observed_at = OffsetDateTime::now_utc();
         let url = format!(
             "{}/markets/{}",
@@ -1934,7 +2008,7 @@ async fn tick_resolution(
             "CLOB resolution condition differs from request"
         );
         let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
-            continue;
+            return Ok(None);
         };
         let outcome_prices = payout.decimals();
         let now_unix = received_at.unix_timestamp();
@@ -1966,27 +2040,17 @@ async fn tick_resolution(
                         .unwrap_or(rust_decimal::Decimal::ZERO);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        market = %market_id,
-                        "authoritative apply_resolution failed; leaving unsettled for next-tick retry"
+                    return Err(e).context(
+                        "authoritative apply_resolution failed; leaving unsettled for next-tick retry",
                     );
-                    continue;
                 }
             }
         } else {
             // Legacy (#511): settle + credit in ONE SQLite transaction, the credit
             // computed inside it from freshly-read positions — a fill committing between
             // an outside read and the settle can no longer be silently uncredited.
-            let binary_payout = match outcome_prices {
-                [outcome_0, outcome_1] => BinaryPayout::new(*outcome_0, *outcome_1)
-                    .context("validate binary resolution payout")?,
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "resolution payout must contain exactly two outcomes"
-                    ));
-                }
-            };
+            let binary_payout = BinaryPayout::new(outcome_prices[0], outcome_prices[1])
+                .context("validate binary resolution payout")?;
             let (applied_credit, _bankroll) = paper_state
                 .settle_and_credit_from_positions(
                     &market_id,
@@ -2038,8 +2102,23 @@ async fn tick_resolution(
                 )
                 .context("note settled")?;
         }
-        any_settled = true;
-        tracing::info!(market = %market_id, %credit, "resolution applied");
+        Ok(Some(credit))
+        }
+        .await;
+        match outcome {
+            Ok(Some(credit)) => {
+                any_settled = true;
+                tracing::info!(market = %market_id, %credit, "resolution applied");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    condition = %condition.0,
+                    error = %error,
+                    "rehearsal resolution condition failed; continuing"
+                );
+            }
+        }
     }
     // Nudge the Supabase sink once per tick to re-upsert the settled set (canonical JSON).
     if any_settled && let Some(sink) = sink {

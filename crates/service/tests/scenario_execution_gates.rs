@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
-    BasisPoints, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
-    SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+    BasisPoints, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceTimestamp,
+    SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
 use pe_paper_state::PaperStateDb;
@@ -543,6 +543,7 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .collect(),
         response_blake3: String::new(),
         fetched_at_ms: 0,
+        source_receipt: None,
     }
 }
 

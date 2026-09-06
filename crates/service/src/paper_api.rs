@@ -1,10 +1,10 @@
 //! HTTP views over one coherent exact paper financial snapshot (#545).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::{Json, extract::Extension, http::StatusCode};
-use pe_core_types::{MarketId, Side};
+use pe_core_types::{MarketOutcomeId, Side};
 use pe_paper_state::{FinancialSnapshot, PaperStateDb};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -68,12 +68,16 @@ pub async fn pnl(
     Extension(state): Extension<Arc<PaperApiState>>,
 ) -> Result<Json<PaperPnlDto>, (StatusCode, Json<ErrorBody>)> {
     let snapshot = financial_snapshot(&state)?;
-    let markets = snapshot
+    let ids = snapshot
         .positions
         .iter()
-        .map(|position| position.market_id.clone())
+        .map(|position| MarketOutcomeId::new(position.market_id.clone(), position.outcome_id))
         .collect::<Vec<_>>();
-    let mids = state.mid_price_cache.fetch_mids(&markets).await;
+    let mids = state
+        .mid_price_cache
+        .fetch_mids_strict(&ids)
+        .await
+        .map_err(unavailable_err)?;
     let open_market_value = mark_open_positions(&snapshot, &mids).map_err(internal_err)?;
     let equity = snapshot
         .cash
@@ -112,18 +116,23 @@ pub async fn positions(
     ))
 }
 
-/// `GET /paper/fills` — the bounded open-and-seven-day exact fill slice.
+/// `GET /paper/fills` — the exact lifetime fill history.
 pub async fn fills(
     Extension(state): Extension<Arc<PaperApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
-    let snapshot = financial_snapshot(&state)?;
-    let settled = snapshot
-        .settlements_7d
+    let fills = state
+        .paper_state
+        .list_financial_fills()
+        .map_err(internal_err)?;
+    let settled = state
+        .paper_state
+        .list_settled_markets()
+        .map_err(internal_err)?
         .iter()
         .map(|row| (row.market_id.clone(), row.settled_at_unix))
         .collect::<HashMap<_, _>>();
-    let mut rows = Vec::with_capacity(snapshot.fills_for_open_and_7d.len());
-    for fill in snapshot.fills_for_open_and_7d {
+    let mut rows = Vec::with_capacity(fills.len());
+    for fill in fills {
         let parsed = ParsedKey::from_key(&fill.idempotency_key);
         let (resolution_unix, resolution_status) = match settled.get(&fill.market_id) {
             Some(settled_at) => (Some(*settled_at), Some("resolved".to_owned())),
@@ -160,7 +169,7 @@ pub async fn status(
     Extension(state): Extension<Arc<PaperApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     let snapshot = financial_snapshot(&state)?;
-    let fills_count = snapshot.fills_for_open_and_7d.len();
+    let fills_count = state.paper_state.fills_count().map_err(internal_err)?;
     Ok(Json(serde_json::json!({
         "bankroll": decimal_string(snapshot.cash),
         "initial_bankroll": decimal_string(state.initial_bankroll),
@@ -180,22 +189,21 @@ fn financial_snapshot(
 
 fn mark_open_positions(
     snapshot: &FinancialSnapshot,
-    mids: &HashMap<MarketId, Vec<Decimal>>,
+    mids: &BTreeMap<(String, u16), crate::mid_price_cache::MidPriceObservation>,
 ) -> Result<Decimal, &'static str> {
     let mut total = Decimal::ZERO;
     for position in &snapshot.positions {
         let price = mids
-            .get(&position.market_id)
-            .and_then(|values| values.get(usize::from(position.outcome_id.0)))
-            .copied()
-            .unwrap_or(Decimal::ZERO);
+            .get(&(position.market_id.to_string(), position.outcome_id.0))
+            .ok_or("paper position price unavailable")?
+            .price;
         let net = position
             .long
             .to_decimal()
             .checked_sub(position.short.to_decimal())
             .ok_or("paper position subtraction overflow")?;
         let value = net
-            .checked_mul(price)
+            .checked_mul(price.0)
             .ok_or("paper position mark overflow")?;
         total = total
             .checked_add(value)
@@ -241,6 +249,15 @@ fn internal_err<E: std::fmt::Display>(error: E) -> (StatusCode, Json<ErrorBody>)
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
             error: error.to_string(),
+        }),
+    )
+}
+
+fn unavailable_err<E: std::fmt::Display>(error: E) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: format!("paper valuation unavailable: {error}"),
         }),
     )
 }

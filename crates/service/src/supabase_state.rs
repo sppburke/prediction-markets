@@ -233,30 +233,17 @@ pub trait SupabaseStateTrait: Send + Sync {
         settled_at_unix: i64,
     ) -> impl Future<Output = Result<ResolutionV2Outcome, SupabaseStateError>> + Send;
 
-    /// #545 Start-bound, Prepared-sequenced exact fill mutation. Existing test fakes that
-    /// exercise only the pre-Start protocol inherit a fail-closed default.
+    /// #545 Start-bound, Prepared-sequenced exact fill mutation.
     fn commit_prepared_fill(
         &self,
-        _request: &PreparedFillRequest,
-    ) -> impl Future<Output = Result<CanonicalFillResult, SupabaseStateError>> + Send {
-        async {
-            Err(SupabaseStateError::Corrupt(
-                "prepared fill protocol is not implemented by this authority".to_owned(),
-            ))
-        }
-    }
+        request: &PreparedFillRequest,
+    ) -> impl Future<Output = Result<CanonicalFillResult, SupabaseStateError>> + Send;
 
     /// #545 Start-bound, Prepared-sequenced exact resolution mutation.
     fn apply_prepared_resolution(
         &self,
-        _request: &PreparedResolutionRequest,
-    ) -> impl Future<Output = Result<CanonicalResolutionResult, SupabaseStateError>> + Send {
-        async {
-            Err(SupabaseStateError::Corrupt(
-                "prepared resolution protocol is not implemented by this authority".to_owned(),
-            ))
-        }
-    }
+        request: &PreparedResolutionRequest,
+    ) -> impl Future<Output = Result<CanonicalResolutionResult, SupabaseStateError>> + Send;
 }
 
 /// Complete authoritative boot reads, split from runtime RPCs for deterministic failure injection.
@@ -1987,6 +1974,15 @@ mod tests {
         ) -> Result<ResolutionV2Outcome, SupabaseStateError> {
             Err(SupabaseStateError::Corrupt(
                 "legacy resolution RPC is outside this fixture".to_owned(),
+            ))
+        }
+
+        async fn commit_prepared_fill(
+            &self,
+            _request: &PreparedFillRequest,
+        ) -> Result<CanonicalFillResult, SupabaseStateError> {
+            Err(SupabaseStateError::Corrupt(
+                "prepared fill RPC is outside this fixture".to_owned(),
             ))
         }
 

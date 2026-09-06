@@ -3,6 +3,7 @@
 //! # Modules
 //!
 //! - **evaluate** — pure signal → Kelly → risk → `OrderIntent` pipeline. No I/O.
+//!
 //! `float_arithmetic = "deny"` — all numeric operations use integers or `rust_decimal`.
 //! No `unwrap`/`expect`/`panic!` in production code.
 

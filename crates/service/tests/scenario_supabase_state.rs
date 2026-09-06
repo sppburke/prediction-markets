@@ -44,9 +44,10 @@ use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
 use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
 use pe_service::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 use pe_service::supabase_state::{
-    AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, ResolutionV2Outcome, SupabaseBootTrait,
-    SupabaseStateError, SupabaseStateTrait, apply_resolution_authoritative,
-    commit_fill_authoritative, resolve_event_frames, supabase_authoritative_boot,
+    AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, PreparedFillRequest,
+    PreparedResolutionRequest, ResolutionV2Outcome, SupabaseBootTrait, SupabaseStateError,
+    SupabaseStateTrait, apply_resolution_authoritative, commit_fill_authoritative,
+    resolve_event_frames, supabase_authoritative_boot,
 };
 use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
@@ -202,6 +203,26 @@ impl FakeSupabaseState {
 }
 
 impl SupabaseStateTrait for FakeSupabaseState {
+    async fn commit_prepared_fill(
+        &self,
+        _request: &PreparedFillRequest,
+    ) -> Result<pe_service::paper_recovery::CanonicalFillResult, SupabaseStateError> {
+        Err(SupabaseStateError::Status(
+            503,
+            "active financial protocol is outside this legacy fixture".to_owned(),
+        ))
+    }
+
+    async fn apply_prepared_resolution(
+        &self,
+        _request: &PreparedResolutionRequest,
+    ) -> Result<pe_service::paper_recovery::CanonicalResolutionResult, SupabaseStateError> {
+        Err(SupabaseStateError::Status(
+            503,
+            "active financial protocol is outside this legacy fixture".to_owned(),
+        ))
+    }
+
     async fn commit_fill_v2(
         &self,
         row: &SupabaseFillRow,

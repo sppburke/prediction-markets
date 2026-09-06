@@ -2948,6 +2948,48 @@ impl PaperStateDb {
         Ok(out)
     }
 
+    /// Exact lifetime fill history for the stable paper API. Risk continues to use the bounded
+    /// transactional [`FinancialSnapshot`]; this reader preserves the endpoint's lifetime scope.
+    pub fn list_financial_fills(&self) -> Result<Vec<FinancialFillRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT idempotency_key, market_id, outcome_id, side, quantity_str, \
+                    fill_price_str, principal_str, fee_str, prepared_seq \
+             FROM fills ORDER BY prepared_seq, idempotency_key",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (key, market, outcome, side, quantity, price, principal, fee, prepared) = row?;
+            result.push(FinancialFillRow {
+                idempotency_key: key,
+                market_id: MarketId(VenueMarketId(market)),
+                outcome_id: OutcomeId(parse_u16(outcome)?),
+                side: parse_side(&side)?,
+                quantity: parse_share_amount(&quantity)?,
+                fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
+                    PaperStateError::Corrupt(format!("financial fill price: {error}"))
+                })?,
+                principal: parse_collateral_amount(&principal)?,
+                fee: parse_collateral_amount(&fee)?,
+                prepared_seq: EventSeq(parse_u64(prepared)?),
+            });
+        }
+        Ok(result)
+    }
+
     // ── Reconciliation cursor ────────────────────────────────────────────────
 
     /// The highest event-log `seq` whose fill has been mirrored into SQLite.
@@ -3128,6 +3170,12 @@ impl PaperStateDb {
         fill: &FinancialFillRecord,
         canonical_cash: Decimal,
     ) -> Result<FinancialApplyOutcome, PaperStateError> {
+        if fill.outcome_id.0 > 1 {
+            return Err(PaperStateError::FinancialConflict(format!(
+                "paper fill outcome {} is not binary",
+                fill.outcome_id.0
+            )));
+        }
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         require_financial_start(&tx, start)?;
@@ -3136,6 +3184,7 @@ impl PaperStateDb {
         if let Some(stored) = tx_financial_fill(&tx, &fill.idempotency_key)? {
             if stored.record != *fill
                 || stored.prepared_seq != prepared_seq
+                || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
                 || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
             {
                 return Err(PaperStateError::FinancialConflict(
@@ -3230,6 +3279,7 @@ impl PaperStateDb {
                 || stored_prepared.map(parse_u64).transpose()?.map(EventSeq) != Some(prepared_seq)
                 || stored_source.map(parse_u64).transpose()?.map(EventSeq)
                     != Some(source_receipt.sequence)
+                || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
                 || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
             {
                 return Err(PaperStateError::FinancialConflict(
@@ -4410,6 +4460,26 @@ fn require_financial_sequence(
         ));
     }
     Ok(())
+}
+
+fn tx_completed_prior_before(
+    conn: &Connection,
+    prepared_seq: EventSeq,
+) -> Result<Option<EventSeq>, PaperStateError> {
+    let prior = conn.query_row(
+        "SELECT MAX(completed_seq) FROM (\
+             SELECT prepared_seq AS completed_seq FROM fills WHERE prepared_seq < ?1 \
+             UNION ALL \
+             SELECT prepared_seq AS completed_seq FROM settled_markets \
+              WHERE prepared_seq IS NOT NULL AND prepared_seq < ?1\
+         )",
+        params![to_i64(prepared_seq.0)?],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    prior
+        .map(parse_u64)
+        .transpose()
+        .map(|value| value.map(EventSeq))
 }
 
 fn tx_set_financial_last_prepared(
@@ -6604,6 +6674,10 @@ mod tests {
         ));
         db.apply_financial_fill(start, None, EventSeq(2), &fill, dec!(9.5))
             .unwrap();
+        assert!(matches!(
+            db.apply_financial_fill(start, Some(EventSeq(1)), EventSeq(2), &fill, dec!(9.5)),
+            Err(PaperStateError::FinancialConflict(_))
+        ));
         let mut changed = fill;
         changed.fee = CollateralAmount::from_decimal_exact(dec!(0.000001)).unwrap();
         assert!(matches!(
@@ -6613,6 +6687,35 @@ mod tests {
         assert!(matches!(
             db.seed_financial_start(append_receipt(3, 3)),
             Err(PaperStateError::FinancialStartConflict)
+        ));
+
+        let source = append_receipt(8, 4);
+        let credit = CollateralAmount::from_decimal_exact(dec!(0.5)).unwrap();
+        db.apply_financial_resolution(
+            start,
+            Some(EventSeq(2)),
+            EventSeq(3),
+            &market(),
+            "[\"0.5\",\"0.5\"]",
+            source,
+            4,
+            credit,
+            dec!(10),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.apply_financial_resolution(
+                start,
+                None,
+                EventSeq(3),
+                &market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            Err(PaperStateError::FinancialConflict(_))
         ));
     }
 

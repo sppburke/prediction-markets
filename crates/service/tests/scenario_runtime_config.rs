@@ -684,6 +684,7 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .collect(),
         response_blake3: String::new(),
         fetched_at_ms: 0,
+        source_receipt: None,
     }
 }
 
@@ -834,7 +835,7 @@ async fn price_impact_ladder_vwap_fill_with_clob_best_ask() {
             (dec!(0.60), dec!(1000)), // outside the 100 bps band — never touched
         ]),
     )]);
-    let mut rc = gate_snapshot(100);
+    let rc = gate_snapshot(100);
     let (fills, contracts) = run_gate_with(&dir, books, rc).await;
     assert_eq!(fills, 1);
     assert_eq!(

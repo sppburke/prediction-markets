@@ -17,6 +17,7 @@ use pe_paper_state::{
 use pe_position_ledger::{AppliedEffect, LedgerEffect, PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
     BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2, IdentityOverride,
+    PageOccurrence,
 };
 use pe_service::decision_replay::{
     AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
@@ -175,7 +176,14 @@ fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
             &pe_service::config::ServiceConfig::default(),
         ),
         decision_inputs_json: "{\"source_window\":\"complete\"}".to_owned(),
-        page_occurrences: Vec::new(),
+        page_occurrences: vec![PageOccurrence {
+            request_url: format!("https://fixture.invalid/activity?epoch={epoch}"),
+            raw_hash: blake3::hash(&epoch.to_le_bytes()).to_hex().to_string(),
+            receipt: pe_event_log::AppendReceipt {
+                sequence: pe_core_types::EventSeq(u64::try_from(epoch).unwrap()),
+                this_hash: blake3::hash(format!("receipt-{epoch}").as_bytes()),
+            },
+        }],
         observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),

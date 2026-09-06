@@ -179,6 +179,7 @@ async fn run_trades(
                     }],
                     response_blake3: String::new(),
                     fetched_at_ms: 0,
+                    source_receipt: None,
                 },
             )
         })
