@@ -201,13 +201,42 @@ elif [[ "$sql" == *json_build_object* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"paper_bankroll":1,"fill_market_snapshots":0}'
 fi
 SH
-  chmod +x "$bin/systemctl" "$bin/psql"
+cat > "$bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
+output=
+url=
+while (($#)); do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+[[ -n "$output" && "$url" == http://127.0.0.1:18080/health/ready ]] || exit 96
+count=0
+[[ ! -f "$state/readiness-count" ]] || count=$(<"$state/readiness-count")
+echo $((count + 1)) > "$state/readiness-count"
+mode=pass
+[[ ! -f "$state/readiness-mode" ]] || mode=$(<"$state/readiness-mode")
+case "$mode" in
+  pass) printf '%s\n' '{"ready":true,"issues":[]}' > "$output" ;;
+  http_failure) printf '%s\n' '{"ready":false,"issues":["http_failure"]}' > "$output"; exit 22 ;;
+  not_ready) printf '%s\n' '{"ready":false,"issues":[]}' > "$output" ;;
+  issues) printf '%s\n' '{"ready":true,"issues":["event_log_not_writable"]}' > "$output" ;;
+  *) exit 95 ;;
+esac
+SH
+  chmod +x "$bin/systemctl" "$bin/psql" "$bin/curl"
 }
 
 write_rehearsal_evidence() {
   local root=$1
   local artifact_sha256=${2:-$(sha256sum "$root/target/pe-service" | awk '{print $1}')}
-  local rehearsal=$root/rehearsal manifest=$root/rehearsal/manifest.txt digest
+  local rehearsal=$root/rehearsal manifest=$root/rehearsal/manifest.txt digest config_sha256 environment_sha256
+  config_sha256=$(sha256sum "$root/target/service.toml" | awk '{print $1}')
+  environment_sha256=$(sha256sum "$root/target/service.env" | awk '{print $1}')
   mkdir -p "$rehearsal"
   printf '%s\n' \
     'result=PASS' \
@@ -215,27 +244,67 @@ write_rehearsal_evidence() {
     'sha=1111111111111111111111111111111111111111' \
     'target_revision=1111111111111111111111111111111111111111' \
     'artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-    "artifact_sha256=$artifact_sha256" > "$manifest"
+    "artifact_sha256=$artifact_sha256" \
+    'activation_id=act-545' \
+    "generation_dir=$root/prediction-markets/gen/g557" \
+    'copy_manifest_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    'readiness_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
+    "config_sha256=$config_sha256" \
+    "environment_sha256=$environment_sha256" > "$manifest"
   digest=$(sha256sum "$manifest" | awk '{print $1}')
   python3 -c 'import json,os,sys
-path,manifest,digest,artifact_sha=sys.argv[1:]
+path,manifest,digest,artifact_sha,activation,generation,config_sha,environment_sha=sys.argv[1:]
 value={"kind":"rehearsal545-evidence-v1","result":"PASS","evidence_sha256":digest,
 "manifest_path":os.path.realpath(manifest),"target_revision":"1"*40,
-"artifact_blake3":"a"*64,"artifact_sha256":artifact_sha}
+"artifact_blake3":"a"*64,"artifact_sha256":artifact_sha,"activation_id":activation,
+"generation_dir":os.path.realpath(generation),"copy_manifest_sha256":"c"*64,
+"readiness_sha256":"d"*64,"config_sha256":config_sha,"environment_sha256":environment_sha}
 json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
-    "$rehearsal/evidence.json" "$manifest" "$digest" "$artifact_sha256"
+    "$rehearsal/evidence.json" "$manifest" "$digest" "$artifact_sha256" "act-545" \
+    "$root/prediction-markets/gen/g557" "$config_sha256" "$environment_sha256"
+}
+
+rewrite_rehearsal_evidence_field() {
+  local root=$1 key=$2 value=$3
+  python3 - "$root/rehearsal/evidence.json" "$key" "$value" <<'PY'
+import hashlib, json, sys
+
+evidence_path, key, replacement = sys.argv[1:]
+with open(evidence_path, encoding="utf-8") as source:
+    evidence = json.load(source)
+manifest_path = evidence["manifest_path"]
+rows = []
+found = False
+with open(manifest_path, encoding="utf-8") as source:
+    for raw in source:
+        name, separator, value = raw.rstrip("\n").partition("=")
+        if name == key:
+            value = replacement
+            found = True
+        rows.append(f"{name}{separator}{value}\n")
+if not found:
+    raise SystemExit(f"result manifest has no {key}")
+with open(manifest_path, "w", encoding="utf-8") as output:
+    output.writelines(rows)
+with open(manifest_path, "rb") as source:
+    evidence["evidence_sha256"] = hashlib.sha256(source.read()).hexdigest()
+evidence[key] = replacement
+with open(evidence_path, "w", encoding="utf-8") as output:
+    json.dump(evidence, output, sort_keys=True, separators=(",", ":"))
+PY
 }
 
 setup_fixture() {
-  local root=$1 service=$root/prediction-markets target=$root/target state=$root/test-state
-  mkdir -p "$service/target/release" "$service/smoke-test" "$service/gen/g557" "$target" "$state"
+  local root=$1 service=$root/prediction-markets target=$root/target state=$root/test-state staged=$root/staged-557
+  mkdir -p "$service/target/release" "$service/smoke-test" "$service/gen/g557" "$target" "$state" "$staged"
   : > "$root/.pe-deploy.lock"
   echo true > "$state/service.active"
   printf '%s\n' old-binary > "$service/target/release/pe-service"
-  printf '%s\n' old-config > "$service/smoke-test/service.toml"
-  printf '%s\n' old-environment > "$service/.env"
-  printf '%s\n' target-config > "$target/service.toml"
+  printf '%s\n' 'bind = "127.0.0.1:8080"' > "$service/smoke-test/service.toml"
+  printf '%s\n' 'PE_BIND=127.0.0.1:8080' > "$service/.env"
+  printf '%s\n' 'bind = "127.0.0.1:18080"' > "$target/service.toml"
   cat > "$target/service.env" <<'ENV'
+PE_BIND=127.0.0.1:18080
 PE_SUPABASE_AUTHORITATIVE=true
 PE_SUPABASE_URL=https://example.invalid
 PE_SUPABASE_SECRET_KEY=test-service-role
@@ -244,6 +313,7 @@ ENV
   printf 'paper-before\n' > "$service/gen/g557/paper.log"
   printf 'source-before\n' > "$service/gen/g557/source_events.log"
   printf 'live-before\n' > "$service/gen/g557/live_journal.log"
+  printf '%s\n' '{}' > "$service/gen/g557/wallet_market_history.json"
   python3 -c 'import sqlite3,sys
 db=sqlite3.connect(sys.argv[1]); db.executescript("""
 create table durable(value text); insert into durable values ("before");
@@ -278,27 +348,33 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
     echo '{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     ;;
   *--financial-era=rollback-check*)
-    [[ ! -f "$state/rollback-error" ]] || exit 95
-    if [[ -f "$state/complete-start" ]]; then echo '{"complete_start":true,"receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}'
-    else echo '{"complete_start":false,"repaired":false}'; fi
+    if [[ -f "$state/complete-start" ]]; then
+      echo '{"complete_start":true,"receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}'
+    else
+      [[ ! -f "$state/rollback-error" ]] || exit 95
+      echo '{"complete_start":false,"repaired":false}'
+    fi
     ;;
   *) exit 96 ;;
 esac
 SH
   chmod +x "$target/pe-service"
+  cp "$service/target/release/pe-service" "$staged/pe-service"
+  cp "$service/smoke-test/service.toml" "$staged/service.toml"
+  cp "$service/.env" "$staged/service.env"
   python3 -c 'import hashlib,json,sys
-path,generation,service,target=sys.argv[1:]
+path,generation,service,target,staged=sys.argv[1:]
 def artifact(value):
     with open(value,"rb") as source: digest=hashlib.sha256(source.read()).hexdigest()
     return {"path":value,"sha256":digest}
 value={
  "activation_id":"act-545","state":"verified","generation_dir":generation,
- "merge_commit":"1"*40,"bankroll":"10000","source_v1_main":artifact(generation+"/source_events.log"),
- "legacy_history":artifact(target+"/membership.json"),
- "artifacts":{"seed_main":artifact(generation+"/paper_state.db"),"binary":artifact(target+"/pe-service"),
-              "config":artifact(target+"/service.toml"),"environment":artifact(target+"/service.env"),
-              "rehearsal_config":artifact(target+"/service.toml"),
-              "rehearsal_environment":artifact(target+"/service.env")},
+ "merge_commit":"5"*40,"bankroll":"10000","source_v1_main":artifact(generation+"/source_events.log"),
+ "legacy_history":artifact(generation+"/wallet_market_history.json"),
+ "artifacts":{"seed_main":artifact(generation+"/paper_state.db"),"binary":artifact(staged+"/pe-service"),
+              "config":artifact(staged+"/service.toml"),"environment":artifact(staged+"/service.env"),
+              "rehearsal_config":artifact(staged+"/service.toml"),
+              "rehearsal_environment":artifact(staged+"/service.env")},
  "old_installed_artifacts":{"service_toml":artifact(service+"/smoke-test/service.toml"),
                             "service_env":artifact(service+"/.env"),
                             "pe_service":artifact(service+"/target/release/pe-service")},
@@ -306,9 +382,9 @@ value={
                  "environment":service+"/.env"},
  "old_paths":{"paper_log":generation+"/paper.log","source_log":generation+"/source_events.log",
               "live_journal":generation+"/live_journal.log","status":generation+"/status.json",
-              "paper_state":generation+"/paper_state.db","legacy_history":target+"/membership.json"}}
+              "paper_state":generation+"/paper_state.db","legacy_history":generation+"/wallet_market_history.json"}}
 json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
-    "$root/pe-activation.json" "$service/gen/g557" "$service" "$target"
+    "$root/pe-activation.json" "$service/gen/g557" "$service" "$target" "$staged"
   write_rehearsal_evidence "$root"
   write_shims "$root"
 }
@@ -587,6 +663,48 @@ set -e
 [[ $status -eq 2 && ! -e "$root/pe-financial-era.json" && $(<"$root/test-state/service.active") == true ]] ||
   fail "removed hot-config assertion was not rejected before mutation"
 
+# Scenario FE-SEPARATE-GENERATION-TARGET-00C
+# Preconditions: the authentic #557 staged paths/commit differ from the reviewed #545 target.
+# PASS: prepared binds the old installed bytes to #557 and records the target independently.
+# FAIL: the target must equal #557, or the installed old files are not proven from #557.
+root=$TEST_TMP/separate-identities
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "distinct #557 and #545 identities did not reach prepared"
+python3 -c 'import json,sys
+activation=json.load(open(sys.argv[1])); financial=json.load(open(sys.argv[2]))
+assert activation["merge_commit"] == "5"*40
+assert financial["generation_merge_commit"] == activation["merge_commit"]
+assert financial["target_revision"] == "1"*40
+assert activation["artifacts"]["binary"]["path"] != sys.argv[3]
+assert financial["old_artifact_sha256"] == activation["artifacts"]["binary"]["sha256"]
+assert financial["old_artifact_sha256"] != financial["target_artifact_sha256"]
+assert financial["generation_source_v1_main"] == activation["source_v1_main"]
+assert financial["generation_legacy_history"] == activation["legacy_history"]' \
+  "$root/pe-activation.json" "$root/pe-financial-era.json" "$root/target/pe-service" ||
+  fail "financial manifest conflated the inherited generation and reviewed target"
+
+# Scenario FE-OLD-GENERATION-DRIFT-00D
+# Preconditions: the installed old binary differs from the verified #557 artifact inventory.
+# PASS: refusal occurs before the financial manifest or a stop intent.
+# FAIL: unverified old bytes become rollback authority.
+root=$TEST_TMP/old-generation-drift
+setup_fixture "$root"
+driver_args "$root"
+printf '%s\n' drift >> "$root/prediction-markets/target/release/pe-service"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'installed old binary differs from the verified #557 artifact'* ]] ||
+  fail "unverified installed old binary was not refused: $output"
+[[ ! -e "$root/pe-financial-era.json" && ! -e "$root/test-state/stop-count" ]] ||
+  fail "old-generation drift crossed the prepared boundary"
+
 # Scenario FE-LEGACY-RELEASE-VALID-00A
 # Preconditions: Legacy17 plus one optional, text, lowercase-64-hex incident release row.
 # Injected boundary: `legacy-contract-verified`.
@@ -692,6 +810,70 @@ binding_after=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys
    ! -e "$root/test-state/archive-count" ]] ||
   fail "matching rehearsal crossed the injected stop-intent boundary"
 
+# Scenario FE-REHEARSAL-CONTEXT-04
+# Preconditions: internally hash-consistent PASS evidence substitutes one current-generation or
+# reviewed-target identity before prepared.
+# PASS: each substitution is typed-refused before service mutation.
+# FAIL: cross-activation, cross-generation, config, or environment evidence reaches prepared.
+for case_name in activation generation config environment; do
+  root="$TEST_TMP/rehearsal-context-$case_name"
+  setup_fixture "$root"
+  driver_args "$root"
+  case "$case_name" in
+    activation)
+      rewrite_rehearsal_evidence_field "$root" activation_id act-other
+      expected=activation_identity_mismatch
+      ;;
+    generation)
+      mkdir -p "$root/other-generation"
+      rewrite_rehearsal_evidence_field "$root" generation_dir "$root/other-generation"
+      expected=generation_identity_mismatch
+      ;;
+    config)
+      rewrite_rehearsal_evidence_field "$root" config_sha256 "$(printf '0%.0s' {1..64})"
+      expected=config_identity_mismatch
+      ;;
+    environment)
+      rewrite_rehearsal_evidence_field "$root" environment_sha256 "$(printf '0%.0s' {1..64})"
+      expected=environment_identity_mismatch
+      ;;
+  esac
+  set +e
+  output=$(run_driver "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *"REHEARSAL_REFUSAL=$expected"* ]] ||
+    fail "$case_name rehearsal substitution was not typed-refused: $output"
+  [[ ! -e "$root/pe-financial-era.json" && ! -e "$root/test-state/stop-count" ]] ||
+    fail "$case_name rehearsal substitution crossed the prepared boundary"
+done
+
+# Scenario FE-REHEARSAL-DURABLE-BINDINGS-05
+# Preconditions: copied-state/readiness identities were bound in prepared, then coherently replaced
+# in both evidence layers with a new result-manifest digest.
+# PASS: guarded revalidation refuses the substituted evidence before stop intent.
+# FAIL: a different copied checkpoint or readiness response authorizes guarded.
+for field in copy_manifest_sha256 readiness_sha256; do
+  root="$TEST_TMP/rehearsal-binding-$field"
+  setup_fixture "$root"
+  driver_args "$root"
+  set +e
+  run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ $status -eq 86 ]] || fail "$field substitution setup did not reach prepared"
+  rewrite_rehearsal_evidence_field "$root" "$field" "$(printf '0%.0s' {1..64})"
+  set +e
+  output=$(run_driver "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *'REHEARSAL_REFUSAL=prepared_evidence_unbound_or_changed'* ]] ||
+    fail "$field rehearsal substitution was not refused at guarded: $output"
+  [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == prepared &&
+     ! -e "$root/test-state/stop-count" ]] ||
+    fail "$field rehearsal substitution crossed the guarded mutation boundary"
+done
+
 # Scenario FE-PREP-01
 # Preconditions: active old service; clean paper/source/live logs and local state.
 # Injected boundary: `preparation`, after offline prepare is durable and before `guarded`.
@@ -795,6 +977,7 @@ status=$?
 set -e
 [[ $status -eq 86 && -f "$root/test-state/complete-start" ]] ||
   fail "complete-Start crash seam was not reached"
+touch "$root/test-state/rollback-error"
 set +e
 output=$(run_driver "$root" --rollback-before-start 2>&1)
 status=$?
@@ -845,8 +1028,42 @@ json.dump(value,open(path,"w"))' "$root/prediction-markets/gen/g557/status.json"
 run_driver "$root" >/dev/null
 python3 -c 'import json,sys
 value=json.load(open(sys.argv[1]));
-assert value["state"]=="verified" and value["verified_state_assertions"] is True' \
+assert value["state"]=="verified" and value["verified_state_assertions"] is True
+assert value["verified_readiness_sha256"]' \
   "$root/pe-financial-era.json" || fail "verified state did not retain all merged assertions"
+[[ $(<"$root/test-state/readiness-count") -eq 1 ]] ||
+  fail "verified transition did not query readiness exactly once"
+
+# Scenario FE-VERIFY-READINESS-07A
+# Preconditions: every status/local/remote assertion passes, but one readiness-only contract fails.
+# PASS: HTTP failure, ready:false, and a nonempty issue list each leave the manifest at started.
+# FAIL: status evidence alone can advance verified or readiness is queried more than once.
+for readiness_mode in http_failure not_ready issues; do
+  root="$TEST_TMP/verify-readiness-$readiness_mode"
+  setup_fixture "$root"
+  driver_args "$root"
+  run_driver "$root" >/dev/null
+  [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
+    fail "$readiness_mode setup did not reach started"
+  touch "$root/prediction-markets/gen/g557/status.json"
+  echo "$readiness_mode" > "$root/test-state/readiness-mode"
+  set +e
+  output=$(run_driver "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "$readiness_mode readiness failure advanced verified"
+  if [[ "$readiness_mode" == http_failure ]]; then
+    [[ "$output" == *'installed readiness endpoint did not return HTTP success'* ]] ||
+      fail "$readiness_mode failed before its readiness assertion: $output"
+  else
+    [[ "$output" == *'installed readiness proof is incomplete'* ]] ||
+      fail "$readiness_mode failed before its readiness assertion: $output"
+  fi
+  [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
+    fail "$readiness_mode readiness failure changed durable state"
+  [[ -f "$root/test-state/readiness-count" && $(<"$root/test-state/readiness-count") -eq 1 ]] ||
+    fail "$readiness_mode readiness failure was not queried exactly once"
+done
 
 # Scenario FE-FORWARD-MATRIX-08
 # Preconditions: fresh fixture at each case; exact staged/environment and Legacy17 guard pass.

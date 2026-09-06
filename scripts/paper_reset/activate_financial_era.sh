@@ -55,15 +55,15 @@ done
   die "one or more reviewed target artifacts are absent"
 [[ -f "$membership_json" ]] || die "membership JSON is absent"
 
-for command in python3 sha256sum flock systemctl psql mktemp; do
+for command in python3 sha256sum flock systemctl psql mktemp curl; do
   command -v "$command" >/dev/null || die "$command not installed"
 done
 : "${SUPABASE_DB_URL:?SUPABASE_DB_URL must be exported for financial-era activation}"
 
 acquire_deploy_lock
 [[ -f "$IDENTITY_MANIFEST" ]] || die "#557 activation identity is absent: $IDENTITY_MANIFEST"
-identity=$(python3 -c 'import hashlib,json,os,re,sys
-path,target_binary,target_config,target_environment=sys.argv[1:]
+identity=$(python3 -c 'import json,os,re,sys
+path,installed_binary,installed_config,installed_environment=sys.argv[1:]
 value=json.load(open(path, encoding="utf-8"))
 required={"activation_id","state","generation_dir","merge_commit","bankroll","source_v1_main",
           "legacy_history","artifacts","old_installed_artifacts","destinations","old_paths"}
@@ -72,32 +72,60 @@ if value.get("state") != "verified": raise SystemExit("#557 activation is not ve
 activation=value.get("activation_id"); generation=value.get("generation_dir"); commit=value.get("merge_commit")
 if not isinstance(activation,str) or re.fullmatch(r"[A-Za-z0-9._-]+",activation) is None:
     raise SystemExit("invalid #557 activation id")
-if not isinstance(generation,str) or not os.path.isabs(generation) or not os.path.isdir(generation):
+if not isinstance(generation,str) or not os.path.isabs(generation) or not os.path.isdir(generation) or os.path.realpath(generation) != generation:
     raise SystemExit("invalid #557 generation directory")
 if not isinstance(commit,str) or re.fullmatch(r"[0-9a-f]{40}",commit) is None:
     raise SystemExit("invalid #557 merge commit")
+bankroll=value.get("bankroll")
+if not isinstance(bankroll,str) or re.fullmatch(r"[0-9]+(?:[.][0-9]{1,6})?",bankroll) is None:
+    raise SystemExit("invalid #557 bankroll")
+def evidence(name):
+    row=value.get(name)
+    if not isinstance(row,dict) or set(row) != {"path","sha256"}:
+        raise SystemExit("invalid #557 "+name+" evidence")
+    evidence_path=row.get("path"); digest=row.get("sha256")
+    if not isinstance(evidence_path,str) or not os.path.isabs(evidence_path):
+        raise SystemExit("invalid #557 "+name+" path")
+    if not isinstance(digest,str) or re.fullmatch(r"[0-9a-f]{64}",digest) is None:
+        raise SystemExit("invalid #557 "+name+" hash")
+    return row
+source_v1_main=evidence("source_v1_main")
+legacy_history=evidence("legacy_history")
 artifacts=value.get("artifacts")
 if not isinstance(artifacts,dict) or set(artifacts) != {"seed_main","binary","config","environment","rehearsal_config","rehearsal_environment"}:
     raise SystemExit("invalid #557 artifact inventory")
-for name,supplied in (("binary",target_binary),("config",target_config),("environment",target_environment)):
+destinations=value.get("destinations")
+if not isinstance(destinations,dict) or set(destinations) != {"binary","config","environment"}:
+    raise SystemExit("invalid #557 installed destinations")
+for name,installed in (("binary",installed_binary),("config",installed_config),("environment",installed_environment)):
     row=artifacts.get(name)
     if not isinstance(row,dict) or set(row) != {"path","sha256"}:
         raise SystemExit("invalid #557 "+name+" artifact")
-    if not isinstance(row["path"],str) or os.path.realpath(row["path"]) != os.path.realpath(supplied):
-        raise SystemExit("#557 "+name+" path differs from the reviewed target")
+    if not isinstance(row["path"],str) or not os.path.isabs(row["path"]):
+        raise SystemExit("invalid #557 "+name+" artifact path")
+    destination=destinations.get(name)
+    if not isinstance(destination,str) or os.path.realpath(destination) != os.path.realpath(installed):
+        raise SystemExit("#557 "+name+" destination differs from the installed old artifact")
     digest=row.get("sha256")
     if not isinstance(digest,str) or re.fullmatch(r"[0-9a-f]{64}",digest) is None:
         raise SystemExit("invalid #557 "+name+" hash")
-    with open(supplied,"rb") as source: actual=hashlib.sha256(source.read()).hexdigest()
-    if actual != digest: raise SystemExit("#557 "+name+" bytes differ from the verified artifact")
-print(activation); print(generation); print(commit)' \
-  "$IDENTITY_MANIFEST" "$target_binary" "$target_config" "$target_environment") ||
+print(activation); print(generation); print(commit); print(bankroll)
+print(json.dumps(source_v1_main,sort_keys=True,separators=(",",":")))
+print(json.dumps(legacy_history,sort_keys=True,separators=(",",":")))
+print(artifacts["binary"]["sha256"]); print(artifacts["config"]["sha256"]); print(artifacts["environment"]["sha256"])' \
+  "$IDENTITY_MANIFEST" "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV") ||
   die "invalid #557 activation identity"
 mapfile -t identity_parts <<< "$identity"
-[[ ${#identity_parts[@]} -eq 3 ]] || die "invalid #557 identity result"
+[[ ${#identity_parts[@]} -eq 9 ]] || die "invalid #557 identity result"
 activation_id=${identity_parts[0]}
 generation=${identity_parts[1]}
 generation_merge_commit=${identity_parts[2]}
+generation_bankroll=${identity_parts[3]}
+generation_source_v1_main=${identity_parts[4]}
+generation_legacy_history=${identity_parts[5]}
+generation_artifact_sha256=${identity_parts[6]}
+generation_config_sha256=${identity_parts[7]}
+generation_environment_sha256=${identity_parts[8]}
 
 staged_identity_output=$("$target_binary" --verify-staged-identity) ||
   die "staged binary could not derive its own identity"
@@ -105,8 +133,6 @@ read -r target_revision artifact_blake3 < <(python3 -c 'import re,sys
 match=re.fullmatch(r"prediction-edge revision=([0-9a-f]{40}) artifact_blake3=([0-9a-f]{64})\n?",sys.stdin.read())
 if match is None: raise SystemExit(1)
 print(*match.groups())' <<< "$staged_identity_output") || die "staged binary identity output is invalid"
-[[ "$target_revision" == "$generation_merge_commit" ]] ||
-  die "staged binary revision differs from the verified #557 merge commit"
 "$target_binary" --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null ||
   die "staged binary identity self-verification failed"
 static_config_hash=$(python3 -c 'import hashlib,json,sys
@@ -119,9 +145,12 @@ target_artifact_sha256=$(sha256_file "$target_binary")
 
 financial_config_rows_dir=
 financial_config_rows_file=
+financial_readiness_response=
 cleanup_financial_config_rows() {
   [[ -z "$financial_config_rows_file" || ! -e "$financial_config_rows_file" ]] ||
     rm -f -- "$financial_config_rows_file"
+  [[ -z "$financial_readiness_response" || ! -e "$financial_readiness_response" ]] ||
+    rm -f -- "$financial_readiness_response"
   [[ -z "$financial_config_rows_dir" || ! -d "$financial_config_rows_dir" ]] ||
     rmdir -- "$financial_config_rows_dir"
 }
@@ -142,7 +171,7 @@ export_financial_config_rows() {
 
 read_rehearsal_evidence() {
   python3 -c 'import hashlib,json,os,sys
-evidence_path,expected_revision,expected_artifact,expected_artifact_sha=sys.argv[1:]
+evidence_path,expected_revision,expected_artifact,expected_artifact_sha,expected_activation,expected_generation,expected_config_sha,expected_environment_sha=sys.argv[1:]
 def refuse(reason):
     print("REHEARSAL_REFUSAL="+reason,file=sys.stderr)
     raise SystemExit(1)
@@ -152,7 +181,7 @@ try:
     with open(evidence_path,encoding="utf-8") as source: evidence=json.load(source)
 except (OSError,ValueError):
     refuse("malformed_evidence_file")
-expected_keys={"kind","result","evidence_sha256","manifest_path","target_revision","artifact_blake3","artifact_sha256"}
+expected_keys={"kind","result","evidence_sha256","manifest_path","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256"}
 if not isinstance(evidence,dict) or set(evidence) != expected_keys or evidence.get("kind") != "rehearsal545-evidence-v1":
     refuse("malformed_evidence_file")
 digest=evidence.get("evidence_sha256")
@@ -174,11 +203,21 @@ try:
             rows[key]=value
 except (OSError,UnicodeError):
     refuse("malformed_result_manifest")
-for key in ("result","target_revision","artifact_blake3","artifact_sha256"):
+for key in ("result","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256"):
     if rows.get(key) != evidence.get(key): refuse("evidence_identity_mismatch")
 if rows.get("sha") != evidence.get("target_revision"): refuse("reviewed_revision_mismatch")
 if evidence.get("target_revision") != expected_revision or evidence.get("artifact_blake3") != expected_artifact or evidence.get("artifact_sha256") != expected_artifact_sha:
     refuse("artifact_identity_mismatch")
+if evidence.get("activation_id") != expected_activation: refuse("activation_identity_mismatch")
+evidence_generation=evidence.get("generation_dir")
+if not isinstance(evidence_generation,str) or not os.path.isabs(evidence_generation) or os.path.realpath(evidence_generation) != expected_generation:
+    refuse("generation_identity_mismatch")
+if evidence.get("config_sha256") != expected_config_sha: refuse("config_identity_mismatch")
+if evidence.get("environment_sha256") != expected_environment_sha: refuse("environment_identity_mismatch")
+for key in ("copy_manifest_sha256","readiness_sha256"):
+    value=evidence.get(key)
+    if not isinstance(value,str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        refuse(key.removesuffix("_sha256")+"_identity_mismatch")
 bound={
     "path":os.path.realpath(evidence_path),
     "manifest_path":os.path.realpath(manifest_path),
@@ -186,15 +225,56 @@ bound={
     "target_revision":evidence["target_revision"],
     "artifact_blake3":evidence["artifact_blake3"],
     "artifact_sha256":evidence["artifact_sha256"],
+    "activation_id":evidence["activation_id"],
+    "generation_dir":evidence["generation_dir"],
+    "copy_manifest_sha256":evidence["copy_manifest_sha256"],
+    "readiness_sha256":evidence["readiness_sha256"],
+    "config_sha256":evidence["config_sha256"],
+    "environment_sha256":evidence["environment_sha256"],
 }
 print(json.dumps(bound,sort_keys=True,separators=(",",":")))' \
-    "$rehearsal_evidence" "$target_revision" "$artifact_blake3" "$target_artifact_sha256"
+    "$rehearsal_evidence" "$target_revision" "$artifact_blake3" "$target_artifact_sha256" \
+    "$activation_id" "$generation" "$(sha256_file "$target_config")" "$(sha256_file "$target_environment")"
 }
 
 file_identity_json() {
   python3 -c 'import json,sys
 print(json.dumps({"path":sys.argv[1],"sha256":sys.argv[2]},sort_keys=True,separators=(",",":")))' \
     "$1" "$(sha256_file "$1")"
+}
+
+installed_readiness_url() {
+  local installed_bind
+  installed_bind=$(env -i HOME="${HOME:-/}" PATH="$PATH" /bin/bash -c '
+set -eo pipefail
+set +u
+set -a
+# shellcheck disable=SC1090
+source "$1"
+set +a
+printf "%s" "${PE_BIND-}"
+' bash "$SERVICE_ENV") || return 1
+  if [[ -z "$installed_bind" ]]; then
+    installed_bind=$(python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as source: value=tomllib.load(source).get("bind","127.0.0.1:8080")
+if not isinstance(value,str): raise SystemExit("installed bind is not a string")
+print(value)' "$SERVICE_CONFIG") || return 1
+  fi
+  python3 -c 'import ipaddress,sys
+value=sys.argv[1]
+if value.startswith("["):
+    close=value.find("]")
+    if close < 0 or value[close+1:close+2] != ":": raise SystemExit("invalid installed bind")
+    host,port=value[1:close],value[close+2:]
+else:
+    host,separator,port=value.rpartition(":")
+    if not separator or ":" in host: raise SystemExit("invalid installed bind")
+if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+    raise SystemExit("invalid installed bind port")
+address=ipaddress.ip_address(host)
+if not address.is_loopback: raise SystemExit("installed readiness bind is not loopback")
+url_host=f"[{address}]" if address.version == 6 else str(address)
+print(f"http://{url_host}:{port}/health/ready")' "$installed_bind"
 }
 
 run_target_offline() {
@@ -415,6 +495,12 @@ if [[ ! -f "$MANIFEST" ]]; then
   [[ "$rollback_before_start" == false ]] || die "financial-era manifest is absent"
   rehearsal_evidence_json=$(read_rehearsal_evidence) ||
     die "financial-era rehearsal evidence was refused"
+  [[ "$(sha256_file "$SERVICE_BINARY")" == "$generation_artifact_sha256" ]] ||
+    die "installed old binary differs from the verified #557 artifact"
+  [[ "$(sha256_file "$SERVICE_CONFIG")" == "$generation_config_sha256" ]] ||
+    die "installed old config differs from the verified #557 artifact"
+  [[ "$(sha256_file "$SERVICE_ENV")" == "$generation_environment_sha256" ]] ||
+    die "installed old environment differs from the verified #557 artifact"
   old_binary=$(file_identity_json "$SERVICE_BINARY")
   old_config=$(file_identity_json "$SERVICE_CONFIG")
   old_environment=$(file_identity_json "$SERVICE_ENV")
@@ -422,7 +508,8 @@ if [[ ! -f "$MANIFEST" ]]; then
   target_config_json=$(file_identity_json "$target_config")
   target_environment_json=$(file_identity_json "$target_environment")
   initial=$(python3 -c 'import decimal,json,sys,time
-(activation,generation,bankroll,revision,artifact,static,batch,policy,members_path,
+(activation,generation,generation_commit,generation_bankroll,generation_source,generation_history,
+ bankroll,revision,artifact,static,batch,policy,members_path,
  paper,source,live,state,old_binary,old_config,old_env,target_binary,target_config,target_env,rehearsal)=sys.argv[1:]
 amount=decimal.Decimal(bankroll)
 atomic=amount*decimal.Decimal(1000000)
@@ -431,6 +518,9 @@ members=json.load(open(members_path,encoding="utf-8"))
 if not isinstance(members,list) or len(members)!=len(set(members)): raise SystemExit("membership must be a unique JSON array")
 value={
  "kind":"financial-era-v1","state":"prepared","activation_id":activation,"generation":generation,
+ "generation_merge_commit":generation_commit,"generation_bankroll":generation_bankroll,
+ "generation_source_v1_main":json.loads(generation_source),
+ "generation_legacy_history":json.loads(generation_history),
  "fresh_bankroll":int(atomic),"target_revision":revision,"artifact_blake3":artifact,"static_config_hash":static,
  "ranking_batch_id":int(batch),"policy_hash":policy,"membership":members,
  "schema_version":3,"parser_version":1,"financial_semantic_version":1,
@@ -440,7 +530,9 @@ value={
  "old_environment_sha256":json.loads(old_env)["sha256"],"target_environment_sha256":json.loads(target_env)["sha256"],
  "rehearsal_evidence":json.loads(rehearsal),"preparation":None}
 print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
-    "$activation_id" "$generation" "$fresh_bankroll" "$target_revision" \
+    "$activation_id" "$generation" "$generation_merge_commit" "$generation_bankroll" \
+    "$generation_source_v1_main" "$generation_legacy_history" \
+    "$fresh_bankroll" "$target_revision" \
     "$artifact_blake3" "$static_config_hash" "$ranking_batch_id" "$policy_hash" "$membership_json" \
     "$paper_log" "$source_log" "$live_journal" "$paper_state" \
     "$old_binary" "$old_config" "$old_environment" "$target_binary_json" \
@@ -451,6 +543,16 @@ fi
 [[ "$(manifest_get kind)" == financial-era-v1 ]] || die "wrong financial-era manifest kind"
 [[ "$(manifest_get activation_id)" == "$activation_id" ]] || die "#557 activation identity changed"
 [[ "$(manifest_get generation)" == "$generation" ]] || die "#557 generation identity changed"
+[[ "$(manifest_get generation_merge_commit)" == "$generation_merge_commit" ]] || die "#557 merge-commit identity changed"
+[[ "$(manifest_get generation_bankroll)" == "$generation_bankroll" ]] || die "#557 bankroll identity changed"
+python3 -c 'import json,sys
+manifest=json.load(open(sys.argv[1],encoding="utf-8"))
+if manifest.get("generation_source_v1_main") != json.loads(sys.argv[2]): raise SystemExit("#557 source evidence changed")
+if manifest.get("generation_legacy_history") != json.loads(sys.argv[3]): raise SystemExit("#557 legacy-history evidence changed")' \
+  "$MANIFEST" "$generation_source_v1_main" "$generation_legacy_history" || die "#557 source/history identity changed"
+[[ "$(manifest_get old_artifact_sha256)" == "$generation_artifact_sha256" ]] || die "recorded old binary is not the verified #557 artifact"
+[[ "$(manifest_get old_config_sha256)" == "$generation_config_sha256" ]] || die "recorded old config is not the verified #557 artifact"
+[[ "$(manifest_get old_environment_sha256)" == "$generation_environment_sha256" ]] || die "recorded old environment is not the verified #557 artifact"
 [[ "$(manifest_get target_revision)" == "$target_revision" ]] || die "reviewed target revision changed"
 [[ "$(sha256_file "$target_binary")" == "$(manifest_get target_artifact_sha256)" ]] || die "reviewed target artifact changed"
 [[ "$(sha256_file "$target_config")" == "$(manifest_get target_config_sha256)" ]] || die "reviewed target config changed"
@@ -786,6 +888,21 @@ if None in identities or len(identities) != len(set(identities)): raise SystemEx
     "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" \
     "$ranking_identity" ||
     die "first fresh health proof is incomplete"
+  readiness_url=$(installed_readiness_url) || die "installed readiness endpoint is invalid"
+  financial_readiness_response=$(mktemp)
+  readiness_env=("PATH=$PATH" "LANG=${LANG:-C.UTF-8}")
+  if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]]; then
+    readiness_env+=("PE_ACTIVATION_TEST_ROOT=$PE_ACTIVATION_TEST_ROOT")
+  fi
+  env -i "${readiness_env[@]}" curl --disable --silent --show-error --fail-with-body --noproxy '*' \
+    --output "$financial_readiness_response" "$readiness_url" ||
+    die "installed readiness endpoint did not return HTTP success"
+  python3 -c 'import json,sys
+with open(sys.argv[1],encoding="utf-8") as source: value=json.load(source)
+if not isinstance(value,dict) or value.get("ready") is not True or value.get("issues",[]) != []:
+    raise SystemExit("installed invocation is not ready")' "$financial_readiness_response" ||
+    die "installed readiness proof is incomplete"
+  verified_readiness_sha256=$(sha256_file "$financial_readiness_response")
   python3 -c 'import decimal,json,sqlite3,sys
 path,start_seq,start_hash,bankroll=sys.argv[1:]
 db=sqlite3.connect("file:"+path+"?mode=ro",uri=True)
@@ -826,7 +943,8 @@ if actual["ranking_batch_id"] != manifest["ranking_batch_id"]: raise SystemExit(
 if sorted(actual["membership"]) != sorted(manifest["membership"]): raise SystemExit("remote membership differs")' \
     "$remote_verified" "$MANIFEST" "$fresh_bankroll" || die "remote financial/ranking/membership proof is incomplete"
   manifest_advance verified \
-    '{"verified_state_assertions":true,"verified_start_reset":true,"verified_source_replay_continuity":true,"verified_ranking_membership":true,"verified_producers_projection":true,"verified_accounts_off_unarmed":true}'
+    "$(python3 -c 'import json,sys
+print(json.dumps({"verified_state_assertions":True,"verified_start_reset":True,"verified_source_replay_continuity":True,"verified_ranking_membership":True,"verified_producers_projection":True,"verified_accounts_off_unarmed":True,"verified_readiness_sha256":sys.argv[1]},sort_keys=True,separators=(",",":")))' "$verified_readiness_sha256")"
 fi
 
 echo "activation_id=$activation_id state=$(manifest_get state)"
