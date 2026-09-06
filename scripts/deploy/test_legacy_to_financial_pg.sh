@@ -36,8 +36,8 @@ psql_admin() {
   psql_url PG_ADMIN_URL "$@"
 }
 
-start_step "create isolated roles and legacy database"
-psql_admin -v ON_ERROR_STOP=1 <<'SQL'
+install_roles() {
+  psql_admin -v ON_ERROR_STOP=1 <<'SQL'
 do $$ begin
   if not exists (select 1 from pg_roles where rolname = 'anon') then
     create role anon nologin nobypassrls;
@@ -54,16 +54,83 @@ do $$ begin
   alter role service_role bypassrls;
 end $$;
 SQL
-psql_admin -v ON_ERROR_STOP=1 -c 'create database pe_legacy_545;'
+}
+
+run_pe_service() {
+  (
+    cd "$REPO_ROOT"
+    # CI already builds all features; select the service binary because this package also owns
+    # the live canary and therefore cannot use Cargo's bare single-binary shorthand.
+    cargo run -p pe-service --all-features --bin pe-service -- "$@"
+  )
+}
+
+run_financial_era() {
+  PE_SUPABASE_AUTHORITATIVE=true \
+    PE_SUPABASE_URL=https://ci-financial-era.invalid \
+    PE_SUPABASE_SECRET_KEY=ci-financial-era-service-role \
+    run_pe_service "$@"
+}
+
+create_isolated_database() {
+  local database_count
+  database_count=$(psql_admin -v ON_ERROR_STOP=1 -Atc \
+    "select count(*) from pg_database where datname = 'pe_legacy_545';")
+  case "$database_count" in
+    0) psql_admin -v ON_ERROR_STOP=1 -c 'create database pe_legacy_545;' ;;
+    1) ;;
+    *) die "isolated database census is invalid: $database_count" ;;
+  esac
+}
+
+apply_financial_config_migration() {
+  local legacy_key_count financial_key_count
+  legacy_key_count=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+    "select count(*) from service_config where key in ('fill_mode','polymarket_fee_rate');")
+  financial_key_count=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+    "select count(*) from service_config where key not in ('risk_halt_release_hash');")
+  if [[ "$legacy_key_count" == 2 && "$financial_key_count" == 17 ]]; then
+    psql_service_db -v ON_ERROR_STOP=1 \
+      -f "$REPO_ROOT/scripts/migrate_service_config_545.sql"
+  elif [[ "$legacy_key_count" != 0 || "$financial_key_count" != 15 ]]; then
+    die "service_config is neither the exact Legacy17 nor Financial15 migration boundary"
+  fi
+}
+
+retry_manifest_patch() {
+  local boundary=$1 patch=$2 first_sha256
+  manifest_patch_boundary "$boundary" "$patch"
+  first_sha256=$(sha256_file "$MANIFEST")
+  manifest_patch_boundary "$boundary" "$patch"
+  [[ "$first_sha256" == "$(sha256_file "$MANIFEST")" ]] ||
+    die "$boundary manifest retry changed the receipt"
+}
+
+retry_manifest_advance() {
+  local state=$1 patch=${2:-'{}'} first_sha256
+  manifest_advance "$state" "$patch"
+  first_sha256=$(sha256_file "$MANIFEST")
+  manifest_advance "$state" "$patch"
+  [[ "$first_sha256" == "$(sha256_file "$MANIFEST")" ]] ||
+    die "$state manifest retry changed the state"
+}
+
+start_step "create isolated roles and legacy database"
+install_roles
+install_roles
+create_isolated_database
+create_isolated_database
 pass_step
 
 start_step "install pre-Start schema and seed Legacy17 plus the release row"
-legacy_schema="$RUNNER_TEMP/supabase_paper_state_schema.pre-545.sql"
-legacy_multi_account_schema="$RUNNER_TEMP/supabase_multi_account_live_schema.pre-545.sql"
-git show origin/main:scripts/supabase_paper_state_schema.sql > "$legacy_schema"
-git show origin/main:scripts/supabase_multi_account_live_schema.sql > "$legacy_multi_account_schema"
+legacy_schema="$REPO_ROOT/scripts/fixtures/pre545/supabase_paper_state_schema.sql"
+legacy_multi_account_schema="$REPO_ROOT/scripts/fixtures/pre545/supabase_multi_account_live_schema.sql"
 [[ -s "$legacy_schema" ]] || die "pre-Start paper-state schema is empty"
 [[ -s "$legacy_multi_account_schema" ]] || die "pre-Start multi-account schema is empty"
+psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_schema.sql"
+psql_service_db -v ON_ERROR_STOP=1 -f "$legacy_schema"
+psql_service_db -v ON_ERROR_STOP=1 -f "$legacy_multi_account_schema"
+# Retry every installed-schema boundary once against the same PostgreSQL database.
 psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_schema.sql"
 psql_service_db -v ON_ERROR_STOP=1 -f "$legacy_schema"
 psql_service_db -v ON_ERROR_STOP=1 -f "$legacy_multi_account_schema"
@@ -123,6 +190,7 @@ pass_step
 
 start_step "run the driver-owned Legacy17 verifier"
 verify_legacy_service_contract
+verify_legacy_service_contract
 pass_step
 
 start_step "prove the Legacy17 verifier refuses a malformed release row"
@@ -142,7 +210,127 @@ psql_service_db -v ON_ERROR_STOP=1 -c \
 verify_legacy_service_contract
 pass_step
 
+start_step "prepare a fresh financial-era fixture through the Rust owner"
+financial_fixture=$(mktemp -d "$RUNNER_TEMP/cipg-financial-era.XXXXXX")
+paper_log="$financial_fixture/paper.log"
+source_log="$financial_fixture/source_events.log"
+live_journal="$financial_fixture/live_journal.log"
+paper_state="$financial_fixture/paper_state.db"
+status_path="$financial_fixture/status.json"
+fixture_config="$financial_fixture/service.toml"
+fixture_environment="$financial_fixture/service.env"
+financial_config_rows="$financial_fixture/service_config.financial15.json"
+activation_manifest="$financial_fixture/pe-financial-era.json"
+
+# These are fresh version-one event-log files. The Rust prepare/start owners verify all three,
+# while --rebuild-state creates the SQLite schema and bankroll through PaperStateDb.
+printf 'EDGE\001' > "$paper_log"
+printf 'EDGE\001' > "$source_log"
+printf 'EDGE\001' > "$live_journal"
+chmod 0600 "$paper_log" "$source_log" "$live_journal"
+printf '%s\n' \
+  '{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}' \
+  > "$status_path"
+python3 -c 'import json,sys
+paper,source,status,state=sys.argv[1:]
+print("event_log_path = "+json.dumps(paper))
+print("source_event_log_path = "+json.dumps(source))
+print("status_path = "+json.dumps(status))
+print("paper_state_db_path = "+json.dumps(state))
+print("bankroll_usd = \"10000\"")' \
+  "$paper_log" "$source_log" "$status_path" "$paper_state" > "$fixture_config"
+printf '%s\n' \
+  'PE_SUPABASE_AUTHORITATIVE=true' \
+  'PE_SUPABASE_URL=https://ci-financial-era.invalid' \
+  'PE_SUPABASE_SECRET_KEY=ci-financial-era-service-role' \
+  > "$fixture_environment"
+chmod 0600 "$fixture_config" "$fixture_environment" "$status_path"
+run_pe_service "$fixture_config" --rebuild-state >/dev/null
+
+psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  "select coalesce(json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key),'[]'::json)::text
+     from service_config
+    where key not in ('fill_mode','polymarket_fee_rate','risk_halt_release_hash');" \
+  > "$financial_config_rows"
+[[ -s "$financial_config_rows" ]] || die "Financial15 configuration export is empty"
+
+staged_identity=$(run_pe_service --verify-staged-identity)
+mapfile -t staged_identity_parts < <(python3 -c 'import re,sys
+match=re.fullmatch(r"prediction-edge revision=([0-9a-f]{40}) artifact_blake3=([0-9a-f]{64})\n?",sys.argv[1])
+if match is None: raise SystemExit("pe-service staged identity is malformed")
+print(match.group(1)); print(match.group(2))' "$staged_identity")
+[[ ${#staged_identity_parts[@]} -eq 2 ]] || die "pe-service staged identity is incomplete"
+target_revision=${staged_identity_parts[0]}
+artifact_blake3=${staged_identity_parts[1]}
+run_pe_service --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null
+run_pe_service --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null
+pe_service_binary="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/pe-service"
+[[ -f "$pe_service_binary" ]] || die "cargo run did not produce $pe_service_binary"
+artifact_sha256=$(sha256_file "$pe_service_binary")
+config_sha256=$(sha256_file "$fixture_config")
+environment_sha256=$(sha256_file "$fixture_environment")
+static_config_hash=$(python3 -c 'import hashlib,json,sys
+config_hash,environment_hash=sys.argv[1:]
+payload=json.dumps({"config_sha256":config_hash,"environment_sha256":environment_hash},sort_keys=True,separators=(",",":")).encode()
+print(hashlib.sha256(b"prediction-edge/effective-static-config-v1\0"+payload).hexdigest())' \
+  "$config_sha256" "$environment_sha256")
+
+initial_manifest=$(python3 -c 'import json,sys
+(path,activation,generation,bankroll,revision,artifact,static,batch,paper,source,live,state,
+ artifact_sha,config_sha,environment_sha)=sys.argv[1:]
+value={
+ "kind":"financial-era-v1","state":"prepared","activation_id":activation,
+ "generation":generation,"fresh_bankroll":int(bankroll)*1000000,
+ "target_revision":revision,"artifact_blake3":artifact,"static_config_hash":static,
+ "ranking_batch_id":int(batch),"membership":[],"schema_version":3,"parser_version":1,
+ "financial_semantic_version":1,"start_unix":1700000000,
+ "paths":{"paper_log":paper,"source_log":source,"live_journal":live,"paper_state":state},
+ "old_artifact_sha256":artifact_sha,"target_artifact_sha256":artifact_sha,
+ "old_config_sha256":config_sha,"target_config_sha256":config_sha,
+ "old_environment_sha256":environment_sha,"target_environment_sha256":environment_sha,
+ "preparation":None
+}
+print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
+  "$activation_manifest" ci-545-transition "$financial_fixture" 10000 "$target_revision" \
+  "$artifact_blake3" "$static_config_hash" 545 "$paper_log" "$source_log" "$live_journal" \
+  "$paper_state" "$artifact_sha256" "$config_sha256" "$environment_sha256")
+# Use the activation driver's fsynced manifest owner for the fixture and every receipt below.
+MANIFEST=$activation_manifest
+atomic_manifest_json "$initial_manifest" prepared
+initial_manifest_sha256=$(sha256_file "$activation_manifest")
+atomic_manifest_json "$initial_manifest" prepared
+[[ "$initial_manifest_sha256" == "$(sha256_file "$activation_manifest")" ]] ||
+  die "prepared-manifest retry changed the initial identity"
+
+durable_before=$(printf '%s:%s:%s:%s' \
+  "$(sha256_file "$paper_log")" "$(sha256_file "$source_log")" \
+  "$(sha256_file "$live_journal")" "$(sha256_file "$paper_state")")
+prepare_first=$(run_financial_era "$fixture_config" --financial-era=prepare \
+  --activation-manifest="$activation_manifest" \
+  --financial-config-rows="$financial_config_rows")
+prepare_retry=$(run_financial_era "$fixture_config" --financial-era=prepare \
+  --activation-manifest="$activation_manifest" \
+  --financial-config-rows="$financial_config_rows")
+[[ "$prepare_first" == "$prepare_retry" ]] || die "financial-era prepare retry changed its result"
+durable_after=$(printf '%s:%s:%s:%s' \
+  "$(sha256_file "$paper_log")" "$(sha256_file "$source_log")" \
+  "$(sha256_file "$live_journal")" "$(sha256_file "$paper_state")")
+[[ "$durable_before" == "$durable_after" ]] || die "financial-era prepare mutated a durable fixture"
+
+# Match the driver's durable preparation receipt followed by its prepared -> guarded advance,
+# retrying both manifest boundaries with the same identities.
+preparation_patch=$(python3 -c 'import json,sys
+print(json.dumps({"preparation":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' \
+  "$prepare_first")
+retry_manifest_patch preparation "$preparation_patch"
+retry_manifest_advance guarded
+pass_step
+
 start_step "archive and reset the pre-Start legacy state"
+retry_manifest_patch remote-archive-intent '{"remote_archive_intent":true}'
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-transition \
+  -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
+# The archive owner recognizes the completed activation stamp and proves the fresh live book.
 psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-transition \
   -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
 psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
@@ -171,37 +359,89 @@ do $$ begin
   end if;
 end $$;
 SQL
+retry_manifest_patch remote-archived '{"remote_archive_completed":true}'
 pass_step
 
-start_step "install financial schema, seed the Start identity, and read it back"
+start_step "execute physical QualificationStarted through the Rust owner"
+retry_manifest_patch qualification-start-intent '{"qualification_start_intent":true}'
+start_first=$(run_financial_era "$fixture_config" --financial-era=start \
+  --activation-manifest="$activation_manifest" \
+  --financial-config-rows="$financial_config_rows")
+start_retry=$(run_financial_era "$fixture_config" --financial-era=start \
+  --activation-manifest="$activation_manifest" \
+  --financial-config-rows="$financial_config_rows")
+[[ "$start_first" == "$start_retry" ]] || die "financial-era Start retry changed its receipt"
+rollback_check_first=$(run_financial_era "$fixture_config" --financial-era=rollback-check \
+  --activation-manifest="$activation_manifest")
+rollback_check_retry=$(run_financial_era "$fixture_config" --financial-era=rollback-check \
+  --activation-manifest="$activation_manifest")
+[[ "$rollback_check_first" == "$rollback_check_retry" ]] || \
+  die "financial-era rollback-check retry changed its result"
+python3 -c 'import json,sys
+start=json.loads(sys.argv[1]); preparation=json.loads(sys.argv[2])
+first=json.loads(sys.argv[3]); retry=json.loads(sys.argv[4])
+if start != preparation.get("expected_receipt"):
+ raise SystemExit("physical Start receipt differs from prepared identity")
+for result in (first,retry):
+ if result.get("complete_start") is not True or result.get("receipt") != start:
+  raise SystemExit("rollback-check did not find the physical manifest-bound Start")' \
+  "$start_first" "$prepare_first" "$rollback_check_first" "$rollback_check_retry"
+mapfile -t start_identity < <(python3 -c 'import json,sys
+value=json.loads(sys.argv[1]); print(value["sequence"]); print(value["this_hash"])' "$start_first")
+[[ ${#start_identity[@]} -eq 2 && "${start_identity[0]}" =~ ^[0-9]+$ && \
+   "${start_identity[1]}" =~ ^[0-9a-f]{64}$ ]] || die "physical Start receipt is invalid"
+start_seq=${start_identity[0]}
+start_hash=${start_identity[1]}
+start_receipt_patch=$(python3 -c 'import json,sys
+print(json.dumps({"start_receipt":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' \
+  "$start_first")
+retry_manifest_patch qualification-started "$start_receipt_patch"
+pass_step
+
+start_step "install financial schema, seed the physical Start receipt, and read it back"
+retry_manifest_patch authority-schema-intent '{"authority_schema_intent":true}'
 psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
-psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
-do $$
-declare
-  start_result jsonb;
-begin
-  start_result := seed_financial_start(42, repeat('b', 64));
-  if start_result->>'outcome' not in ('applied', 'existing')
-     or (start_result->>'start_seq')::bigint <> 42
-     or start_result->>'start_hash' <> repeat('b', 64) then
-    raise exception 'financial Start seed returned an unexpected result: %', start_result;
-  end if;
-  if not exists (
-       select 1 from paper_bankroll
-        where id = 0
-          and bankroll_str::numeric = 10000
-          and start_seq = 42
-          and start_hash = repeat('b', 64)
-          and last_prepared_seq is null
-     ) then
-    raise exception 'financial Start read-back differs from the seeded identity';
-  end if;
-end $$;
-SQL
+# The schema itself is an idempotent boundary.
+psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
+retry_manifest_patch authority-schema-installed '{"authority_schema_installed":true}'
+authority_start_first=$(psql_service_db -v ON_ERROR_STOP=1 -At \
+  -v start_seq="$start_seq" -v start_hash="$start_hash" \
+  -c "select seed_financial_start(:'start_seq'::bigint, :'start_hash');")
+authority_start_retry=$(psql_service_db -v ON_ERROR_STOP=1 -At \
+  -v start_seq="$start_seq" -v start_hash="$start_hash" \
+  -c "select seed_financial_start(:'start_seq'::bigint, :'start_hash');")
+authority_start_readback=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  "select json_build_object(
+     'bankroll',(select bankroll_str from paper_bankroll where id=0),
+     'start_seq',(select start_seq from paper_bankroll where id=0),
+     'start_hash',(select start_hash from paper_bankroll where id=0),
+     'last_prepared_seq',(select last_prepared_seq from paper_bankroll where id=0))::text;")
+python3 -c 'import decimal,json,sys
+sequence=int(sys.argv[1]); digest=sys.argv[2]
+first=json.loads(sys.argv[3]); retry=json.loads(sys.argv[4]); row=json.loads(sys.argv[5])
+if first.get("outcome") != "applied": raise SystemExit("first authority Start was not applied")
+if retry.get("outcome") != "existing": raise SystemExit("authority Start retry was not existing")
+for result in (first,retry):
+ if result.get("start_seq") != sequence or result.get("start_hash") != digest:
+  raise SystemExit("authority Start result differs from the physical receipt")
+if (row.get("start_seq") != sequence or row.get("start_hash") != digest
+    or row.get("last_prepared_seq") is not None
+    or decimal.Decimal(row.get("bankroll")) != decimal.Decimal("10000")):
+ raise SystemExit("authority Start read-back differs from the physical receipt")' \
+  "$start_seq" "$start_hash" "$authority_start_first" "$authority_start_retry" \
+  "$authority_start_readback"
+authority_start_patch=$(python3 -c 'import json,sys
+first=json.loads(sys.argv[1]); row=json.loads(sys.argv[2])
+print(json.dumps({"authority_start_seeded":True,"authority_start_proof":[first,row]},sort_keys=True,separators=(",",":")))' \
+  "$authority_start_first" "$authority_start_readback")
+retry_manifest_patch authority-start-seeded "$authority_start_patch"
 pass_step
 
 start_step "migrate Legacy17 to Financial15 and preserve the release row"
-psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/migrate_service_config_545.sql"
+retry_manifest_patch financial-config-migration-intent \
+  '{"financial_config_migration_intent":true}'
+apply_financial_config_migration
+apply_financial_config_migration
 psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
 do $$
 declare
@@ -235,6 +475,7 @@ begin
   end if;
 end $$;
 SQL
+retry_manifest_patch financial-config-migrated '{"financial_config_migrated":true}'
 pass_step
 
 start_step "round-trip fractional financial state through archive and restore"
@@ -260,6 +501,8 @@ values ('financial-fill', 200);
 SQL
 psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
   -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
+  -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
 psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
 do $$ begin
   if (select count(*) from paper_fills) <> 0
@@ -282,7 +525,12 @@ end $$;
 SQL
 psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
   -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
-psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
+  -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
+psql_service_db -v ON_ERROR_STOP=1 -v start_seq="$start_seq" -v start_hash="$start_hash" <<'SQL'
+begin;
+select set_config('pe.start_seq', :'start_seq', true);
+select set_config('pe.start_hash', :'start_hash', true);
 do $$ begin
   if not exists (
        select 1 from paper_fills
@@ -295,7 +543,8 @@ do $$ begin
      ) or not exists (
        select 1 from paper_bankroll
         where bankroll_str::numeric = 9998.625
-          and start_seq = 42 and start_hash = repeat('b', 64)
+          and start_seq = current_setting('pe.start_seq')::bigint
+          and start_hash = current_setting('pe.start_hash')
           and last_prepared_seq = 44
      ) or not exists (
        select 1 from settled_markets
@@ -305,6 +554,7 @@ do $$ begin
     raise exception 'fractional archive/restore round trip changed the financial book';
   end if;
 end $$;
+commit;
 SQL
 pass_step
 
