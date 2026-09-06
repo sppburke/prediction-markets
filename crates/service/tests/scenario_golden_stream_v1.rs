@@ -22,9 +22,9 @@ use pe_core_types::{
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Scanner, Writer};
 use pe_execution_core::{
-    AdmissionReceipts, CredentialBindingIdentity, EconomicPrepared, FrozenLiveTarget,
-    LiveAdmissionArtifact, LiveControlMode, LiveExecutor, LiveJournal, LiveModeSnapshot,
-    LiveOrderIdentity, LiveOrderPreparedAudit, LiveOrderRequest, LiveOrderVenue,
+    AdmissionReceipts, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
+    FrozenLiveTarget, LiveAdmissionArtifact, LiveControlMode, LiveExecutor, LiveJournal,
+    LiveModeSnapshot, LiveOrderIdentity, LiveOrderPreparedAudit, LiveOrderRequest, LiveOrderVenue,
     LivePostClassification, LivePostFuture, LivePostParseError, LivePrepareResult,
     LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
     LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared, RiskDecisionAudit,
@@ -41,6 +41,7 @@ use pe_service::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
 use pe_service::decision_replay::{DecisionPostBoundaryEvidence, replay_decision_pending};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
+use pe_service::live_fanout::compose_live_economic;
 use pe_service::live_venue_adapter::LiveAdmissionBuilder;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::mark_prices::HistoricalMarkAdapter;
@@ -2011,6 +2012,30 @@ async fn golden_source_stream_replays_exact_economic_core() {
             };
             let first_admission = first_admission.as_ref().unwrap();
             let token_id = first_economic.market.token_id.clone();
+            let live_ladder = ladder_from_economic(first_economic);
+            let live_economic = compose_live_economic(EconomicInputs {
+                market: first_economic.market.clone(),
+                admission: first_admission,
+                plan: &live_ladder,
+                book_receipt: first_economic.book_receipt,
+                observation: first_economic.observation.clone(),
+                sizing_mode: first_economic.sizing.mode,
+                budget: first_economic.sizing.budget,
+                slippage_rate: first_economic.sizing.slippage_rate,
+                risk: first_economic.risk.clone(),
+                cash_before: first_economic.balance.cash_before,
+                price_impact_cap_bps: first_economic.balance.price_impact_cap_bps,
+                chase_ceiling: first_economic.balance.chase_ceiling,
+                band_floor: first_economic.balance.band_floor,
+                band_ceiling_exclusive: first_economic.balance.band_ceiling_exclusive,
+                applied_configuration_hash: first_economic.applied_configuration_hash.clone(),
+            })
+            .unwrap();
+            assert!(live_economic.observation.is_some());
+            assert_eq!(
+                live_economic.core_hash().unwrap(),
+                first_economic.core_hash().unwrap()
+            );
             let live_dispatch_id = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
                 &first_operation.leader_wallet.to_string(),
                 &first_operation.source_trade_id.0,
@@ -2061,8 +2086,8 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 outcome_id: OutcomeId(u16::from(first_economic.market.outcome_index)),
                 token_id,
                 admission: first_admission.clone(),
-                ladder: ladder_from_economic(first_economic),
-                economic: first_economic.clone(),
+                ladder: live_ladder,
+                economic: live_economic,
             };
             let live_now =
                 OffsetDateTime::from_unix_timestamp(first_admission.market.observed_at_unix)

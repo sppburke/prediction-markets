@@ -2074,6 +2074,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn stage_dispatch_if_targeted(
         &self,
         signal: &LeaderSignal,
+        continuation: Option<&DecisionContinuationV3>,
         evidence: &mut Option<DecisionEvidenceAccumulator>,
     ) -> Result<Option<String>, ()> {
         let Some(live) = self.live_accounts.as_ref() else {
@@ -2095,6 +2096,42 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         if armed.is_empty() {
             return Ok(None);
         }
+        let observation = match continuation {
+            Some(continuation) => {
+                let Some((_, source_log_path)) = self.financial_log_paths.as_ref() else {
+                    error!(
+                        trade = %signal.source_trade_id,
+                        "live dispatch has no verified source-log owner"
+                    );
+                    return Err(());
+                };
+                match continuation.observation_from_source_log(source_log_path) {
+                    Ok(Some(observation)) => observation,
+                    Ok(None) => {
+                        error!(
+                            trade = %signal.source_trade_id,
+                            "live dispatch continuation has no version-three observation"
+                        );
+                        return Err(());
+                    }
+                    Err(error) => {
+                        error!(
+                            %error,
+                            trade = %signal.source_trade_id,
+                            "live dispatch observation verification failed"
+                        );
+                        return Err(());
+                    }
+                }
+            }
+            None => {
+                error!(
+                    trade = %signal.source_trade_id,
+                    "live dispatch has no durable decision continuation"
+                );
+                return Err(());
+            }
+        };
         let dispatch_id = pe_strategy_winner_follow::build_idempotency_key(signal);
         let targets = armed
             .iter()
@@ -2113,6 +2150,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let frozen = serde_json::json!({
             "schema_version": 1,
             "signal": signal,
+            "observation": observation,
             "price_impact_cap_bps": self.price_impact_cap_bps,
             "mode": format!("{:?}", self.mode),
         });
@@ -2862,7 +2900,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return;
         }
 
-        let dispatch_id = match self.stage_dispatch_if_targeted(&signal, &mut decision_evidence) {
+        let dispatch_id = match self.stage_dispatch_if_targeted(
+            &signal,
+            pending.as_ref(),
+            &mut decision_evidence,
+        ) {
             Ok(id) => id,
             Err(()) => {
                 // Staging failed: abandoned unseen. #511: exact in-memory rollback so

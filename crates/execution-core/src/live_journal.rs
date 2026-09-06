@@ -450,6 +450,7 @@ pub enum LiveOrderPreparationFailure {
     RecoveryAdmissionExpired,
     PrePostRiskDayChanged,
     PrePostRiskPriceExpired,
+    PrePostLadderExpired,
     PrePostAdmissionExpired,
     PrePostMarkUnavailable,
 }
