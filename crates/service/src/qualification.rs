@@ -17,9 +17,12 @@ use pe_event_log::envelope::{HashInput, compute_hashes};
 use pe_event_log::{
     AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, LogTailBinding, Reader, Scanner, Writer,
 };
+use pe_execution_core::live_executor::{
+    LiveAdmissionAccountEvidence, LiveAdmissionClassificationInput, classify_live_admission,
+};
 use pe_execution_core::{
     AdmissionReceipts, EconomicInputs, EconomicPrepared, LiveAdmissionArtifact,
-    ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingModeAudit,
+    LiveAdmissionVerdict, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingModeAudit,
 };
 use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_pnl::ResolutionStore;
@@ -1346,12 +1349,24 @@ fn verify_live_wrappers(
     start: &QualificationStarted,
     paper_frames: &[ScannedPaperFrame],
 ) -> Result<VerifiedLiveEvidence, QualificationError> {
-    let sealed_events = replay_live_prefix(live_journal, &start.live_prefix, live_prefix)?;
+    let wrapper_events = replay_live_prefix(live_journal, &start.live_prefix, live_prefix)?;
+    let sealed_events = match live_prefix.last_sequence {
+        Some(sealed_sequence) => {
+            pe_execution_core::LiveJournal::replay_prefix(live_journal, sealed_sequence).map_err(
+                |error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "live journal canonical replay failed: {error}"
+                    ))
+                },
+            )?
+        }
+        None => Vec::new(),
+    };
     let source_envelopes = sealed_source_envelopes(source_log, source_prefix)?;
     let paper_bases = paper_live_wrapper_bases(paper_frames)?;
     let mut wrapper_facts = Vec::new();
 
-    let account_ids = sealed_events
+    let account_ids = wrapper_events
         .iter()
         .map(|event| event.account_id.clone())
         .collect::<BTreeSet<_>>();
@@ -1377,13 +1392,26 @@ fn verify_live_wrappers(
             ));
         }
 
-        for event in &events {
+        for event in wrapper_events
+            .iter()
+            .filter(|event| event.account_id == account_id)
+        {
             if let pe_execution_core::LiveJournalPayload::OrderPrepared(wrapper) = &event.payload {
                 let key = &wrapper.identity.idempotency_key;
-                if !derived.validated_prepared_sequences.contains(&event.seq) {
+                if derived
+                    .baseline_sequence
+                    .is_some_and(|baseline_sequence| event.seq >= baseline_sequence)
+                    && !derived.validated_prepared_sequences.contains(&event.seq)
+                {
                     return insufficient(format!(
                         "live wrapper was not admitted by strict reduction for account {account_id} decision {key}"
                     ));
+                }
+                if derived
+                    .baseline_sequence
+                    .is_none_or(|baseline_sequence| event.seq < baseline_sequence)
+                {
+                    verify_paper_wrapper_admission(&account_id, &events, event, wrapper)?;
                 }
                 let projection = wrapper.identity.fill_projection.as_deref().ok_or_else(|| {
                         QualificationError::InsufficientEvidence(format!(
@@ -1463,6 +1491,91 @@ fn verify_live_wrappers(
         journal_hash: Some(live_prefix.last_hash.clone()),
         wrapper_facts,
     })
+}
+
+fn verify_paper_wrapper_admission(
+    account_id: &AccountId,
+    events: &[pe_execution_core::LiveJournalEvent],
+    prepared_event: &pe_execution_core::LiveJournalEvent,
+    wrapper: &pe_execution_core::LiveOrderPreparedAudit,
+) -> Result<(), QualificationError> {
+    let key = &wrapper.identity.idempotency_key;
+    let admissions = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            pe_execution_core::LiveJournalPayload::AdmissionEvaluated(admission)
+                if admission.identity.idempotency_key == *key =>
+            {
+                Some((event, admission.as_ref()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let (admission_event, admission) = match admissions.as_slice() {
+        [] => {
+            return insufficient(format!(
+                "paper-mode live wrapper has no AdmissionEvaluated preimage for account {account_id} decision {key}"
+            ));
+        }
+        [admission] => *admission,
+        _ => {
+            return insufficient(format!(
+                "paper-mode live wrapper has multiple AdmissionEvaluated preimages for account {account_id} decision {key}"
+            ));
+        }
+    };
+    if admission_event.seq >= prepared_event.seq {
+        return insufficient(format!(
+            "paper-mode AdmissionEvaluated does not precede Prepared for account {account_id} decision {key}"
+        ));
+    }
+    if admission.identity != wrapper.identity {
+        return insufficient(format!(
+            "paper-mode AdmissionEvaluated identity differs from Prepared for account {account_id} decision {key}"
+        ));
+    }
+    if admission.frozen_binding != wrapper.frozen_binding {
+        return insufficient(format!(
+            "paper-mode AdmissionEvaluated frozen binding differs from Prepared for account {account_id} decision {key}"
+        ));
+    }
+    if admission.economic != wrapper.economic {
+        return insufficient(format!(
+            "paper-mode AdmissionEvaluated economic inputs differ from Prepared for account {account_id} decision {key}"
+        ));
+    }
+    if admission.verdict != LiveAdmissionVerdict::Approved {
+        return insufficient(format!(
+            "paper-mode AdmissionEvaluated verdict is not Approved for account {account_id} decision {key}"
+        ));
+    }
+
+    let reproduced = classify_live_admission(LiveAdmissionClassificationInput {
+        evaluated_at: admission_event.timestamp,
+        requested_mode: admission.requested_mode,
+        effective_mode: admission.effective_mode,
+        frozen_binding: &admission.frozen_binding,
+        current_binding: &admission.current_binding,
+        identity: &wrapper.identity,
+        condition_id: &wrapper.economic.market.condition_id,
+        outcome_id: OutcomeId(u16::from(wrapper.economic.market.outcome_index)),
+        token_id: &wrapper.economic.market.token_id,
+        admission: &wrapper.economic.admission,
+        ladder: &wrapper.economic.ladder,
+        economic: &wrapper.economic,
+        account: LiveAdmissionAccountEvidence::PaperMode,
+    })
+    .map_err(|_| {
+        QualificationError::InsufficientEvidence(format!(
+            "paper-mode admission classifier requested account state for account {account_id} decision {key}"
+        ))
+    })?;
+    if reproduced != LiveAdmissionVerdict::Approved {
+        return insufficient(format!(
+            "paper-mode admission classifier disagrees with Approved for account {account_id} decision {key}: {reproduced:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn replay_live_prefix(
@@ -5586,10 +5699,12 @@ mod tests {
     use pe_event_log::EventEnvelope;
     use pe_execution_core::{
         BalanceAudit, ECONOMIC_PREPARED_VERSION, FeeAudit, LadderAskAudit, LadderPlanAudit,
-        LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit, MarketSelection, ObservationEvidence,
-        SizingAudit,
+        LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
+        LiveControlMode, LiveFillProjectionIdentity, LiveJournal, LiveJournalPayload,
+        LiveMarketEvidenceAudit, LiveOrderIdentity, LiveOrderPreparedAudit, MarketSelection,
+        ObservationEvidence, SizingAudit,
     };
-    use pe_venue_polymarket::CompactFeeSchedule;
+    use pe_venue_polymarket::{CompactFeeSchedule, PreparedPolymarketBuy};
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -7248,6 +7363,231 @@ mod tests {
                 band_ceiling_exclusive: Price::ONE,
             },
             applied_configuration_hash: "config".to_owned(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PaperWrapperCase {
+        Valid,
+        MissingAdmission,
+        DuplicateAdmission,
+        RelabeledAdmission,
+        RefusedAdmission,
+        TamperedEconomic,
+    }
+
+    fn verify_paper_wrapper_case(
+        case: PaperWrapperCase,
+    ) -> Result<VerifiedLiveEvidence, QualificationError> {
+        let temp = tempfile::tempdir().unwrap();
+        let live_path = temp.path().join("live.log");
+        let source_path = temp.path().join("source.log");
+        let journal = LiveJournal::open(&live_path).unwrap();
+        drop(Writer::open(&source_path).unwrap());
+        let source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+        let mut start = started("hot");
+        start.live_prefix = TailBinding::from(&LiveJournal::verified_tail(&live_path).unwrap());
+
+        let account_id = AccountId::new("paper-account").unwrap();
+        let operation = crate::paper_recovery::PaperFillOperationIdentity {
+            leader_wallet: start.membership[0],
+            source_trade_id: SourceTradeId("g2:paper-wrapper".to_owned()),
+            observed_at_bucket: 1,
+        };
+        let mut economic = test_economic("paper-condition", test_receipt(31), test_receipt(32));
+        if matches!(case, PaperWrapperCase::TamperedEconomic) {
+            economic.admission.market.schema_version = 0;
+        }
+        let dispatch_id = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+            &TraderId(operation.leader_wallet).to_string(),
+            &operation.source_trade_id.0,
+            &economic.market.market_id,
+            u16::from(economic.market.outcome_index),
+            economic.market.side,
+            operation.observed_at_bucket,
+        );
+        let identity = LiveOrderIdentity {
+            dispatch_id: dispatch_id.clone(),
+            idempotency_key: format!("{dispatch_id}:{account_id}"),
+            quote_id: "paper-quote".to_owned(),
+            config_hash: economic.applied_configuration_hash.clone(),
+            decision_hash: "paper-decision".to_owned(),
+            evidence_hashes: vec!["paper-evidence".to_owned()],
+            fill_projection: Some(Box::new(LiveFillProjectionIdentity {
+                leader_wallet: operation.leader_wallet.to_string(),
+                source_trade_id: Some(operation.source_trade_id.0.clone()),
+                market_id: economic.market.market_id.clone(),
+                outcome_id: i64::from(u16::from(economic.market.outcome_index)),
+                side: "buy".to_owned(),
+            })),
+            schema_version: 1,
+            parser_version: 1,
+        };
+        let binding = pe_execution_core::CredentialBindingIdentity {
+            version: 1,
+            key_id: "paper-key".to_owned(),
+        };
+        let observed_at = OffsetDateTime::from_unix_timestamp(1).unwrap();
+        let account_state = LiveAccountStateAudit {
+            observed_at,
+            closed_only: false,
+            geoblocked: false,
+            selected_spender: "paper-spender".to_owned(),
+            collateral_balance: economic.balance.cash_before,
+            allowance: economic.balance.cash_before,
+            reconciled_free_collateral: economic.balance.cash_before,
+            schema_version: 1,
+            parser_version: 1,
+            evidence: Vec::new(),
+            request_descriptor_hashes: Vec::new(),
+            evidence_hashes: Vec::new(),
+        };
+        let wrapper = LiveOrderPreparedAudit {
+            identity: identity.clone(),
+            frozen_binding: binding.clone(),
+            economic: economic.clone(),
+            account_state: account_state.clone(),
+            prepared: PreparedPolymarketBuy {
+                condition_id: economic.market.condition_id.clone(),
+                outcome_id: OutcomeId(u16::from(economic.market.outcome_index)),
+                token_id: economic.market.token_id.clone(),
+                maker: "paper-maker".to_owned(),
+                signer: "paper-signer".to_owned(),
+                funder: "paper-funder".to_owned(),
+                verifying_contract: "paper-spender".to_owned(),
+                spender: "paper-spender".to_owned(),
+                exchange_domain_version: 2,
+                neg_risk: economic.admission.market.neg_risk,
+                side: "BUY".to_owned(),
+                salt: "1".to_owned(),
+                timestamp_ms: 1_000,
+                expiration: "0".to_owned(),
+                maker_collateral: economic.balance.worst_case_debit,
+                taker_shares: economic.sizing.expected_shares,
+                limit_price: economic.ladder.limit_price,
+                minimum_tick_size: economic.admission.market.minimum_tick_size,
+                signature_type: 3,
+                order_type: "FOK".to_owned(),
+                post_only: false,
+                defer_exec: false,
+                metadata: "paper-metadata".to_owned(),
+                builder: "paper-builder".to_owned(),
+                order_hash: "paper-order-hash".to_owned(),
+                post_body_hash: "paper-post-body-hash".to_owned(),
+                sdk_version: "paper-sdk".to_owned(),
+                sdk_archive_sha256: "paper-sdk-sha".to_owned(),
+                metadata_hashes: identity.evidence_hashes.clone(),
+                worst_case_debit: economic.balance.worst_case_debit,
+            },
+        };
+        let mut admission = LiveAdmissionEvaluationAudit {
+            identity,
+            frozen_binding: binding.clone(),
+            current_binding: binding,
+            requested_mode: LiveControlMode::LiveTiny,
+            effective_mode: LiveControlMode::LiveTiny,
+            economic: economic.clone(),
+            account_state: Some(account_state),
+            account_read_failure_evidence: Vec::new(),
+            account_read_failure_request_descriptor_hashes: Vec::new(),
+            account_read_failure_evidence_hashes: Vec::new(),
+            verdict: LiveAdmissionVerdict::Approved,
+        };
+        if matches!(case, PaperWrapperCase::RelabeledAdmission) {
+            admission.identity.dispatch_id = "relabeled-dispatch".to_owned();
+        }
+        if matches!(case, PaperWrapperCase::RefusedAdmission) {
+            admission.verdict = LiveAdmissionVerdict::Refused(
+                pe_execution_core::LiveAdmissionRefusal::ModeNotArmed,
+            );
+        }
+        if !matches!(case, PaperWrapperCase::MissingAdmission) {
+            journal
+                .append(
+                    account_id.clone(),
+                    observed_at,
+                    LiveJournalPayload::AdmissionEvaluated(Box::new(admission.clone())),
+                )
+                .unwrap();
+        }
+        if matches!(case, PaperWrapperCase::DuplicateAdmission) {
+            journal
+                .append(
+                    account_id.clone(),
+                    observed_at,
+                    LiveJournalPayload::AdmissionEvaluated(Box::new(admission)),
+                )
+                .unwrap();
+        }
+        journal
+            .append(
+                account_id,
+                OffsetDateTime::from_unix_timestamp(2).unwrap(),
+                LiveJournalPayload::OrderPrepared(Box::new(wrapper)),
+            )
+            .unwrap();
+        drop(journal);
+        let live_prefix = TailBinding::from(&LiveJournal::verified_tail(&live_path).unwrap());
+        let paper_frames = vec![test_frame(
+            40,
+            1,
+            PaperLogRecord::FinancialPrepared {
+                expected_authority: crate::paper_recovery::ExpectedAuthority {
+                    qualification_start_receipt: test_receipt(30),
+                    prior_completed_prepared_sequence: None,
+                },
+                payload: FinancialPayload::Fill {
+                    operation,
+                    economic,
+                },
+            },
+        )];
+
+        verify_live_wrappers(
+            &live_path,
+            &source_path,
+            &source_prefix,
+            &live_prefix,
+            &start,
+            &paper_frames,
+        )
+    }
+
+    /// PASS: a paper-mode AdmissionEvaluated and Prepared pair with no Baseline qualifies through
+    /// the shared admission classifier.
+    #[test]
+    fn qualification_accepts_paper_wrapper_without_baseline() {
+        let verified = verify_paper_wrapper_case(PaperWrapperCase::Valid).unwrap();
+        assert_eq!(verified.wrapper_facts.len(), 1);
+    }
+
+    /// PASS: missing, duplicate, relabeled, refused, and economically tampered paper admissions
+    /// each fail qualification as insufficient evidence.
+    #[test]
+    fn qualification_rejects_invalid_paper_wrapper_admissions() {
+        let cases = [
+            (PaperWrapperCase::MissingAdmission, "no AdmissionEvaluated"),
+            (
+                PaperWrapperCase::DuplicateAdmission,
+                "multiple AdmissionEvaluated",
+            ),
+            (PaperWrapperCase::RelabeledAdmission, "identity differs"),
+            (
+                PaperWrapperCase::RefusedAdmission,
+                "verdict is not Approved",
+            ),
+            (
+                PaperWrapperCase::TamperedEconomic,
+                "admission classifier disagrees",
+            ),
+        ];
+        for (case, expected_reason) in cases {
+            let error = verify_paper_wrapper_case(case).err().unwrap();
+            assert!(matches!(
+                error,
+                QualificationError::InsufficientEvidence(reason)
+                    if reason.contains(expected_reason)
+            ));
         }
     }
 

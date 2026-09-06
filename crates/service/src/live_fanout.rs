@@ -1832,6 +1832,7 @@ pub(crate) struct ProjectionDerivation {
     pub(crate) latest_reconciled_at: Option<String>,
     pub(crate) baseline_equity: Option<CollateralAmount>,
     pub(crate) baseline_cutoff_unix: Option<i64>,
+    pub(crate) baseline_sequence: Option<u64>,
     pub(crate) daily_marks: BTreeMap<i64, CollateralAmount>,
     pub(crate) realized_closes: Vec<(i64, Decimal)>,
     pub(crate) validated_prepared_sequences: BTreeSet<u64>,
@@ -1934,6 +1935,7 @@ pub(crate) fn derive_projection_rows_with_sources(
     let mut daily_marks = BTreeMap::new();
     let mut baseline_equity = None;
     let mut baseline_cutoff_unix = None;
+    let mut baseline_sequence = None;
     let mut realized_closes = Vec::new();
     let mut custody_facts = HashMap::<
         RedemptionAttemptIdentity,
@@ -1984,6 +1986,7 @@ pub(crate) fn derive_projection_rows_with_sources(
             baseline_seen = true;
             baseline_equity = Some(mark.equity);
             baseline_cutoff_unix = Some(mark.cutoff_unix);
+            baseline_sequence = Some(event.seq);
             economic_cash = Some(mark.equity.to_decimal());
             current_account_binding = Some(mark.account_binding.clone());
             latest_free_collateral = Some(mark.account_state.collateral_balance.to_decimal());
@@ -2546,6 +2549,7 @@ pub(crate) fn derive_projection_rows_with_sources(
         latest_reconciled_at,
         baseline_equity,
         baseline_cutoff_unix,
+        baseline_sequence,
         daily_marks,
         realized_closes,
         validated_prepared_sequences: prepared_orders
@@ -8501,6 +8505,7 @@ mod tests {
             derive_with_baseline_evidence(&account_id, &[baseline_event(&account_id, 1)], &[])
                 .unwrap();
         assert_eq!(accepted.economic_cash, Some(dec!(10)));
+        assert_eq!(accepted.baseline_sequence, Some(1));
 
         let mut negrisk = baseline_event(&account_id, 1);
         if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut negrisk.payload {
