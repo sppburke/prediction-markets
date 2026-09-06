@@ -75,8 +75,8 @@ if [[ "$dry_run" == 1 ]]; then
     "rehearsal_bind=${rehearsal_bind:-required}" \
     "credential_slots=production-secret/service-role,sanitized-rehearsal-publishable" \
     "logs=paper.log,source_events.log,live_journal.log" \
-    "observers=status_file_poller,health_ready_query,reader_drop_classifier,fence_anchor_census,write_refusal_counter" \
-    "proof=exact-revision,poll-after-start,reanchor,real-readiness,critical-health,accounts-off-unarmed,no-unsafe-evidence" \
+    "observers=status_file_poller,health_ready_query,reader_drop_classifier,fence_anchor_census,write_refusal_counter,privileged_account_census" \
+    "proof=exact-revision,poll-after-start,reanchor,real-readiness,critical-health,publishable-child-denied,accounts-before-after-off,no-unsafe-evidence" \
     "stop=first-complete-evidence-or-first-failure-or-timeout" \
     "evidence_contract=rehearsal545-evidence-v1" \
     "evidence_hash_file=$evidence_hash_file"
@@ -453,8 +453,8 @@ matches=re.findall(r"^REHEARSAL_ACCOUNT_CENSUS_V1 count=([0-9]+) sha256=([0-9a-f
 if len(matches) != 1: raise SystemExit("privileged preflight did not emit exactly one account census receipt")
 print(matches[0][0]); print(matches[0][1])' <<< "$preflight_output")
 [[ ${#account_census[@]} -eq 2 ]] || die "privileged preflight account census receipt is absent"
-account_census_count=${account_census[0]}
-account_census_sha256=${account_census[1]}
+account_census_before_count=${account_census[0]}
+account_census_before_sha256=${account_census[1]}
 [[ "$(sha256sum "$rehearsal_env_file" | awk '{print $1}')" == "$rehearsal_environment_sha256" ]] || {
   echo "FATAL: sanitized rehearsal environment changed during privileged preflight" >&2
   exit 1
@@ -630,11 +630,10 @@ printf 'REHEARSAL_START sha=%s activation=%s wallet=%s anchor_before=%s unix=%s\
 status_file_poller() {
   while kill -0 "$service_pid" 2>/dev/null; do
     if [[ -f "$copy_dir/status.json" ]]; then
-      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" \
-        "$account_census_count" "$account_census_sha256" <<'PY' || true
-import datetime, hashlib, json, os, re, sys
-source, started, target, expected_revision, expected_count, expected_digest = sys.argv[1:]
-started, expected_count = int(started), int(expected_count)
+      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" <<'PY' || true
+import datetime, json, os, sys
+source, started, target, expected_revision = sys.argv[1:]
+started = int(started)
 with open(source, encoding="utf-8") as handle:
     value = json.load(handle)
 updated = datetime.datetime.fromisoformat(value["updated_at"].replace("Z", "+00:00")).timestamp()
@@ -646,41 +645,17 @@ critical = [task for task in (value.get("tasks") or []) if task.get("class") == 
 healthy = fresh and bool(critical) and all(task.get("state") == "running" for task in critical)
 live = value.get("live")
 accounts = live.get("accounts") if isinstance(live, dict) else None
-account_rows = []
-identities = []
-accounts_well_formed = isinstance(accounts, list)
-if accounts_well_formed:
-    for account in accounts:
-        if not isinstance(account, dict):
-            accounts_well_formed = False
-            break
-        identity = account.get("account_id")
-        requested = account.get("requested_live_mode")
-        effective = account.get("effective_live_mode")
-        if (not isinstance(identity, str)
-                or re.fullmatch(r"[a-z0-9_-]{1,32}", identity) is None
-                or requested != "off" or effective != "off"
-                or account.get("armed") is not False):
-            accounts_well_formed = False
-            break
-        identities.append(identity)
-        account_rows.append((identity, requested, effective))
-if len(identities) != len(set(identities)):
-    accounts_well_formed = False
-canonical = "".join("|".join(row) + "\n" for row in sorted(account_rows))
-actual_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-accounts_safe = (
+child_authorization_denied = (
     isinstance(live, dict)
-    and live.get("stale") is False
-    and accounts_well_formed
-    and len(account_rows) == expected_count
-    and actual_digest == expected_digest
+    and live.get("stale") is True
+    and isinstance(accounts, list)
+    and not accounts
 )
 temp = target + ".tmp"
 with open(temp, "w", encoding="utf-8") as output:
     output.write(
         f"{int(fresh)} {int(revision_ok)} {int(polled)} {int(healthy)} "
-        f"{int(accounts_safe)}\n"
+        f"{int(child_authorization_denied)}\n"
     )
 os.replace(temp, target)
 PY
@@ -757,18 +732,23 @@ write_refusal_counter & observer_pids+=("$!")
 
 result=FAIL
 reason=timeout
+completion_candidate=0
 deadline=$((started_at + timeout_secs))
 readiness_sha256=absent
 service_log_prefix_length=absent
 service_log_prefix_sha256=absent
 database_observation=absent
-last="status_fresh=0 endpoint_ready=0 revision_ok=0 polled=0 healthy=0 accounts_safe=0 anchored=0 drops=0 credit_loss=0 errors=0 fences=0 refused=0 writes=0"
+account_census_after_count=absent
+account_census_after_sha256=absent
+account_census_after_safe=false
+account_census_before_after_identical=false
+last="status_fresh=0 endpoint_ready=0 revision_ok=0 polled=0 healthy=0 child_authorization_denied=0 anchored=0 drops=0 credit_loss=0 errors=0 fences=0 refused=0 writes=0"
 while (( $(date +%s) <= deadline )); do
   if ! kill -0 "$service_pid" 2>/dev/null; then reason=process_exited; break; fi
-  status_fresh=0; endpoint_ready=0; revision_ok=0; polled=0; healthy=0; accounts_safe=0; anchored=0
+  status_fresh=0; endpoint_ready=0; revision_ok=0; polled=0; healthy=0; child_authorization_denied=0; anchored=0
   drops=0; credit_loss=0; errors=0; fences=0; refused=0; writes=0
   readiness_candidate_sha256=absent
-  [[ ! -f "$status_state" ]] || read -r status_fresh revision_ok polled healthy accounts_safe < "$status_state"
+  [[ ! -f "$status_state" ]] || read -r status_fresh revision_ok polled healthy child_authorization_denied < "$status_state"
   [[ ! -f "$drop_state" ]] || read -r drops credit_loss errors < "$drop_state"
   [[ ! -f "$fence_state" ]] || read -r anchored fences < "$fence_state"
   [[ ! -f "$write_state" ]] || read -r refused writes < "$write_state"
@@ -790,17 +770,17 @@ PY
     fi
   fi
   [[ ! -f "$readiness_response.tmp" ]] || mv "$readiness_response.tmp" "$readiness_response"
-  last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy accounts_safe=$accounts_safe anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
+  last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy child_authorization_denied=$child_authorization_denied anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$last" >> "$watch_log"
   if (( credit_loss > 0 || errors > 0 || fences > 0 || writes > 0 )); then
     reason=unsafe_evidence
     break
   fi
-  if (( status_fresh == 1 && accounts_safe == 0 )); then
-    reason=unsafe_account_evidence
+  if (( status_fresh == 1 && child_authorization_denied == 0 )); then
+    reason=unsafe_child_account_evidence
     break
   fi
-  if (( status_fresh == 1 && endpoint_ready == 1 && revision_ok == 1 && polled == 1 && healthy == 1 && accounts_safe == 1 && anchored == 1 )); then
+  if (( status_fresh == 1 && endpoint_ready == 1 && revision_ok == 1 && polled == 1 && healthy == 1 && child_authorization_denied == 1 && anchored == 1 )); then
     private_binary_path=$(realpath "$binary")
     if service_executable_path=$(realpath "$PROC_ROOT/$service_pid/exe" 2>/dev/null); then
       executable_matches=false
@@ -846,7 +826,7 @@ PY
     anchored=0
     [[ "$anchor_after" -gt "$anchor_before" && "$reanchor" == 0 ]] && anchored=1
     database_observation="anchor_after:$anchor_after,reanchor_required:$reanchor,unexpected_fences:$fences"
-    last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy accounts_safe=$accounts_safe anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
+    last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy child_authorization_denied=$child_authorization_denied anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
     printf '%s FINAL %s service_log_prefix_length=%s service_log_prefix_sha256=%s database_observation=%s\n' \
       "$(date -u +%FT%TZ)" "$last" "$service_log_prefix_length" \
       "$service_log_prefix_sha256" "$database_observation" >> "$watch_log"
@@ -854,8 +834,7 @@ PY
       reason=unsafe_evidence
       break
     fi
-    result=PASS
-    reason=evidence_complete
+    completion_candidate=1
     readiness_sha256=$readiness_candidate_sha256
     break
   fi
@@ -866,6 +845,36 @@ stop_all
 service_pid=""
 observer_pids=()
 trap - EXIT TERM INT
+
+# The child is now quiescent, so this descriptor-fed privileged observation cannot race a later
+# child write. It, not the publishable-only child's intentionally stale/empty snapshot, proves that
+# every account remained off throughout the bounded run.
+if account_census_after=$(account_census_observation); then
+  read -r account_census_after_count account_census_after_sha256 account_census_after_safe_flag \
+    <<< "$account_census_after"
+  if [[ "$account_census_after_count" =~ ^[0-9]+$ &&
+        "$account_census_after_sha256" =~ ^[0-9a-f]{64}$ &&
+        "$account_census_after_safe_flag" =~ ^[01]$ ]]; then
+    [[ "$account_census_after_safe_flag" == 1 ]] && account_census_after_safe=true
+    if [[ "$account_census_after_count" == "$account_census_before_count" &&
+          "$account_census_after_sha256" == "$account_census_before_sha256" ]]; then
+      account_census_before_after_identical=true
+    fi
+  elif ((completion_candidate == 1)); then
+    reason=final_account_census_failed
+  fi
+elif ((completion_candidate == 1)); then
+  reason=final_account_census_failed
+fi
+if ((completion_candidate == 1)); then
+  if [[ "$account_census_after_safe" == true &&
+        "$account_census_before_after_identical" == true ]]; then
+    result=PASS
+    reason=evidence_complete
+  else
+    reason=unsafe_account_census
+  fi
+fi
 manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
 {
   printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nrehearsal_environment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
@@ -875,10 +884,14 @@ manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
     "$service_invocation_pid" "$rehearsal_bind" "$rehearsal_port" "$installed_bind" \
     "$readiness_base_url" "$wallet" "$anchor_before"
   printf 'final=%s\n' "$last"
-  printf 'copy_manifest_sha256=%s\naccount_census_count=%s\naccount_census_sha256=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
+  printf 'copy_manifest_sha256=%s\naccount_census_before_count=%s\naccount_census_before_sha256=%s\naccount_census_before_safe=true\naccount_census_after_count=%s\naccount_census_after_sha256=%s\naccount_census_after_safe=%s\naccount_census_before_after_identical=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
     "$copy_manifest_sha256" \
-    "$account_census_count" \
-    "$account_census_sha256" \
+    "$account_census_before_count" \
+    "$account_census_before_sha256" \
+    "$account_census_after_count" \
+    "$account_census_after_sha256" \
+    "$account_census_after_safe" \
+    "$account_census_before_after_identical" \
     "$readiness_sha256" \
     "$service_log_prefix_length" \
     "$service_log_prefix_sha256" \
