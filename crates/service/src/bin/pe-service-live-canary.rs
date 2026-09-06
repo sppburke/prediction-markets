@@ -1663,7 +1663,9 @@ mod tests {
 
         assert_eq!(
             gamma_market_url(&condition),
-            "https://gamma-api.polymarket.com/markets?condition_ids=0xcondition&limit={GAMMA_BATCH_LIMIT_PARAM}&include_tag=true"
+            format!(
+                "https://gamma-api.polymarket.com/markets?condition_ids=0xcondition&limit={GAMMA_BATCH_LIMIT_PARAM}&include_tag=true"
+            )
         );
     }
 }
