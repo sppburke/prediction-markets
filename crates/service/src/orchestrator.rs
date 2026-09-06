@@ -1100,12 +1100,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             cash
         };
         let source_tail = Scanner::verify(&source_log_path).map_err(|error| error.to_string())?;
-        let financial_tail = Scanner::verify(&paper_log_path).map_err(|error| error.to_string())?;
         let mark = PortfolioMark {
             boundary_receipt,
             cutoff_unix,
             source_tail: TailBinding::from(&source_tail),
-            financial_prefix_seq: financial_tail.last_sequence,
+            financial_prefix_seq: snapshot.last_prepared_seq,
             prices,
             cash,
             equity,
