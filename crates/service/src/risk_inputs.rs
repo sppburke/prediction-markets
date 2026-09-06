@@ -28,9 +28,10 @@ const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
 pub(crate) const MAX_HISTORICAL_MARK_AGE_SECS: i64 = 120;
 
-/// Service-private reason that replayable evidence could not produce a risk snapshot.
+/// Service-owned reason that replayable evidence could not produce a risk snapshot; the strategy
+/// crate sees only the unit `RiskInputsUnavailable` decline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum RiskInputsUnavailable {
+pub enum RiskInputsUnavailable {
     #[error("financial snapshot sequence does not match the completed paper-log prefix")]
     SnapshotSequenceMismatch,
     #[error("the paper log has an unmatched FinancialPrepared record")]
@@ -55,7 +56,6 @@ pub(crate) enum RiskInputsUnavailable {
     Overflow,
 }
 
-#[allow(private_interfaces)]
 #[derive(Debug, thiserror::Error)]
 pub enum BoundaryMarkError {
     #[error("historical mark transport is retryable: {0}")]
@@ -250,7 +250,7 @@ pub(crate) fn completed_prepared_before_boundary(
 
 /// Compose exact paper PnL/latency into the existing proposal snapshot. Exposure, proposal, and cap
 /// fields are preserved from `base`; zeroed proposal facts are never manufactured here.
-pub(crate) fn build_paper_risk_snapshot(
+pub fn build_paper_risk_snapshot(
     base: &RiskSnapshot,
     snapshot: &FinancialSnapshot,
     era: &PaperEra,
