@@ -154,7 +154,8 @@ JSON
     echo '{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     ;;
   *--financial-era=rollback-check*)
-    if [[ -f "$state/complete-start" ]]; then echo '{"complete_start":true}'
+    [[ ! -f "$state/rollback-error" ]] || exit 95
+    if [[ -f "$state/complete-start" ]]; then echo '{"complete_start":true,"receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}'
     else echo '{"complete_start":false,"repaired":false}'; fi
     ;;
   *) exit 96 ;;
@@ -190,8 +191,8 @@ run_driver() {
     PATH="$root/bin:$PATH" "$DRIVER" "${DRIVER_ARGS[@]}" "$@"
 }
 
-# A prepare boundary invokes only the offline command and leaves every durable input and service
-# state untouched.
+# The sole authoritative prepare occurs only after stop/inert and leaves every durable input
+# untouched; no remote archive has begun.
 root=$TEST_TMP/prepare
 setup_fixture "$root"
 driver_args "$root"
@@ -202,9 +203,28 @@ status=$?
 set -e
 [[ $status -eq 86 ]] || fail "prepare crash boundary returned $status"
 after=$(sha256sum "$root/prediction-markets/gen/g557/"{paper.log,source_events.log,live_journal.log,paper_state.db})
-[[ "$before" == "$after" && $(<"$root/test-state/service.active") == true ]] ||
-  fail "prepare mutated a durable input or stopped the service"
+[[ "$before" == "$after" && $(<"$root/test-state/service.active") == false ]] ||
+  fail "prepare mutated a durable input or ran before the service was inert"
+[[ $(<"$root/test-state/stop-count") -eq 1 ]] || fail "prepare did not stop the service exactly once"
 [[ ! -e "$root/test-state/archive-count" ]] || fail "prepare reached the remote archive"
+
+# A failed Start scan is unknown, never equivalent to proven absence and never rollback authority.
+root=$TEST_TMP/start-unknown
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after service-stopped >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "service-stopped crash boundary returned $status"
+touch "$root/test-state/rollback-error"
+set +e
+output=$(run_driver "$root" --rollback-before-start 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'QualificationStarted state is unknown'* ]] ||
+  fail "unknown Start state did not block rollback"
+[[ ! -e "$root/test-state/restore-count" ]] || fail "unknown Start state reached restore"
 
 # Every pre-Start seam restores the complete local backup and stamped remote archive at most once.
 root=$TEST_TMP/pre-start-rollback
@@ -242,5 +262,22 @@ set -e
 [[ $status -ne 0 && "$output" == *'complete QualificationStarted forces roll-forward'* ]] ||
   fail "complete Start did not force roll-forward"
 [[ ! -e "$root/test-state/restore-count" ]] || fail "complete Start was rolled back"
+
+# A crash after service start but before the started receipt scans the physical Start and rolls
+# forward without repeating the remote archive/reset.
+root=$TEST_TMP/post-service-start
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after before-manifest-started >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 && $(<"$root/test-state/service.active") == true ]] ||
+  fail "post-service-start crash seam was not reached"
+[[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "initial activation did not archive once"
+run_driver "$root" >/dev/null
+[[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "Start recovery repeated remote archive"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
+  fail "Start recovery did not durably roll forward to started"
 
 echo 'PASS: financial-era driver preserves read-only prepare, restores every pre-Start seam once, forces roll-forward after Start, shares process proofs, and uses catalog-derived restore equality'
