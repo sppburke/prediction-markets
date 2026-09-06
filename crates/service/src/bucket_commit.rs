@@ -92,7 +92,7 @@ pub struct FrozenDecisionBasis {
     pub bankroll: Decimal,
 }
 
-/// Versioned, self-contained continuation frozen by the bucket transaction.
+/// Receipt-free continuation facts frozen by the bucket transaction.
 /// Inputs read after this boundary are appended to paper/source logs and the
 /// terminal `decision_pending` transition; offline replay never executes it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,12 +117,6 @@ pub struct DecisionContinuationV2 {
     pub applied_configuration: RuntimeConfig,
     pub frozen_basis: FrozenDecisionBasis,
     pub decision_inputs: Value,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub observed_source_receipt: Option<AppendReceipt>,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub page_occurrences: Vec<PageOccurrence>,
 }
 
 /// One occurrence of a fixed-end activity page and the receipt assigned by the source log.
@@ -135,7 +129,7 @@ pub struct PageOccurrence {
     pub receipt: AppendReceipt,
 }
 
-/// Receipt-bearing successor to [`DecisionContinuationV2`].
+/// Durable receipt-bearing successor and runtime owner of a frozen continuation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionContinuationV3 {
     #[serde(flatten)]
@@ -144,7 +138,7 @@ pub struct DecisionContinuationV3 {
     pub page_occurrences: Vec<PageOccurrence>,
 }
 
-impl DecisionContinuationV2 {
+impl DecisionContinuationV3 {
     /// Greatest synchronized activity-page receipt in this complete read.
     #[must_use]
     pub fn complete_bound(&self) -> Option<AppendReceipt> {
@@ -257,8 +251,8 @@ impl DecisionContinuationV2 {
             if envelope.source_id.0 != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
                 || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
                 || envelope.parser_version != ACTIVITY_PARSER_VERSION
-                || activity.wallet != self.wallet
-                || activity.group_id.key() != &self.source_trade_id
+                || activity.wallet != self.prior.wallet
+                || activity.group_id.key() != &self.prior.source_trade_id
             {
                 return Err(DecisionContinuationError::SourceReceiptMismatch {
                     sequence: websocket.sequence.0,
@@ -305,7 +299,7 @@ pub enum DecisionContinuationError {
     SourceReceiveTimeRange,
 }
 
-impl DecisionContinuationV2 {
+impl DecisionContinuationV3 {
     /// Decode and bind a frozen continuation to its durable outer row.
     pub fn from_durable(row: &DecisionPendingRow) -> Result<Self, DecisionContinuationError> {
         let value: Value = serde_json::from_str(&row.frozen_inputs_json)?;
@@ -314,17 +308,16 @@ impl DecisionContinuationV2 {
             .and_then(Value::as_u64)
             .and_then(|value| u16::try_from(value).ok())
             .ok_or(DecisionContinuationError::Version(0))?;
-        let frozen = match version {
-            2 => serde_json::from_value(value)?,
-            3 => {
-                let version_three: DecisionContinuationV3 = serde_json::from_value(value)?;
-                let mut prior = version_three.prior;
-                prior.page_occurrences = version_three.page_occurrences;
-                prior.observed_source_receipt = version_three.observed_source_receipt;
-                prior
-            }
+        let continuation = match version {
+            2 => Self {
+                prior: serde_json::from_value(value)?,
+                observed_source_receipt: None,
+                page_occurrences: Vec::new(),
+            },
+            3 => serde_json::from_value(value)?,
             version => return Err(DecisionContinuationError::Version(version)),
         };
+        let frozen = &continuation.prior;
         if frozen.source_trade_id != row.source_trade_id
             || frozen.semantic_revision != row.semantic_revision
             || frozen.wallet != row.wallet
@@ -336,7 +329,7 @@ impl DecisionContinuationV2 {
             return Err(DecisionContinuationError::DurableMismatch);
         }
         if version == 3 {
-            let page_occurrences = frozen.page_occurrences();
+            let page_occurrences = continuation.page_occurrences();
             if frozen.version != 3 || page_occurrences.is_empty() {
                 return Err(DecisionContinuationError::DurableMismatch);
             }
@@ -348,26 +341,26 @@ impl DecisionContinuationV2 {
                 previous = Some(page.receipt.sequence);
             }
         }
-        Ok(frozen)
+        Ok(continuation)
     }
 
     /// Reconstruct only the transport-neutral trade facts needed by the existing
     /// idempotent decision continuation. Ledger/classification/gate are not rerun.
     pub fn incoming_trade(&self) -> Result<IncomingTrade, DecisionContinuationError> {
-        let observed_at = time::OffsetDateTime::from_unix_timestamp(self.source_epoch)
-            .map_err(|_| DecisionContinuationError::SourceEpoch(self.source_epoch))?;
+        let observed_at = time::OffsetDateTime::from_unix_timestamp(self.prior.source_epoch)
+            .map_err(|_| DecisionContinuationError::SourceEpoch(self.prior.source_epoch))?;
         Ok(IncomingTrade {
-            wallet: self.wallet,
-            market_id: self.market_id.clone(),
-            outcome_id: self.outcome_id,
-            side: self.side,
-            price: self.price,
-            contracts: self.share_amount,
+            wallet: self.prior.wallet,
+            market_id: self.prior.market_id.clone(),
+            outcome_id: self.prior.outcome_id,
+            side: self.prior.side,
+            price: self.prior.price,
+            contracts: self.prior.share_amount,
             observed_at,
             received_at: observed_at,
-            source_trade_id: self.source_trade_id.clone(),
-            transaction_hash: Some(self.transaction_hash.clone()),
-            provenance: self.provenance,
+            source_trade_id: self.prior.source_trade_id.clone(),
+            transaction_hash: Some(self.prior.transaction_hash.clone()),
+            provenance: self.prior.provenance,
         })
     }
 }
@@ -997,20 +990,18 @@ impl BucketCommitEngine {
                                 .canonical_hash(),
                             applied_configuration: context.applied_configuration.clone(),
                             decision_inputs: decision_inputs.clone(),
-                            observed_source_receipt: context
-                                .observed_source_receipts
-                                .get(&source_trade_id)
-                                .copied(),
-                            page_occurrences: context.page_occurrences.clone(),
                         };
-                        if prior.page_occurrences.is_empty() {
+                        if context.page_occurrences.is_empty() {
                             return Err(BucketCommitError::Invariant(
                                 "admitted continuation is missing source page receipts".to_owned(),
                             ));
                         }
                         let frozen_inputs_json = serde_json::to_string(&DecisionContinuationV3 {
-                            observed_source_receipt: prior.observed_source_receipt,
-                            page_occurrences: prior.page_occurrences.clone(),
+                            observed_source_receipt: context
+                                .observed_source_receipts
+                                .get(&source_trade_id)
+                                .copied(),
+                            page_occurrences: context.page_occurrences.clone(),
                             prior,
                         })?;
                         pending.push(DecisionPendingRecord {
@@ -1788,8 +1779,6 @@ mod continuation_v3_tests {
                 bankroll: dec!(100),
             },
             decision_inputs,
-            observed_source_receipt: None,
-            page_occurrences: Vec::new(),
         }
     }
 
@@ -1830,8 +1819,8 @@ mod continuation_v3_tests {
             observed_source_receipt: Some(receipt(7)),
             page_occurrences: pages,
         };
-        let decoded = DecisionContinuationV2::from_durable(&durable(&value)).unwrap();
-        assert_eq!(decoded.version, 3);
+        let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
+        assert_eq!(decoded.prior.version, 3);
         assert_eq!(decoded.page_occurrences().len(), 2);
         assert_eq!(decoded.complete_bound(), Some(receipt(11)));
         assert_eq!(
@@ -1858,7 +1847,7 @@ mod continuation_v3_tests {
                 receipt: receipt(4),
             }],
         };
-        let decoded = DecisionContinuationV2::from_durable(&durable(&value)).unwrap();
+        let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(
             decoded.observation_at(1_700_000_000_004),
             Some(ObservationEvidence {
@@ -1873,8 +1862,8 @@ mod continuation_v3_tests {
         legacy.version = 2;
         let mut row = durable(&value);
         row.frozen_inputs_json = serde_json::to_string(&legacy).unwrap();
-        let decoded = DecisionContinuationV2::from_durable(&row).unwrap();
-        assert_eq!(decoded.version, 2);
+        let decoded = DecisionContinuationV3::from_durable(&row).unwrap();
+        assert_eq!(decoded.prior.version, 2);
         assert_eq!(decoded.observation_at(1_700_000_000_004), None);
     }
 
@@ -1920,7 +1909,7 @@ mod continuation_v3_tests {
                 },
             ],
         };
-        let decoded = DecisionContinuationV2::from_durable(&durable(&value)).unwrap();
+        let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(
             decoded.observation_from_source_log(&path).unwrap(),
             Some(ObservationEvidence {

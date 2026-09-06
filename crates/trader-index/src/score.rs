@@ -116,7 +116,7 @@ pub fn lcb_5pct_decimal(samples: &[Decimal]) -> Option<Decimal> {
     Some(mean - dec!(1.645) * stderr)
 }
 
-/// Basis-point adapter retained for ranking compatibility.
+/// Basis-point adapter retained by the ranking path.
 ///
 /// Undefined scores keep the existing `i32::MIN` ineligibility sentinel.
 fn lcb_5pct(returns: &[Decimal], _n: u32) -> BasisPoints {

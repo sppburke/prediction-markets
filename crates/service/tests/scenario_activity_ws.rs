@@ -514,7 +514,7 @@ async fn start_pool_with_gate(
         ingest = ingest.with_reader_append_gate(gate);
     }
     let replay_path = source_log.clone();
-    // Compatibility projection for the retained #546 reader-pool scenarios:
+    // Projection for the retained #546 reader-pool scenarios:
     // production emits only reconciliation triggers, while these tests still
     // exercise the old orchestrator seam. Reparse the row only after the source
     // log proves it durable; no production path uses this projection.
@@ -1730,8 +1730,6 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         applied_configuration_hash: applied_configuration.canonical_hash(),
         applied_configuration,
         decision_inputs: serde_json::json!({"source_window":"complete"}),
-        observed_source_receipt: None,
-        page_occurrences: vec![support::page_occurrence()],
     };
     paper_state
         .commit_activity_bucket(&ActivityBucketCommit {

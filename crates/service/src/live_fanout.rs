@@ -5648,7 +5648,7 @@ mod tests {
         writer
             .append_synced(EnvelopeIn {
                 source_id: SourceId("pe-service.paper".to_owned()),
-                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION_V2,
+                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
                 parser_version: 1,
                 observed_at: SourceTimestamp(released_at),
                 received_at: ReceivedAt(released_at),

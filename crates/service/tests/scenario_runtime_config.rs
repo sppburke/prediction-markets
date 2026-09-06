@@ -171,8 +171,6 @@ fn install_pending(
         applied_configuration_hash: applied_configuration.canonical_hash(),
         applied_configuration,
         decision_inputs: serde_json::json!({"fixed_end": source_epoch + 10, "pages": 1}),
-        observed_source_receipt: None,
-        page_occurrences: vec![page_occurrence()],
     };
     paper_state
         .commit_activity_bucket(&ActivityBucketCommit {
@@ -476,7 +474,7 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
         .unwrap();
     let replayed = replay_decision_pending(&row).unwrap();
     assert_eq!(
-        replayed.continuation.applied_configuration_hash,
+        replayed.continuation.prior.applied_configuration_hash,
         config_a.canonical_hash()
     );
     assert_eq!(
@@ -625,7 +623,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
         .unwrap();
     let replayed = replay_decision_pending(&row).unwrap();
     assert_eq!(
-        replayed.continuation.applied_configuration_hash,
+        replayed.continuation.prior.applied_configuration_hash,
         config_a.canonical_hash()
     );
     assert_eq!(

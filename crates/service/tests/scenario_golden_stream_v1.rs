@@ -34,7 +34,7 @@ use pe_risk_engine::{
 };
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
 use pe_service::bucket_commit::{
-    BucketCommitEngine, BucketDecisionContext, DecisionContinuationError, DecisionContinuationV2,
+    BucketCommitEngine, BucketDecisionContext, DecisionContinuationError, DecisionContinuationV3,
     FrozenDecisionBasis, PageOccurrence,
 };
 use pe_service::clob_book::OrderBook;
@@ -764,8 +764,8 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 .into_iter()
                 .find(|row| row.source_trade_id == source_trade_id)
                 .unwrap();
-            let continuation = DecisionContinuationV2::from_durable(&row).unwrap();
-            assert_eq!(continuation.gate_result, "admitted");
+            let continuation = DecisionContinuationV3::from_durable(&row).unwrap();
+            assert_eq!(continuation.prior.gate_result, "admitted");
             let source_replay_started = Instant::now();
             let observation = continuation
                 .observation_from_source_log(&source_path)
@@ -956,7 +956,10 @@ async fn golden_source_stream_replays_exact_economic_core() {
                     version: TERMINAL_EVIDENCE_VERSION,
                     owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
                     source_trade_id: source_trade_id.clone(),
-                    applied_configuration_hash: continuation.applied_configuration_hash.clone(),
+                    applied_configuration_hash: continuation
+                        .prior
+                        .applied_configuration_hash
+                        .clone(),
                     market_end: None,
                     market_price: None,
                     book: None,
@@ -1132,7 +1135,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     assert_eq!(decision_rows.len(), QUALIFICATION_DAYS * COPIES_PER_DAY);
     assert!(decision_rows.iter().all(|row| {
         replay_decision_pending(row)
-            .is_ok_and(|decision| decision.continuation.gate_result == "admitted")
+            .is_ok_and(|decision| decision.continuation.prior.gate_result == "admitted")
     }));
     let decision_keys = decision_rows
         .iter()

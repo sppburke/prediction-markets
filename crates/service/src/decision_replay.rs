@@ -7,7 +7,9 @@ use pe_strategy_winner_follow::{WinnerFollowDeclineAudit, WinnerFollowError};
 use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
 
-use crate::bucket_commit::{DecisionContinuationError, DecisionContinuationV2};
+use crate::bucket_commit::{
+    DecisionContinuationError, DecisionContinuationV2, DecisionContinuationV3,
+};
 
 pub const POST_BOUNDARY_EVIDENCE_VERSION: u16 = 2;
 pub const TERMINAL_EVIDENCE_VERSION: u16 = 3;
@@ -359,7 +361,8 @@ impl DecisionEvidenceAccumulator {
     pub(crate) fn from_pending_checkpoint(
         row: &DecisionPendingRow,
     ) -> Result<Self, ReplayDecisionError> {
-        let continuation = DecisionContinuationV2::from_durable(row)?;
+        let continuation = DecisionContinuationV3::from_durable(row)?;
+        let frozen = &continuation.prior;
         let checkpoint: DecisionEvidenceCheckpoint =
             serde_json::from_str(&row.post_commit_inputs_json)?;
         if checkpoint.body.version != POST_BOUNDARY_EVIDENCE_VERSION {
@@ -380,8 +383,8 @@ impl DecisionEvidenceAccumulator {
                 actual,
             });
         }
-        if checkpoint.body.source_trade_id != continuation.source_trade_id
-            || checkpoint.body.applied_configuration_hash != continuation.applied_configuration_hash
+        if checkpoint.body.source_trade_id != frozen.source_trade_id
+            || checkpoint.body.applied_configuration_hash != frozen.applied_configuration_hash
         {
             return Err(ReplayDecisionError::FrozenMismatch);
         }
@@ -414,7 +417,7 @@ pub(crate) fn ladder_plan_blake3(plan: &LadderPlan) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayedDecision {
-    pub continuation: DecisionContinuationV2,
+    pub continuation: DecisionContinuationV3,
     pub post_boundary: DecisionPostBoundaryEvidence,
     /// Exact durable terminal-decision bytes, retained after validation.
     pub recorded_decision_json: String,
@@ -455,7 +458,8 @@ pub fn replay_decision_pending(
     if row.state != DecisionPendingState::Terminal {
         return Err(ReplayDecisionError::OpenRow);
     }
-    let continuation = DecisionContinuationV2::from_durable(row)?;
+    let continuation = DecisionContinuationV3::from_durable(row)?;
+    let frozen = &continuation.prior;
     let post_boundary: DecisionPostBoundaryEvidence =
         serde_json::from_str(&row.post_commit_inputs_json)?;
     if !matches!(
@@ -473,10 +477,9 @@ pub fn replay_decision_pending(
         return Err(ReplayDecisionError::Owners);
     }
     post_boundary.validate_hash()?;
-    if post_boundary.body.source_trade_id != continuation.source_trade_id
-        || post_boundary.body.applied_configuration_hash != continuation.applied_configuration_hash
-        || continuation.applied_configuration.canonical_hash()
-            != continuation.applied_configuration_hash
+    if post_boundary.body.source_trade_id != frozen.source_trade_id
+        || post_boundary.body.applied_configuration_hash != frozen.applied_configuration_hash
+        || frozen.applied_configuration.canonical_hash() != frozen.applied_configuration_hash
     {
         return Err(ReplayDecisionError::FrozenMismatch);
     }
@@ -488,14 +491,14 @@ pub fn replay_decision_pending(
     // describes a DIFFERENT market/outcome/side/identity than the frozen
     // continuation — or an authority outcome contradicting the disposition —
     // must fail, or a recomputed-hash forgery replays as valid.
-    let market = continuation.market_id.to_string();
+    let market = frozen.market_id.to_string();
     if let Some(evidence) = post_boundary.body.market_end.as_ref()
         && evidence.market_id != market
     {
         return Err(ReplayDecisionError::ContinuationBinding);
     }
     if let Some(evidence) = post_boundary.body.market_price.as_ref()
-        && (evidence.market_id != market || evidence.outcome_id != continuation.outcome_id.0)
+        && (evidence.market_id != market || evidence.outcome_id != frozen.outcome_id.0)
     {
         return Err(ReplayDecisionError::ContinuationBinding);
     }
@@ -527,16 +530,16 @@ pub fn replay_decision_pending(
                 return Err(ReplayDecisionError::ContinuationBinding);
             }
             let expected_key = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
-                &pe_core_types::TraderId(continuation.wallet).to_string(),
-                &continuation.source_trade_id.0,
-                &continuation.market_id.0.0,
-                continuation.outcome_id.0,
-                continuation.side,
-                continuation.source_epoch,
+                &pe_core_types::TraderId(frozen.wallet).to_string(),
+                &frozen.source_trade_id.0,
+                &frozen.market_id.0.0,
+                frozen.outcome_id.0,
+                frozen.side,
+                frozen.source_epoch,
             );
-            if fill.market_id != continuation.market_id.0.0
-                || fill.outcome_id != continuation.outcome_id.0
-                || !fill.side.eq_ignore_ascii_case(match continuation.side {
+            if fill.market_id != frozen.market_id.0.0
+                || fill.outcome_id != frozen.outcome_id.0
+                || !fill.side.eq_ignore_ascii_case(match frozen.side {
                     Side::Buy => "buy",
                     Side::Sell => "sell",
                 })
@@ -634,8 +637,6 @@ mod tests {
             applied_configuration_hash: applied_configuration.canonical_hash(),
             applied_configuration,
             decision_inputs: json!({"fixed_end": 1_700_000_010_i64, "pages": 1}),
-            observed_source_receipt: None,
-            page_occurrences: Vec::new(),
         }
     }
 

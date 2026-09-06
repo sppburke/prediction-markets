@@ -16,7 +16,7 @@ use pe_paper_state::{
 };
 use pe_position_ledger::{AppliedEffect, LedgerEffect, PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
-    BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2, IdentityOverride,
+    BucketCommitEngine, BucketDecisionContext, DecisionContinuationV3, IdentityOverride,
     PageOccurrence,
 };
 use pe_service::decision_replay::{
@@ -1135,12 +1135,12 @@ fn trade_aggregate_uses_exact_size_weighted_price_and_not_usdc_audit() {
         .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     let row = paper.open_decision_pending().unwrap().remove(0);
-    let frozen = DecisionContinuationV2::from_durable(&row).unwrap();
-    assert_eq!(frozen.share_amount.atomic(), 4_000_000);
-    assert_eq!(frozen.price.0, rust_decimal::Decimal::new(5, 1));
+    let frozen = DecisionContinuationV3::from_durable(&row).unwrap();
+    assert_eq!(frozen.prior.share_amount.atomic(), 4_000_000);
+    assert_eq!(frozen.prior.price.0, rust_decimal::Decimal::new(5, 1));
     assert_eq!(
-        frozen.applied_configuration_hash,
-        frozen.applied_configuration.canonical_hash(),
+        frozen.prior.applied_configuration_hash,
+        frozen.prior.applied_configuration.canonical_hash(),
         "the pending boundary stores the real canonical hash of its full hot snapshot"
     );
 }
@@ -1304,10 +1304,10 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
     let _restarted_engine = BucketCommitEngine::load(Arc::clone(&restarted), ledger).unwrap();
     assert_eq!(restarted.leader_positions().unwrap(), before);
     for pending in restarted.open_decision_pending().unwrap() {
-        let frozen = DecisionContinuationV2::from_durable(&pending).unwrap();
+        let frozen = DecisionContinuationV3::from_durable(&pending).unwrap();
         let trade = frozen.incoming_trade().unwrap();
         assert_eq!(trade.source_trade_id, pending.source_trade_id);
-        assert_eq!(trade.contracts, frozen.share_amount);
+        assert_eq!(trade.contracts, frozen.prior.share_amount);
         let terminal = TerminalDispositionEvidence {
             disposition: "no_copy:test_terminal".to_owned(),
             reason: "test_terminal".to_owned(),
@@ -1320,7 +1320,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,
             owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
             source_trade_id: pending.source_trade_id.clone(),
-            applied_configuration_hash: frozen.applied_configuration_hash.clone(),
+            applied_configuration_hash: frozen.prior.applied_configuration_hash.clone(),
             market_end: None,
             market_price: None,
             book: None,
@@ -1378,7 +1378,7 @@ fn terminal_decision_pending_retains_financial_final_receipt() {
         .unwrap();
     assert_eq!(result.pending.len(), 1);
     let pending = paper.open_decision_pending().unwrap().remove(0);
-    let frozen = DecisionContinuationV2::from_durable(&pending).unwrap();
+    let frozen = DecisionContinuationV3::from_durable(&pending).unwrap();
     let final_receipt = pe_event_log::AppendReceipt {
         sequence: pe_core_types::EventSeq(77),
         this_hash: blake3::hash(b"financial-final"),
@@ -1389,7 +1389,7 @@ fn terminal_decision_pending_retains_financial_final_receipt() {
         version: pe_service::decision_replay::TERMINAL_EVIDENCE_VERSION,
         owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
         source_trade_id: pending.source_trade_id.clone(),
-        applied_configuration_hash: frozen.applied_configuration_hash,
+        applied_configuration_hash: frozen.prior.applied_configuration_hash,
         market_end: None,
         market_price: None,
         book: None,

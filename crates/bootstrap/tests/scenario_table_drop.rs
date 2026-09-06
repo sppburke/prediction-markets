@@ -5,7 +5,7 @@
 //! / `delta_audit` (≈ half the production cache — `counterparty_edges` alone was
 //! ~275M rows) via an idempotent `DROP TABLE IF EXISTS` migration. The retired
 //! `market_fees` table is left unread in existing caches but is not created in a
-//! fresh cache. These pin both compatibility and fresh-schema retirement.
+//! fresh cache. These pin both existing-cache and fresh-schema retirement.
 //!
 //! Determinism: pure in-process; fresh `TempDir` per test, no network/clock.
 

@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
-use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV2};
+use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3};
 use crate::clob_book::ClobBookFetcher;
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
@@ -43,7 +43,7 @@ use crate::mark_prices::HistoricalMarkAdapter;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
-    PAPER_LOG_SCHEMA_VERSION_V2, PaperLogFrame, PaperLogRecord, PaperMarkPrice, PortfolioMark,
+    PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, PaperMarkPrice, PortfolioMark,
     QualificationSealed, SealReason, TailBinding,
 };
 use crate::risk_inputs::{BoundaryMarkError, RiskInputsUnavailable};
@@ -234,8 +234,7 @@ pub struct ScenarioHooks {
 }
 
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
-    /// Scenario-only compatibility input. Production activity enters exclusively through the
-    /// acknowledged complete-bucket control path.
+    /// Deterministic bucket state shared by acknowledged production commits and scenario checks.
     bucket_engine: BucketCommitEngine,
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
@@ -291,7 +290,7 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     /// Open production continuations loaded before producers. The durable row
     /// remains the owner; this queue only preserves its causal boot order.
     pending_boot: VecDeque<IncomingTrade>,
-    pending_continuations: HashMap<SourceTradeId, DecisionContinuationV2>,
+    pending_continuations: HashMap<SourceTradeId, DecisionContinuationV3>,
     /// True only while replaying continuations that were open at process boot. Newly committed
     /// buckets still pass the current source-health gate before their financial disposition.
     resuming_boot: bool,
@@ -353,7 +352,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         self.paper_writer
             .append_synced(EnvelopeIn {
                 source_id: SourceId("pe-service.paper".to_owned()),
-                schema_version: PAPER_LOG_SCHEMA_VERSION_V2,
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
                 parser_version: 1,
                 observed_at: SourceTimestamp(now),
                 received_at: ReceivedAt(now),
@@ -891,7 +890,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         admission: &pe_execution_core::LiveAdmissionArtifact,
         plan: &LadderPlan,
         book_receipt: pe_event_log::AppendReceipt,
-        continuation: &DecisionContinuationV2,
+        continuation: &DecisionContinuationV3,
         probability: Probability,
         budget: CollateralAmount,
         risk: pe_execution_core::RiskAudit,
@@ -1394,7 +1393,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .open_decision_pending()
             .map_err(|error| anyhow::anyhow!("load open decision continuations: {error}"))?
         {
-            let continuation = DecisionContinuationV2::from_durable(&row).map_err(|error| {
+            let continuation = DecisionContinuationV3::from_durable(&row).map_err(|error| {
                 anyhow::anyhow!("decode pending {}: {error}", row.source_trade_id)
             })?;
             let trade = continuation.incoming_trade().map_err(|error| {
@@ -1495,7 +1494,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         let Some(row) = row else {
             return Ok(None);
         };
-        let continuation = DecisionContinuationV2::from_durable(&row)
+        let continuation = DecisionContinuationV3::from_durable(&row)
             .map_err(|error| anyhow::anyhow!("decode pending {source_trade_id}: {error}"))?;
         let trade = continuation
             .incoming_trade()
@@ -2098,12 +2097,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             },
             None => None,
         };
-        let mut decision_evidence = pending.as_ref().map(DecisionEvidenceAccumulator::new);
+        let mut decision_evidence = pending
+            .as_ref()
+            .map(|continuation| DecisionEvidenceAccumulator::new(&continuation.prior));
         // New decisions use the current hot snapshot. A committed continuation instead
         // reinstalls its complete frozen 17-key snapshot before any post-boundary read.
         let applied_runtime = pending
             .as_ref()
-            .map(|continuation| continuation.applied_configuration.clone())
+            .map(|continuation| continuation.prior.applied_configuration.clone())
             .or_else(|| {
                 self.runtime_config
                     .as_ref()
@@ -2268,15 +2269,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     venue: VenueId::polymarket(),
                     market_id: trade.market_id.clone(),
                     outcome_id: trade.outcome_id,
-                    action: continuation.pre_bucket_action,
+                    action: continuation.prior.pre_bucket_action,
                     leader_side: trade.side,
                     leader_price: trade.price,
                     leader_size: trade.contracts,
                     observed_at: trade.observed_at,
                     received_at: trade.received_at,
-                    reconstruction_quality: continuation.reconstruction_quality,
+                    reconstruction_quality: continuation.prior.reconstruction_quality,
                     source_trade_id: trade.source_trade_id.clone(),
-                    action_confidence_ppm: continuation.action_confidence_ppm,
+                    action_confidence_ppm: continuation.prior.action_confidence_ppm,
                 },
             )
         } else {
@@ -2536,10 +2537,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // sizing all share one basis.
         let p = pending
             .as_ref()
-            .map(|continuation| continuation.frozen_basis.win_rate_p)
+            .map(|continuation| continuation.prior.frozen_basis.win_rate_p)
             .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
         let sizing_bankroll = match pending.as_ref() {
-            Some(continuation) => continuation.frozen_basis.bankroll,
+            Some(continuation) => continuation.prior.frozen_basis.bankroll,
             None => match self
                 .paper_state
                 .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
