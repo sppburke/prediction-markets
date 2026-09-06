@@ -424,7 +424,7 @@ TOML
   cat > "$service/.env" <<EOF
 SUPABASE_DB_URL=postgres://test
 PE_SUPABASE_URL=https://invalid.example
-PE_SUPABASE_ANON_KEY=anon-test
+PE_SUPABASE_ANON_KEY=sb_publishable_test
 PE_SUPABASE_SECRET_KEY=service-test
 PE_BIND=127.0.0.1:9000
 PE_EVENT_LOG_PATH=$service/old/paper.log
