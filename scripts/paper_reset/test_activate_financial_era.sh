@@ -11,6 +11,7 @@ GENERATION="$REPO_ROOT/scripts/deploy/activate_generation.sh"
 RESTORE="$SCRIPT_DIR/restore_paper_state.sql"
 ROLLBACK="$REPO_ROOT/scripts/deploy/rollback_generation.sh"
 RUNBOOK="$REPO_ROOT/docs/35-PE-SERVICE-DEPLOY-RUNBOOK.md"
+REHEARSAL="$REPO_ROOT/scripts/deploy/rehearsal545.sh"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -29,7 +30,14 @@ reject_text() {
   fi
 }
 
-bash -n "$DRIVER" "$COMMON" "$GENERATION" "$ROLLBACK"
+bash -n "$DRIVER" "$COMMON" "$GENERATION" "$ROLLBACK" "$REHEARSAL"
+
+for field in activation_id generation_dir copy_manifest_sha256 readiness_sha256 config_sha256 environment_sha256; do
+  require_text "$REHEARSAL" "\"$field\""
+done
+require_text "$REHEARSAL" 'atomic_adopt "$copy_manifest_stage" "$copy_manifest"'
+require_text "$REHEARSAL" 'atomic_adopt "$manifest_stage" "$manifest"'
+require_text "$REHEARSAL" 'atomic_adopt "$evidence_stage" "$evidence_hash_file"'
 
 # The financial transition has a separate durable identity and never invokes the
 # destructive schema-one bootstrap owner.
@@ -339,6 +347,229 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
   done
   return 1
 }
+
+# Rehearsal fixtures use a curl shim instead of a loopback listener. The shim withholds readiness
+# until every asynchronous observer has published passing state. For a race case it then returns one
+# non-ready response to establish that state, appends the controlled late line during the next curl,
+# and only then completes the successful readiness response.
+setup_rehearsal_fixture() {
+  local root=$1 websocket_enabled=$2 injection=$3
+  local release=$root/release generation=$root/generation target=$root/target installed=$root/installed
+  mkdir -p "$release/target/release" "$release/scripts/deploy" "$generation" "$target" \
+    "$installed" "$root/bin" "$root/test-state"
+  printf 'EDGE\001' > "$generation/paper.log"
+  printf 'EDGE\001' > "$generation/source_events.log"
+  printf 'EDGE\001' > "$generation/live_journal.log"
+  printf '%s\n' '{}' > "$generation/wallet_market_history.json"
+  python3 -c 'import sqlite3,sys
+db=sqlite3.connect(sys.argv[1])
+db.executescript("""
+create table poll_cursors(wallet_hex text primary key,activity_cutoff_unix integer,reanchor_required integer);
+create table position_anchors(wallet_hex text,anchor_seq integer);
+create table wallet_fences(wallet_hex text,cause text);
+insert into poll_cursors values("0x0000000000000000000000000000000000000545",1,0);
+insert into position_anchors values("0x0000000000000000000000000000000000000545",1);
+""")
+db.commit(); db.close()' "$generation/paper_state.db"
+  printf '%s\n' 'bind = "127.0.0.1:19000"' > "$installed/service.toml"
+  printf '%s\n' 'PE_BIND=127.0.0.1:19000' > "$installed/service.env"
+  printf '%s\n' 'bind = "127.0.0.1:19001"' > "$target/service.toml"
+  printf '%s\n' \
+    'PE_SUPABASE_ANON_KEY=sb_publishable_rehearsal' \
+    'PE_SUPABASE_SECRET_KEY=sb_publishable_rehearsal' \
+    "PE_POLYMARKET_ACTIVITY_WS_ENABLED=$websocket_enabled" > "$target/service.env"
+  printf '%s\n' "$injection" > "$root/test-state/injection"
+
+  cat > "$release/target/release/pe-service" <<'SH'
+#!/bin/bash
+set -euo pipefail
+if [[ "$*" == *--verify-staged-identity* ]]; then
+  echo 'prediction-edge revision=1111111111111111111111111111111111111111 artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+/usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" <<'PY'
+import datetime,json,os,sqlite3,sys
+status,database=sys.argv[1:]
+db=sqlite3.connect(database)
+db.execute("insert into position_anchors values(?,?)",("0x0000000000000000000000000000000000000545",2))
+db.execute("update poll_cursors set reanchor_required=0 where wallet_hex=?",("0x0000000000000000000000000000000000000545",))
+db.commit(); db.close()
+value={
+ "revision":"1"*40,"updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+ "tasks":[{"name":"public_activity_poll","state":"running","class":"critical"}],
+ "source_health":{"poll_last_round_age_secs":0},
+ "live":{"accounts":[{"armed":False,"requested_live_mode":"off","effective_live_mode":"off"}]},
+}
+temporary=status+".service.tmp"
+with open(temporary,"w",encoding="utf-8") as output: json.dump(value,output)
+os.replace(temporary,status)
+PY
+printf '%s\n' '{"level":"INFO","message":"fake rehearsal service ready"}'
+trap 'exit 0' TERM INT
+while :; do /bin/sleep 1; done
+SH
+  chmod +x "$release/target/release/pe-service"
+  cat > "$release/scripts/deploy/rehearsal_preflight.sh" <<'SH'
+#!/bin/bash
+set -euo pipefail
+[[ -f "$1" ]]
+SH
+  chmod +x "$release/scripts/deploy/rehearsal_preflight.sh"
+  cat > "$root/bin/curl" <<'SH'
+#!/bin/bash
+set -euo pipefail
+output=
+while (($#)); do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$output" ]]
+rehearsal_root=$(/usr/bin/dirname "$output")
+fixture_root=$(/usr/bin/dirname "$rehearsal_root")
+state=$fixture_root/test-state
+count=0
+[[ ! -f "$state/curl-count" ]] || count=$(<"$state/curl-count")
+count=$((count + 1))
+printf '%s\n' "$count" > "$state/curl-count"
+observers_ready=false
+if [[ -f "$rehearsal_root/status-1111111.state" &&
+      -f "$rehearsal_root/drops-1111111.state" &&
+      -f "$rehearsal_root/fences-1111111.state" &&
+      -f "$rehearsal_root/writes-1111111.state" &&
+      $(<"$rehearsal_root/status-1111111.state") == '1 1 1 1 1' &&
+      $(<"$rehearsal_root/drops-1111111.state") == '0 0 0' &&
+      $(<"$rehearsal_root/fences-1111111.state") == '1 0' &&
+      $(<"$rehearsal_root/writes-1111111.state") == '0 0' ]]; then
+  observers_ready=true
+fi
+injection=$(<"$state/injection")
+if [[ "$observers_ready" != true ]]; then
+  printf '%s\n' '{"ready":false,"issues":["observers_pending"]}' > "$output"
+elif [[ "$injection" != none && ! -f "$state/race-armed" ]]; then
+  : > "$state/race-armed"
+  printf '%s\n' '{"ready":false,"issues":["race_armed"]}' > "$output"
+else
+  if [[ "$injection" != none && ! -f "$state/injected" ]]; then
+    case "$injection" in
+      error) printf '%s\n' '{"level":"ERROR","message":"controlled late error"}' ;;
+      write) printf '%s\n' '{"level":"INFO","message":"fill committed"}' ;;
+      *) exit 97 ;;
+    esac >> "$rehearsal_root/service-1111111.log"
+    : > "$state/injected"
+  fi
+  printf '%s\n' '{"ready":true,"issues":[]}' > "$output"
+fi
+SH
+  chmod +x "$root/bin/curl"
+  python3 -c 'import hashlib,json,sys
+path,generation,config,environment,installed_config,installed_environment=sys.argv[1:]
+def artifact(value):
+    with open(value,"rb") as source: digest=hashlib.sha256(source.read()).hexdigest()
+    return {"path":value,"sha256":digest}
+value={"state":"verified","activation_id":"act-545","generation_dir":generation,
+       "artifacts":{"config":artifact(config),"environment":artifact(environment)},
+       "destinations":{"config":installed_config,"environment":installed_environment}}
+with open(path,"w",encoding="utf-8") as output: json.dump(value,output,sort_keys=True,separators=(",",":"))' \
+    "$root/pe-activation.json" "$generation" "$target/service.toml" "$target/service.env" \
+    "$installed/service.toml" "$installed/service.env"
+}
+
+run_rehearsal_fixture() {
+  local root=$1
+  PATH="$root/bin:$PATH" \
+  PE_ACTIVATION_MANIFEST="$root/pe-activation.json" \
+  PE_REHEARSAL_ROOT="$root/rehearsal" \
+  PE_REHEARSAL_RELEASE_ROOT="$root/release" \
+  PE_REHEARSAL_COPY_DIR="$root/rehearsal/copy" \
+  PE_REHEARSAL_BIND=127.0.0.1:19001 \
+  PE_REHEARSAL_TIMEOUT_SECS=10 \
+  PE_REHEARSAL_POLL_SECS=1 \
+  PE_REHEARSAL_EVIDENCE_HASH_FILE="$root/rehearsal/evidence.json" \
+    "$REHEARSAL" --target-config "$root/target/service.toml" \
+    --target-environment "$root/target/service.env" \
+    1111111111111111111111111111111111111111
+}
+
+# Scenario REHEARSAL-BINDINGS-01
+# Preconditions: authoritative reviewed config/environment and a clean copied generation.
+# PASS: outer and result evidence bind all C2/C3 identities plus the exact final scan.
+# FAIL: a required identity is absent, mismatched, or the clean rehearsal does not pass.
+root=$TEST_TMP/rehearsal-bindings
+setup_rehearsal_fixture "$root" true none
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "bound rehearsal did not pass: $output"
+python3 -c 'import hashlib,json,os,sys
+evidence_path,activation_path,config,environment,copy_manifest,readiness=sys.argv[1:]
+e=json.load(open(evidence_path,encoding="utf-8"))
+a=json.load(open(activation_path,encoding="utf-8"))
+def digest(path): return hashlib.sha256(open(path,"rb").read()).hexdigest()
+assert e["result"]=="PASS"
+assert e["activation_id"]==a["activation_id"]
+assert e["generation_dir"]==os.path.realpath(a["generation_dir"])
+assert e["copy_manifest_sha256"]==digest(copy_manifest)
+assert e["readiness_sha256"]==digest(readiness)
+assert e["config_sha256"]==digest(config)
+assert e["environment_sha256"]==digest(environment)
+rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+for key in ("activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256"):
+    assert rows[key]==e[key]
+assert rows["service_log_prefix_length"].isdigit()
+assert len(rows["service_log_prefix_sha256"])==64
+assert rows["database_observation"]=="anchor_after:2,reanchor_required:0,unexpected_fences:0"' \
+  "$root/rehearsal/evidence.json" "$root/pe-activation.json" "$root/target/service.toml" \
+  "$root/target/service.env" "$root/rehearsal/copy/copied.sha256" \
+  "$root/rehearsal/readiness-1111111.json" || fail "rehearsal evidence bindings are incomplete"
+production_environment_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_sha256"])' \
+  "$root/rehearsal/evidence.json")
+
+# Scenario REHEARSAL-CONFIG-02
+# Preconditions: the explicit target environment enables the activity websocket.
+# PASS: a different PE_REHEARSAL_ENV path is refused, while making the disabled file authoritative
+# changes environment_sha256 in otherwise-valid evidence.
+# FAIL: an arbitrary override runs or the production-affecting flag is absent from evidence identity.
+root=$TEST_TMP/rehearsal-override
+setup_rehearsal_fixture "$root" true none
+sed 's/PE_POLYMARKET_ACTIVITY_WS_ENABLED=true/PE_POLYMARKET_ACTIVITY_WS_ENABLED=false/' \
+  "$root/target/service.env" > "$root/target/disabled.env"
+set +e
+output=$(PE_REHEARSAL_ENV="$root/target/disabled.env" run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'PE_REHEARSAL_ENV differs from the reviewed target environment'* ]] ||
+  fail "arbitrary rehearsal environment override was not refused: $output"
+root=$TEST_TMP/rehearsal-disabled-authority
+setup_rehearsal_fixture "$root" false none
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "authoritative disabled-source rehearsal did not pass: $output"
+disabled_environment_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_sha256"])' \
+  "$root/rehearsal/evidence.json")
+[[ "$production_environment_sha256" != "$disabled_environment_sha256" ]] ||
+  fail "production-enabled source change did not alter rehearsal environment identity"
+
+# Scenarios REHEARSAL-LATE-ERROR-03 and REHEARSAL-LATE-WRITE-04
+# Preconditions: all observer state is passing before curl begins the successful readiness request.
+# Injected boundary: append an ERROR or successful-write line after state reads but before curl returns.
+# PASS: the synchronous final prefix scan records unsafe_evidence and refuses PASS.
+# FAIL: either controlled late observation produces REHEARSAL545_PASS.
+for injection in error write; do
+  root=$TEST_TMP/rehearsal-late-$injection
+  setup_rehearsal_fixture "$root" true "$injection"
+  set +e
+  output=$(run_rehearsal_fixture "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *REHEARSAL545_FAIL* ]] ||
+    fail "late $injection race was not refused: $output"
+  python3 -c 'import json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8")); assert e["result"]=="FAIL"
+rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+assert rows["reason"]=="unsafe_evidence"
+assert rows["service_log_prefix_length"].isdigit()
+assert len(rows["service_log_prefix_sha256"])==64' "$root/rehearsal/evidence.json" ||
+    fail "late $injection result did not bind the refusing final scan"
+done
 
 # Scenario FE-DERIVED-IDENTITIES-00
 # Preconditions: a production-schema #557 manifest and otherwise-valid driver arguments.
