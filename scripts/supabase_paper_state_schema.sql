@@ -43,6 +43,12 @@ create table if not exists paper_positions (
 alter table paper_positions
   alter column long_contracts type numeric using long_contracts::numeric,
   alter column short_contracts type numeric using short_contracts::numeric;
+-- An archive created by a pre-financial reset copied the integer column types; a later
+-- archive of fractional positions would otherwise round silently (proven by the CI
+-- legacy-to-financial scenario). Keep the archive's exact-quantity columns in step.
+alter table if exists paper_positions_archive
+  alter column long_contracts type numeric using long_contracts::numeric,
+  alter column short_contracts type numeric using short_contracts::numeric;
 
 alter table paper_fills add column if not exists principal numeric;
 alter table paper_fills add column if not exists fee numeric;
