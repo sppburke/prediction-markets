@@ -148,12 +148,23 @@ async fn main() -> Result<()> {
         .iter()
         .position(|argument| argument == "--verify-staged-identity")
     {
-        let expected_revision = args.get(position + 1).context(
-            "--verify-staged-identity requires a full Git object identity and BLAKE3 digest",
-        )?;
-        let expected_hash = args.get(position + 2).context(
-            "--verify-staged-identity requires a full Git object identity and BLAKE3 digest",
-        )?;
+        let derived_revision = pe_service::build_info::embedded().source_revision;
+        let derived_hash = {
+            let executable = std::env::current_exe().context("resolve staged executable")?;
+            let bytes = std::fs::read(&executable)
+                .with_context(|| format!("read staged executable {}", executable.display()))?;
+            blake3::hash(&bytes).to_hex().to_string()
+        };
+        let (expected_revision, expected_hash) = match (
+            args.get(position + 1),
+            args.get(position + 2),
+        ) {
+            (None, None) => (derived_revision, derived_hash.as_str()),
+            (Some(revision), Some(hash)) => (revision.as_str(), hash.as_str()),
+            _ => anyhow::bail!(
+                "--verify-staged-identity accepts either no values or a full Git object identity and BLAKE3 digest"
+            ),
+        };
         let actual_hash =
             pe_service::build_info::verify_staged_identity(expected_revision, expected_hash)
                 .context("verify staged binary identity and bytes")?;
@@ -188,6 +199,7 @@ async fn main() -> Result<()> {
             output: PathBuf::from(required_arg_value(&args, "--output")?),
         };
         let (verdict, report_hash) = pe_service::qualification::run_qualify(&options)
+            .await
             .context("run network-free sealed qualification")?;
         println!("verdict={verdict:?} report_blake3={report_hash}");
         return Ok(());

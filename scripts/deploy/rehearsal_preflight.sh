@@ -24,9 +24,9 @@ set +a
 
 # shellcheck source=generation_common.sh
 source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
-verify_legacy_service_contract "$SUPABASE_DB_URL"
+verify_legacy_service_contract
 
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
+psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
 do $$
 declare
   table_name text;
@@ -107,7 +107,7 @@ refused '/rest/v1/wallet_lifecycle_events' \
 refused '/rest/v1/rpc/service_watchlist_replace_v1' \
   '{"expected_token":"2000-01-01T00:00:00Z","entries":[]}'
 
-landed=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
+landed=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
   "select (select count(*) from paper_fills where idempotency_key = '$marker') +
           (select count(*) from supabase_sink_hwm where id = 2) +
           (select count(*) from wallet_lifecycle_events where reason = '$marker') +

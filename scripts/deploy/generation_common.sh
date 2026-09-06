@@ -63,6 +63,14 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+# Keep the credential-bearing libpq URL out of argv and /proc/<pid>/cmdline. PGDATABASE accepts
+# either a database name or a PostgreSQL connection URI, so the existing SUPABASE_DB_URL contract
+# remains unchanged while every caller supplies only non-secret psql options on the command line.
+psql_service_db() {
+  : "${SUPABASE_DB_URL:?SUPABASE_DB_URL is required}"
+  PGDATABASE="$SUPABASE_DB_URL" psql "$@"
+}
+
 manifest_get() {
   python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
@@ -279,9 +287,7 @@ verify_installed_unit_owner() {
 # key rehearsal and the financial-era driver call this owner so callable signatures, grants, and the
 # Legacy17 hot-config inventory cannot drift between the rehearsal and the Start boundary.
 verify_legacy_service_contract() {
-  local database_url=${1:-${SUPABASE_DB_URL:-}}
-  [[ -n "$database_url" ]] || die "database URL is required for the Legacy17 contract guard"
-  psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
+  psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
 set search_path = public, pg_catalog;
 do $$
 declare
@@ -361,7 +367,7 @@ activation_archive_counts() {
   # not exists`); the deployed database had no such column before the first activation (EVIDENCE F7
   # addendum). A missing column means no stamped rows, by definition — never a query error.
   local activation_id=$1 durable_reset=$2 present
-  present=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
+  present=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select count(*) from information_schema.columns where table_schema='public' and column_name='activation_id'
        and table_name in ('paper_fills_archive','settled_markets_archive','paper_positions_archive','paper_bankroll_archive','fill_market_snapshots_archive');") ||
     return 1
@@ -380,7 +386,7 @@ activation_archive_counts() {
       die "activation_id is present on $present of the five archive tables"
       ;;
   esac
-  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -Atc \
+  psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select (select count(*) from paper_fills_archive where activation_id='$activation_id') || ' ' ||
             (select count(*) from settled_markets_archive where activation_id='$activation_id') || ' ' ||
             (select count(*) from paper_positions_archive where activation_id='$activation_id') || ' ' ||
