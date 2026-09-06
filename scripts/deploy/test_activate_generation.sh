@@ -15,7 +15,7 @@ fail() {
 
 # Environment files are parsed as data, including the quoting emitted by the sanitizers.
 parser_env="$TEST_TMP/parser.env"
-printf '%s\n' '# comment' '; comment' 'export QUOTED='"'"'two words'"'" \
+printf '%s\n' '# comment' '; comment' 'QUOTED='"'"'two words'"'" \
   'PE_SUPABASE_ANON_KEY=sb_publishable_rehearsal' 'UNREQUESTED=hidden' > "$parser_env"
 mapfile -d '' -t parsed < <(
   bash -c 'source "$1"; env_file_values "$2" QUOTED PE_SUPABASE_ANON_KEY' \
@@ -31,8 +31,43 @@ bash -c 'source "$1"; env_file_values "$2" PE_SUPABASE_ANON_KEY' \
 status=$?
 set -e
 [[ $status -ne 0 && ! -e "$parser_leak" ]] || fail "environment parser executed shell syntax"
-grep -q 'parser.env:6: invalid environment assignment' "$TEST_TMP/parser.err" ||
+grep -q 'parser.env:6:' "$TEST_TMP/parser.err" ||
   fail "environment parser did not report the offending physical line"
+
+# Representative accepted/rejected physical lines for the fail-closed EnvironmentFile subset.
+assert_env_parser_case() {
+  local label=$1 disposition=$2 line=$3 expected=${4:-}
+  local case_file="$TEST_TMP/parser-case.env" output="$TEST_TMP/parser-case.out"
+  local error="$TEST_TMP/parser-case.err" status
+  printf '%s\n' "$line" > "$case_file"
+  set +e
+  bash -c 'source "$1"; env_file_values "$2"' \
+    bash "$SCRIPT_DIR/generation_common.sh" "$case_file" > "$output" 2> "$error"
+  status=$?
+  set -e
+  if [[ "$disposition" == accept ]]; then
+    [[ $status -eq 0 ]] || fail "$label: accepted parser case was rejected"
+    mapfile -d '' -t parsed_case < "$output"
+    [[ ${#parsed_case[@]} -eq 1 && "${parsed_case[0]}" == "$expected" ]] ||
+      fail "$label: accepted parser value differed"
+  else
+    [[ $status -ne 0 ]] || fail "$label: rejected parser case was accepted"
+    grep -Fq 'parser-case.env:1:' "$error" ||
+      fail "$label: parser rejection omitted the physical line number"
+  fi
+}
+
+assert_env_parser_case escaped-space reject 'a\ b'
+assert_env_parser_case continuation reject "X=trailing\\"
+assert_env_parser_case export-prefix reject 'export X=1'
+assert_env_parser_case leading-whitespace reject ' X=1'
+assert_env_parser_case whitespace-before-equals reject 'X =1'
+assert_env_parser_case whitespace-after-equals reject 'X= 1'
+assert_env_parser_case escaped-double-quote reject 'X="a\"b"'
+assert_env_parser_case adjacent-single-quotes reject "X='it''s'"
+assert_env_parser_case double-quoted accept 'X="ok"' 'X=ok'
+assert_env_parser_case plain accept 'X=plain' 'X=plain'
+assert_env_parser_case interior-space accept 'X=a b' 'X=a b'
 
 # An expected digest is checked on the copied temporary bytes before the destination rename.
 adopt_source="$TEST_TMP/adopt-source"
@@ -495,7 +530,7 @@ PE_STATUS_PATH=$service/old/status.json
 PE_PAPER_STATE_DB_PATH=$service/old/paper_state.db
 PE_LEGACY_WALLET_HISTORY_PATH=$service/old/wallet_market_history.json
 NON_PE_BASE='source value'
-export PE_X=
+PE_X=
 PE_QUOTED_VALUE="quoted \${NON_PE_BASE} with spaces"
 NON_PE_QUOTED_VALUE="non-PE quoted value"
 EOF
@@ -790,6 +825,7 @@ PY
     environ-extra-non-pe) printf 'UNLISTED_NON_PE=1\0' >> "$proc/environ" ;;
     ld-preload) printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ" ;;
     ld-library-path) printf 'LD_LIBRARY_PATH=/tmp/not-allowed\0' >> "$proc/environ" ;;
+    ld-audit) printf 'LD_AUDIT=/tmp/not-allowed.so\0' >> "$proc/environ" ;;
     file-ld-preload)
       printf '%s\n' 'LD_PRELOAD=/tmp/not-allowed.so' >> "$service/.env"
       printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ"
@@ -817,6 +853,7 @@ refuse_process proc-environ-extra-pe environ-extra-pe "does not run the installe
 refuse_process proc-environ-extra-non-pe environ-extra-non-pe "does not run the installed binary, service config and environment"
 refuse_process proc-environ-ld-preload ld-preload "does not run the installed binary, service config and environment"
 refuse_process proc-environ-ld-library-path ld-library-path "does not run the installed binary, service config and environment"
+refuse_process proc-environ-ld-audit ld-audit "does not run the installed binary, service config and environment"
 refuse_process proc-environ-file-ld-preload file-ld-preload "does not run the installed binary, service config and environment"
 refuse_process proc-environ-credential-wrong credential-wrong "does not run the installed binary, service config and environment"
 refuse_process proc-cwd-differs cwd "process cwd is"
@@ -1987,4 +2024,5 @@ echo "rollback durable-fact restore and forward-refusal matrix: PASS"
 echo "lock, preflight, invocation, batch, site, and reboot: PASS"
 echo "post-start refusal stop, disable, rewind, audit, and rerun-or-rollback recovery: PASS"
 echo "process cwd, stable snapshot, and exact environment ownership: PASS"
+echo "strict environment grammar and loader-control refusal: PASS"
 echo "Forge pause tri-state, live status proof, and serialization: PASS"

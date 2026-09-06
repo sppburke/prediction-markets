@@ -149,11 +149,15 @@ process variable not defined by that file must be one of exactly `CREDENTIALS_DI
 `MEMORY_PRESSURE_WRITE`, `PATH`, `SHELL`, `SYSTEMD_EXEC_PID`, `USER`, or the wrapper-owned
 `PWD`, `SHLVL`, `OLDPWD`, or `_`. `CREDENTIALS_DIRECTORY` must equal
 `/run/credentials/pe-service.service`; every other extra is refused. `LD_PRELOAD` and
-`LD_LIBRARY_PATH` are refused even when the installed environment file defines the same value.
-Environment files are data, never shell: blank lines and leading `#`/`;` comments are ignored;
-optional leading `export` and unquoted, single-quoted, or double-quoted `NAME=VALUE` assignments are
-accepted without expansion or continuation; every other physical line is refused with its line
-number. The wrapper-owned `PWD`, `SHLVL`,
+`LD_LIBRARY_PATH`, and `LD_AUDIT` are refused even when the installed environment file defines the
+same value.
+Environment files are data, never shell. Write settings as plain `NAME=value` physical lines. Blank
+lines and lines whose first non-whitespace character is `#` or `;` are ignored, but a backslash
+anywhere in a physical line is refused. Assignment names have no leading whitespace, `=` has no
+adjacent whitespace, and `export` is not accepted. Values are either unquoted with no leading or
+trailing whitespace and no quote, or wholly single/double quoted with no backslash or matching quote
+inside. There is no expansion or continuation; every rejected physical line reports its line number.
+The wrapper-owned `PWD`, `SHLVL`,
 `OLDPWD`, and `_` names are stripped from the expected set because they do not affect the binary;
 `/proc/<pid>/cwd` proves the working directory separately.
 One systemd snapshot supplies `ActiveState`, `MainPID`, `InvocationID`, and `ActiveEnterTimestamp` before
@@ -292,15 +296,20 @@ paths need not equal any #557 staged path, and the harness hashes their bytes di
 `PE_REHEARSAL_CONFIG` or `PE_REHEARSAL_ENV` is present, it must resolve to the corresponding explicit
 target path; an arbitrary override is refused.
 
-The reviewed binary and config are copied first into a private, read-only rehearsal artifact
-directory. Their copied bytes are hashed, self-validated, evidenced, and executed; later replacement
-of either supplied target path cannot change the rehearsal invocation.
+The reviewed binary and config are copied first into a private rehearsal artifact directory, with
+the copied files installed mode `0500` and `0400`, respectively. Their copied bytes are hashed,
+self-validated, evidenced, and executed; later replacement of either supplied target path cannot
+change the rehearsal invocation. Immediately before execution, the harness re-hashes the private
+binary, config, and sanitized environment against their recorded identities. Its hash-bound watch
+log also records that the resolved `/proc/<service_pid>/exe` path equals the private binary path.
 The reviewed production environment must carry a publishable/anon-class value in
 `PE_SUPABASE_ANON_KEY` and a distinct secret/service-role-class value in
-`PE_SUPABASE_SECRET_KEY`. The harness deterministically creates its own mode-`0600` sanitized
-derivative by replacing only those two assignments with the publishable value; each assignment must
-occur exactly once. The shared strict data parser validates both the target and derivative without
-executing either. Preflight requests only the URL and two Supabase service variables, so target-file
+`PE_SUPABASE_SECRET_KEY`. Write the reviewed file using the strict plain `NAME=value` grammar above;
+syntax whose systemd interpretation could differ, including any backslash or `export` prefix, is
+refused with its physical line number. The harness deterministically creates its own mode-`0600`
+sanitized derivative by replacing only those two assignments with the publishable value; each
+assignment must occur exactly once. The shared strict data parser validates both the target and
+derivative without executing either. Preflight requests only the URL and two Supabase service variables, so target-file
 `SUPABASE_DB_URL` and `PG*` assignments never enter its shell. It passes only that derivative to
 `rehearsal_preflight.sh` and to the service child. The preflight accepts a modern
 `sb_publishable_*` key or a legacy JWT with `role=anon` and
@@ -380,9 +389,12 @@ path-equal nor revision-equal to the inherited #557 artifacts. Before it creates
 manifest or can approach Start, the driver also requires the reviewed production
 `PE_SUPABASE_SECRET_KEY` to be a modern `sb_secret_*` key or a legacy JWT with `role=service_role`;
 the validator reads that value through the data parser rather than argv. The publishable-only
-rehearsal derivative is never adopted as production. After Start, each artifact adoption hashes the
-copied temporary file and compares it with the manifest's reviewed digest before the destination
-rename; drift refuses without replacing the installed file. The Start hot-config
+rehearsal derivative is never adopted as production. Before the financial manifest is created, the
+same parser refuses `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `LD_AUDIT`. Every offline rollback-check,
+prepare, and Start invocation receives target-file assignments only through the shared service
+configuration allowlist; unrelated target assignments are not exported. After Start, each artifact
+adoption hashes the copied temporary file and compares it with the manifest's reviewed digest before
+the destination rename; drift refuses without replacing the installed file. The Start hot-config
 identity is not an operator assertion:
 while the service is inert, the driver exports the database rows that the 17→15 migration retains to
 a mode-private temporary file. The database helper reads the credential-bearing URL from its named

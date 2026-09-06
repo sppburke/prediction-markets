@@ -325,7 +325,8 @@ exec 3<&-
 [[ $parsed == 1 ]] || exit 96
 exec "$@"
 ' bash "$target_binary" "$target_config" "$@" \
-    3< <(env_file_values "$target_environment" && printf '__PE_ENV_FILE_PARSED__\0')
+    3< <(env_file_values "$target_environment" "${SERVICE_ENV_ALLOWLIST[@]}" &&
+      printf '__PE_ENV_FILE_PARSED__\0')
 }
 
 manifest_complete_start() {
