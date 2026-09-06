@@ -5,7 +5,7 @@
 //! service-private diagnostic before strategy evaluation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::paper_recovery::active_risk_halts;
 use crate::paper_recovery::{
     FinancialPayload, FinancialResult, HaltState, PaperEra, PaperLogFrame, PaperLogRecord,
-    RiskHaltOwner, oldest_unmatched_prepared,
+    RiskHaltOwner, ScannedPaperFrame, oldest_unmatched_prepared,
 };
 
 const SECONDS_PER_HOUR: i64 = 3_600;
@@ -894,42 +894,58 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 /// paper risk and incident release never need to replay the growing source prefix.
 #[derive(Default)]
 struct SourceReceiptIndexState {
-    entries: BTreeMap<EventSeq, (AppendReceipt, i64)>,
-    envelopes: Arc<Vec<pe_event_log::EventEnvelope>>,
+    frames: Vec<SourceFrameMetadata>,
+    next_byte_offset: Option<u64>,
+}
+
+#[derive(Clone)]
+struct SourceFrameMetadata {
+    receipt: AppendReceipt,
+    received_millis: i64,
+    byte_offset: Option<u64>,
 }
 
 #[derive(Clone, Default)]
 pub struct SourceReceiptMillisIndex {
     state: Arc<RwLock<SourceReceiptIndexState>>,
+    source_log_path: Option<Arc<PathBuf>>,
 }
 
 impl SourceReceiptMillisIndex {
     /// Rebuild the complete verified source-log projection at boot.
     pub fn replay(source_log_path: &Path) -> Result<Self, RiskInputsUnavailable> {
-        let mut entries = BTreeMap::new();
-        let mut envelopes = Vec::new();
-        for item in
-            Reader::replay(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)?
+        let mut frames = Vec::new();
+        for item in Reader::replay_with_offsets(source_log_path)
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
         {
-            let (_sequence, envelope) = item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+            let (byte_offset, _sequence, envelope) =
+                item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
             let receipt = AppendReceipt {
                 sequence: envelope.seq,
                 this_hash: envelope.this_hash,
             };
             let received_millis = received_at_millis(&envelope.received_at)?;
-            if entries
-                .insert(envelope.seq, (receipt, received_millis))
-                .is_some()
-            {
+            let expected_sequence = u64::try_from(frames.len())
+                .map(EventSeq)
+                .map_err(|_| RiskInputsUnavailable::Overflow)?;
+            if envelope.seq != expected_sequence {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
-            envelopes.push(envelope);
+            frames.push(SourceFrameMetadata {
+                receipt,
+                received_millis,
+                byte_offset: Some(byte_offset),
+            });
         }
+        let next_byte_offset = std::fs::metadata(source_log_path)
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+            .len();
         Ok(Self {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
-                entries,
-                envelopes: Arc::new(envelopes),
+                frames,
+                next_byte_offset: Some(next_byte_offset),
             })),
+            source_log_path: Some(Arc::new(source_log_path.to_owned())),
         })
     }
 
@@ -944,24 +960,28 @@ impl SourceReceiptMillisIndex {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(known) = state.entries.get(&receipt.sequence) {
-            return if *known == (receipt, received_millis) {
+        let sequence_index =
+            usize::try_from(receipt.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if let Some(known) = state.frames.get(sequence_index) {
+            return if known.receipt == receipt && known.received_millis == received_millis {
                 Ok(())
             } else {
                 Err(RiskInputsUnavailable::PriceConflict)
             };
         }
-        let expected_sequence = u64::try_from(state.envelopes.len())
+        let expected_sequence = u64::try_from(state.frames.len())
             .map(EventSeq)
             .map_err(|_| RiskInputsUnavailable::Overflow)?;
         if receipt.sequence != expected_sequence {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
         let prev_hash = state
-            .envelopes
+            .frames
             .last()
-            .map_or(blake3::Hash::from_bytes([0; 32]), |known| known.this_hash);
-        let (raw_payload_hash, _, this_hash) =
+            .map_or(blake3::Hash::from_bytes([0; 32]), |known| {
+                known.receipt.this_hash
+            });
+        let (_raw_payload_hash, _, this_hash) =
             pe_event_log::envelope::compute_hashes(pe_event_log::envelope::HashInput {
                 seq: receipt.sequence,
                 source_id: &envelope.source_id,
@@ -977,22 +997,21 @@ impl SourceReceiptMillisIndex {
         if this_hash != receipt.this_hash {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        Arc::make_mut(&mut state.envelopes).push(pe_event_log::EventEnvelope {
-            seq: receipt.sequence,
-            source_id: envelope.source_id.clone(),
-            schema_version: envelope.schema_version,
-            parser_version: envelope.parser_version,
-            observed_at: envelope.observed_at.clone(),
-            received_at: envelope.received_at.clone(),
-            content_type: envelope.content_type.clone(),
-            raw_payload_hash,
-            prev_hash,
-            this_hash,
-            payload: envelope.payload.clone(),
+        let byte_offset = state.next_byte_offset;
+        if let (Some(path), Some(frame_start)) = (&self.source_log_path, byte_offset) {
+            let new_tail = std::fs::metadata(path.as_ref())
+                .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+                .len();
+            if new_tail <= frame_start {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            state.next_byte_offset = Some(new_tail);
+        }
+        state.frames.push(SourceFrameMetadata {
+            receipt,
+            received_millis,
+            byte_offset,
         });
-        state
-            .entries
-            .insert(receipt.sequence, (receipt, received_millis));
         Ok(())
     }
 
@@ -1004,16 +1023,76 @@ impl SourceReceiptMillisIndex {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        source_receipt_received_millis(&state.entries, receipt)
+        let index =
+            usize::try_from(receipt.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        state
+            .frames
+            .get(index)
+            .filter(|metadata| metadata.receipt == receipt)
+            .map(|metadata| metadata.received_millis)
+            .ok_or(RiskInputsUnavailable::PriceMissing)
     }
 
-    /// Take one internally verified, append-extended source-evidence snapshot.
+    /// Read one exact receipt-bearing source envelope without retaining neighboring payloads.
+    pub(crate) fn source_envelope(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<pe_event_log::EventEnvelope, RiskInputsUnavailable> {
+        let sequence_index =
+            usize::try_from(receipt.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        let (metadata, previous_hash) = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let metadata = state
+                .frames
+                .get(sequence_index)
+                .filter(|metadata| metadata.receipt == receipt)
+                .cloned()
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let previous_hash = sequence_index
+                .checked_sub(1)
+                .and_then(|previous| state.frames.get(previous))
+                .map_or(blake3::Hash::from_bytes([0; 32]), |previous| {
+                    previous.receipt.this_hash
+                });
+            (metadata, previous_hash)
+        };
+        let path = self
+            .source_log_path
+            .as_ref()
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let byte_offset = metadata
+            .byte_offset
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let envelope = Reader::read_at(path.as_ref(), byte_offset, receipt.sequence, previous_hash)
+            .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        if envelope.this_hash != receipt.this_hash
+            || received_at_millis(&envelope.received_at)? != metadata.received_millis
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        Ok(envelope)
+    }
+
+    /// Transitional whole-log reader for reducers not yet migrated to receipt lookups. The index
+    /// itself remains metadata-only; callers should prefer [`Self::source_envelope`].
     pub(crate) fn source_envelopes(&self) -> Arc<Vec<pe_event_log::EventEnvelope>> {
-        self.state
+        let receipts = self
+            .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .envelopes
-            .clone()
+            .frames
+            .iter()
+            .map(|metadata| metadata.receipt)
+            .collect::<Vec<_>>();
+        Arc::new(
+            receipts
+                .into_iter()
+                .filter_map(|receipt| self.source_envelope(receipt).ok())
+                .collect(),
+        )
     }
 
     #[cfg(test)]
@@ -1021,8 +1100,24 @@ impl SourceReceiptMillisIndex {
         self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .clone()
+            .frames
+            .iter()
+            .map(|metadata| {
+                (
+                    metadata.receipt.sequence,
+                    (metadata.receipt, metadata.received_millis),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_frame_metadata_bytes(&self) -> usize {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::size_of::<SourceFrameMetadata>().saturating_mul(state.frames.capacity())
     }
 }
 
@@ -1033,6 +1128,41 @@ fn received_at_millis(received_at: &ReceivedAt) -> Result<i64, RiskInputsUnavail
         .checked_div(1_000_000)
         .and_then(|value| i64::try_from(value).ok())
         .ok_or(RiskInputsUnavailable::Overflow)
+}
+
+/// Select the exact paper prefix named by a recorded risk audit and prove it is causal to the
+/// evaluation clock. Later durable frames are deliberately excluded even when their captured
+/// receive timestamps predate the evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PaperPrefixError {
+    #[error("financial prefix is absent from the causal paper log")]
+    Absent,
+    #[error("risk evaluation precedes its financial prefix")]
+    Future,
+    #[error("paper-prefix timestamp milliseconds overflow")]
+    TimestampOverflow,
+}
+
+pub(crate) fn paper_prefix_at_financial_prefix(
+    frames: &[ScannedPaperFrame],
+    financial_prefix: AppendReceipt,
+    evaluated_at_unix_ms: i64,
+) -> Result<&[ScannedPaperFrame], PaperPrefixError> {
+    let prefix_index = frames
+        .iter()
+        .position(|frame| frame.receipt == financial_prefix)
+        .ok_or(PaperPrefixError::Absent)?;
+    let prefix = &frames[..=prefix_index];
+    let prefix_millis = prefix
+        .last()
+        .map(|frame| received_at_millis(&frame.envelope.received_at))
+        .transpose()
+        .map_err(|_| PaperPrefixError::TimestampOverflow)?
+        .ok_or(PaperPrefixError::Absent)?;
+    if prefix_millis > evaluated_at_unix_ms {
+        return Err(PaperPrefixError::Future);
+    }
+    Ok(prefix)
 }
 
 fn source_receipt_millis_index(
@@ -1790,6 +1920,68 @@ mod tests {
         assert_eq!(maintained, from_scratch);
         assert_eq!(maintained.latest.sample_count, 1);
         assert_eq!(maintained.latest.p95_ms, Some(2_000));
+    }
+
+    /// PASS: the maintained index retains zero payload bytes, and appending metadata while an
+    /// independently loaded payload is held neither clones nor invalidates that payload.
+    #[test]
+    fn source_receipt_index_is_payload_independent_during_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let first_at = OffsetDateTime::from_unix_timestamp(10).unwrap();
+        let first_payload = vec![7; 2 * 1024 * 1024];
+        let mut writer = Writer::open(&source_path).unwrap();
+        let first_receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("large-source-page".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(first_at),
+                received_at: ReceivedAt(first_at),
+                content_type: ContentType::Json,
+                payload: first_payload.clone(),
+            })
+            .unwrap();
+        drop(writer);
+
+        let index = SourceReceiptMillisIndex::replay(&source_path).unwrap();
+        let metadata_bytes_before = index.retained_frame_metadata_bytes();
+        assert!(metadata_bytes_before < first_payload.len());
+        let held = index.source_envelope(first_receipt).unwrap();
+        let held_pointer = held.payload.as_ptr();
+
+        let second_at = OffsetDateTime::from_unix_timestamp(11).unwrap();
+        let second = EnvelopeIn {
+            source_id: SourceId("second-source-page".to_owned()),
+            schema_version: 2,
+            parser_version: 3,
+            observed_at: SourceTimestamp(second_at),
+            received_at: ReceivedAt(second_at),
+            content_type: ContentType::Json,
+            payload: vec![9; 1024],
+        };
+        let mut writer = Writer::open(&source_path).unwrap();
+        let second_receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: second.source_id.clone(),
+                schema_version: second.schema_version,
+                parser_version: second.parser_version,
+                observed_at: second.observed_at.clone(),
+                received_at: second.received_at.clone(),
+                content_type: second.content_type.clone(),
+                payload: second.payload.clone(),
+            })
+            .unwrap();
+        index.record_synced_append(second_receipt, &second).unwrap();
+
+        assert!(index.retained_frame_metadata_bytes() < first_payload.len());
+        assert_eq!(held.payload.as_ptr(), held_pointer);
+        assert_eq!(held.payload, first_payload);
+        assert_eq!(
+            index.source_envelope(second_receipt).unwrap().payload,
+            second.payload
+        );
+        assert_eq!(index.snapshot().len(), 2);
     }
 
     /// PASS: replay folds each owner/cause independently and any active cause blocks entries.
