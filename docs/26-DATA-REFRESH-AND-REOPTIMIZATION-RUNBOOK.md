@@ -359,8 +359,18 @@ PE_PYTHON="$PE_PYTHON" bash scripts/rank_and_push.sh \
 
 The exact publication request carries the side path, fixed path, generic prior-backup path, and
 stage hash inside its `publish_key`. If the process stops after preparation, the existing pending
-pointer resumes idempotent activation before publication; no additional pointer is used. Activation
-accepts a verified schema-one or schema-two fixed cache and retains one generic prior-main backup.
+pointer resumes idempotent activation before publication; no additional pointer is used. Before
+either first activation or resumed activation, the publisher validates the complete request and
+returns the sole activation tuple consumed by the wrapper. A content-hash mismatch therefore fails
+before any cache mutation. Request and pointer replacement fsync both the new file and containing
+directory. Activation accepts a verified schema-one or schema-two fixed cache and retains one
+generic prior-main backup.
+
+The wrapper remains the one-shot run-lock owner. For activation it passes the inherited run-lock
+descriptor and, under the supervisor, the inherited loop-lock descriptor. `pe-bootstrap` verifies
+each descriptor's inode, PID stamp, and live kernel contention before skipping only that lock; Rust
+always acquires the cache lock. A direct `pe-bootstrap cache-activate` call without that verified
+handoff continues to acquire loop → run → cache itself.
 
 Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
 hash and schema. Preserve the displaced cache for audit:
@@ -371,12 +381,19 @@ pe-bootstrap cache-restore-prior \
   --backup "$CACHE_PRIOR_BACKUP" \
   --displaced-backup "$DISPLACED_CACHE_BACKUP" \
   --prior-sha256 "$PRIOR_CACHE_SHA256" \
-  --prior-schema "$PRIOR_CACHE_SCHEMA"
+  --prior-schema "$PRIOR_CACHE_SCHEMA" \
+  --publication-request "$PUBLISH_REQUEST_FILE" \
+  --pending-pointer data/eval-results/rank_and_push.pending
 ```
 
-Once the bound batch is current, `cache-restore-prior --bound-batch-current` refuses restoration;
-recover by rolling forward through the existing pending-publication path. Schema one retains
-`auto | duck | sqlite`; schema two requires the verified DuckDB snapshot and refuses SQLite.
+Run this only with `SUPABASE_URL` and `SUPABASE_SECRET_KEY` in the environment after stopping the
+rank supervisor. Restore validates the pending pointer, the complete request `publish_key`, the
+fixed/prior activation paths, and the installed corrected-cache hash while holding the Forge lock
+stack. It then asks authoritative `ranking_batches.publish_key` whether that exact publication was
+ever consumed. A consumed publication, a missing/malformed pointer or request, or unavailable
+authority refuses restoration; recover by rolling forward through the existing pending-publication
+path. There is no operator assertion flag. Schema one retains `auto | duck | sqlite`; schema two
+requires the verified DuckDB snapshot and refuses SQLite.
 
 ### Continuous Forge supervisor
 

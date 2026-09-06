@@ -25,3 +25,11 @@ ROUND2-strategy-doc-lint: REPORTED outside LIVE ownership crates/strategy-winner
 ROUND2-format: DONE cargo fmt --all and cargo fmt --all --check
 ROUND2-live-merge-fixes: DONE allocator-based Kelly adapter crates/service/src/live_fanout.rs:1398; pe-service now reaches only non-owned orchestrator compile errors
 ROUND2-summary: DONE INTEGRATION_SUMMARY_LIVE2.md
+L3-4: DONE raw Polygon evidence and source-log resolution evidence are revalidated in the strict reducer; different finalized-head duplicates now fail and empty preimages are rejected (crates/service/src/live_fanout.rs).
+L3-5: DONE verified live-journal replay now owns account/open-order recovery inventory, including retained current Prepared audits and matched transaction hashes; Polygon finality no longer depends on a SQLite target row (crates/execution-core/src/live_journal.rs, crates/service/src/live_fanout.rs).
+L3-3: DONE composer validates condition/binary outcome/token/buy identity against admission, and live validation binds the same identity to the signed order (crates/execution-core/src/economic.rs, crates/execution-core/src/live_executor.rs).
+L3-7: DONE composer cross-checks venue/audit derived shares, spend, and VWAP and rejects signed minimum-shares times limit below principal (crates/execution-core/src/economic.rs).
+L3-1: DONE each catch-up Daily mark is composed and replay-validated from only live-journal/source envelopes received before that cutoff; current cash/inventory is no longer reused for historical dates (crates/service/src/live_fanout.rs).
+L3-6: DONE one receipt-recording historical-price adapter uses the shared client and `.with_max_retries(0)`; live marks consume it (crates/service/src/mark_prices.rs).
+L3-2: DONE each live account synchronizes its four halt-cause edges through `RiskHaltChange`, preserves the absolute-loss latch, awaits replay, and blocks entry on any paper/live owner in the global active set; repeated/released edges are consumed once by replay state (crates/service/src/live_fanout.rs, crates/service/src/main.rs).
+L3-summary: DONE INTEGRATION_SUMMARY_LIVE3.md

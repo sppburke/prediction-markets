@@ -1357,6 +1357,76 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
     assert_eq!(restarted.leader_positions().unwrap(), before);
 }
 
+/// RC14-DECISION-FINAL-RECEIPT
+///
+/// Preconditions: one admitted first-entry bucket has an open `decision_pending` continuation and
+/// the paper serializer has synchronized its FinancialFinal receipt.
+/// PASS: terminalization removes legacy copied fill evidence, retains the exact Final receipt, and
+/// replay returns the same receipt after reopening SQLite.
+/// FAIL: the receipt is absent/changed, legacy fill evidence survives, or replay rejects the row.
+#[test]
+fn terminal_decision_pending_retains_financial_final_receipt() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let result = engine
+        .commit(
+            vec![position_row(
+                "TRADE", "0x43", MARKET_A, 0, "BUY", "1.25", "0.4", 302,
+            )],
+            &context(302, true),
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(result.pending.len(), 1);
+    let pending = paper.open_decision_pending().unwrap().remove(0);
+    let frozen = DecisionContinuationV2::from_durable(&pending).unwrap();
+    let final_receipt = pe_event_log::AppendReceipt {
+        sequence: pe_core_types::EventSeq(77),
+        this_hash: blake3::hash(b"financial-final"),
+    };
+    let terminal = TerminalDispositionEvidence::final_fill(final_receipt);
+    assert!(terminal.fill.is_none());
+    let evidence = DecisionPostBoundaryEvidence::from_body(DecisionPostBoundaryEvidenceBody {
+        version: pe_service::decision_replay::TERMINAL_EVIDENCE_VERSION,
+        owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
+        source_trade_id: pending.source_trade_id.clone(),
+        applied_configuration_hash: frozen.applied_configuration_hash,
+        market_end: None,
+        market_price: None,
+        book: None,
+        clocks: vec![DecisionClockEvidence {
+            purpose: "financial_final".to_owned(),
+            unix_millis: 302_001,
+        }],
+        authority: AuthorityEvidence {
+            kind: "commit_fill_v2".to_owned(),
+            outcome: "applied".to_owned(),
+            bankroll: Some("9".to_owned()),
+        },
+        terminal,
+    })
+    .unwrap();
+    paper
+        .close_decision_pending(
+            &pending.source_trade_id,
+            &serde_json::to_string(&evidence).unwrap(),
+            "fill",
+            303,
+        )
+        .unwrap();
+    drop(engine);
+    drop(paper);
+
+    let reopened = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    let row = reopened.decision_pending_history().unwrap().remove(0);
+    assert_eq!(row.state, DecisionPendingState::Terminal);
+    let replayed = replay_decision_pending(&row).unwrap();
+    assert_eq!(
+        replayed.post_boundary.body.terminal.final_receipt,
+        Some(final_receipt)
+    );
+    assert!(replayed.post_boundary.body.terminal.fill.is_none());
+}
+
 #[test]
 fn conversion_and_underflow_fence_without_partial_ledger_apply() {
     let (_dir, paper, mut engine) = fresh_anchored();

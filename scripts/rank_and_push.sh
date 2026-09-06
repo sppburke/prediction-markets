@@ -794,26 +794,34 @@ fi
 activate_bound_cache() {
   local request_path="$1"
   local -a binding=()
-  mapfile -t binding < <("$PYTHON_BIN" - "$request_path" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as source:
-    activation = json.load(source).get("cache_activation")
-if activation is not None:
-    for key in ("side_path", "fixed_path", "prior_cache_backup_path", "expected_sha256"):
-        print(activation[key])
-PY
-)
-  if [[ "${#binding[@]}" -eq 0 ]]; then
+  local validation_output
+  validation_output="$("$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
+    --validate-request "$request_path")" || return $?
+  if [[ -z "$validation_output" ]]; then
     return 0
   fi
+  mapfile -t binding <<< "$validation_output"
   [[ "${#binding[@]}" -eq 4 ]] || {
     echo "FATAL: publication request has malformed cache activation evidence" >&2
     return 2
   }
+  local -a lock_handoff=(
+    --held-run-lock-fd 8
+    --held-run-lock-pid "$$"
+  )
+  local loop_lock_file="data/eval-results/.rank_and_push_loop.lock"
+  if [[ -e /proc/self/fd/9 && /proc/self/fd/9 -ef "$loop_lock_file" ]]; then
+    local loop_pid
+    loop_pid="$(tr -cd '0-9' < "$loop_lock_file" 2>/dev/null || true)"
+    [[ -n "$loop_pid" ]] || {
+      echo "FATAL: inherited ranking-loop lock has no holder PID" >&2
+      return 2
+    }
+    lock_handoff+=(--held-loop-lock-fd 9 --held-loop-lock-pid "$loop_pid")
+  fi
   "$PE_BOOTSTRAP_BIN" cache-activate --db "${binding[0]}" \
     --fixed-db "${binding[1]}" --backup "${binding[2]}" \
-    --expected-sha256 "${binding[3]}"
+    --expected-sha256 "${binding[3]}" "${lock_handoff[@]}"
 }
 
 push_rc=0

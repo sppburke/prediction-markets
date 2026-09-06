@@ -8,11 +8,12 @@
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
 deploying it to the VPS with one restart and no stop-before-swap window.
 
-## Issue #557 generation activation
+## Historical issue #557 generation activation
 
-The procedure in this section replaces the ordinary binary swap when a deployment creates a new
-paper-state generation. The AC10 rehearsal is a **mandatory pre-deploy gate**. Do not enter the
-activation driver's `guarded` state without its recorded PASS evidence.
+The procedure in this section applies only when a deployment creates a new paper-state generation;
+issue #545 keeps the verified generation and uses the separate route below. The AC10 rehearsal is a
+**mandatory pre-deploy gate**. Do not enter the generation activation driver's `guarded` state
+without its recorded PASS evidence.
 
 ### Mandatory isolated rehearsal
 
@@ -253,12 +254,41 @@ create a generation, stage new state paths, invoke `seed_v1_empty.sh`, or replac
 `/home/sean/pe-financial-era.json` (`kind: financial-era-v1`) is the sole financial-transition
 manifest.
 
+### Bounded final-head rehearsal
+
+Run the final-head harness before financial activation. Its only command-line option is `--dry-run`;
+the required positional argument is the reviewed full Git object identity:
+
+```bash
+scripts/deploy/rehearsal545.sh --dry-run <reviewed-40-hex>
+scripts/deploy/rehearsal545.sh <reviewed-40-hex>
+```
+
+The harness reads the active generation from `/home/sean/pe-activation.json`, checkpoints its SQLite
+database, all three framed logs, and the captured legacy-history input, then runs the staged binary
+against real first-party venue endpoints. The rehearsal environment must put the same publishable
+Supabase key in both credential slots; `rehearsal_preflight.sh` runs before the service starts.
+
+Path and cadence overrides are environment variables, not flags:
+`PE_REHEARSAL_ROOT`, `PE_ACTIVATION_MANIFEST`, `PE_REHEARSAL_RELEASE_ROOT`,
+`PE_REHEARSAL_BINARY`, `PE_REHEARSAL_CONFIG`, `PE_REHEARSAL_ENV`,
+`PE_REHEARSAL_COPY_DIR`, `PE_REHEARSAL_TIMEOUT_SECS`, `PE_REHEARSAL_POLL_SECS`, and
+`PE_REHEARSAL_EVIDENCE_HASH_FILE`.
+
+The four concurrent observers are the status-file poller, reader-drop classifier, fence/anchor
+census, and write-refusal counter. The run stops at the first complete same-invocation proof, the
+first unsafe observation, process exit, or its bound. PASS requires the reviewed revision, a complete
+ordinary poll after start, successful re-anchor, healthy critical owners, accounts off and unarmed,
+and no credit loss, unexpected fence/error, or successful database write. The harness prints
+`REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a SHA-256 evidence file over its result
+manifest. Preserve and review that evidence before entering the financial driver's `guarded` state.
+
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
-superseded values are accepted only by the private compatibility decoder and never enter corrected
-economics. After Start, apply the reviewed migration and switch consumers to
-`ConfigEra::Financial15`; an optional `risk_halt_release_hash` is separate incident control. The
-driver runs the configuration migration only after the physical Start and financial schema-v3
-migration. Do not apply post-Start changes early.
+superseded values are compatibility data and never enter corrected economics. The old 17-name
+contract is verified before the guarded mutation. Only after the physical Start does the driver
+install the financial schema, seed the Start identity, migrate to `ConfigEra::Financial15`, adopt the
+reviewed files, and start the service. An optional `risk_halt_release_hash` remains separate incident
+control. Do not apply the 17→15 boundary early.
 
 Run the exact reviewed driver command on the production host:
 
@@ -273,6 +303,7 @@ SUPABASE_DB_URL=<session-pooler-url> \
   --live-journal <active-generation-live_journal.log> \
   --paper-state <active-generation-paper_state.db> \
   --fresh-bankroll <amount> \
+  --target-revision <reviewed-40-hex> \
   --artifact-blake3 <hash> \
   --hot-config-hash <expected-15-name-hash> \
   --ranking-batch-id <id> \
@@ -281,25 +312,48 @@ SUPABASE_DB_URL=<session-pooler-url> \
   --membership-proofs-hash <hash>
 ```
 
-The resumable forward order is `prepared → guarded → started → verified`. `prepared` is read-only:
-the staged binary scans all three logs and returns the exact Start payload and expected synchronized
-receipt before constructing any network client. `guarded` stops the service once, proves it inert,
-takes and verifies a complete SQLite online backup, records the remote census and log bounds, and
-requires no open decision, unmatched Prepared, or live order. It then calls
-`archive_paper_state.sql` directly, performs the offline local reset/Start, applies Start-bound SQL,
-adopts reviewed files, and starts the service once.
+The resumable forward order is `prepared → guarded → started → verified`. Creating `prepared` records
+the verified #557 identity, reviewed target identities, durable paths, expected financial identity,
+ranking/membership evidence, and fresh bankroll without changing service or financial state. To
+enter `guarded`, the driver records stop intent, stops the service once, proves it inert, verifies the
+old 17-name contract, takes and verifies a complete SQLite online backup, records the remote census
+and all three log identities, and invokes the staged network-free `prepare` command. That command
+scans the logs and returns the exact Start payload and expected synchronized receipt; it does not
+mutate them.
 
-`started → verified` consumes the first invocation-fresh healthy proof of Start identity, fresh
-financial state, source/replay continuity, and ranking/membership. It has no soak, dwell, repeated
-sample, site approval, or wait loop. Resume the same command after interruption; each durable
-boundary is rechecked.
+From `guarded`, the driver archives/resets the remote paper state, invokes the network-free local
+reset/Start, installs and seeds the Start-bound authority schema, applies the 15-name configuration
+migration, adopts the reviewed files, starts the service once, records `started`, and exits. A rerun
+from `started` performs the first invocation-fresh verification and records `verified`.
 
-Before a complete Start, `--rollback-before-start` records `rolling_back`, validates the manifest,
-backup, census, old installed hashes, and log bounds, restores the activation-stamped remote archive
-and complete SQLite backup once, restarts the old process only if necessary, and records
-`rolled_back`. A scanned complete Start forces roll-forward even when the shell manifest is stale.
-At or after Start, rollback is forbidden: preserve the append-only era and recover with a compatible
-reader.
+`started → verified` checks the installed identities; guarded log-prefix continuity; exact local and
+remote Start/fresh-financial state; applied hot hash; ranking and membership; public projection;
+required producers and critical owners; and accounts off, unarmed, fresh, and free of dispatch work.
+Readiness has no wait loop: if the invocation-fresh status proof is not already present and complete,
+the command fails immediately and the operator reruns the same command. There is no soak, dwell,
+repeated sample, or site approval.
+
+`--rollback-before-start` is the only rollback route. It is accepted only while no complete Start
+exists and restores only from the durable activation archive and complete SQLite backup before
+recording `rolled_back`. A scanned complete Start forces roll-forward even when the shell manifest is
+stale. At or after Start, rollback is forbidden: preserve the append-only era and recover with a
+compatible reader.
+
+The driver invokes these early-dispatch service commands; they accept either `--name=value` or
+`--name value` spellings:
+
+```bash
+pe-service <service.toml> --financial-era=prepare \
+  --activation-manifest=/home/sean/pe-financial-era.json
+pe-service <service.toml> --financial-era=start \
+  --activation-manifest=/home/sean/pe-financial-era.json
+pe-service <service.toml> --financial-era=rollback-check \
+  --activation-manifest=/home/sean/pe-financial-era.json
+```
+
+`prepare` is read-only, `start` performs the idempotent local financial reset and synchronized Start,
+and `rollback-check` reports whether a complete Start is already present. They dispatch before normal
+client construction.
 
 The offline qualification command is separate from activation and constructs no network client:
 
@@ -519,18 +573,16 @@ pe-service applied that batch, and only then disable the flag or roll the binary
 back. Disabling first would copy Δ=2-selected wallets at poll latency — the
 padded-watchlist loss class.
 
-## #510 restart semantics (authoritative mode)
+## Historical #510 pre-Start restart semantics
 
-Since #510 the authoritative catch-up watermark advances at runtime (successor-gated in
-`commit_fill_authoritative`), so a healthy restart's boot catch-up is a **zero-RPC no-op** —
-the boot log prints one summary line: `supabase authoritative boot: catch-up summary`
-(`old_watermark` / `head` / `replayed`). Expect `replayed=0` on a healthy restart; a non-zero
-count is the bounded gap-heal (an earlier RPC failure or halted boot froze the watermark) and
-completes idempotently. Diagnose with
-`sqlite3 paper_state.db "select key,value from meta where key like '%event_seq'"` —
-`last_supabase_applied_event_seq` tracks `last_applied_event_seq` in steady state.
-`--backfill-supabase` (one-time cutover tool) now performs a strict full fill sweep and
-aborts before seeding any cursor if the sweep halts (rerun to resume; fully idempotent).
+This section applies only to the legacy era before `QualificationStarted`. Its successor-gated
+Supabase catch-up cursor makes a healthy legacy restart's boot catch-up a zero-RPC no-op; a non-zero
+replay count is the bounded, idempotent gap heal for an earlier legacy authority failure. The
+one-time `--backfill-supabase` cutover tool is also legacy-only and is refused after Start.
+
+In the financial era this cursor is neither steady-state authority nor a financial progress marker.
+The Start-bound `paper_bankroll.last_prepared_seq`, together with synchronized
+`FinancialPrepared`/`FinancialFinal` receipts, owns financial sequencing and restart recovery.
 
 ## #508 Phase A config cutover (A0–A4)
 

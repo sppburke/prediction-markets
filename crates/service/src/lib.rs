@@ -26,6 +26,7 @@ pub mod live_projections;
 pub mod live_venue_adapter;
 pub mod live_watchlist;
 pub mod logging;
+pub mod mark_prices;
 pub mod market_end_cache;
 pub mod mid_price_cache;
 pub mod orchestrator;

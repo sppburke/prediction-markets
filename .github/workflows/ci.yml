@@ -30,6 +30,8 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -91,6 +93,8 @@ jobs:
       - name: Python drift-guard tests
         run: |
           bash -n scripts/deploy/*.sh scripts/paper_reset/*.sh
+          bash scripts/deploy/rehearsal545.sh --dry-run \
+            0000000000000000000000000000000000000000 >/dev/null
           python3 scripts/check_sql_unfiltered_dml.py
           python3 scripts/test_push_ranking_filter.py
           python3 scripts/test_ranker_decay.py
@@ -115,6 +119,103 @@ jobs:
           python3 scripts/test_ranker_clv_source_comparison.py
           python3 scripts/verify_bakeoff_components.py
           bash scripts/deploy/test_activate_generation.sh
+          bash scripts/paper_reset/test_activate_financial_era.sh
+
+      - name: Legacy-to-financial PostgreSQL archive/restore scenario (issue #545)
+        env:
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          PG_LEGACY_URL: postgres://postgres:postgres@localhost:5432/pe_legacy_545
+        run: |
+          psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          do $$ begin
+            if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon nologin; end if;
+            if not exists (select 1 from pg_roles where rolname = 'authenticated') then create role authenticated nologin; end if;
+            if not exists (select 1 from pg_roles where rolname = 'service_role') then create role service_role nologin; end if;
+          end $$;
+          SQL
+          psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c 'create database pe_legacy_545;'
+          legacy_schema="$RUNNER_TEMP/supabase_paper_state_schema.pre-545.sql"
+          git show origin/main:scripts/supabase_paper_state_schema.sql > "$legacy_schema"
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 -f "$legacy_schema"
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          insert into service_config (key, value, value_type) values
+            ('fill_mode', 'clob_best_ask', 'text'),
+            ('polymarket_fee_rate', '0.04', 'decimal'),
+            ('kelly_fraction_override', '0.01', 'decimal');
+          do $$ begin
+            if (select count(*) from service_config) <> 17 then
+              raise exception 'legacy service_config row count is %, expected 17',
+                (select count(*) from service_config);
+            end if;
+          end $$;
+          insert into paper_bankroll (id, bankroll_str) values (0, '9998.625');
+          insert into paper_positions
+            (market_id, outcome_id, long_contracts, short_contracts)
+            values ('legacy-market', 0, 1, 0);
+          insert into paper_fills
+            (idempotency_key, leader_wallet, source_trade_id, market_id, outcome_id,
+             side, contracts, fill_price, entry_unix, event_seq)
+            values ('legacy-fill', '0x1111111111111111111111111111111111111111',
+                    'legacy-source', 'legacy-market', 0, 'buy', 1.25, 0.55, 100, 7);
+          insert into settled_markets
+            (market_id, outcome_prices, credit_applied, settled_at_unix)
+            values ('settled-market', '[1,0]'::jsonb, 0.625, 101);
+          insert into fill_market_snapshots
+            (idempotency_key, captured_at_unix) values ('legacy-fill', 100);
+          SQL
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 -f scripts/supabase_paper_state_schema.sql
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 -f scripts/migrate_service_config_545.sql
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          update paper_positions
+             set long_contracts = 1.125, short_contracts = 0.375
+           where market_id = 'legacy-market' and outcome_id = 0;
+          do $$ begin
+            if (select count(*) from service_config) <> 15 then
+              raise exception 'financial service_config row count is %, expected 15',
+                (select count(*) from service_config);
+            end if;
+            if exists (select 1 from service_config where key in ('fill_mode', 'polymarket_fee_rate')) then
+              raise exception 'retired financial configuration survived migration';
+            end if;
+          end $$;
+          SQL
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
+            -v bankroll=10000 -f scripts/paper_reset/archive_paper_state.sql
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          do $$ begin
+            if (select count(*) from paper_fills) <> 0
+               or (select count(*) from paper_positions) <> 0
+               or (select count(*) from settled_markets) <> 0 then
+              raise exception 'archive did not clear the live legacy book';
+            end if;
+            if not exists (
+              select 1 from paper_fills_archive
+               where activation_id = 'ci-545-fractional' and contracts = 1.25
+            ) or not exists (
+              select 1 from paper_positions_archive
+               where activation_id = 'ci-545-fractional'
+                 and long_contracts = 1.125 and short_contracts = 0.375
+            ) then
+              raise exception 'fractional values were not archived exactly';
+            end if;
+          end $$;
+          SQL
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
+            -f scripts/paper_reset/restore_paper_state.sql
+          psql "$PG_LEGACY_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          do $$ begin
+            if not exists (select 1 from paper_fills where contracts = 1.25)
+               or not exists (
+                 select 1 from paper_positions
+                  where long_contracts = 1.125 and short_contracts = 0.375
+               )
+               or not exists (select 1 from paper_bankroll where bankroll_str::numeric = 9998.625)
+               or not exists (select 1 from settled_markets where credit_applied = 0.625) then
+              raise exception 'fractional archive/restore round trip changed the legacy book';
+            end if;
+          end $$;
+          SQL
 
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
       # Load both Supabase schema files into the Postgres service (creating the Supabase
@@ -125,7 +226,6 @@ jobs:
         env:
           PGURL: postgres://postgres:postgres@localhost:5432/postgres
         run: |
-          psql "$PGURL" -v ON_ERROR_STOP=1 -c "create role anon nologin; create role authenticated nologin; create role service_role nologin;"
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_paper_state_schema.sql
           # Matview SQL must load on vanilla Postgres too (its pg_cron block self-skips when the

@@ -3,7 +3,7 @@
 //! One service-owned instance serializes every account into one hash-chained stream. Per-account
 //! ledgers are projections of that stream, preserving the global sequence assigned at append time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -660,6 +660,21 @@ pub struct OpenOrderInventoryEntry {
     pub prepared_journal_seq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One nonterminal order plus the journal evidence required to recover it without a projection.
+pub struct OpenOrderRecoveryEntry {
+    pub inventory: OpenOrderInventoryEntry,
+    pub prepared: Option<Box<LiveOrderPreparedAudit>>,
+    pub transaction_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Verified journal-owned accounts and nonterminal orders for one recovery pass.
+pub struct LiveRecoveryInventory {
+    pub account_ids: Vec<AccountId>,
+    pub open_orders: Vec<OpenOrderRecoveryEntry>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LiveJournalError {
     #[error("live journal path is a symlink or is not mode 0600")]
@@ -844,6 +859,8 @@ pub fn prepared_order_fact_matches(
 struct OpenOrderState {
     entry: OpenOrderInventoryEntry,
     order_hash: String,
+    prepared: Option<Box<LiveOrderPreparedAudit>>,
+    transaction_hashes: BTreeSet<String>,
     terminal: bool,
 }
 
@@ -853,6 +870,7 @@ fn insert_open_order(
     prepared_journal_seq: u64,
     identity: LiveOrderIdentity,
     order_hash: String,
+    prepared: Option<Box<LiveOrderPreparedAudit>>,
 ) -> Result<(), LiveJournalError> {
     let key = (account_id.clone(), identity.idempotency_key.clone());
     if orders.contains_key(&key) {
@@ -867,6 +885,8 @@ fn insert_open_order(
                 prepared_journal_seq,
             },
             order_hash,
+            prepared,
+            transaction_hashes: BTreeSet::new(),
             terminal: false,
         },
     );
@@ -879,17 +899,34 @@ fn insert_open_order(
 pub fn open_order_inventory(
     path: impl AsRef<Path>,
 ) -> Result<Vec<OpenOrderInventoryEntry>, LiveJournalError> {
+    Ok(recovery_inventory(path)?
+        .open_orders
+        .into_iter()
+        .map(|order| order.inventory)
+        .collect())
+}
+
+pub fn recovery_inventory(
+    path: impl AsRef<Path>,
+) -> Result<LiveRecoveryInventory, LiveJournalError> {
     let events = replay_all(path)?;
     let mut orders = BTreeMap::<(AccountId, String), OpenOrderState>::new();
+    let mut account_ids = BTreeSet::new();
     for event in events {
+        account_ids.insert(event.account_id.clone());
         match event.payload {
-            LiveJournalPayload::OrderPrepared(prepared) => insert_open_order(
-                &mut orders,
-                event.account_id,
-                event.seq,
-                prepared.identity.clone(),
-                prepared.prepared.order_hash.clone(),
-            )?,
+            LiveJournalPayload::OrderPrepared(prepared) => {
+                let identity = prepared.identity.clone();
+                let order_hash = prepared.prepared.order_hash.clone();
+                insert_open_order(
+                    &mut orders,
+                    event.account_id,
+                    event.seq,
+                    identity,
+                    order_hash,
+                    Some(prepared),
+                )?;
+            }
             LiveJournalPayload::LegacyV1(raw) => {
                 if let Some((identity, order_hash)) = legacy_v1::prepared_order(&raw.0)? {
                     insert_open_order(
@@ -898,6 +935,7 @@ pub fn open_order_inventory(
                         event.seq,
                         identity,
                         order_hash,
+                        None,
                     )?;
                 }
             }
@@ -930,6 +968,14 @@ pub fn open_order_inventory(
                     PreparedOrderFact::Reconciled(&reconciled),
                 ) {
                     return Err(LiveJournalError::OrderFactConflict);
+                }
+                if let LiveJournalOrderOutcome::Matched {
+                    transaction_hashes, ..
+                } = &reconciled.outcome
+                {
+                    order
+                        .transaction_hashes
+                        .extend(transaction_hashes.iter().cloned());
                 }
                 if matches!(
                     reconciled.outcome,
@@ -966,13 +1012,20 @@ pub fn open_order_inventory(
             | LiveJournalPayload::ModeTransitionApplied(_) => {}
         }
     }
-    let mut open = orders
+    let mut open_orders = orders
         .into_values()
         .filter(|order| !order.terminal)
-        .map(|order| order.entry)
+        .map(|order| OpenOrderRecoveryEntry {
+            inventory: order.entry,
+            prepared: order.prepared,
+            transaction_hashes: order.transaction_hashes.into_iter().collect(),
+        })
         .collect::<Vec<_>>();
-    open.sort_by_key(|order| order.prepared_journal_seq);
-    Ok(open)
+    open_orders.sort_by_key(|order| order.inventory.prepared_journal_seq);
+    Ok(LiveRecoveryInventory {
+        account_ids: account_ids.into_iter().collect(),
+        open_orders,
+    })
 }
 
 mod legacy_v1 {
@@ -1449,6 +1502,24 @@ mod tests {
                 LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
                     identity: open.identity.clone(),
                     order_hash: open.prepared.order_hash.clone(),
+                    source: LiveReconciliationSource::PostResponse,
+                    outcome: LiveJournalOrderOutcome::Matched {
+                        venue_order_id: "venue-open".to_owned(),
+                        transaction_hashes: vec![format!("0x{}", "2".repeat(64))],
+                        executed: None,
+                    },
+                    evidence: Vec::new(),
+                    evidence_hashes: Vec::new(),
+                })),
+            )
+            .unwrap();
+        journal
+            .append(
+                open_account.clone(),
+                at,
+                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                    identity: open.identity.clone(),
+                    order_hash: open.prepared.order_hash.clone(),
                     source: LiveReconciliationSource::PolygonFinality,
                     outcome: LiveJournalOrderOutcome::FinalityPending {
                         reason: "above finalized head".to_owned(),
@@ -1467,6 +1538,17 @@ mod tests {
                 account_id: open_account,
                 prepared_journal_seq: 0,
             }]
+        );
+        let recovery = recovery_inventory(&path).unwrap();
+        assert_eq!(recovery.account_ids.len(), 3);
+        assert_eq!(recovery.open_orders.len(), 1);
+        assert_eq!(
+            recovery.open_orders[0].prepared.as_deref(),
+            Some(open.as_ref())
+        );
+        assert_eq!(
+            recovery.open_orders[0].transaction_hashes,
+            vec![format!("0x{}", "2".repeat(64))]
         );
     }
 

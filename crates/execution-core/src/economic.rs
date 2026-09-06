@@ -149,6 +149,8 @@ pub enum EconomicError {
     Arithmetic(#[from] pe_core_types::Error),
     #[error("the ladder audit has no valid expected VWAP")]
     InvalidLadderAudit,
+    #[error("selected market identity disagrees with admission evidence")]
+    InvalidMarketIdentity,
     #[error("the book source receipt is unbound")]
     MissingBookReceipt,
 }
@@ -159,6 +161,18 @@ impl EconomicPrepared {
         if inputs.book_receipt.this_hash == blake3::Hash::from_bytes([0; 32]) {
             return Err(EconomicError::MissingBookReceipt);
         }
+        let outcome_index = usize::from(inputs.market.outcome_index);
+        if inputs.market.side != Side::Buy
+            || inputs.market.condition_id != inputs.admission.market.condition_id
+            || inputs
+                .admission
+                .market
+                .ordered_outcome_token_ids
+                .get(outcome_index)
+                .is_none_or(|token| token != &inputs.market.token_id)
+        {
+            return Err(EconomicError::InvalidMarketIdentity);
+        }
 
         let ladder = LadderPlanAudit::new(inputs.plan);
         let expected_shares = ladder.expected_shares()?;
@@ -166,7 +180,47 @@ impl EconomicPrepared {
             .expected_vwap()
             .ok_or(EconomicError::InvalidLadderAudit)?;
         let expected_spend = ladder.expected_spend()?;
-        if expected_shares < inputs.plan.shares || expected_spend > inputs.plan.worst_case_debit {
+        let plan_expected_shares = inputs
+            .plan
+            .expected_shares()
+            .map_err(|_| EconomicError::InvalidLadderAudit)?;
+        let plan_expected_spend = inputs
+            .plan
+            .expected_spend()
+            .map_err(|_| EconomicError::InvalidLadderAudit)?;
+        let plan_vwap = inputs
+            .plan
+            .vwap()
+            .ok_or(EconomicError::InvalidLadderAudit)?;
+        let signed_value = inputs
+            .plan
+            .shares
+            .to_decimal()
+            .checked_mul(inputs.plan.limit_price.0)
+            .ok_or(pe_core_types::Error::OutOfRange {
+                field: "EconomicPrepared.signed_value",
+            })?;
+        let endpoints_match = inputs.plan.used_asks.first().is_some_and(|ask| {
+            ask.price == inputs.plan.best_ask && ask.shares != ShareAmount::ZERO
+        }) && inputs.plan.used_asks.last().is_some_and(|ask| {
+            ask.price == inputs.plan.limit_price && ask.shares != ShareAmount::ZERO
+        });
+        let asks_are_ordered = inputs.plan.used_asks.windows(2).all(|pair| {
+            pair[0].price <= pair[1].price
+                && pair[0].price != Price::ZERO
+                && pair[1].price != Price::ZERO
+                && pair[0].shares != ShareAmount::ZERO
+                && pair[1].shares != ShareAmount::ZERO
+        });
+        if !endpoints_match
+            || !asks_are_ordered
+            || expected_shares != plan_expected_shares
+            || expected_spend != plan_expected_spend
+            || expected_vwap != plan_vwap
+            || expected_shares < inputs.plan.shares
+            || expected_spend > inputs.plan.worst_case_debit
+            || signed_value < inputs.plan.worst_case_debit.to_decimal()
+        {
             return Err(EconomicError::InvalidLadderAudit);
         }
 
@@ -175,7 +229,6 @@ impl EconomicPrepared {
         let reserve = fee_reserve(
             schedule,
             inputs.plan.worst_case_debit,
-            inputs.plan.shares,
             inputs.plan.best_ask,
             inputs.plan.limit_price,
         )?;
@@ -411,6 +464,32 @@ mod tests {
         assert!(matches!(
             EconomicPrepared::compose(inputs),
             Err(EconomicError::MissingBookReceipt)
+        ));
+    }
+
+    #[test]
+    fn composer_rejects_split_market_identity_and_inconsistent_signed_value() {
+        let admission = admission();
+        let plan = plan();
+        let mut split = inputs(&admission, &plan);
+        split.market.token_id = PolymarketTokenId("22".to_owned());
+        assert!(matches!(
+            EconomicPrepared::compose(split),
+            Err(EconomicError::InvalidMarketIdentity)
+        ));
+
+        let mut inconsistent = plan.clone();
+        inconsistent.shares = ShareAmount::from_decimal_exact(dec!(4)).unwrap();
+        assert!(matches!(
+            EconomicPrepared::compose(inputs(&admission, &inconsistent)),
+            Err(EconomicError::InvalidLadderAudit)
+        ));
+
+        let mut inconsistent = plan;
+        inconsistent.best_ask = Price::new(dec!(0.39)).unwrap();
+        assert!(matches!(
+            EconomicPrepared::compose(inputs(&admission, &inconsistent)),
+            Err(EconomicError::InvalidLadderAudit)
         ));
     }
 

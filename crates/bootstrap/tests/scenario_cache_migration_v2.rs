@@ -11,14 +11,18 @@
 //! missing, a stale sidecar survives, or the installed hash changes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::cache_migration::{
     CacheActivationRequest, CacheV2BuildManifest, FrozenCacheFreshness, FrozenPayloadReference,
-    PriorCacheBinding, activate_cache_v2, finalize_cache_v2, migrate_cache_v2,
-    populate_activity_v2, restore_prior_cache, sha256_file, verify_frozen_payload_v1,
+    PriorCacheBinding, PublicationConsumptionProbe, activate_cache_v2, finalize_cache_v2,
+    migrate_cache_v2, populate_activity_v2, restore_prior_cache, sha256_file,
+    verify_frozen_payload_v1,
 };
 use pe_bootstrap::clob::ClobFetcher;
 use pe_bootstrap::pile::SRC_TRADES;
@@ -28,9 +32,86 @@ use pe_source_polymarket_public::{
     ClobCoveragePage, FixtureFetcher, PageFetcher,
 };
 use rusqlite::{Connection, params};
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 const WALLET: &str = "0x1111111111111111111111111111111111111111";
+
+struct FixedPublicationProbe(bool);
+
+impl PublicationConsumptionProbe for FixedPublicationProbe {
+    fn was_published<'a>(
+        &'a self,
+        _publish_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, pe_bootstrap::error::BootstrapError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(self.0) })
+    }
+}
+
+struct UnavailablePublicationProbe;
+
+impl PublicationConsumptionProbe for UnavailablePublicationProbe {
+    fn was_published<'a>(
+        &'a self,
+        _publish_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, pe_bootstrap::error::BootstrapError>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(pe_bootstrap::error::BootstrapError::Invalid {
+                message: "publication authority unavailable".to_owned(),
+            })
+        })
+    }
+}
+
+fn write_pending_publication(
+    dir: &TempDir,
+    name: &str,
+    side: &std::path::Path,
+    expected_installed: &std::path::Path,
+    fixed: &std::path::Path,
+    prior: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let request_path = dir.path().join(format!("{name}-request.json"));
+    let pending_path = dir.path().join(format!("{name}-pending"));
+    let activation = serde_json::json!({
+        "side_path": side,
+        "fixed_path": fixed,
+        "prior_cache_backup_path": prior,
+        "expected_sha256": sha256_file(expected_installed).unwrap(),
+    });
+    let batch = serde_json::json!({"config_hash": null});
+    let entries = serde_json::json!([{"rank": 1, "wallet_hex": WALLET}]);
+    let identity = serde_json::json!({
+        "batch": batch,
+        "cache_activation": activation,
+        "entries": entries,
+    });
+    let publish_key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).unwrap())
+    );
+    std::fs::write(
+        &request_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "batch": identity["batch"],
+            "entries": identity["entries"],
+            "keep_batches": 1080,
+            "cache_activation": identity["cache_activation"],
+            "publish_key": publish_key,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let relative = request_path
+        .strip_prefix(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::write(&pending_path, format!("{}\n", relative.display())).unwrap();
+    (request_path, pending_path)
+}
 
 fn seed_v1(path: &std::path::Path, timestamp: i64) -> WalletCache {
     let mut cache = WalletCache::open(path).unwrap();
@@ -170,13 +251,51 @@ fn install_payout_manifest(path: &std::path::Path) {
         .unwrap();
 }
 
+async fn finalize_empty_activity_side(
+    dir: &TempDir,
+    side: &std::path::Path,
+    watermark: i64,
+) -> String {
+    drop(seed_v1(side, watermark));
+    let manifest = write_build_manifest(dir, side);
+    migrate_cache_v2(side, &manifest).unwrap();
+    let frozen_path = write_frozen_reference(dir, watermark, vec![WALLET.to_owned()]);
+    verify_frozen_payload_v1(side, &frozen_path, watermark + 70).unwrap();
+    let activity_url = format!(
+        "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={watermark}"
+    );
+    populate_activity_v2(
+        side,
+        &FixtureFetcher::new(HashMap::from([(activity_url, b"[]".to_vec())])),
+        "https://data.example",
+        &frozen_path,
+        watermark,
+        1,
+        watermark + 80,
+    )
+    .await
+    .unwrap();
+    install_payout_manifest(side);
+    finalize_cache_v2(
+        side,
+        &dir.path().join("cache-v2-final.json"),
+        watermark + 90,
+    )
+    .unwrap()
+    .cache_sha256
+}
+
 #[tokio::test]
 async fn migration_is_resumable_and_activation_installs_only_the_finalized_main() {
-    let dir = TempDir::new().unwrap();
-    std::fs::create_dir(dir.path().join("eval-results")).unwrap();
-    let side = dir.path().join("wallet_cache.v2.side.db");
-    let fixed = dir.path().join("wallet_cache.db");
-    let v1_backup = dir.path().join("wallet_cache.v1.sha.db");
+    let dir = tempfile::Builder::new()
+        .prefix("pe-cache-v2-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(data.join("eval-results")).unwrap();
+    let side = data.join("wallet_cache.v2.side.db");
+    let fixed = data.join("wallet_cache.db");
+    let v1_backup = data.join("wallet_cache.v1.sha.db");
     let manifest_path;
     let watermark = 1_800_000_000_i64;
     {
@@ -242,7 +361,7 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     drop(seed_v1(&fixed, watermark - 100));
     let activation_request = CacheActivationRequest {
         fixed_path: fixed.clone(),
-        side_path: side,
+        side_path: side.clone(),
         prior_cache_backup_path: v1_backup.clone(),
         expected_side_sha256: stage.cache_sha256.clone(),
     };
@@ -253,10 +372,111 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         b"partial-copy",
     )
     .unwrap();
-    let activated = activate_cache_v2(&activation_request).unwrap();
-    assert_eq!(activated.installed_sha256, stage.cache_sha256);
-    assert!(!activated.resumed);
-    assert!(activation_cache_v2_evidence_ready(&activated));
+    let (temporary_request, _) =
+        write_pending_publication(&dir, "wrapper", &side, &side, &fixed, &v1_backup);
+    let request_dir = data.join("eval-results/cron-wrapper");
+    std::fs::create_dir(&request_dir).unwrap();
+    let request_path = request_dir.join("ranking_publish_request.json");
+    std::fs::rename(temporary_request, &request_path).unwrap();
+    std::fs::write(
+        request_dir.join("latency_shift_ranked.csv"),
+        format!("wallet,survives\n{WALLET},true\n"),
+    )
+    .unwrap();
+    let pending_path = data.join("eval-results/rank_and_push.pending");
+    let relative_request = request_path.strip_prefix(dir.path()).unwrap();
+    std::fs::write(&pending_path, format!("{}\n", relative_request.display())).unwrap();
+    let scripts = dir.path().join("scripts");
+    let release = dir.path().join("target/release");
+    std::fs::create_dir(&scripts).unwrap();
+    std::fs::create_dir_all(&release).unwrap();
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    std::fs::copy(
+        repository.join("scripts/rank_and_push.sh"),
+        scripts.join("rank_and_push.sh"),
+    )
+    .unwrap();
+    std::fs::copy(
+        repository.join("scripts/push_ranking_to_supabase.py"),
+        scripts.join("push_ranking_to_supabase.py"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_pe-bootstrap"),
+        release.join("pe-bootstrap"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".env"),
+        format!(
+            "SUPABASE_URL=https://fixture.invalid\nSUPABASE_SECRET_KEY=fixture-key\nPE_BOOTSTRAP_OUTPUT={}\n",
+            dir.path().join("watchlist.json").display()
+        ),
+    )
+    .unwrap();
+    let python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    let python = String::from_utf8(python.stdout).unwrap();
+    let site = dir.path().join("python-fixture");
+    std::fs::create_dir(&site).unwrap();
+    std::fs::write(
+        site.join("sitecustomize.py"),
+        r#"import json
+import urllib.request
+class Response:
+    status = 200
+    def __init__(self, value): self.value = value
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self): return json.dumps(self.value).encode()
+def urlopen(request, timeout=30):
+    url = request.full_url
+    if "/rpc/publish_ranking_batch" in url: return Response(7)
+    if "/latest_ranking" in url:
+        return Response([{"batch_id": 7, "rank": 1, "survives": None}])
+    if "/ranking_batches?" in url: return Response([])
+    raise RuntimeError("unexpected fixture URL: " + url)
+urllib.request.urlopen = urlopen
+"#,
+    )
+    .unwrap();
+    let wrapper = Command::new("bash")
+        .args([
+            "-c",
+            "exec 9<>data/eval-results/.rank_and_push_loop.lock; flock -n 9; \
+             printf '%s\\n' \"$$\" > data/eval-results/.rank_and_push_loop.lock; \
+             exec bash scripts/rank_and_push.sh --resume-pending",
+        ])
+        .current_dir(dir.path())
+        .env("PE_PYTHON", python.trim())
+        .env("PYTHONPATH", &site)
+        .output()
+        .unwrap();
+    assert!(
+        wrapper.status.success(),
+        "real wrapper/bootstrap activation failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&wrapper.stdout),
+        String::from_utf8_lossy(&wrapper.stderr)
+    );
+    let activation_json = String::from_utf8_lossy(&wrapper.stdout)
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .unwrap();
+    assert_eq!(activation_json["installed_sha256"], stage.cache_sha256);
+    assert_eq!(activation_json["resumed"], false);
+    assert_eq!(
+        activation_json["activation_evidence"]["activation_ready"],
+        true
+    );
+    assert!(!pending_path.exists());
+
     let resumed = activate_cache_v2(&activation_request).unwrap();
     assert!(resumed.resumed);
     assert!(resumed.activation_evidence.is_none());
@@ -267,8 +487,8 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         2
     );
     let first_binding = PriorCacheBinding {
-        sha256: activated.prior_cache_sha256,
-        schema_version: activated.prior_cache_schema,
+        sha256: resumed.prior_cache_sha256,
+        schema_version: resumed.prior_cache_schema,
     };
 
     let next_side = dir.path().join("wallet_cache.next.v2.db");
@@ -298,25 +518,66 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         schema_version: v2_to_v2.prior_cache_schema,
     };
     let current_hash = sha256_file(&fixed).unwrap();
+    let consumed_side = dir.path().join("consumed-side.db");
+    let (v2_request, v2_pending) =
+        write_pending_publication(&dir, "v2", &consumed_side, &fixed, &fixed, &prior_v2);
     let refused = restore_prior_cache(
         &fixed,
         &prior_v2,
         &dir.path().join("must-not-exist.db"),
         &v2_binding,
-        true,
+        &v2_request,
+        &v2_pending,
+        &FixedPublicationProbe(true),
     )
+    .await
     .unwrap_err();
-    assert!(refused.to_string().contains("bound ranking batch"));
+    assert!(refused.to_string().contains("publication was consumed"));
+    assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+    let unavailable = restore_prior_cache(
+        &fixed,
+        &prior_v2,
+        &dir.path().join("must-not-exist.db"),
+        &v2_binding,
+        &v2_request,
+        &v2_pending,
+        &UnavailablePublicationProbe,
+    )
+    .await
+    .unwrap_err();
+    assert!(unavailable.to_string().contains("authority unavailable"));
     assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
     let displaced_next = dir.path().join("wallet_cache.displaced.next.v2.db");
-    restore_prior_cache(&fixed, &prior_v2, &displaced_next, &v2_binding, false).unwrap();
+    restore_prior_cache(
+        &fixed,
+        &prior_v2,
+        &displaced_next,
+        &v2_binding,
+        &v2_request,
+        &v2_pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
         2
     );
 
     let displaced_v2 = dir.path().join("wallet_cache.displaced.v2.db");
-    restore_prior_cache(&fixed, &v1_backup, &displaced_v2, &first_binding, false).unwrap();
+    let (v1_request, v1_pending) =
+        write_pending_publication(&dir, "v1", &consumed_side, &fixed, &fixed, &v1_backup);
+    restore_prior_cache(
+        &fixed,
+        &v1_backup,
+        &displaced_v2,
+        &first_binding,
+        &v1_request,
+        &v1_pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
         1
@@ -329,15 +590,6 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         2
     );
     assert!(!fixed.with_extension("db-wal").exists());
-}
-
-fn activation_cache_v2_evidence_ready(
-    report: &pe_bootstrap::cache_migration::CacheActivationReport,
-) -> bool {
-    report
-        .activation_evidence
-        .as_ref()
-        .is_some_and(|evidence| evidence.activation_ready)
 }
 
 #[test]
@@ -461,6 +713,60 @@ fn activation_refuses_a_side_main_changed_after_finalization() {
         WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
         1
     );
+}
+
+/// PASS: a post-finalization commit retained only in an open side WAL is rejected before the
+/// immutable side is opened or checkpointed, and the fixed cache remains byte-for-byte unchanged.
+/// FAIL: activation checkpoints the unmanifested table, replaces the fixed cache, or reports the
+/// stale-evidence failure only after replacement.
+#[tokio::test]
+async fn activation_rejects_unmanifested_side_wal_before_replacing_fixed_cache() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    let fixed = dir.path().join("wallet_cache.db");
+    let backup = dir.path().join("v1.db");
+    let watermark = 1_800_000_000_i64;
+    let expected = finalize_empty_activity_side(&dir, &side, watermark).await;
+    drop(seed_v1(&fixed, watermark - 100));
+    let fixed_before = sha256_file(&fixed).unwrap();
+
+    let wal_owner = Connection::open(&side).unwrap();
+    wal_owner
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint = 0;
+             BEGIN IMMEDIATE;
+             CREATE TABLE unmanifested_activation_write(value TEXT NOT NULL);
+             INSERT INTO unmanifested_activation_write(value) VALUES ('stale');
+             COMMIT;",
+        )
+        .unwrap();
+    let wal = side.with_extension("db-wal");
+    let shm = side.with_extension("db-shm");
+    assert!(wal.metadata().unwrap().len() > 0);
+    assert!(shm.metadata().unwrap().len() > 0);
+    assert_eq!(sha256_file(&side).unwrap(), expected);
+
+    let error = activate_cache_v2(&CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: backup,
+        expected_side_sha256: expected,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("non-empty SQLite activation sidecar"),
+        "{error}"
+    );
+    assert_eq!(sha256_file(&fixed).unwrap(), fixed_before);
+    assert_eq!(
+        WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
+        1
+    );
+    assert!(side.is_file());
+    drop(wal_owner);
 }
 
 #[tokio::test]

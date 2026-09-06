@@ -2,8 +2,9 @@ use pe_bootstrap::{
     BootstrapConfig, backfill,
     cache::WalletCache,
     cache_migration::{
-        CacheActivationRequest, PriorCacheBinding, activate_cache_v2, finalize_cache_v2,
-        migrate_cache_v2, populate_activity_v2, restore_prior_cache, verify_frozen_payload_v1,
+        CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
+        activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2, populate_activity_v2,
+        restore_prior_cache, verify_frozen_payload_v1,
     },
     config, coverage,
     error::BootstrapError,
@@ -104,10 +105,15 @@ async fn main() {
         let mut fixed_db_arg: Option<std::path::PathBuf> = None;
         let mut backup_arg: Option<std::path::PathBuf> = None;
         let mut displaced_backup_arg: Option<std::path::PathBuf> = None;
+        let mut publication_request_arg: Option<std::path::PathBuf> = None;
+        let mut pending_pointer_arg: Option<std::path::PathBuf> = None;
         let mut expected_sha256_arg: Option<String> = None;
         let mut prior_sha256_arg: Option<String> = None;
         let mut prior_schema_arg: Option<i64> = None;
-        let mut bound_batch_is_current = false;
+        let mut held_loop_lock_fd_arg: Option<u32> = None;
+        let mut held_loop_lock_pid_arg: Option<u32> = None;
+        let mut held_run_lock_fd_arg: Option<u32> = None;
+        let mut held_run_lock_pid_arg: Option<u32> = None;
         let mut fixed_end_arg: Option<i64> = None;
         let mut generation_arg: Option<u64> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -125,8 +131,22 @@ async fn main() {
                 defer_activation = true;
             } else if a == "--confirm" {
                 confirm = true;
-            } else if a == "--bound-batch-current" {
-                bound_batch_is_current = true;
+            } else if a == "--held-loop-lock-fd" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                held_loop_lock_fd_arg = rest[i].parse().ok();
+            } else if a == "--held-loop-lock-pid" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                held_loop_lock_pid_arg = rest[i].parse().ok();
+            } else if a == "--held-run-lock-fd" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                held_run_lock_fd_arg = rest[i].parse().ok();
+            } else if a == "--held-run-lock-pid" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                held_run_lock_pid_arg = rest[i].parse().ok();
             } else if a == "--batch-id" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -207,6 +227,18 @@ async fn main() {
                 displaced_backup_arg = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--displaced-backup=") {
                 displaced_backup_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--publication-request" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                publication_request_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--publication-request=") {
+                publication_request_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--pending-pointer" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                pending_pointer_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--pending-pointer=") {
+                pending_pointer_arg = Some(std::path::PathBuf::from(v));
             } else if a == "--expected-sha256" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -368,34 +400,90 @@ async fn main() {
                     })
                     .and_then(
                         |((fixed_path, prior_cache_backup_path), expected_side_sha256)| {
-                            activate_cache_v2(&CacheActivationRequest {
+                            let loop_lock = held_loop_lock_fd_arg
+                                .zip(held_loop_lock_pid_arg)
+                                .map(|(fd, holder_pid)| pe_bootstrap::lock::InheritedForgeLock {
+                                    fd,
+                                    holder_pid,
+                                });
+                            let handoff = held_run_lock_fd_arg
+                                .zip(held_run_lock_pid_arg)
+                                .map(|(fd, holder_pid)| pe_bootstrap::lock::ForgeLockHandoff {
+                                    loop_lock,
+                                    run_lock: pe_bootstrap::lock::InheritedForgeLock {
+                                        fd,
+                                        holder_pid,
+                                    },
+                                });
+                            let any_handoff_arg = held_loop_lock_fd_arg.is_some()
+                                || held_loop_lock_pid_arg.is_some()
+                                || held_run_lock_fd_arg.is_some()
+                                || held_run_lock_pid_arg.is_some();
+                            if any_handoff_arg && handoff.is_none() {
+                                return Err(BootstrapError::Invalid {
+                                    message: "cache-activate lock handoff requires both run-lock FD/PID values and either both or neither loop-lock values".to_owned(),
+                                });
+                            }
+                            if held_loop_lock_fd_arg.is_some() != held_loop_lock_pid_arg.is_some() {
+                                return Err(BootstrapError::Invalid {
+                                    message: "cache-activate loop-lock handoff is incomplete".to_owned(),
+                                });
+                            }
+                            activate_cache_v2_with_handoff(&CacheActivationRequest {
                                 fixed_path,
                                 side_path: bootstrap_config.cache_path.clone(),
                                 prior_cache_backup_path,
                                 expected_side_sha256,
-                            })
+                            }, handoff.as_ref())
                             .and_then(json_report)
                         },
                     ),
-                "cache-restore-prior" => fixed_db_arg
+                "cache-restore-prior" => {
+                    let prepared = fixed_db_arg
                     .zip(backup_arg)
                     .zip(displaced_backup_arg)
                     .zip(prior_sha256_arg.zip(prior_schema_arg))
+                    .zip(publication_request_arg.zip(pending_pointer_arg))
                     .ok_or_else(|| BootstrapError::Invalid {
                         message: "cache-restore-prior requires --fixed-db, --backup, \
-                                  --displaced-backup, --prior-sha256, and --prior-schema"
+                                  --displaced-backup, --prior-sha256, --prior-schema, \
+                                  --publication-request, and --pending-pointer"
                             .to_owned(),
                     })
-                    .and_then(|(((fixed, backup), displaced), (sha256, schema_version))| {
-                        restore_prior_cache(
+                    .and_then(|((((fixed, backup), displaced), (sha256, schema_version)),
+                                (publication_request, pending_pointer))| {
+                        let base_url = std::env::var("SUPABASE_URL").map_err(|_| {
+                            BootstrapError::Invalid {
+                                message: "SUPABASE_URL is required for authoritative restore evidence".to_owned(),
+                            }
+                        })?;
+                        let key = std::env::var("SUPABASE_SECRET_KEY").map_err(|_| {
+                            BootstrapError::Invalid {
+                                message: "SUPABASE_SECRET_KEY is required for authoritative restore evidence".to_owned(),
+                            }
+                        })?;
+                        Ok((fixed, backup, displaced, sha256, schema_version,
+                            publication_request, pending_pointer,
+                            SupabasePublicationProbe::new(base_url, key)?))
+                    });
+                    match prepared {
+                        Ok((fixed, backup, displaced, sha256, schema_version,
+                            publication_request, pending_pointer, probe)) => {
+                            restore_prior_cache(
                             &fixed,
                             &backup,
                             &displaced,
                             &PriorCacheBinding { sha256, schema_version },
-                            bound_batch_is_current,
+                            &publication_request,
+                            &pending_pointer,
+                            &probe,
                         )
+                            .await
                             .map(|()| serde_json::json!({"restored": fixed}))
-                    }),
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 _ => Err(BootstrapError::Internal),
             };
             match result {
