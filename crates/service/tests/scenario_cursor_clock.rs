@@ -177,11 +177,11 @@ async fn run_once(
     // Production replays the source receipt index from the on-disk log before the ingest starts
     // (`main.rs`); a restart against a non-empty log must do the same or every synchronized
     // append is refused as non-contiguous.
-    let source_receipt_millis =
-        pe_service::risk_inputs::SourceReceiptMillisIndex::replay(source_log_path).unwrap();
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(source_log_path).unwrap();
     let ingest = tokio::spawn(
         ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
-            .with_source_receipt_millis_index(source_receipt_millis)
+            .with_source_receipt_index(source_receipts)
             .run(),
     );
     let (control_tx, mut control_rx) = mpsc::channel(2);

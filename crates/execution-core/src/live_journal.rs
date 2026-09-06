@@ -1763,26 +1763,27 @@ fn insert_open_order(
     Ok(())
 }
 
-/// Replay the verified global journal once and return every Prepared order without a terminal fact.
-/// `Killed`, `Rejected`, `FinalityConflict`, and `OrderFillFinalized` are terminal. A finality
-/// conflict deliberately preserves the reservation while removing the order from automated
-/// recovery; only an operator may resolve the frozen journal state.
-pub fn open_order_inventory(
-    path: impl AsRef<Path>,
-    era_live_prefix: Option<&LogTailBinding>,
-) -> Result<Vec<OpenOrderInventoryEntry>, LiveJournalError> {
-    Ok(recovery_inventory(path, era_live_prefix)?
-        .open_orders
-        .into_iter()
-        .map(|order| order.inventory)
-        .collect())
-}
-
+/// Recover the verified journal without a service-tier admission verifier.
+///
+/// This remains a consuming inventory: it re-evaluates every admission's retained risk and account
+/// evidence before returning recovery work. Service consumers with preceding source and financial
+/// evidence must use [`recovery_inventory_with_admission_verifier`].
 pub fn recovery_inventory(
     path: impl AsRef<Path>,
     era_live_prefix: Option<&LogTailBinding>,
 ) -> Result<LiveRecoveryInventory, LiveJournalError> {
-    recovery_inventory_with_admission_verifier(path, era_live_prefix, |_, _| Ok(()))
+    build_recovery_inventory(path, era_live_prefix, true, |_, _| Ok(()))
+}
+
+/// Classify recovery work from the verified journal without evaluating admission evidence.
+///
+/// This inventory is an idle-work hint only. It must never drive recovery consumption; consuming
+/// paths must use [`recovery_inventory`] or [`recovery_inventory_with_admission_verifier`].
+pub fn structural_recovery_inventory(
+    path: impl AsRef<Path>,
+    era_live_prefix: Option<&LogTailBinding>,
+) -> Result<LiveRecoveryInventory, LiveJournalError> {
+    build_recovery_inventory(path, era_live_prefix, false, |_, _| Ok(()))
 }
 
 /// Recover the verified journal after an outer owner has reconstructed every admission from its
@@ -1792,6 +1793,18 @@ pub fn recovery_inventory(
 pub fn recovery_inventory_with_admission_verifier<F>(
     path: impl AsRef<Path>,
     era_live_prefix: Option<&LogTailBinding>,
+    verify_admission: F,
+) -> Result<LiveRecoveryInventory, LiveJournalError>
+where
+    F: FnMut(&LiveJournalEvent, &[LiveJournalEvent]) -> Result<(), LiveJournalError>,
+{
+    build_recovery_inventory(path, era_live_prefix, true, verify_admission)
+}
+
+fn build_recovery_inventory<F>(
+    path: impl AsRef<Path>,
+    era_live_prefix: Option<&LogTailBinding>,
+    verify_admissions: bool,
     mut verify_admission: F,
 ) -> Result<LiveRecoveryInventory, LiveJournalError>
 where
@@ -1816,9 +1829,11 @@ where
                 .is_none_or(|last_sequence| event.seq > last_sequence.0)
         });
     }
-    for (event_index, event) in events.iter().enumerate() {
-        if matches!(event.payload, LiveJournalPayload::AdmissionEvaluated(_)) {
-            verify_admission(event, &events[..event_index])?;
+    if verify_admissions {
+        for (event_index, event) in events.iter().enumerate() {
+            if matches!(event.payload, LiveJournalPayload::AdmissionEvaluated(_)) {
+                verify_admission(event, &events[..event_index])?;
+            }
         }
     }
     let mut orders = BTreeMap::<(AccountId, String), OpenOrderState>::new();
@@ -1858,18 +1873,20 @@ where
                 )?;
             }
             LiveJournalPayload::AdmissionEvaluated(admission) => {
-                verify_live_admission_evaluation(
-                    &admission,
-                    event.timestamp,
-                    account_bindings.get(&event.account_id),
-                )
-                .map_err(|error| match error {
-                    LiveAdmissionEvaluationError::Journal(error) => error,
-                    LiveAdmissionEvaluationError::InvalidRiskDecision
-                    | LiveAdmissionEvaluationError::InvalidAccountEvidence => {
-                        LiveJournalError::OrderFactConflict
-                    }
-                })?;
+                if verify_admissions {
+                    verify_live_admission_evaluation(
+                        &admission,
+                        event.timestamp,
+                        account_bindings.get(&event.account_id),
+                    )
+                    .map_err(|error| match error {
+                        LiveAdmissionEvaluationError::Journal(error) => error,
+                        LiveAdmissionEvaluationError::InvalidRiskDecision
+                        | LiveAdmissionEvaluationError::InvalidAccountEvidence => {
+                            LiveJournalError::OrderFactConflict
+                        }
+                    })?;
+                }
                 let key = (
                     event.account_id.clone(),
                     admission.identity.idempotency_key.clone(),
@@ -2714,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn open_order_inventory_is_cross_account_and_terminal_reconciliation_strict() {
+    fn recovery_inventory_is_cross_account_and_terminal_reconciliation_strict() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live.log");
         let journal = LiveJournal::open(&path).unwrap();
@@ -2762,17 +2779,17 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        assert_eq!(
-            open_order_inventory(&path, None).unwrap(),
-            vec![OpenOrderInventoryEntry {
-                identity: open.identity.clone(),
-                account_id: open_account,
-                prepared_journal_seq: open_prepared,
-            }]
-        );
         let recovery = recovery_inventory(&path, None).unwrap();
         assert_eq!(recovery.account_ids.len(), 2);
         assert_eq!(recovery.open_orders.len(), 1);
+        assert_eq!(
+            recovery.open_orders[0].inventory,
+            OpenOrderInventoryEntry {
+                identity: open.identity.clone(),
+                account_id: open_account,
+                prepared_journal_seq: open_prepared,
+            }
+        );
         assert_eq!(
             recovery.open_orders[0].prepared.as_deref(),
             Some(open.as_ref())
@@ -3056,10 +3073,11 @@ mod tests {
         ));
     }
 
-    /// PASS: recovery recomputes the pure risk decision and rejects a producer-recorded Approved
-    /// decision whose snapshot deterministically trips the absolute-loss kill switch.
+    /// PASS: structural recovery reports a producer-recorded Approved decision with a tampered
+    /// risk snapshot as pending without evaluating it, while consuming recovery rejects it.
+    /// FAIL: the hint evaluates the risk evidence or consuming recovery accepts the tamper.
     #[test]
-    fn recovery_rejects_approved_admission_with_blocked_risk_snapshot() {
+    fn structural_recovery_does_not_verify_admission_evidence() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live.log");
         let journal = LiveJournal::open(&path).unwrap();
@@ -3078,6 +3096,13 @@ mod tests {
         journal.append(account_id, at, admission_payload).unwrap();
         drop(journal);
 
+        assert_eq!(
+            structural_recovery_inventory(&path, None)
+                .unwrap()
+                .approved_admissions
+                .len(),
+            1
+        );
         assert!(matches!(
             recovery_inventory(&path, None),
             Err(LiveJournalError::OrderFactConflict)
@@ -3146,7 +3171,7 @@ mod tests {
     }
 
     #[test]
-    fn open_order_inventory_rejects_a_fact_for_another_prepared_identity() {
+    fn recovery_inventory_rejects_a_fact_for_another_prepared_identity() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live.log");
         let journal = LiveJournal::open(&path).unwrap();
@@ -3191,7 +3216,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            open_order_inventory(&path, None),
+            recovery_inventory(&path, None),
             Err(LiveJournalError::OrderFactConflict)
         ));
     }
@@ -3581,13 +3606,15 @@ mod tests {
             replayed[5].payload,
             LiveJournalPayload::RedemptionReceiptTransition(_)
         ));
+        let recovery = recovery_inventory(&path, None).unwrap();
+        assert_eq!(recovery.open_orders.len(), 1);
         assert_eq!(
-            open_order_inventory(&path, None).unwrap(),
-            vec![OpenOrderInventoryEntry {
+            recovery.open_orders[0].inventory,
+            OpenOrderInventoryEntry {
                 identity: identity("legacy-prepared"),
                 account_id,
                 prepared_journal_seq: 1,
-            }]
+            }
         );
     }
 

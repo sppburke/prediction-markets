@@ -98,7 +98,7 @@ use crate::paper_recovery::{
     ScannedPaperFrame, active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::risk_inputs::{
-    RiskInputsUnavailable, SourceReceiptMillisIndex, apply_global_risk_halts,
+    RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
     paper_prefix_at_financial_prefix,
 };
 use crate::runtime_config::LiveRuntimeConfig;
@@ -135,7 +135,7 @@ pub struct LiveFanoutConfig {
     pub mid_price_cache: MidPriceCache,
     pub source_log: SourceLogHandle,
     /// Boot-verified, append-extended source receipt and evidence projection.
-    pub source_receipt_millis: SourceReceiptMillisIndex,
+    pub source_receipts: SourceReceiptIndex,
     pub paper_log_path: PathBuf,
     pub orchestrator_control: tokio::sync::mpsc::Sender<OrchestratorControl>,
     pub http: reqwest::Client,
@@ -192,8 +192,7 @@ fn derive_projection_rows_for_state(
     account_id: &AccountId,
     events: &[LiveJournalEvent],
 ) -> Result<ProjectionDerivation, ProjectionReducerError> {
-    let source_envelopes =
-        source_envelopes_for_live_events(&state.config.source_receipt_millis, events)?;
+    let source_envelopes = source_envelopes_for_live_events(&state.config.source_receipts, events)?;
     let paper_frames = scan_paper_log(&state.config.paper_log_path)
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     verify_replayed_live_risks(
@@ -201,14 +200,14 @@ fn derive_projection_rows_for_state(
         &state.config.journal_path,
         events,
         &source_envelopes,
-        Some(&state.config.source_receipt_millis),
+        Some(&state.config.source_receipts),
         &paper_frames,
     )?;
     derive_projection_rows_with_sources(account_id, events, &source_envelopes)
 }
 
 fn source_envelopes_for_live_events(
-    index: &SourceReceiptMillisIndex,
+    source_receipts: &SourceReceiptIndex,
     events: &[LiveJournalEvent],
 ) -> Result<Vec<EventEnvelope>, ProjectionReducerError> {
     let mut receipts = Vec::new();
@@ -246,7 +245,7 @@ fn source_envelopes_for_live_events(
     receipts
         .into_iter()
         .map(|receipt| {
-            index
+            source_receipts
                 .source_envelope(receipt)
                 .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)
         })
@@ -422,13 +421,6 @@ pub async fn run_live_fanout_until(
     Ok(())
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static RECOVERY_VERIFIER_INVOCATIONS: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-}
-
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
     let paper_frames = scan_paper_log(&state.config.paper_log_path)
         .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
@@ -436,8 +428,6 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
         &state.config.journal_path,
         state.config.era_live_prefix.as_ref(),
         |event, preceding_events| {
-            #[cfg(test)]
-            RECOVERY_VERIFIER_INVOCATIONS.with(|calls| calls.set(calls.get().saturating_add(1)));
             let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload else {
                 return Ok(());
             };
@@ -448,11 +438,9 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
                 .collect::<Vec<_>>();
             let mut scoped_events = account_prefix.clone();
             scoped_events.push(event.clone());
-            let source_envelopes = source_envelopes_for_live_events(
-                &state.config.source_receipt_millis,
-                &scoped_events,
-            )
-            .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
+            let source_envelopes =
+                source_envelopes_for_live_events(&state.config.source_receipts, &scoped_events)
+                    .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
             verify_replayed_live_risk(
                 &event.account_id,
                 &state.config.journal_path,
@@ -484,12 +472,13 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
     for account_id in std::mem::take(&mut recoverable_accounts) {
         let events = replay_live_account(state, &account_id)?;
         let source_envelopes =
-            source_envelopes_for_live_events(&state.config.source_receipt_millis, &events)
-                .map_err(|error| {
+            source_envelopes_for_live_events(&state.config.source_receipts, &events).map_err(
+                |error| {
                     FanoutError::Signal(format!(
                         "live recovery source evidence for {account_id}: {error}"
                     ))
-                })?;
+                },
+            )?;
         let derived = derive_projection_rows_with_sources(&account_id, &events, &source_envelopes)
             .map_err(|error| {
                 FanoutError::Signal(format!(
@@ -570,7 +559,7 @@ fn nonterminal_dispatch_targets_for_seeds(
 fn recovery_is_pending(state: &FanoutState) -> Result<bool, FanoutError> {
     // This is only an idle-work hint. The consuming pass verifies the journal and every admission
     // before using them, while even an unverifiable nonterminal admission must keep recovery pending.
-    let inventory = recovery_inventory(
+    let inventory = pe_execution_core::live_journal::structural_recovery_inventory(
         &state.config.journal_path,
         state.config.era_live_prefix.as_ref(),
     )?;
@@ -1393,36 +1382,6 @@ async fn process_target(
     signal: &LeaderSignal,
     now: OffsetDateTime,
 ) -> Result<PassControl, FanoutError> {
-    if target.state == "pending" {
-        let inventory = verified_recovery_inventory(state)?;
-        if let Some(terminal) = inventory.terminal_admissions.iter().find(|terminal| {
-            terminal.account_id.as_str() == target.account_id
-                && terminal.identity.dispatch_id == target.dispatch_id
-        }) {
-            terminalize(
-                state,
-                target,
-                terminal_recovery_reason(&terminal.outcome),
-                now,
-            )?;
-            state
-                .config
-                .paper_state
-                .finalize_dispatch_if_terminal(&target.dispatch_id, now.unix_timestamp())?;
-            return Ok(PassControl::Continue);
-        }
-        let approved_pending = inventory.approved_admissions.iter().any(|admission| {
-            admission.account_id.as_str() == target.account_id
-                && admission.admission.identity.dispatch_id == target.dispatch_id
-        });
-        let prepared_pending = inventory.open_orders.iter().any(|order| {
-            order.inventory.account_id.as_str() == target.account_id
-                && order.inventory.identity.dispatch_id == target.dispatch_id
-        });
-        if approved_pending || prepared_pending {
-            return Ok(PassControl::StopSeed);
-        }
-    }
     let accounts = state.config.live_accounts.snapshot();
     let account = accounts
         .accounts
@@ -1590,7 +1549,6 @@ async fn process_target(
         &account_state,
         venue.account_binding(),
         &venue.deposit_wallet(),
-        OffsetDateTime::now_utc(),
     )
     .await
         != CheckOutcome::Pass
@@ -1746,7 +1704,6 @@ async fn process_target(
         &account_state,
         venue.account_binding(),
         &venue.deposit_wallet(),
-        OffsetDateTime::now_utc(),
     )
     .await
         != CheckOutcome::Pass
@@ -1870,7 +1827,6 @@ async fn process_target(
             &account_state,
             venue.account_binding(),
             &venue.deposit_wallet(),
-            OffsetDateTime::now_utc(),
         )
         .await
             != CheckOutcome::Pass
@@ -1952,7 +1908,6 @@ async fn process_target(
                 &account_state,
                 venue.account_binding(),
                 &venue.deposit_wallet(),
-                OffsetDateTime::now_utc(),
             )
             .await
                 != CheckOutcome::Pass
@@ -1979,7 +1934,6 @@ async fn process_target(
                         &account_state,
                         venue.account_binding(),
                         &venue.deposit_wallet(),
-                        OffsetDateTime::now_utc(),
                     )
                     .await
                         != CheckOutcome::Pass
@@ -2081,7 +2035,7 @@ fn risk_price_expired(
     Ok(risk.price_receipts.iter().any(|receipt| {
         state
             .config
-            .source_receipt_millis
+            .source_receipts
             .received_millis(*receipt)
             .map_or(true, |observed_at_unix_ms| {
                 crate::mid_price_cache::classify_strict_price_time(
@@ -2529,7 +2483,7 @@ fn replay_live_risk_prices(
     price_receipts: &[AppendReceipt],
     evaluated_at_unix_ms: i64,
     source_envelopes: &[EventEnvelope],
-    source_index: Option<&SourceReceiptMillisIndex>,
+    source_receipts: Option<&SourceReceiptIndex>,
 ) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
     let ids = positions
         .iter()
@@ -2547,7 +2501,7 @@ fn replay_live_risk_prices(
         price_receipts,
         evaluated_at_unix_ms,
         |receipt| {
-            let envelope = match source_index {
+            let envelope = match source_receipts {
                 Some(index) => index.source_envelope(receipt).map_err(|error| {
                     RiskPriceReplayError::Insufficient(format!(
                         "risk price receipt lookup failed: {error}"
@@ -2595,7 +2549,7 @@ fn verify_replayed_live_risk_with_index(
     preceding_events: &[LiveJournalEvent],
     admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
     source_envelopes: &[EventEnvelope],
-    source_index: Option<&SourceReceiptMillisIndex>,
+    source_receipts: Option<&SourceReceiptIndex>,
     paper_frames: &[ScannedPaperFrame],
 ) -> Result<(), ProjectionReducerError> {
     let derived =
@@ -2616,7 +2570,7 @@ fn verify_replayed_live_risk_with_index(
         &admission.economic.risk.price_receipts,
         evaluated_at_unix_ms,
         source_envelopes,
-        source_index,
+        source_receipts,
     )
     .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     let paper_prefix = paper_prefix_at_financial_prefix(
@@ -2682,7 +2636,7 @@ fn verify_replayed_live_risks(
     live_journal_path: &Path,
     events: &[LiveJournalEvent],
     source_envelopes: &[EventEnvelope],
-    source_index: Option<&SourceReceiptMillisIndex>,
+    source_receipts: Option<&SourceReceiptIndex>,
     paper_frames: &[ScannedPaperFrame],
 ) -> Result<(), ProjectionReducerError> {
     for (event_index, event) in events.iter().enumerate() {
@@ -2695,7 +2649,7 @@ fn verify_replayed_live_risks(
             &events[..event_index],
             admission,
             source_envelopes,
-            source_index,
+            source_receipts,
             paper_frames,
         )?;
     }
@@ -5247,7 +5201,6 @@ async fn mode_probe(
             &standard.state,
             &standard.binding,
             &venue.deposit_wallet(),
-            OffsetDateTime::now_utc(),
         )
         .await
     };
@@ -5409,7 +5362,6 @@ async fn ensure_live_portfolio_marks(
     account_state: &pe_execution_core::LiveVenueAccountState,
     account_binding: &LiveAccountBindingAudit,
     custody_wallet: &str,
-    _requested_at: OffsetDateTime,
 ) -> CheckOutcome {
     let mut events = match replay_live_account(state, &account.account_id) {
         Ok(events) => events,
@@ -5535,10 +5487,9 @@ async fn ensure_live_portfolio_marks(
                 .filter(|event| event.timestamp.unix_timestamp() < cutoff)
                 .cloned()
                 .collect::<Vec<_>>();
-            let Ok(cutoff_sources) = source_envelopes_for_live_events(
-                &state.config.source_receipt_millis,
-                &cutoff_events,
-            ) else {
+            let Ok(cutoff_sources) =
+                source_envelopes_for_live_events(&state.config.source_receipts, &cutoff_events)
+            else {
                 return CheckOutcome::PersistentFail("daily mark source evidence");
             };
             let cutoff_derived = match derive_projection_rows_with_sources(
@@ -10669,13 +10620,11 @@ mod tests {
         assert!(!recovery_is_pending(&state).unwrap());
     }
 
-    /// PASS: repeated idle checks perform no admission verification regardless of historical
-    /// admission count; the consuming inventory still verifies every admission exactly once.
+    /// PASS: the structural idle hint reports a tampered Approved admission as pending without
+    /// evaluating its evidence, while consuming recovery rejects the invalid risk decision.
+    /// FAIL: the hint errors on the tamper, misses the pending admission, or consumption accepts it.
     #[tokio::test]
-    async fn idle_recovery_checks_do_not_reverify_historical_admissions() {
-        const HISTORICAL_ADMISSIONS: usize = 4;
-        const IDLE_TICKS: usize = 5;
-
+    async fn idle_recovery_hint_does_not_verify_admission_evidence() {
         let dir = tempdir().unwrap();
         let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let state = fanout_state(
@@ -10685,7 +10634,7 @@ mod tests {
             "http://127.0.0.1:9",
             None,
         );
-        let account_id = AccountId::new("idle-history").unwrap();
+        let account_id = AccountId::new("idle-hint").unwrap();
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
         let mut prepared = finality_prepared();
         prepared.account_state = append_recovery_baseline(
@@ -10701,36 +10650,26 @@ mod tests {
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.price_receipts.clear();
         bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
+        let mut admission = approved_admission(&prepared);
+        admission.economic.risk.snapshot.absolute_pnl_bps = BasisPoints(-1_000);
+        admission.economic.risk.decision = RiskDecisionAudit::Approved;
+        state
+            .config
+            .journal
+            .append(
+                account_id,
+                now,
+                LiveJournalPayload::AdmissionEvaluated(admission),
+            )
+            .unwrap();
 
-        for index in 0..HISTORICAL_ADMISSIONS {
-            prepared.identity = projection_identity(&format!("idle-history-{index}"));
-            prepared.economic.applied_configuration_hash = prepared.identity.config_hash.clone();
-            append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
-            state
-                .config
-                .journal
-                .append(
-                    account_id.clone(),
-                    now,
-                    LiveJournalPayload::OrderPreparationFailed(Box::new(
-                        pe_execution_core::LiveOrderPreparationFailedAudit {
-                            identity: prepared.identity.clone(),
-                            failure: pe_execution_core::LiveOrderPreparationFailure::Venue,
-                        },
-                    )),
-                )
-                .unwrap();
-        }
-
-        RECOVERY_VERIFIER_INVOCATIONS.with(|calls| calls.set(0));
-        for _ in 0..IDLE_TICKS {
-            assert!(!recovery_is_pending(&state).unwrap());
-        }
-        RECOVERY_VERIFIER_INVOCATIONS.with(|calls| assert_eq!(calls.get(), 0));
-
-        let inventory = verified_recovery_inventory(&state).unwrap();
-        assert_eq!(inventory.terminal_admissions.len(), HISTORICAL_ADMISSIONS);
-        RECOVERY_VERIFIER_INVOCATIONS.with(|calls| assert_eq!(calls.get(), HISTORICAL_ADMISSIONS));
+        assert!(recovery_is_pending(&state).unwrap());
+        assert!(matches!(
+            verified_recovery_inventory(&state),
+            Err(FanoutError::Journal(
+                pe_execution_core::LiveJournalError::OrderFactConflict
+            ))
+        ));
     }
 
     /// PASS: recovery exposes no admission when the same strict reducer rejects a zero-equity or
@@ -10804,6 +10743,8 @@ mod tests {
 
     /// PASS: crashes after a durable Refused admission or preparation failure leave a pending
     /// SQLite target that recovery deterministically terminalizes without appending another fact.
+    /// FAIL: ordinary target processing owns terminal crash reconciliation or the terminal reason
+    /// differs from the durable recovery outcome.
     #[tokio::test]
     async fn terminal_admission_crash_seams_reconcile_the_dispatch_projection() {
         for preparation_failed in [false, true] {
@@ -10892,17 +10833,16 @@ mod tests {
             let journal_len = replay_live_account(&state, &AccountId::new("acct").unwrap())
                 .unwrap()
                 .len();
-            let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
+            run_recovery_pass(&mut state, || now, true).await.unwrap();
             let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+            assert_eq!(target.state, "terminal");
             assert_eq!(
-                process_target(&mut state, &seed, &target, &projection_signal(), now)
-                    .await
-                    .unwrap(),
-                PassControl::Continue
-            );
-            assert_eq!(
-                db.dispatch_targets("dispatch-finality").unwrap()[0].state,
-                "terminal"
+                target.terminal_reason.as_deref(),
+                Some(if preparation_failed {
+                    "rejected"
+                } else {
+                    "admission_refused"
+                })
             );
             assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
             assert_eq!(
@@ -12131,7 +12071,7 @@ mod tests {
         let source_log_path = dir.path().join("live-source.log");
         let source_sink =
             crate::source_event_sink::SourceEventSink::open(&source_log_path).unwrap();
-        let source_receipt_millis = SourceReceiptMillisIndex::replay(&source_log_path).unwrap();
+        let source_receipts = SourceReceiptIndex::replay(&source_log_path).unwrap();
         let paper_log_path = dir.path().join("paper.log");
         drop(pe_event_log::Writer::open(&paper_log_path).unwrap());
         let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel(1);
@@ -12145,7 +12085,7 @@ mod tests {
                 trigger_tx,
                 source_health,
             )
-            .with_source_receipt_millis_index(source_receipt_millis.clone())
+            .with_source_receipt_index(source_receipts.clone())
             .run(),
         );
         let admission = LiveAdmissionBuilder::new(
@@ -12176,7 +12116,7 @@ mod tests {
                 book_fetcher: Arc::new(ReqwestClobBookFetcher::new(http.clone())),
                 mid_price_cache: MidPriceCache::new("http://127.0.0.1:9".to_owned()),
                 source_log: source_log.clone(),
-                source_receipt_millis,
+                source_receipts,
                 paper_log_path,
                 orchestrator_control,
                 http: http.clone(),
