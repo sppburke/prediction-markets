@@ -22,7 +22,7 @@ use pe_execution_core::{
     AdmissionReceipts, EconomicInputs, EconomicPrepared, LiveAdmissionArtifact, MarketSelection,
     ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingModeAudit,
 };
-use pe_paper_state::{FinancialFillRecord, PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{FillRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
@@ -903,7 +903,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                     prepared_receipt.sequence,
                     observation.source_receipt,
                     source_unix,
-                    &FinancialFillRecord {
+                    &FillRecord {
                         idempotency_key,
                         market_id: MarketId(VenueMarketId(economic.market.market_id.clone())),
                         outcome_id: OutcomeId(u16::from(economic.market.outcome_index)),
