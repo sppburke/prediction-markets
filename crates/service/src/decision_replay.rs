@@ -13,7 +13,6 @@ use crate::bucket_commit::{
 };
 
 const LEGACY_POST_BOUNDARY_EVIDENCE_VERSION: u16 = 2;
-const LEGACY_TERMINAL_EVIDENCE_VERSION: u16 = 3;
 pub const POST_BOUNDARY_EVIDENCE_VERSION: u16 = 4;
 pub const TERMINAL_EVIDENCE_VERSION: u16 = 5;
 const LEGACY_FINANCIAL_SEMANTIC_VERSION: u32 = 0;
@@ -398,7 +397,7 @@ struct DecodedDecisionEvidence {
 fn decode_decision_evidence(json: &str) -> Result<DecodedDecisionEvidence, ReplayDecisionError> {
     let (version, has_financial_semantic_version) = wire_version_and_financial_field(json)?;
     match (version, has_financial_semantic_version) {
-        (LEGACY_POST_BOUNDARY_EVIDENCE_VERSION | LEGACY_TERMINAL_EVIDENCE_VERSION, false) => {
+        (LEGACY_POST_BOUNDARY_EVIDENCE_VERSION, false) => {
             let legacy: LegacyDecisionPostBoundaryEvidence = serde_json::from_str(json)?;
             legacy.validate_hash()?;
             Ok(DecodedDecisionEvidence {
@@ -416,7 +415,6 @@ fn decode_decision_evidence(json: &str) -> Result<DecodedDecisionEvidence, Repla
         }
         (
             LEGACY_POST_BOUNDARY_EVIDENCE_VERSION
-            | LEGACY_TERMINAL_EVIDENCE_VERSION
             | POST_BOUNDARY_EVIDENCE_VERSION
             | TERMINAL_EVIDENCE_VERSION,
             _,
@@ -695,10 +693,7 @@ pub fn replay_decision_pending(
     }
     let disposition = post_boundary.body.terminal.disposition.as_str();
     let terminal = &post_boundary.body.terminal;
-    if matches!(
-        post_boundary.body.version,
-        LEGACY_TERMINAL_EVIDENCE_VERSION | TERMINAL_EVIDENCE_VERSION
-    ) {
+    if post_boundary.body.version == TERMINAL_EVIDENCE_VERSION {
         let typed_decline = terminal.decline.is_some()
             && terminal.disposition == "no_fill"
             && terminal.fill.is_none()
@@ -1153,20 +1148,20 @@ mod tests {
         );
     }
 
-    /// PASS: a retained pre-financial v3 typed terminal uses the old body-only hash and remains
-    /// readable, while the same legacy version carrying the new field is rejected as ambiguous.
+    /// PASS: a current typed terminal that lost its financial semantic field is rejected as
+    /// ambiguous instead of being decoded under either generation.
     #[test]
-    fn legacy_v3_terminal_dispatches_by_version_and_field_presence() {
+    fn current_terminal_without_financial_field_is_ambiguous() {
         let mut row = terminal_row(
-            "legacy-v3",
+            "missing-financial-field",
             AuthorityEvidence::not_read("strategy_declined"),
             TerminalDispositionEvidence::declined(
                 &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
                 unavailable_inputs(),
             ),
         );
-        let current_json = row.post_commit_inputs_json.clone();
-        let mut missing_field: serde_json::Value = serde_json::from_str(&current_json).unwrap();
+        let mut missing_field: serde_json::Value =
+            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
         missing_field
             .as_object_mut()
             .unwrap()
@@ -1176,34 +1171,6 @@ mod tests {
             replay_decision_pending(&row),
             Err(ReplayDecisionError::FinancialSemanticField {
                 version: TERMINAL_EVIDENCE_VERSION
-            })
-        ));
-
-        row.post_commit_inputs_json = current_json;
-        let current: DecisionPostBoundaryEvidence =
-            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
-        let mut body = current.body;
-        body.version = LEGACY_TERMINAL_EVIDENCE_VERSION;
-        let legacy = LegacyDecisionPostBoundaryEvidence {
-            document_blake3: legacy_body_hash(&body).unwrap(),
-            body,
-        };
-        row.post_commit_inputs_json = serde_json::to_string(&legacy).unwrap();
-        let replayed = replay_decision_pending(&row).unwrap();
-        assert_eq!(
-            replayed.post_boundary.body.version,
-            LEGACY_TERMINAL_EVIDENCE_VERSION
-        );
-
-        let mut ambiguous: serde_json::Value =
-            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
-        ambiguous["financial_semantic_version"] =
-            json!(crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION);
-        row.post_commit_inputs_json = serde_json::to_string(&ambiguous).unwrap();
-        assert!(matches!(
-            replay_decision_pending(&row),
-            Err(ReplayDecisionError::FinancialSemanticField {
-                version: LEGACY_TERMINAL_EVIDENCE_VERSION
             })
         ));
     }
