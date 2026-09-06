@@ -365,6 +365,15 @@ and revalidates them from disk before entering `guarded`. The copy manifest, res
 outer JSON are installed with the shared durable atomic-write primitive (file sync, rename, then
 parent-directory sync).
 
+The mandatory production rehearsal is the PostgREST-level authorization proof: it runs the real
+service through the target project's PostgREST endpoint with the publishable key in both credential
+slots and requires the child's denied account read to surface as `live.stale: true` with an empty
+`live.accounts` list. CI does not install a PostgREST daemon solely for this proof because that would
+add a new infrastructure dependency outside this service/schema change; instead, the PostgreSQL
+scenario proves the real candidate-schema grants under `anon` and `service_role`, and the service
+unit test proves that PostgREST 401/403 responses select the stale, empty boot snapshot. These CI
+checks do not replace or waive the production rehearsal.
+
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
 contract is verified before the guarded mutation. Only after the physical Start does the driver

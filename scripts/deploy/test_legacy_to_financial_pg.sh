@@ -721,4 +721,87 @@ end $$;
 SQL
 pass_step
 
+start_step "prove protected account reads and the rehearsal census against the candidate schema"
+for table_name in accounts account_credentials; do
+  denied_log="$RUNNER_TEMP/anon-${table_name}-select.log"
+  if psql_service_db -v ON_ERROR_STOP=1 >"$denied_log" 2>&1 <<SQL
+begin;
+set local role anon;
+select count(*) from public.$table_name;
+commit;
+SQL
+  then
+    die "anon unexpectedly selected from public.$table_name"
+  fi
+  if ! grep -Fq "permission denied for table $table_name" "$denied_log"; then
+    sed -n '1,120p' "$denied_log" >&2
+    die "anon public.$table_name read failed for an unexpected reason"
+  fi
+done
+
+service_role_initial_counts=$(psql_service_db -v ON_ERROR_STOP=1 -Atq <<'SQL'
+begin;
+set local role service_role;
+select current_user || '|' ||
+       (select count(*)::text from public.accounts) || '|' ||
+       (select count(*)::text from public.account_credentials);
+commit;
+SQL
+)
+[[ "$service_role_initial_counts" == 'service_role|1|0' ]] ||
+  die "service_role protected-table reads returned unexpected counts: $service_role_initial_counts"
+
+psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+begin;
+set local role service_role;
+delete from public.accounts;
+commit;
+SQL
+zero_census=$(PGOPTIONS='-c role=service_role' account_census_observation)
+read -r zero_count zero_digest zero_safe <<< "$zero_census"
+[[ "$zero_count" == 0 && "$zero_digest" =~ ^[0-9a-f]{64}$ && "$zero_safe" == 1 ]] ||
+  die "service_role zero-row account census is invalid: $zero_census"
+
+psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+begin;
+set local role service_role;
+select public.account_create('ci-auth-chain', true, 'ci-545');
+select public.account_rotate_credentials(
+  'ci-auth-chain', 1, 'ci-key', 'ci-sealed-bundle', 'ci-fingerprint', 'ci-545'
+);
+commit;
+SQL
+before_census=$(PGOPTIONS='-c role=service_role' account_census_observation)
+read -r before_count before_digest before_safe <<< "$before_census"
+[[ "$before_count" == 1 && "$before_digest" =~ ^[0-9a-f]{64}$ && "$before_safe" == 1 ]] ||
+  die "service_role non-zero account census is invalid: $before_census"
+service_role_nonzero_counts=$(psql_service_db -v ON_ERROR_STOP=1 -Atq <<'SQL'
+begin;
+set local role service_role;
+select current_user || '|' ||
+       (select count(*)::text from public.accounts) || '|' ||
+       (select count(*)::text from public.account_credentials);
+commit;
+SQL
+)
+[[ "$service_role_nonzero_counts" == 'service_role|1|1' ]] ||
+  die "service_role non-zero protected-table reads returned unexpected counts: $service_role_nonzero_counts"
+
+psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+begin;
+set local role service_role;
+select public.account_request_mode('ci-auth-chain', 'live_tiny', 'ci-545');
+select public.account_set_effective_mode(
+  'ci-auth-chain', 'live_tiny', 'ci-545', 'census drift proof'
+);
+commit;
+SQL
+after_census=$(PGOPTIONS='-c role=service_role' account_census_observation)
+read -r after_count after_digest after_safe <<< "$after_census"
+[[ "$after_count" == 1 && "$after_digest" =~ ^[0-9a-f]{64}$ && "$after_safe" == 0 ]] ||
+  die "live_tiny account census did not fail closed: $after_census"
+[[ "$before_digest" != "$after_digest" ]] ||
+  die "the shared rehearsal census did not detect the live_tiny mode change"
+pass_step
+
 echo "CIPG PASS: real PostgreSQL Legacy17-to-Financial15 scenario completed"

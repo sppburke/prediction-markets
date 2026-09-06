@@ -610,7 +610,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::activity_ingest::ActivityIngest;
     use crate::health::new_shared_health_with_ws;
@@ -634,6 +634,19 @@ mod tests {
                 r#"[{{"conditionId":"0xoverlap","outcomePrices":"[\"{price}\",\"0.5\"]"}}]"#
             )
             .into_bytes())
+        }
+    }
+
+    struct ControlledResponseFetcher {
+        response_completed: Arc<AtomicBool>,
+        body: Vec<u8>,
+    }
+
+    impl PageFetcher for ControlledResponseFetcher {
+        async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            let body = self.body.clone();
+            self.response_completed.store(true, Ordering::Release);
+            Ok(body)
         }
     }
 
@@ -940,34 +953,44 @@ mod tests {
                 )
                 .run(),
             );
-            let mut fx = HashMap::new();
-            fx.insert(
-                url(BASE, "0xcold"),
-                br#"[{"conditionId":"0xcold","outcomePrices":"[\"0.62\",\"0.38\"]"}]"#.to_vec(),
-            );
             let base = datetime!(2026-09-05 12:00 UTC);
+            let response_completed = Arc::new(AtomicBool::new(false));
+            let fetcher = ControlledResponseFetcher {
+                response_completed: Arc::clone(&response_completed),
+                body: br#"[{"conditionId":"0xcold","outcomePrices":"[\"0.62\",\"0.38\"]"}]"#
+                    .to_vec(),
+            };
             let ticks = Arc::new(std::sync::atomic::AtomicI64::new(0));
             let clock_ticks = Arc::clone(&ticks);
-            let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_owned())
+            let clock_response_completed = Arc::clone(&response_completed);
+            let cache = MidPriceCache::with_fetcher(fetcher, BASE.to_owned())
                 .with_source_log(source_log)
                 .with_clock(Arc::new(move || {
-                    base + time::Duration::seconds(
-                        clock_ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-                    )
+                    let tick = clock_ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if tick == 1 {
+                        assert!(
+                            clock_response_completed.load(Ordering::Acquire),
+                            "pre-response stamping: the observation clock was read before the Gamma response completed"
+                        );
+                    }
+                    base + time::Duration::seconds(tick)
                 }));
             if stale_seed {
-                insert_strict_entry(
-                    &cache,
-                    "0xcold",
-                    Some(vec![
-                        Price::new(Decimal::new(5, 1)).unwrap(),
-                        Price::new(Decimal::new(5, 1)).unwrap(),
-                    ]),
-                    base - time::Duration::seconds(61),
-                    None,
-                    false,
-                )
-                .await;
+                let prices = vec![
+                    Price::new(Decimal::new(5, 1)).unwrap(),
+                    Price::new(Decimal::new(5, 1)).unwrap(),
+                ];
+                cache.inner.lock().await.insert(
+                    mid("0xcold"),
+                    CachedEntry {
+                        mids: prices.iter().map(|price| price.0).collect(),
+                        strict_mids: Some(prices),
+                        snapshot: MidMarketSnapshot::default(),
+                        observed_at: base - time::Duration::seconds(61),
+                        receipt: None,
+                        conflicting: false,
+                    },
+                );
             }
 
             let attempt = cache
@@ -981,8 +1004,8 @@ mod tests {
             );
             assert_eq!(attempt.price_receipts.len(), 1, "stale_seed={stale_seed}");
             // Reads: the refetch decision, the post-response stamp, then the evaluation instant.
-            // FAIL: stamping the page before the response (taking the second read before the
-            // fetch) would record `base + 1` on a page that had not been received yet.
+            // FAIL: stamping the page before the response makes the second clock read panic with
+            // the controlled fetcher's completion flag still clear.
             assert_eq!(attempt.evaluated_at, base + time::Duration::seconds(2));
             assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 3);
             let receipt = attempt.price_receipts[0];

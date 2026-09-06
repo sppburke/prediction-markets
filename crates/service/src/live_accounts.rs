@@ -395,6 +395,46 @@ mod tests {
         assert!(url.starts_with("https://example.test/rest/v1/accounts?select=account_id,"));
     }
 
+    /// PASS: PostgREST authorization denial on the first protected account read produces the
+    /// same empty, never-fresh snapshot selected by the service's boot fallback.
+    #[tokio::test]
+    async fn authorization_denial_yields_stale_empty_boot_snapshot() {
+        for status in [
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::http::StatusCode::FORBIDDEN,
+        ] {
+            let app = axum::Router::new().route(
+                "/rest/v1/accounts",
+                axum::routing::get(move || async move { status }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let fetched = fetch_live_accounts(
+                &reqwest::Client::new(),
+                &format!("http://{address}"),
+                "publishable-key",
+                "",
+            )
+            .await;
+            assert!(
+                matches!(
+                    &fetched,
+                    Err(SupabaseError::Status(actual)) if *actual == status.as_u16()
+                ),
+                "expected account read status {status}, got {fetched:?}"
+            );
+            let snapshot = fetched.unwrap_or_default();
+            assert!(snapshot.accounts.is_empty());
+            assert_eq!(snapshot.fetched_at_unix, None);
+            assert!(!snapshot.is_fresh(time::OffsetDateTime::now_utc().unix_timestamp()));
+
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     #[test]
     fn unarmed_disabled_credentialless_and_invalid_accounts_never_target() {
         let snap = LiveAccountsSnapshot::from_rows(
