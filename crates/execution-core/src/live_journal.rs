@@ -1043,20 +1043,23 @@ pub fn prepared_order_fact_matches(
     }
 }
 
+/// Pure classification shared by live Polygon collection and retained-evidence replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RetainedPolygonDisposition {
-    Reconciled(LiveJournalOrderOutcome),
-    Finalized,
-}
-
-fn malformed_polygon_body(error: &ReceiptError) -> bool {
-    matches!(
-        error,
-        ReceiptError::MalformedRpc
-            | ReceiptError::MissingResult
-            | ReceiptError::UnsupportedFinalizedTag
-            | ReceiptError::MalformedHex
-    )
+pub enum PolygonFinalityClassification {
+    Pending {
+        reason: String,
+    },
+    Conflict {
+        reason: String,
+    },
+    Finalized {
+        principal: CollateralAmount,
+        quantity: ShareAmount,
+        fee: CollateralAmount,
+        matched_logs: Vec<MatchedLogIdentity>,
+        chain_id: u64,
+        finalized_head: u64,
+    },
 }
 
 fn unavailable_polygon_error(error: &ReceiptError) -> bool {
@@ -1120,21 +1123,21 @@ fn verified_rpc_body<'a>(
     }
 }
 
-fn classify_retained_polygon_finality(
+#[must_use]
+pub fn classify_polygon_finality(
     prepared: &LiveOrderPreparedAudit,
     transaction_hashes: &[String],
-    chain_id: Option<u64>,
+    chain_id: &Result<u64, ReceiptError>,
     head: &Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>,
     receipts: &BTreeMap<String, Result<Option<MatchedReceipt>, ReceiptError>>,
     blocks: &BTreeMap<u64, Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>>,
-) -> RetainedPolygonDisposition {
-    let pending = |reason| {
-        RetainedPolygonDisposition::Reconciled(LiveJournalOrderOutcome::FinalityPending { reason })
+) -> PolygonFinalityClassification {
+    let pending = |reason| PolygonFinalityClassification::Pending { reason };
+    let conflict = |reason| PolygonFinalityClassification::Conflict { reason };
+    let Ok(chain_id) = chain_id else {
+        return pending("polygon chain identity unavailable or not 137".to_owned());
     };
-    let conflict = |reason| {
-        RetainedPolygonDisposition::Reconciled(LiveJournalOrderOutcome::FinalityConflict { reason })
-    };
-    if chain_id != Some(pe_venue_polymarket::FINALIZED_CHAIN_ID) {
+    if *chain_id != pe_venue_polymarket::FINALIZED_CHAIN_ID {
         return pending("polygon chain identity unavailable or not 137".to_owned());
     }
     let Ok(head) = head else {
@@ -1246,7 +1249,20 @@ fn classify_retained_polygon_finality(
     if !fee_within_reserve(fee, prepared.economic.fee.reserve) {
         return conflict("finalized fee exceeds the prepared reserve".to_owned());
     }
-    RetainedPolygonDisposition::Finalized
+    PolygonFinalityClassification::Finalized {
+        principal,
+        quantity,
+        fee,
+        matched_logs: fills
+            .into_keys()
+            .map(|(transaction_hash, log_index)| MatchedLogIdentity {
+                transaction_hash,
+                log_index,
+            })
+            .collect(),
+        chain_id: *chain_id,
+        finalized_head: head.number,
+    }
 }
 
 /// Strictly re-execute a retained Polygon Pending/Conflict fact from its complete raw evidence.
@@ -1277,10 +1293,8 @@ pub fn verify_polygon_reconciliation(
         &serde_json::json!([]),
     )?;
     let chain_id = match chain_body {
-        Some(body) => Some(
-            parse_chain_id_response(body).map_err(|_| LiveJournalError::InvalidFinalityEvidence)?,
-        ),
-        None => None,
+        Some(body) => parse_chain_id_response(body),
+        None => Err(ReceiptError::MalformedRpc),
     };
 
     let mut receipts = BTreeMap::new();
@@ -1295,12 +1309,7 @@ pub fn verify_polygon_reconciliation(
             &serde_json::json!([hash]),
         )?;
         let parsed = match body {
-            Some(body) => match parse_receipt_response(body, hash) {
-                Err(error) if malformed_polygon_body(&error) => {
-                    return Err(LiveJournalError::InvalidFinalityEvidence);
-                }
-                parsed => parsed,
-            },
+            Some(body) => parse_receipt_response(body, hash),
             None => Err(ReceiptError::MalformedRpc),
         };
         receipts.insert(hash.clone(), parsed);
@@ -1316,8 +1325,7 @@ pub fn verify_polygon_reconciliation(
         &serde_json::json!(["finalized", false]),
     )?;
     let head = match head_body {
-        Some(body) => Ok(parse_finalized_block_response(body)
-            .map_err(|_| LiveJournalError::InvalidFinalityEvidence)?),
+        Some(body) => parse_finalized_block_response(body),
         None => Err(ReceiptError::MalformedRpc),
     };
 
@@ -1352,12 +1360,7 @@ pub fn verify_polygon_reconciliation(
             &serde_json::json!([format!("0x{height:x}"), false]),
         )?;
         let block = match body {
-            Some(body) => match canonical_block_matches(body, height, expected_hash) {
-                Err(error) if malformed_polygon_body(&error) => {
-                    return Err(LiveJournalError::InvalidFinalityEvidence);
-                }
-                block => block,
-            },
+            Some(body) => canonical_block_matches(body, height, expected_hash),
             None => Err(ReceiptError::MalformedRpc),
         };
         blocks.insert(height, block);
@@ -1366,20 +1369,33 @@ pub fn verify_polygon_reconciliation(
         return Err(LiveJournalError::InvalidFinalityEvidence);
     }
 
-    let derived = classify_retained_polygon_finality(
+    let derived = classify_polygon_finality(
         prepared,
         &ordered_hashes,
-        chain_id,
+        &chain_id,
         &head,
         &receipts,
         &blocks,
     );
-    if derived != RetainedPolygonDisposition::Reconciled(reconciled.outcome.clone()) {
+    let expected = match &reconciled.outcome {
+        LiveJournalOrderOutcome::FinalityPending { reason } => {
+            PolygonFinalityClassification::Pending {
+                reason: reason.clone(),
+            }
+        }
+        LiveJournalOrderOutcome::FinalityConflict { reason } => {
+            PolygonFinalityClassification::Conflict {
+                reason: reason.clone(),
+            }
+        }
+        _ => return Err(LiveJournalError::InvalidFinalityEvidence),
+    };
+    if derived != expected {
         return Err(LiveJournalError::InvalidFinalityEvidence);
     }
 
     let mut immutable = BTreeMap::new();
-    if chain_id == Some(pe_venue_polymarket::FINALIZED_CHAIN_ID)
+    if chain_id == Ok(pe_venue_polymarket::FINALIZED_CHAIN_ID)
         && let Ok(head) = &head
     {
         for (hash, receipt) in &receipts {

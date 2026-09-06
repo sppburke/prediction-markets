@@ -19,7 +19,8 @@ use pe_core_types::{
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
 use pe_execution_core::live_journal::{
     LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
-    verify_http_response_request, verify_polygon_reconciliation,
+    PolygonFinalityClassification, classify_polygon_finality, verify_http_response_request,
+    verify_polygon_reconciliation,
 };
 use pe_execution_core::{
     CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
@@ -411,14 +412,15 @@ pub enum FinalityJournalEffect {
     Finalized,
 }
 
-struct ReceiptObservation {
-    attempt: RawHttpAttempt,
-    parsed: Result<Option<MatchedReceipt>, ReceiptError>,
-}
-
-struct BlockObservation {
-    attempt: RawHttpAttempt,
-    block: Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>,
+struct CollectedPolygonFinality {
+    chain_id: Result<u64, ReceiptError>,
+    chain_attempt: RawHttpAttempt,
+    head: Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>,
+    head_attempt: RawHttpAttempt,
+    receipts: BTreeMap<String, Result<Option<MatchedReceipt>, ReceiptError>>,
+    receipt_attempts: BTreeMap<String, RawHttpAttempt>,
+    blocks: BTreeMap<u64, Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>>,
+    block_attempts: BTreeMap<u64, RawHttpAttempt>,
 }
 
 /// Execute one bounded recovery pass: one chain read, one read per distinct transaction, one
@@ -433,20 +435,22 @@ pub async fn collect_order_finality(
 
     let chain_attempt = rpc.chain_id().await;
     let chain_id = response_body(&chain_attempt)
-        .and_then(|body| parse_chain_id_response(body).map_err(|_| ()))
-        .ok();
+        .map_err(|()| ReceiptError::MalformedRpc)
+        .and_then(parse_chain_id_response);
 
     let hashes = orders
         .iter()
         .flat_map(|order| order.transaction_hashes.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut receipts = BTreeMap::new();
+    let mut receipt_attempts = BTreeMap::new();
     for hash in hashes {
         let attempt = rpc.transaction_receipt(&hash).await;
         let parsed = response_body(&attempt)
             .map_err(|_| ReceiptError::MalformedRpc)
             .and_then(|body| parse_receipt_response(body, &hash));
-        receipts.insert(hash, ReceiptObservation { attempt, parsed });
+        receipt_attempts.insert(hash.clone(), attempt);
+        receipts.insert(hash, parsed);
     }
 
     let head_attempt = rpc.finalized_block().await;
@@ -456,7 +460,7 @@ pub async fn collect_order_finality(
     let mut lower_heights = BTreeSet::new();
     if let Ok(head) = &head {
         for observation in receipts.values() {
-            if let Ok(Some(receipt)) = &observation.parsed
+            if let Ok(Some(receipt)) = observation
                 && receipt.block_number < head.number
             {
                 lower_heights.insert(receipt.block_number);
@@ -464,249 +468,121 @@ pub async fn collect_order_finality(
         }
     }
     let mut blocks = BTreeMap::new();
+    let mut block_attempts = BTreeMap::new();
     for height in lower_heights {
         let attempt = rpc.block_by_number(height).await;
-        let expected_hash = receipts
-            .values()
-            .find_map(|observation| match &observation.parsed {
-                Ok(Some(receipt)) if receipt.block_number == height => {
-                    Some(receipt.block_hash.as_str())
-                }
-                Ok(Some(_)) | Ok(None) | Err(_) => None,
-            });
+        let expected_hash = receipts.values().find_map(|observation| match observation {
+            Ok(Some(receipt)) if receipt.block_number == height => {
+                Some(receipt.block_hash.as_str())
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => None,
+        });
         let block = match (response_body(&attempt), expected_hash) {
             (Ok(body), Some(hash)) => canonical_block_matches(body, height, hash),
             (Ok(_), None) | (Err(_), _) => Err(ReceiptError::MalformedRpc),
         };
-        blocks.insert(height, BlockObservation { attempt, block });
+        block_attempts.insert(height, attempt);
+        blocks.insert(height, block);
     }
+    let collected = CollectedPolygonFinality {
+        chain_id,
+        chain_attempt,
+        head,
+        head_attempt,
+        receipts,
+        receipt_attempts,
+        blocks,
+        block_attempts,
+    };
 
     orders
         .into_iter()
-        .map(|order| {
-            classify_order_finality(
-                order,
-                chain_id,
-                &chain_attempt,
-                &head_attempt,
-                &head,
-                &receipts,
-                &blocks,
-            )
-        })
+        .map(|order| order_finality_result(order, &collected))
         .collect()
 }
 
-fn classify_order_finality(
+fn order_finality_result(
     order: PendingOrderFinality,
-    chain_id: Option<u64>,
-    chain_attempt: &RawHttpAttempt,
-    head_attempt: &RawHttpAttempt,
-    head: &Result<pe_venue_polymarket::FinalizedBlock, ReceiptError>,
-    receipts: &BTreeMap<String, ReceiptObservation>,
-    blocks: &BTreeMap<u64, BlockObservation>,
+    collected: &CollectedPolygonFinality,
 ) -> OrderFinalityResult {
     let identity = order.prepared.identity.clone();
     let order_hash = order.prepared.prepared.order_hash.clone();
-    let order_evidence = || {
-        let relevant_heights = order
-            .transaction_hashes
-            .iter()
-            .filter_map(|hash| receipts.get(hash))
-            .filter_map(|observation| match &observation.parsed {
-                Ok(Some(receipt))
-                    if receipt.block_number < head.as_ref().map_or(0, |h| h.number) =>
-                {
-                    Some(receipt.block_number)
-                }
-                Ok(Some(_)) | Ok(None) | Err(_) => None,
-            })
-            .collect::<BTreeSet<_>>();
-        std::iter::once(chain_attempt.clone())
-            .chain(
-                order
-                    .transaction_hashes
-                    .iter()
-                    .filter_map(|hash| receipts.get(hash))
-                    .map(|item| item.attempt.clone()),
-            )
-            .chain(std::iter::once(head_attempt.clone()))
-            .chain(
-                relevant_heights
-                    .iter()
-                    .filter_map(|height| blocks.get(height))
-                    .map(|item| item.attempt.clone()),
-            )
-            .collect::<Vec<_>>()
-    };
-    let pending = |reason: String| OrderFinalityResult {
-        identity: identity.clone(),
-        order_hash: order_hash.clone(),
-        disposition: OrderFinalityDisposition::Pending {
-            reason,
-            evidence: order_evidence(),
-        },
-    };
-    let conflict = |reason: String| OrderFinalityResult {
-        identity: identity.clone(),
-        order_hash: order_hash.clone(),
-        disposition: OrderFinalityDisposition::Conflict {
-            reason,
-            evidence: order_evidence(),
-        },
-    };
-
-    if chain_id != Some(pe_venue_polymarket::FINALIZED_CHAIN_ID) {
-        return pending("polygon chain identity unavailable or not 137".to_owned());
-    }
-    let Ok(head) = head else {
-        return pending("polygon finalized head unavailable".to_owned());
-    };
-    if order.transaction_hashes.is_empty() {
-        return pending("authenticated match has no nonzero transaction hash yet".to_owned());
-    }
-
-    let mut fills = BTreeMap::<(String, u64), DecodedOrderFill>::new();
-    let mut receipt_evidence = vec![chain_attempt.clone()];
-    let mut block_evidence = vec![head_attempt.clone()];
-    let mut has_unfinalized = false;
-    for hash in &order.transaction_hashes {
-        let Some(observation) = receipts.get(hash) else {
-            return conflict(format!(
-                "receipt request missing for authenticated transaction {hash}"
-            ));
-        };
-        receipt_evidence.push(observation.attempt.clone());
-        let receipt = match &observation.parsed {
-            Ok(Some(receipt)) => receipt,
-            Ok(None) => {
-                has_unfinalized = true;
-                continue;
+    let relevant_heights = order
+        .transaction_hashes
+        .iter()
+        .filter_map(|hash| collected.receipts.get(hash))
+        .filter_map(|observation| match observation {
+            Ok(Some(receipt))
+                if receipt.block_number < collected.head.as_ref().map_or(0, |h| h.number) =>
+            {
+                Some(receipt.block_number)
             }
-            Err(error) if finality_evidence_unavailable(error) => {
-                return pending(format!("transaction receipt unavailable: {error}"));
-            }
-            Err(error) => return conflict(format!("transaction receipt conflict: {error}")),
-        };
-        if receipt.block_number > head.number {
-            has_unfinalized = true;
-            continue;
-        }
-        if receipt.block_number == head.number {
-            if receipt.block_hash != head.hash {
-                return conflict("receipt block hash conflicts with finalized head".to_owned());
-            }
-        } else {
-            let Some(block) = blocks.get(&receipt.block_number) else {
-                return conflict("canonical lower block evidence is missing".to_owned());
-            };
-            block_evidence.push(block.attempt.clone());
-            match &block.block {
-                Ok(canonical) if canonical.hash == receipt.block_hash => {}
-                Ok(_) => return conflict("receipt block hash is not canonical".to_owned()),
-                Err(error) if finality_evidence_unavailable(error) => {
-                    return pending(format!("canonical block unavailable: {error}"));
-                }
-                Err(error) => return conflict(format!("canonical block conflict: {error}")),
-            }
-        }
-        let decoded = match decode_order_fills(receipt, &order.prepared.prepared) {
-            Ok(decoded) => decoded,
-            Err(error) => return conflict(format!("OrderFilled conflict: {error}")),
-        };
-        for fill in decoded {
-            let key = (fill.transaction_hash.clone(), fill.log_index);
-            match fills.get(&key) {
-                Some(existing) if existing == &fill => {}
-                Some(_) => {
-                    return conflict(
-                        "OrderFilled log identity was reused with different content".to_owned(),
-                    );
-                }
-                None => {
-                    fills.insert(key, fill);
-                }
-            }
-        }
-    }
-    if has_unfinalized {
-        return pending("one or more authenticated transactions are not finalized".to_owned());
-    }
-    if fills.is_empty() {
-        return conflict("finalized receipts contain zero matching OrderFilled logs".to_owned());
-    }
-
-    let aggregates = fills.values().try_fold(
-        (
-            CollateralAmount::ZERO,
-            ShareAmount::ZERO,
-            CollateralAmount::ZERO,
-        ),
-        |(principal, quantity, fee), fill| {
-            Some((
-                principal.checked_add(fill.principal).ok()?,
-                quantity.checked_add(fill.quantity).ok()?,
-                fee.checked_add(fill.fee).ok()?,
-            ))
-        },
-    );
-    let Some((principal, quantity, fee)) = aggregates else {
-        return conflict("finalized fill aggregation overflow".to_owned());
-    };
-    if order.prepared.economic.sizing.principal != order.prepared.prepared.maker_collateral
-        || order.prepared.economic.ladder.minimum_shares != order.prepared.prepared.taker_shares
-    {
-        return conflict("prepared economics disagree with the signed order".to_owned());
-    }
-    let expected_principal = order.prepared.prepared.maker_collateral;
-    if principal < expected_principal {
-        return pending("finalized principal remains below the signed principal".to_owned());
-    }
-    if principal > expected_principal {
-        return conflict("finalized principal exceeds the signed principal".to_owned());
-    }
-    if quantity < order.prepared.economic.ladder.minimum_shares {
-        return conflict(
-            "full-principal finalized quantity is below the signed minimum".to_owned(),
-        );
-    }
-    if !fee_within_reserve(fee, order.prepared.economic.fee.reserve) {
-        return conflict("finalized fee exceeds the prepared reserve".to_owned());
-    }
-
-    let matched_logs = fills
-        .into_keys()
-        .map(|(transaction_hash, log_index)| MatchedLogIdentity {
-            transaction_hash,
-            log_index,
+            Ok(Some(_)) | Ok(None) | Err(_) => None,
         })
-        .collect();
-    OrderFinalityResult {
-        identity: identity.clone(),
-        order_hash,
-        disposition: OrderFinalityDisposition::Finalized(Box::new(OrderFillFinalizedAudit {
-            identity,
+        .collect::<BTreeSet<_>>();
+    let receipt_evidence = std::iter::once(collected.chain_attempt.clone())
+        .chain(
+            order
+                .transaction_hashes
+                .iter()
+                .filter_map(|hash| collected.receipt_attempts.get(hash).cloned()),
+        )
+        .collect::<Vec<_>>();
+    let block_evidence = std::iter::once(collected.head_attempt.clone())
+        .chain(
+            relevant_heights
+                .iter()
+                .filter_map(|height| collected.block_attempts.get(height).cloned()),
+        )
+        .collect::<Vec<_>>();
+    let reconciliation_evidence = || {
+        receipt_evidence
+            .iter()
+            .chain(&block_evidence)
+            .cloned()
+            .collect()
+    };
+    let disposition = match classify_polygon_finality(
+        &order.prepared,
+        &order.transaction_hashes,
+        &collected.chain_id,
+        &collected.head,
+        &collected.receipts,
+        &collected.blocks,
+    ) {
+        PolygonFinalityClassification::Pending { reason } => OrderFinalityDisposition::Pending {
+            reason,
+            evidence: reconciliation_evidence(),
+        },
+        PolygonFinalityClassification::Conflict { reason } => OrderFinalityDisposition::Conflict {
+            reason,
+            evidence: reconciliation_evidence(),
+        },
+        PolygonFinalityClassification::Finalized {
+            principal,
+            quantity,
+            fee,
+            matched_logs,
+            chain_id,
+            finalized_head,
+        } => OrderFinalityDisposition::Finalized(Box::new(OrderFillFinalizedAudit {
+            identity: identity.clone(),
             prepared_journal_seq: order.prepared_journal_seq,
             principal,
             quantity,
             fee,
             matched_logs,
-            chain_id: pe_venue_polymarket::FINALIZED_CHAIN_ID,
-            finalized_head: head.number,
+            chain_id,
+            finalized_head,
             receipts: receipt_evidence,
             blocks: block_evidence,
         })),
+    };
+    OrderFinalityResult {
+        identity,
+        order_hash,
+        disposition,
     }
-}
-
-fn finality_evidence_unavailable(error: &ReceiptError) -> bool {
-    matches!(
-        error,
-        ReceiptError::MalformedRpc
-            | ReceiptError::RpcError
-            | ReceiptError::MissingResult
-            | ReceiptError::UnsupportedFinalizedTag
-    )
 }
 
 fn response_body(attempt: &RawHttpAttempt) -> Result<&[u8], ()> {
@@ -2190,6 +2066,8 @@ pub(crate) fn derive_projection_rows_with_sources(
                                 return Err(ProjectionReducerError::FinalityObservationConflict);
                             }
                             state.phase = PolygonFinalityPhase::Conflict;
+                            *terminal = true;
+                            terminal_reconciliations.insert(key.clone(), reconciled.clone());
                         }
                         _ => return Err(ProjectionReducerError::InvalidFinalityEvidence),
                     }
@@ -2218,6 +2096,12 @@ pub(crate) fn derive_projection_rows_with_sources(
                 ) {
                     return Err(ProjectionReducerError::PreparedSequenceMismatch);
                 }
+                if polygon_finality
+                    .get(&key)
+                    .is_some_and(|state| state.phase == PolygonFinalityPhase::Conflict)
+                {
+                    return Err(ProjectionReducerError::FinalityConflictFrozen);
+                }
                 if (*terminal && !fills.contains_key(&key))
                     || finalized.principal != prepared_audit.economic.sizing.principal
                     || finalized.principal != prepared_audit.prepared.maker_collateral
@@ -2229,9 +2113,6 @@ pub(crate) fn derive_projection_rows_with_sources(
                     return Err(ProjectionReducerError::InvalidFinalizedFill);
                 }
                 let finality_state = polygon_finality.entry(key.clone()).or_default();
-                if finality_state.phase == PolygonFinalityPhase::Conflict {
-                    return Err(ProjectionReducerError::FinalityConflictFrozen);
-                }
                 let finalized_receipts =
                     verify_finalized_evidence(finalized, &prepared_audit.prepared)?;
                 for (hash, prior) in &finality_state.immutable_receipts {
@@ -7148,6 +7029,24 @@ mod tests {
         })
     }
 
+    fn finality_matched(
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        transaction_hash: String,
+    ) -> LiveOrderReconciliationAudit {
+        LiveOrderReconciliationAudit {
+            identity: prepared.identity.clone(),
+            order_hash: prepared.prepared.order_hash.clone(),
+            source: LiveReconciliationSource::PostResponse,
+            outcome: LiveJournalOrderOutcome::Matched {
+                venue_order_id: "venue-order".to_owned(),
+                transaction_hashes: vec![transaction_hash],
+                executed: None,
+            },
+            evidence: Vec::new(),
+            evidence_hashes: Vec::new(),
+        }
+    }
+
     /// PASS: a terminal reconciliation cannot release a reservation unless every Prepared
     /// identity field, order hash, account envelope, and source/outcome pairing match.
     #[test]
@@ -7252,28 +7151,49 @@ mod tests {
 
     struct FakePolygonRpc {
         calls: Mutex<Vec<(String, Option<u64>)>>,
+        chain_id_body: Vec<u8>,
         finalized_head: u64,
+        finalized_body: Option<Vec<u8>>,
         receipt: Vec<u8>,
         receipts_by_hash: BTreeMap<String, Vec<u8>>,
         canonical_hash_byte: &'static str,
+        canonical_body: Option<Vec<u8>>,
     }
 
     impl FakePolygonRpc {
         fn new(finalized_head: u64) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                chain_id_body: br#"{"jsonrpc":"2.0","id":1,"result":"0x89"}"#.to_vec(),
                 finalized_head,
+                finalized_body: None,
                 receipt: include_bytes!(
                     "../../venue-polymarket/tests/fixtures/receipts/standard_v2.json"
                 )
                 .to_vec(),
                 receipts_by_hash: BTreeMap::new(),
                 canonical_hash_byte: "aa",
+                canonical_body: None,
             }
+        }
+
+        fn with_chain_id_body(mut self, body: Vec<u8>) -> Self {
+            self.chain_id_body = body;
+            self
+        }
+
+        fn with_finalized_body(mut self, body: Vec<u8>) -> Self {
+            self.finalized_body = Some(body);
+            self
         }
 
         fn with_receipt(mut self, receipt: Vec<u8>) -> Self {
             self.receipt = receipt;
+            self
+        }
+
+        fn with_canonical_body(mut self, body: Vec<u8>) -> Self {
+            self.canonical_body = Some(body);
             self
         }
 
@@ -7334,12 +7254,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(("eth_chainId".to_owned(), None));
-            Box::pin(async {
+            let body = self.chain_id_body.clone();
+            Box::pin(async move {
                 Self::response(
                     "polygon-chain-id",
                     "eth_chainId",
                     serde_json::json!([]),
-                    br#"{"jsonrpc":"2.0","id":1,"result":"0x89"}"#.to_vec(),
+                    body,
                 )
             })
         }
@@ -7374,19 +7295,22 @@ mod tests {
                 .unwrap()
                 .push(("eth_getBlockByNumber.finalized".to_owned(), None));
             let number = self.finalized_head;
+            let body = self.finalized_body.clone();
             Box::pin(async move {
                 let hash = if number == 100 { "aa" } else { "bb" };
                 Self::response(
                     "polygon-finalized-block",
                     "eth_getBlockByNumber",
                     serde_json::json!(["finalized", false]),
-                    serde_json::to_vec(&serde_json::json!({
-                        "jsonrpc":"2.0","id":1,"result":{
-                            "number":format!("0x{number:x}"),
-                            "hash":format!("0x{}", hash.repeat(32))
-                        }
-                    }))
-                    .unwrap(),
+                    body.unwrap_or_else(|| {
+                        serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc":"2.0","id":1,"result":{
+                                "number":format!("0x{number:x}"),
+                                "hash":format!("0x{}", hash.repeat(32))
+                            }
+                        }))
+                        .unwrap()
+                    }),
                 )
             })
         }
@@ -7400,18 +7324,21 @@ mod tests {
                 .unwrap()
                 .push(("eth_getBlockByNumber.canonical".to_owned(), Some(number)));
             let hash = self.canonical_hash_byte;
+            let body = self.canonical_body.clone();
             Box::pin(async move {
                 Self::response(
                     "polygon-canonical-block",
                     "eth_getBlockByNumber",
                     serde_json::json!([format!("0x{number:x}"), false]),
-                    serde_json::to_vec(&serde_json::json!({
-                        "jsonrpc":"2.0","id":1,"result":{
-                            "number":format!("0x{number:x}"),
-                            "hash":format!("0x{}", hash.repeat(32))
-                        }
-                    }))
-                    .unwrap(),
+                    body.unwrap_or_else(|| {
+                        serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc":"2.0","id":1,"result":{
+                                "number":format!("0x{number:x}"),
+                                "hash":format!("0x{}", hash.repeat(32))
+                            }
+                        }))
+                        .unwrap()
+                    }),
                 )
             })
         }
@@ -7459,6 +7386,133 @@ mod tests {
         assert_eq!(rpc.call_count("eth_getBlockByNumber.finalized"), 1);
         assert_eq!(rpc.call_count("eth_getBlockByNumber.canonical"), 1);
         assert_eq!(rpc.call_count("eth_getLogs"), 0);
+    }
+
+    /// PASS: each malformed HTTP 200 Polygon body retains its exact raw attempt, appends the
+    /// runtime-produced Pending fact, and is accepted with the same reason by recovery and strict
+    /// projection replay.
+    #[tokio::test]
+    async fn malformed_runtime_finality_results_round_trip_through_both_reducers() {
+        let malformed = b"not-json".to_vec();
+        let cases = [
+            (
+                "polygon-chain-id",
+                FakePolygonRpc::new(101).with_chain_id_body(malformed.clone()),
+                "polygon chain identity unavailable or not 137",
+            ),
+            (
+                "polygon-transaction-receipt",
+                FakePolygonRpc::new(101).with_receipt(malformed.clone()),
+                "transaction receipt unavailable: malformed JSON-RPC response",
+            ),
+            (
+                "polygon-finalized-block",
+                FakePolygonRpc::new(101).with_finalized_body(malformed.clone()),
+                "polygon finalized head unavailable",
+            ),
+            (
+                "polygon-canonical-block",
+                FakePolygonRpc::new(101).with_canonical_body(malformed.clone()),
+                "canonical block unavailable: malformed JSON-RPC response",
+            ),
+        ];
+
+        for (endpoint_kind, rpc, expected_reason) in cases {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("live.log");
+            let journal = LiveJournal::open(&path).unwrap();
+            let account_id = AccountId::new("account").unwrap();
+            let baseline = baseline_event(&account_id, 0);
+            journal
+                .append(account_id.clone(), baseline.timestamp, baseline.payload)
+                .unwrap();
+            let prepared = finality_prepared();
+            let prepared_event = journal
+                .append(
+                    account_id.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                    LiveJournalPayload::OrderPrepared(prepared.clone()),
+                )
+                .unwrap();
+            let transaction_hash = format!("0x{}", "11".repeat(32));
+            journal
+                .append(
+                    account_id.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                    LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                        &prepared,
+                        transaction_hash.clone(),
+                    ))),
+                )
+                .unwrap();
+
+            let result = collect_order_finality(
+                &rpc,
+                vec![PendingOrderFinality {
+                    prepared_journal_seq: prepared_event.seq,
+                    prepared: prepared.clone(),
+                    transaction_hashes: vec![transaction_hash.clone()],
+                }],
+            )
+            .await
+            .pop()
+            .unwrap();
+            assert!(
+                matches!(
+                    &result.disposition,
+                    OrderFinalityDisposition::Pending { .. }
+                ),
+                "{endpoint_kind} should be runtime Pending, got {:?}",
+                result.disposition
+            );
+            let OrderFinalityDisposition::Pending { reason, evidence } = &result.disposition else {
+                continue;
+            };
+            let runtime_reason = reason.clone();
+            let runtime_evidence = evidence.clone();
+            assert_eq!(runtime_reason, expected_reason, "{endpoint_kind}");
+            assert!(runtime_evidence.iter().any(|attempt| matches!(
+                attempt,
+                RawHttpAttempt::Response(response)
+                    if response.endpoint_kind == endpoint_kind && response.body == malformed
+            )));
+            assert_eq!(
+                append_order_finality_result(
+                    &journal,
+                    account_id.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                    result,
+                )
+                .unwrap(),
+                FinalityJournalEffect::Pending
+            );
+
+            let inventory = recovery_inventory(&path).unwrap();
+            assert_eq!(inventory.open_orders.len(), 1, "{endpoint_kind}");
+            assert_eq!(
+                inventory.open_orders[0].transaction_hashes,
+                vec![transaction_hash]
+            );
+            let events = replay_account(&path, &account_id).unwrap();
+            assert!(matches!(
+                &events.last().unwrap().payload,
+                LiveJournalPayload::OrderReconciled(_)
+            ));
+            let LiveJournalPayload::OrderReconciled(replayed) = &events.last().unwrap().payload
+            else {
+                continue;
+            };
+            assert_eq!(replayed.evidence, runtime_evidence, "{endpoint_kind}");
+            assert_eq!(
+                replayed.outcome,
+                LiveJournalOrderOutcome::FinalityPending {
+                    reason: runtime_reason
+                },
+                "{endpoint_kind}"
+            );
+            let projection = derive_with_baseline_evidence(&account_id, &events, &[]).unwrap();
+            assert_eq!(projection.reserved, dec!(2.500120), "{endpoint_kind}");
+        }
     }
 
     fn receipt_for_transaction(
@@ -7628,6 +7682,120 @@ mod tests {
             Some(OrderFinalityDisposition::Pending { .. })
         ));
         assert_eq!(above.call_count("eth_getBlockByNumber.canonical"), 0);
+    }
+
+    /// PASS: recovery inventory and strict projection both accept a verified conflict and its
+    /// exact duplicate, and both reject a later changed PostResponse/Matched reconciliation.
+    #[tokio::test]
+    async fn finality_conflict_terminal_retry_parity_between_both_reducers() {
+        enum Followup {
+            None,
+            ExactDuplicate,
+            LaterMatched,
+        }
+
+        for (case, followup, expected_acceptance) in [
+            ("baseline", Followup::None, true),
+            ("exact_duplicate", Followup::ExactDuplicate, true),
+            ("later_matched", Followup::LaterMatched, false),
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("live.log");
+            let journal = LiveJournal::open(&path).unwrap();
+            let account_id = AccountId::new("account").unwrap();
+            let baseline = baseline_event(&account_id, 0);
+            journal
+                .append(account_id.clone(), baseline.timestamp, baseline.payload)
+                .unwrap();
+            let prepared = finality_prepared();
+            let prepared_event = journal
+                .append(
+                    account_id.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                    LiveJournalPayload::OrderPrepared(prepared.clone()),
+                )
+                .unwrap();
+            let first_hash = format!("0x{}", "11".repeat(32));
+            journal
+                .append(
+                    account_id.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                    LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                        &prepared,
+                        first_hash.clone(),
+                    ))),
+                )
+                .unwrap();
+            let conflict = collect_order_finality(
+                &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_500_001)),
+                vec![PendingOrderFinality {
+                    prepared_journal_seq: prepared_event.seq,
+                    prepared: prepared.clone(),
+                    transaction_hashes: vec![first_hash],
+                }],
+            )
+            .await
+            .pop()
+            .unwrap();
+            assert!(matches!(
+                &conflict.disposition,
+                OrderFinalityDisposition::Conflict { .. }
+            ));
+            assert_eq!(
+                append_order_finality_result(
+                    &journal,
+                    account_id.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                    conflict,
+                )
+                .unwrap(),
+                FinalityJournalEffect::Conflict
+            );
+            let conflict_payload = replay_account(&path, &account_id)
+                .unwrap()
+                .last()
+                .unwrap()
+                .payload
+                .clone();
+            match followup {
+                Followup::None => {}
+                Followup::ExactDuplicate => {
+                    journal
+                        .append(
+                            account_id.clone(),
+                            OffsetDateTime::UNIX_EPOCH,
+                            conflict_payload,
+                        )
+                        .unwrap();
+                }
+                Followup::LaterMatched => {
+                    journal
+                        .append(
+                            account_id.clone(),
+                            OffsetDateTime::UNIX_EPOCH,
+                            LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                                &prepared,
+                                format!("0x{}", "22".repeat(32)),
+                            ))),
+                        )
+                        .unwrap();
+                }
+            }
+
+            let recovery = recovery_inventory(&path);
+            let events = replay_account(&path, &account_id).unwrap();
+            let projection = derive_with_baseline_evidence(&account_id, &events, &[]);
+            assert_eq!(recovery.is_ok(), expected_acceptance, "recovery: {case}");
+            assert_eq!(
+                projection.is_ok(),
+                expected_acceptance,
+                "projection: {case}"
+            );
+            if expected_acceptance {
+                assert!(recovery.unwrap().open_orders.is_empty(), "{case}");
+                assert_eq!(projection.unwrap().reserved, dec!(2.500120), "{case}");
+            }
+        }
     }
 
     /// PASS: Pending may advance to a conflict, but that conflict removes the order from automated
