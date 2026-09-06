@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use pe_core_types::{
     BasisPoints, CollateralAmount, MarketId, OutcomeId, PolymarketConditionId, Price, Probability,
@@ -462,6 +463,8 @@ fn replay_admission_and_book(
 /// FAIL: either incomplete source log replays, returns an untyped error, or names another reason.
 #[tokio::test]
 async fn golden_source_stream_replays_exact_economic_core() {
+    let scenario_started = Instant::now();
+    let start_phase_started = Instant::now();
     assert!(std::path::Path::new(FIXTURE).is_relative());
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("source.log");
@@ -618,12 +621,26 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let mut first_continuation = None;
     let mut first_bodies = None;
 
+    eprintln!(
+        "PERF golden_stream phase=start elapsed={:?} total={:?}",
+        start_phase_started.elapsed(),
+        scenario_started.elapsed()
+    );
+    let stream_started = Instant::now();
+    let mut source_append_elapsed = Duration::ZERO;
+    let mut bucket_commit_elapsed = Duration::ZERO;
+    let mut source_replay_elapsed = Duration::ZERO;
+    let mut paper_scan_risk_elapsed = Duration::ZERO;
+    let mut financial_commit_elapsed = Duration::ZERO;
+    let mut mark_elapsed = Duration::ZERO;
+
     for day in 0..QUALIFICATION_DAYS {
         for within_day in 0..COPIES_PER_DAY {
             let index = day * COPIES_PER_DAY + within_day;
             let source_unix = golden_source_unix(anchor_cutoff, index);
             let bodies = golden_trade_bodies(index, source_unix);
             let now = OffsetDateTime::from_unix_timestamp(source_unix).unwrap();
+            let source_append_started = Instant::now();
             let websocket_receipt = append_source_at(
                 &source_log,
                 "polymarket-activity-ws",
@@ -666,6 +683,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 source_unix,
             )
             .await;
+            source_append_elapsed += source_append_started.elapsed();
             let receipts = AdmissionReceipts {
                 gamma: gamma_receipt,
                 clob_long: clob_receipt,
@@ -728,6 +746,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 }),
             };
             let (committed, acknowledgement) = oneshot::channel();
+            let bucket_commit_started = Instant::now();
             control_tx
                 .send(OrchestratorControl::CommitActivityBucket {
                     aggregates: vec![aggregate],
@@ -737,6 +756,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 .await
                 .unwrap();
             let result = acknowledgement.await.unwrap().unwrap();
+            bucket_commit_elapsed += bucket_commit_started.elapsed();
             assert_eq!(result.dispositions[&source_trade_id.0], "decision_pending");
             let row = paper
                 .open_decision_pending()
@@ -746,11 +766,14 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 .unwrap();
             let continuation = DecisionContinuationV2::from_durable(&row).unwrap();
             assert_eq!(continuation.gate_result, "admitted");
+            let source_replay_started = Instant::now();
             let observation = continuation
                 .observation_from_source_log(&source_path)
                 .unwrap()
                 .unwrap();
+            source_replay_elapsed += source_replay_started.elapsed();
 
+            let paper_scan_risk_started = Instant::now();
             let financial_snapshot = paper.financial_snapshot(source_unix).unwrap();
             assert!(financial_snapshot.positions.is_empty());
             let cash_before =
@@ -793,6 +816,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 false,
             )
             .unwrap();
+            paper_scan_risk_elapsed += paper_scan_risk_started.elapsed();
             let risk = risk_audit(risk_snapshot, source_unix);
             assert_eq!(risk.decision, RiskDecisionAudit::Approved);
             let economic = compose(
@@ -829,6 +853,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 first_bodies = Some(bodies.clone());
             }
 
+            let financial_commit_started = Instant::now();
             for (field, actual) in [
                 (
                     "minimum_shares",
@@ -1041,8 +1066,10 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 resolution_unix,
             );
             prior_completed_prepared_sequence = Some(resolution_prepared.sequence);
+            financial_commit_elapsed += financial_commit_started.elapsed();
         }
 
+        let mark_started = Instant::now();
         let cutoff = anchor_cutoff + i64::try_from(day + 1).unwrap() * DAY_SECS;
         let boundary_payload = serde_json::to_vec(&serde_json::json!({
             "kind": "daily_boundary",
@@ -1072,8 +1099,22 @@ async fn golden_source_stream_replays_exact_economic_core() {
             })),
             cutoff,
         );
+        mark_elapsed += mark_started.elapsed();
     }
 
+    eprintln!(
+        "PERF golden_stream phase=stream wall={:?} source_append={:?} bucket_commit={:?} source_replay={:?} paper_scan_risk={:?} financial_commit={:?} marks={:?} total={:?}",
+        stream_started.elapsed(),
+        source_append_elapsed,
+        bucket_commit_elapsed,
+        source_replay_elapsed,
+        paper_scan_risk_elapsed,
+        financial_commit_elapsed,
+        mark_elapsed,
+        scenario_started.elapsed()
+    );
+
+    let seal_started = Instant::now();
     drop(control_tx);
     control.await.unwrap();
     drop(source_log);
@@ -1116,8 +1157,14 @@ async fn golden_source_stream_replays_exact_economic_core() {
         sealed_cutoff,
     );
     drop(paper_writer);
+    eprintln!(
+        "PERF golden_stream phase=seal elapsed={:?} total={:?}",
+        seal_started.elapsed(),
+        scenario_started.elapsed()
+    );
 
     let output_path = dir.path().join("qualification.json");
+    let qualify_started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_pe-service"))
         .arg("--qualify")
         .arg("--paper-log")
@@ -1132,6 +1179,11 @@ async fn golden_source_stream_replays_exact_economic_core() {
         .arg(&output_path)
         .output()
         .unwrap();
+    eprintln!(
+        "PERF golden_stream phase=qualify elapsed={:?} total={:?}",
+        qualify_started.elapsed(),
+        scenario_started.elapsed()
+    );
     assert!(
         output.status.success(),
         "pe-service --qualify stderr: {}",
@@ -1177,6 +1229,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
 
     let continuation = first_continuation.unwrap();
     let first_bodies = first_bodies.unwrap();
+    let tamper_started = Instant::now();
     let missing_path = dir.path().join("missing-source.log");
     let mut missing_writer = Writer::open(&missing_path).unwrap();
     append_source_direct(
@@ -1252,6 +1305,11 @@ async fn golden_source_stream_replays_exact_economic_core() {
     assert_eq!(LIVE_MARKET_SCHEMA_VERSION, 1);
     assert_eq!(LIVE_MARKET_PARSER_VERSION, 1);
     assert_eq!(CLOB_RESOLUTION_PARSER_VERSION, 2);
+    eprintln!(
+        "PERF golden_stream phase=tamper elapsed={:?} total={:?}",
+        tamper_started.elapsed(),
+        scenario_started.elapsed()
+    );
 
     println!(
         "PASS: I16-GOLDEN-SOURCE-ECONOMIC-V1 — {} exact decisions, {} exact fills, {} complete days",
