@@ -885,8 +885,21 @@ mod tests {
             );
             assert_eq!(attempt.price_receipts.len(), 1, "stale_seed={stale_seed}");
             // Reads: the refetch decision, the post-response stamp, then the evaluation instant.
+            // FAIL: stamping the page before the response (taking the second read before the
+            // fetch) would record `base + 1` on a page that had not been received yet.
             assert_eq!(attempt.evaluated_at, base + time::Duration::seconds(2));
             assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 3);
+            let receipt = attempt.price_receipts[0];
+            let recorded = pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .map(|item| item.unwrap())
+                .find(|(_, envelope)| envelope.seq == receipt.sequence)
+                .map(|(_, envelope)| envelope)
+                .expect("the consulted page is durably appended");
+            assert_eq!(recorded.this_hash, receipt.this_hash);
+            assert_eq!(recorded.observed_at.0, base + time::Duration::seconds(1));
+            assert_eq!(recorded.received_at.0, base + time::Duration::seconds(1));
+            assert!(recorded.observed_at.0 < attempt.evaluated_at);
             ingest.abort();
             let _ = ingest.await;
         }
