@@ -891,17 +891,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 )
             })?;
         attempt.financial_prefix = Some(financial_prefix);
-        let ids = self
-            .paper_state
-            .paper_positions()
-            .map_err(|_| {
-                ActivePaperRiskFailure::new(
-                    RiskInputsUnavailable::SnapshotSequenceMismatch,
-                    &attempt,
-                )
-            })?
-            .iter()
-            .map(|position| MarketOutcomeId::new(position.market_id.clone(), position.outcome_id))
+        let positions = self.paper_state.paper_positions().map_err(|_| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
+        let ids = crate::risk_inputs::open_positions(&positions)
+            .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?
+            .into_iter()
+            .map(|(position, _)| {
+                MarketOutcomeId::new(position.market_id.clone(), position.outcome_id)
+            })
             .collect::<Vec<_>>();
         let mid_price_cache = self.mid_price_cache.clone();
         let price_attempt = mid_price_cache.fetch_mids_strict_attempt(&ids).await;

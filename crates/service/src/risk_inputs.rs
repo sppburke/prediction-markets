@@ -275,6 +275,31 @@ pub(crate) struct PaperExposureBase {
     pub(crate) per_trade_cap_bps: i32,
 }
 
+/// The positions risk values and prices: net quantity per row, excluding zero-net rows (a
+/// market closed by a resolution stays projected with zero shares). Runtime pricing and replay
+/// select the same set through this one rule.
+pub(crate) fn open_positions(
+    positions: &[pe_paper_state::PaperPositionRow],
+) -> Result<
+    Vec<(
+        &pe_paper_state::PaperPositionRow,
+        pe_core_types::ShareAmount,
+    )>,
+    RiskInputsUnavailable,
+> {
+    let mut open = Vec::with_capacity(positions.len());
+    for position in positions {
+        let quantity = position
+            .long
+            .checked_sub(position.short)
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if quantity != pe_core_types::ShareAmount::ZERO {
+            open.push((position, quantity));
+        }
+    }
+    Ok(open)
+}
+
 /// Compose paper risk from a source prefix that the caller has already replayed and verified.
 /// Runtime supplies the maintained receipt-time index; offline qualification keeps its own
 /// sealed-prefix view so every Prepared reuses the correct historical boundary.
@@ -323,14 +348,7 @@ fn compose_paper_risk_snapshot(
     }
 
     let mut valued_positions = Vec::with_capacity(snapshot.positions.len());
-    for position in &snapshot.positions {
-        let quantity = position
-            .long
-            .checked_sub(position.short)
-            .map_err(|_| RiskInputsUnavailable::Overflow)?;
-        if quantity == pe_core_types::ShareAmount::ZERO {
-            continue;
-        }
+    for (position, quantity) in open_positions(&snapshot.positions)? {
         let price = current_prices
             .get(&(position.market_id.clone(), position.outcome_id))
             .copied()
