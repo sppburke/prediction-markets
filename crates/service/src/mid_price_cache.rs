@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pe_core_types::{MarketId, MarketOutcomeId, Price, ReceivedAt, SourceTimestamp};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
@@ -60,7 +60,6 @@ struct CachedEntry {
     mids: Vec<Decimal>,
     strict_mids: Option<Vec<Price>>,
     snapshot: MidMarketSnapshot,
-    at: Instant,
     observed_at: OffsetDateTime,
     receipt: Option<AppendReceipt>,
     conflicting: bool,
@@ -160,7 +159,6 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                 mids: Vec::new(),
                 strict_mids: None,
                 snapshot: MidMarketSnapshot::default(),
-                at: Instant::now(),
                 observed_at,
                 receipt: Some(receipt),
                 conflicting: false,
@@ -308,13 +306,15 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         let mut out: HashMap<MarketId, CachedEntry> = HashMap::new();
         let mut stale: Vec<MarketId> = Vec::new();
 
-        // Brief lock: serve fresh entries, collect the rest. Never held across a fetch.
+        // Brief lock: serve fresh entries, collect the rest. Never held across a fetch. Freshness
+        // is judged on the cache clock so the refetch decision and the strict validation agree.
         {
-            let now = Instant::now();
+            let now = clock();
+            let ttl = time::Duration::seconds(i64::try_from(TTL.as_secs()).unwrap_or(i64::MAX));
             let map = self.inner.lock().await;
             for id in market_ids {
                 match map.get(id) {
-                    Some(entry) if now.duration_since(entry.at) < TTL => {
+                    Some(entry) if now - entry.observed_at < ttl => {
                         out.insert(id.clone(), entry.clone());
                     }
                     _ => stale.push(id.clone()),
@@ -356,7 +356,6 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             .into_iter()
             .collect::<HashSet<_>>();
 
-        let now = Instant::now();
         let mut map = self.inner.lock().await;
         for id in stale {
             // Demux by the echoed `conditionId`: a hit is structurally the requested market, so a
@@ -377,7 +376,6 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                 mids,
                 strict_mids: m.strict_outcome_prices.clone(),
                 snapshot,
-                at: now,
                 observed_at: observed,
                 receipt: fetched
                     .condition_page_hashes
@@ -474,7 +472,6 @@ mod tests {
                 mids,
                 strict_mids: prices,
                 snapshot: MidMarketSnapshot::default(),
-                at: Instant::now(),
                 observed_at,
                 receipt,
                 conflicting,
