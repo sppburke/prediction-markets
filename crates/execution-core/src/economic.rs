@@ -229,7 +229,6 @@ impl EconomicPrepared {
         let reserve = fee_reserve(
             schedule,
             inputs.plan.worst_case_debit,
-            inputs.plan.shares,
             inputs.plan.best_ask,
             inputs.plan.limit_price,
         )?;
