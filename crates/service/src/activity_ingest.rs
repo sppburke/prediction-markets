@@ -66,7 +66,7 @@ use tracing::{debug, info, warn};
 
 use crate::health::{HealthState, ReaderHealth, SharedHealth};
 use crate::live_watchlist::LiveWatchlist;
-use crate::risk_inputs::SourceReceiptMillisIndex;
+use crate::risk_inputs::SourceReceiptIndex;
 use crate::source_event_sink::SourceEventSink;
 
 /// Source id stamped on every websocket envelope in the source event log.
@@ -164,7 +164,7 @@ pub struct ActivityIngest {
     trigger_tx: mpsc::Sender<ReconciliationTrigger>,
     health: SharedHealth,
     reconciliation_triggers_dropped: Arc<AtomicU64>,
-    source_receipt_millis: SourceReceiptMillisIndex,
+    source_receipts: SourceReceiptIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
 }
@@ -208,7 +208,7 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
-            source_receipt_millis: SourceReceiptMillisIndex::default(),
+            source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -228,7 +228,7 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
-            source_receipt_millis: SourceReceiptMillisIndex::default(),
+            source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -255,18 +255,15 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
-            source_receipt_millis: SourceReceiptMillisIndex::default(),
+            source_receipts: SourceReceiptIndex::default(),
             reader_append_gate: None,
         }
     }
 
     /// Install the verified boot projection extended by this ingest's synchronized appends.
     #[must_use]
-    pub fn with_source_receipt_millis_index(
-        mut self,
-        source_receipt_millis: SourceReceiptMillisIndex,
-    ) -> Self {
-        self.source_receipt_millis = source_receipt_millis;
+    pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
+        self.source_receipts = source_receipts;
         self
     }
 
@@ -340,7 +337,7 @@ impl ActivityIngest {
                 fan_in: fan_in_rx,
                 source_rx: self.source_rx.rx,
                 reconciliation_triggers_dropped: self.reconciliation_triggers_dropped,
-                source_receipt_millis: self.source_receipt_millis,
+                source_receipts: self.source_receipts,
                 #[cfg(feature = "scenario")]
                 reader_append_gate: self.reader_append_gate,
             }
@@ -628,7 +625,7 @@ struct Coordinator {
     fan_in: mpsc::Receiver<Observation>,
     source_rx: mpsc::Receiver<SourceLogRequest>,
     reconciliation_triggers_dropped: Arc<AtomicU64>,
-    source_receipt_millis: SourceReceiptMillisIndex,
+    source_receipts: SourceReceiptIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
 }
@@ -768,12 +765,12 @@ impl Coordinator {
         receipt: AppendReceipt,
         envelope: &EnvelopeIn,
     ) -> Result<AppendReceipt, Shutdown> {
-        self.source_receipt_millis
+        self.source_receipts
             .record_synced_append(receipt, envelope)
             .map(|()| receipt)
             .map_err(|error| {
                 warn!(%error, sequence = receipt.sequence.0,
-                    "synchronized source append could not extend receipt-time index");
+                    "synchronized source append could not extend source receipt index");
                 Shutdown
             })
     }
@@ -877,7 +874,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
-                source_receipt_millis: SourceReceiptMillisIndex::default(),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -948,7 +945,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
-                source_receipt_millis: SourceReceiptMillisIndex::default(),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -1030,7 +1027,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::clone(&dropped),
-                source_receipt_millis: SourceReceiptMillisIndex::default(),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -1096,7 +1093,7 @@ mod tests {
             fan_in: fan_in_rx,
             source_rx: source_rx.rx,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
-            source_receipt_millis: SourceReceiptMillisIndex::default(),
+            source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -1123,7 +1120,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
-                source_receipt_millis: SourceReceiptMillisIndex::default(),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -1139,10 +1136,10 @@ mod tests {
             .unwrap();
     }
 
-    /// PASS: the boot receipt-time index equals a fresh verified replay, and the same equality
+    /// PASS: the boot source receipt index equals a fresh verified replay, and the same equality
     /// holds after the coordinator synchronizes and indexes a later source append.
     #[tokio::test]
-    async fn receipt_time_index_matches_fresh_replay_at_boot_and_after_append() {
+    async fn source_receipt_index_matches_fresh_replay_at_boot_and_after_append() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.log");
         let boot_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
@@ -1163,13 +1160,13 @@ mod tests {
             .unwrap();
         drop(boot_sink);
 
-        let index = SourceReceiptMillisIndex::replay(&path).unwrap();
+        let source_receipts = SourceReceiptIndex::replay(&path).unwrap();
         assert_eq!(
-            index.snapshot(),
-            SourceReceiptMillisIndex::replay(&path).unwrap().snapshot()
+            source_receipts.snapshot(),
+            SourceReceiptIndex::replay(&path).unwrap().snapshot()
         );
         assert_eq!(
-            index.received_millis(boot_receipt).unwrap(),
+            source_receipts.received_millis(boot_receipt).unwrap(),
             1_800_000_000_000
         );
 
@@ -1183,7 +1180,7 @@ mod tests {
                 trigger_tx,
                 new_shared_health_with_ws(false, true, 90),
             )
-            .with_source_receipt_millis_index(index.clone())
+            .with_source_receipt_index(source_receipts.clone())
             .run(),
         );
         let runtime_receipt = source_log
@@ -1191,7 +1188,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            index.received_millis(runtime_receipt).unwrap(),
+            source_receipts.received_millis(runtime_receipt).unwrap(),
             1_800_000_002_000
         );
 
@@ -1199,8 +1196,8 @@ mod tests {
         drop(trigger_rx);
         coordinator.await.unwrap();
         assert_eq!(
-            index.snapshot(),
-            SourceReceiptMillisIndex::replay(&path).unwrap().snapshot()
+            source_receipts.snapshot(),
+            SourceReceiptIndex::replay(&path).unwrap().snapshot()
         );
     }
 }

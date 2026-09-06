@@ -18,8 +18,8 @@ use crate::health::SharedHealth;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{HaltState, active_risk_halts, paper_era, scan_paper_log};
 use crate::risk_inputs::{
-    LiveLatencyJournalTailEvidence, SourceReceiptMillisIndex, audited_halt_release,
-    live_latency_samples, paper_latency_samples,
+    LiveLatencyJournalTailEvidence, SourceReceiptIndex, audited_halt_release, live_latency_samples,
+    paper_latency_samples,
 };
 use crate::runtime_config::{
     AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RISK_HALT_RELEASE_HASH_KEY,
@@ -170,7 +170,7 @@ pub enum ConfigPollError {
 #[derive(Clone)]
 pub struct RiskHaltReleaseHandle {
     paper_log_path: PathBuf,
-    source_receipt_millis: SourceReceiptMillisIndex,
+    source_receipts: SourceReceiptIndex,
     live_journal_path: PathBuf,
     control: mpsc::Sender<OrchestratorControl>,
 }
@@ -209,7 +209,7 @@ impl QualificationSealHandle {
 impl RiskHaltReleaseHandle {
     pub fn new(
         paper_log_path: PathBuf,
-        source_receipt_millis: SourceReceiptMillisIndex,
+        source_receipts: SourceReceiptIndex,
         control: mpsc::Sender<OrchestratorControl>,
     ) -> Self {
         let live_journal_path = paper_log_path
@@ -219,7 +219,7 @@ impl RiskHaltReleaseHandle {
             .join("live_journal.log");
         Self {
             paper_log_path,
-            source_receipt_millis,
+            source_receipts,
             live_journal_path,
             control,
         }
@@ -238,7 +238,7 @@ impl RiskHaltReleaseHandle {
             owner_latest_latency_p95(
                 &release.owner,
                 || {
-                    paper_latency_samples(&era, &self.source_receipt_millis, now_unix)
+                    paper_latency_samples(&era, &self.source_receipts, now_unix)
                         .map(|samples| samples.latest.p95_ms)
                         .map_err(|error| format!("derive paper release latency evidence: {error}"))
                 },
@@ -901,11 +901,8 @@ mod tests {
         drop(writer);
 
         let (control, mut controls) = mpsc::channel(1);
-        let handle = RiskHaltReleaseHandle::new(
-            paper_log_path,
-            SourceReceiptMillisIndex::default(),
-            control,
-        );
+        let handle =
+            RiskHaltReleaseHandle::new(paper_log_path, SourceReceiptIndex::default(), control);
         let release_hash = engaged.this_hash.to_hex().to_string();
         let apply = handle.apply(&release_hash);
         let acknowledge = async {

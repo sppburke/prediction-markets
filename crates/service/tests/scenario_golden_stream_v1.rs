@@ -57,7 +57,7 @@ use pe_service::qualification::{
     FinancialEraCommand, FinancialEraManifest, FinancialEraPaths, FinancialEraPreparation,
     QualificationReport, QualificationVerdict, qualification_completion, run_financial_era,
 };
-use pe_service::risk_inputs::SourceReceiptMillisIndex;
+use pe_service::risk_inputs::SourceReceiptIndex;
 use pe_service::runtime_config::{ConfigRow, RuntimeConfig};
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::supabase_sink::SupabaseFillRow;
@@ -1609,7 +1609,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let authority = GoldenAuthority::new(start_receipt);
 
     let source_sink = SourceEventSink::open(&source_path).unwrap();
-    let source_receipt_millis = SourceReceiptMillisIndex::replay(&source_path).unwrap();
+    let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(64);
     let (trigger_tx, _trigger_rx) = mpsc::channel(1);
     let coordinator = tokio::spawn(
@@ -1619,7 +1619,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             trigger_tx,
             new_shared_health_with_ws(false, true, 90),
         )
-        .with_source_receipt_millis_index(source_receipt_millis.clone())
+        .with_source_receipt_index(source_receipts.clone())
         .run(),
     );
 
@@ -1782,7 +1782,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 "http://unused.invalid",
                 source_log.clone(),
             )),
-            source_receipt_millis,
+            source_receipts,
         )
         .unwrap();
     let control = tokio::spawn(orchestrator.run(std::future::pending::<()>()));

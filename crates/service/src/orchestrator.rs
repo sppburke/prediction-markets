@@ -48,7 +48,7 @@ use crate::paper_recovery::{
     QualificationSealed, SealReason, TailBinding,
 };
 use crate::risk_inputs::{
-    BoundaryMarkError, RiskInputsUnavailable, SourceReceiptMillisIndex, apply_global_risk_halts,
+    BoundaryMarkError, RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
 };
 use crate::runtime_config::{self, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
@@ -321,7 +321,7 @@ pub struct Orchestrator<
     /// buckets still pass the current source-health gate before their financial disposition.
     resuming_boot: bool,
     financial_log_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    source_receipt_millis: Option<SourceReceiptMillisIndex>,
+    source_receipts: Option<SourceReceiptIndex>,
     qualification_start: Option<pe_event_log::AppendReceipt>,
     admission_builder: Option<crate::live_venue_adapter::LiveAdmissionBuilder>,
     boundary_mark_fetcher: Option<Arc<HistoricalMarkAdapter>>,
@@ -838,7 +838,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let (paper_log_path, _) = self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
-        let source_receipt_millis = self.source_receipt_millis.as_ref().ok_or_else(|| {
+        let source_receipts = self.source_receipts.as_ref().ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
         let era = crate::paper_recovery::paper_era(
@@ -919,7 +919,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &snapshot,
             &era,
             &prices,
-            |receipt| source_receipt_millis.received_millis(receipt),
+            |receipt| source_receipts.received_millis(receipt),
             now,
             latency_was_active,
         )
@@ -1558,7 +1558,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             pending_continuations,
             resuming_boot: false,
             financial_log_paths: None,
-            source_receipt_millis: None,
+            source_receipts: None,
             qualification_start: None,
             admission_builder: None,
             boundary_mark_fetcher: None,
@@ -1573,7 +1573,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         source_log_path: std::path::PathBuf,
         admission_builder: crate::live_venue_adapter::LiveAdmissionBuilder,
         boundary_mark_fetcher: Arc<HistoricalMarkAdapter>,
-        source_receipt_millis: SourceReceiptMillisIndex,
+        source_receipts: SourceReceiptIndex,
     ) -> Result<(), crate::paper_recovery::PaperLogScanError> {
         let era = crate::paper_recovery::paper_era(crate::paper_recovery::scan_paper_log(
             &paper_log_path,
@@ -1581,7 +1581,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         self.active_risk_halts = crate::paper_recovery::active_risk_halts(&era);
         self.qualification_start = era.start.as_ref().map(|(receipt, _)| *receipt);
         self.financial_log_paths = Some((paper_log_path, source_log_path));
-        self.source_receipt_millis = Some(source_receipt_millis);
+        self.source_receipts = Some(source_receipts);
         self.admission_builder = Some(admission_builder);
         self.boundary_mark_fetcher = Some(boundary_mark_fetcher);
         Ok(())

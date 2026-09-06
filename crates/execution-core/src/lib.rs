@@ -55,7 +55,7 @@ pub use live_journal::{
     RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
     RedemptionRequestedAudit, RedemptionTransactionAudit, ResolutionFinalizedAudit,
     TerminalAdmissionRecoveryEntry, TerminalAdmissionRecoveryOutcome, http_attempt_hashes,
-    open_order_inventory, prepared_order_fact_matches, recovery_inventory, replay_account,
+    prepared_order_fact_matches, recovery_inventory, replay_account, structural_recovery_inventory,
 };
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,

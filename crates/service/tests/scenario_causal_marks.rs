@@ -44,7 +44,7 @@ use pe_service::paper_recovery::{
     FinancialResult, PAPER_LOG_SCHEMA_VERSION, PaperFillOperationIdentity, PaperLogFrame,
     PaperLogRecord, QualificationStarted, TailBinding, paper_era, scan_paper_log,
 };
-use pe_service::risk_inputs::{SourceReceiptMillisIndex, completed_prepared_before_boundary};
+use pe_service::risk_inputs::{SourceReceiptIndex, completed_prepared_before_boundary};
 use pe_service::supabase_state::SupabaseStateClient;
 use pe_service::trade_poller::{
     ACTIVITY_POLL_SOURCE_ID, DAILY_BOUNDARY_SOURCE_ID, PendingBoundary,
@@ -335,7 +335,7 @@ async fn run_real_boundary(
                 "https://offline.invalid",
                 source_log,
             )),
-            SourceReceiptMillisIndex::replay(source_path).unwrap(),
+            SourceReceiptIndex::replay(source_path).unwrap(),
         )
         .unwrap();
 

@@ -274,7 +274,7 @@ pub fn completed_prepared_before_boundary(
         }
     }
     let received_millis =
-        source_receipt_millis_index(source_log_path, causal.iter().map(|(_, receipt)| *receipt))?;
+        source_receipt_index(source_log_path, causal.iter().map(|(_, receipt)| *receipt))?;
     causal
         .into_iter()
         .filter_map(|(prepared_sequence, receipt)| {
@@ -327,7 +327,7 @@ pub(crate) fn open_positions(
 }
 
 /// Compose paper risk from a source prefix that the caller has already replayed and verified.
-/// Runtime supplies the maintained receipt-time index; offline qualification keeps its own
+/// Runtime supplies the maintained source receipt index; offline qualification keeps its own
 /// sealed-prefix view so every Prepared reuses the correct historical boundary.
 pub(crate) fn build_paper_risk_snapshot_from_source_receipts<F>(
     base: &PaperExposureBase,
@@ -638,11 +638,11 @@ pub(crate) fn latency_hysteresis_seed(
 /// observation timestamp. Completion belongs to the hour containing the Final endpoint.
 pub(crate) fn paper_latency_samples(
     era: &PaperEra,
-    source_receipt_millis: &SourceReceiptMillisIndex,
+    source_receipts: &SourceReceiptIndex,
     now_unix: i64,
 ) -> Result<LatencySamples, RiskInputsUnavailable> {
     paper_latency_samples_from_source_receipts(era, now_unix, &|receipt| {
-        source_receipt_millis.received_millis(receipt)
+        source_receipts.received_millis(receipt)
     })
 }
 
@@ -887,11 +887,12 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
         .collect()
 }
 
-/// Process-wide verified source receipt-to-received-time projection.
+/// Process-wide verified source receipt projection.
 ///
-/// Boot replays the source log once to populate this append-only map. The sole synchronized
-/// source-log coordinator records each later append before acknowledging its receipt, so runtime
-/// paper risk and incident release never need to replay the growing source prefix.
+/// Boot replays the source log once to retain each receipt, receive millisecond, and frame byte
+/// offset. The sole synchronized source-log coordinator records each later append before
+/// acknowledging its receipt, so runtime paper risk, incident release, and exact envelope retrieval
+/// never need to replay the growing source prefix.
 #[derive(Default)]
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
@@ -906,12 +907,12 @@ struct SourceFrameMetadata {
 }
 
 #[derive(Clone, Default)]
-pub struct SourceReceiptMillisIndex {
+pub struct SourceReceiptIndex {
     state: Arc<RwLock<SourceReceiptIndexState>>,
     source_log_path: Option<Arc<PathBuf>>,
 }
 
-impl SourceReceiptMillisIndex {
+impl SourceReceiptIndex {
     /// Rebuild the complete verified source-log projection at boot.
     pub fn replay(source_log_path: &Path) -> Result<Self, RiskInputsUnavailable> {
         let mut frames = Vec::new();
@@ -1146,7 +1147,7 @@ pub(crate) fn paper_prefix_at_financial_prefix(
     Ok(prefix)
 }
 
-fn source_receipt_millis_index(
+fn source_receipt_index(
     source_log_path: &Path,
     receipts: impl Iterator<Item = AppendReceipt>,
 ) -> Result<BTreeMap<EventSeq, (AppendReceipt, i64)>, RiskInputsUnavailable> {
@@ -1819,7 +1820,7 @@ mod tests {
         assert_eq!((empty.sample_count, empty.p95_ms), (0, None));
     }
 
-    /// PASS: replacing the per-evaluation source replay with the maintained receipt-time index
+    /// PASS: replacing the per-evaluation source replay with the maintained source receipt index
     /// leaves a non-empty paper latency sample and its completed-hour p95 byte-for-byte unchanged.
     #[test]
     fn maintained_receipt_index_preserves_paper_latency_samples() {
@@ -1886,14 +1887,14 @@ mod tests {
 
         let source_receipts = paper_fill_source_receipts(&era).unwrap();
         let from_scratch_index =
-            source_receipt_millis_index(&source_path, source_receipts.into_iter()).unwrap();
+            source_receipt_index(&source_path, source_receipts.into_iter()).unwrap();
         let from_scratch = paper_latency_samples_from_source_receipts(&era, 10_800, &|receipt| {
             source_receipt_received_millis(&from_scratch_index, receipt)
         })
         .unwrap();
         let maintained = paper_latency_samples(
             &era,
-            &SourceReceiptMillisIndex::replay(&source_path).unwrap(),
+            &SourceReceiptIndex::replay(&source_path).unwrap(),
             10_800,
         )
         .unwrap();
@@ -1925,10 +1926,10 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let index = SourceReceiptMillisIndex::replay(&source_path).unwrap();
-        let metadata_bytes_before = index.retained_frame_metadata_bytes();
+        let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let metadata_bytes_before = source_receipts.retained_frame_metadata_bytes();
         assert!(metadata_bytes_before < first_payload.len());
-        let held = index.source_envelope(first_receipt).unwrap();
+        let held = source_receipts.source_envelope(first_receipt).unwrap();
         let held_pointer = held.payload.as_ptr();
 
         let second_at = OffsetDateTime::from_unix_timestamp(11).unwrap();
@@ -1953,16 +1954,21 @@ mod tests {
                 payload: second.payload.clone(),
             })
             .unwrap();
-        index.record_synced_append(second_receipt, &second).unwrap();
+        source_receipts
+            .record_synced_append(second_receipt, &second)
+            .unwrap();
 
-        assert!(index.retained_frame_metadata_bytes() < first_payload.len());
+        assert!(source_receipts.retained_frame_metadata_bytes() < first_payload.len());
         assert_eq!(held.payload.as_ptr(), held_pointer);
         assert_eq!(held.payload, first_payload);
         assert_eq!(
-            index.source_envelope(second_receipt).unwrap().payload,
+            source_receipts
+                .source_envelope(second_receipt)
+                .unwrap()
+                .payload,
             second.payload
         );
-        assert_eq!(index.snapshot().len(), 2);
+        assert_eq!(source_receipts.snapshot().len(), 2);
     }
 
     /// PASS: replay folds each owner/cause independently and any active cause blocks entries.
