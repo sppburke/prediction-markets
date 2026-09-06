@@ -1,4 +1,4 @@
-//! Test-only schema-one wire fixtures.
+//! Test-only legacy wire fixtures.
 //!
 //! Production keeps the legacy decoder private. Read-compatibility scenarios independently encode
 //! the historical bytes instead of importing the decoder's Rust DTOs.
@@ -13,7 +13,7 @@ use pe_core_types::{
     EventSeq, Price, ReceivedAt, ReconstructionQuality, Side, SourceId, SourceTimestamp,
 };
 use pe_event_log::AppendReceipt;
-use pe_service::bucket_commit::{BucketDecisionContext, PageOccurrence};
+use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts, PageOccurrence};
 use pe_service::config::ServiceConfig;
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::runtime_config::RuntimeConfig;
@@ -50,6 +50,11 @@ pub fn page_occurrence() -> PageOccurrence {
             this_hash: blake3::hash(b"scenario source receipt"),
         },
     }
+}
+
+pub fn legacy_continuation_v2_json(facts: &DecisionContinuationFacts) -> String {
+    let facts = serde_json::to_string(facts).unwrap();
+    format!(r#"{{"version":2,{}"#, facts.strip_prefix('{').unwrap())
 }
 
 pub fn install_empty_anchor(

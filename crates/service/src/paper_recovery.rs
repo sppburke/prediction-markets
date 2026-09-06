@@ -1304,9 +1304,9 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
                 .context("load pending paper-log leader mirror")?
                 .into_iter()
                 .find(|leader| {
-                    leader.wallet == continuation.prior.wallet
-                        && leader.market_id == continuation.prior.market_id
-                        && leader.outcome_id == continuation.prior.outcome_id
+                    leader.wallet == continuation.facts.wallet
+                        && leader.market_id == continuation.facts.market_id
+                        && leader.outcome_id == continuation.facts.outcome_id
                 })
                 .context("pending paper-log continuation has no leader mirror")?;
             let fill_pending = render_pending_evidence(

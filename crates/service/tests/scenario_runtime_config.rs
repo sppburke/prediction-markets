@@ -34,7 +34,7 @@ use pe_paper_state::{
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
 };
 use pe_position_ledger::PositionLedger;
-use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationV2};
+use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts};
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::config::ServiceConfig;
 use pe_service::decision_replay::replay_decision_pending;
@@ -61,8 +61,8 @@ use tokio::sync::{mpsc, oneshot};
 
 mod support;
 use support::{
-    LegacyFillSource, LegacyPaperFill, install_empty_anchor, page_occurrence, send_trade_bucket,
-    send_trade_bucket_with_config,
+    LegacyFillSource, LegacyPaperFill, install_empty_anchor, legacy_continuation_v2_json,
+    page_occurrence, send_trade_bucket, send_trade_bucket_with_config,
 };
 
 // ── Helpers (mirror scenario_execution_gates) ───────────────────────────────────
@@ -144,8 +144,7 @@ fn install_pending(
     let source_trade_id = SourceTradeId(format!("g2:{}", "a".repeat(64)));
     let semantic_revision = "frozen-config-a".to_owned();
     let source_epoch = 1_700_000_000;
-    let continuation = DecisionContinuationV2 {
-        version: 2,
+    let continuation = DecisionContinuationFacts {
         source_trade_id: source_trade_id.clone(),
         semantic_revision: semantic_revision.clone(),
         transaction_hash: "0xfrozen-a".to_owned(),
@@ -219,7 +218,7 @@ fn install_pending(
                 semantic_revision,
                 wallet: leader_wallet(),
                 source_epoch,
-                frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+                frozen_inputs_json: legacy_continuation_v2_json(&continuation),
                 updated_at_unix: source_epoch,
             }],
             fence: None,
@@ -474,7 +473,7 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
         .unwrap();
     let replayed = replay_decision_pending(&row).unwrap();
     assert_eq!(
-        replayed.continuation.prior.applied_configuration_hash,
+        replayed.continuation.facts.applied_configuration_hash,
         config_a.canonical_hash()
     );
     assert_eq!(
@@ -623,7 +622,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
         .unwrap();
     let replayed = replay_decision_pending(&row).unwrap();
     assert_eq!(
-        replayed.continuation.prior.applied_configuration_hash,
+        replayed.continuation.facts.applied_configuration_hash,
         config_a.canonical_hash()
     );
     assert_eq!(
