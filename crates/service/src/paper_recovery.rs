@@ -765,17 +765,15 @@ pub enum MembershipReplayError {
     DuplicateAddition(WalletAddress),
     #[error("MembershipChanged result {actual} exceeds capacity {capacity}")]
     Capacity { actual: usize, capacity: usize },
-    #[error("MembershipChanged at sequence {sequence} has no replacement_entries evidence")]
-    MissingReplacementEntries { sequence: u64 },
-    #[error("MembershipChanged replacement_entries decode failed at sequence {sequence}: {source}")]
-    ReplacementEntries {
+    #[error("MembershipChanged evidence verification failed at sequence {sequence}: {source}")]
+    Evidence {
         sequence: u64,
-        source: serde_json::Error,
+        source: crate::qualification::QualificationError,
     },
     #[error(
-        "MembershipChanged replacement evidence disagrees with its wallet mutation at sequence {sequence}"
+        "MembershipChanged source artifact disagrees with its reconstructed membership at sequence {sequence}"
     )]
-    ReplacementMismatch { sequence: u64 },
+    ReconstructionMismatch { sequence: u64 },
 }
 
 /// The structurally applied watchlist generation rebuilt from the durable paper prefix.
@@ -797,31 +795,18 @@ fn watchlist_with_entries(mut watchlist: Watchlist, entries: Vec<WatchlistEntry>
     watchlist
 }
 
-fn replacement_entries(
-    frame: &ScannedPaperFrame,
-    evidence: &serde_json::Value,
-) -> Result<Vec<WatchlistEntry>, MembershipReplayError> {
-    let value = evidence.get("replacement_entries").cloned().ok_or(
-        MembershipReplayError::MissingReplacementEntries {
-            sequence: frame.receipt.sequence.0,
-        },
-    )?;
-    serde_json::from_value(value).map_err(|source| MembershipReplayError::ReplacementEntries {
-        sequence: frame.receipt.sequence.0,
-        source,
-    })
-}
-
 /// Reconstruct the sole structural watchlist generation from Start's pinned ranking rows and
 /// subsequent synchronized membership records. Score refreshes and durable fence removals remain
 /// owned by their existing projections and therefore do not appear here.
 ///
 /// `start_batch` must be the result of `supabase_reader::fetch_batch` for
-/// `QualificationStarted.ranking_batch_id`. Later additions are recovered only from each durable
-/// record's sealed `replacement_entries`, never from the moving ranking view.
+/// `QualificationStarted.ranking_batch_id`. Later replacement vectors are reconstructed and
+/// verified from the immutable source-log artifacts named by each durable record, never from the
+/// moving ranking view.
 pub fn replay_membership(
     era: &PaperEra,
     start_batch: Watchlist,
+    source_log: &Path,
 ) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
     let Some((_, start)) = &era.start else {
         return Ok(None);
@@ -852,35 +837,43 @@ pub fn replay_membership(
 
     let mut last_ranking_batch_id = start.ranking_batch_id;
     for frame in &era.frames {
-        let PaperLogFrame::Record(PaperLogRecord::MembershipChanged {
-            removed,
-            added,
-            capacity,
-            ranking_batch_id,
-            evidence,
-            ..
-        }) = &frame.frame
+        let PaperLogFrame::Record(
+            record @ PaperLogRecord::MembershipChanged {
+                removed,
+                added,
+                capacity,
+                ranking_batch_id,
+                ..
+            },
+        ) = &frame.frame
         else {
             continue;
         };
+        let mut next_present = present.clone();
         for wallet in removed {
-            if !present.remove(wallet) {
+            if !next_present.remove(wallet) {
                 return Err(MembershipReplayError::MissingRemoval(*wallet));
             }
         }
         for wallet in added {
-            if !present.insert(*wallet) {
+            if !next_present.insert(*wallet) {
                 return Err(MembershipReplayError::DuplicateAddition(*wallet));
             }
         }
-        if present.len() > *capacity {
+        if next_present.len() > *capacity {
             return Err(MembershipReplayError::Capacity {
-                actual: present.len(),
+                actual: next_present.len(),
                 capacity: *capacity,
             });
         }
 
-        let replacements = replacement_entries(frame, evidence)?;
+        let replacements =
+            crate::qualification::replay_published_membership_change(record, source_log, &present)
+                .map_err(|source| MembershipReplayError::Evidence {
+                    sequence: frame.receipt.sequence.0,
+                    source,
+                })?;
+        present = next_present;
         let removed = removed.iter().copied().collect::<HashSet<_>>();
         entries.retain(|entry| !removed.contains(&entry.wallet));
         let mut entry_wallets = entries
@@ -899,7 +892,7 @@ pub fn replay_membership(
         entries.truncate(*capacity);
         entry_wallets = entries.iter().map(|entry| entry.wallet).collect();
         if entry_wallets != present {
-            return Err(MembershipReplayError::ReplacementMismatch {
+            return Err(MembershipReplayError::ReconstructionMismatch {
                 sequence: frame.receipt.sequence.0,
             });
         }
@@ -1280,6 +1273,10 @@ mod paper_log_tests {
     use crate::mid_price_cache::MidPriceCache;
     use crate::orchestrator::{Orchestrator, OrchestratorConfig};
     use crate::runtime_config::RuntimeConfig;
+    use crate::watchlist_admission::{
+        CAPACITY_CONFIG_SOURCE_ID, KNOCKOUT_CAUSAL_SOURCE_ID, MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+        MEMBERSHIP_ARTIFACT_SCHEMA_VERSION, RANKING_MEMBERSHIP_SOURCE_ID,
+    };
 
     fn receipt(sequence: u64) -> AppendReceipt {
         AppendReceipt {
@@ -1658,6 +1655,24 @@ mod paper_log_tests {
             .unwrap()
     }
 
+    fn append_membership_artifact<T: Serialize>(
+        writer: &mut Writer,
+        source_id: &str,
+        value: &T,
+    ) -> AppendReceipt {
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(source_id.to_owned()),
+                schema_version: MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+                parser_version: MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+                observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(value).unwrap(),
+            })
+            .unwrap()
+    }
+
     #[test]
     fn every_paper_record_variant_round_trips() {
         let records = vec![
@@ -1823,49 +1838,141 @@ mod paper_log_tests {
         assert_eq!(frames[1].receipt.sequence, EventSeq(1));
     }
 
-    /// PASS: later membership uses its durable replacement entry and advances the applied batch;
-    /// FAIL: replay consults a moving ranking or reconstructs only wallet identifiers.
+    /// PASS: restart replays records built by all three production evidence constructors from
+    /// their source-log artifacts and restores the exact final structural membership;
+    /// FAIL: any production evidence variant is unreadable or replay consults moving ranking.
     #[test]
-    fn structural_membership_replays_start_and_later_replacement_entries() {
+    fn structural_membership_replays_every_production_evidence_variant() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("membership.log");
-        let mut writer = Writer::open(&path).unwrap();
-        let initial = wallet();
-        let added = WalletAddress([2; 20]);
-        let replacement = watchlist_entry(added, 800);
+        let paper_path = dir.path().join("membership.log");
+        let source_path = dir.path().join("source.log");
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let first = wallet();
+        let second = WalletAddress([2; 20]);
+        let third = WalletAddress([3; 20]);
+        let fourth = WalletAddress([4; 20]);
+        let mut started = start("activation");
+        started.membership = vec![first, second, third, fourth];
         append(
-            &mut writer,
+            &mut paper_writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+            &PaperLogRecord::QualificationStarted(Box::new(started)),
         );
-        append(
-            &mut writer,
-            PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::MembershipChanged {
-                reason: MembershipReason::FullRerank,
-                removed: vec![initial],
-                added: vec![added],
-                capacity: 1,
-                ranking_batch_id: Some(8),
-                evidence: serde_json::json!({
-                    "kind": "full_rerank",
-                    "replacement_entries": [replacement]
-                }),
+
+        let reranked = vec![
+            watchlist_entry(first, 900),
+            watchlist_entry(second, 800),
+            watchlist_entry(third, 700),
+        ];
+        let ranking_receipt = append_membership_artifact(
+            &mut source_writer,
+            RANKING_MEMBERSHIP_SOURCE_ID,
+            &RankingMembershipArtifact {
+                batch_id: Some(8),
+                entries: reranked,
             },
         );
-        drop(writer);
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &MembershipChange {
+                reason: MembershipReason::FullRerank,
+                removed: vec![fourth],
+                added: Vec::new(),
+                capacity: 3,
+                ranking_batch_id: Some(8),
+                evidence: SealedMembershipEvidence::full_rerank(ranking_receipt, Vec::new())
+                    .unwrap(),
+            }
+            .into_record(),
+        );
 
-        let era = paper_era(scan_paper_log(&path).unwrap());
-        let replayed = replay_membership(&era, watchlist(vec![watchlist_entry(initial, 500)]))
-            .unwrap()
-            .unwrap();
+        let knockout_receipt = append_membership_artifact(
+            &mut source_writer,
+            KNOCKOUT_CAUSAL_SOURCE_ID,
+            &KnockoutCausalArtifact {
+                wallet: third,
+                evaluated_at_unix: 259_200,
+                last_trade_unix: Some(0),
+                inactivity_threshold_secs: 259_200,
+                inactivity_hard_cap_secs: 604_800,
+                demotion_min_trades: 10,
+                demotion_cb_alpha: dec!(0.10),
+                demotion_pnl_window_secs: 2_592_000,
+                fills: Vec::new(),
+                settlements: Vec::new(),
+            },
+        );
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &MembershipChange {
+                reason: MembershipReason::KnockoutInactivity,
+                removed: vec![third],
+                added: Vec::new(),
+                capacity: 3,
+                ranking_batch_id: Some(8),
+                evidence: SealedMembershipEvidence::knockout_backfill(
+                    vec![SealedKnockoutEvidence {
+                        wallet: third,
+                        reason: MembershipReason::KnockoutInactivity,
+                        causal_receipt: knockout_receipt,
+                    }],
+                    None,
+                    Vec::new(),
+                )
+                .unwrap(),
+            }
+            .into_record(),
+        );
+
+        let capacity_receipt = append_membership_artifact(
+            &mut source_writer,
+            CAPACITY_CONFIG_SOURCE_ID,
+            &CapacityMembershipArtifact {
+                generation: 2,
+                target: 1,
+                published_entries: vec![watchlist_entry(first, 900)],
+            },
+        );
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &MembershipChange {
+                reason: MembershipReason::CapacityChange,
+                removed: vec![second],
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: None,
+                evidence: SealedMembershipEvidence::capacity_change(
+                    2,
+                    capacity_receipt,
+                    Vec::new(),
+                )
+                .unwrap(),
+            }
+            .into_record(),
+        );
+        drop(paper_writer);
+        drop(source_writer);
+
+        let era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let replayed = replay_membership(
+            &era,
+            watchlist(vec![
+                watchlist_entry(first, 600),
+                watchlist_entry(second, 500),
+                watchlist_entry(third, 400),
+                watchlist_entry(fourth, 300),
+            ]),
+            &source_path,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(replayed.last_ranking_batch_id, 8);
         assert_eq!(replayed.watchlist.entries.len(), 1);
-        assert_eq!(replayed.watchlist.entries[0].wallet, added);
-        assert_eq!(
-            replayed.watchlist.entries[0].leader_score_bps,
-            BasisPoints(800)
-        );
+        assert_eq!(replayed.watchlist.entries[0].wallet, first);
     }
 
     /// PASS: a crash before the new MembershipChanged record leaves boot on Start's A/N;
@@ -1884,9 +1991,13 @@ mod paper_log_tests {
         drop(writer);
 
         let era = paper_era(scan_paper_log(&path).unwrap());
-        let replayed = replay_membership(&era, watchlist(vec![watchlist_entry(initial, 500)]))
-            .unwrap()
-            .unwrap();
+        let replayed = replay_membership(
+            &era,
+            watchlist(vec![watchlist_entry(initial, 500)]),
+            &dir.path().join("source.log"),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(replayed.last_ranking_batch_id, 7);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, initial);
@@ -1909,7 +2020,11 @@ mod paper_log_tests {
         let era = paper_era(scan_paper_log(&path).unwrap());
         let other = WalletAddress([2; 20]);
         assert!(matches!(
-            replay_membership(&era, watchlist(vec![watchlist_entry(other, 500)])),
+            replay_membership(
+                &era,
+                watchlist(vec![watchlist_entry(other, 500)]),
+                &dir.path().join("source.log"),
+            ),
             Err(MembershipReplayError::MissingInitial(missing)) if missing == wallet()
         ));
     }
