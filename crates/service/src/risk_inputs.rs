@@ -193,7 +193,7 @@ pub fn latest_completed_prepared(era: &PaperEra) -> Option<EventSeq> {
 
 /// Completed financial facts whose source observation is inside the boundary prefix and was
 /// received strictly before the cutoff. This is the shared causal filter for historical marks.
-pub(crate) fn completed_prepared_before_boundary(
+pub fn completed_prepared_before_boundary(
     era: &PaperEra,
     source_log_path: &Path,
     cutoff_unix: i64,
