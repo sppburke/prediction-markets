@@ -125,6 +125,8 @@ jobs:
         env:
           PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
           PG_LEGACY_URL: postgres://postgres:postgres@localhost:5432/pe_legacy_545
+        # Keep this in the workspace gate after the Rust build/test commands: the scenario's
+        # `cargo run -p pe-service --all-features --bin pe-service -- ...` invocations are incremental.
         run: bash scripts/deploy/test_legacy_to_financial_pg.sh
 
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────

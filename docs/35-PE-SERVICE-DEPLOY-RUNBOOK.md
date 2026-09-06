@@ -421,6 +421,15 @@ pe-service <service.toml> --financial-era=rollback-check \
 and `rollback-check` reports whether a complete Start is already present. They dispatch before normal
 client construction.
 
+CI proves this cross-store boundary against PostgreSQL 16 with
+[`test_legacy_to_financial_pg.sh`](../scripts/deploy/test_legacy_to_financial_pg.sh). The scenario
+installs checked-in pre-545 schema fixtures pinned to commit `8ea29a9`, creates fresh local logs and
+paper state, runs the production `pe-service --financial-era=prepare` and `start` owners via
+`cargo run -p pe-service --all-features --bin pe-service --`, and passes the returned synchronized
+Start receipt to `seed_financial_start` before applying the configuration migration. It retries every
+transition boundary once and requires the same receipt or exact archive/read-back state, so both
+pull-request and post-merge `main` CI exercise the same legacy input.
+
 The offline qualification command is separate from activation and constructs no network client:
 
 ```bash
