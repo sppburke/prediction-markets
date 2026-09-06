@@ -1762,6 +1762,7 @@ pub fn activate_cache_v2_with_handoff(
         });
     }
     require_regular_file(&request.side_path, "version-two side cache")?;
+    reject_nonempty_activation_sidecars(&request.side_path)?;
     if sha256_file(&request.side_path)? != request.expected_side_sha256 {
         return invalid("version-two side-cache hash changed after finalization".to_owned());
     }
@@ -1799,12 +1800,6 @@ pub fn activate_cache_v2_with_handoff(
         None
     };
 
-    let side = open_existing_rw(&request.side_path)?;
-    require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
-    integrity_check(&side)?;
-    checkpoint_truncate(&side)?;
-    side.close().map_err(|(_, error)| error)?;
-    reject_nonempty_sidecars(&request.side_path)?;
     if request.prior_cache_backup_path.exists() {
         if sha256_file(&request.prior_cache_backup_path)? != prior_cache_sha256 {
             return invalid(format!(
@@ -1818,23 +1813,28 @@ pub fn activate_cache_v2_with_handoff(
     if verified_cache_schema(&request.prior_cache_backup_path)? != current_version {
         return invalid("prior-cache backup schema changed during activation".to_owned());
     }
+
+    // The side cache must remain the exact immutable artifact that was finalized. In particular,
+    // never checkpoint an unmanifested WAL into its main file: all stale-evidence checks complete
+    // against the side path before the authoritative fixed path is replaced.
+    require_regular_file(&request.side_path, "version-two side cache")?;
+    reject_nonempty_activation_sidecars(&request.side_path)?;
+    let side = open_existing_ro(&request.side_path)?;
+    require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
+    integrity_check(&side)?;
+    verify_finalized_v2_manifests(&side)?;
+    side.close().map_err(|(_, error)| error)?;
+    // The read-only validation of a WAL-mode main may itself allocate an SHM index. With the
+    // pre-open sidecar rejection above complete, only nonempty WAL frames can add durable state;
+    // reject those and remove validation-created empty WAL/SHM files.
+    reject_nonempty_sidecars(&request.side_path)?;
+    let installed_hash = sha256_file(&request.side_path)?;
+    if installed_hash != request.expected_side_sha256 {
+        return invalid("version-two side-cache hash changed after finalization".to_owned());
+    }
+
     remove_sidecars(&request.fixed_path)?;
     std::fs::rename(&request.side_path, &request.fixed_path).map_err(map_rename_error)?;
-    sync_parent(&request.fixed_path)?;
-    reject_nonempty_sidecars(&request.fixed_path)?;
-    let installed_hash = sha256_file(&request.fixed_path)?;
-    if installed_hash != request.expected_side_sha256 {
-        return invalid("installed cache hash differs from finalized side cache".to_owned());
-    }
-    let installed = open_existing_ro(&request.fixed_path)?;
-    require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
-    integrity_check(&installed)?;
-    verify_finalized_v2_manifests(&installed)?;
-    installed.close().map_err(|(_, error)| error)?;
-    // Even a read-only validation open may materialize empty WAL/SHM files for
-    // a WAL-mode database. Remove those newly created empties as well; no
-    // sidecar from either generation is part of the installed artifact.
-    reject_nonempty_sidecars(&request.fixed_path)?;
     sync_parent(&request.fixed_path)?;
     Ok(CacheActivationReport {
         installed_path: std::fs::canonicalize(&request.fixed_path)?,
@@ -2565,6 +2565,19 @@ fn reject_nonempty_sidecars(path: &Path) -> Result<(), BootstrapError> {
     let shared_memory = sidecar_path(path, "-shm");
     if shared_memory.exists() {
         std::fs::remove_file(shared_memory)?;
+    }
+    Ok(())
+}
+
+fn reject_nonempty_activation_sidecars(path: &Path) -> Result<(), BootstrapError> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sidecar_path(path, suffix);
+        if sidecar.exists() && std::fs::metadata(&sidecar)?.len() != 0 {
+            return invalid(format!(
+                "non-empty SQLite activation sidecar remains: {}",
+                sidecar.display()
+            ));
+        }
     }
     Ok(())
 }

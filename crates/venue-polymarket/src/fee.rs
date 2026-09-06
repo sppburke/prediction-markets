@@ -152,36 +152,27 @@ pub fn taker_fee(
     CollateralAmount::from_decimal_exact(fee).map_err(|_| FeeError::Arithmetic)
 }
 
-/// Greatest fee reachable for the signed minimum shares over the inclusive price band.
+/// Greatest fee reachable for the principal-implied signed quantity over the inclusive price band.
 ///
 /// The supported exponent-one curve reaches its maximum at one half, so only the interval
 /// endpoints and `0.5` can be the maximizer. The result is rounded upward to the venue's
-/// five-decimal fee quantum.
+/// five-decimal fee quantum. Quantity is derived from the signed principal and limit price here;
+/// callers cannot supply an independent, inconsistent quantity.
 pub fn fee_reserve(
     schedule: CompactFeeSchedule,
     principal: CollateralAmount,
-    minimum_shares: ShareAmount,
-    floor: Price,
-    ceiling: Price,
+    best_ask: Price,
+    limit_price: Price,
 ) -> Result<CollateralAmount, FeeError> {
-    validate_band(floor, ceiling)?;
+    validate_band(best_ask, limit_price)?;
     let Some(rate) = validated_rate(schedule)? else {
         return Ok(CollateralAmount::ZERO);
     };
-    if principal == CollateralAmount::ZERO && minimum_shares == ShareAmount::ZERO {
+    if principal == CollateralAmount::ZERO {
         return Ok(CollateralAmount::ZERO);
     }
-    if principal == CollateralAmount::ZERO
-        || minimum_shares == ShareAmount::ZERO
-        || ceiling == Price::ZERO
-        || minimum_shares
-            .to_decimal()
-            .checked_mul(ceiling.0)
-            .is_none_or(|signed_notional| signed_notional > principal.to_decimal())
-    {
-        return Err(FeeError::Arithmetic);
-    }
-    let curve_price = maximum_curve_price(floor, ceiling);
+    let minimum_shares = principal_implied_shares(principal, limit_price)?;
+    let curve_price = maximum_curve_price(best_ask, limit_price);
     let curve = curve_price
         .checked_mul(
             Decimal::ONE
@@ -190,12 +181,28 @@ pub fn fee_reserve(
         )
         .ok_or(FeeError::Arithmetic)?;
     let reserve = minimum_shares
-        .to_decimal()
         .checked_mul(rate)
         .and_then(|value| value.checked_mul(curve))
         .ok_or(FeeError::Arithmetic)?
         .round_dp_with_strategy(5, RoundingStrategy::ToPositiveInfinity);
     CollateralAmount::from_decimal_exact(reserve).map_err(|_| FeeError::Arithmetic)
+}
+
+/// Exact share quantity implied by a collateral principal and signed limit price.
+///
+/// The ladder owns tick-aware flooring of this quotient; fee reserve deliberately keeps the exact
+/// value so it cannot under-reserve relative to the floored signed quantity.
+pub(crate) fn principal_implied_shares(
+    principal: CollateralAmount,
+    limit_price: Price,
+) -> Result<Decimal, FeeError> {
+    if limit_price == Price::ZERO {
+        return Err(FeeError::Arithmetic);
+    }
+    principal
+        .to_decimal()
+        .checked_div(limit_price.0)
+        .ok_or(FeeError::Arithmetic)
 }
 
 /// Conservative principal whose principal plus fee reserve fits the monetary budget.
@@ -472,7 +479,6 @@ mod tests {
             fee_reserve(
                 schedule,
                 CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
-                ShareAmount::from_decimal_exact(dec!(1.333333)).unwrap(),
                 floor,
                 ceiling
             )
@@ -488,7 +494,7 @@ mod tests {
                 .round_dp_with_strategy(6, RoundingStrategy::ToZero),
         )
         .unwrap();
-        let reserve = fee_reserve(schedule, principal, shares, floor, ceiling).unwrap();
+        let reserve = fee_reserve(schedule, principal, floor, ceiling).unwrap();
         assert!(principal.checked_add(reserve).unwrap() <= budget);
         for price in [floor, ceiling] {
             let fee = taker_fee(schedule, shares, price).unwrap();
@@ -513,14 +519,7 @@ mod tests {
             CollateralAmount::ZERO
         );
         assert_eq!(
-            fee_reserve(
-                CompactFeeSchedule::Zero,
-                budget,
-                ShareAmount::from_decimal_exact(dec!(20)).unwrap(),
-                floor,
-                ceiling
-            )
-            .unwrap(),
+            fee_reserve(CompactFeeSchedule::Zero, budget, floor, ceiling).unwrap(),
             CollateralAmount::ZERO
         );
         assert_eq!(
@@ -536,15 +535,23 @@ mod tests {
             CollateralAmount::from_atomic(30)
         ));
         assert!(matches!(
-            fee_reserve(
-                CompactFeeSchedule::Zero,
-                budget,
-                ShareAmount::from_decimal_exact(dec!(20)).unwrap(),
-                ceiling,
-                floor
-            ),
+            fee_reserve(CompactFeeSchedule::Zero, budget, ceiling, floor),
             Err(FeeError::Band)
         ));
+    }
+
+    #[test]
+    fn reserve_quantity_cannot_be_understated_independently_of_principal() {
+        let price = Price::new(dec!(0.4)).unwrap();
+        let reserve = fee_reserve(
+            CompactFeeSchedule::Taker { rate: dec!(0.0025) },
+            CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+            price,
+            price,
+        )
+        .unwrap();
+
+        assert_eq!(reserve.to_decimal(), dec!(0.00150));
     }
 
     #[test]

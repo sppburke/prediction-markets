@@ -251,6 +251,40 @@ fn install_payout_manifest(path: &std::path::Path) {
         .unwrap();
 }
 
+async fn finalize_empty_activity_side(
+    dir: &TempDir,
+    side: &std::path::Path,
+    watermark: i64,
+) -> String {
+    drop(seed_v1(side, watermark));
+    let manifest = write_build_manifest(dir, side);
+    migrate_cache_v2(side, &manifest).unwrap();
+    let frozen_path = write_frozen_reference(dir, watermark, vec![WALLET.to_owned()]);
+    verify_frozen_payload_v1(side, &frozen_path, watermark + 70).unwrap();
+    let activity_url = format!(
+        "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={watermark}"
+    );
+    populate_activity_v2(
+        side,
+        &FixtureFetcher::new(HashMap::from([(activity_url, b"[]".to_vec())])),
+        "https://data.example",
+        &frozen_path,
+        watermark,
+        1,
+        watermark + 80,
+    )
+    .await
+    .unwrap();
+    install_payout_manifest(side);
+    finalize_cache_v2(
+        side,
+        &dir.path().join("cache-v2-final.json"),
+        watermark + 90,
+    )
+    .unwrap()
+    .cache_sha256
+}
+
 #[tokio::test]
 async fn migration_is_resumable_and_activation_installs_only_the_finalized_main() {
     let dir = tempfile::Builder::new()
@@ -679,6 +713,60 @@ fn activation_refuses_a_side_main_changed_after_finalization() {
         WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
         1
     );
+}
+
+/// PASS: a post-finalization commit retained only in an open side WAL is rejected before the
+/// immutable side is opened or checkpointed, and the fixed cache remains byte-for-byte unchanged.
+/// FAIL: activation checkpoints the unmanifested table, replaces the fixed cache, or reports the
+/// stale-evidence failure only after replacement.
+#[tokio::test]
+async fn activation_rejects_unmanifested_side_wal_before_replacing_fixed_cache() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    let fixed = dir.path().join("wallet_cache.db");
+    let backup = dir.path().join("v1.db");
+    let watermark = 1_800_000_000_i64;
+    let expected = finalize_empty_activity_side(&dir, &side, watermark).await;
+    drop(seed_v1(&fixed, watermark - 100));
+    let fixed_before = sha256_file(&fixed).unwrap();
+
+    let wal_owner = Connection::open(&side).unwrap();
+    wal_owner
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint = 0;
+             BEGIN IMMEDIATE;
+             CREATE TABLE unmanifested_activation_write(value TEXT NOT NULL);
+             INSERT INTO unmanifested_activation_write(value) VALUES ('stale');
+             COMMIT;",
+        )
+        .unwrap();
+    let wal = side.with_extension("db-wal");
+    let shm = side.with_extension("db-shm");
+    assert!(wal.metadata().unwrap().len() > 0);
+    assert!(shm.metadata().unwrap().len() > 0);
+    assert_eq!(sha256_file(&side).unwrap(), expected);
+
+    let error = activate_cache_v2(&CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: backup,
+        expected_side_sha256: expected,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("non-empty SQLite activation sidecar"),
+        "{error}"
+    );
+    assert_eq!(sha256_file(&fixed).unwrap(), fixed_before);
+    assert_eq!(
+        WalletCache::open(&fixed).unwrap().schema_version().unwrap(),
+        1
+    );
+    assert!(side.is_file());
+    drop(wal_owner);
 }
 
 #[tokio::test]
