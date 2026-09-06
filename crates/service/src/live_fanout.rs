@@ -5714,7 +5714,7 @@ mod tests {
         .await;
         let exact = match results.pop().unwrap().disposition {
             OrderFinalityDisposition::Finalized(finalized) => finalized,
-            other => panic!("expected exact multi-level finality, got {other:?}"),
+            other => unreachable!("expected exact multi-level finality, got {other:?}"),
         };
         assert_eq!(exact.quantity.to_decimal(), dec!(3.25));
         assert_eq!(exact.principal.to_decimal(), dec!(2.5));
