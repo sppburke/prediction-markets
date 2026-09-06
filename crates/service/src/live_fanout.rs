@@ -7913,6 +7913,38 @@ mod tests {
         envelope
     }
 
+    async fn append_recovery_risk_price(
+        state: &FanoutState,
+        now: OffsetDateTime,
+    ) -> (AppendReceipt, String) {
+        let prepared = finality_prepared();
+        let condition_id = prepared
+            .identity
+            .fill_projection
+            .as_ref()
+            .unwrap()
+            .market_id
+            .clone();
+        let source =
+            gamma_risk_price_source(fixture_receipt(0), &condition_id, ["0.9", "0.1"], now);
+        let input = EnvelopeIn {
+            source_id: source.source_id,
+            schema_version: source.schema_version,
+            parser_version: source.parser_version,
+            observed_at: source.observed_at,
+            received_at: source.received_at,
+            content_type: source.content_type,
+            payload: source.payload,
+        };
+        let receipt = state.config.source_log.append(input).await.unwrap();
+        state
+            .config
+            .source_receipts
+            .source_envelope(receipt)
+            .unwrap();
+        (receipt, condition_id)
+    }
+
     fn reconstructed_live_risk_fixture() -> (
         tempfile::TempDir,
         AccountId,
@@ -9970,6 +10002,52 @@ mod tests {
         account_state
     }
 
+    async fn append_recovery_filled_position(
+        state: &FanoutState,
+        account_id: &AccountId,
+        account_state: &pe_execution_core::LiveAccountStateAudit,
+        now: OffsetDateTime,
+    ) -> (Vec<LiveJournalEvent>, ProjectionDerivation) {
+        let mut prior = finality_prepared();
+        prior.identity = projection_identity("recovery-risk-prior");
+        prior.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for(&prior.identity.dispatch_id, account_id);
+        prior.account_state = account_state.clone();
+        prior.economic.admission.market.observed_at_unix = now.unix_timestamp();
+        prior.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
+        prior.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
+        bind_empty_live_risk_to_paper_prefix(state, &mut prior, now);
+        append_economic_sources(state, &mut prior.economic, now).await;
+        append_approved_admission(state.config.journal.as_ref(), account_id, &prior, now);
+        let prepared = state
+            .config
+            .journal
+            .append(
+                account_id.clone(),
+                now,
+                LiveJournalPayload::OrderPrepared(prior.clone()),
+            )
+            .unwrap();
+        let matched = finality_matched_event(account_id, &prior, 0, now);
+        state
+            .config
+            .journal
+            .append(account_id.clone(), now, matched.payload)
+            .unwrap();
+        let fill = finalized_fill_event(account_id, &prior, 0, prepared.seq);
+        state
+            .config
+            .journal
+            .append(account_id.clone(), now, fill.payload)
+            .unwrap();
+
+        let events = replay_live_account(state, account_id).unwrap();
+        let sources =
+            source_envelopes_for_live_events(&state.config.source_receipts, &events).unwrap();
+        let derived = derive_projection_rows_with_sources(account_id, &events, &sources).unwrap();
+        (events, derived)
+    }
+
     async fn stage_recoverable_approved(
         state: &mut FanoutState,
         now: OffsetDateTime,
@@ -9978,7 +10056,6 @@ mod tests {
         pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
         pe_venue_polymarket::PreparedPolymarketBuy,
     ) {
-        let has_risk_price_receipt = risk_price_receipt.is_some();
         let account_id = AccountId::new("acct").unwrap();
         stage(
             state.config.paper_state.as_ref(),
@@ -10001,29 +10078,98 @@ mod tests {
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = now.unix_timestamp().saturating_mul(1_000);
         prepared.economic.risk.price_receipts.clear();
-        bind_empty_live_risk_to_paper_prefix(state, &mut prepared, now);
-        prepared
-            .economic
-            .risk
-            .price_receipts
-            .extend(risk_price_receipt);
+        if let Some(price_receipt) = risk_price_receipt {
+            let (events, derived) =
+                append_recovery_filled_position(state, &account_id, &prepared.account_state, now)
+                    .await;
+            let cash =
+                CollateralAmount::from_decimal_exact(derived.economic_cash.unwrap()).unwrap();
+            prepared.economic.balance.cash_before = cash;
+            let binding = derived.account_binding.as_ref().unwrap();
+            prepared.account_state = account_state_fixture_for_binding(cash, now, binding);
+            let mut sources =
+                source_envelopes_for_live_events(&state.config.source_receipts, &events).unwrap();
+            sources.push(
+                state
+                    .config
+                    .source_receipts
+                    .source_envelope(price_receipt)
+                    .unwrap(),
+            );
+            sources.sort_by_key(|source| source.seq);
+            let mids = replay_live_risk_prices(
+                &derived.positions,
+                &[price_receipt],
+                now.unix_timestamp().saturating_mul(1_000),
+                &sources,
+                Some(&state.config.source_receipts),
+            )
+            .unwrap();
+            let paper_frames = scan_paper_log(&state.config.paper_log_path).unwrap();
+            let projection = prepared.identity.fill_projection.as_ref().unwrap();
+            prepared.economic.risk = compose_live_risk_audit(
+                &account_id,
+                &state.config.journal_path,
+                &events,
+                &derived,
+                &paper_era_at_evaluation(&paper_frames, now.unix_timestamp().saturating_mul(1_000))
+                    .unwrap(),
+                &mids,
+                &[price_receipt],
+                now,
+                LiveRiskProposal {
+                    leader_wallet: Some(projection.leader_wallet.clone()),
+                    market_id: Some(projection.market_id.clone()),
+                    proposed_debit: prepared.economic.balance.worst_case_debit,
+                    per_trade_cap_bps: 10_000,
+                },
+            )
+            .unwrap();
+        } else {
+            bind_empty_live_risk_to_paper_prefix(state, &mut prepared, now);
+        }
         append_economic_sources(state, &mut prepared.economic, now).await;
         // The fake venue returns this prepared order verbatim; the resume path requires it to
         // match the request derived from the admission (ladder debit and identity hashes).
         prepared.prepared.worst_case_debit = prepared.prepared.maker_collateral;
         prepared.prepared.metadata_hashes = prepared.identity.evidence_hashes.clone();
         append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
-        let mut inventory = if has_risk_price_receipt {
-            recovery_inventory(
-                &state.config.journal_path,
-                state.config.era_live_prefix.as_ref(),
-            )
-            .unwrap()
-        } else {
-            verified_recovery_inventory(state).unwrap()
-        };
+        let mut inventory = verified_recovery_inventory(state).unwrap();
         let pending = inventory.approved_admissions.remove(0);
         (pending, prepared.prepared)
+    }
+
+    /// PASS: the receipt-bearing recovery fixture has one strictly verified Approved candidate
+    /// and one open position on the market covered by its Gamma price receipt.
+    /// FAIL: service-tier recovery verification or strict projection derivation rejects the
+    /// staged journal, or the staged position and price market differ.
+    #[tokio::test]
+    async fn stage_recoverable_approved_with_price_is_strictly_replayable() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(now.unix_timestamp());
+        let mut state = fanout_state(&dir, db, snapshot, "http://127.0.0.1:9", None);
+        let (price_receipt, condition_id) = append_recovery_risk_price(&state, now).await;
+
+        let _ = stage_recoverable_approved(&mut state, now, Some(price_receipt)).await;
+
+        let inventory = verified_recovery_inventory(&state).unwrap();
+        assert_eq!(inventory.approved_admissions.len(), 1);
+        assert_eq!(
+            inventory.approved_admissions[0]
+                .admission
+                .economic
+                .risk
+                .price_receipts,
+            vec![price_receipt]
+        );
+        let account_id = AccountId::new("acct").unwrap();
+        let events = replay_live_account(&state, &account_id).unwrap();
+        let derived = derive_projection_rows_for_state(&state, &account_id, &events).unwrap();
+        assert_eq!(derived.positions.len(), 1);
+        assert_eq!(derived.positions[0].market_id, condition_id);
     }
 
     /// PASS: two Approved facts for one account/dispatch conflict before any recovery
@@ -13418,6 +13564,22 @@ mod tests {
         Json(Vec::new())
     }
 
+    async fn recovery_open_position(
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Vec<serde_json::Value>> {
+        if query.get("redeemable").map(String::as_str) == Some("false") {
+            return Json(vec![serde_json::json!({
+                "proxyWallet": "0x1111111111111111111111111111111111111111",
+                "asset": "123",
+                "conditionId": finality_prepared().economic.market.condition_id.0,
+                "outcomeIndex": 0,
+                "size": "3.125",
+                "negativeRisk": false,
+            })]);
+        }
+        Json(Vec::new())
+    }
+
     async fn recovery_positions(
         State(include_unknown): State<bool>,
         Query(query): Query<HashMap<String, String>>,
@@ -13656,7 +13818,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_rechecks_price_expiry_after_preparation() {
         let posts = Arc::new(AtomicUsize::new(0));
-        let app = Router::new().route("/positions", get(empty_positions));
+        let app = Router::new().route("/positions", get(recovery_open_position));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -13667,20 +13829,7 @@ mod tests {
         let mut snapshot = armed_snapshot("acct");
         snapshot.fetched_at_unix = Some(pass_started_at.unix_timestamp());
         let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
-        let price_receipt = state
-            .config
-            .source_log
-            .append(EnvelopeIn {
-                source_id: SourceId("recovery-price-boundary".to_owned()),
-                schema_version: 1,
-                parser_version: 1,
-                observed_at: SourceTimestamp(observed_at),
-                received_at: ReceivedAt(observed_at),
-                content_type: ContentType::Json,
-                payload: br#"{"price":"0.50"}"#.to_vec(),
-            })
-            .await
-            .unwrap();
+        let (price_receipt, _) = append_recovery_risk_price(&state, observed_at).await;
         let (pending, prepared) =
             stage_recoverable_approved(&mut state, observed_at, Some(price_receipt)).await;
         let current_account_state =
