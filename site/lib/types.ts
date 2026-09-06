@@ -43,8 +43,7 @@ export interface ServiceConfigRow {
   updated_at: string;
 }
 
-// One row of the anon-readable `paper_fills` table (per-wallet detail tape).
-export interface PaperFill {
+interface FillBase {
   idempotency_key: string;
   leader_wallet: string;
   source_trade_id: string | null;
@@ -56,6 +55,13 @@ export interface PaperFill {
   entry_unix: number | null;
   event_seq: number;
   inserted_at: string;
+}
+
+// One exact row of the anon-readable `paper_fills` table (per-wallet detail tape).
+export interface PaperFill extends FillBase {
+  principal: Numeric;
+  fee: Numeric;
+  prepared_seq: number;
 }
 
 // Display-safe #508 account control state. Credential ciphertext is intentionally absent.
@@ -83,7 +89,7 @@ export interface AccountCredentialMetadata {
   updated_at: string;
 }
 
-export interface LiveFill extends PaperFill {
+export interface LiveFill extends FillBase {
   account_id: string;
 }
 

@@ -226,10 +226,10 @@ impl SinkWriter for SupabaseWriter {
             "market_id": row.fill.market_id.0.0,
             "outcome_id": row.fill.outcome_id.0,
             "side": side_str(row.fill.side),
-            "contracts": row.fill.contracts,
+            "contracts": row.fill.quantity.to_decimal().to_string(),
             "fill_price": row.fill.fill_price.0.to_string(),
             "entry_unix": row.entry_unix,
-            "event_seq": row.fill.event_seq,
+            "event_seq": row.fill.event_seq.0,
         }]);
         self.post_upsert("paper_fills", "idempotency_key", &body)
             .await
@@ -319,15 +319,21 @@ pub async fn reconcile_fills<W: SinkWriter>(
     for row in paper_state
         .list_fills()?
         .into_iter()
-        .filter(|f| f.event_seq > hwm)
+        .filter(|f| i64::try_from(f.event_seq.0).is_ok_and(|sequence| sequence > hwm))
     {
         match supabase_fill_from(&row) {
             Some(sup) => match writer.upsert_fill(&sup).await {
-                Ok(()) => new_hwm = row.event_seq,
+                Ok(()) => {
+                    new_hwm = i64::try_from(row.event_seq.0).map_err(|_| {
+                        SinkError::PaperState(PaperStateError::Internal(
+                            "fill event sequence exceeds i64::MAX".to_owned(),
+                        ))
+                    })?;
+                }
                 Err(e) => {
                     warn!(
                         error = %e,
-                        event_seq = row.event_seq,
+                        event_seq = row.event_seq.0,
                         "supabase sink: fill upsert failed; halting catch-up at last confirmed prefix"
                     );
                     complete = false;
@@ -340,7 +346,11 @@ pub async fn reconcile_fills<W: SinkWriter>(
                     key = %row.idempotency_key,
                     "supabase sink: skipping non-winner-follow fill (no leader in idempotency key)"
                 );
-                new_hwm = row.event_seq;
+                new_hwm = i64::try_from(row.event_seq.0).map_err(|_| {
+                    SinkError::PaperState(PaperStateError::Internal(
+                        "fill event sequence exceeds i64::MAX".to_owned(),
+                    ))
+                })?;
             }
         }
     }
@@ -417,7 +427,7 @@ pub async fn run_sink<W: SinkWriter>(
                 Some(SinkEvent::Fill(row)) => match supabase_fill_from(&row) {
                     Some(sup) => {
                         if let Err(e) = writer.upsert_fill(&sup).await {
-                            warn!(error = %e, event_seq = row.event_seq, "supabase sink: live fill upsert failed; will heal on reconcile");
+                            warn!(error = %e, event_seq = row.event_seq.0, "supabase sink: live fill upsert failed; will heal on reconcile");
                         }
                     }
                     None => warn!(key = %row.idempotency_key, "supabase sink: skipping non-winner-follow fill (no leader)"),

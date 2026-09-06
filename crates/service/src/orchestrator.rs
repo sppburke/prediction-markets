@@ -160,7 +160,7 @@ pub(crate) fn recorded_fill_terminal(
         record.market_id.to_string(),
         record.outcome_id.0,
         side,
-        record.contracts,
+        record.quantity.atomic() / 1_000_000,
         record.fill_price,
         seq,
     )
@@ -1465,7 +1465,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .paper_positions()
                 .map_err(|e| anyhow::anyhow!("load legacy paper positions: {e}"))?
                 .into_iter()
-                .filter(|position| position.long_contracts > 0 || position.short_contracts > 0)
+                .filter(|position| {
+                    position.long != ShareAmount::ZERO || position.short != ShareAmount::ZERO
+                })
                 .map(|position| MarketOutcomeId::new(position.market_id, position.outcome_id))
                 .collect()
         };

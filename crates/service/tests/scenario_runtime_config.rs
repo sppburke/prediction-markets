@@ -730,7 +730,7 @@ async fn run_gate_with(
         .paper_positions()
         .unwrap()
         .first()
-        .map(|p| p.long_contracts)
+        .map(|p| p.long.atomic())
         .unwrap_or(0);
     (paper_fill_count(dir), contracts)
 }
