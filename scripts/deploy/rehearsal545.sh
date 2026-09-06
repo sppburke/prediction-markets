@@ -139,10 +139,7 @@ staged_identity_output=$("$binary" --verify-staged-identity) || {
   echo "FATAL: rehearsal binary could not derive its own identity" >&2
   exit 1
 }
-read -r target_revision artifact_blake3 < <(python3 -c 'import re,sys
-match=re.fullmatch(r"pe-service \S+ revision=([0-9a-f]{40}) config_identity=\S+ artifact_blake3=([0-9a-f]{64})\n?",sys.stdin.read())
-if match is None: raise SystemExit(1)
-print(*match.groups())' <<< "$staged_identity_output") || {
+read -r target_revision artifact_blake3 < <(parse_staged_identity <<< "$staged_identity_output") || {
   echo "FATAL: rehearsal binary identity output is invalid" >&2
   exit 1
 }

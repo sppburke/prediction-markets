@@ -276,13 +276,8 @@ psql_service_db -v ON_ERROR_STOP=1 -Atc \
 [[ -s "$financial_config_rows" ]] || die "Financial15 configuration export is empty"
 
 staged_identity=$(run_pe_service --verify-staged-identity)
-mapfile -t staged_identity_parts < <(python3 -c 'import re,sys
-match=re.fullmatch(r"pe-service \S+ revision=([0-9a-f]{40}) config_identity=\S+ artifact_blake3=([0-9a-f]{64})\n?",sys.argv[1])
-if match is None: raise SystemExit("pe-service staged identity is malformed")
-print(match.group(1)); print(match.group(2))' "$staged_identity")
-[[ ${#staged_identity_parts[@]} -eq 2 ]] || die "pe-service staged identity is incomplete"
-target_revision=${staged_identity_parts[0]}
-artifact_blake3=${staged_identity_parts[1]}
+read -r target_revision artifact_blake3 < <(parse_staged_identity <<< "$staged_identity") ||
+  die "pe-service staged identity is malformed"
 run_pe_service --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null
 run_pe_service --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null
 pe_service_binary="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/pe-service"

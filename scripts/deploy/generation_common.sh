@@ -120,6 +120,15 @@ for name in names:
 ' "$@"
 }
 
+# Parse the service binary's `--verify-staged-identity` line from stdin and print
+# `<revision> <artifact_blake3>`; the binary owns the format (crates/service/src/main.rs).
+parse_staged_identity() {
+  python3 -c 'import re,sys
+match=re.fullmatch(r"pe-service \S+ revision=([0-9a-f]{40}) config_identity=\S+ artifact_blake3=([0-9a-f]{64})\n?",sys.stdin.read())
+if match is None: raise SystemExit(1)
+print(*match.groups())'
+}
+
 # Keep the credential-bearing libpq URL out of argv and /proc/<pid>/cmdline; split it into libpq
 # component variables while every caller supplies only non-secret psql options on the command line.
 # libpq does not expand a connection URL placed in PGDATABASE (verified against PostgreSQL 16:
