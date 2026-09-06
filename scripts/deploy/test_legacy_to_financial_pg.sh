@@ -751,9 +751,15 @@ SQL
 [[ "$service_role_initial_counts" == 'service_role|1|0' ]] ||
   die "service_role protected-table reads returned unexpected counts: $service_role_initial_counts"
 
-psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+# The fixture account owns live rows (restrict foreign keys); the census proof needs an empty
+# accounts table, so the scenario clears the fixture as the database owner, not as a service role.
+psql_admin -d pe_legacy_545 -v ON_ERROR_STOP=1 <<'SQL'
 begin;
-set local role service_role;
+delete from public.live_positions;
+delete from public.live_fills;
+delete from public.live_account_state;
+delete from public.account_events;
+delete from public.account_credentials;
 delete from public.accounts;
 commit;
 SQL
