@@ -426,6 +426,7 @@ The offline qualification command is separate from activation and constructs no 
 ```bash
 pe-service --qualify \
   --paper-log <paper.log> --source-log <source_events.log> \
+  --live-journal <live_journal.log> \
   --paper-state <paper_state.db> --seal-hash <qualification-seal-hash> \
   --output <qualification-report.json>
 ```

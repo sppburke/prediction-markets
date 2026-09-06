@@ -15,7 +15,7 @@ use pe_core_types::{
 };
 use pe_event_log::envelope::{HashInput, compute_hashes};
 use pe_event_log::{
-    AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, Reader, Scanner, Writer,
+    AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, LogTailBinding, Reader, Scanner, Writer,
 };
 use pe_execution_core::{
     AdmissionReceipts, EconomicInputs, EconomicPrepared, LiveAdmissionArtifact, RiskAudit,
@@ -100,6 +100,7 @@ pub enum QualificationError {
 pub struct QualifyOptions {
     pub paper_log: PathBuf,
     pub source_log: PathBuf,
+    pub live_journal: Option<PathBuf>,
     pub paper_state: PathBuf,
     pub seal_hash: String,
     pub output: PathBuf,
@@ -197,6 +198,23 @@ pub struct QualificationEvidenceReport {
     pub hot_config_hash: Option<String>,
     pub financial_semantic_version: Option<u32>,
     pub economic_core_hashes: Vec<String>,
+    #[serde(default)]
+    pub live_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub live_journal_hash: Option<String>,
+    #[serde(default)]
+    pub live_wrapper_facts: Vec<QualificationLiveWrapperFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationLiveWrapperFact {
+    pub account_id: String,
+    pub journal_sequence: u64,
+    pub source_trade_id: String,
+    pub economic_core_hash: String,
+    pub paper_wrapper_hash: String,
+    pub live_wrapper_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +324,9 @@ impl QualificationReport {
                 hot_config_hash: None,
                 financial_semantic_version: None,
                 economic_core_hashes: Vec::new(),
+                live_prefix_hash: None,
+                live_journal_hash: None,
+                live_wrapper_facts: Vec::new(),
             },
             replay: QualificationReplayReport {
                 exact: false,
@@ -1178,6 +1199,13 @@ async fn verify_qualification(
         &decision_observations,
         &start,
     )?;
+    let live_evidence = verify_live_wrappers(
+        options.live_journal.as_deref(),
+        &options.source_log,
+        &seal.source_prefix,
+        &start,
+        &frames[start_index + 1..=financial_prefix_index],
+    )?;
     let anchor_sequence = anchor_mark_sequence.ok_or_else(|| {
         QualificationError::InsufficientEvidence(
             "no valid PortfolioMark exists after the latest demotion anchor".to_owned(),
@@ -1322,6 +1350,9 @@ async fn verify_qualification(
             hot_config_hash: Some(start.hot_config_hash.clone()),
             financial_semantic_version: Some(start.financial_semantic_version),
             economic_core_hashes: economic_hashes,
+            live_prefix_hash: live_evidence.prefix_hash,
+            live_journal_hash: live_evidence.journal_hash,
+            live_wrapper_facts: live_evidence.wrapper_facts,
         },
         replay: QualificationReplayReport {
             exact: true,
@@ -1384,6 +1415,9 @@ fn insufficient_seal_report(
             hot_config_hash: Some(start.hot_config_hash.clone()),
             financial_semantic_version: Some(start.financial_semantic_version),
             economic_core_hashes: Vec::new(),
+            live_prefix_hash: None,
+            live_journal_hash: None,
+            live_wrapper_facts: Vec::new(),
         },
         replay: QualificationReplayReport {
             exact: false,
@@ -1401,6 +1435,288 @@ fn insufficient_seal_report(
 
 fn insufficient<T>(reason: impl Into<String>) -> Result<T, QualificationError> {
     Err(QualificationError::InsufficientEvidence(reason.into()))
+}
+
+// ── Live-wrapper verification ────────────────────────────────────────────────
+
+#[derive(Default)]
+struct VerifiedLiveEvidence {
+    prefix_hash: Option<String>,
+    journal_hash: Option<String>,
+    wrapper_facts: Vec<QualificationLiveWrapperFact>,
+}
+
+#[derive(Clone)]
+struct PaperLiveWrapperBasis {
+    operation: crate::paper_recovery::PaperFillOperationIdentity,
+    economic: EconomicPrepared,
+    economic_core_hash: String,
+    wrapper_hash: String,
+}
+
+fn sealed_source_envelopes(
+    path: &Path,
+    prefix: &TailBinding,
+) -> Result<Vec<EventEnvelope>, QualificationError> {
+    let Some(last_sequence) = prefix.last_sequence else {
+        return Ok(Vec::new());
+    };
+    let expected_hash = tail_hash(prefix)?;
+    let mut envelopes = Vec::new();
+    for item in Reader::replay(path)? {
+        let (sequence, envelope) = item?;
+        if sequence > last_sequence {
+            break;
+        }
+        envelopes.push(envelope);
+    }
+    if envelopes
+        .last()
+        .is_none_or(|envelope| envelope.seq != last_sequence || envelope.this_hash != expected_hash)
+    {
+        return insufficient("sealed source envelopes do not reach their sequence/hash prefix");
+    }
+    Ok(envelopes)
+}
+
+fn paper_live_wrapper_bases(
+    frames: &[ScannedPaperFrame],
+) -> Result<HashMap<String, PaperLiveWrapperBasis>, QualificationError> {
+    let mut bases = HashMap::new();
+    for frame in frames {
+        let PaperLogFrame::Record(record) = &frame.frame else {
+            continue;
+        };
+        let PaperLogRecord::FinancialPrepared {
+            payload:
+                FinancialPayload::Fill {
+                    operation,
+                    economic,
+                },
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let economic_core_hash = economic.core_hash().map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "paper economic core hash failed during live-wrapper verification: {error}"
+            ))
+        })?;
+        let wrapper_hash = blake3::hash(&serde_json::to_vec(record)?)
+            .to_hex()
+            .to_string();
+        let source_trade_id = operation.source_trade_id.0.clone();
+        if bases
+            .insert(
+                source_trade_id.clone(),
+                PaperLiveWrapperBasis {
+                    operation: operation.clone(),
+                    economic: economic.clone(),
+                    economic_core_hash,
+                    wrapper_hash,
+                },
+            )
+            .is_some()
+        {
+            return insufficient(format!(
+                "paper decision {source_trade_id} has multiple Prepared economic wrappers"
+            ));
+        }
+    }
+    Ok(bases)
+}
+
+fn verify_live_wrappers(
+    live_journal: Option<&Path>,
+    source_log: &Path,
+    source_prefix: &TailBinding,
+    start: &QualificationStarted,
+    paper_frames: &[ScannedPaperFrame],
+) -> Result<VerifiedLiveEvidence, QualificationError> {
+    let Some(live_journal) = live_journal else {
+        return Ok(VerifiedLiveEvidence::default());
+    };
+
+    verify_recorded_prefix(live_journal, &start.live_prefix)?;
+    let journal_tail =
+        pe_execution_core::LiveJournal::verified_tail(live_journal).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "live journal verification failed: {error}"
+            ))
+        })?;
+    let source_envelopes = sealed_source_envelopes(source_log, source_prefix)?;
+    let paper_bases = paper_live_wrapper_bases(paper_frames)?;
+    let inventory = pe_execution_core::recovery_inventory(live_journal).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "live journal strict replay failed: {error}"
+        ))
+    })?;
+    let mut wrapper_facts = Vec::new();
+
+    for account_id in inventory.account_ids {
+        let mut events =
+            pe_execution_core::replay_account(live_journal, &account_id).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "live journal account replay failed for {account_id}: {error}"
+                ))
+            })?;
+        events.retain(|event| {
+            start
+                .live_prefix
+                .last_sequence
+                .is_none_or(|last| event.seq > last.0)
+        });
+        crate::live_fanout::derive_projection_rows_with_sources(
+            &account_id,
+            &events,
+            &source_envelopes,
+        )
+        .map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "live journal strict reduction failed for {account_id}: {error}"
+            ))
+        })?;
+
+        let mut approved = BTreeMap::new();
+        let mut completed = HashSet::new();
+        for event in &events {
+            match &event.payload {
+                pe_execution_core::LiveJournalPayload::AdmissionEvaluated(admission)
+                    if admission.verdict == pe_execution_core::LiveAdmissionVerdict::Approved =>
+                {
+                    let key = admission.identity.idempotency_key.clone();
+                    if approved.insert(key.clone(), admission.as_ref()).is_some() {
+                        return insufficient(format!(
+                            "live journal repeats approved admission {key} for account {account_id}"
+                        ));
+                    }
+                }
+                pe_execution_core::LiveJournalPayload::OrderPreparationFailed(failed) => {
+                    let key = &failed.identity.idempotency_key;
+                    let admission = approved.get(key).ok_or_else(|| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "live preparation failure has no approved admission for account {account_id} decision {key}"
+                        ))
+                    })?;
+                    if admission.identity != failed.identity || !completed.insert(key.clone()) {
+                        return insufficient(format!(
+                            "live preparation failure differs from approved admission for account {account_id} decision {key}"
+                        ));
+                    }
+                }
+                pe_execution_core::LiveJournalPayload::OrderPrepared(wrapper) => {
+                    let key = &wrapper.identity.idempotency_key;
+                    let admission = approved.get(key).ok_or_else(|| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "live wrapper has no approved admission for account {account_id} decision {key}"
+                        ))
+                    })?;
+                    if admission.identity != wrapper.identity
+                        || admission.frozen_binding != wrapper.frozen_binding
+                        || admission.economic != wrapper.economic
+                        || admission.account_state.as_ref() != Some(&wrapper.account_state)
+                        || !completed.insert(key.clone())
+                    {
+                        return insufficient(format!(
+                            "live wrapper audit differs from approved admission for account {account_id} decision {key}"
+                        ));
+                    }
+
+                    let projection = wrapper.identity.fill_projection.as_deref().ok_or_else(|| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "live wrapper lacks paper-decision identity for account {account_id} decision {key}"
+                        ))
+                    })?;
+                    let source_trade_id = projection.source_trade_id.as_deref().ok_or_else(|| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "live wrapper lacks source-trade identity for account {account_id} decision {key}"
+                        ))
+                    })?;
+                    let paper = paper_bases.get(source_trade_id).ok_or_else(|| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "live wrapper references no paper Prepared decision {source_trade_id}"
+                        ))
+                    })?;
+                    let expected_side = match paper.economic.market.side {
+                        Side::Buy => "buy",
+                        Side::Sell => "sell",
+                    };
+                    let paper_decision_id =
+                        pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                            &TraderId(paper.operation.leader_wallet).to_string(),
+                            &paper.operation.source_trade_id.0,
+                            &paper.economic.market.market_id,
+                            u16::from(paper.economic.market.outcome_index),
+                            paper.economic.market.side,
+                            paper.operation.observed_at_bucket,
+                        );
+                    if wrapper.identity.dispatch_id != paper_decision_id
+                        || wrapper.identity.idempotency_key
+                            != format!("{paper_decision_id}:{account_id}")
+                        || projection.leader_wallet != paper.operation.leader_wallet.to_string()
+                        || projection.market_id != paper.economic.market.market_id
+                        || projection.outcome_id
+                            != i64::from(u16::from(paper.economic.market.outcome_index))
+                        || projection.side != expected_side
+                    {
+                        return insufficient(format!(
+                            "live wrapper identity differs from paper Prepared decision {source_trade_id}"
+                        ));
+                    }
+                    let economic_core_hash = wrapper.economic.core_hash().map_err(|error| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "live economic core hash failed for decision {source_trade_id}: {error}"
+                        ))
+                    })?;
+                    if wrapper.economic != paper.economic
+                        || economic_core_hash != paper.economic_core_hash
+                    {
+                        return insufficient(format!(
+                            "live wrapper economic core differs from paper Prepared decision {source_trade_id}"
+                        ));
+                    }
+                    let live_wrapper_hash = blake3::hash(&serde_json::to_vec(wrapper.as_ref())?)
+                        .to_hex()
+                        .to_string();
+                    if live_wrapper_hash == paper.wrapper_hash {
+                        return insufficient(format!(
+                            "live and paper wrapper hashes collide for decision {source_trade_id}"
+                        ));
+                    }
+                    wrapper_facts.push(QualificationLiveWrapperFact {
+                        account_id: account_id.as_str().to_owned(),
+                        journal_sequence: event.seq,
+                        source_trade_id: source_trade_id.to_owned(),
+                        economic_core_hash,
+                        paper_wrapper_hash: paper.wrapper_hash.clone(),
+                        live_wrapper_hash,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if let Some(missing) = approved.keys().find(|key| !completed.contains(*key)) {
+            return insufficient(format!(
+                "live wrapper preimage is absent for account {account_id} decision {missing}"
+            ));
+        }
+    }
+
+    let after = pe_execution_core::LiveJournal::verified_tail(live_journal).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "live journal verification failed: {error}"
+        ))
+    })?;
+    if after != journal_tail {
+        return insufficient("live journal changed during qualification verification");
+    }
+
+    Ok(VerifiedLiveEvidence {
+        prefix_hash: Some(start.live_prefix.last_hash.clone()),
+        journal_hash: Some(journal_tail.last_hash.to_hex().to_string()),
+        wrapper_facts,
+    })
 }
 
 fn receipt_key(receipt: AppendReceipt) -> (u64, String) {
@@ -5633,6 +5949,7 @@ mod tests {
         let options = QualifyOptions {
             paper_log: paper_log.clone(),
             source_log: source_log.clone(),
+            live_journal: None,
             paper_state: paper_state.clone(),
             seal_hash: seal_receipt.this_hash.to_hex().to_string(),
             output,
