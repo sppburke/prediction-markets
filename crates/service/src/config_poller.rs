@@ -17,7 +17,9 @@ use tracing::{info, warn};
 use crate::health::SharedHealth;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{HaltState, active_risk_halts, paper_era, scan_paper_log};
-use crate::risk_inputs::{audited_halt_release, live_latency_samples, paper_latency_samples};
+use crate::risk_inputs::{
+    SourceReceiptMillisIndex, audited_halt_release, live_latency_samples, paper_latency_samples,
+};
 use crate::runtime_config::{
     AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RISK_HALT_RELEASE_HASH_KEY,
     RuntimeConfigStatus, WatchlistCapacityEpoch, parse_config,
@@ -167,7 +169,7 @@ pub enum ConfigPollError {
 #[derive(Clone)]
 pub struct RiskHaltReleaseHandle {
     paper_log_path: PathBuf,
-    source_log_path: PathBuf,
+    source_receipt_millis: SourceReceiptMillisIndex,
     live_journal_path: PathBuf,
     control: mpsc::Sender<OrchestratorControl>,
 }
@@ -206,7 +208,7 @@ impl QualificationSealHandle {
 impl RiskHaltReleaseHandle {
     pub fn new(
         paper_log_path: PathBuf,
-        source_log_path: PathBuf,
+        source_receipt_millis: SourceReceiptMillisIndex,
         control: mpsc::Sender<OrchestratorControl>,
     ) -> Self {
         let live_journal_path = paper_log_path
@@ -216,7 +218,7 @@ impl RiskHaltReleaseHandle {
             .join("live_journal.log");
         Self {
             paper_log_path,
-            source_log_path,
+            source_receipt_millis,
             live_journal_path,
             control,
         }
@@ -234,7 +236,7 @@ impl RiskHaltReleaseHandle {
             owner_latest_latency_p95(
                 &release.owner,
                 || {
-                    paper_latency_samples(&era, &self.source_log_path, now_unix)
+                    paper_latency_samples(&era, &self.source_receipt_millis, now_unix)
                         .map(|samples| samples.latest.p95_ms)
                         .map_err(|error| format!("derive paper release latency evidence: {error}"))
                 },
