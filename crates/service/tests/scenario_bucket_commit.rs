@@ -1136,11 +1136,11 @@ fn trade_aggregate_uses_exact_size_weighted_price_and_not_usdc_audit() {
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     let row = paper.open_decision_pending().unwrap().remove(0);
     let frozen = DecisionContinuationV3::from_durable(&row).unwrap();
-    assert_eq!(frozen.prior.share_amount.atomic(), 4_000_000);
-    assert_eq!(frozen.prior.price.0, rust_decimal::Decimal::new(5, 1));
+    assert_eq!(frozen.facts.share_amount.atomic(), 4_000_000);
+    assert_eq!(frozen.facts.price.0, rust_decimal::Decimal::new(5, 1));
     assert_eq!(
-        frozen.prior.applied_configuration_hash,
-        frozen.prior.applied_configuration.canonical_hash(),
+        frozen.facts.applied_configuration_hash,
+        frozen.facts.applied_configuration.canonical_hash(),
         "the pending boundary stores the real canonical hash of its full hot snapshot"
     );
 }
@@ -1307,7 +1307,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
         let frozen = DecisionContinuationV3::from_durable(&pending).unwrap();
         let trade = frozen.incoming_trade().unwrap();
         assert_eq!(trade.source_trade_id, pending.source_trade_id);
-        assert_eq!(trade.contracts, frozen.prior.share_amount);
+        assert_eq!(trade.contracts, frozen.facts.share_amount);
         let terminal = TerminalDispositionEvidence {
             disposition: "no_copy:test_terminal".to_owned(),
             reason: "test_terminal".to_owned(),
@@ -1320,7 +1320,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,
             owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
             source_trade_id: pending.source_trade_id.clone(),
-            applied_configuration_hash: frozen.prior.applied_configuration_hash.clone(),
+            applied_configuration_hash: frozen.facts.applied_configuration_hash.clone(),
             market_end: None,
             market_price: None,
             book: None,
@@ -1389,7 +1389,7 @@ fn terminal_decision_pending_retains_financial_final_receipt() {
         version: pe_service::decision_replay::TERMINAL_EVIDENCE_VERSION,
         owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
         source_trade_id: pending.source_trade_id.clone(),
-        applied_configuration_hash: frozen.prior.applied_configuration_hash,
+        applied_configuration_hash: frozen.facts.applied_configuration_hash,
         market_end: None,
         market_price: None,
         book: None,

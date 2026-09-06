@@ -1932,7 +1932,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     assert_eq!(decision_rows.len(), QUALIFICATION_DAYS * COPIES_PER_DAY);
     assert!(decision_rows.iter().all(|row| {
         replay_decision_pending(row).is_ok_and(|decision| {
-            decision.continuation.prior.gate_result == "admitted"
+            decision.continuation.facts.gate_result == "admitted"
                 && decision.post_boundary.body.terminal.final_receipt.is_some()
         })
     }));

@@ -465,8 +465,8 @@ fn decision_observation_from_source(
         if observation.source_id != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
             || observation.schema_version != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
             || observation.parser_version != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
-            || activity.wallet != continuation.prior.wallet
-            || activity.group_id.key() != &continuation.prior.source_trade_id
+            || activity.wallet != continuation.facts.wallet
+            || activity.group_id.key() != &continuation.facts.source_trade_id
         {
             return insufficient(format!(
                 "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
@@ -776,7 +776,7 @@ async fn verify_qualification(
         verify_decision_classification(&state, decision)?;
         if decision_observations
             .insert(
-                decision.continuation.prior.source_trade_id.clone(),
+                decision.continuation.facts.source_trade_id.clone(),
                 observation,
             )
             .is_some()
@@ -1776,12 +1776,12 @@ fn verify_decision_configurations(
     start: &QualificationStarted,
 ) -> Result<(), QualificationError> {
     for decision in decisions {
-        if decision.continuation.prior.applied_configuration_hash != start.hot_config_hash
+        if decision.continuation.facts.applied_configuration_hash != start.hot_config_hash
             || decision.post_boundary.financial_semantic_version != start.financial_semantic_version
         {
             return insufficient(format!(
                 "decision {} configuration or financial semantics differ from QualificationStarted",
-                decision.continuation.prior.source_trade_id
+                decision.continuation.facts.source_trade_id
             ));
         }
     }
@@ -1916,7 +1916,7 @@ fn verify_decision_source_inputs(
     source: &BTreeMap<u64, SourceObservation>,
 ) -> Result<pe_execution_core::ObservationEvidence, QualificationError> {
     let continuation = &decision.continuation;
-    let frozen = &continuation.prior;
+    let frozen = &continuation.facts;
     let observation = decision_observation_from_source(continuation, source)?.ok_or_else(|| {
         QualificationError::InsufficientEvidence(
             "post-Start decision has no version-three source evidence".to_owned(),
@@ -2019,7 +2019,7 @@ fn verify_decision_classification(
     state: &PaperStateDb,
     decision: &crate::decision_replay::ReplayedDecision,
 ) -> Result<(), QualificationError> {
-    let frozen = &decision.continuation.prior;
+    let frozen = &decision.continuation.facts;
     let anchors = state.position_anchors(&frozen.wallet)?;
     let anchor = anchors
         .iter()
@@ -2206,7 +2206,7 @@ fn verify_complete_second_action(
     mutations: &[LedgerMutation],
     expected: &[AppliedEffect],
 ) -> Result<(), QualificationError> {
-    let frozen = &continuation.prior;
+    let frozen = &continuation.facts;
     let verdict = classify_complete_second(
         ledger,
         frozen.wallet,
@@ -3464,7 +3464,7 @@ fn bind_final_receipts(
         let final_receipt = terminal.final_receipt.ok_or_else(|| {
             QualificationError::InsufficientEvidence(format!(
                 "fill decision {} has no FinancialFinal receipt",
-                decision.continuation.prior.source_trade_id
+                decision.continuation.facts.source_trade_id
             ))
         })?;
         let mut candidates = fills
@@ -3473,14 +3473,14 @@ fn bind_final_receipts(
         let fill = candidates.next().ok_or_else(|| {
             QualificationError::InsufficientEvidence(format!(
                 "fill decision {} references no FinancialFinal",
-                decision.continuation.prior.source_trade_id
+                decision.continuation.facts.source_trade_id
             ))
         })?;
         if candidates.next().is_some() || !matched_finals.insert(receipt_key(final_receipt)) {
             return insufficient("multiple fill decisions bind the same FinancialFinal");
         }
 
-        let continuation = &decision.continuation.prior;
+        let continuation = &decision.continuation.facts;
         let decision_key = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
             &TraderId(continuation.wallet).to_string(),
             &continuation.source_trade_id.0,
@@ -3525,7 +3525,7 @@ fn verify_winner_follow_fill_decision(
     continuation: &DecisionContinuationV3,
     fill: &CompletedFill,
 ) -> Result<(), QualificationError> {
-    let frozen = &continuation.prior;
+    let frozen = &continuation.facts;
     let economic = &fill.economic;
     let configuration = &frozen.applied_configuration;
     let mode =
@@ -4601,9 +4601,8 @@ mod tests {
         let source_epoch = 1_700_000_000;
         let configuration =
             crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
-        let continuation = DecisionContinuationV3 {
-            prior: crate::bucket_commit::DecisionContinuationV2 {
-                version: 3,
+        let continuation = DecisionContinuationV3::new(
+            crate::bucket_commit::DecisionContinuationFacts {
                 source_trade_id: source_trade_id.clone(),
                 semantic_revision: "semantic-v3".to_owned(),
                 transaction_hash: "0xclassification".to_owned(),
@@ -4627,9 +4626,9 @@ mod tests {
                 },
                 decision_inputs: serde_json::json!({"fixture": "classification"}),
             },
-            observed_source_receipt: None,
-            page_occurrences: Vec::new(),
-        };
+            None,
+            Vec::new(),
+        );
         let mutation = LedgerMutation {
             source_trade_id,
             transaction_hash: "0xclassification".to_owned(),
@@ -4666,7 +4665,7 @@ mod tests {
     #[test]
     fn complete_second_replay_rejects_wrong_recorded_entry_classification() {
         let (continuation, mutation) = classification_fixture();
-        let frozen = &continuation.prior;
+        let frozen = &continuation.facts;
         let mut ledger = PositionLedger::new();
         ledger.replace_wallet_snapshot(
             frozen.wallet,
@@ -4694,7 +4693,7 @@ mod tests {
     #[test]
     fn winner_follow_replay_accepts_golden_compatible_positive_outcome() {
         let (continuation, _) = classification_fixture();
-        let frozen = &continuation.prior;
+        let frozen = &continuation.facts;
         let mut economic = risk_economic(&frozen.market_id.0.0, CollateralAmount::from_atomic(1));
         economic.applied_configuration_hash = frozen.applied_configuration_hash.clone();
         let observation = ObservationEvidence {
@@ -5655,8 +5654,7 @@ mod tests {
         let applied_configuration =
             crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
         let source_trade_id = pe_core_types::SourceTradeId("g2:post-seal".to_owned());
-        let continuation = crate::bucket_commit::DecisionContinuationV2 {
-            version: 3,
+        let continuation = crate::bucket_commit::DecisionContinuationFacts {
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v3".to_owned(),
             transaction_hash: "0xpost-seal".to_owned(),
@@ -5690,15 +5688,15 @@ mod tests {
                 )
                 .unwrap();
         let frozen_inputs_json =
-            serde_json::to_string(&crate::bucket_commit::DecisionContinuationV3 {
-                prior: continuation,
-                observed_source_receipt: None,
-                page_occurrences: vec![crate::bucket_commit::PageOccurrence {
+            serde_json::to_string(&crate::bucket_commit::DecisionContinuationV3::new(
+                continuation,
+                None,
+                vec![crate::bucket_commit::PageOccurrence {
                     request_url: "https://example.invalid/activity?end=86400".to_owned(),
                     raw_hash: blake3::hash(&late_payload).to_hex().to_string(),
                     receipt: late_receipt,
                 }],
-            })
+            ))
             .unwrap();
         let connection = rusqlite::Connection::open(&paper_state).unwrap();
         connection

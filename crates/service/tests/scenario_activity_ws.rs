@@ -60,7 +60,7 @@ use pe_paper_state::{
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
 };
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
-use pe_service::bucket_commit::DecisionContinuationV2;
+use pe_service::bucket_commit::DecisionContinuationFacts;
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
@@ -1706,8 +1706,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
     let applied_configuration = pe_service::runtime_config::RuntimeConfig::from_service_config(
         &pe_service::config::ServiceConfig::default(),
     );
-    let frozen = DecisionContinuationV2 {
-        version: 2,
+    let frozen = DecisionContinuationFacts {
         source_trade_id: source_trade_id.clone(),
         semantic_revision: semantic_revision.clone(),
         transaction_hash: "0xpending".to_owned(),
@@ -1778,7 +1777,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
                 semantic_revision,
                 wallet: leader_wallet(),
                 source_epoch,
-                frozen_inputs_json: serde_json::to_string(&frozen).unwrap(),
+                frozen_inputs_json: support::legacy_continuation_v2_json(&frozen),
                 updated_at_unix: 2,
             }],
             fence: None,

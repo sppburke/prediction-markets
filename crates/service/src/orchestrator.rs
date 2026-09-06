@@ -2190,12 +2190,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         };
         let mut decision_evidence = pending
             .as_ref()
-            .map(|continuation| DecisionEvidenceAccumulator::new(&continuation.prior));
+            .map(|continuation| DecisionEvidenceAccumulator::new(&continuation.facts));
         // New decisions use the current hot snapshot. A committed continuation instead
         // reinstalls its complete frozen 17-key snapshot before any post-boundary read.
         let applied_runtime = pending
             .as_ref()
-            .map(|continuation| continuation.prior.applied_configuration.clone())
+            .map(|continuation| continuation.facts.applied_configuration.clone())
             .or_else(|| {
                 self.runtime_config
                     .as_ref()
@@ -2360,15 +2360,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     venue: VenueId::polymarket(),
                     market_id: trade.market_id.clone(),
                     outcome_id: trade.outcome_id,
-                    action: continuation.prior.pre_bucket_action,
+                    action: continuation.facts.pre_bucket_action,
                     leader_side: trade.side,
                     leader_price: trade.price,
                     leader_size: trade.contracts,
                     observed_at: trade.observed_at,
                     received_at: trade.received_at,
-                    reconstruction_quality: continuation.prior.reconstruction_quality,
+                    reconstruction_quality: continuation.facts.reconstruction_quality,
                     source_trade_id: trade.source_trade_id.clone(),
-                    action_confidence_ppm: continuation.prior.action_confidence_ppm,
+                    action_confidence_ppm: continuation.facts.action_confidence_ppm,
                 },
             )
         } else {
@@ -2638,10 +2638,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // sizing all share one basis.
         let p = pending
             .as_ref()
-            .map(|continuation| continuation.prior.frozen_basis.win_rate_p)
+            .map(|continuation| continuation.facts.frozen_basis.win_rate_p)
             .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
         let sizing_bankroll = match pending.as_ref() {
-            Some(continuation) => continuation.prior.frozen_basis.bankroll,
+            Some(continuation) => continuation.facts.frozen_basis.bankroll,
             None => match self
                 .paper_state
                 .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())

@@ -8,7 +8,7 @@ use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
 
 use crate::bucket_commit::{
-    DecisionContinuationError, DecisionContinuationV2, DecisionContinuationV3,
+    DecisionContinuationError, DecisionContinuationFacts, DecisionContinuationV3,
 };
 
 pub const POST_BOUNDARY_EVIDENCE_VERSION: u16 = 2;
@@ -292,7 +292,7 @@ pub struct DecisionEvidenceAccumulator {
 }
 
 impl DecisionEvidenceAccumulator {
-    pub(crate) fn new(continuation: &DecisionContinuationV2) -> Self {
+    pub(crate) fn new(continuation: &DecisionContinuationFacts) -> Self {
         Self {
             source_trade_id: continuation.source_trade_id.clone(),
             applied_configuration_hash: continuation.applied_configuration_hash.clone(),
@@ -374,7 +374,7 @@ impl DecisionEvidenceAccumulator {
         row: &DecisionPendingRow,
     ) -> Result<Self, ReplayDecisionError> {
         let continuation = DecisionContinuationV3::from_durable(row)?;
-        let frozen = &continuation.prior;
+        let frozen = &continuation.facts;
         let checkpoint: DecisionEvidenceCheckpoint =
             serde_json::from_str(&row.post_commit_inputs_json)?;
         if checkpoint.body.version != POST_BOUNDARY_EVIDENCE_VERSION {
@@ -475,7 +475,7 @@ pub fn replay_decision_pending(
         return Err(ReplayDecisionError::OpenRow);
     }
     let continuation = DecisionContinuationV3::from_durable(row)?;
-    let frozen = &continuation.prior;
+    let frozen = &continuation.facts;
     let post_boundary: DecisionPostBoundaryEvidence =
         serde_json::from_str(&row.post_commit_inputs_json)?;
     if !matches!(
@@ -675,10 +675,9 @@ mod tests {
         serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
     }
 
-    fn continuation(source_trade_id: &SourceTradeId) -> DecisionContinuationV2 {
+    fn continuation(source_trade_id: &SourceTradeId) -> DecisionContinuationFacts {
         let applied_configuration = RuntimeConfig::from_service_config(&ServiceConfig::default());
-        DecisionContinuationV2 {
-            version: 2,
+        DecisionContinuationFacts {
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v2".to_owned(),
             transaction_hash: "0xtransaction".to_owned(),
@@ -704,7 +703,12 @@ mod tests {
         }
     }
 
-    fn accumulator(continuation: &DecisionContinuationV2) -> DecisionEvidenceAccumulator {
+    fn legacy_v2_json(facts: &DecisionContinuationFacts) -> String {
+        let facts = serde_json::to_string(facts).unwrap();
+        format!(r#"{{"version":2,{}"#, facts.strip_prefix('{').unwrap())
+    }
+
+    fn accumulator(continuation: &DecisionContinuationFacts) -> DecisionEvidenceAccumulator {
         let mut evidence = DecisionEvidenceAccumulator::new(continuation);
         evidence.record_market_end(MarketEndEvidence {
             market_id: continuation.market_id.to_string(),
@@ -746,7 +750,7 @@ mod tests {
             semantic_revision: continuation.semantic_revision.clone(),
             wallet: continuation.wallet,
             source_epoch: continuation.source_epoch,
-            frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+            frozen_inputs_json: legacy_v2_json(&continuation),
             post_commit_inputs_json: evidence,
             state: DecisionPendingState::Terminal,
             terminal_disposition: Some(terminal.disposition),
@@ -954,7 +958,7 @@ mod tests {
             semantic_revision: continuation.semantic_revision.clone(),
             wallet: continuation.wallet,
             source_epoch: continuation.source_epoch,
-            frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+            frozen_inputs_json: legacy_v2_json(&continuation),
             post_commit_inputs_json: checkpoint,
             state: DecisionPendingState::Open,
             terminal_disposition: None,
