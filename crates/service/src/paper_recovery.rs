@@ -405,9 +405,9 @@ pub fn paper_era(frames: Vec<ScannedPaperFrame>) -> PaperEra {
                     start = Some((receipt, candidate));
                     era_frames.clear();
                 }
-                Some((_, established)) if established == &candidate => {}
-                // `scan_paper_log` rejects this case. Preserve the first start for callers that
-                // construct an era view from already-decoded, trusted frames.
+                // `scan_paper_log` rejects every second physical Start. Preserve the first Start
+                // defensively for callers that construct an era view from already-validated
+                // frames.
                 Some(_) => {}
             }
         }
@@ -420,17 +420,15 @@ pub fn paper_era(frames: Vec<ScannedPaperFrame>) -> PaperEra {
 }
 
 fn validate_qualification_starts(frames: &[ScannedPaperFrame]) -> Result<(), PaperLogScanError> {
-    let mut start = None::<&QualificationStarted>;
+    let mut start_seen = false;
     for frame in frames {
-        let PaperLogFrame::Record(PaperLogRecord::QualificationStarted(candidate)) = &frame.frame
-        else {
+        let PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_)) = &frame.frame else {
             continue;
         };
-        match start {
-            None => start = Some(candidate),
-            Some(established) if established == candidate.as_ref() => {}
-            Some(_) => return Err(PaperLogScanError::ConflictingStart),
+        if start_seen {
+            return Err(PaperLogScanError::ConflictingStart);
         }
+        start_seen = true;
     }
     Ok(())
 }
@@ -960,7 +958,7 @@ mod paper_log_tests {
     }
 
     #[test]
-    fn era_selects_zero_one_identical_and_conflicting_starts() {
+    fn scanner_accepts_at_most_one_physical_start() {
         let dir = tempdir().unwrap();
         let zero_path = dir.path().join("zero.log");
         let mut zero = Writer::open(&zero_path).unwrap();
@@ -973,7 +971,7 @@ mod paper_log_tests {
         let one_path = dir.path().join("one.log");
         let mut one = Writer::open(&one_path).unwrap();
         append(&mut one, 1, &legacy_fill());
-        let first = append(
+        append(
             &mut one,
             PAPER_LOG_SCHEMA_VERSION,
             &PaperLogRecord::QualificationStarted(Box::new(start("same"))),
@@ -984,9 +982,22 @@ mod paper_log_tests {
             &PaperLogRecord::QualificationStarted(Box::new(start("same"))),
         );
         drop(one);
-        let one = paper_era(scan_paper_log(&one_path).unwrap());
-        assert_eq!(one.start.as_ref().map(|value| value.0), Some(first));
-        assert_eq!(one.frames.len(), 2);
+        assert!(matches!(
+            scan_paper_log(&one_path),
+            Err(PaperLogScanError::ConflictingStart)
+        ));
+
+        let single_path = dir.path().join("single.log");
+        let mut single = Writer::open(&single_path).unwrap();
+        let first = append(
+            &mut single,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("same"))),
+        );
+        drop(single);
+        let single = paper_era(scan_paper_log(&single_path).unwrap());
+        assert_eq!(single.start.as_ref().map(|value| value.0), Some(first));
+        assert_eq!(single.frames.len(), 1);
 
         let conflict_path = dir.path().join("conflict.log");
         let mut conflict = Writer::open(&conflict_path).unwrap();

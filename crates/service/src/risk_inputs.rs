@@ -23,11 +23,11 @@ use pe_source_polymarket_public::{
 use pe_strategy_winner_follow::RiskInputsUnavailable;
 use rust_decimal::Decimal;
 
+use crate::activity_ingest::SourceLogHandle;
 use crate::paper_recovery::{
     FinancialPayload, FinancialResult, HaltState, PaperEra, PaperLogFrame, PaperLogRecord,
     RiskHaltOwner, oldest_unmatched_prepared,
 };
-use crate::activity_ingest::SourceLogHandle;
 
 const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -127,15 +127,13 @@ impl BoundaryMarkFetcher {
         let (body, classified) = match fetched {
             Ok(body) => {
                 let map = HashMap::from([(url.clone(), body.clone())]);
-                let classified = ClobPricesHistoryClient::new(
-                    self.base_url.clone(),
-                    FixtureFetcher::new(map),
-                )
-                .with_fidelity_minutes(1)
-                .fetch_prices_history_classified(token_id, start_unix, cutoff_unix)
-                .await
-                .map_err(|error| BoundaryMarkError::Classification(error.to_string()))?
-                .outcome;
+                let classified =
+                    ClobPricesHistoryClient::new(self.base_url.clone(), FixtureFetcher::new(map))
+                        .with_fidelity_minutes(1)
+                        .fetch_prices_history_classified(token_id, start_unix, cutoff_unix)
+                        .await
+                        .map_err(|error| BoundaryMarkError::Classification(error.to_string()))?
+                        .outcome;
                 (body, classified)
             }
             Err(SourceError::Fatal { message }) => {

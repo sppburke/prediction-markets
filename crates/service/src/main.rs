@@ -750,7 +750,7 @@ async fn main() -> Result<()> {
     // adds no second database or obligation table.
     let mut obligations =
         rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
-        .context("rebuild durable activity reconciliation obligations")?;
+            .context("rebuild durable activity reconciliation obligations")?;
     if financial_start.is_some() {
         recover_daily_boundary(
             &cfg.source_event_log_path,

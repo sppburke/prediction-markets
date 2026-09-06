@@ -81,8 +81,14 @@ print(json.dumps({"path":sys.argv[1],"sha256":sys.argv[2]},sort_keys=True,separa
 manifest_complete_start() {
   local output
   output=$("$target_binary" "$target_config" --financial-era=rollback-check \
-    --activation-manifest="$MANIFEST") || return 1
-  python3 -c 'import json,sys; raise SystemExit(0 if json.loads(sys.argv[1]).get("complete_start") else 1)' "$output"
+    --activation-manifest="$MANIFEST") || return 2
+  COMPLETE_START_OUTPUT=$output
+  python3 -c 'import json,sys
+try: value=json.loads(sys.argv[1])
+except Exception: raise SystemExit(2)
+if value.get("complete_start") is True: raise SystemExit(0)
+if value.get("complete_start") is False: raise SystemExit(1)
+raise SystemExit(2)' "$output"
 }
 
 complete_sqlite_backup() {
@@ -185,6 +191,13 @@ if atomic != decimal.Decimal(value["fresh_bankroll"]): raise SystemExit("fresh b
   "$MANIFEST" "$membership_json" "$fresh_bankroll" || die "financial-era membership or bankroll identity changed"
 
 state=$(manifest_get state)
+complete_start=false
+if manifest_complete_start; then
+  complete_start=true
+else
+  start_state=$?
+  [[ $start_state -eq 1 ]] || die "QualificationStarted state is unknown; activation cannot continue"
+fi
 if [[ "$rollback_before_start" == true ]]; then
   case "$state" in
     started|verified) die "rollback is forbidden at or after QualificationStarted" ;;
@@ -192,7 +205,7 @@ if [[ "$rollback_before_start" == true ]]; then
     prepared|guarded|rolling_back) ;;
     *) die "rollback-before-start is invalid from state $state" ;;
   esac
-  if manifest_complete_start; then
+  if [[ "$complete_start" == true ]]; then
     die "a complete QualificationStarted forces roll-forward"
   fi
   [[ "$state" == rolling_back ]] || manifest_advance rolling_back
@@ -213,11 +226,6 @@ fi
 
 case "$state" in
   prepared)
-    if [[ "$(manifest_get preparation)" == "" ]]; then
-      preparation=$("$target_binary" "$target_config" --financial-era=prepare \
-        --activation-manifest="$MANIFEST") || die "read-only financial-era preparation failed"
-      manifest_patch_boundary preparation "$(python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$preparation")"
-    fi
     if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); raise SystemExit(0 if v.get("stop_invoked") else 1)' "$MANIFEST"; then
       was_active=$(systemctl_active_state pe-service)
       "${SERVICE_MUTATE[@]}" stop pe-service
@@ -234,6 +242,11 @@ backup,sha,census,paper,source,live=sys.argv[1:]
 logs={name:{"path":path,"sha256":__import__("hashlib").sha256(open(path,"rb").read()).hexdigest(),"bytes":os.path.getsize(path)} for name,path in (("paper",paper),("source",source),("live",live))}
 print(json.dumps({"backup":{"path":backup,"sha256":sha},"remote_census":json.loads(census),"guarded_logs":logs},sort_keys=True,separators=(",",":")))' \
       "$backup_path" "$backup_sha" "$census" "$paper_log" "$source_log" "$live_journal")
+    if [[ "$(manifest_get preparation)" == "" ]]; then
+      preparation=$("$target_binary" "$target_config" --financial-era=prepare \
+        --activation-manifest="$MANIFEST") || die "read-only financial-era preparation failed"
+      manifest_patch_boundary preparation "$(python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$preparation")"
+    fi
     manifest_advance guarded "$patch"
     state=guarded
     ;;
@@ -243,12 +256,28 @@ print(json.dumps({"backup":{"path":backup,"sha256":sha},"remote_census":json.loa
 esac
 
 if [[ "$state" == guarded ]]; then
-  psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
-    -v bankroll="$fresh_bankroll" -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
-  maybe_crash remote-archived
-  start_receipt=$("$target_binary" "$target_config" --financial-era=start \
-    --activation-manifest="$MANIFEST") || die "offline financial-era Start failed"
-  maybe_crash qualification-started
+  service_active=$(systemctl_active_state pe-service)
+  if [[ "$complete_start" == false ]]; then
+    [[ "$service_active" == false ]] || die "pre-Start guarded activation requires an inert service"
+    if ! python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(0 if value.get("remote_archive_completed") is True else 1)' "$MANIFEST"; then
+      manifest_patch_boundary remote-archive-intent '{"remote_archive_intent":true}'
+      psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
+        -v bankroll="$fresh_bankroll" -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
+      manifest_patch_boundary remote-archived '{"remote_archive_completed":true}'
+    fi
+    manifest_patch_boundary qualification-start-intent '{"qualification_start_intent":true}'
+    start_receipt=$("$target_binary" "$target_config" --financial-era=start \
+      --activation-manifest="$MANIFEST") || die "offline financial-era Start failed"
+    manifest_patch_boundary qualification-started "$(python3 -c 'import json,sys; print(json.dumps({"start_receipt":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$start_receipt")"
+  else
+    start_receipt=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["receipt"],sort_keys=True,separators=(",",":")))' "$COMPLETE_START_OUTPUT") || die "complete Start receipt is invalid"
+    if [[ "$service_active" == true ]]; then
+      [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get target_artifact_sha256)" ]] || die "running post-Start binary is not the reviewed target"
+      [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get target_config_sha256)" ]] || die "running post-Start config is not the reviewed target"
+      [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get target_environment_sha256)" ]] || die "running post-Start environment is not the reviewed target"
+      [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
+    fi
+  fi
   [[ -f "$REPO_ROOT/scripts/migrate_service_config_545.sql" ]] || die "post-Start service-config migration is absent"
   psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
   psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/migrate_service_config_545.sql"
@@ -257,10 +286,11 @@ if [[ "$state" == guarded ]]; then
   atomic_adopt "$target_binary" "$SERVICE_BINARY" 0755 financial-binary-adopted
   service_active=$(systemctl_active_state pe-service)
   if [[ "$service_active" == false ]]; then
+    manifest_patch_boundary service-start-intent '{"service_start_intent":true}'
     "${SERVICE_MUTATE[@]}" start pe-service
   else
     [[ "$service_active" == true ]] || die "pe-service has an invalid active state"
-    verify_installed_unit_owner
+    [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
   fi
   started_unix=$(date +%s)
   manifest_advance started "$(python3 -c 'import json,sys; print(json.dumps({"start_receipt":json.loads(sys.argv[1]),"started_unix":int(sys.argv[2])},sort_keys=True,separators=(",",":")))' "$start_receipt" "$started_unix")"
