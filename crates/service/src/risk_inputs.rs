@@ -38,6 +38,10 @@ pub enum RiskInputsUnavailable {
     SnapshotSequenceMismatch,
     #[error("the paper log has an unmatched FinancialPrepared record")]
     UnmatchedPrepared,
+    #[error(
+        "a post-QualificationStarted live latency release is missing its journal-tail checkpoint"
+    )]
+    LiveLatencyReleaseCheckpointMissing,
     #[error("a required position price is missing")]
     PriceMissing,
     #[error("a required position price is stale")]
@@ -472,8 +476,8 @@ impl LatencySamples {
 
 /// Replayed owner/cause state from which live latency hysteresis resumes.
 ///
-/// New manual releases bind to the exact journal prefix scanned. Historical transitions retain the
-/// former response-time checkpoint so already-recorded logs remain replayable after upgrade.
+/// New manual releases bind to the exact journal prefix scanned. Pre-`QualificationStarted`
+/// transitions retain the former response-time checkpoint so legacy logs remain replayable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LatencyHysteresisSeed {
     pub active: bool,
@@ -531,8 +535,14 @@ pub(crate) fn latency_hysteresis_seed(
             checkpoint: None,
         });
     };
+    let post_start_live_release = state == HaltState::Released
+        && matches!(owner, RiskHaltOwner::LiveAccount(_))
+        && era
+            .start
+            .as_ref()
+            .is_some_and(|(start_receipt, _)| frame.receipt.sequence > start_receipt.sequence);
     let checkpoint = match evidence.get("live_journal_tail") {
-        Some(value) => {
+        Some(value) if !value.is_null() => {
             let tail: LiveLatencyJournalTailEvidence = serde_json::from_value(value.clone())
                 .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
             let hash = blake3::Hash::from_hex(&tail.last_hash)
@@ -556,7 +566,10 @@ pub(crate) fn latency_hysteresis_seed(
             .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
             LatencyReplayCheckpoint::LiveJournalTail(checkpoint)
         }
-        None => {
+        Some(_) | None if post_start_live_release => {
+            return Err(RiskInputsUnavailable::LiveLatencyReleaseCheckpointMissing);
+        }
+        Some(_) | None => {
             let transitioned_at_unix_ms = frame
                 .envelope
                 .received_at
@@ -1169,10 +1182,14 @@ mod tests {
         owner: RiskHaltOwner,
         tail: LiveLatencyJournalTailEvidence,
     ) -> PaperEra {
-        PaperEra {
-            start: None,
-            frames: vec![frame(
+        crate::paper_recovery::paper_era(vec![
+            frame(
                 1,
+                7_199,
+                PaperLogRecord::QualificationStarted(Box::new(start())),
+            ),
+            frame(
+                2,
                 7_200,
                 PaperLogRecord::RiskHaltChanged {
                     owner,
@@ -1180,8 +1197,8 @@ mod tests {
                     state: HaltState::Released,
                     evidence: serde_json::json!({ "live_journal_tail": tail }),
                 },
-            )],
-        }
+            ),
+        ])
     }
 
     fn start() -> crate::paper_recovery::QualificationStarted {
@@ -1373,6 +1390,10 @@ mod tests {
             (
                 RiskInputsUnavailable::UnmatchedPrepared,
                 "the paper log has an unmatched FinancialPrepared record",
+            ),
+            (
+                RiskInputsUnavailable::LiveLatencyReleaseCheckpointMissing,
+                "a post-QualificationStarted live latency release is missing its journal-tail checkpoint",
             ),
             (
                 RiskInputsUnavailable::PriceMissing,
@@ -1763,8 +1784,8 @@ mod tests {
         assert_eq!(latency_release.owner, account());
     }
 
-    /// PASS: restart reconstructs the latest synchronized latency checkpoint independently for
-    /// each owner and ignores later transitions for other causes.
+    /// PASS: a pre-Start release retains the legacy timestamp checkpoint independently for each
+    /// owner and ignores later transitions for other causes.
     #[test]
     fn latency_hysteresis_seed_replays_latest_owner_cause_transition() {
         let owner = account();
@@ -1828,15 +1849,54 @@ mod tests {
         );
     }
 
+    /// PASS: a post-Start live latency release with absent or null account-tail evidence is typed
+    /// corruption, never an inactive timestamp-checkpoint seed.
+    #[test]
+    fn latency_hysteresis_seed_rejects_missing_post_start_live_tail() {
+        let owner = account();
+        for evidence in [
+            serde_json::json!({}),
+            serde_json::json!({ "live_journal_tail": null }),
+        ] {
+            let started = start();
+            let era = crate::paper_recovery::paper_era(vec![
+                frame(
+                    1,
+                    7_200,
+                    PaperLogRecord::QualificationStarted(Box::new(started)),
+                ),
+                frame(
+                    2,
+                    7_201,
+                    PaperLogRecord::RiskHaltChanged {
+                        owner: owner.clone(),
+                        cause: RiskHaltCause::CopyLatency,
+                        state: HaltState::Released,
+                        evidence,
+                    },
+                ),
+            ]);
+
+            assert_eq!(
+                latency_hysteresis_seed(&era, &owner, Path::new("unused")),
+                Err(RiskInputsUnavailable::LiveLatencyReleaseCheckpointMissing)
+            );
+        }
+    }
+
     /// PASS: malformed journal-tail evidence fails closed instead of silently falling back to a
     /// wall-clock checkpoint that could discard a delayed live response.
     #[test]
     fn latency_hysteresis_seed_rejects_malformed_live_tail() {
         let owner = account();
-        let era = PaperEra {
-            start: None,
-            frames: vec![frame(
+        let era = crate::paper_recovery::paper_era(vec![
+            frame(
                 1,
+                7_199,
+                PaperLogRecord::QualificationStarted(Box::new(start())),
+            ),
+            frame(
+                2,
                 7_200,
                 PaperLogRecord::RiskHaltChanged {
                     owner: owner.clone(),
@@ -1851,8 +1911,8 @@ mod tests {
                         },
                     }),
                 },
-            )],
-        };
+            ),
+        ]);
         assert_eq!(
             latency_hysteresis_seed(&era, &owner, Path::new("unused")),
             Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
