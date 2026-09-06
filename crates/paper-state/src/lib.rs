@@ -1377,6 +1377,40 @@ impl PaperStateDb {
         Ok(complete == Some(1))
     }
 
+    /// Return the exact durable complete-history proof for one wallet.
+    ///
+    /// Callers that publish immutable membership evidence need the proof preimage, not only the
+    /// current boolean projection exposed by [`Self::wallet_history_complete`].
+    pub fn wallet_history_status(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Option<WalletHistoryStatusRecord>, PaperStateError> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT complete, proof_json, updated_at_unix \
+                 FROM wallet_history_status_v2 WHERE wallet_hex = ?1",
+                params![wallet.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(complete, proof_json, updated_at_unix)| {
+            Ok(WalletHistoryStatusRecord {
+                wallet: *wallet,
+                complete: parse_bool_flag(complete, "wallet history complete")?,
+                proof_json,
+                updated_at_unix,
+            })
+        })
+        .transpose()
+    }
+
     /// Persist the result of a complete reconciled-history obligation (#544).
     ///
     /// Source ingestion owns the proof; membership only consumes this durable status.

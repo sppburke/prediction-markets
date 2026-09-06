@@ -22,6 +22,7 @@ use pe_execution_core::{
     RiskDecisionAudit, SizingModeAudit,
 };
 use pe_kelly_sizer::{KellyInput, size_contracts};
+use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{
     DecisionPendingRow, DecisionPendingState, FillRow, FinancialSnapshot, PaperPositionRow,
     PaperStateDb, SettledMarketRow,
@@ -48,7 +49,7 @@ use pe_source_polymarket_public::{
     parse_activity_response, parse_activity_row, parse_activity_trade_observation,
     parse_clob_market, validate_live_market,
 };
-use pe_trader_index::{WatchlistEntry, score::lcb_5pct_decimal};
+use pe_trader_index::score::lcb_5pct_decimal;
 use pe_venue_polymarket::{BuySizing, LadderError, parse_compact_market, plan_sized_buy};
 use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
@@ -58,10 +59,12 @@ use crate::bucket_commit::DecisionContinuationV3;
 use crate::config::ServiceConfig;
 use crate::decision_replay::replay_decision_pending;
 use crate::paper_recovery::{
-    FINANCIAL_SEMANTIC_VERSION, FinancialPayload, FinancialResult, MembershipReason,
-    PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, PortfolioMark, QualificationSealed,
-    QualificationStarted, RiskHaltOwner, ScannedPaperFrame, SealReason, TailBinding,
-    active_risk_halts, paper_era, scan_paper_log,
+    CapacityMembershipArtifact, FINANCIAL_SEMANTIC_VERSION, FinancialPayload, FinancialResult,
+    KnockoutCausalArtifact, MembershipAdmissionArtifact, MembershipAdmissionReceipt,
+    MembershipProofBinding, MembershipProofManifest, MembershipReason, PAPER_LOG_SCHEMA_VERSION,
+    PaperLogFrame, PaperLogRecord, PortfolioMark, QualificationSealed, QualificationStarted,
+    RankingMembershipArtifact, RiskHaltOwner, ScannedPaperFrame, SealReason,
+    SealedMembershipEvidence, TailBinding, active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::risk_inputs::{
     PaperExposureBase, RiskInputsUnavailable, build_paper_risk_base,
@@ -69,6 +72,15 @@ use crate::risk_inputs::{
 };
 use crate::runtime_config::{
     ConfigEra, ConfigRow, RISK_HALT_RELEASE_HASH_KEY, RuntimeConfig, parse_config,
+};
+use crate::watchlist_admission::{
+    CAPACITY_CONFIG_SOURCE_ID, KNOCKOUT_CAUSAL_SOURCE_ID, MEMBERSHIP_ADMISSION_SOURCE_ID,
+    MEMBERSHIP_ARTIFACT_PARSER_VERSION, MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+    RANKING_MEMBERSHIP_SOURCE_ID,
+};
+use crate::watchlist_maintenance::{
+    KnockoutReason, MaintenanceConfig, MembershipMode, knockout_decision,
+    planned_admission_wallets, ranked_membership_wallet_change,
 };
 
 const QUALIFICATION_REPORT_VERSION: u16 = 1;
@@ -566,185 +578,6 @@ struct RiskReplayContext<'a> {
     financial_semantic_version: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum SealedMembershipEvidence {
-    FullRerank {
-        replacement_entries: Vec<WatchlistEntry>,
-    },
-    RankerRotation {
-        replacement_entries: Vec<WatchlistEntry>,
-    },
-    KnockoutBackfill {
-        evictions: Vec<SealedKnockoutEvidence>,
-        replacement_entries: Vec<WatchlistEntry>,
-    },
-    CapacityChange {
-        generation: u64,
-        config_receipt: AppendReceipt,
-        replacement_entries: Vec<WatchlistEntry>,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SealedKnockoutEvidence {
-    wallet: pe_core_types::WalletAddress,
-    reason: String,
-    statistic: SealedDemotionStatistic,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum SealedDemotionStatistic {
-    Inactivity {
-        evaluated_at_unix: i64,
-        last_trade_unix: i64,
-        threshold_secs: u64,
-    },
-    InactivityHardCap {
-        evaluated_at_unix: i64,
-        last_trade_unix: i64,
-        threshold_secs: u64,
-    },
-    Underperformance {
-        settled_count: usize,
-        minimum_settled_count: usize,
-        windowed_pnl: String,
-        upper_cb: String,
-    },
-}
-
-impl SealedDemotionStatistic {
-    fn proves(&self, reason: &str) -> bool {
-        match self {
-            Self::Inactivity {
-                evaluated_at_unix,
-                last_trade_unix,
-                threshold_secs,
-            } => {
-                reason == "inactive>72h"
-                    && i64::try_from(*threshold_secs).is_ok_and(|threshold| {
-                        evaluated_at_unix.saturating_sub(*last_trade_unix) >= threshold
-                    })
-            }
-            Self::InactivityHardCap {
-                evaluated_at_unix,
-                last_trade_unix,
-                threshold_secs,
-            } => {
-                reason == "inactive>7d (hard cap)"
-                    && i64::try_from(*threshold_secs).is_ok_and(|threshold| {
-                        evaluated_at_unix.saturating_sub(*last_trade_unix) >= threshold
-                    })
-            }
-            Self::Underperformance {
-                settled_count,
-                minimum_settled_count,
-                windowed_pnl,
-                upper_cb,
-            } => {
-                reason == "upper_cb_edge<0 & windowed_pnl<0"
-                    && settled_count >= minimum_settled_count
-                    && *minimum_settled_count > 0
-                    && Decimal::from_str_exact(windowed_pnl)
-                        .is_ok_and(|value| value < Decimal::ZERO)
-                    && Decimal::from_str_exact(upper_cb).is_ok_and(|value| value < Decimal::ZERO)
-            }
-        }
-    }
-}
-
-impl SealedKnockoutEvidence {
-    #[must_use]
-    pub(crate) fn inactivity(
-        wallet: pe_core_types::WalletAddress,
-        evaluated_at_unix: i64,
-        last_trade_unix: i64,
-        threshold_secs: u64,
-    ) -> Self {
-        Self {
-            wallet,
-            reason: "inactive>72h".to_owned(),
-            statistic: SealedDemotionStatistic::Inactivity {
-                evaluated_at_unix,
-                last_trade_unix,
-                threshold_secs,
-            },
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn inactivity_hard_cap(
-        wallet: pe_core_types::WalletAddress,
-        evaluated_at_unix: i64,
-        last_trade_unix: i64,
-        threshold_secs: u64,
-    ) -> Self {
-        Self {
-            wallet,
-            reason: "inactive>7d (hard cap)".to_owned(),
-            statistic: SealedDemotionStatistic::InactivityHardCap {
-                evaluated_at_unix,
-                last_trade_unix,
-                threshold_secs,
-            },
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn underperformance(
-        wallet: pe_core_types::WalletAddress,
-        settled_count: usize,
-        minimum_settled_count: usize,
-        windowed_pnl: Decimal,
-        upper_cb: Decimal,
-    ) -> Self {
-        Self {
-            wallet,
-            reason: "upper_cb_edge<0 & windowed_pnl<0".to_owned(),
-            statistic: SealedDemotionStatistic::Underperformance {
-                settled_count,
-                minimum_settled_count,
-                windowed_pnl: windowed_pnl.to_string(),
-                upper_cb: upper_cb.to_string(),
-            },
-        }
-    }
-}
-
-impl SealedMembershipEvidence {
-    pub(crate) fn full_rerank(
-        replacement_entries: Vec<WatchlistEntry>,
-    ) -> Result<serde_json::Value, serde_json::Error> {
-        serde_json::to_value(Self::FullRerank {
-            replacement_entries,
-        })
-    }
-
-    pub(crate) fn knockout_backfill(
-        evictions: Vec<SealedKnockoutEvidence>,
-        replacement_entries: Vec<WatchlistEntry>,
-    ) -> Result<serde_json::Value, serde_json::Error> {
-        serde_json::to_value(Self::KnockoutBackfill {
-            evictions,
-            replacement_entries,
-        })
-    }
-
-    pub(crate) fn capacity_change(
-        generation: u64,
-        config_receipt: AppendReceipt,
-        replacement_entries: Vec<WatchlistEntry>,
-    ) -> Result<serde_json::Value, serde_json::Error> {
-        serde_json::to_value(Self::CapacityChange {
-            generation,
-            config_receipt,
-            replacement_entries,
-        })
-    }
-}
-
 async fn verify_qualification(
     options: &QualifyOptions,
 ) -> Result<QualificationReport, QualificationError> {
@@ -770,7 +603,7 @@ async fn verify_qualification(
 
     let source_observations = source_observations(&options.source_log, &seal.source_prefix)?;
     let state = PaperStateDb::open_read_only(&options.paper_state)?;
-    verify_initial_membership(&state, &start)?;
+    verify_initial_membership(&start)?;
     let decisions = decision_rows_from_source_observations(
         &state,
         &start.source_prefix,
@@ -1135,9 +968,13 @@ async fn verify_qualification(
                     *reason,
                     removed,
                     added,
+                    *capacity,
                     *ranking_batch_id,
                     evidence,
-                    &source_observations,
+                    &MembershipEvidenceContext {
+                        source: &source_observations,
+                        current_membership: &membership,
+                    },
                 )?;
                 for wallet in removed {
                     membership.remove(wallet);
@@ -2067,23 +1904,19 @@ fn decision_keys_from_source_observations(
     Ok(ordered)
 }
 
-fn verify_initial_membership(
-    state: &PaperStateDb,
-    start: &QualificationStarted,
-) -> Result<(), QualificationError> {
+fn verify_initial_membership(start: &QualificationStarted) -> Result<(), QualificationError> {
     if start.financial_semantic_version != FINANCIAL_SEMANTIC_VERSION {
         return insufficient(format!(
             "QualificationStarted financial semantic version {} differs from verifier version {FINANCIAL_SEMANTIC_VERSION}",
             start.financial_semantic_version
         ));
     }
-    let rederived = derive_membership_proofs_hash(state, &start.membership)?;
-    if rederived != start.membership_proofs_hash {
-        return insufficient(format!(
-            "QualificationStarted membership proofs differ from sealed state: recorded {}, rederived {rederived}",
-            start.membership_proofs_hash
-        ));
-    }
+    MembershipProofBinding::decode_and_verify(&start.membership_proofs_hash, &start.membership)
+        .map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "QualificationStarted immutable membership proof is invalid: {error}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -2104,42 +1937,69 @@ fn verify_decision_configurations(
     Ok(())
 }
 
+struct MembershipEvidenceContext<'a> {
+    source: &'a BTreeMap<u64, SourceObservation>,
+    current_membership: &'a HashSet<pe_core_types::WalletAddress>,
+}
+
 fn verify_membership_change_evidence(
     reason: MembershipReason,
     removed: &[pe_core_types::WalletAddress],
     added: &[pe_core_types::WalletAddress],
+    capacity: usize,
     ranking_batch_id: Option<i64>,
     evidence: &serde_json::Value,
-    source: &BTreeMap<u64, SourceObservation>,
+    context: &MembershipEvidenceContext<'_>,
 ) -> Result<(), QualificationError> {
+    let MembershipEvidenceContext {
+        source,
+        current_membership,
+    } = context;
     let evidence: SealedMembershipEvidence =
         serde_json::from_value(evidence.clone()).map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
                 "MembershipChanged evidence schema is invalid: {error}"
             ))
         })?;
-    let replacement_entries = match (&evidence, reason) {
+    match (&evidence, reason) {
         (
             SealedMembershipEvidence::FullRerank {
-                replacement_entries,
+                ranking_receipt,
+                admission_receipts,
             },
             MembershipReason::FullRerank,
         )
         | (
-            SealedMembershipEvidence::RankerRotation {
-                replacement_entries,
+            SealedMembershipEvidence::FullRerank {
+                ranking_receipt,
+                admission_receipts,
             },
             MembershipReason::RankerRotation,
         ) => {
-            if ranking_batch_id.is_none() {
+            let Some(ranking_batch_id) = ranking_batch_id else {
                 return insufficient("ranking membership change lacks a ranking batch identity");
+            };
+            let artifact: RankingMembershipArtifact =
+                membership_artifact(source, *ranking_receipt, RANKING_MEMBERSHIP_SOURCE_ID)?;
+            if artifact.batch_id != Some(ranking_batch_id) {
+                return insufficient(
+                    "MembershipChanged ranking receipt names a different published batch",
+                );
             }
-            replacement_entries
+            verify_ranked_change(
+                current_membership,
+                removed,
+                added,
+                capacity,
+                &artifact.entries,
+            )?;
+            verify_admission_receipts(added, admission_receipts, source)?;
         }
         (
             SealedMembershipEvidence::KnockoutBackfill {
                 evictions,
-                replacement_entries,
+                ranking_receipt,
+                admission_receipts,
             },
             MembershipReason::KnockoutInactivity
             | MembershipReason::KnockoutInactivityHardCap
@@ -2147,12 +2007,65 @@ fn verify_membership_change_evidence(
         ) => {
             let mut proved = HashSet::new();
             for eviction in evictions {
-                if !removed.contains(&eviction.wallet)
-                    || !eviction.statistic.proves(&eviction.reason)
-                    || !proved.insert(eviction.wallet)
-                {
+                if !removed.contains(&eviction.wallet) || !proved.insert(eviction.wallet) {
                     return insufficient(
                         "MembershipChanged knockout evidence does not prove its removed wallets",
+                    );
+                }
+                let artifact: KnockoutCausalArtifact = membership_artifact(
+                    source,
+                    eviction.causal_receipt,
+                    KNOCKOUT_CAUSAL_SOURCE_ID,
+                )?;
+                if artifact.wallet != eviction.wallet {
+                    return insufficient(
+                        "MembershipChanged knockout receipt names a different wallet",
+                    );
+                }
+                let fills = artifact
+                    .fills
+                    .iter()
+                    .map(crate::paper_recovery::KnockoutFillArtifact::to_row)
+                    .collect::<Vec<_>>();
+                let settlements = artifact
+                    .settlements
+                    .iter()
+                    .map(crate::paper_recovery::KnockoutSettlementArtifact::to_row)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "MembershipChanged knockout settlement encoding is invalid: {error}"
+                        ))
+                    })?;
+                verify_knockout_causal_inputs(eviction.wallet, &fills, &settlements)?;
+                let resolutions = replay_membership_resolutions(&settlements)?;
+                let stats = crate::demotion_stat::wallet_edge_stats(
+                    &fills,
+                    &resolutions,
+                    artifact.demotion_cb_alpha,
+                    artifact.evaluated_at_unix,
+                    artifact.demotion_pnl_window_secs,
+                );
+                let config = MaintenanceConfig {
+                    interval_secs: 0,
+                    inactivity_threshold_secs: artifact.inactivity_threshold_secs,
+                    inactivity_hard_cap_secs: artifact.inactivity_hard_cap_secs,
+                    demotion_min_trades: artifact.demotion_min_trades,
+                    demotion_cb_alpha: artifact.demotion_cb_alpha,
+                    demotion_pnl_window_secs: artifact.demotion_pnl_window_secs,
+                    bench_overfetch: 0,
+                    membership_mode: MembershipMode::Knockout,
+                };
+                let rederived = knockout_decision(
+                    artifact.last_trade_unix,
+                    stats.get(&eviction.wallet.to_string()),
+                    &config,
+                    artifact.evaluated_at_unix,
+                )
+                .map(membership_reason_from_knockout);
+                if rederived != Some(eviction.reason) {
+                    return insufficient(
+                        "MembershipChanged knockout semantic owner rejects its causal inputs",
                     );
                 }
             }
@@ -2161,42 +2074,204 @@ fn verify_membership_change_evidence(
                     "MembershipChanged knockout evidence omits a removed wallet statistic",
                 );
             }
-            replacement_entries
+            if !evictions.is_empty() && knockout_record_reason(evictions) != Some(reason) {
+                return insufficient(
+                    "MembershipChanged knockout reason differs from its proved evictions",
+                );
+            }
+            let candidates = match ranking_receipt {
+                Some(receipt) => {
+                    let artifact: RankingMembershipArtifact =
+                        membership_artifact(source, *receipt, RANKING_MEMBERSHIP_SOURCE_ID)?;
+                    if artifact.batch_id != ranking_batch_id {
+                        return insufficient(
+                            "MembershipChanged knockout ranking receipt names a different batch",
+                        );
+                    }
+                    artifact.entries
+                }
+                None => Vec::new(),
+            };
+            let removed_set = removed.iter().copied().collect::<HashSet<_>>();
+            let expected =
+                planned_admission_wallets(current_membership, &removed_set, &candidates, capacity)
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+            if expected != added.iter().copied().collect() {
+                return insufficient(
+                    "MembershipChanged knockout candidate receipt disagrees with its additions",
+                );
+            }
+            verify_admission_receipts(added, admission_receipts, source)?;
         }
         (
             SealedMembershipEvidence::CapacityChange {
                 generation,
                 config_receipt,
-                replacement_entries,
+                admission_receipts,
             },
             MembershipReason::CapacityChange,
         ) => {
+            let artifact: CapacityMembershipArtifact =
+                membership_artifact(source, *config_receipt, CAPACITY_CONFIG_SOURCE_ID)?;
             if *generation == 0
-                || source
-                    .get(&config_receipt.sequence.0)
-                    .is_none_or(|observation| observation.receipt != *config_receipt)
+                || artifact.generation != *generation
+                || usize::try_from(artifact.target) != Ok(capacity)
             {
                 return insufficient(
-                    "MembershipChanged capacity evidence lacks its exact config receipt",
+                    "MembershipChanged capacity receipt differs from generation or target",
                 );
             }
-            replacement_entries
+            if ranking_batch_id.is_some() {
+                return insufficient(
+                    "MembershipChanged capacity change unexpectedly names a batch",
+                );
+            }
+            verify_ranked_change(
+                current_membership,
+                removed,
+                added,
+                capacity,
+                &artifact.published_entries,
+            )?;
+            verify_admission_receipts(added, admission_receipts, source)?;
         }
         _ => return insufficient("MembershipChanged evidence kind does not match its reason"),
-    };
-    let entry_wallets = replacement_entries
+    }
+    Ok(())
+}
+
+fn membership_artifact<T: serde::de::DeserializeOwned>(
+    source: &BTreeMap<u64, SourceObservation>,
+    receipt: AppendReceipt,
+    expected_source_id: &str,
+) -> Result<T, QualificationError> {
+    let observation = source
+        .get(&receipt.sequence.0)
+        .filter(|observation| observation.receipt == receipt)
+        .ok_or_else(|| {
+            QualificationError::InsufficientEvidence(
+                "MembershipChanged artifact receipt is absent from the sealed source prefix"
+                    .to_owned(),
+            )
+        })?;
+    if observation.source_id != expected_source_id
+        || observation.schema_version != MEMBERSHIP_ARTIFACT_SCHEMA_VERSION
+        || observation.parser_version != MEMBERSHIP_ARTIFACT_PARSER_VERSION
+        || observation.content_type != ContentType::Json
+    {
+        return insufficient("MembershipChanged artifact receipt has the wrong envelope identity");
+    }
+    serde_json::from_slice(&observation.payload).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "MembershipChanged artifact payload is invalid: {error}"
+        ))
+    })
+}
+
+fn verify_ranked_change(
+    current: &HashSet<pe_core_types::WalletAddress>,
+    removed: &[pe_core_types::WalletAddress],
+    added: &[pe_core_types::WalletAddress],
+    capacity: usize,
+    entries: &[pe_trader_index::WatchlistEntry],
+) -> Result<(), QualificationError> {
+    let entry_wallets = entries
         .iter()
         .map(|entry| entry.wallet)
         .collect::<HashSet<_>>();
-    if entry_wallets.len() != replacement_entries.len()
-        || added.iter().any(|wallet| !entry_wallets.contains(wallet))
-        || removed.iter().any(|wallet| entry_wallets.contains(wallet))
+    if entry_wallets.len() != entries.len() || entries.len() > capacity {
+        return insufficient("MembershipChanged ranked artifact is duplicate or over-capacity");
+    }
+    let (expected_removed, expected_added) =
+        ranked_membership_wallet_change(current, entries, capacity);
+    if expected_removed != removed.iter().copied().collect()
+        || expected_added != added.iter().copied().collect()
     {
         return insufficient(
-            "MembershipChanged ranking/admission evidence disagrees with its wallet mutation",
+            "MembershipChanged ranked artifact disagrees with its exact wallet mutation",
         );
     }
     Ok(())
+}
+
+fn verify_admission_receipts(
+    added: &[pe_core_types::WalletAddress],
+    receipts: &[MembershipAdmissionReceipt],
+    source: &BTreeMap<u64, SourceObservation>,
+) -> Result<(), QualificationError> {
+    let mut proved = HashSet::new();
+    for proof_receipt in receipts {
+        if !added.contains(&proof_receipt.wallet) || !proved.insert(proof_receipt.wallet) {
+            return insufficient(
+                "MembershipChanged admission receipts repeat or name an unadded wallet",
+            );
+        }
+        let artifact: MembershipAdmissionArtifact = membership_artifact(
+            source,
+            proof_receipt.receipt,
+            MEMBERSHIP_ADMISSION_SOURCE_ID,
+        )?;
+        if artifact.wallet != proof_receipt.wallet {
+            return insufficient("MembershipChanged admission receipt names a different wallet");
+        }
+        artifact
+            .proof
+            .verify(&[proof_receipt.wallet])
+            .map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "MembershipChanged admission proof is invalid: {error}"
+                ))
+            })?;
+    }
+    if proved != added.iter().copied().collect() {
+        return insufficient("MembershipChanged omits an added wallet admission receipt");
+    }
+    Ok(())
+}
+
+fn replay_membership_resolutions(
+    settlements: &[SettledMarketRow],
+) -> Result<ResolutionStore, QualificationError> {
+    let state = std::sync::Arc::new(PaperStateDb::open(Path::new(":memory:"))?);
+    for settlement in settlements {
+        state.record_settled_market(
+            &settlement.market_id,
+            &settlement.outcome_prices_json,
+            settlement.credit_applied,
+            settlement.settled_at_unix,
+        )?;
+    }
+    ResolutionStore::load(state).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "MembershipChanged settlement replay failed: {error}"
+        ))
+    })
+}
+
+fn membership_reason_from_knockout(reason: KnockoutReason) -> MembershipReason {
+    match reason {
+        KnockoutReason::Inactivity => MembershipReason::KnockoutInactivity,
+        KnockoutReason::InactivityHardCap => MembershipReason::KnockoutInactivityHardCap,
+        KnockoutReason::Underperformance => MembershipReason::KnockoutUnderperformance,
+        KnockoutReason::RankerRotation => MembershipReason::RankerRotation,
+    }
+}
+
+fn knockout_record_reason(
+    evidence: &[crate::paper_recovery::SealedKnockoutEvidence],
+) -> Option<MembershipReason> {
+    evidence
+        .iter()
+        .map(|eviction| eviction.reason)
+        .find(|reason| *reason == MembershipReason::KnockoutUnderperformance)
+        .or_else(|| {
+            evidence
+                .iter()
+                .map(|eviction| eviction.reason)
+                .find(|reason| *reason == MembershipReason::KnockoutInactivityHardCap)
+        })
+        .or_else(|| evidence.first().map(|eviction| eviction.reason))
 }
 
 #[cfg(test)]
@@ -2208,6 +2283,7 @@ pub(crate) fn verify_published_membership_change(
         reason,
         removed,
         added,
+        capacity,
         ranking_batch_id,
         evidence,
         ..
@@ -2217,14 +2293,55 @@ pub(crate) fn verify_published_membership_change(
     };
     let source_prefix = TailBinding::from(&Scanner::verify(source_log)?);
     let source = source_observations(source_log, &source_prefix)?;
+    let current_membership = removed.iter().copied().collect();
     verify_membership_change_evidence(
         *reason,
         removed,
         added,
+        *capacity,
         *ranking_batch_id,
         evidence,
-        &source,
+        &MembershipEvidenceContext {
+            source: &source,
+            current_membership: &current_membership,
+        },
     )
+}
+
+fn verify_knockout_causal_inputs(
+    wallet: pe_core_types::WalletAddress,
+    fills: &[FillRow],
+    settlements: &[SettledMarketRow],
+) -> Result<(), QualificationError> {
+    let wallet_hex = wallet.to_string();
+    let mut fill_keys = HashSet::new();
+    let mut settlement_markets = HashSet::new();
+    for settlement in settlements {
+        if !settlement_markets.insert(settlement.market_id.clone()) {
+            return insufficient("MembershipChanged knockout settlements repeat a market");
+        }
+    }
+    for fill in fills {
+        if !fill_keys.insert(fill.idempotency_key.clone())
+            || crate::paper_api::ParsedKey::from_key(&fill.idempotency_key)
+                .leader
+                .as_deref()
+                != Some(&wallet_hex)
+            || !settlement_markets.contains(&fill.market_id)
+        {
+            return insufficient(
+                "MembershipChanged knockout causal fills are duplicated, foreign, or unsettled",
+            );
+        }
+    }
+    if settlements.iter().any(|settlement| {
+        !fills
+            .iter()
+            .any(|fill| fill.market_id == settlement.market_id)
+    }) {
+        return insufficient("MembershipChanged knockout includes an unused settlement");
+    }
+    Ok(())
 }
 
 fn verify_decision_source_inputs(
@@ -4129,91 +4246,16 @@ fn derive_membership_proofs_hash(
     state: &PaperStateDb,
     membership: &[pe_core_types::WalletAddress],
 ) -> Result<String, QualificationError> {
-    let mut unique = HashSet::new();
-    let mut proofs = Vec::with_capacity(membership.len());
-    for wallet in membership {
-        if !unique.insert(*wallet) {
-            return insufficient(format!("financial-era membership repeats wallet {wallet}"));
-        }
-        if !state.wallet_history_complete(wallet)? {
-            return insufficient(format!(
-                "financial-era membership lacks complete history for {wallet}"
-            ));
-        }
-        let coverage = state.wallet_coverage(wallet)?;
-        let (Some(activity_cutoff_unix), Some(anchor_seq), Some(anchored_at_unix)) = (
-            coverage.activity_cutoff_unix,
-            coverage.anchor_seq,
-            coverage.anchored_at_unix,
-        ) else {
-            return insufficient(format!(
-                "financial-era membership lacks installed anchor coverage for {wallet}"
-            ));
-        };
-        if coverage.reanchor_required {
-            return insufficient(format!(
-                "financial-era membership requires a new anchor for {wallet}"
-            ));
-        }
-        let anchors = state.position_anchors(wallet)?;
-        let anchor = anchors.last().ok_or_else(|| {
-            QualificationError::InsufficientEvidence(format!(
-                "financial-era membership lacks an anchor record for {wallet}"
-            ))
-        })?;
-        if anchor.anchor_seq != anchor_seq
-            || anchor.activity_cutoff_unix != activity_cutoff_unix
-            || anchor.anchored_at_unix != anchored_at_unix
-        {
-            return insufficient(format!(
-                "financial-era membership anchor and coverage disagree for {wallet}"
-            ));
-        }
-        let validation = state.position_validation(wallet)?.ok_or_else(|| {
-            QualificationError::InsufficientEvidence(format!(
-                "financial-era membership lacks a current position validation for {wallet}"
-            ))
-        })?;
-        if validation.ledger_hash != anchor.ledger_hash_after
-            || validation.proof_json != anchor.proof_json
-        {
-            return insufficient(format!(
-                "financial-era membership validation and anchor disagree for {wallet}"
-            ));
-        }
-        proofs.push(serde_json::json!({
-            "wallet": wallet.to_string(),
-            "coverage": {
-                "activity_cutoff_unix": activity_cutoff_unix,
-                "coverage_generation": coverage.coverage_generation,
-                "reanchor_required": coverage.reanchor_required,
-                "anchor_seq": anchor_seq,
-                "anchored_at_unix": anchored_at_unix,
-            },
-            "anchor": {
-                "anchor_seq": anchor.anchor_seq,
-                "anchored_at_unix": anchor.anchored_at_unix,
-                "activity_cutoff_unix": anchor.activity_cutoff_unix,
-                "balances_json": anchor.balances_json,
-                "ledger_hash_after": anchor.ledger_hash_after,
-                "proof_json": anchor.proof_json,
-            },
-            "validation": {
-                "ledger_hash": validation.ledger_hash,
-                "positions_proof_hash": validation.positions_proof_hash,
-                "activity_bounds_json": validation.activity_bounds_json,
-                "source_log_generation": validation.source_log_generation,
-                "proof_json": validation.proof_json,
-                "recorded_at_unix": validation.recorded_at_unix,
-            },
-        }));
-    }
-    let membership: Vec<_> = membership.iter().map(ToString::to_string).collect();
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "membership": membership,
-        "proofs": proofs,
-    }))?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    let manifest = MembershipProofManifest::capture(state, membership).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "financial-era membership proof capture failed: {error}"
+        ))
+    })?;
+    MembershipProofBinding::encode(manifest).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "financial-era membership proof binding failed: {error}"
+        ))
+    })
 }
 
 fn verify_live_preparation_posture(
@@ -5299,12 +5341,146 @@ mod tests {
                 MembershipReason::FullRerank,
                 &[],
                 &[],
+                1,
                 Some(7),
                 &serde_json::json!({"x": 1}),
-                &BTreeMap::new(),
+                &MembershipEvidenceContext {
+                    source: &BTreeMap::new(),
+                    current_membership: &HashSet::new(),
+                },
             ),
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason.contains("evidence schema is invalid")
+        ));
+    }
+
+    /// PASS: knockout verification recomputes underperformance from receipt-bound fill and
+    /// settlement inputs; removing those inputs cannot preserve the publisher's reason.
+    #[test]
+    fn knockout_replays_retained_demotion_inputs() {
+        let wallet = WalletAddress([9; 20]);
+        let evaluated_at_unix = 1_900_000_000;
+        let quantity = ShareAmount::from_whole(100).unwrap();
+        let principal = CollateralAmount::from_decimal_exact(dec!(50)).unwrap();
+        let mut fills = Vec::new();
+        let mut settlements = Vec::new();
+        for index in 0..10u64 {
+            let market_id = MarketId(VenueMarketId(format!("losing-market-{index}")));
+            fills.push(crate::paper_recovery::KnockoutFillArtifact::from_row(
+                &FillRow {
+                    idempotency_key: format!(
+                        "wf|{wallet}|g2:{}|{}|0|buy|{}",
+                        "a".repeat(64),
+                        market_id.0.0,
+                        evaluated_at_unix - 10
+                    ),
+                    market_id: market_id.clone(),
+                    outcome_id: OutcomeId(0),
+                    side: Side::Buy,
+                    quantity,
+                    fill_price: Price::new(dec!(0.5)).unwrap(),
+                    principal,
+                    fee: CollateralAmount::ZERO,
+                    event_seq: EventSeq(index + 1),
+                    prepared_seq: EventSeq(index + 1),
+                    source_receipt_seq: None,
+                },
+            ));
+            settlements.push(crate::paper_recovery::KnockoutSettlementArtifact {
+                market_id,
+                outcome_prices: vec![Decimal::ZERO, Decimal::ONE],
+                credit_applied: Decimal::ZERO,
+                settled_at_unix: evaluated_at_unix - 1,
+            });
+        }
+        let artifact = KnockoutCausalArtifact {
+            wallet,
+            evaluated_at_unix,
+            last_trade_unix: Some(evaluated_at_unix - 1),
+            inactivity_threshold_secs: 259_200,
+            inactivity_hard_cap_secs: 604_800,
+            demotion_min_trades: 10,
+            demotion_cb_alpha: dec!(0.10),
+            demotion_pnl_window_secs: 2_592_000,
+            fills,
+            settlements,
+        };
+        let observation = |sequence: u64, artifact: &KnockoutCausalArtifact| {
+            let payload = serde_json::to_vec(artifact).unwrap();
+            let receipt = AppendReceipt {
+                sequence: EventSeq(sequence),
+                this_hash: blake3::hash(&payload),
+            };
+            let at = OffsetDateTime::from_unix_timestamp(evaluated_at_unix).unwrap();
+            (
+                receipt,
+                SourceObservation {
+                    receipt,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    received_unix_ms: evaluated_at_unix * 1_000,
+                    source_id: KNOCKOUT_CAUSAL_SOURCE_ID.to_owned(),
+                    schema_version: MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+                    parser_version: MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+                    content_type: ContentType::Json,
+                    payload,
+                },
+            )
+        };
+        let (receipt, source_observation) = observation(1, &artifact);
+        let evidence = SealedMembershipEvidence::knockout_backfill(
+            vec![crate::paper_recovery::SealedKnockoutEvidence {
+                wallet,
+                reason: MembershipReason::KnockoutUnderperformance,
+                causal_receipt: receipt,
+            }],
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        verify_membership_change_evidence(
+            MembershipReason::KnockoutUnderperformance,
+            &[wallet],
+            &[],
+            1,
+            None,
+            &evidence,
+            &MembershipEvidenceContext {
+                source: &BTreeMap::from([(1, source_observation)]),
+                current_membership: &HashSet::from([wallet]),
+            },
+        )
+        .unwrap();
+
+        let mut omitted = artifact;
+        omitted.fills.clear();
+        omitted.settlements.clear();
+        let (receipt, source_observation) = observation(2, &omitted);
+        let evidence = SealedMembershipEvidence::knockout_backfill(
+            vec![crate::paper_recovery::SealedKnockoutEvidence {
+                wallet,
+                reason: MembershipReason::KnockoutUnderperformance,
+                causal_receipt: receipt,
+            }],
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_membership_change_evidence(
+                MembershipReason::KnockoutUnderperformance,
+                &[wallet],
+                &[],
+                1,
+                None,
+                &evidence,
+                &MembershipEvidenceContext {
+                    source: &BTreeMap::from([(2, source_observation)]),
+                    current_membership: &HashSet::from([wallet]),
+                },
+            ),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("semantic owner rejects")
         ));
     }
 
@@ -5312,16 +5488,61 @@ mod tests {
     /// the caller-provided label.
     #[test]
     fn initial_membership_label_is_not_proof() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
         let mut start = started("config");
         start.membership.clear();
         start.membership_proofs_hash = "not-a-proof".to_owned();
         assert!(matches!(
-            verify_initial_membership(&state, &start),
+            verify_initial_membership(&start),
             Err(QualificationError::InsufficientEvidence(reason))
-                if reason.contains("membership proofs differ")
+                if reason.contains("immutable membership proof is invalid")
         ));
+    }
+
+    /// PASS: Start retains the exact accepted membership preimages, so deleting the mutable
+    /// current position-validation projection after Start cannot invalidate the era proof.
+    #[test]
+    fn initial_membership_proof_does_not_read_current_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("paper.db");
+        let state = PaperStateDb::open(&state_path).unwrap();
+        let wallet = WalletAddress([42; 20]);
+        let at = 1_700_000_100;
+        state
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{\"complete\":true}".to_owned(),
+                updated_at_unix: at,
+            })
+            .unwrap();
+        state.seed_cursors_if_absent(&[(wallet, at)]).unwrap();
+        state
+            .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: at,
+                anchored_at_unix: at,
+                ledger_hash_after: "ledger-at-start".to_owned(),
+                positions_proof_hash: "positions-at-start".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "source-at-start".to_owned(),
+                proof_json: "{\"anchor\":1}".to_owned(),
+                recorded_at_unix: at,
+            }])
+            .unwrap();
+        let mut start = started("config");
+        start.membership = vec![wallet];
+        start.membership_proofs_hash = derive_membership_proofs_hash(&state, &[wallet]).unwrap();
+
+        let connection = rusqlite::Connection::open(&state_path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM position_validations WHERE wallet_hex = ?1",
+                rusqlite::params![wallet.to_string()],
+            )
+            .unwrap();
+        assert!(!state.position_validation_current(&wallet).unwrap());
+        verify_initial_membership(&start).unwrap();
     }
 
     #[test]
@@ -6211,14 +6432,13 @@ mod tests {
             preparation.start.hot_config_hash,
             derive_hot_config_hash(&config_rows, &config).unwrap()
         );
-        assert_eq!(preparation.start.membership_proofs_hash.len(), 64);
-        assert!(
-            preparation
-                .start
-                .membership_proofs_hash
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        );
+        let membership_manifest = MembershipProofBinding::decode_and_verify(
+            &preparation.start.membership_proofs_hash,
+            &[],
+        )
+        .unwrap();
+        assert!(membership_manifest.membership.is_empty());
+        assert!(membership_manifest.proofs.is_empty());
         let after = paths
             .iter()
             .map(|path| fs::read(path).unwrap())

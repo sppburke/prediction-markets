@@ -11,16 +11,18 @@ use anyhow::{Context, Result};
 use pe_copy_signal_engine::{PositionSnapshot, PositionState};
 use pe_core_types::{
     AccountId, CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId,
-    PolymarketConditionId, Price, ShareAmount, SourceTimestamp, SourceTradeId, VenueMarketId,
+    PolymarketConditionId, Price, ShareAmount, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader};
 use pe_execution_core::EconomicPrepared;
-use pe_paper_state::{FillRecord, FillRow, PaperStateDb};
+use pe_paper_pnl::SettlementInfo;
+use pe_paper_state::{FillRecord, FillRow, PaperStateDb, SettledMarketRow};
 use pe_position_ledger::{
     AppliedEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation, PositionLedger,
 };
 use pe_risk_engine::RiskHaltCause;
+use pe_trader_index::WatchlistEntry;
 use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -172,6 +174,527 @@ pub struct MembershipChange {
     pub capacity: usize,
     pub ranking_batch_id: Option<i64>,
     pub evidence: serde_json::Value,
+}
+
+/// Versioned binding stored in the legacy-named `membership_proofs_hash` Start field.
+///
+/// Keeping the durable field preserves existing Start constructors while the value now carries
+/// both the canonical immutable preimages and their digest. Qualification never consults mutable
+/// paper-state membership projections after Start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipProofBinding {
+    version: u8,
+    proof_hash: String,
+    manifest: MembershipProofManifest,
+}
+
+/// Canonical ordered proof preimages for the membership installed by Start or one admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipProofManifest {
+    pub(crate) membership: Vec<WalletAddress>,
+    pub(crate) proofs: Vec<MembershipWalletProof>,
+}
+
+/// Exact history, coverage, anchor, and position-validation rows accepted for one wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipWalletProof {
+    pub(crate) wallet: WalletAddress,
+    pub(crate) history: MembershipHistoryProof,
+    pub(crate) coverage: MembershipCoverageProof,
+    pub(crate) anchor: MembershipAnchorProof,
+    pub(crate) validation: MembershipPositionValidationProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipHistoryProof {
+    complete: bool,
+    proof_json: String,
+    updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipCoverageProof {
+    activity_cutoff_unix: i64,
+    coverage_generation: i64,
+    reanchor_required: bool,
+    anchor_seq: i64,
+    anchored_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipAnchorProof {
+    anchor_seq: i64,
+    anchored_at_unix: i64,
+    activity_cutoff_unix: i64,
+    balances_json: String,
+    ledger_hash_after: String,
+    proof_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipPositionValidationProof {
+    ledger_hash: String,
+    positions_proof_hash: String,
+    activity_bounds_json: String,
+    source_log_generation: String,
+    proof_json: String,
+    recorded_at_unix: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MembershipProofError {
+    #[error("paper state: {0}")]
+    PaperState(#[from] pe_paper_state::PaperStateError),
+    #[error("membership proof JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("membership repeats wallet {0}")]
+    DuplicateWallet(WalletAddress),
+    #[error("membership proof lacks complete history for {0}")]
+    MissingHistory(WalletAddress),
+    #[error("membership proof lacks installed anchor coverage for {0}")]
+    MissingCoverage(WalletAddress),
+    #[error("membership proof requires a new anchor for {0}")]
+    ReanchorRequired(WalletAddress),
+    #[error("membership proof lacks an anchor record for {0}")]
+    MissingAnchor(WalletAddress),
+    #[error("membership anchor and coverage disagree for {0}")]
+    AnchorCoverageMismatch(WalletAddress),
+    #[error("membership proof lacks a current position validation for {0}")]
+    MissingValidation(WalletAddress),
+    #[error("membership validation and anchor disagree for {0}")]
+    ValidationAnchorMismatch(WalletAddress),
+    #[error("membership proof manifest does not name the recorded membership")]
+    MembershipMismatch,
+    #[error("membership proof manifest and wallet preimages differ")]
+    ProofWalletMismatch,
+    #[error("membership proof binding is not canonical")]
+    NonCanonicalBinding,
+    #[error("membership proof binding version {0} is unsupported")]
+    UnsupportedVersion(u8),
+    #[error("membership proof digest differs from its immutable preimages")]
+    DigestMismatch,
+}
+
+impl MembershipProofManifest {
+    pub(crate) fn capture(
+        state: &PaperStateDb,
+        membership: &[WalletAddress],
+    ) -> Result<Self, MembershipProofError> {
+        let mut unique = HashSet::new();
+        let mut proofs = Vec::with_capacity(membership.len());
+        for wallet in membership {
+            if !unique.insert(*wallet) {
+                return Err(MembershipProofError::DuplicateWallet(*wallet));
+            }
+            let history = state
+                .wallet_history_status(wallet)?
+                .filter(|status| status.complete)
+                .ok_or(MembershipProofError::MissingHistory(*wallet))?;
+            let coverage = state.wallet_coverage(wallet)?;
+            let (Some(activity_cutoff_unix), Some(anchor_seq), Some(anchored_at_unix)) = (
+                coverage.activity_cutoff_unix,
+                coverage.anchor_seq,
+                coverage.anchored_at_unix,
+            ) else {
+                return Err(MembershipProofError::MissingCoverage(*wallet));
+            };
+            if coverage.reanchor_required {
+                return Err(MembershipProofError::ReanchorRequired(*wallet));
+            }
+            let anchor = state
+                .position_anchors(wallet)?
+                .into_iter()
+                .last()
+                .ok_or(MembershipProofError::MissingAnchor(*wallet))?;
+            if anchor.anchor_seq != anchor_seq
+                || anchor.activity_cutoff_unix != activity_cutoff_unix
+                || anchor.anchored_at_unix != anchored_at_unix
+            {
+                return Err(MembershipProofError::AnchorCoverageMismatch(*wallet));
+            }
+            let validation = state
+                .position_validation(wallet)?
+                .ok_or(MembershipProofError::MissingValidation(*wallet))?;
+            if validation.ledger_hash != anchor.ledger_hash_after
+                || validation.proof_json != anchor.proof_json
+            {
+                return Err(MembershipProofError::ValidationAnchorMismatch(*wallet));
+            }
+            proofs.push(MembershipWalletProof {
+                wallet: *wallet,
+                history: MembershipHistoryProof {
+                    complete: history.complete,
+                    proof_json: history.proof_json,
+                    updated_at_unix: history.updated_at_unix,
+                },
+                coverage: MembershipCoverageProof {
+                    activity_cutoff_unix,
+                    coverage_generation: coverage.coverage_generation,
+                    reanchor_required: coverage.reanchor_required,
+                    anchor_seq,
+                    anchored_at_unix,
+                },
+                anchor: MembershipAnchorProof {
+                    anchor_seq: anchor.anchor_seq,
+                    anchored_at_unix: anchor.anchored_at_unix,
+                    activity_cutoff_unix: anchor.activity_cutoff_unix,
+                    balances_json: anchor.balances_json,
+                    ledger_hash_after: anchor.ledger_hash_after,
+                    proof_json: anchor.proof_json,
+                },
+                validation: MembershipPositionValidationProof {
+                    ledger_hash: validation.ledger_hash,
+                    positions_proof_hash: validation.positions_proof_hash,
+                    activity_bounds_json: validation.activity_bounds_json,
+                    source_log_generation: validation.source_log_generation,
+                    proof_json: validation.proof_json,
+                    recorded_at_unix: validation.recorded_at_unix,
+                },
+            });
+        }
+        let manifest = Self {
+            membership: membership.to_vec(),
+            proofs,
+        };
+        manifest.verify(membership)?;
+        Ok(manifest)
+    }
+
+    pub(crate) fn verify(&self, membership: &[WalletAddress]) -> Result<(), MembershipProofError> {
+        if self.membership != membership {
+            return Err(MembershipProofError::MembershipMismatch);
+        }
+        let mut unique = HashSet::new();
+        for wallet in membership {
+            if !unique.insert(*wallet) {
+                return Err(MembershipProofError::DuplicateWallet(*wallet));
+            }
+        }
+        if self.proofs.len() != membership.len()
+            || self
+                .proofs
+                .iter()
+                .zip(membership)
+                .any(|(proof, wallet)| proof.wallet != *wallet)
+        {
+            return Err(MembershipProofError::ProofWalletMismatch);
+        }
+        for proof in &self.proofs {
+            if !proof.history.complete {
+                return Err(MembershipProofError::MissingHistory(proof.wallet));
+            }
+            for document in [
+                &proof.history.proof_json,
+                &proof.anchor.balances_json,
+                &proof.anchor.proof_json,
+                &proof.validation.activity_bounds_json,
+                &proof.validation.proof_json,
+            ] {
+                serde_json::from_str::<serde_json::Value>(document)?;
+            }
+            if proof.coverage.reanchor_required {
+                return Err(MembershipProofError::ReanchorRequired(proof.wallet));
+            }
+            if proof.coverage.anchor_seq != proof.anchor.anchor_seq
+                || proof.coverage.activity_cutoff_unix != proof.anchor.activity_cutoff_unix
+                || proof.coverage.anchored_at_unix != proof.anchor.anchored_at_unix
+            {
+                return Err(MembershipProofError::AnchorCoverageMismatch(proof.wallet));
+            }
+            if proof.validation.ledger_hash != proof.anchor.ledger_hash_after
+                || proof.validation.proof_json != proof.anchor.proof_json
+            {
+                return Err(MembershipProofError::ValidationAnchorMismatch(proof.wallet));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MembershipProofBinding {
+    const VERSION: u8 = 1;
+
+    pub(crate) fn encode(
+        manifest: MembershipProofManifest,
+    ) -> Result<String, MembershipProofError> {
+        let proof_hash = blake3::hash(&serde_json::to_vec(&manifest)?)
+            .to_hex()
+            .to_string();
+        Ok(serde_json::to_string(&Self {
+            version: Self::VERSION,
+            proof_hash,
+            manifest,
+        })?)
+    }
+
+    pub(crate) fn decode_and_verify(
+        encoded: &str,
+        membership: &[WalletAddress],
+    ) -> Result<MembershipProofManifest, MembershipProofError> {
+        let binding: Self = serde_json::from_str(encoded)?;
+        if binding.version != Self::VERSION {
+            return Err(MembershipProofError::UnsupportedVersion(binding.version));
+        }
+        if serde_json::to_string(&binding)? != encoded {
+            return Err(MembershipProofError::NonCanonicalBinding);
+        }
+        binding.manifest.verify(membership)?;
+        let rederived = blake3::hash(&serde_json::to_vec(&binding.manifest)?)
+            .to_hex()
+            .to_string();
+        if binding.proof_hash != rederived {
+            return Err(MembershipProofError::DigestMismatch);
+        }
+        Ok(binding.manifest)
+    }
+}
+
+/// Source-log artifact for the exact ranking rows used by one structural publication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RankingMembershipArtifact {
+    pub(crate) batch_id: Option<i64>,
+    pub(crate) entries: Vec<WatchlistEntry>,
+}
+
+/// Source-log artifact for a capacity generation and its exact published ranked set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapacityMembershipArtifact {
+    pub(crate) generation: u64,
+    pub(crate) target: u64,
+    pub(crate) published_entries: Vec<WatchlistEntry>,
+}
+
+/// Source-log artifact containing the exact immutable admission proof preimages for one wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipAdmissionArtifact {
+    pub(crate) wallet: WalletAddress,
+    pub(crate) proof: MembershipProofManifest,
+}
+
+/// Policy and cursor inputs retained before the paper membership record is published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KnockoutCausalArtifact {
+    pub(crate) wallet: WalletAddress,
+    pub(crate) evaluated_at_unix: i64,
+    pub(crate) last_trade_unix: Option<i64>,
+    pub(crate) inactivity_threshold_secs: u64,
+    pub(crate) inactivity_hard_cap_secs: u64,
+    pub(crate) demotion_min_trades: usize,
+    pub(crate) demotion_cb_alpha: Decimal,
+    pub(crate) demotion_pnl_window_secs: u64,
+    pub(crate) fills: Vec<KnockoutFillArtifact>,
+    pub(crate) settlements: Vec<KnockoutSettlementArtifact>,
+}
+
+/// Exact persisted fill fields consumed by the demotion-statistic owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KnockoutFillArtifact {
+    pub(crate) idempotency_key: String,
+    pub(crate) market_id: MarketId,
+    pub(crate) outcome_id: OutcomeId,
+    pub(crate) side: Side,
+    pub(crate) quantity: ShareAmount,
+    pub(crate) fill_price: Price,
+    pub(crate) principal: CollateralAmount,
+    pub(crate) fee: CollateralAmount,
+    pub(crate) event_seq: EventSeq,
+    pub(crate) prepared_seq: EventSeq,
+    pub(crate) source_receipt_seq: Option<EventSeq>,
+}
+
+impl KnockoutFillArtifact {
+    pub(crate) fn from_row(row: &FillRow) -> Self {
+        Self {
+            idempotency_key: row.idempotency_key.clone(),
+            market_id: row.market_id.clone(),
+            outcome_id: row.outcome_id,
+            side: row.side,
+            quantity: row.quantity,
+            fill_price: row.fill_price,
+            principal: row.principal,
+            fee: row.fee,
+            event_seq: row.event_seq,
+            prepared_seq: row.prepared_seq,
+            source_receipt_seq: row.source_receipt_seq,
+        }
+    }
+
+    pub(crate) fn to_row(&self) -> FillRow {
+        FillRow {
+            idempotency_key: self.idempotency_key.clone(),
+            market_id: self.market_id.clone(),
+            outcome_id: self.outcome_id,
+            side: self.side,
+            quantity: self.quantity,
+            fill_price: self.fill_price,
+            principal: self.principal,
+            fee: self.fee,
+            event_seq: self.event_seq,
+            prepared_seq: self.prepared_seq,
+            source_receipt_seq: self.source_receipt_seq,
+        }
+    }
+}
+
+/// Exact settlement values read by the demotion-statistic owner for retained fills.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KnockoutSettlementArtifact {
+    pub(crate) market_id: MarketId,
+    pub(crate) outcome_prices: Vec<Decimal>,
+    pub(crate) credit_applied: Decimal,
+    pub(crate) settled_at_unix: i64,
+}
+
+impl KnockoutSettlementArtifact {
+    pub(crate) fn from_info(market_id: MarketId, info: SettlementInfo) -> Self {
+        Self {
+            market_id,
+            outcome_prices: info.outcome_prices,
+            credit_applied: info.credit_applied,
+            settled_at_unix: info.settled_at_unix,
+        }
+    }
+
+    pub(crate) fn to_row(&self) -> Result<SettledMarketRow, serde_json::Error> {
+        Ok(SettledMarketRow {
+            market_id: self.market_id.clone(),
+            outcome_prices_json: serde_json::to_string(
+                &self
+                    .outcome_prices
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )?,
+            credit_applied: self.credit_applied,
+            settled_at_unix: self.settled_at_unix,
+            prepared_seq: None,
+            source_receipt_seq: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MembershipAdmissionReceipt {
+    pub(crate) wallet: WalletAddress,
+    pub(crate) receipt: AppendReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SealedKnockoutEvidence {
+    pub(crate) wallet: WalletAddress,
+    pub(crate) reason: MembershipReason,
+    pub(crate) causal_receipt: AppendReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum SealedMembershipEvidence {
+    FullRerank {
+        ranking_receipt: AppendReceipt,
+        admission_receipts: Vec<MembershipAdmissionReceipt>,
+    },
+    KnockoutBackfill {
+        evictions: Vec<SealedKnockoutEvidence>,
+        ranking_receipt: Option<AppendReceipt>,
+        admission_receipts: Vec<MembershipAdmissionReceipt>,
+    },
+    CapacityChange {
+        generation: u64,
+        config_receipt: AppendReceipt,
+        admission_receipts: Vec<MembershipAdmissionReceipt>,
+    },
+}
+
+impl SealedMembershipEvidence {
+    /// Check the receipt identities that must exactly match the structural mutation derived under
+    /// the publication lock. Artifact payload semantics are re-run later by qualification.
+    pub(crate) fn matches_wallet_mutation(
+        &self,
+        removed: &[WalletAddress],
+        added: &[WalletAddress],
+    ) -> bool {
+        let receipt_wallets = |receipts: &[MembershipAdmissionReceipt]| {
+            receipts
+                .iter()
+                .map(|proof| proof.wallet)
+                .collect::<HashSet<_>>()
+        };
+        let added_set = added.iter().copied().collect::<HashSet<_>>();
+        match self {
+            Self::FullRerank {
+                admission_receipts, ..
+            }
+            | Self::CapacityChange {
+                admission_receipts, ..
+            } => {
+                admission_receipts.len() == added.len()
+                    && receipt_wallets(admission_receipts) == added_set
+            }
+            Self::KnockoutBackfill {
+                evictions,
+                admission_receipts,
+                ..
+            } => {
+                let eviction_wallets = evictions
+                    .iter()
+                    .map(|eviction| eviction.wallet)
+                    .collect::<HashSet<_>>();
+                admission_receipts.len() == added.len()
+                    && receipt_wallets(admission_receipts) == added_set
+                    && evictions.len() == removed.len()
+                    && eviction_wallets == removed.iter().copied().collect()
+            }
+        }
+    }
+
+    pub(crate) fn full_rerank(
+        ranking_receipt: AppendReceipt,
+        admission_receipts: Vec<MembershipAdmissionReceipt>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::FullRerank {
+            ranking_receipt,
+            admission_receipts,
+        })
+    }
+
+    pub(crate) fn knockout_backfill(
+        evictions: Vec<SealedKnockoutEvidence>,
+        ranking_receipt: Option<AppendReceipt>,
+        admission_receipts: Vec<MembershipAdmissionReceipt>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::KnockoutBackfill {
+            evictions,
+            ranking_receipt,
+            admission_receipts,
+        })
+    }
+
+    pub(crate) fn capacity_change(
+        generation: u64,
+        config_receipt: AppendReceipt,
+        admission_receipts: Vec<MembershipAdmissionReceipt>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::CapacityChange {
+            generation,
+            config_receipt,
+            admission_receipts,
+        })
+    }
 }
 
 impl MembershipChange {

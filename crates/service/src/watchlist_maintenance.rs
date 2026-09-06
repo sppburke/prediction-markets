@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use pe_core_types::WalletAddress;
 use pe_paper_pnl::ResolutionStore;
-use pe_paper_state::{PaperStateDb, PaperStateError};
+use pe_paper_state::{FillRow, PaperStateDb, PaperStateError};
 use pe_trader_index::{Watchlist, WatchlistEntry};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -64,8 +64,11 @@ use tracing::{info, warn};
 
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
 use crate::live_watchlist::LiveWatchlist;
-use crate::paper_recovery::{MembershipChange, MembershipReason};
-use crate::qualification::{SealedKnockoutEvidence, SealedMembershipEvidence};
+use crate::paper_api::ParsedKey;
+use crate::paper_recovery::{
+    KnockoutCausalArtifact, KnockoutFillArtifact, KnockoutSettlementArtifact, MembershipChange,
+    MembershipReason, SealedMembershipEvidence,
+};
 use crate::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
 use crate::supabase_reader;
 use crate::watchlist_admission::AdmissionPreparer;
@@ -145,6 +148,8 @@ pub enum MembershipApplyError {
     IncompleteHistory { wallet: WalletAddress },
     #[error("newly admitted wallet {wallet} lacks a current causal position validation")]
     UnvalidatedPosition { wallet: WalletAddress },
+    #[error("membership evidence receipts differ from the writer-locked wallet mutation")]
+    EvidenceMutation,
     #[error("publish synchronized membership: {0}")]
     Publication(String),
 }
@@ -185,6 +190,25 @@ fn recheck_admissions(
         if !paper_state.position_validation_current(wallet)? {
             return Err(MembershipApplyError::UnvalidatedPosition { wallet: *wallet });
         }
+    }
+    Ok(())
+}
+
+fn recheck_publication_evidence(
+    publication: &MembershipPublication,
+    removed: &[WalletAddress],
+    added: &[WalletAddress],
+) -> Result<(), MembershipApplyError> {
+    // The public helper predates sealed qualification and remains used by non-qualifying
+    // scenario callers with documentary JSON. Production publishers always construct this enum;
+    // qualification independently rejects an untyped durable record.
+    let Ok(evidence) =
+        serde_json::from_value::<SealedMembershipEvidence>(publication.evidence.clone())
+    else {
+        return Ok(());
+    };
+    if !evidence.matches_wallet_mutation(removed, added) {
+        return Err(MembershipApplyError::EvidenceMutation);
     }
     Ok(())
 }
@@ -255,10 +279,6 @@ pub struct Eviction {
     /// The wallet's real last-trade time (its poll cursor = the inactivity clock) at eviction
     /// (#357); `None` for a never-polled wallet evicted on a non-inactivity trigger.
     pub last_trade_unix: Option<i64>,
-    /// Trailing realized P&L used by an underperformance decision.
-    windowed_pnl: Option<Decimal>,
-    /// Upper confidence bound used by an underperformance decision.
-    upper_cb: Option<Decimal>,
 }
 
 /// Decide whether a single live wallet is knocked out this tick. Pure.
@@ -326,40 +346,60 @@ pub fn decide_evictions(
                 trades_observed: s.map_or(0, |st| st.settled_count),
                 // The poll cursor IS the real last-trade time (#357) — record it for the audit.
                 last_trade_unix: last_ts,
-                windowed_pnl: s.map(|st| st.windowed_pnl),
-                upper_cb: s.and_then(|st| st.upper_cb),
             })
         })
         .collect()
 }
 
-fn sealed_knockout_evidence(
+fn knockout_causal_input(
     eviction: &Eviction,
     cfg: &MaintenanceConfig,
     evaluated_at_unix: i64,
-) -> Option<SealedKnockoutEvidence> {
-    match eviction.reason {
-        KnockoutReason::Inactivity => Some(SealedKnockoutEvidence::inactivity(
-            eviction.wallet,
-            evaluated_at_unix,
-            eviction.last_trade_unix?,
-            cfg.inactivity_threshold_secs,
-        )),
-        KnockoutReason::InactivityHardCap => Some(SealedKnockoutEvidence::inactivity_hard_cap(
-            eviction.wallet,
-            evaluated_at_unix,
-            eviction.last_trade_unix?,
-            cfg.inactivity_hard_cap_secs,
-        )),
-        KnockoutReason::Underperformance => Some(SealedKnockoutEvidence::underperformance(
-            eviction.wallet,
-            eviction.trades_observed,
-            cfg.demotion_min_trades,
-            eviction.windowed_pnl?,
-            eviction.upper_cb?,
-        )),
-        KnockoutReason::RankerRotation => None,
+    fills: &[FillRow],
+    resolutions: &ResolutionStore,
+) -> Option<(MembershipReason, KnockoutCausalArtifact)> {
+    if matches!(
+        eviction.reason,
+        KnockoutReason::Inactivity | KnockoutReason::InactivityHardCap
+    ) && eviction.last_trade_unix.is_none()
+    {
+        return None;
     }
+    let wallet_hex = eviction.wallet.to_string();
+    let mut retained_fills = Vec::new();
+    let mut retained_settlements = Vec::new();
+    let mut settled_markets = HashSet::new();
+    for fill in fills {
+        if ParsedKey::from_key(&fill.idempotency_key).leader.as_deref() != Some(&wallet_hex) {
+            continue;
+        }
+        let Some(settlement) = resolutions.settlement_info(&fill.market_id) else {
+            continue;
+        };
+        retained_fills.push(KnockoutFillArtifact::from_row(fill));
+        if settled_markets.insert(fill.market_id.clone()) {
+            retained_settlements.push(KnockoutSettlementArtifact::from_info(
+                fill.market_id.clone(),
+                settlement,
+            ));
+        }
+    }
+    let reason = MembershipReason::from(eviction.reason);
+    Some((
+        reason,
+        KnockoutCausalArtifact {
+            wallet: eviction.wallet,
+            evaluated_at_unix,
+            last_trade_unix: eviction.last_trade_unix,
+            inactivity_threshold_secs: cfg.inactivity_threshold_secs,
+            inactivity_hard_cap_secs: cfg.inactivity_hard_cap_secs,
+            demotion_min_trades: cfg.demotion_min_trades,
+            demotion_cb_alpha: cfg.demotion_cb_alpha,
+            demotion_pnl_window_secs: cfg.demotion_pnl_window_secs,
+            fills: retained_fills,
+            settlements: retained_settlements,
+        },
+    ))
 }
 
 fn planned_admissions(
@@ -368,10 +408,22 @@ fn planned_admissions(
     candidates: &[WatchlistEntry],
     cap: usize,
 ) -> Vec<WalletAddress> {
+    let current = current.iter().map(|entry| entry.wallet).collect();
+    planned_admission_wallets(&current, removed, candidates, cap)
+}
+
+/// Pure wallet-identity owner for knockout/backfill admission selection. Qualification reuses
+/// this function against receipt-bound candidate rows.
+pub(crate) fn planned_admission_wallets(
+    current: &HashSet<WalletAddress>,
+    removed: &HashSet<WalletAddress>,
+    candidates: &[WatchlistEntry],
+    cap: usize,
+) -> Vec<WalletAddress> {
     let mut present: HashSet<WalletAddress> = current
         .iter()
-        .filter(|entry| !removed.contains(&entry.wallet))
-        .map(|entry| entry.wallet)
+        .filter(|wallet| !removed.contains(wallet))
+        .copied()
         .collect();
     let mut size = present.len().min(cap);
     let mut admitted = Vec::new();
@@ -386,6 +438,22 @@ fn planned_admissions(
         size += 1;
     }
     admitted
+}
+
+/// Re-run the ranked-set membership owner using only structural wallet identity.
+pub(crate) fn ranked_membership_wallet_change(
+    current: &HashSet<WalletAddress>,
+    incoming: &[WatchlistEntry],
+    cap: usize,
+) -> (HashSet<WalletAddress>, HashSet<WalletAddress>) {
+    let published = incoming
+        .iter()
+        .take(cap)
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    let removed = current.difference(&published).copied().collect();
+    let added = published.difference(current).copied().collect();
+    (removed, added)
 }
 
 /// The exact membership change an incoming ranked set produces against `current`: the wallets
@@ -479,6 +547,7 @@ pub async fn apply_evictions_and_backfill(
         return Ok(current.entries.len());
     }
     recheck_admissions(paper_state, &admissions)?;
+    recheck_publication_evidence(&publication, &actual_removed, &admissions)?;
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
     // #511: insert-only — an existing (possibly HELD) delivery cursor is already a valid
     // lower bound and must never be jumped by a re-admission seed; activity MAX-seeds.
@@ -523,6 +592,7 @@ pub(crate) async fn apply_ranked_membership_locked(
         return Ok((current.entries.len(), dropped));
     }
     recheck_admissions(paper_state, &admissions)?;
+    recheck_publication_evidence(&publication, &dropped, &admissions)?;
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
     // #511: insert-only (see membership admission above).
     paper_state.seed_cursors_if_absent(&seeds)?;
@@ -657,11 +727,17 @@ pub async fn run_maintenance_loop(
 /// Load per-wallet edge stats from the authoritative local paper-state. `None` (with a
 /// warn) on any read failure — the knockout pass skips its tick; the full-rerank audit
 /// degrades to stat-less rows.
+struct LoadedEdgeStats {
+    by_wallet: HashMap<String, WalletEdgeStats>,
+    fills: Vec<FillRow>,
+    resolutions: ResolutionStore,
+}
+
 fn load_edge_stats(
     paper_state: &Arc<PaperStateDb>,
     cfg: &MaintenanceConfig,
     now_unix: i64,
-) -> Option<HashMap<String, WalletEdgeStats>> {
+) -> Option<LoadedEdgeStats> {
     let fills = match paper_state.list_fills() {
         Ok(f) => f,
         Err(e) => {
@@ -676,13 +752,18 @@ fn load_edge_stats(
             return None;
         }
     };
-    Some(wallet_edge_stats(
+    let by_wallet = wallet_edge_stats(
         &fills,
         &resolutions,
         cfg.demotion_cb_alpha,
         now_unix,
         cfg.demotion_pnl_window_secs,
-    ))
+    );
+    Some(LoadedEdgeStats {
+        by_wallet,
+        fills,
+        resolutions,
+    })
 }
 
 /// One maintenance pass. Best-effort throughout: any single failure (batch fetch, list_fills,
@@ -752,8 +833,31 @@ async fn maintenance_tick(
                                     "full_rerank: admission preparation failed; keeping membership and batch marker for retry");
                                 return;
                             }
+                            let ranking_receipt = match preparer
+                                .record_ranking_membership(Some(batch_id), incoming.entries.clone())
+                                .await
+                            {
+                                Ok(receipt) => receipt,
+                                Err(error) => {
+                                    warn!(%error,
+                                        "full_rerank: ranking evidence recording failed; keeping membership and batch marker for retry");
+                                    return;
+                                }
+                            };
+                            let admission_receipts = match preparer
+                                .record_admission_proofs(&additions)
+                                .await
+                            {
+                                Ok(receipts) => receipts,
+                                Err(error) => {
+                                    warn!(%error,
+                                        "full_rerank: admission evidence recording failed; keeping membership and batch marker for retry");
+                                    return;
+                                }
+                            };
                             let evidence = match SealedMembershipEvidence::full_rerank(
-                                incoming.entries.clone(),
+                                ranking_receipt,
+                                admission_receipts,
                             ) {
                                 Ok(evidence) => evidence,
                                 Err(error) => {
@@ -788,7 +892,9 @@ async fn maintenance_tick(
                             };
                             let audit_stats = load_edge_stats(paper_state, cfg, now_unix);
                             for w in &dropped {
-                                let s = audit_stats.as_ref().and_then(|m| m.get(&w.to_string()));
+                                let s = audit_stats
+                                    .as_ref()
+                                    .and_then(|loaded| loaded.by_wallet.get(&w.to_string()));
                                 if let Err(e) = supabase_reader::write_lifecycle_event(
                                     client,
                                     base_url,
@@ -877,7 +983,7 @@ async fn maintenance_tick(
     }
 
     // 4. Decide evictions. Nothing to do only when there are no evictions and the set is full.
-    let evictions = decide_evictions(&live_snapshot, &stats, &cursors, cfg, now_unix);
+    let evictions = decide_evictions(&live_snapshot, &stats.by_wallet, &cursors, cfg, now_unix);
     if evictions.is_empty() && live_wallets.len() >= cap {
         return;
     }
@@ -950,10 +1056,14 @@ async fn maintenance_tick(
             (Vec::new(), HashMap::new())
         }
     };
+    let published_admissions =
+        planned_admissions(&live_snapshot.entries, &removed, &candidates, cap);
 
-    let Some(knockout_evictions) = evictions
+    let Some(knockout_inputs) = evictions
         .iter()
-        .map(|eviction| sealed_knockout_evidence(eviction, cfg, now_unix))
+        .map(|eviction| {
+            knockout_causal_input(eviction, cfg, now_unix, &stats.fills, &stats.resolutions)
+        })
         .collect::<Option<Vec<_>>>()
     else {
         warn!(
@@ -961,9 +1071,44 @@ async fn maintenance_tick(
         );
         return;
     };
+    let knockout_evictions = match preparer.record_knockout_inputs(knockout_inputs).await {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            warn!(%error,
+                "maintenance: knockout causal evidence recording failed; keeping membership and eviction memory");
+            return;
+        }
+    };
+    let ranking_receipt = if candidates.is_empty() {
+        None
+    } else {
+        match preparer
+            .record_ranking_membership(sync.marker, candidates.clone())
+            .await
+        {
+            Ok(receipt) => Some(receipt),
+            Err(error) => {
+                warn!(%error,
+                    "maintenance: knockout ranking evidence recording failed; keeping membership and eviction memory");
+                return;
+            }
+        }
+    };
+    let admission_receipts = match preparer
+        .record_admission_proofs(&published_admissions)
+        .await
+    {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            warn!(%error,
+                "maintenance: knockout admission evidence recording failed; keeping membership and eviction memory");
+            return;
+        }
+    };
     let evidence = match SealedMembershipEvidence::knockout_backfill(
         knockout_evictions,
-        candidates.clone(),
+        ranking_receipt,
+        admission_receipts,
     ) {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -1040,12 +1185,15 @@ async fn maintenance_tick(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use pe_core_types::{BasisPoints, ReconstructionQuality};
-    use pe_trader_index::WatchlistTier;
     use rust_decimal_macros::dec;
     use tokio::sync::mpsc;
 
     use crate::orchestrator_control::OrchestratorControl;
+    use crate::paper_recovery::{KnockoutCausalArtifact, SealedKnockoutEvidence};
+    use crate::watchlist_admission::{
+        KNOCKOUT_CAUSAL_SOURCE_ID, MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+        MEMBERSHIP_ARTIFACT_SCHEMA_VERSION, RANKING_MEMBERSHIP_SOURCE_ID,
+    };
 
     fn cfg() -> MaintenanceConfig {
         MaintenanceConfig {
@@ -1079,22 +1227,88 @@ mod tests {
 
     const NOW: i64 = 1_900_000_000;
 
-    fn evidence_entry(wallet: WalletAddress) -> WatchlistEntry {
-        WatchlistEntry {
+    fn append_artifact<T: serde::Serialize>(
+        source_log: &std::path::Path,
+        source_id: &str,
+        artifact: &T,
+    ) -> pe_event_log::AppendReceipt {
+        let at = time::OffsetDateTime::from_unix_timestamp(NOW).unwrap();
+        let mut writer = pe_event_log::Writer::open(source_log).unwrap();
+        writer
+            .append_synced(pe_event_log::EnvelopeIn {
+                source_id: pe_core_types::SourceId(source_id.to_owned()),
+                schema_version: MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+                parser_version: MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+                observed_at: pe_core_types::SourceTimestamp(at),
+                received_at: pe_core_types::ReceivedAt(at),
+                content_type: pe_event_log::ContentType::Json,
+                payload: serde_json::to_vec(artifact).unwrap(),
+            })
+            .unwrap()
+    }
+
+    fn settled_edge_artifact(
+        wallet: WalletAddress,
+        winner: bool,
+        last_trade_unix: Option<i64>,
+    ) -> KnockoutCausalArtifact {
+        let quantity = pe_core_types::ShareAmount::from_whole(100).unwrap();
+        let principal = pe_core_types::CollateralAmount::from_decimal_exact(dec!(50)).unwrap();
+        let mut fills = Vec::new();
+        let mut settlements = Vec::new();
+        for index in 0..10u64 {
+            let market_id = pe_core_types::MarketId(pe_core_types::VenueMarketId(format!(
+                "membership-proof-{index}"
+            )));
+            fills.push(KnockoutFillArtifact::from_row(&FillRow {
+                idempotency_key: format!(
+                    "wf|{wallet}|g2:{}|{}|0|buy|{}",
+                    "a".repeat(64),
+                    market_id.0.0,
+                    NOW - 10
+                ),
+                market_id: market_id.clone(),
+                outcome_id: pe_core_types::OutcomeId(0),
+                side: pe_core_types::Side::Buy,
+                quantity,
+                fill_price: pe_core_types::Price::new(dec!(0.5)).unwrap(),
+                principal,
+                fee: pe_core_types::CollateralAmount::ZERO,
+                event_seq: pe_core_types::EventSeq(index + 1),
+                prepared_seq: pe_core_types::EventSeq(index + 1),
+                source_receipt_seq: None,
+            }));
+            settlements.push(KnockoutSettlementArtifact {
+                market_id,
+                outcome_prices: if winner {
+                    vec![Decimal::ONE, Decimal::ZERO]
+                } else {
+                    vec![Decimal::ZERO, Decimal::ONE]
+                },
+                credit_applied: Decimal::ZERO,
+                settled_at_unix: NOW - 1,
+            });
+        }
+        KnockoutCausalArtifact {
             wallet,
-            tier: WatchlistTier::Active,
-            leader_score_bps: BasisPoints::ZERO,
-            lcb_5pct_bps: BasisPoints::ZERO,
-            win_rate_bps: BasisPoints::ZERO,
-            closed_trades_in_window: 0,
-            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            evaluated_at_unix: NOW,
+            last_trade_unix,
+            inactivity_threshold_secs: 259_200,
+            inactivity_hard_cap_secs: 604_800,
+            demotion_min_trades: 10,
+            demotion_cb_alpha: dec!(0.10),
+            demotion_pnl_window_secs: 2_592_000,
+            fills,
+            settlements,
         }
     }
 
-    async fn publish_and_verify(change: MembershipChange, replacements: Vec<WatchlistEntry>) {
+    async fn publish_and_verify(
+        source_log: std::path::PathBuf,
+        change: MembershipChange,
+        replacements: Vec<WatchlistEntry>,
+    ) {
         let temp = tempfile::tempdir().unwrap();
-        let source_log = temp.path().join("source.log");
-        drop(pe_event_log::Writer::open(&source_log).unwrap());
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let verifier_source_log = source_log.clone();
@@ -1129,16 +1343,28 @@ mod tests {
 
     #[tokio::test]
     async fn full_rerank_publication_round_trips_membership_verifier() {
-        let (removed, added) = (WalletAddress([1; 20]), WalletAddress([2; 20]));
-        let replacements = vec![evidence_entry(added)];
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("source.log");
+        let removed = WalletAddress([1; 20]);
+        let replacements = Vec::new();
+        let ranking_receipt = append_artifact(
+            &source_log,
+            RANKING_MEMBERSHIP_SOURCE_ID,
+            &crate::paper_recovery::RankingMembershipArtifact {
+                batch_id: Some(7),
+                entries: replacements.clone(),
+            },
+        );
         publish_and_verify(
+            source_log,
             MembershipChange {
                 reason: MembershipReason::FullRerank,
                 removed: vec![removed],
-                added: vec![added],
+                added: Vec::new(),
                 capacity: 1,
                 ranking_batch_id: Some(7),
-                evidence: SealedMembershipEvidence::full_rerank(replacements.clone()).unwrap(),
+                evidence: SealedMembershipEvidence::full_rerank(ranking_receipt, Vec::new())
+                    .unwrap(),
             },
             replacements,
         )
@@ -1147,8 +1373,27 @@ mod tests {
 
     #[tokio::test]
     async fn inactivity_publication_round_trips_membership_verifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("source.log");
         let removed = WalletAddress([5; 20]);
+        let causal_receipt = append_artifact(
+            &source_log,
+            KNOCKOUT_CAUSAL_SOURCE_ID,
+            &KnockoutCausalArtifact {
+                wallet: removed,
+                evaluated_at_unix: NOW,
+                last_trade_unix: Some(NOW - 259_200),
+                inactivity_threshold_secs: 259_200,
+                inactivity_hard_cap_secs: 604_800,
+                demotion_min_trades: 10,
+                demotion_cb_alpha: dec!(0.10),
+                demotion_pnl_window_secs: 2_592_000,
+                fills: Vec::new(),
+                settlements: Vec::new(),
+            },
+        );
         publish_and_verify(
+            source_log,
             MembershipChange {
                 reason: MembershipReason::KnockoutInactivity,
                 removed: vec![removed],
@@ -1156,12 +1401,12 @@ mod tests {
                 capacity: 1,
                 ranking_batch_id: Some(9),
                 evidence: SealedMembershipEvidence::knockout_backfill(
-                    vec![SealedKnockoutEvidence::inactivity(
-                        removed,
-                        NOW,
-                        NOW - 259_200,
-                        259_200,
-                    )],
+                    vec![SealedKnockoutEvidence {
+                        wallet: removed,
+                        reason: MembershipReason::KnockoutInactivity,
+                        causal_receipt,
+                    }],
+                    None,
                     Vec::new(),
                 )
                 .unwrap(),
@@ -1173,8 +1418,16 @@ mod tests {
 
     #[tokio::test]
     async fn inactivity_hard_cap_publication_round_trips_membership_verifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("source.log");
         let removed = WalletAddress([6; 20]);
+        let causal_receipt = append_artifact(
+            &source_log,
+            KNOCKOUT_CAUSAL_SOURCE_ID,
+            &settled_edge_artifact(removed, true, Some(NOW - 604_800)),
+        );
         publish_and_verify(
+            source_log,
             MembershipChange {
                 reason: MembershipReason::KnockoutInactivityHardCap,
                 removed: vec![removed],
@@ -1182,12 +1435,12 @@ mod tests {
                 capacity: 1,
                 ranking_batch_id: Some(10),
                 evidence: SealedMembershipEvidence::knockout_backfill(
-                    vec![SealedKnockoutEvidence::inactivity_hard_cap(
-                        removed,
-                        NOW,
-                        NOW - 604_800,
-                        604_800,
-                    )],
+                    vec![SealedKnockoutEvidence {
+                        wallet: removed,
+                        reason: MembershipReason::KnockoutInactivityHardCap,
+                        causal_receipt,
+                    }],
+                    None,
                     Vec::new(),
                 )
                 .unwrap(),
@@ -1199,8 +1452,16 @@ mod tests {
 
     #[tokio::test]
     async fn underperformance_publication_round_trips_membership_verifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("source.log");
         let removed = WalletAddress([7; 20]);
+        let causal_receipt = append_artifact(
+            &source_log,
+            KNOCKOUT_CAUSAL_SOURCE_ID,
+            &settled_edge_artifact(removed, false, Some(NOW - 1)),
+        );
         publish_and_verify(
+            source_log,
             MembershipChange {
                 reason: MembershipReason::KnockoutUnderperformance,
                 removed: vec![removed],
@@ -1208,13 +1469,12 @@ mod tests {
                 capacity: 1,
                 ranking_batch_id: Some(11),
                 evidence: SealedMembershipEvidence::knockout_backfill(
-                    vec![SealedKnockoutEvidence::underperformance(
-                        removed,
-                        12,
-                        10,
-                        dec!(-2.5),
-                        dec!(-0.1),
-                    )],
+                    vec![SealedKnockoutEvidence {
+                        wallet: removed,
+                        reason: MembershipReason::KnockoutUnderperformance,
+                        causal_receipt,
+                    }],
+                    None,
                     Vec::new(),
                 )
                 .unwrap(),
@@ -1341,7 +1601,10 @@ mod tests {
         use tokio::sync::mpsc;
 
         use super::*;
+        use crate::activity_ingest::{ActivityIngest, ReconciliationTrigger, SourceLogHandle};
+        use crate::health::new_shared_health_with_ws;
         use crate::orchestrator_control::OrchestratorControl;
+        use crate::source_event_sink::SourceEventSink;
 
         const CAP: usize = 3;
 
@@ -1488,6 +1751,8 @@ mod tests {
             client: reqwest::Client,
             base_url: String,
             controls: Arc<StdMutex<ControlLog>>,
+            _source_task: tokio::task::JoinHandle<()>,
+            _source_triggers: mpsc::Receiver<ReconciliationTrigger>,
             _temp: TempDir,
         }
 
@@ -1507,7 +1772,16 @@ mod tests {
             let base_url = fake.serve().await;
             let temp = TempDir::new().unwrap();
             let source_log = temp.path().join("source.log");
-            drop(pe_event_log::Writer::open(&source_log).unwrap());
+            let source_sink = SourceEventSink::open(&source_log).unwrap();
+            let (source_handle, source_rx) = SourceLogHandle::channel(16);
+            let (trigger_tx, source_triggers) = mpsc::channel(1);
+            let source_ingest = ActivityIngest::poll_only(
+                source_sink,
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 1),
+            );
+            let source_task = tokio::spawn(source_ingest.run());
             let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
             for wallet in history_wallets {
                 paper_state
@@ -1609,7 +1883,8 @@ mod tests {
             let preparer = crate::watchlist_admission::AdmissionPreparer::new(
                 control_tx,
                 Arc::clone(&paper_state),
-            );
+            )
+            .with_source_log(source_handle);
             Harness {
                 live,
                 paper_state,
@@ -1619,6 +1894,8 @@ mod tests {
                 client: reqwest::Client::new(),
                 base_url,
                 controls,
+                _source_task: source_task,
+                _source_triggers: source_triggers,
                 _temp: temp,
             }
         }

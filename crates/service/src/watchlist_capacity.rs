@@ -17,8 +17,7 @@ use tracing::info;
 
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
-use crate::paper_recovery::MembershipReason;
-use crate::qualification::SealedMembershipEvidence;
+use crate::paper_recovery::{MembershipReason, SealedMembershipEvidence};
 use crate::runtime_config::AppliedWatchlistCapacity;
 use crate::supabase_reader::{self, SupabaseError};
 use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
@@ -109,6 +108,7 @@ impl SupabaseWatchlistCapacity {
         let (_, additions) =
             ranked_membership_change(&self.live.snapshot().entries, &incoming.entries, target);
         self.preparer.prepare(&additions).await?;
+        let admission_receipts = self.preparer.record_admission_proofs(&additions).await?;
         let prepared: HashSet<WalletAddress> = additions.iter().copied().collect();
 
         let _writer = self.writer_lock.lock().await;
@@ -132,12 +132,12 @@ impl SupabaseWatchlistCapacity {
         }
         let config_receipt = self
             .preparer
-            .record_capacity_config(request.generation, request.target)
+            .record_capacity_config(request.generation, request.target, incoming.entries.clone())
             .await?;
         let evidence = SealedMembershipEvidence::capacity_change(
             request.generation,
             config_receipt,
-            incoming.entries.clone(),
+            admission_receipts,
         )?;
         let (actual, dropped) = apply_ranked_membership_locked(
             &self.live,
@@ -334,7 +334,7 @@ mod tests {
         let generation = 1;
         let target = 2;
         let config_receipt = preparer
-            .record_capacity_config(generation, target)
+            .record_capacity_config(generation, target, Vec::new())
             .await
             .unwrap();
         let evidence =
@@ -367,7 +367,11 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&source_records[0].1.payload).unwrap(),
-            serde_json::json!({"generation": generation, "target": target})
+            serde_json::json!({
+                "generation": generation,
+                "target": target,
+                "published_entries": []
+            })
         );
         source_log.task.abort();
     }
