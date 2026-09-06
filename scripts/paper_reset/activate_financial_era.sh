@@ -12,17 +12,17 @@ MANIFEST="$DEPLOY_HOME/pe-financial-era.json"
 usage() {
   echo "usage: $0 --target-binary PATH --target-config PATH --target-environment PATH \
 --paper-log PATH --source-log PATH --live-journal PATH --paper-state PATH \
---fresh-bankroll DECIMAL --rehearsal-evidence PATH --hot-config-hash HASH \
+--fresh-bankroll DECIMAL --rehearsal-evidence PATH \
 --ranking-batch-id ID --policy-hash HASH --membership-json PATH \
---membership-proofs-hash HASH [--rollback-before-start] [--simulate-crash-after BOUNDARY]" >&2
+[--rollback-before-start] [--simulate-crash-after BOUNDARY]" >&2
   exit 2
 }
 
 target_binary= target_config= target_environment=
 paper_log= source_log= live_journal= paper_state=
-fresh_bankroll= artifact_blake3= hot_config_hash= ranking_batch_id=
+fresh_bankroll= artifact_blake3= ranking_batch_id=
 target_revision=
-policy_hash= membership_json= membership_proofs_hash= rehearsal_evidence=
+policy_hash= membership_json= rehearsal_evidence=
 rollback_before_start=false
 while (($#)); do
   case "$1" in
@@ -35,11 +35,9 @@ while (($#)); do
     --paper-state) [[ $# -ge 2 ]] || usage; paper_state=$2; shift 2 ;;
     --fresh-bankroll) [[ $# -ge 2 ]] || usage; fresh_bankroll=$2; shift 2 ;;
     --rehearsal-evidence) [[ $# -ge 2 ]] || usage; rehearsal_evidence=$2; shift 2 ;;
-    --hot-config-hash) [[ $# -ge 2 ]] || usage; hot_config_hash=$2; shift 2 ;;
     --ranking-batch-id) [[ $# -ge 2 ]] || usage; ranking_batch_id=$2; shift 2 ;;
     --policy-hash) [[ $# -ge 2 ]] || usage; policy_hash=$2; shift 2 ;;
     --membership-json) [[ $# -ge 2 ]] || usage; membership_json=$2; shift 2 ;;
-    --membership-proofs-hash) [[ $# -ge 2 ]] || usage; membership_proofs_hash=$2; shift 2 ;;
     --rollback-before-start) rollback_before_start=true; shift ;;
     --simulate-crash-after) [[ $# -ge 2 ]] || usage; SIMULATE_CRASH_AFTER=$2; shift 2 ;;
     *) usage ;;
@@ -47,30 +45,59 @@ while (($#)); do
 done
 
 for value in target_binary target_config target_environment paper_log source_log live_journal \
-  paper_state fresh_bankroll rehearsal_evidence hot_config_hash ranking_batch_id policy_hash \
-  membership_json membership_proofs_hash; do
+  paper_state fresh_bankroll rehearsal_evidence ranking_batch_id policy_hash membership_json; do
   [[ -n "${!value}" ]] || usage
 done
 [[ "$fresh_bankroll" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "fresh bankroll must be an exact non-negative six-decimal value"
-[[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "invalid hot-config hash"
 [[ "$ranking_batch_id" =~ ^[0-9]+$ ]] || die "invalid ranking batch id"
+[[ "$policy_hash" =~ ^[0-9a-f]{64}$ ]] || die "invalid policy hash"
 [[ -f "$target_binary" && -f "$target_config" && -f "$target_environment" ]] ||
   die "one or more reviewed target artifacts are absent"
 [[ -f "$membership_json" ]] || die "membership JSON is absent"
 
-for command in python3 sha256sum flock systemctl psql; do
+for command in python3 sha256sum flock systemctl psql mktemp; do
   command -v "$command" >/dev/null || die "$command not installed"
 done
 : "${SUPABASE_DB_URL:?SUPABASE_DB_URL must be exported for financial-era activation}"
 
 acquire_deploy_lock
 [[ -f "$IDENTITY_MANIFEST" ]] || die "#557 activation identity is absent: $IDENTITY_MANIFEST"
-identity=$(python3 -c 'import json,sys
-value=json.load(open(sys.argv[1], encoding="utf-8"))
+identity=$(python3 -c 'import hashlib,json,os,re,sys
+path,target_binary,target_config,target_environment=sys.argv[1:]
+value=json.load(open(path, encoding="utf-8"))
+required={"activation_id","state","generation_dir","merge_commit","bankroll","source_v1_main",
+          "legacy_history","artifacts","old_installed_artifacts","destinations","old_paths"}
+if not required <= set(value): raise SystemExit("#557 activation manifest lacks its production schema")
 if value.get("state") != "verified": raise SystemExit("#557 activation is not verified")
-print(value["activation_id"], value["generation"])' "$IDENTITY_MANIFEST") || die "invalid #557 activation identity"
-read -r activation_id generation <<< "$identity"
-[[ "$activation_id" =~ ^[A-Za-z0-9._-]+$ && -n "$generation" ]] || die "invalid #557 identity"
+activation=value.get("activation_id"); generation=value.get("generation_dir"); commit=value.get("merge_commit")
+if not isinstance(activation,str) or re.fullmatch(r"[A-Za-z0-9._-]+",activation) is None:
+    raise SystemExit("invalid #557 activation id")
+if not isinstance(generation,str) or not os.path.isabs(generation) or not os.path.isdir(generation):
+    raise SystemExit("invalid #557 generation directory")
+if not isinstance(commit,str) or re.fullmatch(r"[0-9a-f]{40}",commit) is None:
+    raise SystemExit("invalid #557 merge commit")
+artifacts=value.get("artifacts")
+if not isinstance(artifacts,dict) or set(artifacts) != {"seed_main","binary","config","environment","rehearsal_config","rehearsal_environment"}:
+    raise SystemExit("invalid #557 artifact inventory")
+for name,supplied in (("binary",target_binary),("config",target_config),("environment",target_environment)):
+    row=artifacts.get(name)
+    if not isinstance(row,dict) or set(row) != {"path","sha256"}:
+        raise SystemExit("invalid #557 "+name+" artifact")
+    if not isinstance(row["path"],str) or os.path.realpath(row["path"]) != os.path.realpath(supplied):
+        raise SystemExit("#557 "+name+" path differs from the reviewed target")
+    digest=row.get("sha256")
+    if not isinstance(digest,str) or re.fullmatch(r"[0-9a-f]{64}",digest) is None:
+        raise SystemExit("invalid #557 "+name+" hash")
+    with open(supplied,"rb") as source: actual=hashlib.sha256(source.read()).hexdigest()
+    if actual != digest: raise SystemExit("#557 "+name+" bytes differ from the verified artifact")
+print(activation); print(generation); print(commit)' \
+  "$IDENTITY_MANIFEST" "$target_binary" "$target_config" "$target_environment") ||
+  die "invalid #557 activation identity"
+mapfile -t identity_parts <<< "$identity"
+[[ ${#identity_parts[@]} -eq 3 ]] || die "invalid #557 identity result"
+activation_id=${identity_parts[0]}
+generation=${identity_parts[1]}
+generation_merge_commit=${identity_parts[2]}
 
 staged_identity_output=$("$target_binary" --verify-staged-identity) ||
   die "staged binary could not derive its own identity"
@@ -78,6 +105,8 @@ read -r target_revision artifact_blake3 < <(python3 -c 'import re,sys
 match=re.fullmatch(r"prediction-edge revision=([0-9a-f]{40}) artifact_blake3=([0-9a-f]{64})\n?",sys.stdin.read())
 if match is None: raise SystemExit(1)
 print(*match.groups())' <<< "$staged_identity_output") || die "staged binary identity output is invalid"
+[[ "$target_revision" == "$generation_merge_commit" ]] ||
+  die "staged binary revision differs from the verified #557 merge commit"
 "$target_binary" --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null ||
   die "staged binary identity self-verification failed"
 static_config_hash=$(python3 -c 'import hashlib,json,sys
@@ -87,6 +116,29 @@ print(hashlib.sha256(b"prediction-edge/effective-static-config-v1\0"+payload).he
   "$(sha256_file "$target_config")" "$(sha256_file "$target_environment")") ||
   die "derive effective staged configuration identity"
 target_artifact_sha256=$(sha256_file "$target_binary")
+
+financial_config_rows_dir=
+financial_config_rows_file=
+cleanup_financial_config_rows() {
+  [[ -z "$financial_config_rows_file" || ! -e "$financial_config_rows_file" ]] ||
+    rm -f -- "$financial_config_rows_file"
+  [[ -z "$financial_config_rows_dir" || ! -d "$financial_config_rows_dir" ]] ||
+    rmdir -- "$financial_config_rows_dir"
+}
+trap cleanup_financial_config_rows EXIT
+
+export_financial_config_rows() {
+  if [[ -z "$financial_config_rows_dir" ]]; then
+    financial_config_rows_dir=$(mktemp -d)
+    financial_config_rows_file="$financial_config_rows_dir/service_config.financial15.json"
+  fi
+  psql_service_db -v ON_ERROR_STOP=1 -Atc \
+    "select coalesce(json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key),'[]'::json)::text
+       from service_config
+      where key not in ('fill_mode','polymarket_fee_rate','risk_halt_release_hash');" \
+    > "$financial_config_rows_file" || die "export the exact Financial15 configuration rows"
+  [[ -s "$financial_config_rows_file" ]] || die "Financial15 configuration export is empty"
+}
 
 read_rehearsal_evidence() {
   python3 -c 'import hashlib,json,os,sys
@@ -370,7 +422,7 @@ if [[ ! -f "$MANIFEST" ]]; then
   target_config_json=$(file_identity_json "$target_config")
   target_environment_json=$(file_identity_json "$target_environment")
   initial=$(python3 -c 'import decimal,json,sys,time
-(manifest,activation,generation,bankroll,revision,artifact,static,hot,batch,policy,members_path,proofs,
+(activation,generation,bankroll,revision,artifact,static,batch,policy,members_path,
  paper,source,live,state,old_binary,old_config,old_env,target_binary,target_config,target_env,rehearsal)=sys.argv[1:]
 amount=decimal.Decimal(bankroll)
 atomic=amount*decimal.Decimal(1000000)
@@ -380,18 +432,17 @@ if not isinstance(members,list) or len(members)!=len(set(members)): raise System
 value={
  "kind":"financial-era-v1","state":"prepared","activation_id":activation,"generation":generation,
  "fresh_bankroll":int(atomic),"target_revision":revision,"artifact_blake3":artifact,"static_config_hash":static,
- "hot_config_hash":hot,"ranking_batch_id":int(batch),"policy_hash":policy,"membership":members,
- "membership_proofs_hash":proofs,"schema_version":3,"parser_version":1,"financial_semantic_version":1,
+ "ranking_batch_id":int(batch),"policy_hash":policy,"membership":members,
+ "schema_version":3,"parser_version":1,"financial_semantic_version":1,
  "start_unix":int(time.time()),"paths":{"paper_log":paper,"source_log":source,"live_journal":live,"paper_state":state},
  "old_artifact_sha256":json.loads(old_binary)["sha256"],"target_artifact_sha256":json.loads(target_binary)["sha256"],
  "old_config_sha256":json.loads(old_config)["sha256"],"target_config_sha256":json.loads(target_config)["sha256"],
  "old_environment_sha256":json.loads(old_env)["sha256"],"target_environment_sha256":json.loads(target_env)["sha256"],
- "expected_hot_config_names_hash":hot,"ranking_identity":"batch:"+batch,
- "fresh_bankroll_identity":format(amount,"f"),"rehearsal_evidence":json.loads(rehearsal),"preparation":None}
+ "rehearsal_evidence":json.loads(rehearsal),"preparation":None}
 print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
-    "$MANIFEST" "$activation_id" "$generation" "$fresh_bankroll" "$target_revision" \
-    "$artifact_blake3" "$static_config_hash" "$hot_config_hash" "$ranking_batch_id" "$policy_hash" "$membership_json" \
-    "$membership_proofs_hash" "$paper_log" "$source_log" "$live_journal" "$paper_state" \
+    "$activation_id" "$generation" "$fresh_bankroll" "$target_revision" \
+    "$artifact_blake3" "$static_config_hash" "$ranking_batch_id" "$policy_hash" "$membership_json" \
+    "$paper_log" "$source_log" "$live_journal" "$paper_state" \
     "$old_binary" "$old_config" "$old_environment" "$target_binary_json" \
     "$target_config_json" "$target_environment_json" "$rehearsal_evidence_json") || die "construct financial-era manifest"
   atomic_manifest_json "$initial" prepared
@@ -410,11 +461,10 @@ fi
    "$paper_state" == "$(manifest_get paths.paper_state)" ]] || die "financial-era durable paths changed"
 [[ "$artifact_blake3" == "$(manifest_get artifact_blake3)" &&
    "$static_config_hash" == "$(manifest_get static_config_hash)" &&
-   "$hot_config_hash" == "$(manifest_get hot_config_hash)" &&
    "$ranking_batch_id" == "$(manifest_get ranking_batch_id)" &&
-   "$policy_hash" == "$(manifest_get policy_hash)" &&
-   "$membership_proofs_hash" == "$(manifest_get membership_proofs_hash)" ]] ||
+   "$policy_hash" == "$(manifest_get policy_hash)" ]] ||
   die "financial-era evidence identity changed"
+ranking_identity="batch:$ranking_batch_id"
 python3 -c 'import decimal,json,sys
 manifest,members,bankroll=sys.argv[1:]
 value=json.load(open(manifest,encoding="utf-8"))
@@ -573,8 +623,11 @@ logs={name:{"path":path,"sha256":__import__("hashlib").sha256(open(path,"rb").re
 print(json.dumps({"backup":{"path":backup,"sha256":sha},"guarded_paper_state_sha256":guarded_state_sha,"remote_census":json.loads(census),"guarded_logs":logs},sort_keys=True,separators=(",",":")))' \
       "$backup_path" "$backup_sha" "$guarded_paper_state_sha" "$census" "$paper_log" "$source_log" "$live_journal")
     if [[ "$(manifest_get preparation)" == "" ]]; then
+      export_financial_config_rows
       preparation=$(run_target_offline --financial-era=prepare \
-        --activation-manifest="$MANIFEST") || die "read-only financial-era preparation failed"
+        --activation-manifest="$MANIFEST" \
+        --financial-config-rows="$financial_config_rows_file") ||
+        die "read-only financial-era preparation failed"
       manifest_patch_boundary preparation "$(python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$preparation")"
     fi
     manifest_advance guarded "$patch"
@@ -596,9 +649,11 @@ if [[ "$state" == guarded ]]; then
         -v bankroll="$fresh_bankroll" -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
       manifest_patch_boundary remote-archived '{"remote_archive_completed":true}'
     fi
+    export_financial_config_rows
     manifest_patch_boundary qualification-start-intent '{"qualification_start_intent":true}'
     start_receipt=$(run_target_offline --financial-era=start \
-      --activation-manifest="$MANIFEST") || die "offline financial-era Start failed"
+      --activation-manifest="$MANIFEST" \
+      --financial-config-rows="$financial_config_rows_file") || die "offline financial-era Start failed"
     manifest_patch_boundary qualification-started "$(python3 -c 'import json,sys; print(json.dumps({"start_receipt":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$start_receipt")"
   else
     start_receipt=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["receipt"],sort_keys=True,separators=(",",":")))' "$COMPLETE_START_OUTPUT") || die "complete Start receipt is invalid"
@@ -683,6 +738,11 @@ if [[ "$state" == started ]]; then
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get target_config_sha256)" ]] || die "installed target config hash mismatch"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get target_environment_sha256)" ]] || die "installed target environment hash mismatch"
   [[ -f "$generation/status.json" ]] || die "fresh status proof is not available yet"
+  hot_config_hash=$(manifest_get preparation.start.hot_config_hash)
+  [[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "prepared hot-config identity is invalid"
+  membership_proofs_hash=$(manifest_get preparation.start.membership_proofs_hash)
+  [[ "$membership_proofs_hash" =~ ^[0-9a-f]{64}$ ]] ||
+    die "prepared membership-proofs identity is invalid"
   verify_guarded_log_prefixes || die "paper/source/live prefixes do not extend their guarded identities"
   python3 -c 'import decimal,json,os,sys
 path,started,revision,hot,bankroll,membership_count,ranking_identity=sys.argv[1:]
@@ -724,7 +784,7 @@ for account in accounts:
 if None in identities or len(identities) != len(set(identities)): raise SystemExit("live account inventory is not uniquely identified")' \
     "$generation/status.json" "$(manifest_get started_unix)" "$target_revision" \
     "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" \
-    "$(manifest_get ranking_identity)" ||
+    "$ranking_identity" ||
     die "first fresh health proof is incomplete"
   python3 -c 'import decimal,json,sqlite3,sys
 path,start_seq,start_hash,bankroll=sys.argv[1:]

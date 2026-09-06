@@ -349,7 +349,11 @@ begin
     end if;
   end loop;
 
-  if exists (select key from service_config except select key from unnest(legacy_keys) key)
+  if exists (
+       select key from service_config
+       except
+       select key from unnest(legacy_keys || array['risk_halt_release_hash']::text[]) key
+     )
      or exists (
        select key from unnest(legacy_keys) key
         where key <> 'kelly_fraction_override'
@@ -357,6 +361,14 @@ begin
      )
      or (select count(*) from service_config where key = 'kelly_fraction_override') > 1 then
     raise exception 'service_config does not match the Legacy17 contract';
+  end if;
+  if (select count(*) from service_config where key = 'risk_halt_release_hash') > 1
+     or exists (
+       select 1 from service_config
+        where key = 'risk_halt_release_hash'
+          and (value_type <> 'text' or value !~ '^[0-9a-f]{64}$')
+     ) then
+    raise exception 'optional risk_halt_release_hash is malformed';
   end if;
 end $$;
 SQL

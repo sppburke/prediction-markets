@@ -10,6 +10,7 @@ COMMON="$REPO_ROOT/scripts/deploy/generation_common.sh"
 GENERATION="$REPO_ROOT/scripts/deploy/activate_generation.sh"
 RESTORE="$SCRIPT_DIR/restore_paper_state.sql"
 ROLLBACK="$REPO_ROOT/scripts/deploy/rollback_generation.sh"
+RUNBOOK="$REPO_ROOT/docs/35-PE-SERVICE-DEPLOY-RUNBOOK.md"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -42,6 +43,7 @@ require_text "$DRIVER" 'archive_paper_state.sql'
 require_text "$DRIVER" '--financial-era=prepare'
 require_text "$DRIVER" '--financial-era=start'
 require_text "$DRIVER" '--financial-era=rollback-check'
+require_text "$DRIVER" '--financial-config-rows='
 require_text "$DRIVER" '--verify-staged-identity'
 require_text "$DRIVER" '--rehearsal-evidence'
 require_text "$DRIVER" 'REHEARSAL_REFUSAL='
@@ -51,6 +53,27 @@ require_text "$DRIVER" 'local_restored'
 require_text "$DRIVER" 'old_service_started'
 reject_text "$DRIVER" 'seed_v1_empty.sh'
 reject_text "$DRIVER" 'sleep '
+reject_text "$DRIVER" '--hot-config-hash'
+reject_text "$DRIVER" '--membership-proofs-hash'
+reject_text "$DRIVER" 'expected_hot_config_names_hash'
+reject_text "$DRIVER" 'fresh_bankroll_identity'
+
+# The operator command is an executable contract: every required driver flag is documented and no
+# unsupported flag can drift into the canonical runbook.
+python3 -c 'import re,sys
+driver,runbook=sys.argv[1:]
+source=open(driver,encoding="utf-8").read()
+usage=source.split("usage() {",1)[1].split("}",1)[0]
+usage_flags=set(re.findall(r"--[a-z][a-z0-9-]*",usage))
+optional={"--rollback-before-start","--simulate-crash-after"}
+text=open(runbook,encoding="utf-8").read()
+section=text.split("Run the exact reviewed driver command on the production host:",1)[1]
+command=section.split("```bash",1)[1].split("```",1)[0]
+documented=set(re.findall(r"--[a-z][a-z0-9-]*",command))
+expected=usage_flags-optional
+if documented != expected:
+    raise SystemExit(f"financial driver/runbook flag drift: documented={sorted(documented)} expected={sorted(expected)}")' \
+  "$DRIVER" "$RUNBOOK" || fail "documented financial driver command does not match usage"
 
 # Only the three process-proof functions moved, and both drivers source them.
 for function_name in process_runs_service read_service_process_snapshot verify_installed_unit_owner; do
@@ -141,6 +164,20 @@ elif [[ "$file" == *restore_paper_state.sql ]]; then
   echo restored > "$state/remote-state"
 elif [[ "$stdin" == *"live % differs from activation"* ]]; then
   [[ -f "$state/remote-state" && $(<"$state/remote-state") == restored ]] || exit 1
+elif [[ "$stdin" == *"anon must exist and must not bypass RLS"* ]]; then
+  [[ "$stdin" == *"legacy_keys || array['risk_halt_release_hash']"* ]] || exit 93
+  [[ "$stdin" == *"value_type <> 'text' or value !~ '^[0-9a-f]{64}$'"* ]] || exit 93
+  if [[ -f "$state/release-row" ]]; then
+    read -r count value_type value < "$state/release-row"
+    [[ "$count" == 1 && "$value_type" == text && "$value" =~ ^[0-9a-f]{64}$ ]] || {
+      echo 'simulated malformed optional risk_halt_release_hash' >&2
+      exit 94
+    }
+  fi
+elif [[ "$sql" == *"json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key)"* ]]; then
+  cat <<'JSON'
+[{"key":"active_watchlist_size","value":"100","value_type":"integer"},{"key":"flip_human_approved","value":"false","value_type":"bool"},{"key":"kelly_fraction_above_default_human_approved","value":"false","value_type":"bool"},{"key":"max_fill_price","value":"0.85","value_type":"decimal"},{"key":"max_resolution_horizon_secs","value":"172800","value_type":"integer"},{"key":"min_fill_price","value":"0.15","value_type":"decimal"},{"key":"min_resolution_horizon_secs","value":"60","value_type":"integer"},{"key":"mode","value":"paper","value_type":"text"},{"key":"per_trade_cap","value":"unlimited","value_type":"text"},{"key":"price_impact_cap_bps","value":"100","value_type":"integer"},{"key":"sizing_contracts","value":"1","value_type":"integer"},{"key":"sizing_dollar_usd","value":"25","value_type":"decimal"},{"key":"sizing_mode","value":"dollar","value_type":"text"},{"key":"slippage_rate","value":"0.01","value_type":"decimal"}]
+JSON
 elif [[ "$sql" == *information_schema.columns* ]]; then
   echo 5
 elif [[ "$sql" == *paper_fills_archive* ]]; then
@@ -206,10 +243,6 @@ create table bankroll(id integer primary key, bankroll_str text not null);
 insert into bankroll values(0,"10000"); create table meta(key text primary key,value blob not null);
 """); db.commit(); db.close()' \
     "$service/gen/g557/paper_state.db"
-  python3 -c 'import json,sys
-path,generation=sys.argv[1:]
-json.dump({"state":"verified","activation_id":"act-545","generation":generation},open(path,"w"))' \
-    "$root/pe-activation.json" "$service/gen/g557"
   cat > "$target/pe-service" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -220,7 +253,7 @@ case "$*" in
     ;;
   *--financial-era=prepare*)
     cat <<'JSON'
-{"start":{"starting_bankroll":10000000000,"paper_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"source_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"live_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"artifact_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","static_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","hot_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"g557","activation_id":"act-545","ranking_batch_id":545,"policy_hash":"policy-545","membership":[],"membership_proofs_hash":"proof-545","schema_version":3,"parser_version":1,"financial_semantic_version":1},"expected_receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
+{"start":{"starting_bankroll":10000000000,"paper_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"source_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"live_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"artifact_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","static_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","hot_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"g557","activation_id":"act-545","ranking_batch_id":545,"policy_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","membership":["0x0000000000000000000000000000000000000545"],"membership_proofs_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","schema_version":3,"parser_version":1,"financial_semantic_version":1},"expected_receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
 JSON
     ;;
   *--financial-era=start*)
@@ -243,6 +276,29 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
 esac
 SH
   chmod +x "$target/pe-service"
+  python3 -c 'import hashlib,json,sys
+path,generation,service,target=sys.argv[1:]
+def artifact(value):
+    with open(value,"rb") as source: digest=hashlib.sha256(source.read()).hexdigest()
+    return {"path":value,"sha256":digest}
+value={
+ "activation_id":"act-545","state":"verified","generation_dir":generation,
+ "merge_commit":"1"*40,"bankroll":"10000","source_v1_main":artifact(generation+"/source_events.log"),
+ "legacy_history":artifact(target+"/membership.json"),
+ "artifacts":{"seed_main":artifact(generation+"/paper_state.db"),"binary":artifact(target+"/pe-service"),
+              "config":artifact(target+"/service.toml"),"environment":artifact(target+"/service.env"),
+              "rehearsal_config":artifact(target+"/service.toml"),
+              "rehearsal_environment":artifact(target+"/service.env")},
+ "old_installed_artifacts":{"service_toml":artifact(service+"/smoke-test/service.toml"),
+                            "service_env":artifact(service+"/.env"),
+                            "pe_service":artifact(service+"/target/release/pe-service")},
+ "destinations":{"binary":service+"/target/release/pe-service","config":service+"/smoke-test/service.toml",
+                 "environment":service+"/.env"},
+ "old_paths":{"paper_log":generation+"/paper.log","source_log":generation+"/source_events.log",
+              "live_journal":generation+"/live_journal.log","status":generation+"/status.json",
+              "paper_state":generation+"/paper_state.db","legacy_history":target+"/membership.json"}}
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
+    "$root/pe-activation.json" "$service/gen/g557" "$service" "$target"
   write_rehearsal_evidence "$root"
   write_shims "$root"
 }
@@ -259,11 +315,9 @@ driver_args() {
     --paper-state "$service/gen/g557/paper_state.db"
     --fresh-bankroll 10000
     --rehearsal-evidence "$root/rehearsal/evidence.json"
-    --hot-config-hash bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     --ranking-batch-id 545
-    --policy-hash policy-545
+    --policy-hash dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
     --membership-json "$target/membership.json"
-    --membership-proofs-hash proof-545
   )
 }
 
@@ -285,6 +339,51 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
   done
   return 1
 }
+
+# Scenario FE-DERIVED-IDENTITIES-00
+# Preconditions: a production-schema #557 manifest and otherwise-valid driver arguments.
+# PASS: the removed digest assertions are rejected during parsing before any durable mutation.
+# FAIL: a caller can still supply either derived Start identity.
+root=$TEST_TMP/derived-identities
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --hot-config-hash "$(printf '0%.0s' {1..64})" >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 2 && ! -e "$root/pe-financial-era.json" && $(<"$root/test-state/service.active") == true ]] ||
+  fail "removed hot-config assertion was not rejected before mutation"
+
+# Scenario FE-LEGACY-RELEASE-VALID-00A
+# Preconditions: Legacy17 plus one optional, text, lowercase-64-hex incident release row.
+# Injected boundary: `legacy-contract-verified`.
+# PASS: the common guard accepts the row without making it an economic key.
+# FAIL: the valid incident row bricks the pre-Start cutover.
+root=$TEST_TMP/release-valid
+setup_fixture "$root"
+driver_args "$root"
+printf '1 text %s\n' "$(printf 'a%.0s' {1..64})" > "$root/test-state/release-row"
+set +e
+run_driver "$root" --simulate-crash-after legacy-contract-verified >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "valid optional risk-halt release row was refused"
+
+# Scenario FE-LEGACY-RELEASE-MALFORMED-00B
+# Preconditions: Legacy17 plus a malformed incident release row.
+# PASS: the common guard refuses before backup, preparation, archive, or Start.
+# FAIL: the malformed row crosses the legacy-contract boundary.
+root=$TEST_TMP/release-malformed
+setup_fixture "$root"
+driver_args "$root"
+printf '%s\n' '1 text NOT-A-LOWERCASE-DIGEST' > "$root/test-state/release-row"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'simulated malformed optional risk_halt_release_hash'* ]] ||
+  fail "malformed optional risk-halt release row was not refused: $output"
+[[ ! -e "$root/test-state/archive-count" ]] || fail "malformed release row reached archive"
 
 # Scenario FE-REHEARSAL-MISSING-01
 # Preconditions: a durable prepared manifest lacks the rehearsal binding expected by the driver.
@@ -598,4 +697,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
   [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the old service more than once"
 done
 
-echo "PASS: FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
