@@ -7,8 +7,9 @@
 //! row; venue account state not `closed_only`; not geoblocked; balance AND allowance
 //! for BOTH V2 exchange spenders (standard + NegRisk) covering at least the account's
 //! posture; a current seal/config/semantic-bound `Pass` report; and an audited operator
-//! review carrying that same seal POST-DATING the Phase-D executor's first boot (the
-//! arming fence — D1 provably ships dark) that is not superseded by a later revocation.
+//! review carrying that same seal and the exact report BLAKE3 POST-DATING the Phase-D
+//! executor's first boot (the arming fence — D1 provably ships dark) that is not
+//! superseded by a later revocation.
 //! `requested_live_mode` alone never authorizes live.
 //!
 //! Armed-account semantics (Decision 8, explicit): persistent invalid conditions —
@@ -41,17 +42,19 @@ pub struct QualificationFacts {
     seal_hash: String,
     economic_configuration_hash: Option<String>,
     financial_semantic_version: Option<u32>,
+    report_blake3: String,
 }
 
 impl QualificationFacts {
     /// Retain only the report fields that ordinary-live mode admission compares with runtime truth.
     #[must_use]
-    pub fn from_report(report: &QualificationReport) -> Self {
+    pub fn from_report(report: &QualificationReport, report_blake3: String) -> Self {
         Self {
             verdict: report.verdict,
             seal_hash: report.evidence.seal_hash.clone(),
             economic_configuration_hash: report.evidence.hot_config_hash.clone(),
             financial_semantic_version: report.evidence.financial_semantic_version,
+            report_blake3,
         }
     }
 }
@@ -71,7 +74,8 @@ pub fn load_qualification_facts(
 ) -> Result<QualificationFacts, QualificationReportLoadError> {
     let bytes = std::fs::read(path)?;
     let report = serde_json::from_slice::<QualificationReport>(&bytes)?;
-    Ok(QualificationFacts::from_report(&report))
+    let report_blake3 = blake3::hash(&bytes).to_hex().to_string();
+    Ok(QualificationFacts::from_report(&report, report_blake3))
 }
 
 /// Venue-side arming probes, trait-injected so the machine is testable without network
@@ -96,14 +100,21 @@ pub struct PromotionFacts {
     pub latest_review_unix: Option<i64>,
     /// Seal hash carried by that exact newest review. `None` is a legacy, unbound review.
     pub latest_review_seal_hash: Option<String>,
+    /// Exact qualification-report byte digest carried by that same review.
+    pub latest_review_report_blake3: Option<String>,
     /// Newest `promotion_review_revoked` event time (Unix), if any.
     pub latest_revocation_unix: Option<i64>,
 }
 
 impl PromotionFacts {
-    /// A review is valid iff it post-dates the fence, remains unrevoked, and names the current
-    /// qualification seal. A pre-binding legacy review is persistent invalid evidence.
-    fn outcome_after_fence(&self, fence_unix: i64, seal_hash: &str) -> CheckOutcome {
+    /// A review is valid iff it post-dates the fence, remains unrevoked, and binds the current
+    /// qualification seal plus the exact loaded report bytes. Legacy reviews are invalid.
+    fn outcome_after_fence(
+        &self,
+        fence_unix: i64,
+        seal_hash: &str,
+        report_blake3: &str,
+    ) -> CheckOutcome {
         let Some(review) = self
             .latest_review_unix
             .filter(|review| *review > fence_unix)
@@ -121,6 +132,16 @@ impl PromotionFacts {
         };
         if review_seal_hash != seal_hash {
             return CheckOutcome::PersistentFail("promotion review seal binding mismatches report");
+        }
+        let Some(review_report_blake3) = self.latest_review_report_blake3.as_deref() else {
+            return CheckOutcome::PersistentFail(
+                "promotion review has no qualification report BLAKE3 binding",
+            );
+        };
+        if review_report_blake3 != report_blake3 {
+            return CheckOutcome::PersistentFail(
+                "promotion review qualification report BLAKE3 binding mismatches loaded bytes",
+            );
         }
         CheckOutcome::Pass
     }
@@ -188,10 +209,19 @@ pub fn evaluate_mode<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> ModeDecision
     }
 
     let qualification = qualification_outcome(inputs);
-    let promotion = match (inputs.fence_unix, inputs.current_seal_hash) {
-        (Some(fence), Some(seal_hash)) => inputs.promotion.outcome_after_fence(fence, seal_hash),
-        (None, _) => CheckOutcome::PersistentFail("live executor arming fence is missing"),
-        (_, None) => CheckOutcome::PersistentFail("current qualification seal is missing"),
+    let promotion = match (
+        inputs.fence_unix,
+        inputs.current_seal_hash,
+        inputs.qualification.as_ref(),
+    ) {
+        (Some(fence), Some(seal_hash), Some(report)) => {
+            inputs
+                .promotion
+                .outcome_after_fence(fence, seal_hash, &report.report_blake3)
+        }
+        (None, _, _) => CheckOutcome::PersistentFail("live executor arming fence is missing"),
+        (_, None, _) => CheckOutcome::PersistentFail("current qualification seal is missing"),
+        (_, _, None) => CheckOutcome::PersistentFail("qualification report is missing"),
     };
 
     // Gather the condition set.
@@ -314,11 +344,20 @@ pub fn promotion_facts_from_rows(rows: &[PromotionEventRow]) -> PromotionFacts {
                     .is_none_or(|current| unix > current) =>
             {
                 facts.latest_review_unix = Some(unix);
-                facts.latest_review_seal_hash = row
-                    .evidence_ref
-                    .as_deref()
-                    .filter(|value| valid_seal_hash(value))
-                    .map(str::to_owned);
+                facts.latest_review_seal_hash = None;
+                facts.latest_review_report_blake3 = None;
+                if let Some(evidence_ref) = row.evidence_ref.as_deref() {
+                    if let Some((seal_hash, report_blake3)) =
+                        promotion_review_bindings(evidence_ref)
+                    {
+                        facts.latest_review_seal_hash = Some(seal_hash.to_owned());
+                        facts.latest_review_report_blake3 = Some(report_blake3.to_owned());
+                    } else if valid_blake3(evidence_ref) {
+                        // Preserve the old seal-only shape solely so it fails with the specific
+                        // missing-report-digest disposition below.
+                        facts.latest_review_seal_hash = Some(evidence_ref.to_owned());
+                    }
+                }
             }
             "promotion_reviewed" => {}
             "promotion_review_revoked" => {
@@ -331,7 +370,13 @@ pub fn promotion_facts_from_rows(rows: &[PromotionEventRow]) -> PromotionFacts {
     facts
 }
 
-fn valid_seal_hash(value: &str) -> bool {
+/// The durable `evidence_ref` format is `<seal_blake3>:<qualification_report_blake3>`.
+fn promotion_review_bindings(value: &str) -> Option<(&str, &str)> {
+    let (seal_hash, report_blake3) = value.split_once(':')?;
+    (valid_blake3(seal_hash) && valid_blake3(report_blake3)).then_some((seal_hash, report_blake3))
+}
+
+fn valid_blake3(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -340,6 +385,8 @@ fn valid_seal_hash(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     const SEAL_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -347,6 +394,9 @@ mod tests {
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const ECONOMIC_CONFIGURATION_HASH: &str =
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const REPORT_BLAKE3: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const OTHER_REPORT_BLAKE3: &str =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
 
     struct FixtureProbe {
@@ -384,6 +434,7 @@ mod tests {
         PromotionFacts {
             latest_review_unix: Some(if after_fence { 2_000 } else { 500 }),
             latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
+            latest_review_report_blake3: Some(REPORT_BLAKE3.to_owned()),
             latest_revocation_unix: None,
         }
     }
@@ -394,7 +445,73 @@ mod tests {
             seal_hash: SEAL_HASH.to_owned(),
             economic_configuration_hash: Some(ECONOMIC_CONFIGURATION_HASH.to_owned()),
             financial_semantic_version: Some(FINANCIAL_SEMANTIC_VERSION),
+            report_blake3: REPORT_BLAKE3.to_owned(),
         }
+    }
+
+    fn qualification_report_bytes(verdict: &str) -> Vec<u8> {
+        let report = serde_json::json!({
+            "version": 1,
+            "verdict": verdict,
+            "reasons": [],
+            "sealed_cutoff_unix": 2_000,
+            "first_valid_mark_unix": 1_000,
+            "promotion_anchor_mark_unix": 1_000,
+            "complete_days": 30,
+            "closed_copies": 90,
+            "paper_p95_delay_ms": 1_000,
+            "delay_samples_ms": [],
+            "complete_day_log_equity_growth": [],
+            "lcb_5pct_decimal": "0.01",
+            "promotion_max_drawdown_fraction": "0.05",
+            "start_to_seal_max_drawdown_fraction": "0.05",
+            "absolute_profit_loss": "1",
+            "demotions": 0,
+            "marks": [],
+            "thresholds": {
+                "minimum_complete_days": 30,
+                "minimum_closed_copies": 90,
+                "maximum_p95_delay_ms": 2_000,
+                "maximum_drawdown_fraction_exclusive": "0.1",
+                "lcb_5pct_must_be_positive": true
+            },
+            "evidence": {
+                "start_sequence": 1,
+                "start_hash": OTHER_SEAL_HASH,
+                "seal_sequence": 2,
+                "seal_hash": SEAL_HASH,
+                "source_prefix_hash": OTHER_SEAL_HASH,
+                "financial_prefix_hash": OTHER_SEAL_HASH,
+                "decision_evidence_digest": OTHER_SEAL_HASH,
+                "artifact_blake3": OTHER_SEAL_HASH,
+                "static_config_hash": OTHER_SEAL_HASH,
+                "hot_config_hash": ECONOMIC_CONFIGURATION_HASH,
+                "policy_hash": OTHER_SEAL_HASH,
+                "financial_semantic_version": FINANCIAL_SEMANTIC_VERSION,
+                "economic_core_hashes": []
+            },
+            "replay": {
+                "exact": true,
+                "financial_prepared": 90,
+                "financial_final": 90,
+                "decisions": 90,
+                "fills": 90,
+                "no_fills": 0,
+                "no_copies": 0,
+                "membership_changes": 0,
+                "final_membership_count": 1
+            }
+        });
+        let mut bytes = serde_json::to_vec(&report).expect("encode qualification report fixture");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn load_report_bytes(bytes: &[u8]) -> QualificationFacts {
+        let temp = tempfile::tempdir().expect("create qualification report tempdir");
+        let path = temp.path().join("qualification.json");
+        std::fs::write(&path, bytes).expect("write qualification report fixture");
+        load_qualification_facts(&path).expect("load qualification report fixture")
     }
 
     fn inputs<'a, P: ArmingProbe>(
@@ -472,6 +589,7 @@ mod tests {
         let promo = PromotionFacts {
             latest_review_unix: Some(2_000),
             latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
+            latest_review_report_blake3: Some(REPORT_BLAKE3.to_owned()),
             latest_revocation_unix: Some(3_000), // later revocation supersedes
         };
         let d = evaluate_mode(&inputs(
@@ -490,10 +608,11 @@ mod tests {
         let promo2 = PromotionFacts {
             latest_review_unix: Some(4_000),
             latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
+            latest_review_report_blake3: Some(REPORT_BLAKE3.to_owned()),
             latest_revocation_unix: Some(3_000),
         };
         assert_eq!(
-            promo2.outcome_after_fence(1_000, SEAL_HASH),
+            promo2.outcome_after_fence(1_000, SEAL_HASH, REPORT_BLAKE3),
             CheckOutcome::Pass
         );
     }
@@ -651,7 +770,7 @@ mod tests {
             PromotionEventRow {
                 event_kind: "promotion_reviewed".into(),
                 created_at: "2026-08-11T00:00:00Z".into(),
-                evidence_ref: Some(SEAL_HASH.to_owned()),
+                evidence_ref: Some(format!("{SEAL_HASH}:{REPORT_BLAKE3}")),
             },
             PromotionEventRow {
                 event_kind: "promotion_review_revoked".into(),
@@ -667,20 +786,29 @@ mod tests {
         let facts = promotion_facts_from_rows(&rows);
         assert!(facts.latest_review_unix.is_some());
         assert_eq!(facts.latest_review_seal_hash.as_deref(), Some(SEAL_HASH));
+        assert_eq!(
+            facts.latest_review_report_blake3.as_deref(),
+            Some(REPORT_BLAKE3)
+        );
         assert!(facts.latest_revocation_unix > facts.latest_review_unix);
     }
 
     #[test]
-    fn legacy_unbound_review_is_a_persistent_failure() {
+    fn legacy_seal_only_review_is_a_persistent_failure() {
         let probe = all_pass();
         let promotion = promotion_facts_from_rows(&[PromotionEventRow {
             event_kind: "promotion_reviewed".to_owned(),
             created_at: "2026-08-11T00:00:00Z".to_owned(),
-            evidence_ref: Some("legacy-report-reference".to_owned()),
+            evidence_ref: Some(SEAL_HASH.to_owned()),
         }]);
+        assert_eq!(
+            promotion.latest_review_seal_hash.as_deref(),
+            Some(SEAL_HASH)
+        );
+        assert!(promotion.latest_review_report_blake3.is_none());
         assert!(matches!(
-            promotion.outcome_after_fence(1_000, SEAL_HASH),
-            CheckOutcome::PersistentFail(_)
+            promotion.outcome_after_fence(1_000, SEAL_HASH, REPORT_BLAKE3),
+            CheckOutcome::PersistentFail(reason) if reason.contains("report BLAKE3")
         ));
         let decision = evaluate_mode(&inputs(
             "live_tiny",
@@ -691,7 +819,7 @@ mod tests {
         ));
         assert!(
             matches!(decision, ModeDecision::RefuseOrders { ref reason }
-                if reason.contains("promotion_review") && reason.contains("legacy")),
+                if reason.contains("promotion_review") && reason.contains("report BLAKE3")),
             "{decision:?}"
         );
     }
@@ -702,7 +830,7 @@ mod tests {
         let mut promotion = reviewed(true);
         promotion.latest_review_seal_hash = Some(OTHER_SEAL_HASH.to_owned());
         assert!(matches!(
-            promotion.outcome_after_fence(1_000, SEAL_HASH),
+            promotion.outcome_after_fence(1_000, SEAL_HASH, REPORT_BLAKE3),
             CheckOutcome::PersistentFail(_)
         ));
         let decision = evaluate_mode(&inputs(
@@ -717,6 +845,72 @@ mod tests {
                 if reason.contains("promotion_review") && reason.contains("mismatches")),
             "{decision:?}"
         );
+    }
+
+    #[test]
+    fn one_byte_report_tamper_is_a_persistent_failure() {
+        let original_bytes = qualification_report_bytes("pass");
+        let original_blake3 = blake3::hash(&original_bytes).to_hex().to_string();
+        let mut tampered_bytes = original_bytes;
+        let final_byte = tampered_bytes
+            .last_mut()
+            .expect("qualification report fixture is nonempty");
+        *final_byte = b' ';
+        let tampered = load_report_bytes(&tampered_bytes);
+        assert_ne!(tampered.report_blake3, original_blake3);
+
+        let promotion = PromotionFacts {
+            latest_review_unix: Some(2_000),
+            latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
+            latest_review_report_blake3: Some(original_blake3),
+            latest_revocation_unix: None,
+        };
+        assert!(matches!(
+            promotion.outcome_after_fence(1_000, SEAL_HASH, &tampered.report_blake3),
+            CheckOutcome::PersistentFail(reason) if reason.contains("BLAKE3")
+        ));
+    }
+
+    #[test]
+    fn forged_pass_report_is_a_persistent_failure() {
+        let reviewed_bytes = qualification_report_bytes("fail");
+        let reviewed_blake3 = blake3::hash(&reviewed_bytes).to_hex().to_string();
+        let forged = load_report_bytes(&qualification_report_bytes("pass"));
+        assert_eq!(forged.verdict, QualificationVerdict::Pass);
+        assert_ne!(forged.report_blake3, reviewed_blake3);
+
+        let promotion = PromotionFacts {
+            latest_review_unix: Some(2_000),
+            latest_review_seal_hash: Some(SEAL_HASH.to_owned()),
+            latest_review_report_blake3: Some(reviewed_blake3),
+            latest_revocation_unix: None,
+        };
+        assert!(matches!(
+            promotion.outcome_after_fence(1_000, SEAL_HASH, &forged.report_blake3),
+            CheckOutcome::PersistentFail(reason) if reason.contains("BLAKE3")
+        ));
+    }
+
+    #[test]
+    fn stale_report_is_a_persistent_failure() {
+        let probe = all_pass();
+        let promotion = reviewed(true);
+        let mut stale = inputs("live_tiny", "off", CheckOutcome::Pass, &promotion, &probe);
+        stale.current_seal_hash = Some(OTHER_SEAL_HASH);
+        assert_eq!(
+            qualification_outcome(&stale),
+            CheckOutcome::PersistentFail("qualification report seal mismatches current seal")
+        );
+    }
+
+    #[test]
+    fn report_digest_review_mismatch_is_a_persistent_failure() {
+        let mut promotion = reviewed(true);
+        promotion.latest_review_report_blake3 = Some(OTHER_REPORT_BLAKE3.to_owned());
+        assert!(matches!(
+            promotion.outcome_after_fence(1_000, SEAL_HASH, REPORT_BLAKE3),
+            CheckOutcome::PersistentFail(reason) if reason.contains("BLAKE3")
+        ));
     }
 
     #[test]
