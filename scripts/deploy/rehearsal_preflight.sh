@@ -181,6 +181,12 @@ landed=$(rehearsal_psql -v ON_ERROR_STOP=1 -Atc \
             '0x0000000000000000000000000000000000000557');")
 [[ "$landed" == 0 ]] || { echo "FATAL: $landed rehearsal canary row(s) landed" >&2; exit 1; }
 
+account_census=$(account_census_receipt) || die "privileged rehearsal account census failed"
+read -r account_census_count account_census_sha256 <<< "$account_census"
+[[ "$account_census_count" =~ ^[0-9]+$ && "$account_census_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+  die "privileged rehearsal account census receipt is malformed"
+
 echo "rehearsal privilege matrix: PASS"
 echo "rehearsal publishable-key class: PASS"
 echo "rehearsal non-mutating canaries: PASS (all 401/403; landed=0)"
+echo "REHEARSAL_ACCOUNT_CENSUS_V1 count=$account_census_count sha256=$account_census_sha256"

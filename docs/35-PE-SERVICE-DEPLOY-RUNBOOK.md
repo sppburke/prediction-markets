@@ -52,7 +52,9 @@ write production Supabase.
 3. Run `scripts/deploy/rehearsal_preflight.sh <rehearsal-env>`. Its database matrix must prove:
 
    - `anon` cannot execute any of the six service write RPCs while `service_role` can;
-   - `anon` has no DML grants on the three live tables; and
+   - `anon` has no DML grants on the three live tables;
+   - the privileged database connection observes one canonical C-ordered `accounts` census in which
+     account IDs are unique and every requested/effective mode is `off`; and
    - each other reachable sink has RLS enabled, is not anon-owned, anon cannot bypass RLS, and no
      anon/PUBLIC/authenticated write policy exists.
 
@@ -330,7 +332,13 @@ The four concurrent observers are the status-file poller, reader-drop classifier
 census, and write-refusal counter. Each decision pass also queries the staged process's real
 `/health/ready` endpoint at the dedicated loopback bind and requires HTTP success plus
 `ready: true` with no reported issues (the empty `issues` field may be omitted); status freshness
-and critical-task assertions remain independent requirements. The run stops at the first complete
+and critical-task assertions remain independent requirements. Before the publishable-only child is
+started, the descriptor-fed privileged preflight queries `accounts` once and emits its canonical
+C-ordered count and SHA-256 receipt. The child still receives no service-role credential. Its fresh
+status must contain `live`, report `stale: false`, and list exactly the same uniquely identified
+account rows with requested/effective modes `off` and `armed: false`; absent, stale, empty when the
+census is nonempty, armed/`live_tiny`, or count/digest-mismatched evidence fails immediately. The
+run stops at the first complete
 same-invocation proof, the first unsafe
 observation, process exit, or its bound. PASS requires the reviewed revision, a complete ordinary
 poll after start, successful re-anchor, real readiness, healthy critical owners, accounts off and
@@ -345,7 +353,9 @@ binary's revision, embedded BLAKE3 identity, file SHA-256, activation ID, canoni
 directory, copied-state manifest SHA-256, exact passing readiness-body SHA-256, config SHA-256, and
 both environment identities. `environment_sha256` is the reviewed production target;
 `rehearsal_environment_sha256` is the generated publishable-only derivative. Preserve and review the
-JSON file and its result manifest, which binds the same identities; the financial driver compares the
+JSON file and its result manifest. The result manifest records `account_census_count` and
+`account_census_sha256`; the outer JSON's `evidence_sha256` binds those fields as part of the exact
+result-manifest bytes. The financial driver compares the
 production identity to `--target-environment`, binds both before entering `prepared`, and revalidates
 them from disk before entering `guarded`. The copy manifest, result manifest, and outer JSON are
 installed with the shared durable atomic-write primitive (file sync, rename, then parent-directory

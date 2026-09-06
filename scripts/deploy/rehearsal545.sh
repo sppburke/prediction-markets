@@ -439,14 +439,22 @@ atomic_adopt "$rehearsal_env_stage" "$rehearsal_env_file" 0600 sanitized-rehears
   "$rehearsal_environment_sha256"
 rm -f "$rehearsal_env_stage"
 
-env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" /bin/bash -c '
+preflight_output=$(env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" /bin/bash -c '
 eval "$(cat <&3)"
 exec 3<&-
 exec /bin/bash "$@"
 ' bash "$release_root/scripts/deploy/rehearsal_preflight.sh" "$rehearsal_env_file" \
   3< <(python3 -c 'import os,shlex,sys
 name=sys.argv[1]
-print(f"export {name}={shlex.quote(os.environ[name])}")' SUPABASE_DB_URL)
+print(f"export {name}={shlex.quote(os.environ[name])}")' SUPABASE_DB_URL))
+printf '%s\n' "$preflight_output"
+readarray -t account_census < <(python3 -c 'import re,sys
+matches=re.findall(r"^REHEARSAL_ACCOUNT_CENSUS_V1 count=([0-9]+) sha256=([0-9a-f]{64})$",sys.stdin.read(),re.MULTILINE)
+if len(matches) != 1: raise SystemExit("privileged preflight did not emit exactly one account census receipt")
+print(matches[0][0]); print(matches[0][1])' <<< "$preflight_output")
+[[ ${#account_census[@]} -eq 2 ]] || die "privileged preflight account census receipt is absent"
+account_census_count=${account_census[0]}
+account_census_sha256=${account_census[1]}
 [[ "$(sha256sum "$rehearsal_env_file" | awk '{print $1}')" == "$rehearsal_environment_sha256" ]] || {
   echo "FATAL: sanitized rehearsal environment changed during privileged preflight" >&2
   exit 1
@@ -622,9 +630,11 @@ printf 'REHEARSAL_START sha=%s activation=%s wallet=%s anchor_before=%s unix=%s\
 status_file_poller() {
   while kill -0 "$service_pid" 2>/dev/null; do
     if [[ -f "$copy_dir/status.json" ]]; then
-      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" <<'PY' || true
-import datetime, json, os, sys
-source, started, target, expected_revision = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" \
+        "$account_census_count" "$account_census_sha256" <<'PY' || true
+import datetime, hashlib, json, os, re, sys
+source, started, target, expected_revision, expected_count, expected_digest = sys.argv[1:]
+started, expected_count = int(started), int(expected_count)
 with open(source, encoding="utf-8") as handle:
     value = json.load(handle)
 updated = datetime.datetime.fromisoformat(value["updated_at"].replace("Z", "+00:00")).timestamp()
@@ -634,13 +644,37 @@ health = value.get("source_health") or {}
 polled = fresh and health.get("poll_last_round_age_secs") is not None
 critical = [task for task in (value.get("tasks") or []) if task.get("class") == "critical"]
 healthy = fresh and bool(critical) and all(task.get("state") == "running" for task in critical)
-live = value.get("live") or {}
-accounts = live.get("accounts") or []
-accounts_safe = all(
-    not account.get("armed", False)
-    and account.get("requested_live_mode") == "off"
-    and account.get("effective_live_mode") == "off"
-    for account in accounts
+live = value.get("live")
+accounts = live.get("accounts") if isinstance(live, dict) else None
+account_rows = []
+identities = []
+accounts_well_formed = isinstance(accounts, list)
+if accounts_well_formed:
+    for account in accounts:
+        if not isinstance(account, dict):
+            accounts_well_formed = False
+            break
+        identity = account.get("account_id")
+        requested = account.get("requested_live_mode")
+        effective = account.get("effective_live_mode")
+        if (not isinstance(identity, str)
+                or re.fullmatch(r"[a-z0-9_-]{1,32}", identity) is None
+                or requested != "off" or effective != "off"
+                or account.get("armed") is not False):
+            accounts_well_formed = False
+            break
+        identities.append(identity)
+        account_rows.append((identity, requested, effective))
+if len(identities) != len(set(identities)):
+    accounts_well_formed = False
+canonical = "".join("|".join(row) + "\n" for row in sorted(account_rows))
+actual_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+accounts_safe = (
+    isinstance(live, dict)
+    and live.get("stale") is False
+    and accounts_well_formed
+    and len(account_rows) == expected_count
+    and actual_digest == expected_digest
 )
 temp = target + ".tmp"
 with open(temp, "w", encoding="utf-8") as output:
@@ -762,6 +796,10 @@ PY
     reason=unsafe_evidence
     break
   fi
+  if (( status_fresh == 1 && accounts_safe == 0 )); then
+    reason=unsafe_account_evidence
+    break
+  fi
   if (( status_fresh == 1 && endpoint_ready == 1 && revision_ok == 1 && polled == 1 && healthy == 1 && accounts_safe == 1 && anchored == 1 )); then
     private_binary_path=$(realpath "$binary")
     if service_executable_path=$(realpath "$PROC_ROOT/$service_pid/exe" 2>/dev/null); then
@@ -837,8 +875,10 @@ manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
     "$service_invocation_pid" "$rehearsal_bind" "$rehearsal_port" "$installed_bind" \
     "$readiness_base_url" "$wallet" "$anchor_before"
   printf 'final=%s\n' "$last"
-  printf 'copy_manifest_sha256=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
+  printf 'copy_manifest_sha256=%s\naccount_census_count=%s\naccount_census_sha256=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
     "$copy_manifest_sha256" \
+    "$account_census_count" \
+    "$account_census_sha256" \
     "$readiness_sha256" \
     "$service_log_prefix_length" \
     "$service_log_prefix_sha256" \

@@ -38,6 +38,10 @@ for field in activation_id generation_dir copy_manifest_sha256 readiness_sha256 
   environment_sha256 rehearsal_environment_sha256; do
   require_text "$REHEARSAL" "\"$field\""
 done
+require_text "$COMMON" 'account_census_receipt()'
+require_text "$REHEARSAL_PREFLIGHT" 'REHEARSAL_ACCOUNT_CENSUS_V1'
+require_text "$REHEARSAL" 'account_census_count='
+require_text "$REHEARSAL" 'account_census_sha256='
 require_text "$REHEARSAL" 'atomic_adopt "$copy_manifest_stage" "$copy_manifest"'
 require_text "$REHEARSAL" 'atomic_adopt "$manifest_stage" "$manifest"'
 require_text "$REHEARSAL" 'atomic_adopt "$evidence_stage" "$evidence_hash_file"'
@@ -250,6 +254,8 @@ elif [[ "$stdin" == *"anon must exist and must not bypass RLS"* ]]; then
       exit 94
     }
   fi
+elif [[ "$sql" == *"from public.accounts"* ]]; then
+  cat "$state/rehearsal-account-census"
 elif [[ "$sql" == *"json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key)"* ]]; then
   cat <<'JSON'
 [{"key":"active_watchlist_size","value":"100","value_type":"integer"},{"key":"flip_human_approved","value":"false","value_type":"bool"},{"key":"kelly_fraction_above_default_human_approved","value":"false","value_type":"bool"},{"key":"max_fill_price","value":"0.85","value_type":"decimal"},{"key":"max_resolution_horizon_secs","value":"172800","value_type":"integer"},{"key":"min_fill_price","value":"0.15","value_type":"decimal"},{"key":"min_resolution_horizon_secs","value":"60","value_type":"integer"},{"key":"mode","value":"paper","value_type":"text"},{"key":"per_trade_cap","value":"unlimited","value_type":"text"},{"key":"price_impact_cap_bps","value":"100","value_type":"integer"},{"key":"sizing_contracts","value":"1","value_type":"integer"},{"key":"sizing_dollar_usd","value":"25","value_type":"decimal"},{"key":"sizing_mode","value":"dollar","value_type":"text"},{"key":"slippage_rate","value":"0.01","value_type":"decimal"}]
@@ -462,9 +468,10 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
         /usr/bin/ln -s "$0" "$fixture_root/proc/$$/exe"
         ;;
     esac
-    /usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" <<'PY'
+    /usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" \
+      "$fixture_root/test-state/rehearsal-account-status" <<'PY'
 import datetime,json,os,sqlite3,sys
-status,database=sys.argv[1:]
+status,database,scenario_path=sys.argv[1:]
 db=sqlite3.connect(database)
 db.execute("insert into position_anchors values(?,?)",("0x0000000000000000000000000000000000000545",2))
 db.execute("update poll_cursors set reanchor_required=0 where wallet_hex=?",("0x0000000000000000000000000000000000000545",))
@@ -473,8 +480,18 @@ value={
  "revision":"1"*40,"updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
  "tasks":[{"name":"public_activity_poll","state":"running","class":"critical"}],
  "source_health":{"poll_last_round_age_secs":0},
- "live":{"accounts":[{"armed":False,"requested_live_mode":"off","effective_live_mode":"off"}]},
+ "live":{"stale":False,"accounts":[{"account_id":"live-a","armed":False,"requested_live_mode":"off","effective_live_mode":"off"}]},
 }
+scenario=open(scenario_path,encoding="utf-8").read().strip()
+if scenario == "absent_live": value.pop("live")
+elif scenario == "stale": value["live"]["stale"] = True
+elif scenario == "empty": value["live"]["accounts"] = []
+elif scenario == "armed": value["live"]["accounts"][0]["armed"] = True
+elif scenario == "live_tiny":
+    value["live"]["accounts"][0]["requested_live_mode"] = "live_tiny"
+    value["live"]["accounts"][0]["effective_live_mode"] = "live_tiny"
+    value["live"]["accounts"][0]["armed"] = True
+elif scenario != "safe": raise SystemExit("unknown rehearsal account-status scenario")
 temporary=status+".service.tmp"
 with open(temporary,"w",encoding="utf-8") as output: json.dump(value,output)
 os.replace(temporary,status)
@@ -557,12 +574,19 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
 # non-ready response to establish that state, appends the controlled late line during the next curl,
 # and only then completes the successful readiness response.
 setup_rehearsal_fixture() {
-  local root=$1 websocket_enabled=$2 injection=$3
+  local root=$1 websocket_enabled=$2 injection=$3 account_scenario=${4:-safe}
   local release=$root/release target=$root/target
   setup_fixture "$root"
   mkdir -p "$release/target/release" "$release/scripts/deploy"
   printf '%s\n' "PE_POLYMARKET_ACTIVITY_WS_ENABLED=$websocket_enabled" >> "$target/service.env"
   printf '%s\n' "$injection" > "$root/test-state/injection"
+  printf '%s\n' "$account_scenario" > "$root/test-state/rehearsal-account-status"
+  if [[ "$account_scenario" == database_live_tiny ]]; then
+    printf '%s\n' 'live-a|live_tiny|live_tiny' > "$root/test-state/rehearsal-account-census"
+    printf '%s\n' safe > "$root/test-state/rehearsal-account-status"
+  else
+    printf '%s\n' 'live-a|off|off' > "$root/test-state/rehearsal-account-census"
+  fi
   cp "$target/pe-service" "$release/target/release/pe-service"
   cp "$COMMON" "$release/scripts/deploy/generation_common.sh"
   cat > "$release/scripts/deploy/rehearsal_preflight.sh" <<'SH'
@@ -575,7 +599,10 @@ fixture_root=$(dirname "$(dirname "$1")")
 export PE_ACTIVATION_TEST_ROOT="$fixture_root"
 export SUPABASE_DB_URL
 python3 -c 'import os; raise SystemExit(0 if os.environ.get("SUPABASE_DB_URL") else 1)'
-psql_url SUPABASE_DB_URL -Atc 'select 1' >/dev/null
+account_census=$(account_census_receipt)
+read -r account_census_count account_census_sha256 <<< "$account_census"
+printf 'REHEARSAL_ACCOUNT_CENSUS_V1 count=%s sha256=%s\n' \
+  "$account_census_count" "$account_census_sha256"
 if [[ -f "$fixture_root/test-state/replace-rehearsal-target-binary" ]]; then
   mv "$fixture_root/target/pe-service.next" "$fixture_root/target/pe-service"
 fi
@@ -736,11 +763,12 @@ grep -Fq "PROCESS_EXE expected=$root/rehearsal/artifacts-1111111/pe-service reso
   "$root/rehearsal/watch-1111111.log" ||
   fail "rehearsal watch log did not bind the running private executable"
 python3 -c 'import hashlib,json,os,re,stat,sys
-evidence_path,activation_path,config,environment,rehearsal_environment,copy_manifest,readiness,target_binary=sys.argv[1:]
+evidence_path,activation_path,config,environment,rehearsal_environment,copy_manifest,readiness,target_binary,census_path=sys.argv[1:]
 e=json.load(open(evidence_path,encoding="utf-8"))
 a=json.load(open(activation_path,encoding="utf-8"))
 def digest(path): return hashlib.sha256(open(path,"rb").read()).hexdigest()
 assert e["result"]=="PASS"
+assert e["evidence_sha256"]==digest(e["manifest_path"])
 assert e["activation_id"]==a["activation_id"]
 assert e["generation_dir"]==os.path.realpath(a["generation_dir"])
 assert set(a["artifacts"])=={"seed_main","binary","config","environment","rehearsal_config","rehearsal_environment"}
@@ -763,13 +791,17 @@ assert rehearsal_credentials == ["sb_publishable_rehearsal","sb_publishable_rehe
 rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
 for key in ("activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256","rehearsal_environment_sha256"):
     assert rows[key]==e[key]
+canonical=open(census_path,"rb").read()
+assert rows["account_census_count"]==str(len(canonical.splitlines()))
+assert rows["account_census_sha256"]==hashlib.sha256(canonical).hexdigest()
 assert rows["service_log_prefix_length"].isdigit()
 assert len(rows["service_log_prefix_sha256"])==64
 assert rows["database_observation"]=="anchor_after:2,reanchor_required:0,unexpected_fences:0"' \
   "$root/rehearsal/evidence.json" "$root/pe-activation.json" "$root/target/service.toml" \
   "$root/target/service.env" "$root/rehearsal/environment-1111111.rehearsal.env" \
   "$root/rehearsal/copy/copied.sha256" \
-  "$root/rehearsal/readiness-1111111.json" "$root/target/pe-service" ||
+  "$root/rehearsal/readiness-1111111.json" "$root/target/pe-service" \
+  "$root/test-state/rehearsal-account-census" ||
   fail "rehearsal evidence bindings are incomplete"
 production_environment_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_sha256"])' \
   "$root/rehearsal/evidence.json")
@@ -792,6 +824,39 @@ assert financial["old_config_sha256"] != financial["target_config_sha256"]
 assert financial["old_environment_sha256"] != financial["target_environment_sha256"]' \
   "$root/pe-activation.json" "$root/pe-financial-era.json" "$root/rehearsal/evidence.json" ||
   fail "joined rehearsal/driver fixture conflated inherited and target identities"
+
+# Scenarios REHEARSAL-ACCOUNTS-02A..02F
+# Preconditions: the privileged psql census contains one off account unless the scenario explicitly
+# supplies a database live_tiny row; the publishable-only child reports the selected live block.
+# PASS: absent/stale/mismatched/armed/live_tiny child evidence and a database live_tiny row all fail.
+# FAIL: any scenario records REHEARSAL545_PASS or an unsafe database census reaches the child.
+for account_scenario in absent_live stale empty armed live_tiny; do
+  root=$TEST_TMP/rehearsal-account-$account_scenario
+  setup_rehearsal_fixture "$root" true none "$account_scenario"
+  set +e
+  output=$(run_rehearsal_fixture "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *REHEARSAL545_FAIL* ]] ||
+    fail "$account_scenario rehearsal account evidence was not refused: $output"
+  python3 -c 'import json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8")); assert e["result"]=="FAIL"
+rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+assert rows["reason"]=="unsafe_account_evidence"
+assert rows["account_census_count"]=="1"
+assert len(rows["account_census_sha256"])==64' "$root/rehearsal/evidence.json" ||
+    fail "$account_scenario refusal did not bind the privileged account census"
+done
+
+root=$TEST_TMP/rehearsal-account-database-live-tiny
+setup_rehearsal_fixture "$root" true none database_live_tiny
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'account census contains a live_tiny account'* &&
+   "$output" != *REHEARSAL545_PASS* ]] ||
+  fail "database live_tiny account was not refused by privileged preflight: $output"
 
 # Scenario REHEARSAL-CONFIG-02
 # Preconditions: the explicit target environment enables the activity websocket.

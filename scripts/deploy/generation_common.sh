@@ -197,6 +197,34 @@ raise SystemExit(0 if os.environ.get(sys.argv[1]) else 1)' SUPABASE_DB_URL ||
   psql_url SUPABASE_DB_URL "$@"
 }
 
+# Produce the canonical privileged census used by the #545 rehearsal. The database query lives
+# here so production preflight and its psql-shim scenario harness exercise the same row contract.
+# The digest covers C-ordered `account_id|requested_live_mode|effective_live_mode\n` records.
+account_census_receipt() {
+  local rows
+  rows=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+    'select account_id, requested_live_mode, effective_live_mode
+       from public.accounts
+      order by account_id collate "C";') || return
+  printf '%s' "$rows" | python3 -c '
+import hashlib, re, sys
+
+raw = sys.stdin.read()
+rows = [] if not raw else [line.split("|") for line in raw.splitlines()]
+if any(len(row) != 3 for row in rows):
+    raise SystemExit("account census row has an invalid shape")
+identities = [row[0] for row in rows]
+if any(re.fullmatch(r"[a-z0-9_-]{1,32}", identity) is None for identity in identities):
+    raise SystemExit("account census contains an invalid account_id")
+if len(identities) != len(set(identities)):
+    raise SystemExit("account census contains duplicate account_id values")
+if any(requested != "off" or effective != "off" for _, requested, effective in rows):
+    raise SystemExit("account census contains a live_tiny account")
+canonical = "".join("|".join(row) + "\n" for row in sorted(rows))
+print(len(rows), hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+'
+}
+
 manifest_get() {
   python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
