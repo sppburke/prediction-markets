@@ -288,7 +288,7 @@ impl DecisionPostBoundaryEvidence {
     }
 }
 
-/// Pre-financial wire contract retained only for validating durable v2/v3 documents.
+/// Pre-financial wire contract retained only for validating durable v2 documents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LegacyDecisionPostBoundaryEvidence {
     #[serde(flatten)]
