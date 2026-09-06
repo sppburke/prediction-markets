@@ -404,12 +404,15 @@ psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_s
 # The schema itself is an idempotent boundary.
 psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
 retry_manifest_patch authority-schema-installed '{"authority_schema_installed":true}'
-authority_start_first=$(psql_service_db -v ON_ERROR_STOP=1 -At \
-  -v start_seq="$start_seq" -v start_hash="$start_hash" \
-  -c "select seed_financial_start(:'start_seq'::bigint, :'start_hash');")
-authority_start_retry=$(psql_service_db -v ON_ERROR_STOP=1 -At \
-  -v start_seq="$start_seq" -v start_hash="$start_hash" \
-  -c "select seed_financial_start(:'start_seq'::bigint, :'start_hash');")
+# psql does not interpolate variables inside -c strings; feed the statement on standard input.
+seed_start() {
+  psql_service_db -v ON_ERROR_STOP=1 -At \
+    -v start_seq="$start_seq" -v start_hash="$start_hash" <<'SQL'
+select seed_financial_start(:'start_seq'::bigint, :'start_hash');
+SQL
+}
+authority_start_first=$(seed_start)
+authority_start_retry=$(seed_start)
 authority_start_readback=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
   "select json_build_object(
      'bankroll',(select bankroll_str from paper_bankroll where id=0),
