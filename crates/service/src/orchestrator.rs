@@ -1988,7 +1988,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     best_ask: Some(best.0.normalize().to_string()),
                     vwap_basis: None,
                     ladder_plan_blake3: None,
-                    reason: Some("budget afforded no whole share".to_owned()),
+                    reason: Some("budget afforded no atomic share".to_owned()),
                 },
                 gate: GatePlan::NothingAffordable { best_ask: best },
                 book_receipt: book.source_receipt,
@@ -2865,7 +2865,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // could not absorb an atomic share for the paper budget.
         if matches!(&gate, GatePlan::NothingAffordable { .. }) {
             info!(
-                reason = "impact band absorbs no whole share of the paper budget (paper-only)",
+                reason = "paper budget afforded no atomic share within the impact band (paper-only)",
                 market = %signal.market_id,
                 outcome = signal.outcome_id.0,
                 "signal did not produce order",

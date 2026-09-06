@@ -356,8 +356,10 @@ its binary self-reports its revision and BLAKE3 under `--verify-staged-identity`
 the binary/config/environment SHA-256 values to the rehearsal evidence. A #545 target is neither
 path-equal nor revision-equal to the inherited #557 artifacts. The Start hot-config identity is not an operator assertion:
 while the service is inert, the driver exports the database rows that the 17→15 migration retains to
-a mode-private temporary file (the credential-bearing database URL remains in `PGDATABASE`, never
-argv), and the Rust prepare owner parses them as `ConfigEra::Financial15` and calls
+a mode-private temporary file. The database helper reads the credential-bearing URL from its named
+environment variable and exports `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, and optional
+`PGSSLMODE` from it for `psql`; the URL is never in argv. The Rust prepare owner parses the rows as
+`ConfigEra::Financial15` and calls
 `RuntimeConfig::canonical_hash`. The membership-proofs identity is likewise a Rust-owned BLAKE3 of
 the exact manifest membership array plus each member's current complete-history, coverage, latest
 position-anchor, and position-validation records. Missing or inconsistent evidence fails prepare.
@@ -442,7 +444,7 @@ It emits canonical compact JSON plus one trailing newline and reports its BLAKE3
 | unit | systemd **system** unit `pe-service` (`/etc/systemd/system/pe-service.service` + drop-in `pe-service.service.d/age-identity.conf`); `WantedBy=multi-user.target`, `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2` (SIGINT — the binary's shutdown signal, so a restart drains buffered trades). Start/stop/restart need root: run [`scripts/vps_grant_pe_service_sudo.sh`](../scripts/vps_grant_pe_service_sudo.sh) once as root to grant the deploy user passwordless, command-scoped `systemctl` control of the pe-service units (verified with `sudo -n -l`); until then use `ssh -t … 'sudo systemctl restart pe-service'` |
 | binary path | `ExecStart` runs `/bin/bash -c 'set -a; source /home/sean/prediction-markets/.env; set +a; exec /home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml'` with `WorkingDirectory=/home/sean/prediction-markets` (verified 2026-08-31) |
 | backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
-| env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
+| env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_SUPABASE_AUTHORITATIVE` defaults to `false` but must be `true` in the #545 production target. `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
 | build box | the VPS has no cargo — build on the dev box and `scp`. Release-like builds derive the full revision directly from the checked-out Git object and reject a dirty, unknown, or invalid checkout; no environment override is accepted. Dev/test builds use the explicit `dev-dirty` sentinel when needed. |
 | logs | `journalctl -u pe-service -f` (Tier-1 prod check); JSONL sinks per `jsonl_log_path`; `status.json` in the working directory |
 
