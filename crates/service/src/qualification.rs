@@ -8,8 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use pe_core_types::{
-    AccountId, BasisPoints, CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ReceivedAt,
-    ShareAmount, Side, SourceId, SourceTimestamp, TraderId, VenueMarketId,
+    AccountId, CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ReceivedAt, ShareAmount,
+    Side, SourceId, SourceTimestamp, TraderId, VenueMarketId,
 };
 use pe_event_log::envelope::{HashInput, compute_hashes};
 use pe_event_log::{
@@ -21,15 +21,15 @@ use pe_execution_core::{
 };
 use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{
-    DecisionPendingState, FillRow, FinancialSnapshot, PaperPositionRow, PaperStateDb,
-    SettledMarketRow,
+    DecisionPendingRow, DecisionPendingState, FillRow, FinancialSnapshot, PaperPositionRow,
+    PaperStateDb, SettledMarketRow,
 };
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
 use pe_risk_engine::{
     BinaryPayout, KILL_SWITCH_DRAWDOWN_BPS, RiskDecision, RiskHaltCause, RiskSnapshot,
-    aggregate_resolution_credit, evaluate_risk, exposure_bps_ceil, nearest_rank_p95,
+    aggregate_resolution_credit, evaluate_risk, nearest_rank_p95,
 };
 use pe_source_polymarket_public::ClassifiedPricesHistory;
 use pe_source_polymarket_public::{
@@ -45,6 +45,7 @@ use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::bucket_commit::DecisionContinuationV2;
 use crate::config::ServiceConfig;
 use crate::decision_replay::replay_decision_pending;
 use crate::paper_recovery::{
@@ -52,7 +53,7 @@ use crate::paper_recovery::{
     PaperLogRecord, PortfolioMark, QualificationSealed, QualificationStarted, RiskHaltOwner,
     ScannedPaperFrame, SealReason, TailBinding, active_risk_halts, paper_era, scan_paper_log,
 };
-use crate::risk_inputs::{build_paper_risk_snapshot, historical_mark_price};
+use crate::risk_inputs::{build_paper_risk_base, build_paper_risk_snapshot, historical_mark_price};
 use crate::supabase_state::resolution_source_received_at;
 
 const QUALIFICATION_REPORT_VERSION: u16 = 1;
@@ -383,16 +384,12 @@ async fn verify_qualification(
 
     let source_observations = source_observations(&options.source_log, &seal.source_prefix)?;
     let state = PaperStateDb::open_read_only(&options.paper_state)?;
-    let start_unix = frames[start_index].envelope.received_at.0.unix_timestamp();
-    let mut decisions = state
-        .decision_pending_history()?
-        .into_iter()
-        .filter(|row| row.source_epoch >= start_unix && row.source_epoch <= seal.sealed_cutoff_unix)
-        .collect::<Vec<_>>();
-    decisions.sort_by(|left, right| {
-        (left.source_epoch, &left.source_trade_id.0)
-            .cmp(&(right.source_epoch, &right.source_trade_id.0))
-    });
+    let decisions = decision_rows_from_source_observations(
+        &state,
+        &start.source_prefix,
+        &seal.source_prefix,
+        &source_observations,
+    )?;
     if decisions
         .iter()
         .any(|row| row.state != DecisionPendingState::Terminal)
@@ -1208,6 +1205,68 @@ fn source_observations(
     Ok(observations)
 }
 
+/// Select the ordered durable decision rows whose complete source evidence is in the immutable
+/// post-Start portion of `sealed_prefix`. Timestamp fields in the SQLite projection are never a
+/// membership input.
+pub(crate) fn decision_rows_for_source_prefix(
+    state: &PaperStateDb,
+    source_log_path: &Path,
+    start_prefix: &TailBinding,
+    sealed_prefix: &TailBinding,
+) -> Result<Vec<DecisionPendingRow>, QualificationError> {
+    let observations = source_observations(source_log_path, sealed_prefix)?;
+    decision_rows_from_source_observations(state, start_prefix, sealed_prefix, &observations)
+}
+
+fn decision_rows_from_source_observations(
+    state: &PaperStateDb,
+    start_prefix: &TailBinding,
+    sealed_prefix: &TailBinding,
+    observations: &BTreeMap<u64, SourceObservation>,
+) -> Result<Vec<DecisionPendingRow>, QualificationError> {
+    let start_sequence = start_prefix.last_sequence;
+    let Some(sealed_sequence) = sealed_prefix.last_sequence else {
+        return Ok(Vec::new());
+    };
+    let mut selected = Vec::new();
+    for row in state.decision_pending_history()? {
+        let continuation = DecisionContinuationV2::from_durable(&row).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision source receipt link is invalid: {error}"
+            ))
+        })?;
+        let receipts = continuation
+            .page_occurrences()
+            .iter()
+            .map(|page| page.receipt)
+            .chain(continuation.observed_source_receipt)
+            .collect::<Vec<_>>();
+        if receipts.is_empty()
+            || receipts
+                .iter()
+                .any(|receipt| start_sequence.is_some_and(|start| receipt.sequence <= start))
+            || receipts
+                .iter()
+                .any(|receipt| receipt.sequence > sealed_sequence)
+        {
+            continue;
+        }
+        if receipts.iter().any(|receipt| {
+            observations
+                .get(&receipt.sequence.0)
+                .is_none_or(|observation| observation.receipt != *receipt)
+        }) {
+            return insufficient("decision source receipt does not match the sealed source prefix");
+        }
+        selected.push(row);
+    }
+    selected.sort_by(|left, right| {
+        (left.source_epoch, &left.source_trade_id.0)
+            .cmp(&(right.source_epoch, &right.source_trade_id.0))
+    });
+    Ok(selected)
+}
+
 fn verify_decision_source_inputs(
     decision: &crate::decision_replay::ReplayedDecision,
     source: &BTreeMap<u64, SourceObservation>,
@@ -1767,108 +1826,23 @@ fn replayed_sized_plan(
 }
 
 fn replayed_risk_base(
-    operation: &crate::paper_recovery::PaperFillOperationIdentity,
-    economic: &EconomicPrepared,
-    sized: &pe_venue_polymarket::SizedBuyPlan,
+    leader_wallet: pe_core_types::WalletAddress,
+    market_id: &str,
+    proposed_debit: CollateralAmount,
+    per_trade_cap_bps: i32,
     era: &crate::paper_recovery::PaperEra,
 ) -> Result<RiskSnapshot, QualificationError> {
-    let completed = era
-        .frames
-        .iter()
-        .filter_map(|frame| match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
-                prepared_receipt, ..
-            }) => Some(prepared_receipt.sequence),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let resolved = era
-        .frames
-        .iter()
-        .filter_map(|frame| match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
-                payload: FinancialPayload::Resolution { condition_id, .. },
-                ..
-            }) if completed.contains(&frame.receipt.sequence) => Some(condition_id.0.clone()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let mut leader_exposure = CollateralAmount::ZERO;
-    let mut market_exposure = CollateralAmount::ZERO;
-    let mut total_exposure = CollateralAmount::ZERO;
-    for frame in &era.frames {
-        let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
-            payload:
-                FinancialPayload::Fill {
-                    operation: prior_operation,
-                    economic: prior_economic,
-                },
-            ..
-        }) = &frame.frame
-        else {
-            continue;
-        };
-        if !completed.contains(&frame.receipt.sequence)
-            || resolved.contains(&prior_economic.market.market_id)
-        {
-            continue;
-        }
-        let debit = prior_economic
-            .sizing
-            .principal
-            .checked_add(prior_economic.fee.expected_fee)
-            .map_err(|_| {
-                QualificationError::InsufficientEvidence("risk exposure debit overflow".to_owned())
-            })?;
-        total_exposure = total_exposure.checked_add(debit).map_err(|_| {
-            QualificationError::InsufficientEvidence("total risk exposure overflow".to_owned())
-        })?;
-        if prior_economic.market.market_id == economic.market.market_id {
-            market_exposure = market_exposure.checked_add(debit).map_err(|_| {
-                QualificationError::InsufficientEvidence("market risk exposure overflow".to_owned())
-            })?;
-        }
-        if prior_operation.leader_wallet == operation.leader_wallet {
-            leader_exposure = leader_exposure.checked_add(debit).map_err(|_| {
-                QualificationError::InsufficientEvidence("leader risk exposure overflow".to_owned())
-            })?;
-        }
-    }
-    let bankroll = era
-        .start
-        .as_ref()
-        .map(|(_, start)| start.starting_bankroll)
-        .ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "risk replay has no QualificationStarted bankroll".to_owned(),
-            )
-        })?;
-    let exposure = |amount| {
-        exposure_bps_ceil(amount, bankroll).ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "risk exposure basis-point conversion failed".to_owned(),
-            )
-        })
-    };
-    let proposed_debit = sized.worst_case_all_in_debit().map_err(|error| {
+    build_paper_risk_base(
+        era,
+        leader_wallet,
+        market_id,
+        proposed_debit,
+        per_trade_cap_bps,
+    )
+    .map_err(|error| {
         QualificationError::InsufficientEvidence(format!(
-            "proposed risk debit reconstruction failed: {error}"
+            "risk base reconstruction failed: {error}"
         ))
-    })?;
-    Ok(RiskSnapshot {
-        leader_exposure_bps: exposure(leader_exposure)?,
-        market_exposure_bps: exposure(market_exposure)?,
-        // This exactly mirrors the current paper owner: no durable family identity exists, so the
-        // market exposure is the conservative available family exposure.
-        family_exposure_bps: exposure(market_exposure)?,
-        total_copy_exposure_bps: exposure(total_exposure)?,
-        intraday_pnl_bps: BasisPoints::ZERO,
-        rolling_7d_pnl_bps: BasisPoints::ZERO,
-        absolute_pnl_bps: BasisPoints::ZERO,
-        copy_latency_kill_switch_active: false,
-        proposed_trade_bps: exposure(proposed_debit)?,
-        per_trade_cap_bps: economic.risk.snapshot.per_trade_cap_bps,
-        concentration_caps: None,
     })
 }
 
@@ -1936,7 +1910,18 @@ async fn verify_economic(
     let era = paper_era(context.paper_prefix.to_vec());
     let latency_was_active =
         active_risk_halts(&era).contains(&(RiskHaltOwner::Paper, RiskHaltCause::CopyLatency));
-    let base = replayed_risk_base(operation, economic, &sized, &era)?;
+    let proposed_debit = sized.worst_case_all_in_debit().map_err(|error| {
+        QualificationError::InsufficientEvidence(format!(
+            "proposed risk debit reconstruction failed: {error}"
+        ))
+    })?;
+    let base = replayed_risk_base(
+        operation.leader_wallet,
+        &economic.market.market_id,
+        proposed_debit,
+        economic.risk.snapshot.per_trade_cap_bps,
+        &era,
+    )?;
     let reconstructed = build_paper_risk_snapshot(
         &base,
         &snapshot,
@@ -3140,7 +3125,15 @@ fn start_envelope(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use pe_core_types::WalletAddress;
+    use pe_core_types::{
+        KellyFraction, LeaderAction, PolymarketConditionId, PolymarketTokenId, Probability,
+        ProbabilityPpm, SourceTradeId, WalletAddress,
+    };
+    use pe_execution_core::{
+        BalanceAudit, ECONOMIC_PREPARED_VERSION, FeeAudit, LadderAskAudit, LadderPlanAudit,
+        LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit, MarketSelection, SizingAudit,
+    };
+    use pe_venue_polymarket::CompactFeeSchedule;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -3175,6 +3168,158 @@ mod tests {
             schema_version: 3,
             parser_version: 1,
             financial_semantic_version: 1,
+        }
+    }
+
+    fn append_paper_record_at(
+        writer: &mut Writer,
+        record: &PaperLogRecord,
+        unix: i64,
+    ) -> AppendReceipt {
+        let timestamp = OffsetDateTime::from_unix_timestamp(unix).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(record).unwrap(),
+            })
+            .unwrap()
+    }
+
+    fn risk_economic(market_id: &str, principal: CollateralAmount) -> EconomicPrepared {
+        let price = Price::new(dec!(0.5)).unwrap();
+        let shares = ShareAmount::from_whole(2).unwrap();
+        let receipt = |sequence| AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::hash(&sequence.to_be_bytes()),
+        };
+        EconomicPrepared {
+            version: ECONOMIC_PREPARED_VERSION,
+            market: MarketSelection {
+                condition_id: PolymarketConditionId(market_id.to_owned()),
+                outcome_index: 0,
+                token_id: PolymarketTokenId(format!("token-{market_id}")),
+                side: Side::Buy,
+                market_id: market_id.to_owned(),
+            },
+            admission: LiveAdmissionArtifactAudit {
+                market: LiveMarketEvidenceAudit {
+                    condition_id: PolymarketConditionId(market_id.to_owned()),
+                    ordered_outcome_token_ids: [
+                        PolymarketTokenId(format!("token-{market_id}")),
+                        PolymarketTokenId(format!("other-{market_id}")),
+                    ],
+                    neg_risk: false,
+                    minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                    minimum_order_size: shares,
+                    observed_at_unix: 1,
+                    schema_version: 1,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                },
+                settlement: VenueSettlementRecord {
+                    schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+                    condition_id: PolymarketConditionId(market_id.to_owned()),
+                    status: VenueResolutionStatus::Unresolved,
+                    raw_evidence_hash: "settlement".to_owned(),
+                    source_timestamp_unix: Some(1),
+                    observed_at_unix: 1,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                },
+                fee_schedule: CompactFeeSchedule::Zero,
+                scheduled_end_unix: Some(100),
+                receipts: AdmissionReceipts {
+                    gamma: receipt(10),
+                    clob_long: receipt(11),
+                    clob_compact: receipt(12),
+                },
+            },
+            ladder: LadderPlanAudit {
+                used_asks: vec![LadderAskAudit { price, shares }],
+                best_ask: price,
+                limit_price: price,
+                minimum_shares: shares,
+                principal,
+            },
+            book_receipt: receipt(13),
+            observation: None,
+            sizing: SizingAudit {
+                mode: SizingModeAudit::Kelly {
+                    fraction: KellyFraction::new(dec!(0.25)).unwrap(),
+                    probability: Probability::new(dec!(0.6)).unwrap(),
+                },
+                budget: principal,
+                principal,
+                minimum_shares: shares,
+                expected_shares: shares,
+                expected_vwap: price,
+                all_in_price: price,
+                slippage_rate: Decimal::ZERO,
+            },
+            fee: FeeAudit {
+                schedule: CompactFeeSchedule::Zero,
+                expected_fee: CollateralAmount::ZERO,
+                reserve: CollateralAmount::ZERO,
+            },
+            risk: RiskAudit {
+                snapshot: RiskSnapshot {
+                    leader_exposure_bps: pe_core_types::BasisPoints::ZERO,
+                    market_exposure_bps: pe_core_types::BasisPoints::ZERO,
+                    family_exposure_bps: pe_core_types::BasisPoints::ZERO,
+                    total_copy_exposure_bps: pe_core_types::BasisPoints::ZERO,
+                    intraday_pnl_bps: pe_core_types::BasisPoints::ZERO,
+                    rolling_7d_pnl_bps: pe_core_types::BasisPoints::ZERO,
+                    absolute_pnl_bps: pe_core_types::BasisPoints::ZERO,
+                    copy_latency_kill_switch_active: false,
+                    proposed_trade_bps: pe_core_types::BasisPoints::ZERO,
+                    per_trade_cap_bps: 10_000,
+                    concentration_caps: None,
+                },
+                decision: RiskDecisionAudit::Approved,
+                price_receipts: Vec::new(),
+                evaluated_at_unix_ms: 1,
+            },
+            balance: BalanceAudit {
+                cash_before: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+                worst_case_debit: principal,
+                price_impact_cap_bps: 100,
+                chase_ceiling: price,
+                band_floor: Price::ZERO,
+                band_ceiling_exclusive: Price::ONE,
+            },
+            applied_configuration_hash: "config".to_owned(),
+        }
+    }
+
+    fn risk_frame(sequence: u64, record: PaperLogRecord) -> ScannedPaperFrame {
+        let receipt = AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::hash(&sequence.to_be_bytes()),
+        };
+        let timestamp =
+            OffsetDateTime::from_unix_timestamp(i64::try_from(sequence).unwrap()).unwrap();
+        ScannedPaperFrame {
+            envelope: pe_event_log::EventEnvelope {
+                seq: receipt.sequence,
+                source_id: SourceId("paper-test".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                raw_payload_hash: blake3::hash(b"payload"),
+                prev_hash: blake3::hash(b"previous"),
+                this_hash: receipt.this_hash,
+                payload: Vec::new(),
+            },
+            receipt,
+            frame: PaperLogFrame::Record(record),
+            legacy_fill: None,
         }
     }
 
@@ -3474,6 +3619,274 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// PASS: runtime and qualification adapters produce byte-for-byte equal base snapshots from
+    /// the same financial-era and proposal fixture because both call the shared reducer.
+    #[test]
+    fn runtime_and_qualification_risk_bases_are_equal() {
+        let start = started("hot");
+        let start_receipt = AppendReceipt {
+            sequence: EventSeq(0),
+            this_hash: blake3::hash(b"start"),
+        };
+        let leader = start.membership[0];
+        let prepared_receipt = |sequence| AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::hash(&sequence.to_be_bytes()),
+        };
+        let expected = |prior| crate::paper_recovery::ExpectedAuthority {
+            qualification_start_receipt: start_receipt,
+            prior_completed_prepared_sequence: prior,
+        };
+        let fill =
+            |source_trade_id: &str, market_id: &str, principal| PaperLogRecord::FinancialPrepared {
+                expected_authority: expected(None),
+                payload: FinancialPayload::Fill {
+                    operation: crate::paper_recovery::PaperFillOperationIdentity {
+                        leader_wallet: leader,
+                        source_trade_id: SourceTradeId(source_trade_id.to_owned()),
+                        observed_at_bucket: 1,
+                    },
+                    economic: risk_economic(market_id, principal),
+                },
+            };
+        let fill_final = |sequence, principal| PaperLogRecord::FinancialFinal {
+            prepared_receipt: prepared_receipt(sequence),
+            result: FinancialResult::Fill {
+                canonical: crate::paper_recovery::CanonicalFillResult {
+                    outcome: "applied".to_owned(),
+                    bankroll: dec!(99),
+                    applied_prepared_seq: EventSeq(sequence),
+                    quantity: ShareAmount::from_whole(2).unwrap(),
+                    principal,
+                    fee: CollateralAmount::ZERO,
+                    fill_price: Price::new(dec!(0.5)).unwrap(),
+                },
+            },
+        };
+        let one = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
+        let four = CollateralAmount::from_decimal_exact(dec!(4)).unwrap();
+        let era = crate::paper_recovery::PaperEra {
+            start: Some((start_receipt, start.clone())),
+            frames: vec![
+                risk_frame(1, fill("unresolved", "market-a", one)),
+                risk_frame(2, fill_final(1, one)),
+                risk_frame(3, fill("resolved", "market-resolved", four)),
+                risk_frame(4, fill_final(3, four)),
+                risk_frame(
+                    5,
+                    PaperLogRecord::FinancialPrepared {
+                        expected_authority: expected(Some(EventSeq(3))),
+                        payload: FinancialPayload::Resolution {
+                            condition_id: PolymarketConditionId("market-resolved".to_owned()),
+                            payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
+                            resolution_source_receipt: prepared_receipt(20),
+                        },
+                    },
+                ),
+                risk_frame(
+                    6,
+                    PaperLogRecord::FinancialFinal {
+                        prepared_receipt: prepared_receipt(5),
+                        result: FinancialResult::Resolution {
+                            canonical: crate::paper_recovery::CanonicalResolutionResult {
+                                outcome: "applied".to_owned(),
+                                bankroll: dec!(103),
+                                applied_prepared_seq: EventSeq(5),
+                                credit: CollateralAmount::from_decimal_exact(dec!(8)).unwrap(),
+                                settled_at_unix: 6,
+                            },
+                        },
+                    },
+                ),
+            ],
+        };
+        let proposed_debit = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
+
+        let runtime =
+            build_paper_risk_base(&era, leader, "market-a", proposed_debit, 10_000).unwrap();
+        let qualification =
+            replayed_risk_base(leader, "market-a", proposed_debit, 10_000, &era).unwrap();
+
+        assert_eq!(runtime, qualification);
+        assert_eq!(runtime.proposed_trade_bps, pe_core_types::BasisPoints(100));
+        assert_eq!(runtime.leader_exposure_bps, pe_core_types::BasisPoints(100));
+        assert_eq!(runtime.market_exposure_bps, pe_core_types::BasisPoints(100));
+        assert_eq!(runtime.family_exposure_bps, pe_core_types::BasisPoints(100));
+        assert_eq!(
+            runtime.total_copy_exposure_bps,
+            pe_core_types::BasisPoints(100)
+        );
+    }
+
+    /// PASS: after sealing, a terminal row with an old source epoch but version-three receipts
+    /// after the sealed source prefix leaves the verifier's complete report unchanged.
+    /// FAIL: mutable SQLite time selection admits the late row or changes the sealed digest.
+    #[tokio::test]
+    async fn post_seal_decision_after_source_prefix_does_not_change_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let paper_log = temp.path().join("paper.log");
+        let source_log = temp.path().join("source.log");
+        let paper_state = temp.path().join("paper.db");
+        let output = temp.path().join("qualification.json");
+        let mut paper_writer = Writer::open(&paper_log).unwrap();
+        let mut source_writer = Writer::open(&source_log).unwrap();
+        let empty_paper_prefix = Scanner::verify(&paper_log).unwrap();
+        let empty_source_prefix = Scanner::verify(&source_log).unwrap();
+        let cutoff_unix = 86_400;
+        let start_unix = cutoff_unix - 100;
+        let mut start = started("hot");
+        start.paper_prefix = TailBinding::from(&empty_paper_prefix);
+        start.source_prefix = TailBinding::from(&empty_source_prefix);
+        start.live_prefix = TailBinding::from(&empty_source_prefix);
+        let start_receipt = paper_writer
+            .append_synced(start_envelope(&start, start_unix).unwrap())
+            .unwrap();
+
+        let boundary_at = OffsetDateTime::from_unix_timestamp(cutoff_unix).unwrap();
+        let boundary_receipt = source_writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.boundary".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(boundary_at),
+                received_at: ReceivedAt(boundary_at),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&serde_json::json!({
+                    "kind": "daily_boundary",
+                    "cutoff_unix": cutoff_unix,
+                }))
+                .unwrap(),
+            })
+            .unwrap();
+        let sealed_source_tail = Scanner::verify(&source_log).unwrap();
+        append_paper_record_at(
+            &mut paper_writer,
+            &PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
+                boundary_receipt,
+                cutoff_unix,
+                source_tail: TailBinding::from(&sealed_source_tail),
+                financial_prefix_seq: None,
+                prices: Vec::new(),
+                cash: dec!(100),
+                equity: dec!(100),
+                invalid: None,
+            })),
+            cutoff_unix,
+        );
+        let sealed_financial_tail = Scanner::verify(&paper_log).unwrap();
+        let state = PaperStateDb::open(&paper_state).unwrap();
+        let decision_evidence = state.seal_decision_evidence(&[]).unwrap();
+        drop(state);
+        let seal_receipt = append_paper_record_at(
+            &mut paper_writer,
+            &PaperLogRecord::QualificationSealed(Box::new(QualificationSealed {
+                start_receipt,
+                source_prefix: TailBinding::from(&sealed_source_tail),
+                financial_prefix: TailBinding::from(&sealed_financial_tail),
+                decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
+                sealed_cutoff_unix: cutoff_unix,
+                reason: SealReason::Complete,
+            })),
+            cutoff_unix + 1,
+        );
+        let options = QualifyOptions {
+            paper_log: paper_log.clone(),
+            source_log: source_log.clone(),
+            paper_state: paper_state.clone(),
+            seal_hash: seal_receipt.this_hash.to_hex().to_string(),
+            output,
+        };
+        let before = verify_qualification(&options).await.unwrap();
+
+        let late_payload = br#"[]"#.to_vec();
+        let late_at = OffsetDateTime::from_unix_timestamp(cutoff_unix + 2).unwrap();
+        let late_receipt = source_writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(late_at),
+                received_at: ReceivedAt(late_at),
+                content_type: ContentType::Json,
+                payload: late_payload.clone(),
+            })
+            .unwrap();
+        let applied_configuration =
+            crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
+        let source_trade_id = pe_core_types::SourceTradeId("g2:post-seal".to_owned());
+        let continuation = crate::bucket_commit::DecisionContinuationV2 {
+            version: 3,
+            source_trade_id: source_trade_id.clone(),
+            semantic_revision: "semantic-v3".to_owned(),
+            transaction_hash: "0xpost-seal".to_owned(),
+            wallet: start.membership[0],
+            source_epoch: cutoff_unix - 1,
+            market_id: MarketId(VenueMarketId("market-post-seal".to_owned())),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            price: Price::new(dec!(0.5)).unwrap(),
+            share_amount: ShareAmount::from_whole(1).unwrap(),
+            provenance: pe_copy_signal_engine::TradeProvenance::RestPoll,
+            pre_bucket_action: LeaderAction::Entry,
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+            gate_result: "admitted".to_owned(),
+            applied_configuration_hash: applied_configuration.canonical_hash(),
+            applied_configuration,
+            frozen_basis: crate::bucket_commit::FrozenDecisionBasis {
+                win_rate_p: Probability::new(dec!(0.6)).unwrap(),
+                bankroll: dec!(100),
+            },
+            decision_inputs: serde_json::json!({"post_seal": true}),
+            observed_source_receipt: None,
+            page_occurrences: Vec::new(),
+        };
+        let terminal = crate::decision_replay::TerminalDispositionEvidence::no_copy("post_seal");
+        let terminal_disposition = terminal.disposition.clone();
+        let post_commit_inputs_json =
+            crate::decision_replay::DecisionEvidenceAccumulator::new(&continuation)
+                .render(
+                    crate::decision_replay::AuthorityEvidence::not_read("post_seal"),
+                    terminal,
+                )
+                .unwrap();
+        let frozen_inputs_json =
+            serde_json::to_string(&crate::bucket_commit::DecisionContinuationV3 {
+                prior: continuation,
+                observed_source_receipt: None,
+                page_occurrences: vec![crate::bucket_commit::PageOccurrence {
+                    request_url: "https://example.invalid/activity?end=86400".to_owned(),
+                    raw_hash: blake3::hash(&late_payload).to_hex().to_string(),
+                    receipt: late_receipt,
+                }],
+            })
+            .unwrap();
+        let connection = rusqlite::Connection::open(&paper_state).unwrap();
+        connection
+            .execute(
+                "INSERT INTO decision_pending
+                    (source_trade_id, semantic_revision, wallet_hex, source_epoch,
+                     frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition,
+                     updated_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'terminal', ?7, ?8)",
+                rusqlite::params![
+                    source_trade_id.0,
+                    "semantic-v3",
+                    start.membership[0].to_string(),
+                    cutoff_unix - 1,
+                    frozen_inputs_json,
+                    post_commit_inputs_json,
+                    terminal_disposition,
+                    cutoff_unix + 2,
+                ],
+            )
+            .unwrap();
+
+        let after = verify_qualification(&options).await.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after.replay.decisions, 0);
     }
 
     #[tokio::test]

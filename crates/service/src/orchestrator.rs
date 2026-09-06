@@ -12,9 +12,9 @@ use pe_copy_signal_engine::{
     IncomingTrade, LeaderSignal, SignalConfig, TradeProvenance, classify_trade,
 };
 use pe_core_types::{
-    BasisPoints, CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, Price,
-    Probability, ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp,
-    SourceTradeId, TraderId, VenueId, WalletAddress,
+    CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, Price, Probability,
+    ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
+    TraderId, VenueId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
 use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
@@ -477,7 +477,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             crate::paper_recovery::scan_paper_log(paper_log_path)
                 .map_err(|error| error.to_string())?,
         );
-        let (start_receipt, _) = era
+        let (start_receipt, started) = era
             .start
             .as_ref()
             .ok_or_else(|| "qualification seal has no verified Start".to_owned())?;
@@ -492,23 +492,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
             return Err("qualification seal waits for the oldest unmatched Prepared".to_owned());
         }
-        let start_unix = era
-            .frames
-            .iter()
-            .find(|frame| frame.receipt == *start_receipt)
-            .map(|frame| frame.envelope.received_at.0.unix_timestamp())
-            .ok_or_else(|| "qualification Start receipt is absent from its era".to_owned())?;
-        let mut decisions = self
-            .paper_state
-            .decision_pending_history()
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter(|row| row.source_epoch >= start_unix && row.source_epoch <= sealed_cutoff_unix)
-            .collect::<Vec<_>>();
-        decisions.sort_by(|left, right| {
-            (left.source_epoch, &left.source_trade_id.0)
-                .cmp(&(right.source_epoch, &right.source_trade_id.0))
-        });
+        let source_prefix = Scanner::verify(source_log_path).map_err(|error| error.to_string())?;
+        let sealed_source_prefix = TailBinding::from(&source_prefix);
+        let decisions = crate::qualification::decision_rows_for_source_prefix(
+            &self.paper_state,
+            source_log_path,
+            &started.source_prefix,
+            &sealed_source_prefix,
+        )
+        .map_err(|error| error.to_string())?;
         let decision_keys = decisions
             .into_iter()
             .map(|row| (row.source_trade_id, row.semantic_revision))
@@ -517,13 +509,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .paper_state
             .seal_decision_evidence(&decision_keys)
             .map_err(|error| error.to_string())?;
-        let source_prefix = Scanner::verify(source_log_path).map_err(|error| error.to_string())?;
         let financial_prefix =
             Scanner::verify(paper_log_path).map_err(|error| error.to_string())?;
         self.append_paper_record(&PaperLogRecord::QualificationSealed(Box::new(
             QualificationSealed {
                 start_receipt: *start_receipt,
-                source_prefix: TailBinding::from(&source_prefix),
+                source_prefix: sealed_source_prefix,
                 financial_prefix: TailBinding::from(&financial_prefix),
                 decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
                 sealed_cutoff_unix,
@@ -854,98 +845,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             })
             .collect::<HashMap<_, _>>();
 
-        let completed = era
-            .frames
-            .iter()
-            .filter_map(|frame| match &frame.frame {
-                crate::paper_recovery::PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
-                    prepared_receipt,
-                    ..
-                }) => Some(prepared_receipt.sequence),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        let resolved =
-            era.frames
-                .iter()
-                .filter_map(|frame| match &frame.frame {
-                    crate::paper_recovery::PaperLogFrame::Record(
-                        PaperLogRecord::FinancialPrepared {
-                            payload:
-                                crate::paper_recovery::FinancialPayload::Resolution {
-                                    condition_id, ..
-                                },
-                            ..
-                        },
-                    ) if completed.contains(&frame.receipt.sequence) => {
-                        Some(condition_id.0.clone())
-                    }
-                    _ => None,
-                })
-                .collect::<HashSet<_>>();
-        let mut leader_exposure = CollateralAmount::ZERO;
-        let mut market_exposure = CollateralAmount::ZERO;
-        let mut total_exposure = CollateralAmount::ZERO;
-        for frame in &era.frames {
-            let crate::paper_recovery::PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
-                payload:
-                    crate::paper_recovery::FinancialPayload::Fill {
-                        operation,
-                        economic,
-                    },
-                ..
-            }) = &frame.frame
-            else {
-                continue;
-            };
-            if !completed.contains(&frame.receipt.sequence)
-                || resolved.contains(&economic.market.market_id)
-            {
-                continue;
-            }
-            let debit = economic
-                .sizing
-                .principal
-                .checked_add(economic.fee.expected_fee)
-                .map_err(|_| RiskInputsUnavailable::Overflow)?;
-            total_exposure = total_exposure
-                .checked_add(debit)
-                .map_err(|_| RiskInputsUnavailable::Overflow)?;
-            if economic.market.market_id == signal.market_id.to_string() {
-                market_exposure = market_exposure
-                    .checked_add(debit)
-                    .map_err(|_| RiskInputsUnavailable::Overflow)?;
-            }
-            if operation.leader_wallet == signal.leader.0 {
-                leader_exposure = leader_exposure
-                    .checked_add(debit)
-                    .map_err(|_| RiskInputsUnavailable::Overflow)?;
-            }
-        }
-        let bankroll = era
-            .start
-            .as_ref()
-            .map(|(_, start)| start.starting_bankroll)
-            .ok_or(RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-        let exposure = |amount| {
-            pe_risk_engine::exposure_bps_ceil(amount, bankroll)
-                .ok_or(RiskInputsUnavailable::Overflow)
-        };
-        let base = RiskSnapshot {
-            leader_exposure_bps: exposure(leader_exposure)?,
-            market_exposure_bps: exposure(market_exposure)?,
-            // No durable market-family identity exists in the paper protocol. The market value
-            // is the conservative available family exposure rather than a fabricated zero.
-            family_exposure_bps: exposure(market_exposure)?,
-            total_copy_exposure_bps: exposure(total_exposure)?,
-            intraday_pnl_bps: BasisPoints::ZERO,
-            rolling_7d_pnl_bps: BasisPoints::ZERO,
-            absolute_pnl_bps: BasisPoints::ZERO,
-            copy_latency_kill_switch_active: false,
-            proposed_trade_bps: exposure(proposed_debit)?,
+        let base = crate::risk_inputs::build_paper_risk_base(
+            &era,
+            signal.leader.0,
+            &signal.market_id.to_string(),
+            proposed_debit,
             per_trade_cap_bps,
-            concentration_caps: None,
-        };
+        )?;
         let latency_was_active = self.active_risk_halts.contains(&(
             crate::paper_recovery::RiskHaltOwner::Paper,
             pe_risk_engine::RiskHaltCause::CopyLatency,
