@@ -3021,6 +3021,38 @@ impl PaperStateDb {
         })
     }
 
+    /// The genuinely OPEN positions — net-nonzero rows whose market has not settled — with the
+    /// same semantic as `positions_count`, portfolio valuation, and the financial snapshot. Risk
+    /// pricing must select markets from this set, never from the cumulative `positions` table.
+    pub fn open_positions(&self) -> Result<Vec<PaperPositionRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT p.market_id, p.outcome_id, p.long_str, p.short_str FROM positions p \
+             WHERE (CAST(p.long_str AS NUMERIC) > 0 OR CAST(p.short_str AS NUMERIC) > 0) \
+               AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id) \
+             ORDER BY p.market_id, p.outcome_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (market, outcome, long, short) = row?;
+            out.push(PaperPositionRow {
+                market_id: MarketId(VenueMarketId(market)),
+                outcome_id: OutcomeId(parse_u16(outcome)?),
+                long: parse_share_amount(&long)?,
+                short: parse_share_amount(&short)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Number of settled-market rows. Cheap `COUNT(*)` for the status snapshot.
     pub fn settled_count(&self) -> Result<usize, PaperStateError> {
         let conn = self.lock();
