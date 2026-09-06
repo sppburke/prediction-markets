@@ -528,8 +528,11 @@ The panel requests a mode, but the service is the sole writer of effective mode 
 `account_set_effective_mode` control RPC. Arming requires a decryptable, correctly bound credential
 bundle; venue state not `closed_only`; passing geoblock evidence; sufficient balance and allowance
 for both V2 exchange spenders; a loaded `Pass` qualification report bound to the current seal,
-economic configuration hash, and financial semantic version; and an unrevoked review newer than the
-executor's first-boot arming fence that names that same seal. A legacy unbound review is invalid.
+economic configuration hash, and financial semantic version; and an unrevoked post-`Pass` review
+newer than the executor's first-boot arming fence that binds both that seal and the BLAKE3 of the
+exact loaded report bytes. The `promotion_reviewed.evidence_ref` format is
+`<seal_blake3>:<qualification_report_blake3>` (two lowercase 64-hex digests). A legacy seal-only or
+otherwise unbound review is invalid.
 Requested mode alone never authorizes an order. Invalid credentials, missing or mismatched
 qualification evidence, a missing/revoked/mismatched review, or `closed_only` demote an armed
 account; transient probe failure refuses orders without demotion. A pending, ambiguous, or failed
@@ -559,8 +562,8 @@ historical reconstruction
   -> one corrected financial era records exact paper decisions and economics
   -> the first eligible mark synchronizes QualificationSealed
   -> network-free exact replay emits Pass, Fail, or InsufficientEvidence
-  -> ordinary service loads that seal-bound Pass report via --qualification-report=<path>
-  -> one later manual review bound to the same seal may authorize live-tiny
+  -> ordinary service loads and hashes that seal-bound Pass report via --qualification-report=<path>
+  -> one later manual review bound to the same seal and exact report BLAKE3 may authorize live-tiny
 ```
 
 The exact quantitative gate is owned by `_GLOSSARY.md`. The observation begins at the first valid
