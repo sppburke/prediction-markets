@@ -1828,8 +1828,11 @@ async fn positions_before_activity_retry_then_converge_without_fence() {
     assert!(paper.position_validation_current(&wallet).unwrap());
 }
 
+/// PASS: receipt, raw-payload, numeric presentation, and field-order changes within one explicit
+/// position partition preserve the semantic proof and install the anchor.
+/// FAIL: non-semantic wire presentation changes trigger a retry, fence, or failed installation.
 #[tokio::test]
-async fn presentation_receipt_raw_hash_and_partition_layout_changes_still_accept() {
+async fn presentation_receipt_raw_hash_and_field_layout_changes_still_accept() {
     let wallet = wallet(0x62);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     let activity =
@@ -1841,7 +1844,7 @@ async fn presentation_receipt_raw_hash_and_partition_layout_changes_still_accept
         "cashPnl": 123,
         "currentValue": 456,
         "avgPrice": 0.01,
-        "negativeRisk": false,
+        "negativeRisk": true,
         "outcomeIndex": 0,
         "size": "1",
         "conditionId": condition(1),
@@ -1856,11 +1859,11 @@ async fn presentation_receipt_raw_hash_and_partition_layout_changes_still_accept
         ),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
-            vec![first, b"[]".to_vec()],
+            vec![first, second],
         ),
         (
             position_url(wallet, PositionPartition::Redeemable),
-            vec![b"[]".to_vec(), second],
+            vec![b"[]".to_vec(), b"[]".to_vec()],
         ),
     ]);
 

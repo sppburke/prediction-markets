@@ -79,6 +79,8 @@ async fn exact_paper_api_contract_uses_decimal_strings() {
         start,
         None,
         EventSeq(11),
+        receipt(9, 9),
+        1_700_000_000,
         &FinancialFillRecord {
             idempotency_key: "wf|0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|g2:golden|condition-golden|0|buy|1800000000".to_owned(),
             market_id: market(),
@@ -179,6 +181,8 @@ async fn paper_pnl_is_typed_unavailable_when_price_is_missing() {
         start,
         None,
         EventSeq(21),
+        receipt(19, 19),
+        1_700_000_000,
         &FinancialFillRecord {
             idempotency_key: "missing-price".to_owned(),
             market_id: market(),

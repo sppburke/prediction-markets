@@ -45,7 +45,8 @@ use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
 use pe_execution_core::{
     AdmissionReceipts, BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
     LadderAskAudit, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit,
-    MarketSelection, RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
+    MarketSelection, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit,
+    SizingModeAudit,
 };
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRecord, FillRow, FinancialFillRecord, LeaderPositionRow, PaperStateDb};
@@ -58,7 +59,6 @@ use pe_service::paper_recovery::{
     FinancialResult, PaperFillOperationIdentity, PaperLogFrame, PaperLogRecord,
     QualificationStarted, TailBinding, scan_paper_log,
 };
-use pe_service::paper_recovery::{LegacyFillSource, LegacyPaperFill};
 use pe_service::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 use pe_service::supabase_state::{
     AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, PreparedFillRequest,
@@ -1091,7 +1091,7 @@ fn active_start_record() -> PaperLogRecord {
     }))
 }
 
-fn active_economic() -> EconomicPrepared {
+fn active_economic(source_receipt: AppendReceipt) -> EconomicPrepared {
     let price = Price::new(dec!(0.5)).unwrap();
     let shares = ShareAmount::from_whole(2).unwrap();
     let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
@@ -1145,7 +1145,12 @@ fn active_economic() -> EconomicPrepared {
             principal,
         },
         book_receipt: active_receipt(4, 4),
-        observation: None,
+        observation: Some(ObservationEvidence {
+            source_receipt,
+            complete_bound_receipt: source_receipt,
+            observed_unix_ms: 1_700_000_000_000,
+            provenance: "scenario_rest".to_owned(),
+        }),
         sizing: SizingAudit {
             mode: SizingModeAudit::Kelly {
                 fraction: KellyFraction::new(dec!(0.25)).unwrap(),
@@ -1209,6 +1214,21 @@ fn append_active_record(writer: &mut Writer, record: &PaperLogRecord) -> AppendR
         .unwrap()
 }
 
+fn append_source_observation(writer: &mut Writer) -> AppendReceipt {
+    let timestamp = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("scenario.activity".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(timestamp),
+            received_at: ReceivedAt(timestamp),
+            content_type: ContentType::Json,
+            payload: br#"{"type":"TRADE"}"#.to_vec(),
+        })
+        .unwrap()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FillCrashSeam {
     PreparedAppend,
@@ -1235,7 +1255,9 @@ async fn active_fill_crash_matrix_converges_once() {
         let dir = tempfile::tempdir().unwrap();
         let paper_log = dir.path().join("active-paper.log");
         let source_log = dir.path().join("active-source.log");
-        drop(Writer::open(&source_log).unwrap());
+        let mut source_writer = Writer::open(&source_log).unwrap();
+        let source_receipt = append_source_observation(&mut source_writer);
+        drop(source_writer);
         let mut writer = Writer::open(&paper_log).unwrap();
         let start = append_active_record(&mut writer, &active_start_record());
         let state = PaperStateDb::open(&dir.path().join("active-paper.db")).unwrap();
@@ -1257,7 +1279,7 @@ async fn active_fill_crash_matrix_converges_once() {
         };
         let payload = FinancialPayload::Fill {
             operation: operation.clone(),
-            economic: active_economic(),
+            economic: active_economic(source_receipt),
         };
         let prepared_receipt = append_active_record(
             &mut writer,
@@ -1296,6 +1318,8 @@ async fn active_fill_crash_matrix_converges_once() {
                     start,
                     None,
                     prepared_receipt.sequence,
+                    source_receipt,
+                    1_700_000_000,
                     &FinancialFillRecord {
                         idempotency_key: request.idempotency_key.clone(),
                         market_id: MarketId(VenueMarketId(request.market_id.clone())),
@@ -1396,7 +1420,7 @@ async fn prepared_authority_changed_field_conflict_matrix() {
         source_trade_id: SourceTradeId("g2:authority-fill".to_owned()),
         observed_at_bucket: 1_800_000_000,
     };
-    let economic = active_economic();
+    let economic = active_economic(active_receipt(5, 5));
     let request =
         PreparedFillRequest::from_prepared(expected, active_receipt(11, 11), &operation, &economic);
     authority.commit_prepared_fill(&request).await.unwrap();
