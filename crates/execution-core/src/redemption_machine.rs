@@ -1522,6 +1522,7 @@ mod tests {
                             schema_version: 1,
                             parser_version: 1,
                             evidence: Vec::new(),
+                            request_descriptor_hashes: Vec::new(),
                             evidence_hashes: Vec::new(),
                         },
                         venue_positions: Vec::new(),

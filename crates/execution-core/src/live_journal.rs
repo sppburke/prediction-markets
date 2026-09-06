@@ -10,13 +10,9 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::Mutex;
 
-use pe_core_types::http_evidence::{
-    REQUEST_DESCRIPTOR_HASH_HEADER, SanitizedHttpRequestDescriptor,
-};
 use pe_core_types::{
     AccountId, CollateralAmount, EventSeq, PolymarketConditionId, PolymarketTokenId, Price,
-    RawHttpAttempt, RawHttpResponse, ReceivedAt, ShareAmount, SourceId, SourceTimestamp,
-    WalletAddress,
+    RawHttpAttempt, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress,
 };
 use pe_event_log::{
     AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer,
@@ -41,6 +37,24 @@ const LIVE_JOURNAL_PARSER_VERSION: u32 = 1;
 pub struct CredentialBindingIdentity {
     pub version: i64,
     pub key_id: String,
+}
+
+/// Canonical, secret-free identity of one account-scoped HTTP request.
+///
+/// The ordered query is retained exactly as sent. `partition` names the logical page family
+/// (for example `redeemable=false`), while `offset` is kept separately so an empty page still
+/// proves which slice of which custody account was requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedHttpRequestDescriptor {
+    pub account_id: String,
+    pub credential_fingerprint: String,
+    pub custody_wallet: String,
+    pub method: String,
+    pub path: String,
+    pub partition: String,
+    pub offset: u64,
+    pub ordered_query: Vec<(String, String)>,
 }
 
 /// Nonsecret identity of the credentialed account read that produced a financial fact.
@@ -311,6 +325,8 @@ pub struct LiveAccountStateAudit {
     pub schema_version: u16,
     pub parser_version: u16,
     pub evidence: Vec<RawHttpAttempt>,
+    /// Descriptor hashes in response order; transport failures have no response descriptor entry.
+    pub request_descriptor_hashes: Vec<String>,
     pub evidence_hashes: Vec<String>,
 }
 
@@ -377,6 +393,8 @@ pub struct LiveAdmissionEvaluationAudit {
     pub economic: crate::economic::EconomicPrepared,
     pub account_state: Option<LiveAccountStateAudit>,
     pub account_read_failure_evidence: Vec<RawHttpAttempt>,
+    /// Descriptor hashes in response order for retained failed account reads.
+    pub account_read_failure_request_descriptor_hashes: Vec<String>,
     pub account_read_failure_evidence_hashes: Vec<String>,
     pub verdict: LiveAdmissionVerdict,
 }
@@ -1614,6 +1632,22 @@ mod legacy_v1 {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
+    pub(super) struct LiveAccountStateAudit {
+        pub observed_at: OffsetDateTime,
+        pub closed_only: bool,
+        pub geoblocked: bool,
+        pub selected_spender: String,
+        pub collateral_balance: CollateralAmount,
+        pub allowance: CollateralAmount,
+        pub reconciled_free_collateral: CollateralAmount,
+        pub schema_version: u16,
+        pub parser_version: u16,
+        pub evidence: Vec<RawHttpAttempt>,
+        pub evidence_hashes: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub(super) struct LiveFeeEvidenceAudit {
         pub gamma_fees_enabled: Option<serde_json::Value>,
         pub gamma_fee_schedule: Option<serde_json::Value>,
@@ -1816,7 +1850,7 @@ pub(crate) fn hash_serializable<T: Serialize + ?Sized>(
         .map_err(Into::into)
 }
 
-/// Stable hash that binds an account/custody request descriptor into retained response evidence.
+/// Stable hash that binds an account/custody request descriptor into retained account evidence.
 pub fn request_descriptor_hash(
     descriptor: &SanitizedHttpRequestDescriptor,
 ) -> Result<String, LiveJournalError> {
@@ -1826,38 +1860,12 @@ pub fn request_descriptor_hash(
     ))
 }
 
-/// Add the reserved descriptor binding to a response before it becomes durable evidence.
-pub fn bind_http_response_to_request(
-    response: &mut RawHttpResponse,
-    descriptor: &SanitizedHttpRequestDescriptor,
-) -> Result<(), LiveJournalError> {
-    if response
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(REQUEST_DESCRIPTOR_HASH_HEADER))
-    {
-        return Err(LiveJournalError::RequestBinding);
-    }
-    response.headers.push((
-        REQUEST_DESCRIPTOR_HASH_HEADER.to_owned(),
-        request_descriptor_hash(descriptor)?,
-    ));
-    Ok(())
-}
-
-/// Verify the unique reserved descriptor binding before a retained response body is parsed.
+/// Verify an explicit retained descriptor hash before its response body is parsed.
 pub fn verify_http_response_request(
-    response: &RawHttpResponse,
     descriptor: &SanitizedHttpRequestDescriptor,
+    retained_descriptor_hash: &str,
 ) -> Result<(), LiveJournalError> {
-    let expected = request_descriptor_hash(descriptor)?;
-    let mut bindings = response
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case(REQUEST_DESCRIPTOR_HASH_HEADER));
-    if bindings.next().map(|(_, value)| value.as_str()) != Some(expected.as_str())
-        || bindings.next().is_some()
-    {
+    if request_descriptor_hash(descriptor)? != retained_descriptor_hash {
         return Err(LiveJournalError::RequestBinding);
     }
     Ok(())
@@ -1925,6 +1933,7 @@ mod tests {
             schema_version: 1,
             parser_version: 1,
             evidence: Vec::new(),
+            request_descriptor_hashes: Vec::new(),
             evidence_hashes: Vec::new(),
         };
         let prepared = PreparedPolymarketBuy {
@@ -2486,7 +2495,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                     admission,
-                    account_state: LiveAccountStateAudit {
+                    account_state: legacy_v1::LiveAccountStateAudit {
                         observed_at: at,
                         closed_only: false,
                         geoblocked: false,

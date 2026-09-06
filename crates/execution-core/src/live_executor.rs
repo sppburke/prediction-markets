@@ -120,6 +120,8 @@ pub struct LiveVenueAccountState {
     pub schema_version: u16,
     pub parser_version: u16,
     pub evidence: Vec<RawHttpAttempt>,
+    /// Descriptor hashes in response order; transport failures have no response descriptor entry.
+    pub request_descriptor_hashes: Vec<String>,
 }
 
 impl LiveVenueAccountState {
@@ -136,6 +138,7 @@ impl LiveVenueAccountState {
             schema_version: self.schema_version,
             parser_version: self.parser_version,
             evidence: self.evidence.clone(),
+            request_descriptor_hashes: self.request_descriptor_hashes.clone(),
             evidence_hashes: http_attempt_hashes(&self.evidence)?,
         })
     }
@@ -145,6 +148,8 @@ impl LiveVenueAccountState {
 pub struct LiveVenueAccountReadError {
     pub kind: LiveAccountReadFailure,
     pub evidence: Vec<RawHttpAttempt>,
+    /// Descriptor hashes in response order for responses retained by the failed read.
+    pub request_descriptor_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -378,6 +383,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 economic,
                 None,
                 Vec::new(),
+                Vec::new(),
                 LiveAdmissionRefusal::ModeNotArmed,
             );
         }
@@ -398,6 +404,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 economic,
                 None,
                 Vec::new(),
+                Vec::new(),
                 LiveAdmissionRefusal::CredentialVersionChanged,
             );
         }
@@ -406,7 +413,15 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         let required = match validate_artifact_and_ladder(&request, now) {
             Ok(required) => required,
             Err(reason) => {
-                return self.refuse(&request, now, economic, None, Vec::new(), reason);
+                return self.refuse(
+                    &request,
+                    now,
+                    economic,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    reason,
+                );
             }
         };
 
@@ -423,6 +438,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     economic,
                     None,
                     error.evidence,
+                    error.request_descriptor_hashes,
                     LiveAdmissionRefusal::AccountStateUnavailable(error.kind),
                 );
             }
@@ -437,6 +453,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 economic,
                 Some(account_audit),
                 Vec::new(),
+                Vec::new(),
                 LiveAdmissionRefusal::AccountClosedOnly,
             );
         }
@@ -446,6 +463,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 now,
                 economic,
                 Some(account_audit),
+                Vec::new(),
                 Vec::new(),
                 LiveAdmissionRefusal::Geoblocked,
             );
@@ -459,6 +477,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 economic,
                 Some(account_audit),
                 Vec::new(),
+                Vec::new(),
                 LiveAdmissionRefusal::InsufficientBalance {
                     required,
                     available: account.collateral_balance,
@@ -471,6 +490,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 now,
                 economic,
                 Some(account_audit),
+                Vec::new(),
                 Vec::new(),
                 LiveAdmissionRefusal::InsufficientAllowance {
                     required,
@@ -487,6 +507,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 economic,
                 Some(account_audit),
                 Vec::new(),
+                Vec::new(),
                 LiveAdmissionRefusal::WorstCaseDebitExceedsFreeCollateral {
                     required,
                     available: account.reconciled_free_collateral,
@@ -499,6 +520,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             now,
             economic.clone(),
             Some(account_audit.clone()),
+            Vec::new(),
             Vec::new(),
             LiveAdmissionVerdict::Approved,
         )?;
@@ -695,6 +717,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         economic: crate::economic::EconomicPrepared,
         account_state: Option<LiveAccountStateAudit>,
         failure_evidence: Vec<RawHttpAttempt>,
+        failure_request_descriptor_hashes: Vec<String>,
         reason: LiveAdmissionRefusal,
     ) -> Result<LivePrepareResult<V::Submission>, LiveExecutorError> {
         self.journal_admission(
@@ -703,6 +726,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             economic,
             account_state,
             failure_evidence,
+            failure_request_descriptor_hashes,
             LiveAdmissionVerdict::Refused(reason.clone()),
         )?;
         Ok(LivePrepareResult::Terminal(LiveOrderOutcome::Refused {
@@ -718,6 +742,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         economic: crate::economic::EconomicPrepared,
         account_state: Option<LiveAccountStateAudit>,
         failure_evidence: Vec<RawHttpAttempt>,
+        failure_request_descriptor_hashes: Vec<String>,
         verdict: LiveAdmissionVerdict,
     ) -> Result<(), LiveJournalError> {
         let failure_hashes = http_attempt_hashes(&failure_evidence)?;
@@ -733,6 +758,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 economic,
                 account_state,
                 account_read_failure_evidence: failure_evidence,
+                account_read_failure_request_descriptor_hashes: failure_request_descriptor_hashes,
                 account_read_failure_evidence_hashes: failure_hashes,
                 verdict,
             })),
@@ -1206,6 +1232,7 @@ mod tests {
             schema_version: 1,
             parser_version: 1,
             evidence: vec![RawHttpAttempt::Response(raw_response("account-state"))],
+            request_descriptor_hashes: Vec::new(),
         }
     }
 
@@ -1770,6 +1797,7 @@ mod tests {
             Err(LiveVenueAccountReadError {
                 kind: LiveAccountReadFailure::Authentication,
                 evidence,
+                request_descriptor_hashes: Vec::new(),
             }),
             LiveAdmissionRefusal::AccountStateUnavailable(LiveAccountReadFailure::Authentication),
         )

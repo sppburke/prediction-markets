@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use age::x25519::Identity;
 use pe_copy_signal_engine::LeaderSignal;
-use pe_core_types::http_evidence::SanitizedHttpRequestDescriptor;
 use pe_core_types::{
     AccountId, CollateralAmount, KellyFraction, MarketId, MarketOutcomeId, OutcomeId,
     PolymarketConditionId, Price, Probability, RawHttpAttempt, ReceivedAt, ShareAmount, Side,
@@ -19,7 +18,7 @@ use pe_core_types::{
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
 use pe_execution_core::live_journal::{
     LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
-    verify_http_response_request, verify_polygon_reconciliation,
+    SanitizedHttpRequestDescriptor, verify_http_response_request, verify_polygon_reconciliation,
 };
 use pe_execution_core::{
     CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
@@ -2653,6 +2652,7 @@ fn verify_account_state(
     if !binding.is_valid_for(&binding.account_id) {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
+    let mut request_descriptor_hashes = account.request_descriptor_hashes.iter();
     for attempt in &account.evidence {
         let RawHttpAttempt::Response(response) = attempt else {
             continue;
@@ -2664,19 +2664,28 @@ fn verify_account_state(
             0,
             response.ordered_query.clone(),
         );
-        verify_http_response_request(response, &descriptor)
+        let retained_descriptor_hash = request_descriptor_hashes
+            .next()
+            .ok_or(ProjectionReducerError::InvalidAccountEvidence)?;
+        verify_http_response_request(&descriptor, retained_descriptor_hash)
             .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+    }
+    if request_descriptor_hashes.next().is_some() {
+        return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
     let evidence_hashes = http_attempt_hashes(&account.evidence)
         .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     if evidence_hashes != account.evidence_hashes {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
-    let expected =
-        classify_account_responses(account.evidence.clone(), account.selected_spender.clone())
-            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?
-            .audit()
-            .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
+    let expected = classify_account_responses(
+        account.evidence.clone(),
+        account.selected_spender.clone(),
+        account.request_descriptor_hashes.clone(),
+    )
+    .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?
+    .audit()
+    .map_err(|_| ProjectionReducerError::InvalidAccountEvidence)?;
     if *account != expected {
         return Err(ProjectionReducerError::InvalidAccountEvidence);
     }
@@ -6518,6 +6527,7 @@ mod tests {
                 Err(LiveVenueAccountReadError {
                     kind: LiveAccountReadFailure::Protocol,
                     evidence: Vec::new(),
+                    request_descriptor_hashes: Vec::new(),
                 })
             })
         }
@@ -6664,7 +6674,7 @@ mod tests {
                         path: &str,
                         ordered_query: Vec<(String, String)>,
                         body: Vec<u8>| {
-            let mut response = pe_core_types::RawHttpResponse {
+            RawHttpAttempt::Response(pe_core_types::RawHttpResponse {
                 source_id: "polymarket-clob-v2".to_owned(),
                 endpoint_kind: endpoint_kind.to_owned(),
                 method: "GET".to_owned(),
@@ -6680,20 +6690,7 @@ mod tests {
                 schema_version: 1,
                 parser_version: 1,
                 adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
-            };
-            let descriptor = binding.request_descriptor(
-                response.method.clone(),
-                response.path.clone(),
-                response.endpoint_kind.clone(),
-                0,
-                response.ordered_query.clone(),
-            );
-            pe_execution_core::live_journal::bind_http_response_to_request(
-                &mut response,
-                &descriptor,
-            )
-            .unwrap();
-            RawHttpAttempt::Response(response)
+            })
         };
         let evidence = vec![
             response(
@@ -6725,6 +6722,7 @@ mod tests {
                 .unwrap(),
             ),
         ];
+        let request_descriptor_hashes = account_request_descriptor_hashes(&evidence, binding);
         pe_execution_core::LiveAccountStateAudit {
             observed_at,
             closed_only: false,
@@ -6735,9 +6733,35 @@ mod tests {
             reconciled_free_collateral: cash,
             schema_version: 1,
             parser_version: 1,
+            request_descriptor_hashes,
             evidence_hashes: http_attempt_hashes(&evidence).unwrap(),
             evidence,
         }
+    }
+
+    fn account_request_descriptor_hashes(
+        evidence: &[RawHttpAttempt],
+        binding: &LiveAccountBindingAudit,
+    ) -> Vec<String> {
+        evidence
+            .iter()
+            .filter_map(|attempt| match attempt {
+                RawHttpAttempt::Response(response) => Some(response),
+                RawHttpAttempt::TransportFailure(_) => None,
+            })
+            .map(|response| {
+                pe_execution_core::live_journal::request_descriptor_hash(
+                    &binding.request_descriptor(
+                        response.method.clone(),
+                        response.path.clone(),
+                        response.endpoint_kind.clone(),
+                        0,
+                        response.ordered_query.clone(),
+                    ),
+                )
+                .unwrap()
+            })
+            .collect()
     }
 
     /// PASS: every runtime-success classification produces an audit accepted by the reducer for
@@ -6813,18 +6837,24 @@ mod tests {
                 let ordered_evidence = order
                     .into_iter()
                     .map(|index| evidence[index].clone())
-                    .collect();
-                let classified = classify_account_responses(ordered_evidence, spender.clone());
+                    .collect::<Vec<_>>();
+                let account_id = AccountId::new("account").unwrap();
+                let binding = account_binding_fixture(
+                    &account_id,
+                    "0x1111111111111111111111111111111111111111",
+                );
+                let request_descriptor_hashes =
+                    account_request_descriptor_hashes(&ordered_evidence, &binding);
+                let classified = classify_account_responses(
+                    ordered_evidence,
+                    spender.clone(),
+                    request_descriptor_hashes,
+                );
 
                 if let Some(expected_allowance) = expected_allowance {
                     let state = classified.unwrap();
                     assert_eq!(state.allowance, expected_allowance);
                     let audit = state.audit().unwrap();
-                    let account_id = AccountId::new("account").unwrap();
-                    let binding = account_binding_fixture(
-                        &account_id,
-                        "0x1111111111111111111111111111111111111111",
-                    );
                     verify_account_state(&audit, &binding).unwrap();
                 } else {
                     assert_eq!(
@@ -7111,6 +7141,7 @@ mod tests {
                 schema_version: 1,
                 parser_version: 1,
                 evidence: Vec::new(),
+                request_descriptor_hashes: Vec::new(),
                 evidence_hashes: Vec::new(),
             },
             prepared: pe_venue_polymarket::PreparedPolymarketBuy {
@@ -8082,6 +8113,19 @@ mod tests {
             derive_projection_rows_with_sources(
                 &account_id,
                 &[copied_hash],
+                &baseline_sources(&account_id),
+            ),
+            Err(ProjectionReducerError::InvalidAccountEvidence)
+        ));
+
+        let mut copied_request_hash = baseline_event(&account_id, 1);
+        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut copied_request_hash.payload {
+            mark.account_state.request_descriptor_hashes[0] = "rewritten".to_owned();
+        }
+        assert!(matches!(
+            derive_projection_rows_with_sources(
+                &account_id,
+                &[copied_request_hash],
                 &baseline_sources(&account_id),
             ),
             Err(ProjectionReducerError::InvalidAccountEvidence)

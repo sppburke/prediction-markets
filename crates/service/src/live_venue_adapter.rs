@@ -18,7 +18,7 @@ use pe_core_types::{
     RawTransportFailure, ReceivedAt, SourceId, SourceTimestamp, TransportErrorClass, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
-use pe_execution_core::live_journal::{LiveAccountBindingAudit, bind_http_response_to_request};
+use pe_execution_core::live_journal::{LiveAccountBindingAudit, request_descriptor_hash};
 use pe_execution_core::{
     AdmissionReceipts, LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact,
     LiveExecutedAmounts, LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification,
@@ -335,16 +335,23 @@ impl PolymarketLiveVenue {
     ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (mut evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
-        bind_account_read_responses(&mut evidence, &self.account_binding)
-            .map_err(|()| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
+        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
+        let request_descriptor_hashes =
+            bind_account_read_responses(&evidence, &self.account_binding).map_err(|()| {
+                account_read_error(
+                    LiveAccountReadFailure::Protocol,
+                    evidence.clone(),
+                    Vec::new(),
+                )
+            })?;
         if protocol_failure.is_some() {
             return Err(account_read_error(
                 LiveAccountReadFailure::Protocol,
                 evidence,
+                request_descriptor_hashes,
             ));
         }
-        parse_account_state(evidence, neg_risk)
+        parse_account_state(evidence, neg_risk, request_descriptor_hashes)
     }
 
     pub(crate) async fn account_states(
@@ -353,17 +360,25 @@ impl PolymarketLiveVenue {
     {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (mut evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
-        bind_account_read_responses(&mut evidence, &self.account_binding)
-            .map_err(|()| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
+        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
+        let request_descriptor_hashes =
+            bind_account_read_responses(&evidence, &self.account_binding).map_err(|()| {
+                account_read_error(
+                    LiveAccountReadFailure::Protocol,
+                    evidence.clone(),
+                    Vec::new(),
+                )
+            })?;
         if protocol_failure.is_some() {
             return Err(account_read_error(
                 LiveAccountReadFailure::Protocol,
                 evidence,
+                request_descriptor_hashes,
             ));
         }
-        let standard = parse_account_state(evidence.clone(), false)?;
-        let neg_risk = parse_account_state(evidence, true)?;
+        let standard =
+            parse_account_state(evidence.clone(), false, request_descriptor_hashes.clone())?;
+        let neg_risk = parse_account_state(evidence, true, request_descriptor_hashes)?;
         Ok((
             BoundLiveVenueAccountState {
                 state: standard,
@@ -378,31 +393,26 @@ impl PolymarketLiveVenue {
 }
 
 fn bind_account_read_responses(
-    evidence: &mut [RawEvidence],
+    evidence: &[RawEvidence],
     binding: &LiveAccountBindingAudit,
-) -> Result<(), ()> {
-    if evidence.iter().any(|item| match item {
-        RawEvidence::HttpResponse(response) => response.headers.iter().any(|(name, _)| {
-            name.eq_ignore_ascii_case(pe_core_types::http_evidence::REQUEST_DESCRIPTOR_HASH_HEADER)
-        }),
-        RawEvidence::HttpTransportFailure(_) | RawEvidence::Artifact(_) => false,
-    }) {
-        return Err(());
-    }
-    for item in evidence {
-        let RawEvidence::HttpResponse(response) = item else {
-            continue;
-        };
-        let descriptor = binding.request_descriptor(
-            response.method.clone(),
-            response.path.clone(),
-            response.endpoint_kind.clone(),
-            0,
-            response.ordered_query.clone(),
-        );
-        bind_http_response_to_request(response, &descriptor).map_err(|_| ())?;
-    }
-    Ok(())
+) -> Result<Vec<String>, ()> {
+    evidence
+        .iter()
+        .filter_map(|item| match item {
+            RawEvidence::HttpResponse(response) => Some(response),
+            RawEvidence::HttpTransportFailure(_) | RawEvidence::Artifact(_) => None,
+        })
+        .map(|response| {
+            let descriptor = binding.request_descriptor(
+                response.method.clone(),
+                response.path.clone(),
+                response.endpoint_kind.clone(),
+                0,
+                response.ordered_query.clone(),
+            );
+            request_descriptor_hash(&descriptor).map_err(|_| ())
+        })
+        .collect()
 }
 
 fn live_account_credential_fingerprint(credentials: &LiveAccountCredentials) -> String {
@@ -741,16 +751,24 @@ fn canonical_nonzero_transaction_hash(value: &str) -> Option<String> {
 fn parse_account_state(
     evidence: Vec<RawEvidence>,
     neg_risk: bool,
+    request_descriptor_hashes: Vec<String>,
 ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
     let selected_spender = if neg_risk {
         CanaryV2Client::negrisk_spender()
     } else {
         CanaryV2Client::standard_spender()
     }
-    .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
+    .map_err(|_| {
+        account_read_error(
+            LiveAccountReadFailure::Protocol,
+            evidence.clone(),
+            request_descriptor_hashes.clone(),
+        )
+    })?;
     classify_account_responses(
         evidence.into_iter().filter_map(raw_attempt).collect(),
         selected_spender,
+        request_descriptor_hashes,
     )
 }
 
@@ -758,15 +776,18 @@ fn parse_account_state(
 pub(crate) fn classify_account_responses(
     evidence: Vec<RawHttpAttempt>,
     selected_spender: String,
+    request_descriptor_hashes: Vec<String>,
 ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
+    let account_error = |kind| LiveVenueAccountReadError {
+        kind,
+        evidence: evidence.clone(),
+        request_descriptor_hashes: request_descriptor_hashes.clone(),
+    };
     if evidence
         .iter()
         .any(|item| matches!(item, RawHttpAttempt::TransportFailure(_)))
     {
-        return Err(classified_account_error(
-            LiveAccountReadFailure::Transport,
-            evidence,
-        ));
+        return Err(account_error(LiveAccountReadFailure::Transport));
     }
     if evidence.len() != 3
         || !is_known_account_spender(&selected_spender)
@@ -774,15 +795,11 @@ pub(crate) fn classify_account_responses(
             .into_iter()
             .any(|kind| response_by_kind(&evidence, kind).is_none())
     {
-        return Err(classified_account_error(
-            LiveAccountReadFailure::Protocol,
-            evidence,
-        ));
+        return Err(account_error(LiveAccountReadFailure::Protocol));
     }
     let response = |kind: &str| {
-        response_by_kind(&evidence, kind).ok_or_else(|| {
-            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-        })
+        response_by_kind(&evidence, kind)
+            .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))
     };
     let geoblock = response("geoblock")?;
     let closed_only_response = response("closed-only")?;
@@ -791,10 +808,7 @@ pub(crate) fn classify_account_responses(
         .iter()
         .any(|response| response.status == 401 || response.status == 403)
     {
-        return Err(classified_account_error(
-            LiveAccountReadFailure::Authentication,
-            evidence,
-        ));
+        return Err(account_error(LiveAccountReadFailure::Authentication));
     }
     if !valid_account_response(geoblock, "geoblock", "/api/geoblock", &[])
         || !valid_account_response(
@@ -810,64 +824,46 @@ pub(crate) fn classify_account_responses(
             &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
         )
     {
-        return Err(classified_account_error(
-            LiveAccountReadFailure::Protocol,
-            evidence,
-        ));
+        return Err(account_error(LiveAccountReadFailure::Protocol));
     }
-    let geoblock_json = response_json(geoblock).map_err(|_| {
-        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-    })?;
-    let closed_json = response_json(closed_only_response).map_err(|_| {
-        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-    })?;
-    let balance_json = response_json(balance).map_err(|_| {
-        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-    })?;
+    let geoblock_json =
+        response_json(geoblock).map_err(|_| account_error(LiveAccountReadFailure::Protocol))?;
+    let closed_json = response_json(closed_only_response)
+        .map_err(|_| account_error(LiveAccountReadFailure::Protocol))?;
+    let balance_json =
+        response_json(balance).map_err(|_| account_error(LiveAccountReadFailure::Protocol))?;
     let blocked = geoblock_json
         .get("blocked")
         .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-        })?;
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
     let country = geoblock_json
         .get("country")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-        })?;
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
     let geoblocked = blocked && !matches!(country, "IE" | "JP" | "MT" | "NL");
     let closed_only = closed_json
         .get("closed_only")
         .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-        })?;
-    let collateral_balance = atomic_amount(balance_json.get("balance")).ok_or_else(|| {
-        classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-    })?;
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
+    let collateral_balance = atomic_amount(balance_json.get("balance"))
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
     let allowances = balance_json
         .get("allowances")
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-        })?;
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
     let allowance = match allowances
         .iter()
         .find(|(spender, _)| spender.eq_ignore_ascii_case(&selected_spender))
     {
-        Some((_, value)) => atomic_amount(Some(value)).ok_or_else(|| {
-            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-        })?,
+        Some((_, value)) => atomic_amount(Some(value))
+            .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?,
         None => CollateralAmount::ZERO,
     };
     let observed_at = [geoblock, closed_only_response, balance]
         .iter()
         .map(|response| response.observed_at)
         .min()
-        .ok_or_else(|| {
-            classified_account_error(LiveAccountReadFailure::Protocol, evidence.clone())
-        })?;
+        .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?;
     Ok(LiveVenueAccountState {
         observed_at,
         closed_only,
@@ -881,6 +877,7 @@ pub(crate) fn classify_account_responses(
         schema_version: 1,
         parser_version: 1,
         evidence,
+        request_descriptor_hashes,
     })
 }
 
@@ -933,20 +930,15 @@ fn valid_account_response(
         && response.adapter_version == pe_venue_polymarket::SDK_VERSION
 }
 
-fn classified_account_error(
-    kind: LiveAccountReadFailure,
-    evidence: Vec<RawHttpAttempt>,
-) -> LiveVenueAccountReadError {
-    LiveVenueAccountReadError { kind, evidence }
-}
-
 fn account_read_error(
     kind: LiveAccountReadFailure,
     evidence: Vec<RawEvidence>,
+    request_descriptor_hashes: Vec<String>,
 ) -> LiveVenueAccountReadError {
     LiveVenueAccountReadError {
         kind,
         evidence: evidence.into_iter().filter_map(raw_attempt).collect(),
+        request_descriptor_hashes,
     }
 }
 
@@ -1576,6 +1568,102 @@ mod tests {
             parser_version: 1,
             adapter_version: "test".to_owned(),
         }
+    }
+
+    /// PASS: an external account response carrying the former internal sentinel name remains
+    /// literal response evidence and is classified with its separate request descriptor hash.
+    #[test]
+    fn account_response_accepts_literal_request_descriptor_named_header() {
+        let account_id = AccountId::new("account").unwrap();
+        let custody_wallet =
+            WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap();
+        let binding = LiveAccountBindingAudit::new(
+            account_id,
+            pe_execution_core::CredentialBindingIdentity {
+                version: 1,
+                key_id: "key".to_owned(),
+            },
+            custody_wallet,
+            blake3::hash(b"credential").to_hex().to_string(),
+        );
+        let spender = CanaryV2Client::standard_spender().unwrap();
+        let response = |endpoint_kind: &str,
+                        path: &str,
+                        ordered_query: Vec<(String, String)>,
+                        headers: Vec<(String, String)>,
+                        body: Vec<u8>| {
+            RawEvidence::HttpResponse(RawHttpResponse {
+                source_id: "polymarket-clob-v2".to_owned(),
+                endpoint_kind: endpoint_kind.to_owned(),
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                ordered_query,
+                status: 200,
+                headers,
+                body,
+                attempt_ordinal: 1,
+                source_at: None,
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+                received_at: OffsetDateTime::UNIX_EPOCH,
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+            })
+        };
+        let literal_header = (
+            "x-pe-request-descriptor-blake3".to_owned(),
+            "venue-value".to_owned(),
+        );
+        let evidence = vec![
+            response(
+                "geoblock",
+                "/api/geoblock",
+                Vec::new(),
+                vec![literal_header.clone()],
+                br#"{"blocked":false,"country":"US"}"#.to_vec(),
+            ),
+            response(
+                "closed-only",
+                "/auth/ban-status/closed-only",
+                Vec::new(),
+                Vec::new(),
+                br#"{"closed_only":false}"#.to_vec(),
+            ),
+            response(
+                "balance-allowance",
+                "/balance-allowance",
+                vec![
+                    ("asset_type".to_owned(), "COLLATERAL".to_owned()),
+                    ("signature_type".to_owned(), "3".to_owned()),
+                ],
+                Vec::new(),
+                serde_json::to_vec(&json!({
+                    "balance": "1000000",
+                    "allowances": { spender.clone(): "1000000" },
+                }))
+                .unwrap(),
+            ),
+        ];
+
+        let descriptor_hashes = bind_account_read_responses(&evidence, &binding).unwrap();
+        let headers = evidence
+            .iter()
+            .find_map(|item| match item {
+                RawEvidence::HttpResponse(response) if response.endpoint_kind == "geoblock" => {
+                    Some(&response.headers)
+                }
+                RawEvidence::HttpResponse(_)
+                | RawEvidence::HttpTransportFailure(_)
+                | RawEvidence::Artifact(_) => None,
+            })
+            .unwrap();
+        assert_eq!(headers.as_slice(), &[literal_header]);
+        let attempts = evidence.into_iter().filter_map(raw_attempt).collect();
+        let state = classify_account_responses(attempts, spender, descriptor_hashes).unwrap();
+        assert_eq!(
+            state.collateral_balance,
+            CollateralAmount::from_atomic(1_000_000)
+        );
     }
 
     /// PASS: post evidence retains exact fractional improved quantity for audit-only use.
