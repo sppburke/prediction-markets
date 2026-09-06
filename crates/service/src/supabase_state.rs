@@ -1,22 +1,15 @@
 //! Authoritative Supabase paper-state client (issue #397).
 //!
-//! When `PE_SUPABASE_AUTHORITATIVE=1`, Supabase is the system of record for "the money and
-//! the book": the new `paper_bankroll` + `paper_positions` tables and the reused
-//! `paper_fills` + `settled_markets`. Mutations go through two Postgres RPCs —
-//! [`SupabaseStateClient::commit_fill`] and [`SupabaseStateClient::apply_resolution`] — that
-//! are atomic and idempotent (the SQL gates each money write on the dedup row newly
-//! inserting and mutates `paper_bankroll` via a single self-referencing UPDATE, so the
-//! concurrent fill and resolution tasks cannot lose an update). Local SQLite is mirrored
-//! write-through and is the read cache; `seen_trades`/`leader_positions`/`poll_cursors`/
-//! `meta` stay local-only.
-//!
-//! Financial-era mutations flow through the Prepared-sequenced write-through paths
+//! When `PE_SUPABASE_AUTHORITATIVE=1`, Supabase is the system of record for the paper money
+//! and book. Financial-era mutations flow through the Prepared-sequenced write-through paths
 //! ([`commit_prepared_fill`](SupabaseStateTrait::commit_prepared_fill) and
-//! [`apply_prepared_resolution`](SupabaseStateTrait::apply_prepared_resolution)); the legacy
-//! `commit_fill_v2` shape survives only for the pre-Start migration frame walk. Everything is
-//! generic over [`SupabaseStateTrait`] so scenario tests drive it with an in-memory fake and
-//! inject RPC failures with no live network — mirroring the [`crate::supabase_sink`]
-//! `SinkWriter` seam.
+//! [`apply_prepared_resolution`](SupabaseStateTrait::apply_prepared_resolution)), which call
+//! `commit_fill_v2` and `apply_resolution_v2` with the Start identity, completed predecessor,
+//! and current Prepared sequence. Local SQLite receives the canonical result before Final.
+//! The legacy `commit_fill_v2` request shape survives only for the pre-Start frame walk.
+//! Everything is generic over [`SupabaseStateTrait`] so scenario tests drive it with an in-memory
+//! fake and inject RPC failures with no live network — mirroring the
+//! [`crate::supabase_sink`] `SinkWriter` seam.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -228,8 +221,8 @@ pub struct PreparedResolutionRequest {
     pub settled_at_unix: i64,
 }
 
-/// Idempotent authoritative writes. Abstracted as a trait so scenario tests drive
-/// [`commit_fill_authoritative`] / [`apply_resolution_authoritative`] with an in-memory fake.
+/// Idempotent authoritative writes. Abstracted as a trait so scenario tests drive the legacy
+/// frame-walk and Prepared-sequenced methods with an in-memory fake.
 pub trait SupabaseStateTrait: Send + Sync {
     /// Commit a fill via the authoritative `commit_fill_v2` RPC (#511): typed outcome,
     /// canonical row, lock-first settled refusal.
@@ -269,7 +262,7 @@ pub struct SupabaseStateClient {
     client: reqwest::Client,
     base_url: String,
     token: String,
-    /// Cumulative count of authoritative RPC calls (`commit_fill` + `apply_resolution`),
+    /// Cumulative count of authoritative RPC calls (`commit_fill_v2` + `apply_resolution_v2`),
     /// surfaced in `status.json` so an agent can see the steady-state Supabase write rate.
     /// `Arc` so every clone (one per fill, in the orchestrator) shares the same counter.
     calls: Arc<AtomicU64>,
@@ -509,7 +502,7 @@ impl SupabaseStateClient {
     // ── One-time backfill upserts (SQLite → Supabase, service stopped) ──────────
 
     /// Upsert the bankroll singleton to an exact value (backfill — distinct from the
-    /// delta-based `commit_fill`/`apply_resolution` RPCs; this is the only way to seed the
+    /// Prepared-sequenced financial RPCs; this is the only way to seed the
     /// authoritative balance from the complete local SQLite scalar).
     pub async fn upsert_bankroll(&self, value: Decimal) -> Result<(), SupabaseStateError> {
         let body = serde_json::json!([{ "id": 0, "bankroll_str": value.to_string() }]);
@@ -1636,11 +1629,8 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
 /// the advanced watermark, then pull the authoritative bankroll + positions back into SQLite
 /// so values read after this reflect the Supabase source of truth.
 ///
-/// The settled set is **not** pulled: it self-heals via the gated `apply_resolution` on the
-/// next resolution tick (a market settled in Supabase but missing from SQLite is re-driven —
-/// the RPC gate credits zero, the SQLite `settle_and_credit` mirror inserts+credits once),
-/// which also avoids a fragile jsonb→text round-trip. Fail-closed: a pull error aborts boot
-/// (refuse to run authoritative without the authority).
+/// The settled set is not pulled during this pre-Start compatibility boot. A pull error aborts
+/// boot rather than running without the authority.
 pub async fn supabase_authoritative_boot<S: SupabaseBootTrait + ?Sized>(
     client: &S,
     paper_state: &PaperStateDb,

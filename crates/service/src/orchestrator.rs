@@ -57,8 +57,8 @@ use crate::supabase_state::{
     terminalize_final_fill_decision,
 };
 
-/// Hot-path `/book` fetch timeout for the price-impact gate (#398 WS2). Tighter than the worker's
-/// 5 s per-request timeout so a slow book fails open (no cap) without stalling the trade.
+/// Hot-path `/book` fetch timeout for the mandatory price-impact gate (#398 WS2). A timeout makes
+/// the book unusable and closes copy admission without stalling the trade.
 /// Canonical default in `docs/_GLOSSARY.md`: `clob_book_hot_path_timeout_secs`.
 const CLOB_BOOK_HOT_PATH_TIMEOUT_SECS: u64 = 2;
 
@@ -72,7 +72,7 @@ const LOCAL_COMMIT_RETRY_DELAY_MS: u64 = 100;
 enum GatePlan {
     /// The budget planner produced a within-band plan (quantity/VWAP/limit).
     Planned(LadderPlan),
-    /// The book read SUCCEEDED but the in-band ladder affords no whole share of the paper
+    /// The book read SUCCEEDED but the in-band ladder affords no atomic share for the paper
     /// budget — a paper-only skip that must never suppress live targets (Decision 10). The
     /// best ask anchors the shared band gate.
     NothingAffordable { best_ask: Price },
@@ -268,9 +268,9 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // Liquidity-at-fill snapshot enqueue handle (issue #350 WS2 PR-H). `None` when capture is
     // disabled. Buy-only; enqueue is non-blocking (drop-on-full), off the trade hot path.
     snapshot_sink: Option<SnapshotHandle>,
-    // Authoritative Supabase paper-state client (issue #397). `Some` when
-    // `PE_SUPABASE_AUTHORITATIVE=1`: a paper fill writes the `commit_fill` RPC first
-    // (fail-closed), then mirrors to SQLite. `None` → the legacy SQLite-authoritative path.
+    // Authoritative Supabase paper-state client (issue #397). In the financial era, `Some` owns
+    // the Prepared-sequenced authority mutation before the local projection and Final append.
+    // `None` is the legacy SQLite-authoritative path.
     supabase_state: Option<SupabaseStateClient>,
     // Supabase-authoritative runtime config (#398 WS1). `Some` in production; the per-event
     // rebuild at the top of `handle_trade` reads one snapshot. `None` in tests (boot config).
@@ -1599,15 +1599,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
     // ── Private handlers ──────────────────────────────────────────────────────
 
-    /// Impact-gate ladder plan (#508 Phase A): ONE `/book` fetch per admitted signal feeds
-    /// the band gate, the budget planner, and (in `clob_best_ask` paper mode) the fill basis.
+    /// Impact-gate ladder plan (#508 Phase A): one `/book` fetch per admitted signal feeds
+    /// the band gate, sizing plan, and paper fill basis.
     ///
     /// Called only when the gate is enabled (`price_impact_cap_bps ≥ 1`). Every failure is a
     /// typed skip reason and **fails closed** — unusable book (missing token, fetch
     /// error/timeout, corrupt levels, empty ladder, stale snapshot) and an in-band ladder
-    /// affording no whole share both produce no order. The planner budget follows the sizing
-    /// mode: `Dollar` plans within its USD notional; `Contract` caps at the requested count
-    /// within the available bankroll; `Kelly` plans the full in-band depth within bankroll.
+    /// affording no atomic share both produce no order. The planner budget follows the sizing
+    /// mode: `Dollar` requests its USD notional; `Contract` requests its exact configured count;
+    /// `Kelly` requests its allocator result. The venue planner declines requests that depth or a
+    /// monetary bound cannot satisfy.
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
@@ -2526,11 +2527,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
         };
 
-        // Mandatory price-impact gate (#508 Phase A, #544): ONE `/book` fetch produces the
-        // executable-ladder plan that feeds the band gate, the size cap, and (in
-        // `clob_best_ask` paper mode) the VWAP fill basis. An unusable book — missing token,
-        // fetch error/timeout, corrupt/empty/stale — fails CLOSED (skip), as does an in-band
-        // ladder that affords no whole share.
+        // Mandatory price-impact gate (#508 Phase A, #544): one `/book` fetch produces the
+        // executable-ladder plan that feeds the band gate, sizing plan, and VWAP fill basis.
+        // An unusable book — missing token, fetch error/timeout, corrupt/empty/stale — fails
+        // closed, as does an in-band ladder that affords no atomic share.
         // A resumed continuation evaluates under its frozen basis; only a fresh
         // decision reads the live watchlist and bankroll (#544 review round 3).
         // Selected BEFORE the impact gate so ladder budget, VWAP, and strategy
@@ -2761,7 +2761,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
 
         // Paper-only zero-absorb skip (#508 Decision 10): the successful admission quote
-        // could not absorb one whole share of the paper budget.
+        // could not absorb an atomic share for the paper budget.
         if matches!(&gate, GatePlan::NothingAffordable { .. }) {
             info!(
                 reason = "impact band absorbs no whole share of the paper budget (paper-only)",
