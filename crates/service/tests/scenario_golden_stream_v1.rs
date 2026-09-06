@@ -2066,7 +2066,11 @@ async fn golden_source_stream_replays_exact_economic_core() {
                     .unwrap();
             let live_venue = GoldenLiveVenue;
             let live_executor = LiveExecutor::new(&live_venue, &live_journal);
-            let live_prepared = match live_executor.prepare(live_request, live_now).await.unwrap() {
+            let live_prepared = match live_executor
+                .prepare_with_clock(live_request, move || live_now)
+                .await
+                .unwrap()
+            {
                 LivePrepareResult::Prepared(prepared) => prepared,
                 LivePrepareResult::Terminal(outcome) => {
                     panic!("golden live wrapper preparation terminated: {outcome:?}")

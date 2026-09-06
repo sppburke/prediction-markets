@@ -1224,7 +1224,7 @@ async fn main() -> Result<()> {
                 .clone()
                 .with_source_log(resolution_source_log.clone()),
             source_log: resolution_source_log.clone(),
-            source_log_path: cfg.source_event_log_path.clone(),
+            source_receipt_millis: source_receipt_millis.clone(),
             paper_log_path: cfg.event_log_path.clone(),
             orchestrator_control: control_tx.clone(),
             http: live_http_client,

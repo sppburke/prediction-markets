@@ -892,15 +892,22 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 /// Boot replays the source log once to populate this append-only map. The sole synchronized
 /// source-log coordinator records each later append before acknowledging its receipt, so runtime
 /// paper risk and incident release never need to replay the growing source prefix.
+#[derive(Default)]
+struct SourceReceiptIndexState {
+    entries: BTreeMap<EventSeq, (AppendReceipt, i64)>,
+    envelopes: Arc<Vec<pe_event_log::EventEnvelope>>,
+}
+
 #[derive(Clone, Default)]
 pub struct SourceReceiptMillisIndex {
-    entries: Arc<RwLock<BTreeMap<EventSeq, (AppendReceipt, i64)>>>,
+    state: Arc<RwLock<SourceReceiptIndexState>>,
 }
 
 impl SourceReceiptMillisIndex {
     /// Rebuild the complete verified source-log projection at boot.
     pub fn replay(source_log_path: &Path) -> Result<Self, RiskInputsUnavailable> {
         let mut entries = BTreeMap::new();
+        let mut envelopes = Vec::new();
         for item in
             Reader::replay(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)?
         {
@@ -916,9 +923,13 @@ impl SourceReceiptMillisIndex {
             {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
+            envelopes.push(envelope);
         }
         Ok(Self {
-            entries: Arc::new(RwLock::new(entries)),
+            state: Arc::new(RwLock::new(SourceReceiptIndexState {
+                entries,
+                envelopes: Arc::new(envelopes),
+            })),
         })
     }
 
@@ -926,21 +937,62 @@ impl SourceReceiptMillisIndex {
     pub(crate) fn record_synced_append(
         &self,
         receipt: AppendReceipt,
-        received_at: &ReceivedAt,
+        envelope: &pe_event_log::EnvelopeIn,
     ) -> Result<(), RiskInputsUnavailable> {
-        let received_millis = received_at_millis(received_at)?;
-        let mut entries = self
-            .entries
+        let received_millis = received_at_millis(&envelope.received_at)?;
+        let mut state = self
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(known) = entries.get(&receipt.sequence) {
+        if let Some(known) = state.entries.get(&receipt.sequence) {
             return if *known == (receipt, received_millis) {
                 Ok(())
             } else {
                 Err(RiskInputsUnavailable::PriceConflict)
             };
         }
-        entries.insert(receipt.sequence, (receipt, received_millis));
+        let expected_sequence = u64::try_from(state.envelopes.len())
+            .map(EventSeq)
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if receipt.sequence != expected_sequence {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        let prev_hash = state
+            .envelopes
+            .last()
+            .map_or(blake3::Hash::from_bytes([0; 32]), |known| known.this_hash);
+        let (raw_payload_hash, _, this_hash) =
+            pe_event_log::envelope::compute_hashes(pe_event_log::envelope::HashInput {
+                seq: receipt.sequence,
+                source_id: &envelope.source_id,
+                schema_version: envelope.schema_version,
+                parser_version: envelope.parser_version,
+                observed_at: &envelope.observed_at,
+                received_at: &envelope.received_at,
+                content_type: &envelope.content_type,
+                prev_hash: &prev_hash,
+                payload: &envelope.payload,
+            })
+            .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        if this_hash != receipt.this_hash {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        Arc::make_mut(&mut state.envelopes).push(pe_event_log::EventEnvelope {
+            seq: receipt.sequence,
+            source_id: envelope.source_id.clone(),
+            schema_version: envelope.schema_version,
+            parser_version: envelope.parser_version,
+            observed_at: envelope.observed_at.clone(),
+            received_at: envelope.received_at.clone(),
+            content_type: envelope.content_type.clone(),
+            raw_payload_hash,
+            prev_hash,
+            this_hash,
+            payload: envelope.payload.clone(),
+        });
+        state
+            .entries
+            .insert(receipt.sequence, (receipt, received_millis));
         Ok(())
     }
 
@@ -948,18 +1000,28 @@ impl SourceReceiptMillisIndex {
         &self,
         receipt: AppendReceipt,
     ) -> Result<i64, RiskInputsUnavailable> {
-        let entries = self
-            .entries
+        let state = self
+            .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        source_receipt_received_millis(&entries, receipt)
+        source_receipt_received_millis(&state.entries, receipt)
+    }
+
+    /// Take one internally verified, append-extended source-evidence snapshot.
+    pub(crate) fn source_envelopes(&self) -> Arc<Vec<pe_event_log::EventEnvelope>> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .envelopes
+            .clone()
     }
 
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> BTreeMap<EventSeq, (AppendReceipt, i64)> {
-        self.entries
+        self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .clone()
     }
 }

@@ -882,7 +882,7 @@ impl LiveAdmissionBuilder {
         );
         let clob_url = format!("{}/markets/{}", self.clob_base_url, condition_id.0);
         let compact_url = format!("{}/clob-markets/{}", self.clob_base_url, condition_id.0);
-        let (gamma_raw, gamma_receipt) = self
+        let (gamma_raw, gamma_receipt, gamma_received_at) = self
             .fetch_and_record(
                 &gamma_url,
                 GAMMA_MARKETS_SOURCE_ID,
@@ -890,7 +890,7 @@ impl LiveAdmissionBuilder {
                 GAMMA_MARKETS_PARSER_VERSION,
             )
             .await?;
-        let (clob_raw, clob_long_receipt) = self
+        let (clob_raw, clob_long_receipt, clob_long_received_at) = self
             .fetch_and_record(
                 &clob_url,
                 CLOB_LONG_MARKET_SOURCE_ID,
@@ -898,7 +898,7 @@ impl LiveAdmissionBuilder {
                 LIVE_MARKET_PARSER_VERSION,
             )
             .await?;
-        let market = validate_live_market(
+        let mut market = validate_live_market(
             &gamma_raw,
             &clob_raw,
             condition_id,
@@ -906,7 +906,10 @@ impl LiveAdmissionBuilder {
             LIVE_MARKET_FRESHNESS_SECS,
         )
         .map_err(|error| LiveVenueAdapterError::MarketValidation(error.to_string()))?;
-        let (compact_raw, clob_compact_receipt) = self
+        market.observed_at_unix = gamma_received_at
+            .max(clob_long_received_at)
+            .unix_timestamp();
+        let (compact_raw, clob_compact_receipt, _compact_received_at) = self
             .fetch_and_record(
                 &compact_url,
                 CLOB_COMPACT_MARKET_SOURCE_ID,
@@ -937,7 +940,7 @@ impl LiveAdmissionBuilder {
             status: VenueResolutionStatus::Unresolved,
             raw_evidence_hash: blake3::hash(&clob_raw).to_hex().to_string(),
             source_timestamp_unix: None,
-            observed_at_unix: now.unix_timestamp(),
+            observed_at_unix: clob_long_received_at.unix_timestamp(),
             parser_version: 1,
             freshness_window_secs: LIVE_MARKET_FRESHNESS_SECS,
         };
@@ -959,7 +962,7 @@ impl LiveAdmissionBuilder {
         source_id: &str,
         schema_version: u32,
         parser_version: u32,
-    ) -> Result<(Vec<u8>, pe_event_log::AppendReceipt), LiveVenueAdapterError> {
+    ) -> Result<(Vec<u8>, pe_event_log::AppendReceipt, OffsetDateTime), LiveVenueAdapterError> {
         let response = self
             .client
             .get(url)
@@ -990,7 +993,7 @@ impl LiveAdmissionBuilder {
         if !status.is_success() {
             return Err(LiveVenueAdapterError::MarketStatus(status.as_u16()));
         }
-        Ok((body, receipt))
+        Ok((body, receipt, received_at))
     }
 }
 
