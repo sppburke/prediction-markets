@@ -2071,7 +2071,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                                 return Err(ProjectionReducerError::FinalityObservationConflict);
                             }
                             state.phase = PolygonFinalityPhase::Pending;
-                            merge_immutable_receipts(&mut state.immutable_receipts, immutable)?;
+                            state.immutable_receipts.extend(immutable);
                         }
                         LiveJournalOrderOutcome::FinalityConflict { .. } => {
                             if matches!(
@@ -2121,8 +2121,13 @@ pub(crate) fn derive_projection_rows_with_sources(
                     return Err(ProjectionReducerError::InvalidFinalizedFill);
                 }
                 let finality_state = polygon_finality.entry(key.clone()).or_default();
+                let authenticated_transaction_hashes = matched_transaction_hashes
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 verify_polygon_finalized(
                     prepared_audit,
+                    &authenticated_transaction_hashes,
                     finalized,
                     &finality_state.immutable_receipts,
                 )
@@ -3062,24 +3067,6 @@ fn retained_source_payload<'a>(
         return Err(kind.error());
     }
     Ok(&envelope.payload)
-}
-
-fn merge_immutable_receipts(
-    retained: &mut BTreeMap<String, MatchedReceipt>,
-    observed: BTreeMap<String, MatchedReceipt>,
-) -> Result<(), ProjectionReducerError> {
-    for (hash, receipt) in observed {
-        match retained.get(&hash) {
-            Some(prior) if prior != &receipt => {
-                return Err(ProjectionReducerError::FinalityObservationConflict);
-            }
-            Some(_) => {}
-            None => {
-                retained.insert(hash, receipt);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn verify_resolution_evidence<'a>(
@@ -6950,6 +6937,23 @@ mod tests {
         }
     }
 
+    fn finality_matched_event(
+        account_id: &AccountId,
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        seq: u64,
+        timestamp: OffsetDateTime,
+    ) -> LiveJournalEvent {
+        LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp,
+            payload: LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                prepared,
+                format!("0x{}", "11".repeat(32)),
+            ))),
+        }
+    }
+
     /// PASS: a terminal reconciliation cannot release a reservation unless every Prepared
     /// identity field, order hash, account envelope, and source/outcome pairing match.
     #[test]
@@ -7998,8 +8002,9 @@ mod tests {
         serde_json::to_vec(&receipt).unwrap()
     }
 
-    /// PASS: malformed, economically rewritten, and prior-Pending-contradicting Finals are rejected
-    /// as invalid finality evidence by both recovery inventory and the strict financial reducer.
+    /// PASS: malformed, economically rewritten, inventory-unbound, canonical-query-mismatched,
+    /// and prior-Pending-contradicting Finals are rejected as invalid finality evidence by both
+    /// recovery inventory and the strict financial reducer.
     #[tokio::test]
     async fn finalized_evidence_parity_matrix_rejects_invalid_finals() {
         let account_id = AccountId::new("account").unwrap();
@@ -8045,6 +8050,72 @@ mod tests {
         }
         economic.push(economic_final);
 
+        let second_transaction_hash = format!("0x{}", "22".repeat(32));
+        let mut missing_authenticated_hash = prefix();
+        if let LiveJournalPayload::OrderReconciled(reconciled) =
+            &mut missing_authenticated_hash[2].payload
+            && let LiveJournalOrderOutcome::Matched {
+                transaction_hashes, ..
+            } = &mut reconciled.outcome
+        {
+            transaction_hashes.push(second_transaction_hash.clone());
+        }
+        missing_authenticated_hash.push(finalized_fill_event(&account_id, &prepared, 3, 1));
+
+        let mut substituted_authenticated_hash = prefix();
+        if let LiveJournalPayload::OrderReconciled(reconciled) =
+            &mut substituted_authenticated_hash[2].payload
+            && let LiveJournalOrderOutcome::Matched {
+                transaction_hashes, ..
+            } = &mut reconciled.outcome
+        {
+            *transaction_hashes = vec![second_transaction_hash.clone()];
+        }
+        substituted_authenticated_hash.push(finalized_fill_event(&account_id, &prepared, 3, 1));
+
+        let mut zero_authenticated_hashes = vec![
+            baseline_event(&account_id, 0),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 1,
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+            },
+        ];
+        zero_authenticated_hashes.push(finalized_fill_event(&account_id, &prepared, 2, 1));
+
+        let mut extra_receipt = prefix();
+        let mut extra_receipt_final = finalized_fill_event(&account_id, &prepared, 3, 1);
+        if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut extra_receipt_final.payload
+        {
+            let mut receipt_body: serde_json::Value = serde_json::from_slice(
+                &receipt_for_transaction(&second_transaction_hash, 8, 0, 0, 0),
+            )
+            .unwrap();
+            receipt_body["result"]["logs"] = serde_json::json!([]);
+            let RawHttpAttempt::Response(mut response) = finalized.receipts[1].clone() else {
+                unreachable!();
+            };
+            response.ordered_query[1].1 = serde_json::json!([second_transaction_hash]).to_string();
+            response.body = serde_json::to_vec(&receipt_body).unwrap();
+            finalized.receipts.push(RawHttpAttempt::Response(response));
+        }
+        extra_receipt.push(extra_receipt_final);
+
+        let mut canonical_key_mismatch = prefix();
+        let mut canonical_key_mismatch_final = finalized_fill_event(&account_id, &prepared, 3, 1);
+        if let LiveJournalPayload::OrderFillFinalized(finalized) =
+            &mut canonical_key_mismatch_final.payload
+        {
+            let RawHttpAttempt::Response(mut response) = finalized.blocks[0].clone() else {
+                unreachable!();
+            };
+            response.endpoint_kind = "polygon-canonical-block".to_owned();
+            response.ordered_query[1].1 = serde_json::json!(["0x64", false]).to_string();
+            finalized.blocks.push(RawHttpAttempt::Response(response));
+        }
+        canonical_key_mismatch.push(canonical_key_mismatch_final);
+
         let pending_result = collect_order_finality(
             &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_499_999)),
             vec![PendingOrderFinality {
@@ -8077,9 +8148,18 @@ mod tests {
         });
         contradicts_pending.push(finalized_fill_event(&account_id, &prepared, 4, 1));
 
+        let mut failures = Vec::new();
         for (case, events) in [
             ("malformed", malformed),
             ("economic_change", economic),
+            ("missing_authenticated_hash", missing_authenticated_hash),
+            (
+                "substituted_authenticated_hash",
+                substituted_authenticated_hash,
+            ),
+            ("zero_authenticated_hashes", zero_authenticated_hashes),
+            ("extra_receipt", extra_receipt),
+            ("canonical_key_mismatch", canonical_key_mismatch),
             ("prior_pending_contradiction", contradicts_pending),
         ] {
             let dir = tempdir().unwrap();
@@ -8095,21 +8175,23 @@ mod tests {
                     .unwrap();
             }
             drop(journal);
-            assert!(
-                matches!(
-                    recovery_inventory(&path),
-                    Err(pe_execution_core::LiveJournalError::InvalidFinalityEvidence)
-                ),
-                "recovery accepted {case}"
-            );
-            assert!(
-                matches!(
-                    derive_with_baseline_evidence(&account_id, &events, &[]),
-                    Err(ProjectionReducerError::InvalidFinalityEvidence)
-                ),
-                "strict reducer accepted {case}"
-            );
+            let recovery = recovery_inventory(&path);
+            if !matches!(
+                recovery,
+                Err(pe_execution_core::LiveJournalError::InvalidFinalityEvidence)
+            ) {
+                failures.push(format!("recovery accepted {case}: {recovery:?}"));
+            }
+            let projection = derive_with_baseline_evidence(&account_id, &events, &[]);
+            match projection {
+                Err(ProjectionReducerError::InvalidFinalityEvidence) => {}
+                Err(error) => {
+                    failures.push(format!("strict reducer returned {error:?} for {case}"));
+                }
+                Ok(_) => failures.push(format!("strict reducer accepted {case}")),
+            }
         }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     async fn one_finality_disposition(rpc: &FakePolygonRpc) -> OrderFinalityDisposition {
@@ -8836,14 +8918,14 @@ mod tests {
     fn live_resolution_half_payout_and_loser_are_exact() {
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let mut half_fill = finalized_fill_event(&account_id, &prepared, 3, 2);
+        let mut half_fill = finalized_fill_event(&account_id, &prepared, 4, 2);
         if let LiveJournalPayload::OrderFillFinalized(fill) = &mut half_fill.payload {
             fill.quantity = ShareAmount::from_atomic(3_125_001);
             if let Some(RawHttpAttempt::Response(response)) = fill.receipts.get_mut(1) {
                 response.body = receipt_with_word(3, 3_125_001);
             }
         }
-        let mut half_resolution = resolution_event(&account_id, 4);
+        let mut half_resolution = resolution_event(&account_id, 5);
         if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut half_resolution.payload {
             resolution.payout_by_outcome_index_json =
                 BinaryPayoutVector::fifty_fifty().canonical_json();
@@ -8859,6 +8941,12 @@ mod tests {
                     timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                     payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
                 },
+                finality_matched_event(
+                    &account_id,
+                    &prepared,
+                    3,
+                    OffsetDateTime::from_unix_timestamp(6).unwrap(),
+                ),
                 half_fill,
                 half_resolution,
             ],
@@ -8868,7 +8956,7 @@ mod tests {
         assert_eq!(half.receivable, dec!(1.562500));
         assert_eq!(half.economic_cash, Some(dec!(9.062380)));
 
-        let mut losing_resolution = resolution_event(&account_id, 4);
+        let mut losing_resolution = resolution_event(&account_id, 5);
         if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut losing_resolution.payload
         {
             resolution.payout_by_outcome_index_json =
@@ -8885,7 +8973,13 @@ mod tests {
                     timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                     payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
                 },
-                finalized_fill_event(&account_id, &prepared, 3, 2),
+                finality_matched_event(
+                    &account_id,
+                    &prepared,
+                    3,
+                    OffsetDateTime::from_unix_timestamp(6).unwrap(),
+                ),
+                finalized_fill_event(&account_id, &prepared, 4, 2),
                 losing_resolution,
             ],
             &[losing_source],
@@ -8906,11 +9000,11 @@ mod tests {
         let daily_at = OffsetDateTime::from_unix_timestamp(86_402).unwrap();
         let (position_evidence, position_sources) =
             empty_position_evidence(120, daily_at, &binding);
-        let mut fill = finalized_fill_event(&account_id, &prepared, 3, 2);
+        let mut fill = finalized_fill_event(&account_id, &prepared, 4, 2);
         fill.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
         let daily = LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 4,
+            seq: 5,
             timestamp: daily_at,
             payload: LiveJournalPayload::AccountPortfolioMarked(Box::new(
                 pe_execution_core::AccountPortfolioMarkedAudit {
@@ -8936,8 +9030,14 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 2,
                 timestamp: OffsetDateTime::from_unix_timestamp(86_401).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
+            finality_matched_event(
+                &account_id,
+                &prepared,
+                3,
+                OffsetDateTime::from_unix_timestamp(86_401).unwrap(),
+            ),
             fill,
             daily,
         ];
@@ -8953,7 +9053,7 @@ mod tests {
     fn daily_mark_replays_the_cutoff_bounded_financial_view() {
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let mut resolution = resolution_event(&account_id, 4);
+        let mut resolution = resolution_event(&account_id, 5);
         resolution.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
         let source = resolution_source_envelope(&resolution);
         let account_binding =
@@ -8983,7 +9083,7 @@ mod tests {
         let cash = CollateralAmount::from_decimal_exact(dec!(7.499880)).unwrap();
         let daily = LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 5,
+            seq: 6,
             timestamp: OffsetDateTime::from_unix_timestamp(86_402).unwrap(),
             payload: LiveJournalPayload::AccountPortfolioMarked(Box::new(
                 pe_execution_core::AccountPortfolioMarkedAudit {
@@ -9023,7 +9123,13 @@ mod tests {
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                 payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
-            finalized_fill_event(&account_id, &prepared, 3, 2),
+            finality_matched_event(
+                &account_id,
+                &prepared,
+                3,
+                OffsetDateTime::from_unix_timestamp(6).unwrap(),
+            ),
+            finalized_fill_event(&account_id, &prepared, 4, 2),
             resolution,
             daily,
         ];
@@ -9126,7 +9232,7 @@ mod tests {
     fn finalized_resolution_and_custody_replay_converge_once() {
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let repeated_fill = finalized_fill_event(&account_id, &prepared, 4, 2);
+        let repeated_fill = finalized_fill_event(&account_id, &prepared, 5, 2);
         let mut events = vec![
             baseline_event(&account_id, 1),
             LiveJournalEvent {
@@ -9135,7 +9241,13 @@ mod tests {
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
                 payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
             },
-            finalized_fill_event(&account_id, &prepared, 3, 2),
+            finality_matched_event(
+                &account_id,
+                &prepared,
+                3,
+                OffsetDateTime::from_unix_timestamp(6).unwrap(),
+            ),
+            finalized_fill_event(&account_id, &prepared, 4, 2),
         ];
         let filled = derive_with_baseline_evidence(&account_id, &events, &[]).unwrap();
         assert_eq!(filled.positions.len(), 1);
@@ -9152,7 +9264,7 @@ mod tests {
         conflicting_events.push(conflicting_fill);
         assert!(derive_with_baseline_evidence(&account_id, &conflicting_events, &[]).is_err());
 
-        let mut invented_fill = finalized_fill_event(&account_id, &prepared, 4, 2);
+        let mut invented_fill = finalized_fill_event(&account_id, &prepared, 5, 2);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut invented_fill.payload {
             finalized.receipts.clear();
             finalized.blocks.clear();
@@ -9164,12 +9276,12 @@ mod tests {
             Err(ProjectionReducerError::InvalidFinalityEvidence)
         ));
 
-        let first_resolution = resolution_event(&account_id, 5);
+        let first_resolution = resolution_event(&account_id, 6);
         let resolution_source = resolution_source_envelope(&first_resolution);
         events.extend([
             repeated_fill,
             first_resolution,
-            resolution_event(&account_id, 6),
+            resolution_event(&account_id, 7),
         ]);
         let resolved = derive_with_baseline_evidence(
             &account_id,
@@ -9217,7 +9329,7 @@ mod tests {
         };
         events.push(LiveJournalEvent {
             account_id: account_id.clone(),
-            seq: 7,
+            seq: 8,
             timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
             payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
                 custody_audit.clone(),
@@ -9235,7 +9347,7 @@ mod tests {
         events.extend([
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 7,
+                seq: 8,
                 timestamp: OffsetDateTime::from_unix_timestamp(28).unwrap(),
                 payload: LiveJournalPayload::RedemptionTransactionIdentified(Box::new(
                     pe_execution_core::RedemptionTransactionAudit {
@@ -9250,7 +9362,7 @@ mod tests {
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 8,
+                seq: 9,
                 timestamp: OffsetDateTime::from_unix_timestamp(29).unwrap(),
                 payload: LiveJournalPayload::RedemptionReceiptTransition(Box::new(
                     pe_execution_core::RedemptionReceiptAudit {
@@ -9266,7 +9378,7 @@ mod tests {
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 9,
+                seq: 10,
                 timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
                 payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
                     custody_audit.clone(),
@@ -9274,7 +9386,7 @@ mod tests {
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
-                seq: 10,
+                seq: 11,
                 timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
                 payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(custody_audit)),
             },
@@ -9631,10 +9743,22 @@ mod tests {
                 LiveJournalPayload::OrderPrepared(prepared.clone()),
             )
             .unwrap();
+        let matched_event = state
+            .config
+            .journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                    &prepared,
+                    format!("0x{}", "11".repeat(32)),
+                ))),
+            )
+            .unwrap();
         let fill = finalized_fill_event(
             &account_id,
             &prepared,
-            prepared_event.seq + 1,
+            matched_event.seq + 1,
             prepared_event.seq,
         );
         state

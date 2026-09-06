@@ -1490,9 +1490,12 @@ fn strict_rpc_params(attempt: &RawHttpAttempt) -> Result<serde_json::Value, Live
 }
 
 /// Strictly re-execute a retained successful Polygon Final from its complete raw evidence and
-/// require both the recorded fill and every earlier immutable observation to agree.
+/// require its receipt requests to equal the authenticated transaction inventory, its canonical
+/// block requests to equal the distinct lower receipt heights, and every earlier immutable
+/// observation to agree.
 pub fn verify_polygon_finalized(
     prepared: &LiveOrderPreparedAudit,
+    authenticated_transaction_hashes: &BTreeSet<String>,
     finalized: &OrderFillFinalizedAudit,
     immutable_receipts: &BTreeMap<String, MatchedReceipt>,
 ) -> Result<(), LiveJournalError> {
@@ -1543,7 +1546,12 @@ pub fn verify_polygon_finalized(
         }
     }
     let chain_id = chain_id.ok_or(LiveJournalError::InvalidFinalityEvidence)?;
-    if receipts.is_empty() {
+    if authenticated_transaction_hashes.is_empty()
+        || receipts.len() != authenticated_transaction_hashes.len()
+        || receipts
+            .keys()
+            .any(|hash| !authenticated_transaction_hashes.contains(hash))
+    {
         return Err(LiveJournalError::InvalidFinalityEvidence);
     }
     if immutable_receipts
@@ -1608,8 +1616,18 @@ pub fn verify_polygon_finalized(
         }
     }
     let head = head.ok_or(LiveJournalError::InvalidFinalityEvidence)?;
+    let required_block_heights = receipts
+        .values()
+        .filter_map(|receipt| (receipt.block_number < head.number).then_some(receipt.block_number))
+        .collect::<BTreeSet<_>>();
+    if blocks.keys().copied().collect::<BTreeSet<_>>() != required_block_heights {
+        return Err(LiveJournalError::InvalidFinalityEvidence);
+    }
 
-    let transaction_hashes = receipts.keys().cloned().collect::<Vec<_>>();
+    let transaction_hashes = authenticated_transaction_hashes
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let receipt_observations = receipts
         .iter()
         .map(|(hash, receipt)| (hash.clone(), Ok(Some(receipt.clone()))))
@@ -1789,17 +1807,7 @@ pub fn recovery_inventory(
                         reconciled.outcome,
                         LiveJournalOrderOutcome::FinalityPending { .. }
                     ) {
-                        for (hash, receipt) in immutable {
-                            match order.immutable_receipts.get(&hash) {
-                                Some(prior) if prior != &receipt => {
-                                    return Err(LiveJournalError::InvalidFinalityEvidence);
-                                }
-                                Some(_) => {}
-                                None => {
-                                    order.immutable_receipts.insert(hash, receipt);
-                                }
-                            }
-                        }
+                        order.immutable_receipts.extend(immutable);
                     }
                 }
                 if let LiveJournalOrderOutcome::Matched {
@@ -1847,7 +1855,12 @@ pub fn recovery_inventory(
                     .prepared
                     .as_deref()
                     .ok_or(LiveJournalError::InvalidFinalityEvidence)?;
-                verify_polygon_finalized(prepared, &finalized, &order.immutable_receipts)?;
+                verify_polygon_finalized(
+                    prepared,
+                    &order.transaction_hashes,
+                    &finalized,
+                    &order.immutable_receipts,
+                )?;
                 order.terminal = true;
             }
             LiveJournalPayload::AdmissionEvaluated(_)
