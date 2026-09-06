@@ -3,7 +3,7 @@
 use pe_core_types::{EventSeq, Price, Side, SourceTradeId};
 use pe_event_log::AppendReceipt;
 use pe_paper_state::{DecisionPendingRow, DecisionPendingState};
-use pe_strategy_winner_follow::{WinnerFollowDeclineAudit, WinnerFollowError};
+use pe_strategy_winner_follow::{KellyErrorAudit, WinnerFollowDeclineAudit, WinnerFollowError};
 use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
 
@@ -433,6 +433,8 @@ pub enum ReplayDecisionError {
     AuthorityBinding,
     #[error("version-three terminal evidence contradicts its disposition")]
     TerminalEvidenceBinding,
+    #[error("typed Winner-Follow decline does not match its durable reason")]
+    DeclineReasonBinding,
     #[error("decision_pending row is not terminal")]
     OpenRow,
     #[error("frozen decision continuation: {0}")]
@@ -522,6 +524,13 @@ pub fn replay_decision_pending(
     {
         return Err(ReplayDecisionError::TerminalEvidenceBinding);
     }
+    if terminal
+        .decline
+        .as_ref()
+        .is_some_and(|decline| !decline_matches_reason(decline, &terminal.reason))
+    {
+        return Err(ReplayDecisionError::DeclineReasonBinding);
+    }
     match (terminal.fill.as_ref(), terminal.final_receipt) {
         (Some(_), Some(_)) => return Err(ReplayDecisionError::TerminalEvidenceBinding),
         (Some(fill), None) => {
@@ -590,6 +599,46 @@ pub fn replay_decision_pending(
         post_boundary,
         recorded_decision_json: row.post_commit_inputs_json.clone(),
     })
+}
+
+fn decline_matches_reason(decline: &WinnerFollowDeclineAudit, reason: &str) -> bool {
+    let expected = match decline {
+        WinnerFollowDeclineAudit::ShadowMode => {
+            "paper_reject:shadow mode: signal recorded but not executed".to_owned()
+        }
+        WinnerFollowDeclineAudit::FlipNotApproved => {
+            "paper_reject:flip action requires human approval (flip_human_approved = false)"
+                .to_owned()
+        }
+        WinnerFollowDeclineAudit::NoEdge => {
+            "paper_reject:no edge: Kelly sizing produced zero contracts".to_owned()
+        }
+        WinnerFollowDeclineAudit::Blocked(block) => {
+            format!("paper_reject:risk blocked: {block:?}")
+        }
+        WinnerFollowDeclineAudit::RiskInputsUnavailable => {
+            const PREFIX: &str = "paper_reject:risk inputs unavailable";
+            return reason == PREFIX
+                || reason
+                    .strip_prefix(PREFIX)
+                    .is_some_and(|detail| detail.starts_with(": ") && detail.len() > 2);
+        }
+        WinnerFollowDeclineAudit::KellySizing(error) => match error {
+            KellyErrorAudit::InvalidProbability { value } => format!(
+                "paper_reject:Kelly sizing error: probability p must be in [0, 1], got {value}"
+            ),
+            KellyErrorAudit::InvalidNetPrice { value } => format!(
+                "paper_reject:Kelly sizing error: net price c must be in (0, 1), got {value}"
+            ),
+            KellyErrorAudit::InvalidBankroll { value } => {
+                format!("paper_reject:Kelly sizing error: bankroll must be positive, got {value}")
+            }
+            KellyErrorAudit::ContractOverflow { value } => format!(
+                "paper_reject:Kelly sizing error: contract count overflow: floored value {value} out of u64 range"
+            ),
+        },
+    };
+    reason == expected
 }
 
 #[cfg(test)]
@@ -834,6 +883,30 @@ mod tests {
         assert!(matches!(
             replay_decision_pending(&row),
             Err(ReplayDecisionError::TerminalEvidenceBinding)
+        ));
+    }
+
+    /// PASS: recomputing the evidence hash cannot pair a typed decline with another decline's
+    /// durable display reason.
+    #[test]
+    fn replay_rejects_decline_enum_that_disagrees_with_reason() {
+        let mut row = terminal_row(
+            "wrong-decline",
+            AuthorityEvidence::not_read("strategy_declined"),
+            TerminalDispositionEvidence::declined(
+                &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+            ),
+        );
+        let document: DecisionPostBoundaryEvidence =
+            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+        let mut body = document.body;
+        body.terminal.decline = Some(WinnerFollowDeclineAudit::RiskInputsUnavailable);
+        row.post_commit_inputs_json =
+            serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(body).unwrap()).unwrap();
+
+        assert!(matches!(
+            replay_decision_pending(&row),
+            Err(ReplayDecisionError::DeclineReasonBinding)
         ));
     }
 
