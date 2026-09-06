@@ -558,16 +558,18 @@ pub(crate) struct LatencyHysteresisSeed {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LatencyReplayCheckpoint {
-    LiveJournalTail(Option<EventSeq>),
+    LiveJournalTail(pe_execution_core::live_journal::LiveJournalTail),
     LegacyResponseTime(i64),
 }
 
-/// Audited sequence/hash identity of the live-journal prefix used by a manual release scan.
+/// Audited account-local tail and complete journal-prefix identity used by a manual release scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LiveLatencyJournalTailEvidence {
     pub last_sequence: Option<EventSeq>,
     pub last_hash: String,
+    pub scanned_prefix_last_sequence: Option<EventSeq>,
+    pub scanned_prefix_last_hash: String,
 }
 
 impl From<pe_execution_core::live_journal::LiveJournalTail> for LiveLatencyJournalTailEvidence {
@@ -575,6 +577,8 @@ impl From<pe_execution_core::live_journal::LiveJournalTail> for LiveLatencyJourn
         Self {
             last_sequence: tail.last_sequence,
             last_hash: tail.last_hash.to_hex().to_string(),
+            scanned_prefix_last_sequence: tail.scanned_prefix_last_sequence,
+            scanned_prefix_last_hash: tail.scanned_prefix_last_hash.to_hex().to_string(),
         }
     }
 }
@@ -583,6 +587,7 @@ impl From<pe_execution_core::live_journal::LiveJournalTail> for LiveLatencyJourn
 pub(crate) fn latency_hysteresis_seed(
     era: &PaperEra,
     owner: &RiskHaltOwner,
+    live_journal_path: &Path,
 ) -> Result<LatencyHysteresisSeed, RiskInputsUnavailable> {
     let transition = era.frames.iter().rev().find_map(|frame| {
         let PaperLogFrame::Record(PaperLogRecord::RiskHaltChanged {
@@ -608,10 +613,24 @@ pub(crate) fn latency_hysteresis_seed(
                 .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
             let hash = blake3::Hash::from_hex(&tail.last_hash)
                 .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-            if tail.last_sequence.is_none() && hash != blake3::Hash::from_bytes([0; 32]) {
+            let scanned_prefix_hash = blake3::Hash::from_hex(&tail.scanned_prefix_last_hash)
+                .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+            let checkpoint = pe_execution_core::live_journal::LiveJournalTail {
+                last_sequence: tail.last_sequence,
+                last_hash: hash,
+                scanned_prefix_last_sequence: tail.scanned_prefix_last_sequence,
+                scanned_prefix_last_hash: scanned_prefix_hash,
+            };
+            let RiskHaltOwner::LiveAccount(account_id) = owner else {
                 return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
-            }
-            LatencyReplayCheckpoint::LiveJournalTail(tail.last_sequence)
+            };
+            pe_execution_core::live_journal::verify_account_tail_checkpoint(
+                live_journal_path,
+                account_id,
+                checkpoint,
+            )
+            .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+            LatencyReplayCheckpoint::LiveJournalTail(checkpoint)
         }
         None => {
             let transitioned_at_unix_ms = frame
@@ -741,8 +760,8 @@ fn live_latency_endpoint_samples(
     for event in events {
         if matches!(
             checkpoint,
-            Some(LatencyReplayCheckpoint::LiveJournalTail(Some(last_sequence)))
-                if event.seq <= last_sequence.0
+            Some(LatencyReplayCheckpoint::LiveJournalTail(tail))
+                if tail.last_sequence.is_some_and(|last| event.seq <= last.0)
         ) {
             continue;
         }
@@ -1217,6 +1236,46 @@ mod tests {
 
     fn account() -> RiskHaltOwner {
         RiskHaltOwner::LiveAccount(AccountId::new("live-a").unwrap())
+    }
+
+    fn append_live_mode_event(
+        journal: &pe_execution_core::LiveJournal,
+        account_id: AccountId,
+        unix: i64,
+    ) {
+        journal
+            .append(
+                account_id,
+                OffsetDateTime::from_unix_timestamp(unix).unwrap(),
+                pe_execution_core::LiveJournalPayload::ModeTransitionApplied(
+                    pe_execution_core::LiveModeTransitionAudit {
+                        requested: pe_execution_core::LiveControlMode::LiveTiny,
+                        previous_effective: pe_execution_core::LiveControlMode::Off,
+                        new_effective: pe_execution_core::LiveControlMode::LiveTiny,
+                        reason: pe_execution_core::LiveModeTransitionReason::Armed,
+                    },
+                ),
+            )
+            .unwrap();
+    }
+
+    fn released_latency_era(
+        owner: RiskHaltOwner,
+        tail: LiveLatencyJournalTailEvidence,
+    ) -> PaperEra {
+        PaperEra {
+            start: None,
+            frames: vec![frame(
+                1,
+                7_200,
+                PaperLogRecord::RiskHaltChanged {
+                    owner,
+                    cause: RiskHaltCause::CopyLatency,
+                    state: HaltState::Released,
+                    evidence: serde_json::json!({ "live_journal_tail": tail }),
+                },
+            )],
+        }
     }
 
     fn start() -> crate::paper_recovery::QualificationStarted {
@@ -1853,8 +1912,14 @@ mod tests {
             active: false,
             checkpoint: Some(LatencyReplayCheckpoint::LegacyResponseTime(7_202_000)),
         };
-        assert_eq!(latency_hysteresis_seed(&era, &owner).unwrap(), expected);
-        assert_eq!(latency_hysteresis_seed(&era, &owner).unwrap(), expected);
+        assert_eq!(
+            latency_hysteresis_seed(&era, &owner, Path::new("unused")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            latency_hysteresis_seed(&era, &owner, Path::new("unused")).unwrap(),
+            expected
+        );
     }
 
     /// PASS: malformed journal-tail evidence fails closed instead of silently falling back to a
@@ -1875,14 +1940,90 @@ mod tests {
                         "live_journal_tail": {
                             "last_sequence": EventSeq(4),
                             "last_hash": "not-a-hash",
+                            "scanned_prefix_last_sequence": EventSeq(4),
+                            "scanned_prefix_last_hash": "00".repeat(32),
                         },
                     }),
                 },
             )],
         };
         assert_eq!(
-            latency_hysteresis_seed(&era, &owner),
+            latency_hysteresis_seed(&era, &owner, Path::new("unused")),
             Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
+        );
+    }
+
+    /// PASS: a syntactically valid hash that does not bind the recorded account sequence fails
+    /// closed against the verified live journal.
+    #[test]
+    fn latency_hysteresis_seed_rejects_wrong_live_tail_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("live.log");
+        let account_id = AccountId::new("live-a").unwrap();
+        let owner = RiskHaltOwner::LiveAccount(account_id.clone());
+        let journal = pe_execution_core::LiveJournal::open(&journal_path).unwrap();
+        append_live_mode_event(&journal, account_id.clone(), 7_100);
+        let (_, tail) =
+            pe_execution_core::live_journal::replay_account_with_tail(&journal_path, &account_id)
+                .unwrap();
+        let mut evidence = LiveLatencyJournalTailEvidence::from(tail);
+        let mut wrong_hash = *tail.last_hash.as_bytes();
+        wrong_hash[0] ^= 1;
+        evidence.last_hash = blake3::Hash::from_bytes(wrong_hash).to_hex().to_string();
+        let era = released_latency_era(owner.clone(), evidence);
+
+        assert_eq!(
+            latency_hysteresis_seed(&era, &owner, &journal_path),
+            Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
+        );
+    }
+
+    /// PASS: a future account sequence cannot resolve inside the release's verified journal
+    /// prefix and fails closed even when every hash field is well formed.
+    #[test]
+    fn latency_hysteresis_seed_rejects_future_live_tail_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("live.log");
+        let account_id = AccountId::new("live-a").unwrap();
+        let owner = RiskHaltOwner::LiveAccount(account_id.clone());
+        let journal = pe_execution_core::LiveJournal::open(&journal_path).unwrap();
+        append_live_mode_event(&journal, account_id.clone(), 7_100);
+        let (_, tail) =
+            pe_execution_core::live_journal::replay_account_with_tail(&journal_path, &account_id)
+                .unwrap();
+        let mut evidence = LiveLatencyJournalTailEvidence::from(tail);
+        evidence.last_sequence = Some(EventSeq(100));
+        let era = released_latency_era(owner.clone(), evidence);
+
+        assert_eq!(
+            latency_hysteresis_seed(&era, &owner, &journal_path),
+            Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
+        );
+    }
+
+    /// PASS: an empty verified release prefix accepts an account-local `None`, while an account
+    /// event appended after that exact prefix remains post-release.
+    #[test]
+    fn latency_hysteresis_seed_accepts_empty_live_journal_prefix_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("live.log");
+        let account_id = AccountId::new("live-a").unwrap();
+        let owner = RiskHaltOwner::LiveAccount(account_id.clone());
+        let journal = pe_execution_core::LiveJournal::open(&journal_path).unwrap();
+        let (_, tail) =
+            pe_execution_core::live_journal::replay_account_with_tail(&journal_path, &account_id)
+                .unwrap();
+        assert_eq!(tail.last_sequence, None);
+        assert_eq!(tail.scanned_prefix_last_sequence, None);
+        append_live_mode_event(&journal, account_id, 7_201);
+        let era = released_latency_era(owner.clone(), LiveLatencyJournalTailEvidence::from(tail));
+
+        assert_eq!(
+            latency_hysteresis_seed(&era, &owner, &journal_path).unwrap(),
+            LatencyHysteresisSeed {
+                active: false,
+                checkpoint: Some(LatencyReplayCheckpoint::LiveJournalTail(tail)),
+            }
         );
     }
 }

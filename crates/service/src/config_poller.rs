@@ -934,6 +934,8 @@ mod tests {
                 Some(&serde_json::json!({
                     "last_sequence": null,
                     "last_hash": "00".repeat(32),
+                    "scanned_prefix_last_sequence": null,
+                    "scanned_prefix_last_hash": "00".repeat(32),
                 }))
             );
             acknowledged

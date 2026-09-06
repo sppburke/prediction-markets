@@ -714,11 +714,13 @@ pub struct LiveJournalEvent {
     pub payload: LiveJournalPayload,
 }
 
-/// Sequence/hash identity of the final account event used by one verified account replay.
+/// Account-local tail and complete journal-prefix identity from one verified account replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveJournalTail {
     pub last_sequence: Option<EventSeq>,
     pub last_hash: blake3::Hash,
+    pub scanned_prefix_last_sequence: Option<EventSeq>,
+    pub scanned_prefix_last_hash: blake3::Hash,
 }
 
 /// One prepared ordinary-live order that has no matching terminal journal fact.
@@ -883,23 +885,82 @@ pub fn replay_account_with_tail(
     path: impl AsRef<Path>,
     account_id: &AccountId,
 ) -> Result<(Vec<LiveJournalEvent>, LiveJournalTail), LiveJournalError> {
+    let replayed = replay_all_with_receipts(path)?;
+    let scanned_prefix = replayed
+        .last()
+        .map_or((None, blake3::Hash::from_bytes([0; 32])), |(_, receipt)| {
+            (Some(receipt.sequence), receipt.this_hash)
+        });
     let mut tail = LiveJournalTail {
         last_sequence: None,
         last_hash: blake3::Hash::from_bytes([0; 32]),
+        scanned_prefix_last_sequence: scanned_prefix.0,
+        scanned_prefix_last_hash: scanned_prefix.1,
     };
-    let events = replay_all_with_receipts(path)?
+    let events = replayed
         .into_iter()
         .filter_map(|(event, receipt)| {
             (&event.account_id == account_id).then(|| {
                 tail = LiveJournalTail {
                     last_sequence: Some(receipt.sequence),
                     last_hash: receipt.this_hash,
+                    ..tail
                 };
                 event
             })
         })
         .collect();
     Ok((events, tail))
+}
+
+/// Verify that an account-local tail is the final account event in the recorded journal prefix.
+///
+/// The current journal may contain a suffix appended after the checkpoint. The recorded global
+/// prefix identity makes an account-local `None` independently verifiable even in that case.
+pub fn verify_account_tail_checkpoint(
+    path: impl AsRef<Path>,
+    account_id: &AccountId,
+    checkpoint: LiveJournalTail,
+) -> Result<(), LiveJournalError> {
+    let replayed = replay_all_with_receipts(path)?;
+    let prefix_len = match checkpoint.scanned_prefix_last_sequence {
+        None => {
+            if checkpoint.scanned_prefix_last_hash != blake3::Hash::from_bytes([0; 32]) {
+                return Err(LiveJournalError::SequenceMismatch);
+            }
+            0
+        }
+        Some(last_sequence) => {
+            let prefix_len = last_sequence
+                .0
+                .checked_add(1)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(LiveJournalError::SequenceMismatch)?;
+            let (_, receipt) = replayed
+                .get(prefix_len - 1)
+                .ok_or(LiveJournalError::SequenceMismatch)?;
+            if receipt.sequence != last_sequence
+                || receipt.this_hash != checkpoint.scanned_prefix_last_hash
+            {
+                return Err(LiveJournalError::SequenceMismatch);
+            }
+            prefix_len
+        }
+    };
+    let scanned_prefix = replayed
+        .get(..prefix_len)
+        .ok_or(LiveJournalError::SequenceMismatch)?;
+    let actual_account_tail = scanned_prefix
+        .iter()
+        .rev()
+        .find(|(event, _)| &event.account_id == account_id)
+        .map_or((None, blake3::Hash::from_bytes([0; 32])), |(_, receipt)| {
+            (Some(receipt.sequence), receipt.this_hash)
+        });
+    if actual_account_tail != (checkpoint.last_sequence, checkpoint.last_hash) {
+        return Err(LiveJournalError::SequenceMismatch);
+    }
+    Ok(())
 }
 
 /// A journal fact whose identity must match an earlier `OrderPrepared` exactly.
@@ -1787,10 +1848,17 @@ mod tests {
             vec![event0.clone(), event2.clone()]
         );
         let (_, account_tail_envelope) = Reader::replay(&path).unwrap().nth(2).unwrap().unwrap();
+        let (_, scanned_prefix_envelope) = Reader::replay(&path).unwrap().nth(3).unwrap().unwrap();
         let (events, tail) = replay_account_with_tail(&path, &first).unwrap();
         assert_eq!(events, vec![event0, event2]);
         assert_eq!(tail.last_sequence, Some(EventSeq(2)));
         assert_eq!(tail.last_hash, account_tail_envelope.this_hash);
+        assert_eq!(tail.scanned_prefix_last_sequence, Some(EventSeq(3)));
+        assert_eq!(
+            tail.scanned_prefix_last_hash,
+            scanned_prefix_envelope.this_hash
+        );
+        verify_account_tail_checkpoint(&path, &first, tail).unwrap();
         assert_eq!(
             LiveJournal::verified_tail(&path).unwrap().last_sequence,
             Some(EventSeq(3))
