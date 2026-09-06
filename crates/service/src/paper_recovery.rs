@@ -33,8 +33,8 @@ use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pendi
 use crate::position_seeder::ledger_capture;
 use crate::supabase_sink::supabase_fill_from;
 
-pub const PAPER_LOG_SCHEMA_VERSION_V2: u32 = 2;
-pub const PAPER_LOG_SCHEMA_VERSION: u32 = PAPER_LOG_SCHEMA_VERSION_V2;
+pub const PAPER_LOG_SCHEMA_VERSION: u32 = 2;
+pub use PAPER_LOG_SCHEMA_VERSION as PAPER_LOG_SCHEMA_VERSION_V2;
 /// Current paper financial meaning. A changed value seals the active qualification before use.
 pub const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
 

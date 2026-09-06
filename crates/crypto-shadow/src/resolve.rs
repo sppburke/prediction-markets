@@ -9,9 +9,8 @@
 //! = Down won). Verified live 2026-06-09 against a resolved `btc-updown-5m`
 //! market. As of issue #382 Phase 4 this delegates to the shared batched
 //! [`GammaMarketsClient`](pe_source_polymarket_public::GammaMarketsClient)
-//! (`ClosedOnly`) — like `pe-paper-pnl::GammaResolutionFetcher`, many
-//! condition_ids per request, demuxed by `conditionId`. `closed=true` is required
-//! — the plain endpoint returns an empty list for resolved markets.
+//! (`ClosedOnly`): many condition_ids per request, demuxed by `conditionId`.
+//! `closed=true` is required — the plain endpoint returns an empty list for resolved markets.
 
 use pe_source_polymarket_public::{GammaMarketsClient, MarketFilter, PageFetcher};
 use rust_decimal::Decimal;
@@ -52,11 +51,10 @@ impl<F: PageFetcher + Send + Sync> BtcResolutionFetcher<F> {
     /// open markets, unknown markets (Gamma `200` without the id), and ids in a
     /// 4xx chunk are skipped, so an in-progress 5m market simply yields no row yet.
     ///
-    /// Resilient by design (mirrors `pe-paper-pnl::GammaResolutionFetcher`): a
-    /// batch-level failure (a transient fetch error or a corrupt response) logs and
-    /// yields an empty result for this run rather than erroring — `resolve` is a
-    /// re-runnable idempotent upsert, so the markets are retried next time. The
-    /// `Result`/[`ResolveError`] is retained for the public error surface.
+    /// This wrapper deliberately degrades a shared-client batch failure (a transient fetch error
+    /// or a corrupt response) to an empty result for this run: `resolve` is a re-runnable
+    /// idempotent upsert, so the markets are retried next time. The `Result`/[`ResolveError`] is
+    /// retained for the public error surface.
     ///
     /// The YES/Up side wins when the first settled price exceeds `0.5` (resolved
     /// markets settle to exactly `1`/`0`). Limitation (unchanged, shadow-only): a
