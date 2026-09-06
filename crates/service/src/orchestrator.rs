@@ -17,11 +17,12 @@ use pe_core_types::{
     SourceTradeId, TraderId, VenueId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
+use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
 use pe_paper_state::{
     FillRecord, FillRow, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence,
 };
 use pe_position_ledger::PositionLedger;
-use pe_risk_engine::{EquityInputs, RiskSnapshot, current_equity};
+use pe_risk_engine::{EquityInputs, RiskSnapshot, TradingMode, current_equity};
 use pe_source_polymarket_public::PageFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
@@ -45,8 +46,8 @@ use crate::live_watchlist::LiveWatchlist;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
-    LegacyFillSource, LegacyPaperFill, PAPER_LOG_SCHEMA_VERSION_V2, PaperLogRecord, PaperMarkPrice,
-    PortfolioMark, TailBinding,
+    LegacyPaperFill, PAPER_LOG_SCHEMA_VERSION_V2, PaperLogRecord, PaperMarkPrice, PortfolioMark,
+    TailBinding,
 };
 use crate::risk_inputs::{BoundaryMarkError, BoundaryMarkFetcher};
 use crate::runtime_config::{self, LiveRuntimeConfig};
@@ -90,6 +91,7 @@ struct GatePlanEvidence {
     book: BookEvidence,
     book_receipt: Option<pe_event_log::AppendReceipt>,
     budget: CollateralAmount,
+    worst_case_all_in_debit: CollateralAmount,
     checked_at_unix_ms: u64,
 }
 
@@ -379,25 +381,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .map_err(|error| error.to_string())
     }
 
-    fn append_legacy_fill(
-        &mut self,
-        fill: &LegacyPaperFill,
-    ) -> Result<pe_event_log::AppendReceipt, String> {
-        let payload = serde_json::to_vec(fill).map_err(|error| error.to_string())?;
-        let now = OffsetDateTime::now_utc();
-        self.paper_writer
-            .append_synced(EnvelopeIn {
-                source_id: SourceId("pe-service.paper".to_owned()),
-                schema_version: 1,
-                parser_version: 1,
-                observed_at: SourceTimestamp(now),
-                received_at: ReceivedAt(now),
-                content_type: ContentType::Json,
-                payload,
-            })
-            .map_err(|error| error.to_string())
-    }
-
     async fn apply_resolution_candidate(
         &mut self,
         condition: pe_core_types::PolymarketConditionId,
@@ -620,7 +603,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     async fn active_paper_risk_snapshot(
         &self,
         signal: &LeaderSignal,
-    ) -> Result<RiskSnapshot, pe_strategy_winner_follow::RiskInputsUnavailable> {
+        proposed_debit: CollateralAmount,
+        per_trade_cap_bps: i32,
+    ) -> Result<pe_execution_core::RiskAudit, pe_strategy_winner_follow::RiskInputsUnavailable>
+    {
         use pe_strategy_winner_follow::RiskInputsUnavailable;
 
         let (paper_log_path, source_log_path) = self
@@ -631,7 +617,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             crate::paper_recovery::scan_paper_log(paper_log_path)
                 .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?,
         );
-        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let evaluated_at = OffsetDateTime::now_utc();
+        let now = evaluated_at.unix_timestamp();
+        let evaluated_at_unix_ms = evaluated_at
+            .unix_timestamp_nanos()
+            .checked_div(1_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(RiskInputsUnavailable::Overflow)?;
         let snapshot = self
             .paper_state
             .financial_snapshot(now)
@@ -642,6 +634,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .map(|position| MarketOutcomeId::new(position.market_id.clone(), position.outcome_id))
             .collect::<Vec<_>>();
         let observed = self.mid_price_cache.fetch_mids_strict(&ids).await?;
+        let mut price_receipts = observed
+            .values()
+            .map(|value| value.receipt)
+            .collect::<Vec<_>>();
+        price_receipts.sort_by_key(|receipt| receipt.sequence);
+        price_receipts.dedup();
         let prices = observed
             .into_iter()
             .map(|((market, outcome), value)| {
@@ -743,15 +741,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             rolling_7d_pnl_bps: BasisPoints::ZERO,
             absolute_pnl_bps: BasisPoints::ZERO,
             copy_latency_kill_switch_active: false,
-            proposed_trade_bps: BasisPoints::ZERO,
-            per_trade_cap_bps: 0,
+            proposed_trade_bps: exposure(proposed_debit)?,
+            per_trade_cap_bps,
             concentration_caps: None,
         };
         let latency_was_active = self.active_risk_halts.contains(&(
             crate::paper_recovery::RiskHaltOwner::Paper,
             pe_risk_engine::RiskHaltCause::CopyLatency,
         ));
-        crate::risk_inputs::build_paper_risk_snapshot(
+        let snapshot = crate::risk_inputs::build_paper_risk_snapshot(
             &base,
             &snapshot,
             &era,
@@ -759,7 +757,110 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             source_log_path,
             now,
             latency_was_active,
+        )?;
+        let decision = match pe_risk_engine::evaluate_risk(&snapshot) {
+            pe_risk_engine::RiskDecision::Approved => {
+                pe_execution_core::RiskDecisionAudit::Approved
+            }
+            pe_risk_engine::RiskDecision::Blocked(reason) => {
+                pe_execution_core::RiskDecisionAudit::Blocked { reason }
+            }
+        };
+        Ok(pe_execution_core::RiskAudit {
+            snapshot,
+            decision,
+            price_receipts,
+            evaluated_at_unix_ms,
+        })
+    }
+
+    /// Compose the one active-era economic record from the final sized plan. This is the only
+    /// paper call to `EconomicPrepared::compose`; strategy evaluation consumes its all-in price.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_active_paper_economic(
+        &self,
+        signal: &LeaderSignal,
+        admission: &pe_execution_core::LiveAdmissionArtifact,
+        plan: &LadderPlan,
+        book_receipt: pe_event_log::AppendReceipt,
+        continuation: &DecisionContinuationV2,
+        probability: Probability,
+        budget: CollateralAmount,
+        risk: pe_execution_core::RiskAudit,
+        applied_configuration_hash: String,
+    ) -> Result<pe_execution_core::EconomicPrepared, String> {
+        let (_, source_log_path) = self
+            .financial_log_paths
+            .as_ref()
+            .ok_or_else(|| "active fill has no verified financial log paths".to_owned())?;
+        let observation = continuation
+            .observation_from_source_log(source_log_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "active fill lacks verified observation evidence".to_owned())?;
+        let outcome_index = u8::try_from(signal.outcome_id.0)
+            .ok()
+            .filter(|value| *value <= 1)
+            .ok_or_else(|| "active fill outcome is not binary".to_owned())?;
+        let token_id = admission
+            .market
+            .ordered_outcome_token_ids
+            .get(usize::from(outcome_index))
+            .cloned()
+            .ok_or_else(|| "active fill outcome has no admitted token".to_owned())?;
+        let band_floor = Price::new(self.min_fill_price.max(Decimal::ZERO))
+            .map_err(|error| error.to_string())?;
+        let band_ceiling_exclusive = Price::new(if self.max_fill_price > Decimal::ZERO {
+            self.max_fill_price
+        } else {
+            Decimal::ONE
+        })
+        .map_err(|error| error.to_string())?;
+        let cash_before = CollateralAmount::from_decimal_exact(
+            self.paper_state
+                .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
+                .map_err(|error| error.to_string())?
+                .cash,
         )
+        .map_err(|error| error.to_string())?;
+        let sizing_mode = match self.strategy.config().sizing_mode {
+            SizingMode::Dollar { usd } => pe_execution_core::SizingModeAudit::Dollar { usd },
+            SizingMode::Contract { contracts } => {
+                pe_execution_core::SizingModeAudit::Contract { contracts }
+            }
+            SizingMode::Kelly => pe_execution_core::SizingModeAudit::Kelly {
+                fraction: self.strategy.config().kelly_fraction_override.unwrap_or(
+                    match self.mode {
+                        ExecutionMode::LiveTiny | ExecutionMode::Promoted => KELLY_NORMAL,
+                        ExecutionMode::Paper | ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
+                    },
+                ),
+                probability,
+            },
+        };
+        pe_execution_core::EconomicPrepared::compose(pe_execution_core::EconomicInputs {
+            market: pe_execution_core::MarketSelection {
+                condition_id: pe_core_types::PolymarketConditionId(signal.market_id.to_string()),
+                outcome_index,
+                token_id,
+                side: signal.leader_side,
+                market_id: signal.market_id.to_string(),
+            },
+            admission,
+            plan,
+            book_receipt,
+            observation: Some(observation),
+            sizing_mode,
+            budget,
+            slippage_rate: self.strategy.config().slippage_rate,
+            risk,
+            cash_before,
+            price_impact_cap_bps: self.price_impact_cap_bps,
+            chase_ceiling: signal.leader_price,
+            band_floor,
+            band_ceiling_exclusive,
+            applied_configuration_hash,
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// Build and synchronize the one paper mark for an acknowledged source boundary.
@@ -1164,14 +1265,32 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             ));
         }
 
-        // Seed the dedup set from any positions already in the DB (crash-restart safety).
-        let filled_positions: HashSet<MarketOutcomeId> = paper_state
-            .paper_positions()
-            .map_err(|e| anyhow::anyhow!("load paper positions: {e}"))?
-            .into_iter()
-            .filter(|p| p.long_contracts > 0 || p.short_contracts > 0)
-            .map(|p| MarketOutcomeId::new(p.market_id, p.outcome_id))
-            .collect();
+        // Seed the held-position guard from the exact active-era projection. Fractional positions
+        // must not disappear across restart merely because the legacy integer view floors them.
+        let filled_positions: HashSet<MarketOutcomeId> = if paper_state
+            .financial_start()
+            .map_err(|e| anyhow::anyhow!("load financial Start: {e}"))?
+            .is_some()
+        {
+            paper_state
+                .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
+                .map_err(|e| anyhow::anyhow!("load exact paper positions: {e}"))?
+                .positions
+                .into_iter()
+                .filter(|position| {
+                    position.long != ShareAmount::ZERO || position.short != ShareAmount::ZERO
+                })
+                .map(|position| MarketOutcomeId::new(position.market_id, position.outcome_id))
+                .collect()
+        } else {
+            paper_state
+                .paper_positions()
+                .map_err(|e| anyhow::anyhow!("load legacy paper positions: {e}"))?
+                .into_iter()
+                .filter(|position| position.long_contracts > 0 || position.short_contracts > 0)
+                .map(|position| MarketOutcomeId::new(position.market_id, position.outcome_id))
+                .collect()
+        };
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
@@ -1463,6 +1582,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
+        probability: Probability,
         sizing_bankroll: Decimal,
         admission: Option<&pe_execution_core::LiveAdmissionArtifact>,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
@@ -1626,15 +1746,54 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             })
         };
         let cash_cap = to_budget(sizing_bankroll)?;
+        let per_trade_cap_bps = self
+            .strategy
+            .config()
+            .per_trade_cap
+            .resolve_bps(TradingMode::LiveTiny);
+        let proportional_cap = to_budget(
+            sizing_bankroll
+                .checked_mul(Decimal::from(per_trade_cap_bps))
+                .and_then(|value| value.checked_div(Decimal::from(10_000)))
+                .ok_or_else(|| GatePlanFailure {
+                    reason: "impact budget not constructible",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "arithmetic_failure",
+                        Some(&book.response_blake3),
+                        Some(book.fetched_at_ms),
+                        "per-trade cap not constructible",
+                    )),
+                    checked_at_unix_ms: Some(checked_at_unix_ms),
+                })?,
+        )?;
+        let kelly_fraction =
+            self.strategy
+                .config()
+                .kelly_fraction_override
+                .unwrap_or(match self.mode {
+                    ExecutionMode::LiveTiny | ExecutionMode::Promoted => KELLY_NORMAL,
+                    ExecutionMode::Paper | ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
+                });
+        let allocate = |price: Price| {
+            let quantity = size_contracts(&KellyInput {
+                p: probability,
+                c: price,
+                kelly_fraction,
+                bankroll: sizing_bankroll,
+            })
+            .map_err(|_| LadderError::KellySizing)?;
+            ShareAmount::from_whole(quantity.0).map_err(|_| LadderError::Amount)
+        };
         let sizing = match self.strategy.config().sizing_mode {
             SizingMode::Dollar { usd } => BuySizing::Dollar {
                 budget: to_budget(usd)?,
             },
             SizingMode::Contract { contracts } => BuySizing::Contract { contracts },
-            // The current strategy interface still yields Kelly contracts only after evaluation.
-            // This preliminary plan supplies its exact all-in price; the active financial path
-            // replans the returned fixed quantity before composing the durable economics.
-            SizingMode::Kelly => BuySizing::Dollar { budget: cash_cap },
+            SizingMode::Kelly => BuySizing::Kelly {
+                allocate: &allocate,
+                slippage_rate: self.strategy.config().slippage_rate,
+            },
         };
         let maximum_price_exclusive = Price::new(if self.max_fill_price > Decimal::ZERO {
             self.max_fill_price
@@ -1676,7 +1835,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             &ladder,
             schedule,
             sizing,
-            &[cash_cap],
+            &[cash_cap, proportional_cap],
             minimum_order_size,
             minimum_tick_size,
             minimum_price,
@@ -1686,6 +1845,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         ) {
             Ok(sized) => {
                 let budget = sized.budget;
+                let worst_case_all_in_debit =
+                    sized
+                        .worst_case_all_in_debit()
+                        .map_err(|_| GatePlanFailure {
+                            reason: "price-impact ladder arithmetic failed (fail closed)",
+                            book: Box::new(book_failure(
+                                Some(&token_id),
+                                "arithmetic_failure",
+                                Some(&book.response_blake3),
+                                Some(book.fetched_at_ms),
+                                "all-in ladder debit could not be derived",
+                            )),
+                            checked_at_unix_ms: Some(checked_at_unix_ms),
+                        })?;
                 let plan = sized.ladder;
                 Ok(GatePlanEvidence {
                     book: BookEvidence {
@@ -1701,6 +1874,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     gate: GatePlan::Planned(plan),
                     book_receipt: book.source_receipt,
                     budget,
+                    worst_case_all_in_debit,
                     checked_at_unix_ms,
                 })
             }
@@ -1722,6 +1896,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 gate: GatePlan::NothingAffordable { best_ask: best },
                 book_receipt: book.source_receipt,
                 budget: CollateralAmount::ZERO,
+                worst_case_all_in_debit: CollateralAmount::ZERO,
                 checked_at_unix_ms,
             }),
             Err(LadderError::BelowBandAsk | LadderError::InsufficientDepth) => {
@@ -1741,6 +1916,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 LadderError::Amount
                 | LadderError::BelowMinimum
                 | LadderError::CapExceeded
+                | LadderError::NoEdge
+                | LadderError::KellySizing
                 | LadderError::Fee(_),
             ) => Err(GatePlanFailure {
                 reason: "price-impact ladder arithmetic failed (fail closed)",
@@ -2284,7 +2461,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // only to (a) confirm the market is open/priced and (b) log the divergence for
         // diagnosis; sizing and gating below use `fill_basis` instead. Fail closed on an
         // absent mid (unchanged liveness behaviour).
-        let market_mid = {
+        let _market_mid = {
             let mids = self
                 .mid_price_cache
                 .fetch_mids(std::slice::from_ref(&signal.market_id))
@@ -2363,7 +2540,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             None => self.bankroll,
         };
         let gate_evidence = match self
-            .plan_impact_gate(&signal, sizing_bankroll, admission.as_ref())
+            .plan_impact_gate(&signal, p, sizing_bankroll, admission.as_ref())
             .await
         {
             Ok(outcome) => outcome,
@@ -2407,6 +2584,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
         let book_receipt = gate_evidence.book_receipt;
         let plan_budget = gate_evidence.budget;
+        let planned_worst_case_all_in_debit = gate_evidence.worst_case_all_in_debit;
         let gate = gate_evidence.gate;
         let gate_plan: Option<&LadderPlan> = match &gate {
             GatePlan::Planned(plan) => Some(plan),
@@ -2590,48 +2768,93 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return;
         }
 
-        // Size cap from the mandatory ladder plan (#508): the planned whole-share quantity IS the
-        // within-band, within-budget maximum. The no-affordable-shares arm returned above.
-        let book_cap_contracts = gate_plan.map(|plan| plan.shares.atomic() / 1_000_000);
-
-        let snapshot = if self.financial_log_paths.is_some() {
-            match self.active_paper_risk_snapshot(&signal).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    let decline =
-                        pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable(error);
-                    info!(reason = %decline, "signal did not produce order");
-                    self.no_fill_or_rollback(
-                        &trade,
-                        &leader_row,
-                        dispatch_id.as_deref(),
-                        &format!("paper_reject:{decline}"),
-                        &rb,
-                        Some(&signal.market_id),
-                        decision_evidence.as_ref(),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        } else {
-            pre_start_risk_snapshot()
+        let Some(plan) = gate_plan else {
+            self.intake_stopped = true;
+            return;
         };
-        // Sizing basis: pass the leader's price as the RAW `current_price` (Kelly cost `c`,
-        // per-trade cap, exposure bps) and `fill_basis` as the dollar-sizing price, so the
-        // Dollar arm computes `floor(sizing_dollar_usd / fill_basis)` (→ `contracts × fill ==
-        // sizing_dollar_usd`) while the fee-additive Kelly `c` is NOT double-counted against a
-        // fill-inclusive price. (Kelly is not used on the live copy path, but this keeps both
-        // arms correct rather than relying on that as an invariant.)
+        let Some(admission) = admission.as_ref() else {
+            let decline = pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable(
+                pe_strategy_winner_follow::RiskInputsUnavailable::SnapshotSequenceMismatch,
+            );
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                dispatch_id.as_deref(),
+                &format!("paper_reject:{decline}"),
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
+            return;
+        };
+        let Some(book_receipt) = book_receipt else {
+            error!(trade = %trade.source_trade_id, "active fill book is not source-log bound");
+            self.intake_stopped = true;
+            return;
+        };
+        let Some(continuation) = pending.as_ref() else {
+            error!(trade = %trade.source_trade_id, "active fill has no durable continuation");
+            self.intake_stopped = true;
+            return;
+        };
+        let per_trade_cap_bps = self
+            .strategy
+            .config()
+            .per_trade_cap
+            .resolve_bps(TradingMode::LiveTiny);
+        let risk = match self
+            .active_paper_risk_snapshot(&signal, planned_worst_case_all_in_debit, per_trade_cap_bps)
+            .await
+        {
+            Ok(risk) => risk,
+            Err(error) => {
+                let decline =
+                    pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable(error);
+                info!(reason = %decline, "signal did not produce order");
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    dispatch_id.as_deref(),
+                    &format!("paper_reject:{decline}"),
+                    &rb,
+                    Some(&signal.market_id),
+                    decision_evidence.as_ref(),
+                )
+                .await;
+                return;
+            }
+        };
+        let applied_configuration_hash = applied_runtime
+            .as_ref()
+            .map(runtime_config::RuntimeConfig::canonical_hash)
+            .unwrap_or_else(|| "pre_start_boot_configuration".to_owned());
+        let economic = match self.compose_active_paper_economic(
+            &signal,
+            admission,
+            plan,
+            book_receipt,
+            continuation,
+            p,
+            plan_budget,
+            risk,
+            applied_configuration_hash,
+        ) {
+            Ok(economic) => economic,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "compose active paper economics failed");
+                self.intake_stopped = true;
+                return;
+            }
+        };
+        let snapshot = economic.risk.snapshot.clone();
         match self.strategy.evaluate_at_price(
             &signal,
-            signal.leader_price,
+            economic.sizing.all_in_price,
             p,
-            snapshot.clone(),
+            snapshot,
             sizing_bankroll,
             self.mode,
-            book_cap_contracts,
-            Some(fill_basis),
         ) {
             Err(e) => {
                 info!(reason = %e, "signal did not produce order");
@@ -2671,220 +2894,36 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         return;
                     }
                 }
-                if self.financial_log_paths.is_some() {
-                    let Some(admission) = admission.as_ref() else {
-                        error!(trade = %trade.source_trade_id, "active fill lost admission evidence");
-                        self.intake_stopped = true;
-                        return;
-                    };
-                    let Some(plan) = gate_plan else {
-                        error!(trade = %trade.source_trade_id, "active fill lost its ladder plan");
-                        self.intake_stopped = true;
-                        return;
-                    };
-                    let Some(book_receipt) = book_receipt else {
-                        error!(trade = %trade.source_trade_id, "active fill book is not source-log bound");
-                        self.intake_stopped = true;
-                        return;
-                    };
-                    let Some((_, source_log_path)) = self.financial_log_paths.as_ref() else {
-                        self.intake_stopped = true;
-                        return;
-                    };
-                    let observation = match pending.as_ref() {
-                        Some(continuation) => {
-                            match continuation.observation_from_source_log(source_log_path) {
-                                Ok(Some(observation)) => Some(observation),
-                                Ok(None) | Err(_) => {
-                                    error!(trade = %trade.source_trade_id, "active fill lacks verified observation evidence");
-                                    self.intake_stopped = true;
-                                    return;
-                                }
-                            }
-                        }
-                        None => {
-                            error!(trade = %trade.source_trade_id, "active fill has no durable continuation");
-                            self.intake_stopped = true;
-                            return;
-                        }
-                    };
-                    let sizing_mode = match self.strategy.config().sizing_mode {
-                        SizingMode::Dollar { usd } => {
-                            pe_execution_core::SizingModeAudit::Dollar { usd }
-                        }
-                        SizingMode::Contract { contracts } => {
-                            pe_execution_core::SizingModeAudit::Contract { contracts }
-                        }
-                        SizingMode::Kelly => pe_execution_core::SizingModeAudit::Kelly {
-                            fraction: self
-                                .strategy
-                                .config()
-                                .kelly_fraction_override
-                                .unwrap_or(pe_core_types::KellyFraction(Decimal::new(1, 1))),
-                            probability: p,
-                        },
-                    };
-                    let outcome_index = match u8::try_from(signal.outcome_id.0) {
-                        Ok(value) if value <= 1 => value,
-                        _ => {
-                            self.intake_stopped = true;
-                            return;
-                        }
-                    };
-                    let Some(token_id) = admission
-                        .market
-                        .ordered_outcome_token_ids
-                        .get(usize::from(outcome_index))
-                        .cloned()
-                    else {
-                        self.intake_stopped = true;
-                        return;
-                    };
-                    let band_floor = match Price::new(self.min_fill_price.max(Decimal::ZERO)) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            self.intake_stopped = true;
-                            return;
-                        }
-                    };
-                    let band_ceiling_exclusive =
-                        match Price::new(if self.max_fill_price > Decimal::ZERO {
-                            self.max_fill_price
-                        } else {
-                            Decimal::ONE
-                        }) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                self.intake_stopped = true;
-                                return;
-                            }
-                        };
-                    let cash_before = match CollateralAmount::from_decimal_exact(sizing_bankroll) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            self.intake_stopped = true;
-                            return;
-                        }
-                    };
-                    let applied_configuration_hash = applied_runtime
-                        .as_ref()
-                        .map(runtime_config::RuntimeConfig::canonical_hash)
-                        .unwrap_or_else(|| "pre_start_boot_configuration".to_owned());
-                    let economic = match pe_execution_core::EconomicPrepared::compose(
-                        pe_execution_core::EconomicInputs {
-                            market: pe_execution_core::MarketSelection {
-                                condition_id,
-                                outcome_index,
-                                token_id,
-                                side: intent.side,
-                                market_id: intent.market_id.to_string(),
-                            },
-                            admission,
-                            plan,
-                            book_receipt,
-                            observation,
-                            sizing_mode,
-                            budget: plan_budget,
-                            slippage_rate: self.strategy.config().slippage_rate,
-                            risk: pe_execution_core::RiskAudit {
-                                snapshot,
-                                decision: pe_execution_core::RiskDecisionAudit::Approved,
-                            },
-                            cash_before,
-                            price_impact_cap_bps: self.price_impact_cap_bps,
-                            chase_ceiling: signal.leader_price,
-                            band_floor,
-                            band_ceiling_exclusive,
-                            applied_configuration_hash,
-                        },
-                    ) {
-                        Ok(economic) => economic,
-                        Err(error) => {
-                            error!(%error, trade = %trade.source_trade_id, "compose active paper economics failed");
-                            self.intake_stopped = true;
-                            return;
-                        }
-                    };
-                    match self
-                        .apply_active_financial_fill(&trade, economic, dispatch_id.as_deref())
-                        .await
-                    {
-                        Ok(final_receipt) => {
-                            self.filled_positions.insert(MarketOutcomeId::new(
-                                signal.market_id.clone(),
-                                signal.outcome_id,
-                            ));
-                            enqueue_if_buy(
-                                self.snapshot_sink.as_ref(),
-                                intent.side,
-                                &intent.idempotency_key,
-                                &intent.market_id,
-                                intent.outcome_id,
-                                OffsetDateTime::now_utc().unix_timestamp(),
-                            );
-                            info!(
-                                kind = "paper_financial_final",
-                                final_sequence = final_receipt.sequence.0,
-                                market = %intent.market_id,
-                                "paper fill committed"
-                            );
-                        }
-                        Err(error) => {
-                            error!(%error, trade = %trade.source_trade_id, "active paper financial transition is uncertain");
-                            self.intake_stopped = true;
-                        }
-                    }
-                    return;
-                }
-                let fill = LegacyPaperFill {
-                    intent,
-                    simulated_fill_price: fill_basis,
-                    simulated_at: SourceTimestamp(execution_at),
-                    fill_source: LegacyFillSource::ClobBestAsk,
-                };
-                let receipt = match self.append_legacy_fill(&fill) {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        error!(%error, "paper log durability uncertain; stopping producer intake");
-                        {
-                            let mut health = self
-                                .health
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            health.paper_durability_uncertain = true;
-                            health.refresh_event_log_writable();
-                        }
-                        self.rollback_admission(&rb, None);
-                        self.intake_stopped = true;
-                        return;
-                    }
-                };
-                let filled_key =
-                    MarketOutcomeId::new(fill.intent.market_id.clone(), fill.intent.outcome_id);
-                if PaperCommitResult::Filled
-                    == self
-                        .commit_paper_fill(
-                            &trade,
-                            &leader_row,
-                            &fill,
-                            receipt.sequence,
-                            dispatch_id.as_deref(),
-                            decision_evidence.as_ref(),
-                        )
-                        .await
+                match self
+                    .apply_active_financial_fill(&trade, economic, dispatch_id.as_deref())
+                    .await
                 {
-                    self.filled_positions.insert(filled_key);
-                    info!(
-                        kind = "legacy_paper_fill",
-                        idempotency_key = %fill.intent.idempotency_key,
-                        market = %fill.intent.market_id,
-                        side = ?fill.intent.side,
-                        contracts = fill.intent.contracts.0,
-                        fill_price = %fill.simulated_fill_price.0,
-                        leader_price = %signal.leader_price.0,
-                        market_mid = %market_mid.0,
-                    );
+                    Ok(final_receipt) => {
+                        self.filled_positions.insert(MarketOutcomeId::new(
+                            signal.market_id.clone(),
+                            signal.outcome_id,
+                        ));
+                        enqueue_if_buy(
+                            self.snapshot_sink.as_ref(),
+                            intent.side,
+                            &intent.idempotency_key,
+                            &intent.market_id,
+                            intent.outcome_id,
+                            OffsetDateTime::now_utc().unix_timestamp(),
+                        );
+                        info!(
+                            kind = "paper_financial_final",
+                            final_sequence = final_receipt.sequence.0,
+                            market = %intent.market_id,
+                            "paper fill committed"
+                        );
+                    }
+                    Err(error) => {
+                        error!(%error, trade = %trade.source_trade_id, "active paper financial transition is uncertain");
+                        self.intake_stopped = true;
+                    }
                 }
+                return;
             }
         }
     }
@@ -3539,24 +3578,6 @@ fn check_resolution_horizon(
 }
 
 // ── Stub risk snapshot ────────────────────────────────────────────────────────
-
-/// Legacy-era compatibility snapshot. It is unreachable after QualificationStarted; the active
-/// era always derives risk from the coherent exact financial projection.
-fn pre_start_risk_snapshot() -> RiskSnapshot {
-    RiskSnapshot {
-        leader_exposure_bps: BasisPoints(0),
-        market_exposure_bps: BasisPoints(0),
-        family_exposure_bps: BasisPoints(0),
-        total_copy_exposure_bps: BasisPoints(0),
-        intraday_pnl_bps: BasisPoints(0),
-        rolling_7d_pnl_bps: BasisPoints(0),
-        absolute_pnl_bps: BasisPoints(0),
-        copy_latency_kill_switch_active: false,
-        proposed_trade_bps: BasisPoints(0), // overridden by evaluate()
-        per_trade_cap_bps: 0,               // overridden by evaluate()
-        concentration_caps: None,           // un-enforced by owner decision (#508)
-    }
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

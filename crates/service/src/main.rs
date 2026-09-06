@@ -41,8 +41,9 @@ use pe_paper_pnl::{PnlLedger, ResolutionStore};
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::config_poller::{
-    CONFIG_POLL_INTERVAL_SECS, SupabaseConfigFetcher, capacity_request_channel,
-    fetch_service_config, run_capacity_worker, run_config_poll_loop,
+    CONFIG_POLL_INTERVAL_SECS, RiskHaltReleaseHandle, SupabaseConfigFetcher,
+    capacity_request_channel, fetch_service_config, partition_risk_halt_release_hash,
+    run_capacity_worker, run_config_poll_loop,
 };
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
@@ -317,9 +318,18 @@ async fn main() -> Result<()> {
     } else {
         ConfigEra::Legacy17
     };
-    let initial_runtime_config =
-        load_initial_runtime_config(&initial_config_rows, &cfg, clob_creds_present, config_era)
-            .context("validate required initial service_config snapshot")?;
+    let initial_partitioned = partition_risk_halt_release_hash(&initial_config_rows);
+    if let Some(warning) = initial_partitioned.warning {
+        warn!(?warning, "boot risk halt release row ignored");
+    }
+    let initial_release_hash = initial_partitioned.risk_halt_release_hash.clone();
+    let initial_runtime_config = load_initial_runtime_config(
+        &initial_partitioned.economic_rows,
+        &cfg,
+        clob_creds_present,
+        config_era,
+    )
+    .context("validate required initial service_config snapshot")?;
     let mode = parse_mode(&initial_runtime_config.mode)?;
     let max_fill_price = initial_runtime_config.max_fill_price;
     let min_fill_price = initial_runtime_config.min_fill_price;
@@ -783,6 +793,13 @@ async fn main() -> Result<()> {
 
     // Bounded service-side activity-bucket/admission control channel (#544).
     let (control_tx, control_rx) = mpsc::channel(2);
+    let risk_halt_release = financial_start.is_some().then(|| {
+        RiskHaltReleaseHandle::new(
+            cfg.event_log_path.clone(),
+            cfg.source_event_log_path.clone(),
+            control_tx.clone(),
+        )
+    });
     let (producer_start_tx, producer_start_rx) = watch::channel(false);
 
     // Runtime admissions prove durable history and recheck the fence under the shared
@@ -1202,6 +1219,14 @@ async fn main() -> Result<()> {
             .map(|()| TaskExit::CleanShutdown)
             .map_err(TaskFailure::typed)
     });
+    if let (Some(handle), Some(release_hash)) =
+        (risk_halt_release.as_ref(), initial_release_hash.as_deref())
+    {
+        handle
+            .apply(release_hash)
+            .await
+            .context("synchronize boot risk halt release")?;
+    }
     producer_start_tx
         .send(true)
         .map_err(|_| anyhow::anyhow!("source producer start gate closed"))?;
@@ -1356,6 +1381,7 @@ async fn main() -> Result<()> {
             clob_creds_present,
             config_era,
             Some(health.clone()),
+            risk_halt_release.clone(),
         );
         supervisor.spawn(
             TaskName::RuntimeConfigPoller,

@@ -1316,6 +1316,8 @@ mod tests {
             risk: RiskAudit {
                 snapshot: risk_snapshot,
                 decision: RiskDecisionAudit::Approved,
+                price_receipts: Vec::new(),
+                evaluated_at_unix_ms: 0,
             },
             balance: BalanceAudit {
                 cash_before: CollateralAmount::from_atomic(10_000_000),

@@ -30,6 +30,7 @@ age = { version = "0.11", features = ["armor"] }
 pe-core-types               = { path = "../core-types",                 version = "0.1.0" }
 pe-copy-signal-engine       = { path = "../copy-signal-engine",         version = "0.1.0" }
 pe-event-log                = { path = "../event-log",                  version = "0.1.0" }
+pe-kelly-sizer              = { path = "../kelly-sizer",                version = "0.1.0" }
 pe-risk-engine              = { path = "../risk-engine",                version = "0.1.0" }
 pe-resolver-card            = { path = "../resolver-card",              version = "0.1.0" }
 pe-source-core              = { path = "../source-core",                version = "0.1.0" }

@@ -6,6 +6,7 @@
 //! polling while that worker performs potentially slow history/position preparation. Only a
 //! successfully applied membership generation becomes the runtime snapshot's active capacity.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,9 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::health::SharedHealth;
+use crate::orchestrator_control::OrchestratorControl;
+use crate::paper_recovery::{HaltState, paper_era, scan_paper_log};
+use crate::risk_inputs::{audited_halt_release, paper_latency_samples, rebuild_active_risk_halts};
 use crate::runtime_config::{
     AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RuntimeConfigStatus,
     WatchlistCapacityEpoch, parse_config,
@@ -158,6 +162,65 @@ pub enum ConfigPollError {
     CapacityResultChannelClosed,
 }
 
+/// Applies the optional incident release through the paper serializer. Re-reading the paper log
+/// makes the row naturally consume-once: after the synchronized release edge the named cause is no
+/// longer active and the same hash cannot match again.
+#[derive(Clone)]
+pub struct RiskHaltReleaseHandle {
+    paper_log_path: PathBuf,
+    source_log_path: PathBuf,
+    control: mpsc::Sender<OrchestratorControl>,
+}
+
+impl RiskHaltReleaseHandle {
+    pub fn new(
+        paper_log_path: PathBuf,
+        source_log_path: PathBuf,
+        control: mpsc::Sender<OrchestratorControl>,
+    ) -> Self {
+        Self {
+            paper_log_path,
+            source_log_path,
+            control,
+        }
+    }
+
+    pub async fn apply(&self, release_hash: &str) -> Result<(), String> {
+        let era =
+            paper_era(scan_paper_log(&self.paper_log_path).map_err(|error| error.to_string())?);
+        let active = rebuild_active_risk_halts(&era);
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let latest_latency_p95_ms = paper_latency_samples(&era, &self.source_log_path, now_unix)
+            .map_err(|error| format!("derive release latency evidence: {error}"))?
+            .latest
+            .p95_ms;
+        let Some(release) =
+            audited_halt_release(&era, &active, release_hash, latest_latency_p95_ms)
+        else {
+            return Ok(());
+        };
+        let (acknowledged, response) = tokio::sync::oneshot::channel();
+        self.control
+            .send(OrchestratorControl::RiskHaltChange {
+                owner: release.owner,
+                cause: release.cause,
+                state: HaltState::Released,
+                evidence: serde_json::json!({
+                    "engaged_receipt": release.engaged_receipt,
+                    "release_hash": release_hash,
+                    "latest_latency_p95_ms": latest_latency_p95_ms,
+                }),
+                acknowledged,
+            })
+            .await
+            .map_err(|_| "orchestrator control channel closed during risk release".to_owned())?;
+        response
+            .await
+            .map_err(|_| "orchestrator dropped risk release acknowledgement".to_owned())?
+            .map(|_| ())
+    }
+}
+
 fn publish_generation_health(
     health: Option<&SharedHealth>,
     capacity_requests: &CapacityRequestHandle,
@@ -281,6 +344,7 @@ pub async fn poll_once<F: ConfigFetcher>(
     capacity_requests: &CapacityRequestHandle,
     clob_creds_present: bool,
     era: ConfigEra,
+    risk_release: Option<&RiskHaltReleaseHandle>,
 ) {
     let rows =
         match fetch_with_timeout(fetcher, Duration::from_secs(CONFIG_FETCH_TIMEOUT_SECS)).await {
@@ -317,6 +381,14 @@ pub async fn poll_once<F: ConfigFetcher>(
         }
     };
     let requested_target = parsed.active_watchlist_size;
+
+    if let (Some(handle), Some(release_hash)) =
+        (risk_release, partitioned.risk_halt_release_hash.as_deref())
+        && let Err(error) = handle.apply(release_hash).await
+    {
+        warn!(%error, "risk halt release was not synchronized; keeping last-known-good config");
+        return;
+    }
 
     // This task is the sole RuntimeConfig writer. Other valid edits take effect immediately;
     // active_watchlist_size continues to describe the last successfully applied membership cap.
@@ -420,6 +492,7 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     clob_creds_present: bool,
     era: ConfigEra,
     health: Option<SharedHealth>,
+    risk_release: Option<RiskHaltReleaseHandle>,
 ) -> Result<(), ConfigPollError> {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -436,6 +509,7 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
                     &capacity_requests,
                     clob_creds_present,
                     era,
+                    risk_release.as_ref(),
                 ).await;
                 publish_generation_health(health.as_ref(), &capacity_requests, &applied_capacity);
             }
@@ -675,6 +749,7 @@ mod tests {
             &requests,
             false,
             ConfigEra::Financial15,
+            None,
         )
         .await;
         assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
@@ -694,6 +769,7 @@ mod tests {
             &requests,
             false,
             ConfigEra::Financial15,
+            None,
         )
         .await;
         assert_eq!(live.snapshot().max_fill_price, before);
@@ -719,6 +795,7 @@ mod tests {
             &requests,
             false,
             ConfigEra::Financial15,
+            None,
         )
         .await;
         let snapshot = live.snapshot();
@@ -740,6 +817,7 @@ mod tests {
             &requests,
             false,
             ConfigEra::Financial15,
+            None,
         )
         .await;
         poll_once(
@@ -749,6 +827,7 @@ mod tests {
             &requests,
             false,
             ConfigEra::Financial15,
+            None,
         )
         .await;
         assert_eq!(requests.current().target, 150);
@@ -804,6 +883,7 @@ mod tests {
                 3_600,
                 false,
                 ConfigEra::Financial15,
+                None,
                 None,
             )
             .await,
@@ -922,6 +1002,7 @@ mod tests {
             3_600,
             false,
             ConfigEra::Financial15,
+            None,
             None,
         ));
 

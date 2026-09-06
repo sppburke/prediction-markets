@@ -19,3 +19,9 @@ B7: DONE crates/execution-core/src/live_journal.rs:181
 RB8-live: DONE crates/service/src/live_fanout.rs:1532
 RB7-live: DONE crates/service/src/live_venue_adapter.rs:1313
 RE10: DONE crates/execution-core/src/live_journal.rs:1047
+ROUND2-open-order-inventory: DONE crates/execution-core/src/live_journal.rs:879
+ROUND2-S5-live-risk-audit: DONE crates/service/src/live_fanout.rs:1459
+ROUND2-strategy-doc-lint: REPORTED outside LIVE ownership crates/strategy-winner-follow/src/lib.rs
+ROUND2-format: DONE cargo fmt --all and cargo fmt --all --check
+ROUND2-live-merge-fixes: DONE allocator-based Kelly adapter crates/service/src/live_fanout.rs:1398; pe-service now reaches only non-owned orchestrator compile errors
+ROUND2-summary: DONE INTEGRATION_SUMMARY_LIVE2.md
