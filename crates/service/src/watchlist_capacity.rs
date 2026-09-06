@@ -738,9 +738,29 @@ mod tests {
                 "pe-service.watchlist-capacity-config"
             ]
         );
+        // The configuration receipt binds the generation, the target, and the exact published set.
+        let config_payload =
+            serde_json::from_slice::<serde_json::Value>(&source_records[1].1.payload).unwrap();
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&source_records[1].1.payload).unwrap(),
-            serde_json::json!({"generation": request.generation, "target": request.target})
+            config_payload["generation"],
+            serde_json::json!(request.generation)
+        );
+        assert_eq!(config_payload["target"], serde_json::json!(request.target));
+        let published_wallets: Vec<String> = config_payload["published_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["wallet"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            published_wallets,
+            vec![format!("{existing:?}"), format!("{newcomer:?}")]
+                .into_iter()
+                .map(|wallet| wallet
+                    .trim_start_matches("WalletAddress(")
+                    .trim_end_matches(')')
+                    .to_owned())
+                .collect::<Vec<_>>()
         );
         source_log.task.abort();
         server.abort();
