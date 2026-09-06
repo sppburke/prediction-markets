@@ -876,13 +876,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .price_receipts
             .clone_from(&price_attempt.price_receipts);
         let evaluated_at = price_attempt.evaluated_at;
-        let evaluated_at_unix_ms = evaluated_at
-            .unix_timestamp_nanos()
-            .checked_div(1_000_000)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or_else(|| {
-                ActivePaperRiskFailure::new(RiskInputsUnavailable::Overflow, &attempt)
-            })?;
+        let evaluated_at_unix_ms = i64::try_from(
+            evaluated_at.unix_timestamp_nanos().div_euclid(1_000_000),
+        )
+        .map_err(|_| ActivePaperRiskFailure::new(RiskInputsUnavailable::Overflow, &attempt))?;
         attempt.evaluated_at_unix_ms = evaluated_at_unix_ms;
         let observed = price_attempt
             .result

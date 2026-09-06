@@ -3426,7 +3426,7 @@ async fn replayed_risk_prices(
         .collect::<HashSet<_>>();
     let mut covered_markets = HashSet::new();
     let mut entries = HashMap::<MarketId, StrictPriceInput>::new();
-    let evaluated_at_unix_nanos = i128::from(evaluated_at_unix_ms) * 1_000_000;
+    let evaluated_at_unix_ms = i128::from(evaluated_at_unix_ms);
     for receipt in price_receipts {
         let observation = source
             .get(&receipt.sequence.0)
@@ -3446,8 +3446,8 @@ async fn replayed_risk_prices(
             ));
         }
         classify_strict_price_time(
-            observation.received_at.0.unix_timestamp_nanos(),
-            evaluated_at_unix_nanos,
+            i128::from(observation.received_unix_ms),
+            evaluated_at_unix_ms,
         )
         .map_err(RiskPriceReplayError::Unavailable)?;
         let record = serde_json::from_slice::<GammaPriceAttemptRecord>(&observation.payload)
@@ -3543,7 +3543,7 @@ async fn replayed_risk_prices(
                     || conflicting.contains(&row.condition_id)
                     || existing.strict_mids != row.strict_outcome_prices;
                 existing.strict_mids = row.strict_outcome_prices;
-                existing.observed_at_unix_nanos = observation.received_at.0.unix_timestamp_nanos();
+                existing.observed_at_unix_ms = i128::from(observation.received_unix_ms);
                 existing.receipt = *receipt;
                 continue;
             }
@@ -3551,7 +3551,7 @@ async fn replayed_risk_prices(
                 market,
                 StrictPriceInput {
                     strict_mids: row.strict_outcome_prices,
-                    observed_at_unix_nanos: observation.received_at.0.unix_timestamp_nanos(),
+                    observed_at_unix_ms: i128::from(observation.received_unix_ms),
                     receipt: *receipt,
                     conflicting: conflicting.contains(&row.condition_id),
                 },
@@ -3570,7 +3570,7 @@ async fn replayed_risk_prices(
         .iter()
         .map(|position| MarketOutcomeId::new(position.market_id.clone(), position.outcome_id))
         .collect::<Vec<_>>();
-    classify_strict_prices(&ids, evaluated_at_unix_nanos, &entries)
+    classify_strict_prices(&ids, evaluated_at_unix_ms, &entries)
         .map(|prices| {
             prices
                 .into_iter()
@@ -9290,6 +9290,123 @@ mod tests {
         let after = verify_qualification(&options).await.unwrap();
         assert_eq!(before, after);
         assert_eq!(after.replay.decisions, 0);
+    }
+
+    /// PASS: successful and failed attempts inside one millisecond, the final fresh millisecond,
+    /// and the exact TTL boundary retain the runtime classifier's outcome after receipt-bound
+    /// evidence is reconstructed by qualification.
+    #[tokio::test]
+    async fn strict_price_millisecond_outcomes_round_trip_through_qualification() {
+        const OBSERVED_NS: i128 = 100_000_900_000;
+        const SAME_MILLISECOND_EVALUATED_NS: i128 = 100_000_950_000;
+        const LAST_FRESH_EVALUATED_NS: i128 = 159_999_950_000;
+        const STALE_BOUNDARY_EVALUATED_NS: i128 = 160_000_000_000;
+
+        let market = MarketId(VenueMarketId("condition-millisecond".to_owned()));
+        let position = PaperPositionRow {
+            market_id: market.clone(),
+            outcome_id: OutcomeId(0),
+            long: ShareAmount::from_atomic(1_000_000),
+            short: ShareAmount::ZERO,
+        };
+        let request_url = format!(
+            "https://offline.invalid/markets?condition_ids={market}&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let raw =
+            br#"[{"conditionId":"condition-millisecond","outcomePrices":"[\"0.4\",\"0.6\"]"}]"#;
+        let observed_ms = i64::try_from(OBSERVED_NS.div_euclid(1_000_000)).unwrap();
+
+        for (label, page_succeeded, evaluated_ns, expected_error) in [
+            (
+                "successful_same_millisecond",
+                true,
+                SAME_MILLISECOND_EVALUATED_NS,
+                None,
+            ),
+            (
+                "failed_same_millisecond",
+                false,
+                SAME_MILLISECOND_EVALUATED_NS,
+                Some(RiskInputsUnavailable::PriceMissing),
+            ),
+            (
+                "last_fresh_millisecond",
+                true,
+                LAST_FRESH_EVALUATED_NS,
+                None,
+            ),
+            (
+                "exact_ttl_boundary",
+                true,
+                STALE_BOUNDARY_EVALUATED_NS,
+                Some(RiskInputsUnavailable::PriceStale),
+            ),
+        ] {
+            let receipt = test_receipt(2_000);
+            let evaluated_ms = i64::try_from(evaluated_ns.div_euclid(1_000_000)).unwrap();
+            let mut runtime_entries = HashMap::new();
+            if page_succeeded {
+                runtime_entries.insert(
+                    market.clone(),
+                    StrictPriceInput {
+                        strict_mids: Some(vec![
+                            Price::new(dec!(0.4)).unwrap(),
+                            Price::new(dec!(0.6)).unwrap(),
+                        ]),
+                        observed_at_unix_ms: i128::from(observed_ms),
+                        receipt,
+                        conflicting: false,
+                    },
+                );
+            }
+            let runtime = classify_strict_prices(
+                &[MarketOutcomeId::new(market.clone(), OutcomeId(0))],
+                i128::from(evaluated_ms),
+                &runtime_entries,
+            );
+            let payload = if page_succeeded {
+                gamma_price_page_record(&request_url, observed_ms, raw, true)
+            } else {
+                gamma_price_failure_record(&request_url, "transport unavailable")
+            };
+            let durable = source_observation(
+                receipt.sequence.0,
+                observed_ms,
+                GAMMA_MARKETS_SOURCE_ID,
+                GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+                GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+                &payload,
+            );
+            let source = BTreeMap::from([(receipt.sequence.0, durable)]);
+            let replay = replayed_risk_prices(
+                &[receipt],
+                evaluated_ms,
+                std::slice::from_ref(&position),
+                &source,
+            )
+            .await;
+
+            match expected_error {
+                None => {
+                    assert!(runtime.is_ok(), "{label}: {runtime:?}");
+                    assert!(replay.is_ok(), "{label}: {replay:?}");
+                    let runtime = runtime.unwrap();
+                    let replay = replay.unwrap();
+                    assert_eq!(
+                        runtime.get(&(market.to_string(), 0)).map(|row| row.price),
+                        replay.get(&(market.clone(), OutcomeId(0))).copied(),
+                        "{label}"
+                    );
+                }
+                Some(expected) => {
+                    assert_eq!(runtime.unwrap_err(), expected, "{label}");
+                    assert!(
+                        matches!(replay, Err(RiskPriceReplayError::Unavailable(actual)) if actual == expected),
+                        "{label}: {replay:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -35,6 +35,7 @@ use crate::risk_inputs::RiskInputsUnavailable;
 
 /// How long a cached mid stays fresh before a refetch.
 const TTL: Duration = Duration::from_secs(60);
+const NANOS_PER_MILLISECOND: i128 = 1_000_000;
 /// Min spacing between requests on this fetcher: 50 ms ⇒ ≤ 20 req/s. See `_GLOSSARY`.
 /// (Batch concurrency is the client's `GAMMA_CONCURRENCY`; this gate still bounds actual throughput.)
 const GAMMA_MIN_INTERVAL_MS: u64 = 50;
@@ -113,33 +114,44 @@ pub struct MidPriceObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StrictPriceInput {
     pub strict_mids: Option<Vec<Price>>,
-    pub observed_at_unix_nanos: i128,
+    pub observed_at_unix_ms: i128,
     pub receipt: AppendReceipt,
     pub conflicting: bool,
 }
 
 /// Classify one consulted page timestamp against the strict evaluation clock.
 pub(crate) fn classify_strict_price_time(
-    observed_at_unix_nanos: i128,
-    evaluated_at_unix_nanos: i128,
+    observed_at_unix_ms: i128,
+    evaluated_at_unix_ms: i128,
 ) -> Result<(), RiskInputsUnavailable> {
-    if observed_at_unix_nanos > evaluated_at_unix_nanos {
+    if observed_at_unix_ms > evaluated_at_unix_ms {
         return Err(RiskInputsUnavailable::PriceFuture);
     }
-    let age_nanos = evaluated_at_unix_nanos
-        .checked_sub(observed_at_unix_nanos)
+    let age_ms = evaluated_at_unix_ms
+        .checked_sub(observed_at_unix_ms)
         .ok_or(RiskInputsUnavailable::Overflow)?;
-    if age_nanos >= i128::try_from(TTL.as_nanos()).map_err(|_| RiskInputsUnavailable::Overflow)? {
+    if age_ms >= i128::try_from(TTL.as_millis()).map_err(|_| RiskInputsUnavailable::Overflow)? {
         return Err(RiskInputsUnavailable::PriceStale);
     }
     Ok(())
+}
+
+fn unix_timestamp_ms(instant: OffsetDateTime) -> i128 {
+    instant
+        .unix_timestamp_nanos()
+        .div_euclid(NANOS_PER_MILLISECOND)
+}
+
+fn quantize_to_millisecond(instant: OffsetDateTime) -> OffsetDateTime {
+    let nanos = instant.nanosecond() / 1_000_000 * 1_000_000;
+    instant.replace_nanosecond(nanos).unwrap_or(instant)
 }
 
 /// Apply the strict cache classifier in requested-position order. Qualification reconstructs these
 /// inputs from only the recorded acquisition receipts and calls this same function.
 pub(crate) fn classify_strict_prices(
     ids: &[MarketOutcomeId],
-    evaluated_at_unix_nanos: i128,
+    evaluated_at_unix_ms: i128,
     entries: &HashMap<MarketId, StrictPriceInput>,
 ) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
     let mut output = BTreeMap::new();
@@ -150,7 +162,7 @@ pub(crate) fn classify_strict_prices(
         if entry.conflicting {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        classify_strict_price_time(entry.observed_at_unix_nanos, evaluated_at_unix_nanos)?;
+        classify_strict_price_time(entry.observed_at_unix_ms, evaluated_at_unix_ms)?;
         let outcome = usize::from(id.outcome().0);
         let price = entry
             .strict_mids
@@ -163,10 +175,8 @@ pub(crate) fn classify_strict_prices(
             MidPriceObservation {
                 price,
                 receipt: entry.receipt,
-                observed_unix: i64::try_from(
-                    entry.observed_at_unix_nanos.div_euclid(1_000_000_000),
-                )
-                .map_err(|_| RiskInputsUnavailable::Overflow)?,
+                observed_unix: i64::try_from(entry.observed_at_unix_ms.div_euclid(1_000))
+                    .map_err(|_| RiskInputsUnavailable::Overflow)?,
             },
         );
     }
@@ -328,7 +338,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         // The response pages are durably appended by `ensure_entries` and stamped from the same
         // clock; the one risk clock is taken only after that await so a newly fetched observation
         // cannot be newer than its validator.
-        let evaluated_at = clock();
+        let evaluated_at = quantize_to_millisecond(clock());
         let map = self.inner.lock().await;
         let mut price_receipts = ensured.missing_receipts;
         price_receipts.extend(
@@ -347,13 +357,13 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                     market.clone(),
                     StrictPriceInput {
                         strict_mids: entry.strict_mids.clone(),
-                        observed_at_unix_nanos: entry.observed_at.unix_timestamp_nanos(),
+                        observed_at_unix_ms: unix_timestamp_ms(entry.observed_at),
                         receipt,
                         conflicting: entry.conflicting,
                     },
                 );
             }
-            classify_strict_prices(ids, evaluated_at.unix_timestamp_nanos(), &entries)
+            classify_strict_prices(ids, unix_timestamp_ms(evaluated_at), &entries)
         };
         StrictMidPriceAttempt {
             evaluated_at,
@@ -418,7 +428,12 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             Ok(fetched) => fetched,
             Err(error) => {
                 let missing_receipts = self
-                    .record_pages(&error.pages, &error.failed_requests, false, clock())
+                    .record_pages(
+                        &error.pages,
+                        &error.failed_requests,
+                        false,
+                        quantize_to_millisecond(clock()),
+                    )
                     .await
                     .map(|recorded| {
                         let mut receipts = recorded.page_receipts.into_values().collect::<Vec<_>>();
@@ -441,7 +456,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                 };
             }
         };
-        let observed = clock();
+        let observed = quantize_to_millisecond(clock());
         let recorded = match self
             .record_pages(&fetched.pages, &fetched.failed_requests, true, observed)
             .await
@@ -794,7 +809,7 @@ mod tests {
             &cache,
             "future",
             Some(one_price()),
-            now + time::Duration::nanoseconds(1),
+            now + time::Duration::milliseconds(1),
             Some(receipt(2)),
             false,
         )
@@ -823,6 +838,87 @@ mod tests {
                 .result,
             Err(RiskInputsUnavailable::PriceConflict)
         );
+    }
+
+    /// PASS: observation and evaluation instants in the same millisecond compare equal, the last
+    /// fresh millisecond is accepted, and the exact 60-second boundary is stale.
+    #[test]
+    fn strict_time_classifier_uses_millisecond_boundaries() {
+        const OBSERVED_MS: i128 = 100_000;
+
+        assert_eq!(classify_strict_price_time(OBSERVED_MS, OBSERVED_MS), Ok(()));
+        assert_eq!(
+            classify_strict_price_time(OBSERVED_MS, OBSERVED_MS + 59_999),
+            Ok(())
+        );
+        assert_eq!(
+            classify_strict_price_time(OBSERVED_MS, OBSERVED_MS + 60_000),
+            Err(RiskInputsUnavailable::PriceStale)
+        );
+    }
+
+    /// PASS: successful and failed Gamma attempts observed and evaluated within one millisecond
+    /// stamp the durable envelope and the returned evaluation instant at that shared millisecond.
+    #[tokio::test]
+    async fn strict_attempts_quantize_runtime_and_durable_clocks() {
+        for succeeds in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(4);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let mut fixtures = HashMap::new();
+            if succeeds {
+                fixtures.insert(
+                    url(BASE, "0xmillisecond"),
+                    br#"[{"conditionId":"0xmillisecond","outcomePrices":"[\"0.62\",\"0.38\"]"}]"#
+                        .to_vec(),
+                );
+            }
+            let base = datetime!(2026-09-05 12:00 UTC);
+            let reads = Arc::new(AtomicUsize::new(0));
+            let clock_reads = Arc::clone(&reads);
+            let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fixtures), BASE.to_owned())
+                .with_source_log(source_log)
+                .with_clock(Arc::new(move || {
+                    match clock_reads.fetch_add(1, Ordering::SeqCst) {
+                        0 => base + time::Duration::microseconds(100),
+                        1 => base + time::Duration::microseconds(900),
+                        _ => base + time::Duration::microseconds(950),
+                    }
+                }));
+
+            let attempt = cache
+                .fetch_mids_strict_attempt(&[outcome("0xmillisecond", 0)])
+                .await;
+
+            if succeeds {
+                assert!(attempt.result.is_ok());
+            } else {
+                assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceMissing));
+            }
+            assert_eq!(attempt.evaluated_at, base);
+            assert_eq!(attempt.price_receipts.len(), 1);
+            let recorded = pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .map(|item| item.unwrap())
+                .find(|(_, envelope)| envelope.seq == attempt.price_receipts[0].sequence)
+                .map(|(_, envelope)| envelope)
+                .expect("the consulted attempt is durably appended");
+            assert_eq!(recorded.observed_at.0, base);
+            assert_eq!(recorded.received_at.0, base);
+            drop(cache);
+            ingest.abort();
+            let _ = ingest.await;
+        }
     }
 
     /// PASS: with a clock that advances on every read, both a cold cache and a stale seeded entry
