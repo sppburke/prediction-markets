@@ -35,7 +35,7 @@ use crate::clob_book::ClobBookFetcher;
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
     MarketPriceEvidence, TerminalDispositionEvidence, WinnerFollowDecisionInputs,
-    ladder_plan_blake3, replay_decision_pending,
+    WinnerFollowRiskInputEvidence, ladder_plan_blake3, replay_decision_pending,
 };
 use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
@@ -92,6 +92,20 @@ struct GatePlanFailure {
     reason: &'static str,
     book: Box<BookEvidence>,
     checked_at_unix_ms: Option<u64>,
+}
+
+struct ActivePaperRiskFailure {
+    cause: RiskInputsUnavailable,
+    evidence: WinnerFollowRiskInputEvidence,
+}
+
+impl ActivePaperRiskFailure {
+    fn new(cause: RiskInputsUnavailable, evidence: &WinnerFollowRiskInputEvidence) -> Self {
+        Self {
+            cause,
+            evidence: evidence.clone(),
+        }
+    }
 }
 
 fn book_failure(
@@ -838,42 +852,83 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         signal: &LeaderSignal,
         proposed_debit: CollateralAmount,
         per_trade_cap_bps: i32,
-    ) -> Result<pe_execution_core::RiskAudit, RiskInputsUnavailable> {
-        let (paper_log_path, _) = self
-            .financial_log_paths
-            .as_ref()
-            .ok_or(RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-        let source_receipt_millis = self
-            .source_receipt_millis
-            .as_ref()
-            .ok_or(RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-        let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(paper_log_path)
-                .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?,
-        );
-        let evaluated_at = self.financial_now();
-        let now = evaluated_at.unix_timestamp();
+        evaluated_at: OffsetDateTime,
+    ) -> Result<(pe_execution_core::RiskAudit, pe_event_log::AppendReceipt), ActivePaperRiskFailure>
+    {
         let evaluated_at_unix_ms = evaluated_at
             .unix_timestamp_nanos()
             .checked_div(1_000_000)
             .and_then(|value| i64::try_from(value).ok())
-            .ok_or(RiskInputsUnavailable::Overflow)?;
-        let snapshot = self
-            .paper_state
-            .financial_snapshot(now)
-            .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+            .ok_or_else(|| ActivePaperRiskFailure {
+                cause: RiskInputsUnavailable::Overflow,
+                evidence: WinnerFollowRiskInputEvidence {
+                    financial_prefix: None,
+                    price_receipts: Vec::new(),
+                    evaluated_at_unix_ms: i64::MAX,
+                    proposed_debit,
+                    per_trade_cap_bps,
+                },
+            })?;
+        let mut attempt = WinnerFollowRiskInputEvidence {
+            financial_prefix: None,
+            price_receipts: Vec::new(),
+            evaluated_at_unix_ms,
+            proposed_debit,
+            per_trade_cap_bps,
+        };
+        let paper_log_path = self
+            .financial_log_paths
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .ok_or_else(|| {
+                ActivePaperRiskFailure::new(
+                    RiskInputsUnavailable::SnapshotSequenceMismatch,
+                    &attempt,
+                )
+            })?;
+        let source_receipt_millis = self.source_receipt_millis.as_ref().ok_or_else(|| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
+        let era = crate::paper_recovery::paper_era(
+            crate::paper_recovery::scan_paper_log(&paper_log_path).map_err(|_| {
+                ActivePaperRiskFailure::new(
+                    RiskInputsUnavailable::SnapshotSequenceMismatch,
+                    &attempt,
+                )
+            })?,
+        );
+        let financial_prefix = era
+            .frames
+            .last()
+            .map(|frame| frame.receipt)
+            .ok_or_else(|| {
+                ActivePaperRiskFailure::new(
+                    RiskInputsUnavailable::SnapshotSequenceMismatch,
+                    &attempt,
+                )
+            })?;
+        attempt.financial_prefix = Some(financial_prefix);
+        let now = evaluated_at.unix_timestamp();
+        let snapshot = self.paper_state.financial_snapshot(now).map_err(|_| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
         let ids = snapshot
             .positions
             .iter()
             .map(|position| MarketOutcomeId::new(position.market_id.clone(), position.outcome_id))
             .collect::<Vec<_>>();
-        let observed = self.mid_price_cache.fetch_mids_strict(&ids).await?;
+        let observed = self
+            .mid_price_cache
+            .fetch_mids_strict(&ids)
+            .await
+            .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?;
         let mut price_receipts = observed
             .values()
             .map(|value| value.receipt)
             .collect::<Vec<_>>();
         price_receipts.sort_by_key(|receipt| receipt.sequence);
         price_receipts.dedup();
+        attempt.price_receipts.clone_from(&price_receipts);
         let prices = observed
             .into_iter()
             .map(|((market, outcome), value)| {
@@ -893,7 +948,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &signal.market_id.to_string(),
             proposed_debit,
             per_trade_cap_bps,
-        )?;
+        )
+        .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?;
         let latency_was_active = self.active_risk_halts.contains(&(
             crate::paper_recovery::RiskHaltOwner::Paper,
             pe_risk_engine::RiskHaltCause::CopyLatency,
@@ -906,9 +962,31 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             |receipt| source_receipt_millis.received_millis(receipt),
             now,
             latency_was_active,
-        )?;
+        )
+        .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?;
         self.synchronize_paper_risk_halts(&snapshot, evaluated_at_unix_ms)
-            .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+            .map_err(|_| {
+                ActivePaperRiskFailure::new(
+                    RiskInputsUnavailable::SnapshotSequenceMismatch,
+                    &attempt,
+                )
+            })?;
+        let financial_prefix = crate::paper_recovery::scan_paper_log(&paper_log_path)
+            .map_err(|_| {
+                ActivePaperRiskFailure::new(
+                    RiskInputsUnavailable::SnapshotSequenceMismatch,
+                    &attempt,
+                )
+            })?
+            .last()
+            .map(|frame| frame.receipt)
+            .ok_or_else(|| {
+                ActivePaperRiskFailure::new(
+                    RiskInputsUnavailable::SnapshotSequenceMismatch,
+                    &attempt,
+                )
+            })?;
+        attempt.financial_prefix = Some(financial_prefix);
         self.apply_global_halts_to_snapshot(&mut snapshot);
         let decision = match pe_risk_engine::evaluate_risk(&snapshot) {
             pe_risk_engine::RiskDecision::Approved => {
@@ -918,12 +996,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 pe_execution_core::RiskDecisionAudit::Blocked { reason }
             }
         };
-        Ok(pe_execution_core::RiskAudit {
-            snapshot,
-            decision,
-            price_receipts,
-            evaluated_at_unix_ms,
-        })
+        Ok((
+            pe_execution_core::RiskAudit {
+                snapshot,
+                decision,
+                price_receipts,
+                evaluated_at_unix_ms,
+            },
+            financial_prefix,
+        ))
     }
 
     /// Compose the one active-era economic record from the final sized plan. This is the only
@@ -2908,14 +2989,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .config()
             .per_trade_cap
             .resolve_bps(TradingMode::LiveTiny);
-        let risk = match self
-            .active_paper_risk_snapshot(&signal, planned_worst_case_all_in_debit, per_trade_cap_bps)
+        let risk_evaluated_at = self.financial_now();
+        let (risk, risk_financial_prefix) = match self
+            .active_paper_risk_snapshot(
+                &signal,
+                planned_worst_case_all_in_debit,
+                per_trade_cap_bps,
+                risk_evaluated_at,
+            )
             .await
         {
             Ok(risk) => risk,
-            Err(error) => {
+            Err(failure) => {
                 let decline = pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable;
-                let reason = format!("{decline}: {error}");
+                let reason = format!("{decline}: {}", failure.cause);
                 info!(reason = %reason, "signal did not produce order");
                 self.decline_or_rollback(
                     &trade,
@@ -2923,7 +3010,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     dispatch_id.as_deref(),
                     &format!("paper_reject:{reason}"),
                     &decline,
-                    WinnerFollowDecisionInputs::RiskInputsUnavailable,
+                    WinnerFollowDecisionInputs::RiskInputsUnavailable {
+                        cause: failure.cause,
+                        evidence: failure.evidence,
+                    },
                     &rb,
                     Some(&signal.market_id),
                     decision_evidence.as_ref(),
@@ -2956,12 +3046,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 return;
             }
         };
-        let snapshot = economic.risk.snapshot.clone();
         match self.strategy.evaluate_at_price(
             &signal,
             economic.sizing.all_in_price,
             p,
-            snapshot.clone(),
+            economic.risk.snapshot.clone(),
             sizing_bankroll,
             self.mode,
         ) {
@@ -2975,8 +3064,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     &reason,
                     &e,
                     WinnerFollowDecisionInputs::Evaluated {
-                        all_in_price: economic.sizing.all_in_price,
-                        risk_snapshot: snapshot,
+                        economic: Box::new(economic),
+                        financial_prefix: risk_financial_prefix,
                     },
                     &rb,
                     Some(&signal.market_id),

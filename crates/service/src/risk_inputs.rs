@@ -32,7 +32,10 @@ pub(crate) const MAX_HISTORICAL_MARK_AGE_SECS: i64 = 120;
 
 /// Service-owned reason that replayable evidence could not produce a risk snapshot; the strategy
 /// crate sees only the unit `RiskInputsUnavailable` decline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskInputsUnavailable {
     #[error("financial snapshot sequence does not match the completed paper-log prefix")]
     SnapshotSequenceMismatch,

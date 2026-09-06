@@ -1,9 +1,9 @@
 //! Pure replay and validation for post-boundary `decision_pending` evidence.
 
-use pe_core_types::{EventSeq, Price, Side, SourceTradeId};
+use pe_core_types::{CollateralAmount, EventSeq, Price, Side, SourceTradeId};
 use pe_event_log::AppendReceipt;
+use pe_execution_core::EconomicPrepared;
 use pe_paper_state::{DecisionPendingRow, DecisionPendingState};
-use pe_risk_engine::RiskSnapshot;
 use pe_strategy_winner_follow::{WinnerFollowDeclineAudit, WinnerFollowError};
 use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
@@ -96,16 +96,34 @@ pub struct RecordedFillEvidence {
     pub event_seq: u64,
 }
 
-/// Exact direct inputs to the shared Winner-Follow decision, or the typed fact that they could not
-/// be constructed. Qualification consumes this record without reading a live clock or database.
+/// Causal evidence retained when the financial prefix cannot construct a strategy risk snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WinnerFollowRiskInputEvidence {
+    /// Exact paper prefix observed before risk construction. `None` preserves an acquisition
+    /// failure that occurred before a verified financial prefix was available.
+    pub financial_prefix: Option<AppendReceipt>,
+    /// Source receipts consumed while valuing the prefix's open positions.
+    pub price_receipts: Vec<AppendReceipt>,
+    /// Clock used for PnL, price freshness, and latency reconstruction.
+    pub evaluated_at_unix_ms: i64,
+    pub proposed_debit: CollateralAmount,
+    pub per_trade_cap_bps: i32,
+}
+
+/// Receipt-bound inputs to the shared Winner-Follow decision, or the typed causal failure that
+/// prevented their construction. Qualification replays both variants from the sealed prefixes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum WinnerFollowDecisionInputs {
     Evaluated {
-        all_in_price: Price,
-        risk_snapshot: RiskSnapshot,
+        economic: Box<EconomicPrepared>,
+        financial_prefix: AppendReceipt,
     },
-    RiskInputsUnavailable,
+    RiskInputsUnavailable {
+        cause: crate::risk_inputs::RiskInputsUnavailable,
+        evidence: WinnerFollowRiskInputEvidence,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -775,8 +793,8 @@ pub fn replay_decision_pending(
 mod tests {
     use pe_copy_signal_engine::TradeProvenance;
     use pe_core_types::{
-        BasisPoints, LeaderAction, MarketId, OutcomeId, ProbabilityPpm, ShareAmount, Side,
-        VenueMarketId, WalletAddress,
+        LeaderAction, MarketId, OutcomeId, ProbabilityPpm, ShareAmount, Side, VenueMarketId,
+        WalletAddress,
     };
     use rust_decimal_macros::dec;
     use serde_json::json;
@@ -915,21 +933,15 @@ mod tests {
         evidence
     }
 
-    fn evaluated_inputs() -> WinnerFollowDecisionInputs {
-        WinnerFollowDecisionInputs::Evaluated {
-            all_in_price: Price(dec!(0.50)),
-            risk_snapshot: RiskSnapshot {
-                leader_exposure_bps: BasisPoints::ZERO,
-                market_exposure_bps: BasisPoints::ZERO,
-                family_exposure_bps: BasisPoints::ZERO,
-                total_copy_exposure_bps: BasisPoints::ZERO,
-                intraday_pnl_bps: BasisPoints::ZERO,
-                rolling_7d_pnl_bps: BasisPoints::ZERO,
-                absolute_pnl_bps: BasisPoints::ZERO,
-                copy_latency_kill_switch_active: false,
-                proposed_trade_bps: BasisPoints::ZERO,
+    fn unavailable_inputs() -> WinnerFollowDecisionInputs {
+        WinnerFollowDecisionInputs::RiskInputsUnavailable {
+            cause: crate::risk_inputs::RiskInputsUnavailable::PriceMissing,
+            evidence: WinnerFollowRiskInputEvidence {
+                financial_prefix: None,
+                price_receipts: Vec::new(),
+                evaluated_at_unix_ms: 1_700_000_000_000,
+                proposed_debit: CollateralAmount::ZERO,
                 per_trade_cap_bps: 10_000,
-                concentration_caps: None,
             },
         }
     }
@@ -1043,7 +1055,7 @@ mod tests {
 
         let declined = TerminalDispositionEvidence::declined(
             &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
-            evaluated_inputs(),
+            unavailable_inputs(),
         );
         assert_eq!(declined.disposition, "no_fill");
         assert_eq!(
@@ -1150,7 +1162,7 @@ mod tests {
             AuthorityEvidence::not_read("strategy_declined"),
             TerminalDispositionEvidence::declined(
                 &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
-                evaluated_inputs(),
+                unavailable_inputs(),
             ),
         );
         let current_json = row.post_commit_inputs_json.clone();
@@ -1203,7 +1215,7 @@ mod tests {
             AuthorityEvidence::not_read("strategy_declined"),
             TerminalDispositionEvidence::declined(
                 &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
-                evaluated_inputs(),
+                unavailable_inputs(),
             ),
         );
         let document: DecisionPostBoundaryEvidence =
@@ -1227,7 +1239,7 @@ mod tests {
             AuthorityEvidence::not_read("strategy_declined"),
             TerminalDispositionEvidence::declined(
                 &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
-                evaluated_inputs(),
+                unavailable_inputs(),
             ),
         );
         let document: DecisionPostBoundaryEvidence =
