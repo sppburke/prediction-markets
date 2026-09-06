@@ -27,29 +27,29 @@ use pe_execution_core::live_journal::{
     verify_polygon_finalized, verify_polygon_reconciliation,
 };
 use pe_execution_core::{
-    CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
-    FrozenLiveTarget, LiveAdmissionRefusal, LiveControlMode, LiveExecutor,
-    LiveFillProjectionIdentity, LiveJournal, LiveJournalEvent, LiveJournalOrderOutcome,
-    LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit, LiveModeTransitionReason,
-    LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome, LiveOrderReconciliationAudit,
-    LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveRecoveryInventory,
-    LiveVenueReconciledOutcome, MarkKind, OrderFillFinalizedAudit, PreparedOrderFact,
-    RedemptionAttempt, RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput,
-    RiskAudit, RiskDecisionAudit, SizingModeAudit, TerminalAdmissionRecoveryOutcome,
-    http_attempt_hashes, prepared_order_fact_matches, reconstruct_redemption_attempts,
-    recovery_inventory, redemption_posture, replay_account, run_redemption_pass,
+    AdmissionReceipts, CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs,
+    EconomicPrepared, FrozenLiveTarget, LiveAdmissionArtifact, LiveAdmissionRefusal,
+    LiveControlMode, LiveExecutor, LiveFillProjectionIdentity, LiveJournal, LiveJournalEvent,
+    LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit,
+    LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome,
+    LiveOrderReconciliationAudit, LiveOrderVenue, LivePrepareResult, LiveReconciliationSource,
+    LiveRecoveryInventory, LiveVenueReconciledOutcome, MarkKind, OrderFillFinalizedAudit,
+    PreparedOrderFact, RedemptionAttempt, RedemptionAttemptIdentity, RedemptionAttemptState,
+    RedemptionPassInput, RiskAudit, RiskDecisionAudit, SizingModeAudit,
+    TerminalAdmissionRecoveryOutcome, http_attempt_hashes, prepared_order_fact_matches,
+    reconstruct_redemption_attempts, recovery_inventory, redemption_posture, replay_account,
+    run_redemption_pass,
 };
+use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ActivityAssetMapping, BinaryPayoutVector, ClobPayoutResolution, ClobPricesHistoryClient,
-    FixtureFetcher, PositionClassification, ReconciliationFetcher, fetch_complete_positions,
-    parse_clob_market,
-};
-#[cfg(test)]
-use pe_source_polymarket_public::{
-    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
+    FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
+    PositionClassification, ReconciliationFetcher, fetch_complete_positions, parse_clob_market,
+    validate_live_market,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowError, WinnerFollowStrategy,
@@ -57,8 +57,9 @@ use pe_strategy_winner_follow::{
 use pe_venue_polymarket::{
     BuySizing, CustodyKind, LadderError, MatchedReceipt, ReceiptError, RedemptionTransport,
     RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy, build_redemption_call,
-    canonical_block_matches, parse_chain_id_response, parse_finalized_block_response,
-    parse_receipt_response, plan_sized_buy, sign_deposit_wallet_redemption,
+    canonical_block_matches, parse_chain_id_response, parse_compact_market,
+    parse_finalized_block_response, parse_receipt_response, plan_sized_buy,
+    sign_deposit_wallet_redemption,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
@@ -214,6 +215,12 @@ fn source_envelopes_for_live_events(
     for event in events {
         match &event.payload {
             LiveJournalPayload::AdmissionEvaluated(admission) => {
+                receipts.extend([
+                    admission.economic.admission.receipts.gamma,
+                    admission.economic.admission.receipts.clob_long,
+                    admission.economic.admission.receipts.clob_compact,
+                    admission.economic.book_receipt,
+                ]);
                 receipts.extend(admission.economic.risk.price_receipts.iter().copied());
             }
             LiveJournalPayload::ResolutionFinalized(resolution) => {
@@ -2475,6 +2482,342 @@ fn sorted_price_receipts(
     Ok(receipts)
 }
 
+/// Receipt payload retained by the shared admission/book economic replay owner.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordedEconomicSource {
+    pub payload: Vec<u8>,
+    pub received_unix_ms: i64,
+    pub source_id: String,
+    pub schema_version: u32,
+    pub parser_version: u32,
+    pub content_type: ContentType,
+}
+
+/// Fail-closed source-backed economic reconstruction error shared by qualification and live replay.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct EconomicReplayError(pub(crate) String);
+
+fn economic_replay_error(message: impl Into<String>) -> EconomicReplayError {
+    EconomicReplayError(message.into())
+}
+
+/// Admission and sized ladder reconstructed from the exact four source receipts.
+pub(crate) struct SourceBackedEconomicReplay {
+    admission: LiveAdmissionArtifact,
+    sized: pe_venue_polymarket::SizedBuyPlan,
+    cash_before: CollateralAmount,
+}
+
+impl SourceBackedEconomicReplay {
+    pub(crate) fn proposed_debit(&self) -> Result<CollateralAmount, EconomicReplayError> {
+        self.sized.worst_case_all_in_debit().map_err(|error| {
+            economic_replay_error(format!(
+                "proposed risk debit reconstruction failed: {error}"
+            ))
+        })
+    }
+
+    /// Recompose the complete canonical record after the wrapper reconstructs its risk audit.
+    pub(crate) fn recompose(
+        &self,
+        economic: &EconomicPrepared,
+        risk: RiskAudit,
+        applied_configuration_hash: String,
+    ) -> Result<EconomicPrepared, EconomicReplayError> {
+        let recomposed = EconomicPrepared::compose(EconomicInputs {
+            market: economic.market.clone(),
+            admission: &self.admission,
+            plan: &self.sized.ladder,
+            book_receipt: economic.book_receipt,
+            observation: economic.observation.clone(),
+            sizing_mode: economic.sizing.mode,
+            budget: self.sized.budget,
+            slippage_rate: economic.sizing.slippage_rate,
+            risk,
+            cash_before: self.cash_before,
+            price_impact_cap_bps: economic.balance.price_impact_cap_bps,
+            chase_ceiling: economic.balance.chase_ceiling,
+            band_floor: economic.balance.band_floor,
+            band_ceiling_exclusive: economic.balance.band_ceiling_exclusive,
+            applied_configuration_hash,
+        })
+        .map_err(|error| {
+            economic_replay_error(format!(
+                "EconomicPrepared canonical composition failed: {error}"
+            ))
+        })?;
+        let recomposed_hash = recomposed.core_hash().map_err(|error| {
+            economic_replay_error(format!("recomposed economic core hash failed: {error}"))
+        })?;
+        let recorded_hash = economic.core_hash().map_err(|error| {
+            economic_replay_error(format!("recorded economic core hash failed: {error}"))
+        })?;
+        if &recomposed != economic || recomposed_hash != recorded_hash {
+            return Err(economic_replay_error(
+                "EconomicPrepared differs from raw-evidence canonical replay",
+            ));
+        }
+        Ok(recomposed)
+    }
+}
+
+fn exact_economic_source<L>(
+    receipt: AppendReceipt,
+    source_id: &str,
+    schema_version: u32,
+    parser_version: u32,
+    evidence_cutoff_unix_ms: i64,
+    lookup: &mut L,
+) -> Result<RecordedEconomicSource, EconomicReplayError>
+where
+    L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
+{
+    let observation = lookup(receipt).map_err(|_| {
+        economic_replay_error(format!(
+            "{source_id} receipt is absent from the sealed source prefix"
+        ))
+    })?;
+    if observation.source_id != source_id
+        || observation.schema_version != schema_version
+        || observation.parser_version != parser_version
+        || observation.content_type != ContentType::Json
+        || observation.received_unix_ms > evidence_cutoff_unix_ms
+    {
+        return Err(economic_replay_error(format!(
+            "{source_id} receipt has the wrong source contract or is noncausal"
+        )));
+    }
+    Ok(observation)
+}
+
+/// Rebuild admission, compact fee authority, and the signed `/book` ladder from four exact
+/// receipts. Qualification supplies its sealed-prefix lookup; live replay supplies its scoped
+/// source-index lookup. No copied fee, reserve, quantity, or ladder field is trusted here.
+pub(crate) fn replay_source_backed_economic<L>(
+    economic: &EconomicPrepared,
+    evidence_cutoff_unix_ms: i64,
+    cash_before: CollateralAmount,
+    mut lookup: L,
+) -> Result<SourceBackedEconomicReplay, EconomicReplayError>
+where
+    L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
+{
+    const CLOB_LONG_SOURCE_ID: &str = "polymarket.clob.markets";
+    const CLOB_COMPACT_SOURCE_ID: &str = "polymarket.clob.compact-market";
+    const CLOB_BOOK_SOURCE_ID: &str = "polymarket.clob.book";
+    const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
+
+    let receipts = economic.admission.receipts;
+    if [
+        receipts.gamma.sequence,
+        receipts.clob_long.sequence,
+        receipts.clob_compact.sequence,
+        economic.book_receipt.sequence,
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>()
+    .len()
+        != 4
+    {
+        return Err(economic_replay_error(
+            "economic admission and book receipts are not unique",
+        ));
+    }
+    let gamma = exact_economic_source(
+        receipts.gamma,
+        GAMMA_MARKETS_SOURCE_ID,
+        GAMMA_MARKETS_SCHEMA_VERSION,
+        GAMMA_MARKETS_PARSER_VERSION,
+        evidence_cutoff_unix_ms,
+        &mut lookup,
+    )?;
+    let clob_long = exact_economic_source(
+        receipts.clob_long,
+        CLOB_LONG_SOURCE_ID,
+        LIVE_MARKET_SCHEMA_VERSION,
+        LIVE_MARKET_PARSER_VERSION,
+        evidence_cutoff_unix_ms,
+        &mut lookup,
+    )?;
+    let clob_compact = exact_economic_source(
+        receipts.clob_compact,
+        CLOB_COMPACT_SOURCE_ID,
+        LIVE_MARKET_SCHEMA_VERSION,
+        LIVE_MARKET_PARSER_VERSION,
+        evidence_cutoff_unix_ms,
+        &mut lookup,
+    )?;
+    let book_observation = exact_economic_source(
+        economic.book_receipt,
+        CLOB_BOOK_SOURCE_ID,
+        1,
+        1,
+        evidence_cutoff_unix_ms,
+        &mut lookup,
+    )?;
+    if economic.admission.market.freshness_window_secs != LIVE_MARKET_FRESHNESS_SECS
+        || economic.admission.market.observed_at_unix < 0
+        || economic
+            .admission
+            .market
+            .observed_at_unix
+            .checked_mul(1_000)
+            .is_none_or(|observed| observed > gamma.received_unix_ms)
+    {
+        return Err(economic_replay_error(
+            "economic admission clock or freshness contract is invalid",
+        ));
+    }
+    let market = validate_live_market(
+        &gamma.payload,
+        &clob_long.payload,
+        &economic.market.condition_id,
+        economic.admission.market.observed_at_unix,
+        LIVE_MARKET_FRESHNESS_SECS,
+    )
+    .map_err(|error| {
+        economic_replay_error(format!("economic long-market replay failed: {error}"))
+    })?;
+    let compact = parse_compact_market(
+        &clob_compact.payload,
+        &economic.market.condition_id,
+        &market.ordered_outcome_token_ids,
+    )
+    .map_err(|error| {
+        economic_replay_error(format!("economic compact-market replay failed: {error}"))
+    })?;
+    if compact.minimum_order_size != market.minimum_order_size
+        || compact.minimum_tick_size != market.minimum_tick_size
+        || compact.neg_risk != market.neg_risk
+    {
+        return Err(economic_replay_error(
+            "economic compact and long market rules disagree",
+        ));
+    }
+    let admission = LiveAdmissionArtifact {
+        settlement: pe_resolver_card::VenueSettlementRecord {
+            schema_version: pe_resolver_card::VENUE_SETTLEMENT_SCHEMA_VERSION,
+            condition_id: economic.market.condition_id.clone(),
+            status: pe_resolver_card::VenueResolutionStatus::Unresolved,
+            raw_evidence_hash: blake3::hash(&clob_long.payload).to_hex().to_string(),
+            source_timestamp_unix: None,
+            observed_at_unix: market.observed_at_unix,
+            parser_version: 1,
+            freshness_window_secs: LIVE_MARKET_FRESHNESS_SECS,
+        },
+        market,
+        fee_schedule: compact.fee_schedule,
+        receipts: AdmissionReceipts {
+            gamma: receipts.gamma,
+            clob_long: receipts.clob_long,
+            clob_compact: receipts.clob_compact,
+        },
+    };
+    let book = crate::clob_book::OrderBook::from_book_json(&book_observation.payload)
+        .map_err(|error| economic_replay_error(format!("economic book replay failed: {error}")))?;
+    let asks = book
+        .ladder()
+        .ok_or_else(|| economic_replay_error("economic book cannot form the production ladder"))?;
+    let best_ask = asks
+        .first()
+        .map(|ask| ask.price)
+        .ok_or_else(|| economic_replay_error("economic book has no eligible asks"))?;
+    let impact_ceiling = recorded_impact_ceiling(best_ask, economic.balance.price_impact_cap_bps)?;
+    let allocate = |price: Price| {
+        let SizingModeAudit::Kelly {
+            fraction,
+            probability,
+        } = economic.sizing.mode
+        else {
+            return Err(LadderError::KellySizing);
+        };
+        let quantity = size_contracts(&KellyInput {
+            p: probability,
+            c: price,
+            kelly_fraction: fraction,
+            bankroll: cash_before.to_decimal(),
+        })
+        .map_err(|_| LadderError::KellySizing)?;
+        ShareAmount::from_whole(quantity.0).map_err(|_| LadderError::Amount)
+    };
+    let sizing = match economic.sizing.mode {
+        SizingModeAudit::Dollar { usd } => {
+            let budget = CollateralAmount::from_decimal_exact(
+                usd.max(Decimal::ZERO)
+                    .round_dp_with_strategy(6, RoundingStrategy::ToZero),
+            )
+            .map_err(|error| {
+                economic_replay_error(format!("economic Dollar budget is invalid: {error}"))
+            })?;
+            BuySizing::Dollar { budget }
+        }
+        SizingModeAudit::Contract { contracts } => BuySizing::Contract { contracts },
+        SizingModeAudit::Kelly { .. } => BuySizing::Kelly {
+            allocate: &allocate,
+            slippage_rate: economic.sizing.slippage_rate,
+        },
+    };
+    let proportional_cap = CollateralAmount::from_decimal_exact(
+        cash_before
+            .to_decimal()
+            .checked_mul(Decimal::from(economic.risk.snapshot.per_trade_cap_bps))
+            .and_then(|value| value.checked_div(Decimal::from(10_000u32)))
+            .ok_or_else(|| economic_replay_error("economic per-trade cap arithmetic overflow"))?
+            .max(Decimal::ZERO)
+            .round_dp_with_strategy(6, RoundingStrategy::ToZero),
+    )
+    .map_err(|error| {
+        economic_replay_error(format!("economic per-trade cap is invalid: {error}"))
+    })?;
+    let sized = plan_sized_buy(
+        &asks,
+        admission.fee_schedule,
+        sizing,
+        &[cash_before, proportional_cap],
+        admission.market.minimum_order_size,
+        admission.market.minimum_tick_size,
+        economic.balance.band_floor,
+        economic.balance.band_ceiling_exclusive,
+        economic.balance.chase_ceiling,
+        impact_ceiling,
+    )
+    .map_err(|error| {
+        economic_replay_error(format!("economic sized-plan replay failed: {error}"))
+    })?;
+
+    Ok(SourceBackedEconomicReplay {
+        admission,
+        sized,
+        cash_before,
+    })
+}
+
+fn recorded_impact_ceiling(best_ask: Price, cap_bps: i32) -> Result<Price, EconomicReplayError> {
+    let cap_bps = u32::try_from(cap_bps)
+        .ok()
+        .filter(|cap| (1..=10_000).contains(cap))
+        .ok_or_else(|| {
+            economic_replay_error("EconomicPrepared price-impact cap is outside 1..=10000")
+        })?;
+    let numerator = 10_000u32
+        .checked_add(cap_bps)
+        .ok_or_else(|| economic_replay_error("EconomicPrepared price-impact cap overflow"))?;
+    let ceiling = best_ask
+        .0
+        .checked_mul(Decimal::from(numerator))
+        .and_then(|value| value.checked_div(Decimal::from(10_000u32)))
+        .map(|value| value.min(Decimal::ONE))
+        .ok_or_else(|| {
+            economic_replay_error("EconomicPrepared price-impact arithmetic overflow")
+        })?;
+    Price::new(ceiling).map_err(|error| {
+        economic_replay_error(format!(
+            "EconomicPrepared price-impact ceiling is invalid: {error}"
+        ))
+    })
+}
+
 /// Rebuild the current-position mids from only the receipt inventory recorded on the admission.
 /// Each receipt must be a valid strict Gamma acquisition that actually covered an open position;
 /// the shared strict classifier remains the owner of outcome selection and freshness.
@@ -2559,6 +2902,55 @@ fn verify_replayed_live_risk_with_index(
         return Ok(());
     }
     let evaluated_at_unix_ms = admission.economic.risk.evaluated_at_unix_ms;
+    let cash_before = CollateralAmount::from_decimal_exact(
+        derived
+            .economic_cash
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
+    )
+    .map_err(|_| ProjectionReducerError::Arithmetic)?;
+    let source_backed_economic = replay_source_backed_economic(
+        &admission.economic,
+        evaluated_at_unix_ms,
+        cash_before,
+        |receipt| {
+            let envelope = match source_receipts {
+                Some(index) => index
+                    .source_envelope(receipt)
+                    .map_err(|error| EconomicReplayError(error.to_string()))?,
+                None => source_envelopes
+                    .iter()
+                    .find(|envelope| {
+                        envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        EconomicReplayError(
+                            "economic source receipt is absent from the source prefix".to_owned(),
+                        )
+                    })?,
+            };
+            let received_unix_ms = i64::try_from(
+                envelope
+                    .received_at
+                    .0
+                    .unix_timestamp_nanos()
+                    .div_euclid(1_000_000),
+            )
+            .map_err(|_| EconomicReplayError("economic source clock overflow".to_owned()))?;
+            Ok(RecordedEconomicSource {
+                payload: envelope.payload,
+                received_unix_ms,
+                source_id: envelope.source_id.0,
+                schema_version: envelope.schema_version,
+                parser_version: envelope.parser_version,
+                content_type: envelope.content_type,
+            })
+        },
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let proposed_debit = source_backed_economic
+        .proposed_debit()
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     let now = OffsetDateTime::from_unix_timestamp_nanos(
         i128::from(evaluated_at_unix_ms)
             .checked_mul(1_000_000)
@@ -2601,7 +2993,7 @@ fn verify_replayed_live_risk_with_index(
         LiveRiskProposal {
             leader_wallet: Some(projection.leader_wallet.clone()),
             market_id: Some(projection.market_id.clone()),
-            proposed_debit: admission.economic.balance.worst_case_debit,
+            proposed_debit,
             per_trade_cap_bps,
         },
     )
@@ -2609,6 +3001,13 @@ fn verify_replayed_live_risk_with_index(
     if reconstructed != admission.economic.risk {
         return Err(ProjectionReducerError::InvalidRiskEvidence);
     }
+    source_backed_economic
+        .recompose(
+            &admission.economic,
+            reconstructed,
+            admission.identity.config_hash.clone(),
+        )
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     Ok(())
 }
 
@@ -7105,6 +7504,53 @@ mod tests {
         );
     }
 
+    /// PASS: receipt-scoped live source collection retains the three admission responses, exact
+    /// `/book`, and risk-price evidence referenced by an `AdmissionEvaluated` record.
+    #[test]
+    fn live_source_scope_includes_all_economic_receipts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let mut writer = pe_event_log::Writer::open(&path).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        let mut receipts = Vec::new();
+        for ordinal in 0..5 {
+            receipts.push(
+                writer
+                    .append_synced(EnvelopeIn {
+                        source_id: SourceId(format!("scope-{ordinal}")),
+                        schema_version: 1,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(now),
+                        received_at: ReceivedAt(now),
+                        content_type: ContentType::Json,
+                        payload: vec![u8::try_from(ordinal).unwrap()],
+                    })
+                    .unwrap(),
+            );
+        }
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        let mut prepared = finality_prepared();
+        prepared.economic.admission.receipts = AdmissionReceipts {
+            gamma: receipts[0],
+            clob_long: receipts[1],
+            clob_compact: receipts[2],
+        };
+        prepared.economic.book_receipt = receipts[3];
+        prepared.economic.risk.price_receipts = vec![receipts[4]];
+        let account_id = AccountId::new("source-scope").unwrap();
+        let events = [approved_admission_event(&account_id, &prepared, 0, now)];
+
+        let scoped = source_envelopes_for_live_events(&index, &events).unwrap();
+        assert_eq!(
+            scoped.iter().map(|source| source.seq).collect::<Vec<_>>(),
+            receipts
+                .iter()
+                .map(|receipt| receipt.sequence)
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn gamma_risk_price_source(
         receipt: AppendReceipt,
         condition_id: &str,
@@ -7194,6 +7640,7 @@ mod tests {
         ];
         let price_receipt = fixture_receipt(200);
         let mut sources = baseline_sources(&account_id);
+        sources.extend(economic_source_envelopes(&prior.economic, now));
         let derived = derive_projection_rows_with_sources(&account_id, &events, &sources).unwrap();
         let condition_id = derived.positions[0].market_id.clone();
         sources.push(gamma_risk_price_source(
@@ -7213,6 +7660,8 @@ mod tests {
 
         let mut candidate = finality_prepared();
         candidate.identity = projection_identity("risk-candidate");
+        candidate.economic.balance.cash_before =
+            CollateralAmount::from_decimal_exact(derived.economic_cash.unwrap()).unwrap();
         let projection = candidate.identity.fill_projection.as_ref().unwrap();
         candidate.economic.risk = compose_live_risk_audit(
             &account_id,
@@ -7369,6 +7818,161 @@ mod tests {
         ));
     }
 
+    /// PASS: strict live replay requires each exact Gamma, CLOB-long, CLOB-compact, and `/book`
+    /// receipt; substituting an admission or book receipt with conflicting payload evidence fails
+    /// before the admission can enter projection or recovery.
+    #[test]
+    fn strict_live_economic_requires_exact_admission_and_book_receipts() {
+        let (dir, account_id, events, sources, paper_frames, admission) =
+            reconstructed_live_risk_fixture();
+        let journal_path = dir.path().join("live.journal");
+        let economic_receipts = [
+            admission.economic.admission.receipts.gamma,
+            admission.economic.admission.receipts.clob_long,
+            admission.economic.admission.receipts.clob_compact,
+            admission.economic.book_receipt,
+        ];
+
+        for missing_receipt in economic_receipts {
+            let missing = sources
+                .iter()
+                .filter(|source| {
+                    source.seq != missing_receipt.sequence
+                        || source.this_hash != missing_receipt.this_hash
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                verify_replayed_live_risk(
+                    &account_id,
+                    &journal_path,
+                    &events,
+                    &admission,
+                    &missing,
+                    &paper_frames,
+                ),
+                Err(ProjectionReducerError::InvalidRiskEvidence)
+            ));
+        }
+
+        let substituted_gamma_receipt = fixture_receipt(210);
+        let other_condition = format!("0x{}", "66".repeat(32));
+        let mut substituted_gamma_sources = sources.clone();
+        substituted_gamma_sources.push(source_envelope(
+            substituted_gamma_receipt,
+            GAMMA_MARKETS_SOURCE_ID,
+            economic_source_payloads(&other_condition)[0].clone(),
+            OffsetDateTime::from_unix_timestamp(20).unwrap(),
+        ));
+        let mut substituted_gamma = admission.clone();
+        substituted_gamma.economic.admission.receipts.gamma = substituted_gamma_receipt;
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &substituted_gamma,
+                &substituted_gamma_sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+
+        let substituted_book_receipt = fixture_receipt(211);
+        let mut substituted_book_sources = sources.clone();
+        substituted_book_sources.push(source_envelope(
+            substituted_book_receipt,
+            "polymarket.clob.book",
+            br#"{"asks":[{"price":"0.81","size":"3.125"}]}"#.to_vec(),
+            OffsetDateTime::from_unix_timestamp(20).unwrap(),
+        ));
+        let mut substituted_book = admission.clone();
+        substituted_book.economic.book_receipt = substituted_book_receipt;
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &substituted_book,
+                &substituted_book_sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+    }
+
+    /// PASS: payloads that conflict with the copied admission or ladder fail even when presented
+    /// under the journal's referenced receipt identity.
+    #[test]
+    fn strict_live_economic_rejects_payload_conflicts() {
+        let (dir, account_id, events, sources, paper_frames, admission) =
+            reconstructed_live_risk_fixture();
+        let journal_path = dir.path().join("live.journal");
+        for receipt in [
+            admission.economic.admission.receipts.gamma,
+            admission.economic.admission.receipts.clob_long,
+            admission.economic.admission.receipts.clob_compact,
+            admission.economic.book_receipt,
+        ] {
+            let mut conflicting = sources.clone();
+            let envelope = conflicting
+                .iter_mut()
+                .find(|source| {
+                    source.seq == receipt.sequence && source.this_hash == receipt.this_hash
+                })
+                .unwrap();
+            envelope.payload = br#"{"conflicting":true}"#.to_vec();
+            assert!(matches!(
+                verify_replayed_live_risk(
+                    &account_id,
+                    &journal_path,
+                    &events,
+                    &admission,
+                    &conflicting,
+                    &paper_frames,
+                ),
+                Err(ProjectionReducerError::InvalidRiskEvidence)
+            ));
+        }
+    }
+
+    /// PASS: a journal that copies internally consistent zero-fee fields from a nonzero compact
+    /// fee source is rejected by source-derived reserve, debit, risk, and canonical recomposition.
+    #[test]
+    fn strict_live_economic_rejects_zero_copied_fee_for_nonzero_source_fee() {
+        let (dir, account_id, events, sources, paper_frames, mut admission) =
+            reconstructed_live_risk_fixture();
+        let journal_path = dir.path().join("live.journal");
+        admission.economic.admission.fee_schedule = pe_venue_polymarket::CompactFeeSchedule::Zero;
+        admission.economic.fee = FeeAudit {
+            schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
+            expected_fee: CollateralAmount::ZERO,
+            reserve: CollateralAmount::ZERO,
+        };
+        admission.economic.sizing.all_in_price = Price(dec!(0.8));
+        admission.economic.balance.worst_case_debit = admission.economic.sizing.principal;
+        admission.economic.risk.snapshot.proposed_trade_bps = BasisPoints(2_500);
+        admission.economic.risk.decision =
+            match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
+                pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
+                pe_risk_engine::RiskDecision::Blocked(reason) => {
+                    RiskDecisionAudit::Blocked { reason }
+                }
+            };
+
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &admission,
+                &sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+    }
+
     /// PASS: strict replay treats each recorded in-domain per-trade cap as an input, reconstructs
     /// its derived decision, and fails closed before reconstruction for an out-of-domain cap.
     #[test]
@@ -7378,8 +7982,8 @@ mod tests {
         let journal_path = dir.path().join("live.journal");
 
         for cap in [
-            pe_strategy_winner_follow::PerTradeCap::ModeDefault.resolve_bps(TradingMode::LiveTiny),
-            pe_strategy_winner_follow::PerTradeCap::Bps(3_000).resolve_bps(TradingMode::LiveTiny),
+            pe_strategy_winner_follow::PerTradeCap::Bps(5_000).resolve_bps(TradingMode::LiveTiny),
+            pe_strategy_winner_follow::PerTradeCap::Unlimited.resolve_bps(TradingMode::LiveTiny),
         ] {
             let mut recorded = admission.clone();
             recorded.economic.risk.snapshot.per_trade_cap_bps = cap;
@@ -8547,14 +9151,143 @@ mod tests {
         ));
     }
 
+    fn economic_source_payloads_with_end(
+        condition_id: &str,
+        scheduled_end_unix: Option<i64>,
+    ) -> [Vec<u8>; 4] {
+        let gamma = serde_json::to_vec(&serde_json::json!([{
+            "conditionId": condition_id,
+            "active": true,
+            "closed": false,
+            "acceptingOrders": true,
+            "enableOrderBook": true,
+            "negRisk": false,
+            "outcomes": "[\"Yes\",\"No\"]",
+            "clobTokenIds": "[\"123\",\"124\"]",
+            "orderPriceMinTickSize": "0.01",
+            "orderMinSize": "1",
+            "secondsDelay": 0
+        }]))
+        .unwrap();
+        let mut clob_long = serde_json::json!({
+            "condition_id": condition_id,
+            "active": true,
+            "closed": false,
+            "accepting_orders": true,
+            "enable_order_book": true,
+            "minimum_order_size": "1",
+            "minimum_tick_size": "0.01",
+            "neg_risk": false,
+            "seconds_delay": 0,
+            "tokens": [
+                {"token_id": "123", "outcome": "Yes"},
+                {"token_id": "124", "outcome": "No"}
+            ]
+        });
+        if let Some(scheduled_end_unix) = scheduled_end_unix {
+            clob_long["end_date_iso"] = serde_json::Value::String(
+                OffsetDateTime::from_unix_timestamp(scheduled_end_unix)
+                    .unwrap()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            );
+        }
+        let clob_long = serde_json::to_vec(&clob_long).unwrap();
+        let clob_compact = format!(
+            r#"{{"c":"{condition_id}","t":[{{"t":"123","o":"Yes"}},{{"t":"124","o":"No"}}],"mts":0.01,"mos":1,"nr":false,"fd":{{"r":0.00024,"e":1,"to":true}}}}"#
+        )
+        .into_bytes();
+        let book = br#"{"asks":[{"price":"0.80","size":"3.125"}]}"#.to_vec();
+        [gamma, clob_long, clob_compact, book]
+    }
+
+    fn economic_source_payloads(condition_id: &str) -> [Vec<u8>; 4] {
+        economic_source_payloads_with_end(condition_id, None)
+    }
+
+    fn economic_source_envelopes(
+        economic: &EconomicPrepared,
+        received_at: OffsetDateTime,
+    ) -> Vec<EventEnvelope> {
+        let payloads = economic_source_payloads_with_end(
+            &economic.market.condition_id.0,
+            economic.admission.scheduled_end_unix,
+        );
+        let receipts = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ];
+        let source_ids = [
+            GAMMA_MARKETS_SOURCE_ID,
+            "polymarket.clob.markets",
+            "polymarket.clob.compact-market",
+            "polymarket.clob.book",
+        ];
+        receipts
+            .into_iter()
+            .zip(source_ids)
+            .zip(payloads)
+            .map(|((receipt, source_id), payload)| {
+                source_envelope(receipt, source_id, payload, received_at)
+            })
+            .collect()
+    }
+
+    async fn append_economic_sources(
+        state: &FanoutState,
+        economic: &mut EconomicPrepared,
+        received_at: OffsetDateTime,
+    ) {
+        let payloads = economic_source_payloads_with_end(
+            &economic.market.condition_id.0,
+            economic.admission.scheduled_end_unix,
+        );
+        let source_ids = [
+            GAMMA_MARKETS_SOURCE_ID,
+            "polymarket.clob.markets",
+            "polymarket.clob.compact-market",
+            "polymarket.clob.book",
+        ];
+        let mut receipts = Vec::new();
+        for (source_id, payload) in source_ids.into_iter().zip(payloads.iter()) {
+            receipts.push(
+                state
+                    .config
+                    .source_log
+                    .append(EnvelopeIn {
+                        source_id: SourceId(source_id.to_owned()),
+                        schema_version: 1,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(received_at),
+                        received_at: ReceivedAt(received_at),
+                        content_type: ContentType::Json,
+                        payload: payload.clone(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        economic.admission.receipts = AdmissionReceipts {
+            gamma: receipts[0],
+            clob_long: receipts[1],
+            clob_compact: receipts[2],
+        };
+        economic.book_receipt = receipts[3];
+        economic.admission.settlement.raw_evidence_hash =
+            blake3::hash(&payloads[1]).to_hex().to_string();
+    }
+
     fn finality_prepared() -> Box<pe_execution_core::LiveOrderPreparedAudit> {
         let identity = projection_identity("dispatch-finality");
         let condition_id = PolymarketConditionId(format!("0x{}", "77".repeat(32)));
         let token_id = pe_core_types::PolymarketTokenId("123".to_owned());
-        let receipt = AppendReceipt {
-            sequence: EventSeq(1),
-            this_hash: blake3::Hash::from_bytes([1; 32]),
-        };
+        let gamma_receipt = fixture_receipt(1);
+        let clob_long_receipt = fixture_receipt(2);
+        let clob_compact_receipt = fixture_receipt(3);
+        let book_receipt = fixture_receipt(4);
+        let clob_long_payload = economic_source_payloads(&condition_id.0)[1].clone();
         let market = pe_execution_core::LiveMarketEvidenceAudit {
             condition_id: condition_id.clone(),
             ordered_outcome_token_ids: [
@@ -8575,7 +9308,7 @@ mod tests {
                 schema_version: pe_resolver_card::VENUE_SETTLEMENT_SCHEMA_VERSION,
                 condition_id: condition_id.clone(),
                 status: pe_resolver_card::VenueResolutionStatus::Unresolved,
-                raw_evidence_hash: "settlement".to_owned(),
+                raw_evidence_hash: blake3::hash(&clob_long_payload).to_hex().to_string(),
                 source_timestamp_unix: None,
                 observed_at_unix: 0,
                 parser_version: 1,
@@ -8586,9 +9319,9 @@ mod tests {
             },
             scheduled_end_unix: None,
             receipts: pe_execution_core::AdmissionReceipts {
-                gamma: receipt,
-                clob_long: receipt,
-                clob_compact: receipt,
+                gamma: gamma_receipt,
+                clob_long: clob_long_receipt,
+                clob_compact: clob_compact_receipt,
             },
         };
         let ladder = LadderPlanAudit {
@@ -8613,16 +9346,18 @@ mod tests {
             },
             admission,
             ladder,
-            book_receipt: receipt,
+            book_receipt,
             observation: None,
             sizing: SizingAudit {
-                mode: SizingModeAudit::Contract { contracts: 3 },
-                budget: cash,
+                mode: SizingModeAudit::Dollar {
+                    usd: dec!(2.500121),
+                },
+                budget: CollateralAmount::from_atomic(2_500_121),
                 principal: CollateralAmount::from_atomic(2_500_000),
                 minimum_shares: ShareAmount::from_atomic(3_125_000),
                 expected_shares: ShareAmount::from_atomic(3_125_000),
-                expected_vwap: Price(dec!(0.80)),
-                all_in_price: Price(dec!(0.80)),
+                expected_vwap: Price(dec!(0.8)),
+                all_in_price: Price(dec!(0.8000384)),
                 slippage_rate: Decimal::ZERO,
             },
             fee: FeeAudit {
@@ -8633,7 +9368,7 @@ mod tests {
                 reserve: CollateralAmount::from_atomic(120),
             },
             risk: RiskAudit {
-                financial_prefix: receipt,
+                financial_prefix: gamma_receipt,
                 snapshot: RiskSnapshot {
                     leader_exposure_bps: BasisPoints(0),
                     market_exposure_bps: BasisPoints(0),
@@ -8648,7 +9383,7 @@ mod tests {
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,
-                price_receipts: vec![receipt],
+                price_receipts: Vec::new(),
                 evaluated_at_unix_ms: 0,
             },
             balance: BalanceAudit {
@@ -8828,7 +9563,6 @@ mod tests {
         .await;
         prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
         prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
-        prepared.economic.admission.settlement.source_timestamp_unix = Some(now.unix_timestamp());
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = now.unix_timestamp().saturating_mul(1_000);
         prepared.economic.risk.price_receipts.clear();
@@ -8838,6 +9572,7 @@ mod tests {
             .risk
             .price_receipts
             .extend(risk_price_receipt);
+        append_economic_sources(state, &mut prepared.economic, now).await;
         // The fake venue returns this prepared order verbatim; the resume path requires it to
         // match the request derived from the admission (ladder debit and identity hashes).
         prepared.prepared.worst_case_debit = prepared.prepared.maker_collateral;
@@ -10708,8 +11443,6 @@ mod tests {
             prepared.account_state = account_state;
             prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
             prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
-            prepared.economic.admission.settlement.source_timestamp_unix =
-                Some(now.unix_timestamp());
             prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
             prepared.economic.risk.evaluated_at_unix_ms =
                 now.unix_timestamp().saturating_mul(1_000);
@@ -10776,13 +11509,12 @@ mod tests {
             prepared.account_state = account_state;
             prepared.economic.admission.market.observed_at_unix = now.unix_timestamp();
             prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
-            prepared.economic.admission.settlement.source_timestamp_unix =
-                Some(now.unix_timestamp());
             prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
             prepared.economic.risk.evaluated_at_unix_ms =
                 now.unix_timestamp().saturating_mul(1_000);
             prepared.economic.risk.price_receipts.clear();
             bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
+            append_economic_sources(&state, &mut prepared.economic, now).await;
             if preparation_failed {
                 append_approved_admission(
                     state.config.journal.as_ref(),

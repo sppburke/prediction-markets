@@ -1016,6 +1016,98 @@ impl SourceReceiptIndex {
         Ok(())
     }
 
+    /// Extend the projection through complete frames that survived a synchronization uncertainty.
+    ///
+    /// The sole source-log coordinator calls this after `Writer::open` has verified and
+    /// synchronized the physical tail, but before it retries the held envelope. The stored next
+    /// byte offset is the boundary between already indexed frames and the newly verified suffix.
+    pub(crate) fn catch_up_verified_tail(&self) -> Result<(), RiskInputsUnavailable> {
+        let Some(path) = self.source_log_path.as_ref() else {
+            return Ok(());
+        };
+        let (indexed_len, next_byte_offset, indexed_last_hash) = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(next_byte_offset) = state.next_byte_offset else {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            };
+            (
+                state.frames.len(),
+                next_byte_offset,
+                state
+                    .frames
+                    .last()
+                    .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                        frame.receipt.this_hash
+                    }),
+            )
+        };
+        let mut previous_hash = indexed_last_hash;
+        let mut recovered = Vec::new();
+        for item in Reader::replay_with_offsets(path.as_ref())
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+        {
+            let (byte_offset, sequence, envelope) =
+                item.map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+            if byte_offset < next_byte_offset {
+                continue;
+            }
+            if recovered.is_empty() && byte_offset != next_byte_offset {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            let expected_sequence = indexed_len
+                .checked_add(recovered.len())
+                .and_then(|index| u64::try_from(index).ok())
+                .map(EventSeq)
+                .ok_or(RiskInputsUnavailable::Overflow)?;
+            if sequence != expected_sequence
+                || envelope.seq != expected_sequence
+                || envelope.prev_hash != previous_hash
+            {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            let receipt = AppendReceipt {
+                sequence,
+                this_hash: envelope.this_hash,
+            };
+            let received_millis = received_at_millis(&envelope.received_at)?;
+            previous_hash = receipt.this_hash;
+            recovered.push(SourceFrameMetadata {
+                receipt,
+                received_millis,
+                byte_offset: Some(byte_offset),
+            });
+        }
+        let verified_tail = std::fs::metadata(path.as_ref())
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+            .len();
+        if verified_tail < next_byte_offset {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.frames.len() != indexed_len
+            || state.next_byte_offset != Some(next_byte_offset)
+            || state
+                .frames
+                .last()
+                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                    frame.receipt.this_hash
+                })
+                != indexed_last_hash
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        state.frames.extend(recovered);
+        state.next_byte_offset = Some(verified_tail);
+        Ok(())
+    }
+
     pub(crate) fn received_millis(
         &self,
         receipt: AppendReceipt,

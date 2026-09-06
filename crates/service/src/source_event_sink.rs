@@ -26,10 +26,12 @@ pub struct SourceEventSink {
     path: PathBuf,
     writer: Option<Writer>,
     /// Crate-private one-shot faults for the coordinator's module tests only
-    /// (#546): fail the next append / the next reopen exactly once. Absent from
-    /// production builds.
+    /// (#546): fail the next append, post-frame synchronization, or reopen exactly once.
+    /// Absent from production builds.
     #[cfg(test)]
     fail_next_append: bool,
+    #[cfg(test)]
+    fail_next_sync: bool,
     #[cfg(test)]
     fail_next_reopen: bool,
 }
@@ -48,6 +50,8 @@ impl SourceEventSink {
             #[cfg(test)]
             fail_next_append: false,
             #[cfg(test)]
+            fail_next_sync: false,
+            #[cfg(test)]
             fail_next_reopen: false,
         })
     }
@@ -56,6 +60,12 @@ impl SourceEventSink {
     #[cfg(test)]
     pub(crate) fn fail_next_append(&mut self) {
         self.fail_next_append = true;
+    }
+
+    /// Arm one synchronization uncertainty after a complete frame has reached the file.
+    #[cfg(test)]
+    pub(crate) fn fail_next_sync(&mut self) {
+        self.fail_next_sync = true;
     }
 
     /// Arm one reopen failure (the sink stays poisoned for that attempt).
@@ -73,6 +83,20 @@ impl SourceEventSink {
             self.writer = None;
             return Err(LogError::Io(std::io::Error::other(
                 "injected append failure",
+            )));
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_sync) {
+            let Some(writer) = self.writer.as_mut() else {
+                return Err(LogError::Io(std::io::Error::other(
+                    "source event sink poisoned",
+                )));
+            };
+            writer.append(envelope)?;
+            writer.flush()?;
+            self.writer = None;
+            return Err(LogError::Io(std::io::Error::other(
+                "injected synchronization uncertainty",
             )));
         }
         let Some(writer) = self.writer.as_mut() else {
