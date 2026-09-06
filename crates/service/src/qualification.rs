@@ -18,7 +18,8 @@ use pe_event_log::{
     AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, LogTailBinding, Reader, Scanner, Writer,
 };
 use pe_execution_core::live_executor::{
-    LiveAdmissionAccountEvidence, LiveAdmissionClassificationInput, classify_live_admission,
+    LiveAdmissionAccountEvidence, LiveAdmissionClassificationInput, LiveAdmissionNeedsAccountState,
+    classify_live_admission,
 };
 use pe_execution_core::{
     AdmissionReceipts, EconomicInputs, EconomicPrepared, LiveAdmissionArtifact,
@@ -1563,17 +1564,15 @@ fn verify_paper_wrapper_admission(
         admission: &wrapper.economic.admission,
         ladder: &wrapper.economic.ladder,
         economic: &wrapper.economic,
-        account: LiveAdmissionAccountEvidence::PaperMode,
-    })
-    .map_err(|_| {
-        QualificationError::InsufficientEvidence(format!(
-            "paper-mode admission classifier requested account state for account {account_id} decision {key}"
-        ))
-    })?;
-    if reproduced != LiveAdmissionVerdict::Approved {
-        return insufficient(format!(
-            "paper-mode admission classifier disagrees with Approved for account {account_id} decision {key}: {reproduced:?}"
-        ));
+        account: LiveAdmissionAccountEvidence::NotRead,
+    });
+    match reproduced {
+        Err(LiveAdmissionNeedsAccountState) => {}
+        Ok(verdict) => {
+            return insufficient(format!(
+                "paper-mode pre-account admission replay did not require account state for account {account_id} decision {key}: {verdict:?}"
+            ));
+        }
     }
     Ok(())
 }
@@ -7578,7 +7577,7 @@ mod tests {
             ),
             (
                 PaperWrapperCase::TamperedEconomic,
-                "admission classifier disagrees",
+                "pre-account admission replay did not require account state",
             ),
         ];
         for (case, expected_reason) in cases {

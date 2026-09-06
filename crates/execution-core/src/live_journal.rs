@@ -20,15 +20,17 @@ use pe_event_log::{
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
 use pe_venue_polymarket::{
-    CompactFeeSchedule, DecodedOrderFill, LadderPlan, MatchedReceipt, PreparedPolymarketBuy,
-    ReceiptError, canonical_block_matches, decode_order_fills, fee_within_reserve,
-    parse_chain_id_response, parse_finalized_block_response, parse_receipt_response,
+    CanaryV2Client, CompactFeeSchedule, DecodedOrderFill, LadderPlan, MatchedReceipt,
+    PreparedPolymarketBuy, ReceiptError, canonical_block_matches, decode_order_fills,
+    fee_within_reserve, parse_chain_id_response, parse_finalized_block_response,
+    parse_receipt_response,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::live_executor::{
-    LiveAdmissionAccountEvidence, LiveAdmissionClassificationInput, classify_live_admission,
+    LiveAccountResponseClassification, LiveAdmissionAccountEvidence,
+    LiveAdmissionClassificationInput, classify_live_account_responses, classify_live_admission,
 };
 
 const LIVE_JOURNAL_SOURCE: &str = "ordinary-live-execution";
@@ -1734,26 +1736,6 @@ fn insert_open_order(
     Ok(())
 }
 
-fn verify_recovery_account_attempts(
-    evidence: &[RawHttpAttempt],
-    request_descriptor_hashes: &[String],
-    evidence_hashes: &[String],
-    binding: &LiveAccountBindingAudit,
-) -> Result<(), LiveJournalError> {
-    if evidence.len() != request_descriptor_hashes.len()
-        || http_attempt_hashes(evidence)? != evidence_hashes
-    {
-        return Err(LiveJournalError::RequestBinding);
-    }
-    for (attempt, retained_hash) in evidence.iter().zip(request_descriptor_hashes) {
-        verify_http_response_request(
-            &binding.request_descriptor_for_attempt(attempt),
-            retained_hash,
-        )?;
-    }
-    Ok(())
-}
-
 fn verify_recovery_admission(
     admission: &LiveAdmissionEvaluationAudit,
     evaluated_at: OffsetDateTime,
@@ -1800,29 +1782,42 @@ fn verify_recovery_admission(
     {
         return Err(LiveJournalError::RequestBinding);
     }
-    let account = if let Some(account) = &admission.account_state {
-        verify_recovery_account_attempts(
-            &account.evidence,
-            &account.request_descriptor_hashes,
-            &account.evidence_hashes,
-            binding,
-        )?;
-        LiveAdmissionAccountEvidence::State(account)
+    let selected_spender = if admission.economic.admission.market.neg_risk {
+        CanaryV2Client::negrisk_spender()
     } else {
-        verify_recovery_account_attempts(
-            &admission.account_read_failure_evidence,
-            &admission.account_read_failure_request_descriptor_hashes,
-            &admission.account_read_failure_evidence_hashes,
+        CanaryV2Client::standard_spender()
+    }
+    .map_err(|_| LiveJournalError::RequestBinding)?;
+    let expected = if let Some(account) = &admission.account_state {
+        let classified = classify_live_account_responses(
+            &account.evidence,
+            &selected_spender,
+            &account.request_descriptor_hashes,
+            Some(&account.evidence_hashes),
             binding,
         )?;
-        let LiveAdmissionVerdict::Refused(LiveAdmissionRefusal::AccountStateUnavailable(kind)) =
-            admission.verdict
-        else {
+        let LiveAccountResponseClassification::State(state) = classified else {
             return Err(LiveJournalError::OrderFactConflict);
         };
-        LiveAdmissionAccountEvidence::ReadFailure(kind)
+        let derived = state.audit()?;
+        if *account != derived {
+            return Err(LiveJournalError::OrderFactConflict);
+        }
+        classify(LiveAdmissionAccountEvidence::State(&derived))
+    } else {
+        let classified = classify_live_account_responses(
+            &admission.account_read_failure_evidence,
+            &selected_spender,
+            &admission.account_read_failure_request_descriptor_hashes,
+            Some(&admission.account_read_failure_evidence_hashes),
+            binding,
+        )?;
+        let LiveAccountResponseClassification::ReadFailure(failure) = classified else {
+            return Err(LiveJournalError::OrderFactConflict);
+        };
+        classify(LiveAdmissionAccountEvidence::ReadFailure(failure.kind))
     };
-    if classify(account).map_err(|_| LiveJournalError::OrderFactConflict)? != admission.verdict {
+    if expected.map_err(|_| LiveJournalError::OrderFactConflict)? != admission.verdict {
         return Err(LiveJournalError::OrderFactConflict);
     }
     Ok(())
@@ -2360,7 +2355,7 @@ mod tests {
         }
     }
 
-    fn current_prepared(dispatch: &str) -> Box<LiveOrderPreparedAudit> {
+    fn prepared_with_empty_account_evidence(dispatch: &str) -> Box<LiveOrderPreparedAudit> {
         let identity = identity(dispatch);
         let condition_id = PolymarketConditionId("condition".to_owned());
         let token_id = PolymarketTokenId("yes".to_owned());
@@ -2525,20 +2520,116 @@ mod tests {
         })
     }
 
-    fn baseline_for(
+    fn account_binding_for(
         account_id: &AccountId,
-        prepared: &LiveOrderPreparedAudit,
-    ) -> LiveJournalPayload {
+        credential: &CredentialBindingIdentity,
+    ) -> LiveAccountBindingAudit {
         let custody_wallet =
             WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap();
-        let binding = LiveAccountBindingAudit::new(
+        LiveAccountBindingAudit::new(
             account_id.clone(),
-            prepared.frozen_binding.clone(),
+            credential.clone(),
             custody_wallet,
             blake3::hash(account_id.as_str().as_bytes())
                 .to_hex()
                 .to_string(),
+        )
+    }
+
+    fn authenticated_account_state(
+        account_id: &AccountId,
+        credential: &CredentialBindingIdentity,
+        observed_at: OffsetDateTime,
+    ) -> LiveAccountStateAudit {
+        let binding = account_binding_for(account_id, credential);
+        let spender = CanaryV2Client::standard_spender().unwrap();
+        let collateral = CollateralAmount::from_whole(10).unwrap();
+        let response = |endpoint_kind: &str,
+                        path: &str,
+                        ordered_query: Vec<(String, String)>,
+                        body: Vec<u8>| {
+            RawHttpAttempt::Response(pe_core_types::RawHttpResponse {
+                source_id: "polymarket-clob-v2".to_owned(),
+                endpoint_kind: endpoint_kind.to_owned(),
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                ordered_query,
+                status: 200,
+                headers: Vec::new(),
+                body,
+                attempt_ordinal: 1,
+                source_at: None,
+                observed_at,
+                received_at: observed_at,
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+            })
+        };
+        let evidence = vec![
+            response(
+                "geoblock",
+                "/api/geoblock",
+                Vec::new(),
+                br#"{"blocked":false,"country":"US"}"#.to_vec(),
+            ),
+            response(
+                "closed-only",
+                "/auth/ban-status/closed-only",
+                Vec::new(),
+                br#"{"closed_only":false}"#.to_vec(),
+            ),
+            response(
+                "balance-allowance",
+                "/balance-allowance",
+                vec![
+                    ("asset_type".to_owned(), "COLLATERAL".to_owned()),
+                    ("signature_type".to_owned(), "3".to_owned()),
+                ],
+                serde_json::to_vec(&serde_json::json!({
+                    "balance": collateral.atomic().to_string(),
+                    "allowances": { spender.clone(): collateral.atomic().to_string() },
+                }))
+                .unwrap(),
+            ),
+        ];
+        let request_descriptor_hashes = evidence
+            .iter()
+            .map(|attempt| {
+                request_descriptor_hash(&binding.request_descriptor_for_attempt(attempt)).unwrap()
+            })
+            .collect();
+        LiveAccountStateAudit {
+            observed_at,
+            closed_only: false,
+            geoblocked: false,
+            selected_spender: spender,
+            collateral_balance: collateral,
+            allowance: collateral,
+            reconciled_free_collateral: collateral,
+            schema_version: 1,
+            parser_version: 1,
+            evidence_hashes: http_attempt_hashes(&evidence).unwrap(),
+            evidence,
+            request_descriptor_hashes,
+        }
+    }
+
+    fn current_prepared(account_id: &AccountId, dispatch: &str) -> Box<LiveOrderPreparedAudit> {
+        let mut prepared = prepared_with_empty_account_evidence(dispatch);
+        prepared.account_state = authenticated_account_state(
+            account_id,
+            &prepared.frozen_binding,
+            prepared.account_state.observed_at,
         );
+        prepared
+    }
+
+    fn baseline_for(
+        account_id: &AccountId,
+        prepared: &LiveOrderPreparedAudit,
+    ) -> LiveJournalPayload {
+        let binding = account_binding_for(account_id, &prepared.frozen_binding);
         LiveJournalPayload::AccountPortfolioMarked(Box::new(AccountPortfolioMarkedAudit {
             kind: MarkKind::Baseline,
             cutoff_unix: prepared.account_state.observed_at.unix_timestamp(),
@@ -2601,8 +2692,8 @@ mod tests {
         let open_account = AccountId::new("open").unwrap();
         let killed_account = AccountId::new("killed").unwrap();
         let at = datetime!(2026-08-11 12:00 UTC);
-        let open = current_prepared("open");
-        let killed = current_prepared("killed");
+        let open = current_prepared(&open_account, "open");
+        let killed = current_prepared(&killed_account, "killed");
 
         let open_prepared = append_admitted_prepared(&journal, &open_account, &open, at);
         append_admitted_prepared(&journal, &killed_account, &killed, at);
@@ -2663,6 +2754,65 @@ mod tests {
         );
     }
 
+    /// PASS: recovery rejects an Approved account state with no raw attempts, matching strict
+    /// reduction's fail-closed account-evidence requirement.
+    #[test]
+    fn recovery_rejects_empty_approved_account_evidence_like_strict_reduction() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("empty-evidence").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = prepared_with_empty_account_evidence("empty-evidence");
+
+        append_admitted_prepared(&journal, &account_id, &prepared, at);
+        drop(journal);
+
+        assert!(matches!(
+            recovery_inventory(&path),
+            Err(LiveJournalError::RequestBinding)
+        ));
+    }
+
+    /// PASS: recovery derives an account-read result from retained bytes and rejects successful
+    /// status-200 account responses relabeled as an authentication failure.
+    #[test]
+    fn recovery_rejects_producer_selected_account_failure_label() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("relabeled-failure").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "relabeled-failure");
+        let mut admission_payload = approved_admission_for(&prepared);
+        assert!(matches!(
+            admission_payload,
+            LiveJournalPayload::AdmissionEvaluated(_)
+        ));
+        let LiveJournalPayload::AdmissionEvaluated(admission) = &mut admission_payload else {
+            return;
+        };
+        let account_state = admission.account_state.take().unwrap();
+        admission.account_read_failure_evidence = account_state.evidence;
+        admission.account_read_failure_request_descriptor_hashes =
+            account_state.request_descriptor_hashes;
+        admission.account_read_failure_evidence_hashes = account_state.evidence_hashes;
+        admission.verdict = LiveAdmissionVerdict::Refused(
+            LiveAdmissionRefusal::AccountStateUnavailable(LiveAccountReadFailure::Authentication),
+        );
+
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
+        journal.append(account_id, at, admission_payload).unwrap();
+        drop(journal);
+
+        assert!(matches!(
+            recovery_inventory(&path),
+            Err(LiveJournalError::OrderFactConflict)
+        ));
+    }
+
     /// PASS: recovery tolerates only a complete exact retry of Killed/Rejected and rejects every
     /// changed reconciliation after that terminal fact.
     #[test]
@@ -2672,7 +2822,7 @@ mod tests {
         let journal = LiveJournal::open(&path).unwrap();
         let account_id = AccountId::new("account").unwrap();
         let at = datetime!(2026-08-11 12:00 UTC);
-        let prepared = current_prepared("terminal-retry");
+        let prepared = current_prepared(&account_id, "terminal-retry");
         let terminal = LiveOrderReconciliationAudit {
             identity: prepared.identity.clone(),
             order_hash: prepared.prepared.order_hash.clone(),
@@ -2722,7 +2872,7 @@ mod tests {
     fn recovery_requires_replayed_approved_admission_before_prepared() {
         let account_id = AccountId::new("account").unwrap();
         let at = datetime!(2026-08-11 12:00 UTC);
-        let prepared = current_prepared("admission");
+        let prepared = current_prepared(&account_id, "admission");
 
         let missing_dir = tempdir().unwrap();
         let missing_path = missing_dir.path().join("live.log");
@@ -2781,8 +2931,8 @@ mod tests {
         let journal = LiveJournal::open(&path).unwrap();
         let account_id = AccountId::new("account").unwrap();
         let at = datetime!(2026-08-11 12:00 UTC);
-        let prepared = current_prepared("prepared");
-        let wrong = current_prepared("wrong");
+        let prepared = current_prepared(&account_id, "prepared");
+        let wrong = current_prepared(&account_id, "wrong");
         journal
             .append(
                 account_id.clone(),
