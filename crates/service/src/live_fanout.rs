@@ -1,6 +1,6 @@
 //! Strictly sequential ordinary-live dispatch consumer (#508 Decision 10).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -44,8 +44,9 @@ use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ActivityAssetMapping, BinaryPayoutVector, ClobPayoutResolution, ClobPricesHistoryClient,
-    FixtureFetcher, PositionClassification, ReconciliationFetcher, fetch_complete_positions,
-    parse_clob_market,
+    FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaOpenConditionRequest, MarketFilter,
+    PositionClassification, ReconciliationFetcher, fetch_complete_positions, parse_clob_market,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowError, WinnerFollowStrategy,
@@ -80,13 +81,19 @@ use crate::live_venue_adapter::{
 };
 use crate::live_watchlist::LiveWatchlist;
 use crate::mark_prices::HistoricalMarkAdapter;
-use crate::mid_price_cache::{MidPriceCache, MidPriceObservation};
+use crate::mid_price_cache::{
+    GAMMA_PRICE_ATTEMPT_PARSER_VERSION, GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+    GammaPriceAttemptRecord, MidPriceCache, MidPriceObservation, StrictPriceInput,
+    classify_strict_prices,
+};
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
-    FINANCIAL_SEMANTIC_VERSION, HaltState, PaperLogFrame, PaperLogRecord, RiskHaltOwner,
-    active_risk_halts, paper_era, scan_paper_log,
+    FINANCIAL_SEMANTIC_VERSION, HaltState, PaperEra, PaperLogFrame, PaperLogRecord, RiskHaltOwner,
+    ScannedPaperFrame, active_risk_halts, paper_era, scan_paper_log,
 };
-use crate::risk_inputs::{RiskInputsUnavailable, SourceReceiptMillisIndex};
+use crate::risk_inputs::{
+    RiskInputsUnavailable, SourceReceiptMillisIndex, apply_global_risk_halts,
+};
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::supabase_reader::auth_token;
 
@@ -179,6 +186,15 @@ fn derive_projection_rows_for_state(
     events: &[LiveJournalEvent],
 ) -> Result<ProjectionDerivation, ProjectionReducerError> {
     let source_envelopes = state.config.source_receipt_millis.source_envelopes();
+    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    verify_replayed_live_risks(
+        account_id,
+        &state.config.journal_path,
+        events,
+        &source_envelopes,
+        &paper_frames,
+    )?;
     derive_projection_rows_with_sources(account_id, events, &source_envelopes)
 }
 
@@ -350,9 +366,31 @@ pub async fn run_live_fanout_until(
 }
 
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
-    let inventory = recovery_inventory(
+    let source_envelopes = state.config.source_receipt_millis.source_envelopes();
+    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+        .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
+    let inventory = pe_execution_core::live_journal::recovery_inventory_with_admission_verifier(
         &state.config.journal_path,
         state.config.era_live_prefix.as_ref(),
+        |event, preceding_events| {
+            let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload else {
+                return Ok(());
+            };
+            let account_prefix = preceding_events
+                .iter()
+                .filter(|prior| prior.account_id == event.account_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            verify_replayed_live_risk(
+                &event.account_id,
+                &state.config.journal_path,
+                &account_prefix,
+                admission.as_ref(),
+                &source_envelopes,
+                &paper_frames,
+            )
+            .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)
+        },
     )?;
     let mut recoverable_accounts = inventory
         .approved_admissions
@@ -371,7 +409,6 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
                 .map(|entry| entry.account_id.clone()),
         )
         .collect::<BTreeSet<_>>();
-    let source_envelopes = state.config.source_receipt_millis.source_envelopes();
     for account_id in std::mem::take(&mut recoverable_accounts) {
         let events = replay_live_account(state, &account_id)?;
         let derived = derive_projection_rows_with_sources(&account_id, &events, &source_envelopes)
@@ -2036,14 +2073,6 @@ async fn live_risk_audit(
         .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
     let derived = derive_projection_rows_for_state(state, &account.account_id, &events)
         .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-    let baseline = derived
-        .baseline_equity
-        .filter(|value| *value != CollateralAmount::ZERO)
-        .ok_or(RiskInputsUnavailable::BaselineNonPositive)?;
-    let cash = derived
-        .economic_cash
-        .ok_or(RiskInputsUnavailable::BaselineNonPositive)?;
-
     let ids = derived
         .positions
         .iter()
@@ -2063,7 +2092,100 @@ async fn live_risk_audit(
         .await;
     let now = price_attempt.evaluated_at;
     let mids = price_attempt.result?;
-    let price_receipts = sorted_price_receipts(&mids)?;
+    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+        .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
+    let era = paper_era_at_evaluation(&paper_frames, evaluated_at_millis(now)?)?;
+    compose_live_risk_audit(
+        &account.account_id,
+        &state.config.journal_path,
+        &events,
+        &derived,
+        &era,
+        &mids,
+        &price_attempt.price_receipts,
+        now,
+        LiveRiskProposal {
+            leader_wallet: signal.map(|signal| signal.leader.to_string()),
+            market_id: signal.map(|signal| signal.market_id.to_string()),
+            proposed_debit,
+            per_trade_cap_bps,
+        },
+    )
+}
+
+#[derive(Debug, Clone)]
+struct LiveRiskProposal {
+    leader_wallet: Option<String>,
+    market_id: Option<String>,
+    proposed_debit: CollateralAmount,
+    per_trade_cap_bps: i32,
+}
+
+fn evaluated_at_millis(now: OffsetDateTime) -> Result<i64, RiskInputsUnavailable> {
+    i64::try_from(now.unix_timestamp_nanos().div_euclid(1_000_000))
+        .map_err(|_| RiskInputsUnavailable::Overflow)
+}
+
+/// Select the exact paper prefix available at the risk clock. A later frame with an earlier
+/// timestamp would make cross-log causality ambiguous and therefore fails closed.
+fn paper_era_at_evaluation(
+    frames: &[ScannedPaperFrame],
+    evaluated_at_unix_ms: i64,
+) -> Result<PaperEra, RiskInputsUnavailable> {
+    let mut prefix = Vec::new();
+    let mut passed_clock = false;
+    for frame in frames {
+        let received_at_unix_ms = i64::try_from(
+            frame
+                .envelope
+                .received_at
+                .0
+                .unix_timestamp_nanos()
+                .div_euclid(1_000_000),
+        )
+        .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if received_at_unix_ms <= evaluated_at_unix_ms {
+            if passed_clock {
+                return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
+            }
+            prefix.push(frame.clone());
+        } else {
+            passed_clock = true;
+        }
+    }
+    if prefix.is_empty() {
+        return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
+    }
+    Ok(paper_era(prefix))
+}
+
+/// The one deterministic owner of an ordinary-live risk audit. Production passes freshly
+/// acquired mids; strict replay reconstructs those same observations from the recorded receipts.
+/// Every financial dimension is derived from the preceding live prefix, and the paper prefix owns
+/// the strategy-wide halt overlay plus the live latency hysteresis seed.
+#[allow(clippy::too_many_arguments)]
+fn compose_live_risk_audit(
+    account_id: &AccountId,
+    live_journal_path: &Path,
+    events: &[LiveJournalEvent],
+    derived: &ProjectionDerivation,
+    paper_era: &PaperEra,
+    mids: &BTreeMap<(String, u16), MidPriceObservation>,
+    acquired_price_receipts: &[AppendReceipt],
+    now: OffsetDateTime,
+    proposal: LiveRiskProposal,
+) -> Result<RiskAudit, RiskInputsUnavailable> {
+    let baseline = derived
+        .baseline_equity
+        .filter(|value| *value != CollateralAmount::ZERO)
+        .ok_or(RiskInputsUnavailable::BaselineNonPositive)?;
+    let cash = derived
+        .economic_cash
+        .ok_or(RiskInputsUnavailable::BaselineNonPositive)?;
+    let price_receipts = sorted_price_receipts(mids)?;
+    if acquired_price_receipts != price_receipts {
+        return Err(RiskInputsUnavailable::PriceConflict);
+    }
     let marked_positions = derived
         .positions
         .iter()
@@ -2128,30 +2250,21 @@ async fn live_risk_audit(
             })
     };
     let total = exposure(None, None)?;
-    let leader_identity = signal.map(|signal| signal.leader.to_string());
-    let market_identity = signal.map(|signal| signal.market_id.to_string());
-    let leader = exposure(leader_identity.as_deref(), None)?;
-    let market = exposure(None, market_identity.as_deref())?;
+    let leader = exposure(proposal.leader_wallet.as_deref(), None)?;
+    let market = exposure(None, proposal.market_id.as_deref())?;
     let to_bps = |amount| {
         pe_risk_engine::exposure_bps_ceil(amount, baseline).ok_or(RiskInputsUnavailable::Overflow)
     };
-    let latency_owner = RiskHaltOwner::LiveAccount(account.account_id.clone());
-    let latency_era = paper_era(
-        scan_paper_log(&state.config.paper_log_path)
-            .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?,
-    );
-    let financial_prefix = latency_era
+    let latency_owner = RiskHaltOwner::LiveAccount(account_id.clone());
+    let financial_prefix = paper_era
         .frames
         .last()
         .map(|frame| frame.receipt)
         .ok_or(RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-    let latency_seed = crate::risk_inputs::latency_hysteresis_seed(
-        &latency_era,
-        &latency_owner,
-        &state.config.journal_path,
-    )?;
-    let copy_latency_kill_switch_active = live_latency_switch(&events, now, latency_seed)?;
-    let snapshot = RiskSnapshot {
+    let latency_seed =
+        crate::risk_inputs::latency_hysteresis_seed(paper_era, &latency_owner, live_journal_path)?;
+    let copy_latency_kill_switch_active = live_latency_switch(events, now, latency_seed)?;
+    let mut snapshot = RiskSnapshot {
         leader_exposure_bps: to_bps(leader)?,
         market_exposure_bps: to_bps(market)?,
         // The live protocol has no independent family identity. Treating every open position as
@@ -2162,16 +2275,16 @@ async fn live_risk_audit(
         rolling_7d_pnl_bps: pnl.rolling_7d,
         absolute_pnl_bps: pnl.absolute,
         copy_latency_kill_switch_active,
-        proposed_trade_bps: to_bps(proposed_debit)?,
-        per_trade_cap_bps,
+        proposed_trade_bps: to_bps(proposal.proposed_debit)?,
+        per_trade_cap_bps: proposal.per_trade_cap_bps,
         concentration_caps: None,
     };
+    apply_global_risk_halts(&active_risk_halts(paper_era), &mut snapshot);
     let decision = match pe_risk_engine::evaluate_risk(&snapshot) {
         pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
         pe_risk_engine::RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
     };
-    let evaluated_at_unix_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000)
-        .map_err(|_| RiskInputsUnavailable::Overflow)?;
+    let evaluated_at_unix_ms = evaluated_at_millis(now)?;
     Ok(RiskAudit {
         financial_prefix,
         snapshot,
@@ -2267,6 +2380,249 @@ fn sorted_price_receipts(
     }
     receipts.dedup_by_key(|receipt| receipt.sequence);
     Ok(receipts)
+}
+
+/// Rebuild the current-position mids from only the receipt inventory recorded on the admission.
+/// Each receipt must be a valid strict Gamma acquisition that actually covered an open position;
+/// the shared strict classifier remains the owner of outcome selection and freshness.
+fn replay_live_risk_prices(
+    positions: &[LivePositionRow],
+    price_receipts: &[AppendReceipt],
+    evaluated_at_unix_ms: i64,
+    source_envelopes: &[EventEnvelope],
+) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
+    if price_receipts
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
+        return Err(RiskInputsUnavailable::PriceConflict);
+    }
+    if positions.is_empty() {
+        return if price_receipts.is_empty() {
+            Ok(BTreeMap::new())
+        } else {
+            Err(RiskInputsUnavailable::PriceConflict)
+        };
+    }
+
+    let ids = positions
+        .iter()
+        .map(|position| {
+            let outcome =
+                u16::try_from(position.outcome_id).map_err(|_| RiskInputsUnavailable::Overflow)?;
+            Ok(MarketOutcomeId::new(
+                MarketId(VenueMarketId(position.market_id.clone())),
+                OutcomeId(outcome),
+            ))
+        })
+        .collect::<Result<Vec<_>, RiskInputsUnavailable>>()?;
+    let wanted_markets = ids
+        .iter()
+        .map(|id| id.market().clone())
+        .collect::<HashSet<_>>();
+    let mut covered_markets = HashSet::new();
+    let mut entries = HashMap::<MarketId, StrictPriceInput>::new();
+
+    for receipt in price_receipts {
+        let payload = retained_source_payload(
+            receipt,
+            source_envelopes,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            RetainedSourceKind::Price,
+        )
+        .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        let envelope = source_envelopes
+            .iter()
+            .find(|envelope| {
+                envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+            })
+            .ok_or(RiskInputsUnavailable::PriceConflict)?;
+        let observed_at_unix_ms = envelope
+            .received_at
+            .0
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000);
+        let record = serde_json::from_slice::<GammaPriceAttemptRecord>(payload)
+            .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        let (request_url, page) = match record {
+            GammaPriceAttemptRecord::Page {
+                evidence,
+                payload,
+                usable,
+            } => {
+                let canonical = serde_json::from_slice::<serde_json::Value>(&payload)
+                    .and_then(|value| serde_json::to_vec(&value))
+                    .unwrap_or_else(|_| payload.clone());
+                if evidence.source_id.0 != GAMMA_MARKETS_SOURCE_ID
+                    || evidence.schema_version != GAMMA_MARKETS_SCHEMA_VERSION
+                    || evidence.parser_version != GAMMA_MARKETS_PARSER_VERSION
+                    || evidence.raw_page_hash != blake3::hash(&payload).to_hex().to_string()
+                    || evidence.canonical_page_hash != blake3::hash(&canonical).to_hex().to_string()
+                {
+                    return Err(RiskInputsUnavailable::PriceConflict);
+                }
+                (evidence.request_url, usable.then_some(payload))
+            }
+            GammaPriceAttemptRecord::Failure {
+                request_url,
+                error: _,
+            } => (request_url, None),
+        };
+        let request = GammaOpenConditionRequest::parse(&request_url)
+            .ok_or(RiskInputsUnavailable::PriceConflict)?;
+        let covered = request
+            .condition_ids
+            .iter()
+            .filter_map(|condition_id| {
+                let market = MarketId(VenueMarketId(condition_id.clone()));
+                wanted_markets.contains(&market).then_some(market)
+            })
+            .collect::<Vec<_>>();
+        if covered.is_empty() {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        covered_markets.extend(covered);
+        let Some(page) = page else {
+            continue;
+        };
+        let replayed = futures::executor::block_on(
+            GammaMarketsClient::new(
+                request.base_url.clone(),
+                FixtureFetcher::new(HashMap::from([(request_url.clone(), page.clone())])),
+            )
+            .with_batch_size(request.condition_ids.len())
+            .fetch_markets_with_pages(&request.condition_ids, MarketFilter::OpenOnly),
+        )
+        .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        if replayed.pages.len() != 1
+            || replayed.pages[0].0.request_url != request_url
+            || replayed.pages[0].1 != page
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        let conflicting = replayed
+            .conflicting_condition_ids
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for row in replayed.markets.markets.into_values() {
+            let market = MarketId(VenueMarketId(row.condition_id.clone()));
+            if !wanted_markets.contains(&market) {
+                continue;
+            }
+            let strict_mids = row.strict_outcome_prices;
+            if let Some(existing) = entries.get_mut(&market) {
+                existing.conflicting = existing.conflicting
+                    || conflicting.contains(&row.condition_id)
+                    || existing.strict_mids != strict_mids;
+                existing.strict_mids = strict_mids;
+                existing.observed_at_unix_ms = observed_at_unix_ms;
+                existing.receipt = *receipt;
+            } else {
+                entries.insert(
+                    market,
+                    StrictPriceInput {
+                        strict_mids,
+                        observed_at_unix_ms,
+                        receipt: *receipt,
+                        conflicting: conflicting.contains(&row.condition_id),
+                    },
+                );
+            }
+        }
+    }
+    if wanted_markets
+        .iter()
+        .any(|market| !covered_markets.contains(market))
+    {
+        return Err(RiskInputsUnavailable::PriceMissing);
+    }
+    classify_strict_prices(&ids, i128::from(evaluated_at_unix_ms), &entries)
+}
+
+fn verify_replayed_live_risk(
+    account_id: &AccountId,
+    live_journal_path: &Path,
+    preceding_events: &[LiveJournalEvent],
+    admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
+    source_envelopes: &[EventEnvelope],
+    paper_frames: &[ScannedPaperFrame],
+) -> Result<(), ProjectionReducerError> {
+    let derived =
+        derive_projection_rows_with_sources(account_id, preceding_events, source_envelopes)?;
+    // Pre-Baseline history remains audit-only and owns no financial state.
+    if derived.baseline_sequence.is_none() {
+        return Ok(());
+    }
+    let evaluated_at_unix_ms = admission.economic.risk.evaluated_at_unix_ms;
+    let now = OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(evaluated_at_unix_ms)
+            .checked_mul(1_000_000)
+            .ok_or(ProjectionReducerError::Arithmetic)?,
+    )
+    .map_err(|_| ProjectionReducerError::Arithmetic)?;
+    let mids = replay_live_risk_prices(
+        &derived.positions,
+        &admission.economic.risk.price_receipts,
+        evaluated_at_unix_ms,
+        source_envelopes,
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let paper_era = paper_era_at_evaluation(paper_frames, evaluated_at_unix_ms)
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let projection = admission
+        .identity
+        .fill_projection
+        .as_deref()
+        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+    let reconstructed = compose_live_risk_audit(
+        account_id,
+        live_journal_path,
+        preceding_events,
+        &derived,
+        &paper_era,
+        &mids,
+        &admission.economic.risk.price_receipts,
+        now,
+        LiveRiskProposal {
+            leader_wallet: Some(projection.leader_wallet.clone()),
+            market_id: Some(projection.market_id.clone()),
+            proposed_debit: admission.economic.balance.worst_case_debit,
+            // Ordinary live production requires the reviewed unlimited per-trade setting; the
+            // retained research/boot variants are not a valid replay input for this worker.
+            per_trade_cap_bps: pe_strategy_winner_follow::PerTradeCap::Unlimited
+                .resolve_bps(TradingMode::LiveTiny),
+        },
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    if reconstructed != admission.economic.risk {
+        return Err(ProjectionReducerError::InvalidRiskEvidence);
+    }
+    Ok(())
+}
+
+fn verify_replayed_live_risks(
+    account_id: &AccountId,
+    live_journal_path: &Path,
+    events: &[LiveJournalEvent],
+    source_envelopes: &[EventEnvelope],
+    paper_frames: &[ScannedPaperFrame],
+) -> Result<(), ProjectionReducerError> {
+    for (event_index, event) in events.iter().enumerate() {
+        let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload else {
+            continue;
+        };
+        verify_replayed_live_risk(
+            account_id,
+            live_journal_path,
+            &events[..event_index],
+            admission,
+            source_envelopes,
+            paper_frames,
+        )?;
+    }
+    Ok(())
 }
 
 fn live_latency_switch(
@@ -2483,6 +2839,7 @@ pub(crate) struct ProjectionDerivation {
     pub(crate) baseline_equity: Option<CollateralAmount>,
     pub(crate) baseline_cutoff_unix: Option<i64>,
     pub(crate) baseline_sequence: Option<u64>,
+    pub(crate) account_binding: Option<LiveAccountBindingAudit>,
     pub(crate) daily_marks: BTreeMap<i64, CollateralAmount>,
     pub(crate) realized_closes: Vec<(i64, Decimal)>,
     pub(crate) validated_prepared_sequences: BTreeSet<u64>,
@@ -2510,6 +2867,10 @@ pub(crate) enum ProjectionReducerError {
         "recorded risk decision disagrees with deterministic risk evaluation or is not approved"
     )]
     InvalidRiskDecision,
+    #[error(
+        "recorded risk snapshot, financial prefix, price receipts, or decision disagrees with reconstructed evidence"
+    )]
+    InvalidRiskEvidence,
     #[error("OrderPrepared has no single matching replay-approved admission")]
     MissingApprovedAdmission,
     #[error("retained complete-position evidence is missing, malformed, or inconsistent")]
@@ -3223,6 +3584,7 @@ pub(crate) fn derive_projection_rows_with_sources(
         baseline_equity,
         baseline_cutoff_unix,
         baseline_sequence,
+        account_binding: current_account_binding,
         daily_marks,
         realized_closes,
         validated_prepared_sequences: prepared_orders
@@ -4957,6 +5319,13 @@ async fn polygon_arming_health(state: &FanoutState) -> CheckOutcome {
     }
 }
 
+fn baseline_owns_current_binding(
+    derived: &ProjectionDerivation,
+    current: &LiveAccountBindingAudit,
+) -> bool {
+    derived.baseline_equity.is_none() || derived.account_binding.as_ref() == Some(current)
+}
+
 async fn ensure_live_portfolio_marks(
     state: &mut FanoutState,
     account: &AccountContext,
@@ -4969,13 +5338,6 @@ async fn ensure_live_portfolio_marks(
         Ok(events) => events,
         Err(_) => return CheckOutcome::Transient("live journal unavailable"),
     };
-    let inventory =
-        match fetch_complete_venue_inventory(state, custody_wallet, account_binding, &events).await
-        {
-            Ok(inventory) => inventory,
-            Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
-        };
-    let inventory_observed_at = OffsetDateTime::now_utc();
     let expected_credential = account
         .credential_binding
         .as_ref()
@@ -4994,6 +5356,18 @@ async fn ensure_live_portfolio_marks(
         Ok(derived) => derived,
         Err(_) => return CheckOutcome::PersistentFail("live financial journal conflicts"),
     };
+    if !baseline_owns_current_binding(&derived, account_binding) {
+        return CheckOutcome::PersistentFail(
+            "current live account binding differs from the financial-era Baseline",
+        );
+    }
+    let inventory =
+        match fetch_complete_venue_inventory(state, custody_wallet, account_binding, &events).await
+        {
+            Ok(inventory) => inventory,
+            Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
+        };
+    let inventory_observed_at = OffsetDateTime::now_utc();
     if derived.baseline_equity.is_none() {
         // The first Baseline is the account's era boundary. Older records remain readable audit
         // history and deliberately create no managed state; only current complete venue inventory
@@ -6703,6 +7077,399 @@ mod tests {
         );
     }
 
+    fn gamma_risk_price_source(
+        receipt: AppendReceipt,
+        condition_id: &str,
+        prices: [&str; 2],
+        now: OffsetDateTime,
+    ) -> EventEnvelope {
+        let request_url = format!(
+            "https://gamma-api.polymarket.com/markets?condition_ids={condition_id}&limit={}",
+            pe_source_polymarket_public::GAMMA_BATCH_LIMIT_PARAM
+        );
+        let encoded_prices = serde_json::to_string(&prices).unwrap();
+        let raw = serde_json::to_vec(&serde_json::json!([{
+            "conditionId": condition_id,
+            "outcomePrices": encoded_prices,
+        }]))
+        .unwrap();
+        let canonical = serde_json::from_slice::<serde_json::Value>(&raw)
+            .and_then(|value| serde_json::to_vec(&value))
+            .unwrap();
+        let payload = serde_json::to_vec(&GammaPriceAttemptRecord::Page {
+            evidence: pe_source_polymarket_public::MetadataPageEvidence {
+                request_url,
+                raw_page_hash: blake3::hash(&raw).to_hex().to_string(),
+                canonical_page_hash: blake3::hash(&canonical).to_hex().to_string(),
+                received_at: ReceivedAt(now),
+                source_id: SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
+                schema_version: GAMMA_MARKETS_SCHEMA_VERSION,
+                parser_version: GAMMA_MARKETS_PARSER_VERSION,
+            },
+            payload: raw,
+            usable: true,
+        })
+        .unwrap();
+        let mut envelope = source_envelope(receipt, GAMMA_MARKETS_SOURCE_ID, payload, now);
+        envelope.schema_version = GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION;
+        envelope.parser_version = GAMMA_PRICE_ATTEMPT_PARSER_VERSION;
+        envelope
+    }
+
+    fn reconstructed_live_risk_fixture() -> (
+        tempfile::TempDir,
+        AccountId,
+        Vec<LiveJournalEvent>,
+        Vec<EventEnvelope>,
+        Vec<ScannedPaperFrame>,
+        Box<pe_execution_core::LiveAdmissionEvaluationAudit>,
+    ) {
+        let dir = tempdir().unwrap();
+        let journal_path = dir.path().join("live.journal");
+        drop(LiveJournal::open(&journal_path).unwrap());
+        let paper_path = dir.path().join("paper.log");
+        let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        let mut paper = pe_event_log::Writer::open(&paper_path).unwrap();
+        paper
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&PaperLogRecord::RiskHaltChanged {
+                    owner: RiskHaltOwner::Paper,
+                    cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                    state: HaltState::Released,
+                    evidence: serde_json::json!({"fixture": "risk-reconstruction"}),
+                })
+                .unwrap(),
+            })
+            .unwrap();
+        drop(paper);
+        let paper_frames = scan_paper_log(&paper_path).unwrap();
+
+        let account_id = AccountId::new("account").unwrap();
+        let prior = finality_prepared();
+        let events = vec![
+            baseline_event(&account_id, 0),
+            approved_admission_event(&account_id, &prior, 1, OffsetDateTime::UNIX_EPOCH),
+            LiveJournalEvent {
+                account_id: account_id.clone(),
+                seq: 2,
+                timestamp: OffsetDateTime::UNIX_EPOCH,
+                payload: LiveJournalPayload::OrderPrepared(prior.clone()),
+            },
+            finality_matched_event(&account_id, &prior, 3, OffsetDateTime::UNIX_EPOCH),
+            finalized_fill_event(&account_id, &prior, 4, 2),
+        ];
+        let price_receipt = fixture_receipt(200);
+        let mut sources = baseline_sources(&account_id);
+        let derived = derive_projection_rows_with_sources(&account_id, &events, &sources).unwrap();
+        let condition_id = derived.positions[0].market_id.clone();
+        sources.push(gamma_risk_price_source(
+            price_receipt,
+            &condition_id,
+            ["0.9", "0.1"],
+            now,
+        ));
+        let mids = replay_live_risk_prices(
+            &derived.positions,
+            &[price_receipt],
+            now.unix_timestamp().saturating_mul(1_000),
+            &sources,
+        )
+        .unwrap();
+
+        let mut candidate = finality_prepared();
+        candidate.identity = projection_identity("risk-candidate");
+        let projection = candidate.identity.fill_projection.as_ref().unwrap();
+        candidate.economic.risk = compose_live_risk_audit(
+            &account_id,
+            &journal_path,
+            &events,
+            &derived,
+            &paper_era_at_evaluation(&paper_frames, now.unix_timestamp().saturating_mul(1_000))
+                .unwrap(),
+            &mids,
+            &[price_receipt],
+            now,
+            LiveRiskProposal {
+                leader_wallet: Some(projection.leader_wallet.clone()),
+                market_id: Some(projection.market_id.clone()),
+                proposed_debit: candidate.economic.balance.worst_case_debit,
+                per_trade_cap_bps: 10_000,
+            },
+        )
+        .unwrap();
+        let admission = approved_admission(&candidate);
+        (dir, account_id, events, sources, paper_frames, admission)
+    }
+
+    /// PASS: strict live replay independently rebuilds cash, position value, every exposure/PnL
+    /// dimension, latency, proposal/cap state, paper prefix, receipt inventory, and decision; a
+    /// producer-mutated self-consistent snapshot is rejected for every field.
+    #[test]
+    fn strict_live_risk_reconstructs_every_snapshot_dimension() {
+        let (dir, account_id, events, sources, paper_frames, admission) =
+            reconstructed_live_risk_fixture();
+        let journal_path = dir.path().join("live.journal");
+        verify_replayed_live_risk(
+            &account_id,
+            &journal_path,
+            &events,
+            &admission,
+            &sources,
+            &paper_frames,
+        )
+        .unwrap();
+        assert_eq!(
+            admission.economic.risk.snapshot.leader_exposure_bps,
+            BasisPoints(2_501)
+        );
+        assert_eq!(
+            admission.economic.risk.snapshot.market_exposure_bps,
+            BasisPoints(2_501)
+        );
+        assert_eq!(
+            admission.economic.risk.snapshot.family_exposure_bps,
+            BasisPoints(2_501)
+        );
+        assert_eq!(
+            admission.economic.risk.snapshot.total_copy_exposure_bps,
+            BasisPoints(2_501)
+        );
+        assert_eq!(
+            admission.economic.risk.snapshot.intraday_pnl_bps,
+            BasisPoints(312)
+        );
+        assert_eq!(
+            admission.economic.risk.snapshot.rolling_7d_pnl_bps,
+            BasisPoints(0)
+        );
+        assert_eq!(
+            admission.economic.risk.snapshot.absolute_pnl_bps,
+            BasisPoints(312)
+        );
+        assert!(
+            !admission
+                .economic
+                .risk
+                .snapshot
+                .copy_latency_kill_switch_active
+        );
+        assert_eq!(
+            admission.economic.risk.snapshot.proposed_trade_bps,
+            BasisPoints(2_501)
+        );
+        assert_eq!(admission.economic.risk.snapshot.per_trade_cap_bps, 10_000);
+        assert_eq!(admission.economic.risk.snapshot.concentration_caps, None);
+        assert_eq!(
+            admission.economic.risk.decision,
+            RiskDecisionAudit::Approved
+        );
+
+        for (index, dimension) in [
+            "leader",
+            "market",
+            "family",
+            "total",
+            "intraday",
+            "rolling",
+            "absolute",
+            "latency",
+            "proposal",
+            "cap",
+            "concentration",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut changed = admission.clone();
+            let snapshot = &mut changed.economic.risk.snapshot;
+            match index {
+                0 => snapshot.leader_exposure_bps.0 += 1,
+                1 => snapshot.market_exposure_bps.0 += 1,
+                2 => snapshot.family_exposure_bps.0 += 1,
+                3 => snapshot.total_copy_exposure_bps.0 += 1,
+                4 => snapshot.intraday_pnl_bps.0 += 1,
+                5 => snapshot.rolling_7d_pnl_bps.0 += 1,
+                6 => snapshot.absolute_pnl_bps.0 += 1,
+                7 => snapshot.copy_latency_kill_switch_active = true,
+                8 => snapshot.proposed_trade_bps.0 += 1,
+                9 => snapshot.per_trade_cap_bps -= 1,
+                _ => {
+                    snapshot.concentration_caps = Some(pe_risk_engine::ConcentrationCaps::CANONICAL)
+                }
+            }
+            changed.economic.risk.decision = match pe_risk_engine::evaluate_risk(snapshot) {
+                pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
+                pe_risk_engine::RiskDecision::Blocked(reason) => {
+                    RiskDecisionAudit::Blocked { reason }
+                }
+            };
+            assert!(
+                matches!(
+                    verify_replayed_live_risk(
+                        &account_id,
+                        &journal_path,
+                        &events,
+                        &changed,
+                        &sources,
+                        &paper_frames,
+                    ),
+                    Err(ProjectionReducerError::InvalidRiskEvidence)
+                ),
+                "{dimension}"
+            );
+        }
+
+        let mut wrong_prefix = admission.clone();
+        wrong_prefix.economic.risk.financial_prefix = fixture_receipt(199);
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &wrong_prefix,
+                &sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+    }
+
+    /// PASS: strict live reconstruction applies the shared strategy-wide halt overlay from the
+    /// paper prefix at the evaluation clock and binds the resulting decision to that prefix.
+    #[test]
+    fn strict_live_risk_applies_the_paper_global_halt_prefix() {
+        let (dir, account_id, events, sources, _, mut admission) =
+            reconstructed_live_risk_fixture();
+        let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let mut writer = pe_event_log::Writer::open(&paper_path).unwrap();
+        let financial_prefix = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&PaperLogRecord::RiskHaltChanged {
+                    owner: RiskHaltOwner::Paper,
+                    cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                    state: HaltState::Engaged,
+                    evidence: serde_json::json!({"fixture": "global-halt"}),
+                })
+                .unwrap(),
+            })
+            .unwrap();
+        drop(writer);
+        let paper_frames = scan_paper_log(&paper_path).unwrap();
+        admission.economic.risk.financial_prefix = financial_prefix;
+        admission
+            .economic
+            .risk
+            .snapshot
+            .copy_latency_kill_switch_active = true;
+        admission.economic.risk.decision =
+            match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
+                pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
+                pe_risk_engine::RiskDecision::Blocked(reason) => {
+                    RiskDecisionAudit::Blocked { reason }
+                }
+            };
+
+        verify_replayed_live_risk(
+            &account_id,
+            &dir.path().join("live.journal"),
+            &events,
+            &admission,
+            &sources,
+            &paper_frames,
+        )
+        .unwrap();
+        assert!(matches!(
+            admission.economic.risk.decision,
+            RiskDecisionAudit::Blocked { .. }
+        ));
+    }
+
+    /// PASS: an open live position requires its exact source-backed price inventory; a missing,
+    /// unrelated-market, or substituted-price receipt cannot validate a copied snapshot.
+    #[test]
+    fn strict_live_risk_rejects_missing_unrelated_and_substituted_price_receipts() {
+        let (dir, account_id, events, mut sources, paper_frames, admission) =
+            reconstructed_live_risk_fixture();
+        let journal_path = dir.path().join("live.journal");
+
+        let mut missing = admission.clone();
+        missing.economic.risk.price_receipts.clear();
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &missing,
+                &sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+
+        let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        let unrelated_receipt = fixture_receipt(201);
+        sources.push(gamma_risk_price_source(
+            unrelated_receipt,
+            &format!("0x{}", "88".repeat(32)),
+            ["0.9", "0.1"],
+            now,
+        ));
+        let mut unrelated = admission.clone();
+        unrelated.economic.risk.price_receipts = vec![unrelated_receipt];
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &unrelated,
+                &sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+
+        let substituted_receipt = fixture_receipt(202);
+        let condition_id = admission
+            .identity
+            .fill_projection
+            .as_ref()
+            .unwrap()
+            .market_id
+            .clone();
+        sources.push(gamma_risk_price_source(
+            substituted_receipt,
+            &condition_id,
+            ["0.8", "0.2"],
+            now,
+        ));
+        let mut substituted = admission;
+        substituted.economic.risk.price_receipts = vec![substituted_receipt];
+        assert!(matches!(
+            verify_replayed_live_risk(
+                &account_id,
+                &journal_path,
+                &events,
+                &substituted,
+                &sources,
+                &paper_frames,
+            ),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+    }
+
     /// PASS: live risk price expiry uses millisecond units through the receipt index: observations
     /// aged 1 ms and 59,999 ms remain fresh, while the strict 60,000 ms boundary is expired.
     #[tokio::test]
@@ -7557,6 +8324,76 @@ mod tests {
         }
     }
 
+    fn rotated_account_binding(account_id: &AccountId) -> LiveAccountBindingAudit {
+        LiveAccountBindingAudit::new(
+            account_id.clone(),
+            CredentialBindingIdentity {
+                version: 2,
+                key_id: "key-2".to_owned(),
+            },
+            WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap(),
+            blake3::hash(b"rotated-secret-material")
+                .to_hex()
+                .to_string(),
+        )
+    }
+
+    /// PASS: a target frozen to a newly rotated credential cannot pass the existing financial-era
+    /// Baseline; arming must wait for the next canonical Baseline transition.
+    #[test]
+    fn new_version_target_requires_a_new_baseline() {
+        let account_id = AccountId::new("credential-rotation").unwrap();
+        let derived =
+            derive_with_baseline_evidence(&account_id, &[baseline_event(&account_id, 0)], &[])
+                .unwrap();
+        assert!(!baseline_owns_current_binding(
+            &derived,
+            &rotated_account_binding(&account_id)
+        ));
+    }
+
+    /// PASS: a same-day credential rotation cannot replace the Baseline's full binding, including
+    /// its secret-derived fingerprint, without a new financial era.
+    #[test]
+    fn same_day_credential_rotation_keeps_the_baseline_binding() {
+        let account_id = AccountId::new("same-day-rotation").unwrap();
+        let derived =
+            derive_with_baseline_evidence(&account_id, &[baseline_event(&account_id, 0)], &[])
+                .unwrap();
+        let mut same_version_new_secret =
+            account_binding_fixture(&account_id, "0x1111111111111111111111111111111111111111");
+        same_version_new_secret.credential_fingerprint =
+            blake3::hash(b"new-secret").to_hex().to_string();
+        assert!(!baseline_owns_current_binding(
+            &derived,
+            &same_version_new_secret
+        ));
+    }
+
+    /// PASS: a Daily mark preserves rather than transitions the Baseline binding, so a rotated
+    /// target remains blocked across the UTC-day boundary.
+    #[test]
+    fn daily_boundary_does_not_transition_the_baseline_binding() {
+        let account_id = AccountId::new("daily-rotation").unwrap();
+        let mut daily = baseline_event(&account_id, 1);
+        daily.timestamp = OffsetDateTime::from_unix_timestamp(86_401).unwrap();
+        let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut daily.payload else {
+            return;
+        };
+        mark.kind = MarkKind::Daily;
+        mark.cutoff_unix = 86_400;
+        let derived = derive_with_baseline_evidence(
+            &account_id,
+            &[baseline_event(&account_id, 0), daily],
+            &[],
+        )
+        .unwrap();
+        assert!(!baseline_owns_current_binding(
+            &derived,
+            &rotated_account_binding(&account_id)
+        ));
+    }
+
     fn finality_prepared() -> Box<pe_execution_core::LiveOrderPreparedAudit> {
         let identity = projection_identity("dispatch-finality");
         let condition_id = PolymarketConditionId(format!("0x{}", "77".repeat(32)));
@@ -7840,6 +8677,7 @@ mod tests {
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = now.unix_timestamp().saturating_mul(1_000);
         prepared.economic.risk.price_receipts.clear();
+        bind_empty_live_risk_to_paper_prefix(state, &mut prepared, now);
         append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
         let pending = verified_recovery_inventory(state)
             .unwrap()
@@ -9597,6 +10435,7 @@ mod tests {
             CollateralAmount::from_atomic(10_000_000),
         )
         .await;
+        bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, OffsetDateTime::UNIX_EPOCH);
         append_approved_admission(
             state.config.journal.as_ref(),
             &account_id,
@@ -9652,21 +10491,30 @@ mod tests {
             prepared.economic.risk.evaluated_at_unix_ms =
                 now.unix_timestamp().saturating_mul(1_000);
             prepared.economic.risk.price_receipts.clear();
+            bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
             append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
 
-            assert_eq!(
-                recovery_inventory(&state.config.journal_path, None)
-                    .unwrap()
-                    .approved_admissions
-                    .len(),
-                1
-            );
-            let error = verified_recovery_inventory(&state).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("live recovery strict reduction failed")
-            );
+            if duplicate {
+                assert!(matches!(
+                    recovery_inventory(&state.config.journal_path, None),
+                    Err(pe_execution_core::LiveJournalError::RequestBinding)
+                ));
+            } else {
+                assert_eq!(
+                    recovery_inventory(&state.config.journal_path, None)
+                        .unwrap()
+                        .approved_admissions
+                        .len(),
+                    1
+                );
+            }
+            assert!(matches!(
+                verified_recovery_inventory(&state),
+                Err(FanoutError::Journal(
+                    pe_execution_core::LiveJournalError::OrderFactConflict
+                        | pe_execution_core::LiveJournalError::RequestBinding
+                ))
+            ));
         }
     }
 
@@ -9709,6 +10557,7 @@ mod tests {
             prepared.economic.risk.evaluated_at_unix_ms =
                 now.unix_timestamp().saturating_mul(1_000);
             prepared.economic.risk.price_receipts.clear();
+            bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
             if preparation_failed {
                 append_approved_admission(
                     state.config.journal.as_ref(),
@@ -11069,6 +11918,50 @@ mod tests {
             last_projection_unix: None,
             last_prune_unix: None,
         }
+    }
+
+    fn bind_empty_live_risk_to_paper_prefix(
+        state: &FanoutState,
+        prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
+        now: OffsetDateTime,
+    ) {
+        let mut writer = pe_event_log::Writer::open(&state.config.paper_log_path).unwrap();
+        let financial_prefix = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&PaperLogRecord::RiskHaltChanged {
+                    owner: RiskHaltOwner::Paper,
+                    cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                    state: HaltState::Released,
+                    evidence: serde_json::json!({"fixture": "live-risk-prefix"}),
+                })
+                .unwrap(),
+            })
+            .unwrap();
+        prepared.economic.risk = RiskAudit {
+            financial_prefix,
+            snapshot: RiskSnapshot {
+                leader_exposure_bps: BasisPoints(0),
+                market_exposure_bps: BasisPoints(0),
+                family_exposure_bps: BasisPoints(0),
+                total_copy_exposure_bps: BasisPoints(0),
+                intraday_pnl_bps: BasisPoints(0),
+                rolling_7d_pnl_bps: BasisPoints(0),
+                absolute_pnl_bps: BasisPoints(0),
+                copy_latency_kill_switch_active: false,
+                proposed_trade_bps: BasisPoints(2_501),
+                per_trade_cap_bps: 10_000,
+                concentration_caps: None,
+            },
+            decision: RiskDecisionAudit::Approved,
+            price_receipts: Vec::new(),
+            evaluated_at_unix_ms: now.unix_timestamp().saturating_mul(1_000),
+        };
     }
 
     async fn counting_fallback(

@@ -1782,6 +1782,21 @@ pub fn recovery_inventory(
     path: impl AsRef<Path>,
     era_live_prefix: Option<&LogTailBinding>,
 ) -> Result<LiveRecoveryInventory, LiveJournalError> {
+    recovery_inventory_with_admission_verifier(path, era_live_prefix, |_, _| Ok(()))
+}
+
+/// Recover the verified journal after an outer owner has reconstructed every admission from its
+/// preceding financial and source evidence. Execution-core cannot own that service-tier evidence,
+/// so the callback is invoked for each admission with its exact preceding live-journal prefix
+/// before any admission can become recovery work.
+pub fn recovery_inventory_with_admission_verifier<F>(
+    path: impl AsRef<Path>,
+    era_live_prefix: Option<&LogTailBinding>,
+    mut verify_admission: F,
+) -> Result<LiveRecoveryInventory, LiveJournalError>
+where
+    F: FnMut(&LiveJournalEvent, &[LiveJournalEvent]) -> Result<(), LiveJournalError>,
+{
     let path = path.as_ref();
     let mut events = replay_all(path)?;
     if let Some(prefix) = era_live_prefix {
@@ -1800,6 +1815,11 @@ pub fn recovery_inventory(
                 .last_sequence
                 .is_none_or(|last_sequence| event.seq > last_sequence.0)
         });
+    }
+    for (event_index, event) in events.iter().enumerate() {
+        if matches!(event.payload, LiveJournalPayload::AdmissionEvaluated(_)) {
+            verify_admission(event, &events[..event_index])?;
+        }
     }
     let mut orders = BTreeMap::<(AccountId, String), OpenOrderState>::new();
     let mut account_ids = BTreeSet::new();
@@ -1895,7 +1915,9 @@ pub fn recovery_inventory(
             }
             LiveJournalPayload::AccountPortfolioMarked(mark) => {
                 if mark.kind == MarkKind::Baseline {
-                    if !mark.account_binding.is_valid_for(&event.account_id) {
+                    if !mark.account_binding.is_valid_for(&event.account_id)
+                        || account_bindings.contains_key(&event.account_id)
+                    {
                         return Err(LiveJournalError::RequestBinding);
                     }
                     account_bindings.insert(event.account_id, mark.account_binding.clone());
@@ -3059,6 +3081,67 @@ mod tests {
         assert!(matches!(
             recovery_inventory(&path, None),
             Err(LiveJournalError::OrderFactConflict)
+        ));
+    }
+
+    /// PASS: recovery invokes the service-tier deterministic admission verifier with the exact
+    /// preceding journal prefix before returning an Approved admission as recovery work.
+    #[test]
+    fn recovery_consumes_admission_only_after_outer_reconstruction() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("risk-owner").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "risk-owner");
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
+        journal
+            .append(account_id, at, approved_admission_for(&prepared))
+            .unwrap();
+        drop(journal);
+
+        let mut calls = 0;
+        assert!(matches!(
+            recovery_inventory_with_admission_verifier(&path, None, |event, prefix| {
+                calls += 1;
+                assert!(matches!(
+                    event.payload,
+                    LiveJournalPayload::AdmissionEvaluated(_)
+                ));
+                assert_eq!(prefix.len(), 1);
+                assert!(matches!(
+                    prefix[0].payload,
+                    LiveJournalPayload::AccountPortfolioMarked(_)
+                ));
+                Err(LiveJournalError::OrderFactConflict)
+            }),
+            Err(LiveJournalError::OrderFactConflict)
+        ));
+        assert_eq!(calls, 1);
+    }
+
+    /// PASS: within one recovery era the first Baseline permanently owns the complete account
+    /// binding; a second Baseline cannot replace it even when both are individually well formed.
+    #[test]
+    fn recovery_rejects_a_second_same_era_baseline_binding() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("baseline-owner").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "baseline-owner");
+        let baseline = baseline_for(&account_id, &prepared);
+        journal
+            .append(account_id.clone(), at, baseline.clone())
+            .unwrap();
+        journal.append(account_id, at, baseline).unwrap();
+        drop(journal);
+
+        assert!(matches!(
+            recovery_inventory(&path, None),
+            Err(LiveJournalError::RequestBinding)
         ));
     }
 
