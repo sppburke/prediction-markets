@@ -2645,8 +2645,12 @@ fn validate_financial_manifest(
 
 fn verify_live_preparation_posture(
     live_path: &Path,
+    source_log_path: &Path,
     status_path: &Path,
 ) -> Result<LogTailBinding, QualificationError> {
+    let source_envelopes = Reader::replay(source_log_path)?
+        .map(|item| item.map(|(_, envelope)| envelope))
+        .collect::<Result<Vec<_>, _>>()?;
     let before = pe_execution_core::LiveJournal::verified_tail(live_path).map_err(|error| {
         QualificationError::InsufficientEvidence(format!("live journal: {error}"))
     })?;
@@ -2745,7 +2749,12 @@ fn verify_live_preparation_posture(
                     "live journal account replay failed for {account_id}: {error}"
                 ))
             })?;
-        crate::live_fanout::derive_projection_rows(&account_id, &events).map_err(|error| {
+        crate::live_fanout::derive_projection_rows_with_sources(
+            &account_id,
+            &events,
+            &source_envelopes,
+        )
+        .map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
                 "live journal strict reduction failed for {account_id}: {error}"
             ))
@@ -2778,7 +2787,11 @@ fn prepare_financial_era(
     let paper_prefix = Scanner::verify(&manifest.paths.paper_log)?;
     let source_prefix = Scanner::verify(&manifest.paths.source_log)?;
     let live_path = configured_live_journal_path(config);
-    let live_prefix = verify_live_preparation_posture(&live_path, &config.status_path)?;
+    let live_prefix = verify_live_preparation_posture(
+        &live_path,
+        &manifest.paths.source_log,
+        &config.status_path,
+    )?;
     let state = PaperStateDb::open_read_only(&manifest.paths.paper_state)?;
     if !state.open_decision_pending()?.is_empty() {
         return insufficient("financial-era prepare found an open decision");
@@ -2918,7 +2931,11 @@ fn rollback_check_financial_era(
     config: &ServiceConfig,
 ) -> Result<String, QualificationError> {
     validate_financial_manifest(manifest, config)?;
-    verify_live_preparation_posture(&configured_live_journal_path(config), &config.status_path)?;
+    verify_live_preparation_posture(
+        &configured_live_journal_path(config),
+        &config.source_event_log_path,
+        &config.status_path,
+    )?;
     let scan = Scanner::inspect(&manifest.paths.paper_log)?;
     let mut repaired = false;
     if scan.incomplete_tail.is_some() {
@@ -3411,9 +3428,11 @@ mod tests {
             br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}"#,
         )
         .unwrap();
-        let mut config = ServiceConfig::default();
-        config.event_log_path = paper_log.clone();
-        config.source_event_log_path = source_log.clone();
+        let config = ServiceConfig {
+            event_log_path: paper_log.clone(),
+            source_event_log_path: source_log.clone(),
+            ..ServiceConfig::default()
+        };
         config.paper_state_db_path = paper_state.clone();
         config.status_path = status_path;
 
@@ -3481,7 +3500,14 @@ mod tests {
             br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"live-a","requested_live_mode":"off","effective_live_mode":"off","armed":true}]}}"#,
         )
         .unwrap();
-        assert!(verify_live_preparation_posture(&live_journal, &config.status_path).is_err());
+        assert!(
+            verify_live_preparation_posture(
+                &live_journal,
+                &config.source_event_log_path,
+                &config.status_path
+            )
+            .is_err()
+        );
         fs::write(
             &config.status_path,
             br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}"#,
