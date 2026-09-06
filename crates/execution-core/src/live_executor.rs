@@ -44,6 +44,8 @@ pub struct LiveModeSnapshot {
 pub enum LiveAdmissionAccountEvidence<'a> {
     /// The ordered pre-I/O gates are being evaluated before an account read is attempted.
     NotRead,
+    /// Qualification is replaying a paper wrapper, for which account gates do not apply.
+    PaperMode,
     /// A complete authenticated account state was reconstructed from retained evidence.
     State(&'a LiveAccountStateAudit),
     /// Retained evidence deterministically classified as this account-read failure.
@@ -959,6 +961,7 @@ pub fn classify_live_admission(
 
     let account = match input.account {
         LiveAdmissionAccountEvidence::NotRead => return Err(LiveAdmissionNeedsAccountState),
+        LiveAdmissionAccountEvidence::PaperMode => return Ok(LiveAdmissionVerdict::Approved),
         LiveAdmissionAccountEvidence::ReadFailure(kind) => {
             return Ok(LiveAdmissionVerdict::Refused(
                 LiveAdmissionRefusal::AccountStateUnavailable(kind),
@@ -1846,6 +1849,29 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn paper_mode_replays_shared_pre_account_admission_without_account_state() {
+        let account_id = AccountId::new("paper-account").unwrap();
+        let request = request(&account_id);
+        let verdict = classify_live_admission(LiveAdmissionClassificationInput {
+            evaluated_at: now(),
+            requested_mode: request.mode.requested,
+            effective_mode: request.mode.effective,
+            frozen_binding: &request.target.credential_binding,
+            current_binding: &request.current_credential_binding,
+            identity: &request.identity,
+            condition_id: &request.condition_id,
+            outcome_id: request.outcome_id,
+            token_id: &request.token_id,
+            admission: &request.economic.admission,
+            ladder: &request.economic.ladder,
+            economic: &request.economic,
+            account: LiveAdmissionAccountEvidence::PaperMode,
+        });
+
+        assert_eq!(verdict, Ok(LiveAdmissionVerdict::Approved));
     }
 
     #[tokio::test]
