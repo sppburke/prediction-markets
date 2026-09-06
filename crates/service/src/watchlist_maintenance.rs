@@ -1261,6 +1261,13 @@ mod tests {
                         | OrchestratorControl::CaptureAdmissionLedger { .. } => {
                             panic!("legacy admission test sent a causal-bracket command")
                         }
+                        OrchestratorControl::ResolutionCandidate { .. }
+                        | OrchestratorControl::PublishMembership { .. }
+                        | OrchestratorControl::RiskHaltChange { .. }
+                        | OrchestratorControl::DailyBoundary { .. }
+                        | OrchestratorControl::SealCheck { .. } => {
+                            panic!("maintenance sent an unrelated financial control")
+                        }
                     }
                 }
             }));

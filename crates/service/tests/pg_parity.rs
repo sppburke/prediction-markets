@@ -175,6 +175,22 @@ async fn sql_bankroll(client: &Client) -> Decimal {
     dec(&row.get::<_, String>(0))
 }
 
+async fn financial_tables_json(client: &Client) -> String {
+    client
+        .query_one(
+            "select jsonb_build_object(\
+               'bankroll', (select coalesce(jsonb_agg(to_jsonb(t) order by id), '[]'::jsonb) from paper_bankroll t), \
+               'fills', (select coalesce(jsonb_agg(to_jsonb(t) order by idempotency_key), '[]'::jsonb) from paper_fills t), \
+               'positions', (select coalesce(jsonb_agg(to_jsonb(t) order by market_id, outcome_id), '[]'::jsonb) from paper_positions t), \
+               'settlements', (select coalesce(jsonb_agg(to_jsonb(t) order by market_id), '[]'::jsonb) from settled_markets t)\
+             )::text",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
 async fn sql_replace_watchlist(
     client: &Client,
     token: &str,
@@ -360,6 +376,86 @@ async fn pg_parity_and_concurrency() {
     assert_eq!(dec(applied["bankroll"].as_str().unwrap()), dec!(99995.79));
     assert_eq!(sql_bankroll(&client).await, dec!(99995.79));
     println!("PASS: PG-PARITY — exact principal+fee debit and idempotent retry");
+}
+
+/// PG-545-START: neither authority RPC can mutate before Start is durably seeded.
+#[tokio::test]
+async fn pg_financial_rpcs_require_seeded_start_before_mutation() {
+    let Ok(url) = std::env::var("PE_TEST_PG_URL") else {
+        eprintln!("SKIP: PE_TEST_PG_URL unset — Start-bypass test runs only in CI / local pg");
+        return;
+    };
+    let _guard = pg_lock(&url).await;
+    load_financial_schema(&_guard).await;
+    let client = connect(&url).await;
+    client
+        .batch_execute(
+            "delete from paper_fills; delete from paper_positions; \
+             delete from settled_markets; delete from paper_bankroll; \
+             insert into paper_bankroll \
+               (id, bankroll_str, start_seq, start_hash, last_prepared_seq) \
+             values (0, '100', null, null, null);",
+        )
+        .await
+        .unwrap();
+    let before = financial_tables_json(&client).await;
+    let fill: String = client
+        .query_one(
+            "select commit_fill_v2(null,null,null,11,'pre-start','leader','trade',\
+             'market',0,'buy',1,0.5,0.5,0,1)::text",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&fill).unwrap()["outcome"],
+        "conflict"
+    );
+    assert_eq!(financial_tables_json(&client).await, before);
+    let resolution: String = client
+        .query_one(
+            "select apply_resolution_v2(null,null,null,11,'market','[\"1\",\"0\"]'::jsonb,1)::text",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&resolution).unwrap()["outcome"],
+        "conflict"
+    );
+    assert_eq!(financial_tables_json(&client).await, before);
+
+    client
+        .execute(
+            "update paper_bankroll set last_prepared_seq = 9 where id = 0",
+            &[],
+        )
+        .await
+        .unwrap();
+    let seed: String = client
+        .query_one(
+            "select seed_financial_start($1,$2)::text",
+            &[&START_SEQ, &START_HASH],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&seed).unwrap()["outcome"],
+        "conflict"
+    );
+    let row = client
+        .query_one(
+            "select start_seq, start_hash, last_prepared_seq from paper_bankroll where id = 0",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<i64>>(0), None);
+    assert_eq!(row.get::<_, Option<String>>(1), None);
+    assert_eq!(row.get::<_, Option<i64>>(2), Some(9));
 }
 
 /// PG-CAS (#508 Phase A): rehearse the predicated compare-and-swap `service_config` UPDATE

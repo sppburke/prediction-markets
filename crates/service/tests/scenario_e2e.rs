@@ -30,7 +30,7 @@ use std::sync::Arc;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, classify_trade};
 use pe_core_types::{
     BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
-    ReconstructionQuality, Side, SourceId, SourceTimestamp, SourceTradeId, VenueId, VenueMarketId,
+    ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, VenueId, VenueMarketId,
     WalletAddress,
 };
 use pe_event_log::Writer;

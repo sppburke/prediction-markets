@@ -330,9 +330,7 @@ pub fn recover_daily_boundary(
         .find_map(|frame| match &frame.frame {
             crate::paper_recovery::PaperLogFrame::Record(
                 crate::paper_recovery::PaperLogRecord::QualificationStarted(candidate),
-            ) if candidate.as_ref() == start => {
-                Some(frame.envelope.received_at.0.unix_timestamp())
-            }
+            ) if candidate.as_ref() == start => Some(frame.envelope.received_at.0.unix_timestamp()),
             _ => None,
         })
         .ok_or_else(|| ObligationRebuildError::Boundary("Start envelope is absent".to_owned()))?;
@@ -639,13 +637,11 @@ impl TradePoller {
         let Some(anchor) = self.obligations.boundary_anchor() else {
             return Ok(());
         };
-        let Some(cutoff_unix) = completed_midnight_cutoffs_after(
-            anchor,
-            (self.now)().unix_timestamp(),
-        )
-        .map_err(|error| TradePollerOwnerError::DailyBoundary(error.to_string()))?
-        .into_iter()
-        .next()
+        let Some(cutoff_unix) =
+            completed_midnight_cutoffs_after(anchor, (self.now)().unix_timestamp())
+                .map_err(|error| TradePollerOwnerError::DailyBoundary(error.to_string()))?
+                .into_iter()
+                .next()
         else {
             return Ok(());
         };
@@ -695,9 +691,7 @@ impl TradePoller {
             ));
         }
         match received.await {
-            Ok(Ok(())) => self
-                .obligations
-                .set_boundary_anchor(boundary.cutoff_unix),
+            Ok(Ok(())) => self.obligations.set_boundary_anchor(boundary.cutoff_unix),
             Ok(Err(error)) => {
                 self.obligations.install_boundary(boundary);
                 return Err(TradePollerOwnerError::DailyBoundary(error));

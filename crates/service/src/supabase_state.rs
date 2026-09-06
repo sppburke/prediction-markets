@@ -1977,6 +1977,15 @@ mod tests {
             ))
         }
 
+        async fn commit_prepared_fill(
+            &self,
+            _request: &PreparedFillRequest,
+        ) -> Result<CanonicalFillResult, SupabaseStateError> {
+            Err(SupabaseStateError::Corrupt(
+                "prepared fill RPC is outside this fixture".to_owned(),
+            ))
+        }
+
         fn apply_prepared_resolution(
             &self,
             request: &PreparedResolutionRequest,

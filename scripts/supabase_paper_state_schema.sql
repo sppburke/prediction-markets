@@ -108,6 +108,13 @@ begin
       'start_seq', v_bankroll.start_seq, 'start_hash', v_bankroll.start_hash);
   end if;
 
+  if v_bankroll.start_seq is null and v_bankroll.start_hash is null
+     and v_bankroll.last_prepared_seq is not null then
+    return jsonb_build_object(
+      'outcome', 'conflict', 'conflict_reason', 'prepared_exists_without_financial_start',
+      'start_seq', v_bankroll.start_seq, 'start_hash', v_bankroll.start_hash);
+  end if;
+
   if v_bankroll.start_seq is null and v_bankroll.start_hash is null then
     update paper_bankroll
        set start_seq = p_start_seq,
@@ -155,6 +162,7 @@ as $$
 declare
   v_bankroll       paper_bankroll%rowtype;
   v_fill           paper_fills%rowtype;
+  v_original_prior bigint;
   v_long           numeric := 0;
   v_short          numeric := 0;
   v_covered        numeric;
@@ -166,7 +174,9 @@ begin
     raise exception 'paper_bankroll singleton missing before financial fill';
   end if;
 
-  if v_bankroll.start_seq is distinct from p_start_seq
+  if v_bankroll.start_seq is null or v_bankroll.start_hash is null
+     or p_start_seq is null or p_start_hash is null
+     or v_bankroll.start_seq is distinct from p_start_seq
      or v_bankroll.start_hash is distinct from p_start_hash then
     return jsonb_build_object(
       'outcome', 'conflict', 'conflict_reason', 'financial_start_mismatch',
@@ -182,6 +192,14 @@ begin
 
   select * into v_fill from paper_fills where idempotency_key = p_idempotency_key;
   if found then
+    select max(completed_seq) into v_original_prior
+      from (
+        select prepared_seq as completed_seq from paper_fills
+         where prepared_seq < p_prepared_seq
+        union all
+        select prepared_seq as completed_seq from settled_markets
+         where prepared_seq < p_prepared_seq
+      ) completed;
     if v_fill.leader_wallet is distinct from p_leader_wallet
        or v_fill.source_trade_id is distinct from p_source_trade_id
        or v_fill.market_id is distinct from p_market_id
@@ -194,6 +212,7 @@ begin
        or v_fill.entry_unix is distinct from p_entry_unix
        or v_fill.event_seq is distinct from p_prepared_seq
        or v_fill.prepared_seq is distinct from p_prepared_seq
+       or v_original_prior is distinct from p_expected_prior_seq
        or v_bankroll.last_prepared_seq is distinct from p_prepared_seq then
       return jsonb_build_object(
         'outcome', 'conflict', 'conflict_reason', 'fill_retry_mismatch',
@@ -232,8 +251,18 @@ begin
       'bankroll', v_bankroll.bankroll_str,
       'applied_prepared_seq', v_bankroll.last_prepared_seq, 'row', null);
   end if;
-  if p_side not in ('buy', 'sell') or p_quantity <= 0 or p_principal < 0 or p_fee < 0
-     or p_fill_price <= 0 or p_fill_price >= 1 then
+  if p_outcome_id is null or p_outcome_id not in (0, 1)
+     or p_side is null or p_side not in ('buy', 'sell')
+     or p_quantity is null or p_quantity <= 0
+     or p_quantity <> trunc(p_quantity, 6)
+     or p_quantity > 18446744073709.551615
+     or p_principal is null or p_principal < 0
+     or p_principal <> trunc(p_principal, 6)
+     or p_principal > 18446744073709.551615
+     or p_fee is null or p_fee < 0
+     or p_fee <> trunc(p_fee, 6)
+     or p_fee > 18446744073709.551615
+     or p_fill_price is null or p_fill_price <= 0 or p_fill_price >= 1 then
     return jsonb_build_object(
       'outcome', 'conflict', 'conflict_reason', 'invalid_fill_economics',
       'bankroll', v_bankroll.bankroll_str,
@@ -321,6 +350,7 @@ as $$
 declare
   v_bankroll     paper_bankroll%rowtype;
   v_settled      settled_markets%rowtype;
+  v_original_prior bigint;
   v_credit       numeric := 0;
   v_new_bankroll numeric;
 begin
@@ -328,7 +358,9 @@ begin
   if not found then
     raise exception 'paper_bankroll singleton missing before financial resolution';
   end if;
-  if v_bankroll.start_seq is distinct from p_start_seq
+  if v_bankroll.start_seq is null or v_bankroll.start_hash is null
+     or p_start_seq is null or p_start_hash is null
+     or v_bankroll.start_seq is distinct from p_start_seq
      or v_bankroll.start_hash is distinct from p_start_hash then
     return jsonb_build_object(
       'outcome', 'conflict', 'conflict_reason', 'financial_start_mismatch',
@@ -345,9 +377,18 @@ begin
 
   select * into v_settled from settled_markets where market_id = p_condition_id;
   if found then
+    select max(completed_seq) into v_original_prior
+      from (
+        select prepared_seq as completed_seq from paper_fills
+         where prepared_seq < p_prepared_seq
+        union all
+        select prepared_seq as completed_seq from settled_markets
+         where prepared_seq < p_prepared_seq
+      ) completed;
     if v_settled.outcome_prices is distinct from p_payout_by_outcome_index
        or v_settled.settled_at_unix is distinct from p_settled_at_unix
        or v_settled.prepared_seq is distinct from p_prepared_seq
+       or v_original_prior is distinct from p_expected_prior_seq
        or v_bankroll.last_prepared_seq is distinct from p_prepared_seq then
       return jsonb_build_object(
         'outcome', 'conflict', 'conflict_reason', 'resolution_retry_mismatch',
