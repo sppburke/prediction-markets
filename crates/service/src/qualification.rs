@@ -69,6 +69,8 @@ const QUALIFICATION_SOURCE_ID: &str = "pe-service.qualification";
 const MINIMUM_COMPLETE_DAYS: usize = 30;
 const MINIMUM_CLOSED_COPIES: usize = 90;
 const MAX_P95_DELAY_MS: u64 = 2_000;
+const QUALIFICATION_PASS_REASON: &str =
+    "all sealed one-system gates passed; manual review remains required";
 
 #[derive(Debug, thiserror::Error)]
 pub enum QualificationError {
@@ -216,6 +218,54 @@ pub struct QualificationReport {
 }
 
 impl QualificationReport {
+    /// Validate the self-contained report invariants required for ordinary-live promotion.
+    pub(crate) fn validate_for_live_promotion(&self) -> Result<(), &'static str> {
+        if self.version != QUALIFICATION_REPORT_VERSION {
+            return Err("qualification report version is unsupported");
+        }
+        if self.verdict != QualificationVerdict::Pass {
+            return Err("qualification report verdict is not Pass");
+        }
+        if !self.replay.exact {
+            return Err("qualification report replay is not exact");
+        }
+
+        let canonical_thresholds = QualificationThresholds::canonical();
+        if self.thresholds != canonical_thresholds {
+            return Err("qualification report thresholds are not canonical");
+        }
+        if self.complete_days < canonical_thresholds.minimum_complete_days {
+            return Err("qualification report complete-days gate failed");
+        }
+        if self.closed_copies < canonical_thresholds.minimum_closed_copies {
+            return Err("qualification report closed-copies gate failed");
+        }
+        if self
+            .lcb_5pct_decimal
+            .is_none_or(|value| value <= Decimal::ZERO)
+        {
+            return Err("qualification report LCB_5pct gate failed");
+        }
+        if self.promotion_max_drawdown_fraction.is_none_or(|value| {
+            value < Decimal::ZERO
+                || value >= canonical_thresholds.maximum_drawdown_fraction_exclusive
+        }) {
+            return Err("qualification report promotion-drawdown gate failed");
+        }
+        if self
+            .paper_p95_delay_ms
+            .is_none_or(|value| value > canonical_thresholds.maximum_p95_delay_ms)
+        {
+            return Err("qualification report paper-delay gate failed");
+        }
+        if self.reasons.len() != 1
+            || self.reasons.first().map(String::as_str) != Some(QUALIFICATION_PASS_REASON)
+        {
+            return Err("qualification report Pass reasons are inconsistent");
+        }
+        Ok(())
+    }
+
     fn insufficient(seal_hash: &str, reason: String) -> Self {
         Self {
             version: QUALIFICATION_REPORT_VERSION,
@@ -1021,8 +1071,7 @@ async fn verify_qualification(
 
     let (verdict, mut reasons) = qualification_gate_verdict(failures);
     if verdict == QualificationVerdict::Pass {
-        reasons
-            .push("all sealed one-system gates passed; manual review remains required".to_owned());
+        reasons.push(QUALIFICATION_PASS_REASON.to_owned());
     }
 
     let no_fills = replayed_decisions

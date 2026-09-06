@@ -23,7 +23,7 @@ use std::path::Path;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::qualification::{QualificationReport, QualificationVerdict};
+use crate::qualification::QualificationReport;
 
 /// One arming-condition evaluation. `Transient` failures never demote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,25 +35,19 @@ pub enum CheckOutcome {
     Transient(&'static str),
 }
 
-/// Promotion-relevant fields extracted from the canonical sealed qualification report.
+/// Canonical sealed qualification report and its exact loaded-byte identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualificationFacts {
-    verdict: QualificationVerdict,
-    seal_hash: String,
-    economic_configuration_hash: Option<String>,
-    financial_semantic_version: Option<u32>,
+    report: QualificationReport,
     report_blake3: String,
 }
 
 impl QualificationFacts {
-    /// Retain only the report fields that ordinary-live mode admission compares with runtime truth.
+    /// Retain the whole report so ordinary-live admission can validate every promotion invariant.
     #[must_use]
     pub fn from_report(report: &QualificationReport, report_blake3: String) -> Self {
         Self {
-            verdict: report.verdict,
-            seal_hash: report.evidence.seal_hash.clone(),
-            economic_configuration_hash: report.evidence.hot_config_hash.clone(),
-            financial_semantic_version: report.evidence.financial_semantic_version,
+            report: report.clone(),
             report_blake3,
         }
     }
@@ -66,6 +60,8 @@ pub enum QualificationReportLoadError {
     Io(#[from] std::io::Error),
     #[error("decode qualification report: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid qualification report: {0}")]
+    Invalid(&'static str),
 }
 
 /// Load the canonical report emitted by `pe-service --qualify`.
@@ -74,6 +70,9 @@ pub fn load_qualification_facts(
 ) -> Result<QualificationFacts, QualificationReportLoadError> {
     let bytes = std::fs::read(path)?;
     let report = serde_json::from_slice::<QualificationReport>(&bytes)?;
+    report
+        .validate_for_live_promotion()
+        .map_err(QualificationReportLoadError::Invalid)?;
     let report_blake3 = blake3::hash(&bytes).to_hex().to_string();
     Ok(QualificationFacts::from_report(&report, report_blake3))
 }
@@ -295,21 +294,23 @@ fn qualification_outcome<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> CheckOut
     let Some(report) = inputs.qualification.as_ref() else {
         return CheckOutcome::PersistentFail("qualification report is missing");
     };
-    if report.verdict != QualificationVerdict::Pass {
-        return CheckOutcome::PersistentFail("qualification report verdict is not Pass");
+    if let Err(reason) = report.report.validate_for_live_promotion() {
+        return CheckOutcome::PersistentFail(reason);
     }
     let Some(current_seal_hash) = inputs.current_seal_hash else {
         return CheckOutcome::PersistentFail("current qualification seal is missing");
     };
-    if report.seal_hash != current_seal_hash {
+    if report.report.evidence.seal_hash != current_seal_hash {
         return CheckOutcome::PersistentFail("qualification report seal mismatches current seal");
     }
-    if report.economic_configuration_hash.as_deref() != Some(inputs.economic_configuration_hash) {
+    if report.report.evidence.hot_config_hash.as_deref() != Some(inputs.economic_configuration_hash)
+    {
         return CheckOutcome::PersistentFail(
             "qualification report economic configuration mismatches runtime",
         );
     }
-    if report.financial_semantic_version != Some(inputs.financial_semantic_version) {
+    if report.report.evidence.financial_semantic_version != Some(inputs.financial_semantic_version)
+    {
         return CheckOutcome::PersistentFail(
             "qualification report financial semantics mismatch runtime",
         );
@@ -388,6 +389,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use crate::qualification::QualificationVerdict;
 
     const SEAL_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_SEAL_HASH: &str =
@@ -440,20 +442,21 @@ mod tests {
     }
 
     fn passing_qualification() -> QualificationFacts {
-        QualificationFacts {
-            verdict: QualificationVerdict::Pass,
-            seal_hash: SEAL_HASH.to_owned(),
-            economic_configuration_hash: Some(ECONOMIC_CONFIGURATION_HASH.to_owned()),
-            financial_semantic_version: Some(FINANCIAL_SEMANTIC_VERSION),
-            report_blake3: REPORT_BLAKE3.to_owned(),
-        }
+        let mut facts = load_report_bytes(&qualification_report_bytes("pass"));
+        facts.report_blake3 = REPORT_BLAKE3.to_owned();
+        facts
     }
 
     fn qualification_report_bytes(verdict: &str) -> Vec<u8> {
+        let reasons = if verdict == "pass" {
+            vec!["all sealed one-system gates passed; manual review remains required"]
+        } else {
+            vec!["LCB_5pct is not positive"]
+        };
         let report = serde_json::json!({
             "version": 1,
             "verdict": verdict,
-            "reasons": [],
+            "reasons": reasons,
             "sealed_cutoff_unix": 2_000,
             "first_valid_mark_unix": 1_000,
             "promotion_anchor_mark_unix": 1_000,
@@ -507,11 +510,38 @@ mod tests {
         bytes
     }
 
-    fn load_report_bytes(bytes: &[u8]) -> QualificationFacts {
+    fn try_load_report_bytes(
+        bytes: &[u8],
+    ) -> Result<QualificationFacts, QualificationReportLoadError> {
         let temp = tempfile::tempdir().expect("create qualification report tempdir");
         let path = temp.path().join("qualification.json");
         std::fs::write(&path, bytes).expect("write qualification report fixture");
-        load_qualification_facts(&path).expect("load qualification report fixture")
+        load_qualification_facts(&path)
+    }
+
+    fn load_report_bytes(bytes: &[u8]) -> QualificationFacts {
+        try_load_report_bytes(bytes).expect("load qualification report fixture")
+    }
+
+    fn edit_report_bytes(bytes: &[u8], edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let mut report =
+            serde_json::from_slice(bytes).expect("decode qualification report fixture for edit");
+        edit(&mut report);
+        let mut edited =
+            serde_json::to_vec(&report).expect("encode edited qualification report fixture");
+        edited.push(b'\n');
+        edited
+    }
+
+    fn assert_invalid_report(bytes: &[u8], expected_reason: &str) {
+        assert!(
+            matches!(
+                try_load_report_bytes(bytes),
+                Err(QualificationReportLoadError::Invalid(reason))
+                    if reason.contains(expected_reason)
+            ),
+            "report unexpectedly passed validation"
+        );
     }
 
     fn inputs<'a, P: ArmingProbe>(
@@ -847,6 +877,99 @@ mod tests {
         );
     }
 
+    /// PASS: the complete report shape emitted by the golden qualification scenario is accepted.
+    #[test]
+    fn genuine_golden_qualification_report_shape_passes() {
+        let facts = load_report_bytes(&qualification_report_bytes("pass"));
+        assert_eq!(facts.report.verdict, QualificationVerdict::Pass);
+        assert!(facts.report.replay.exact);
+        assert_eq!(facts.report.complete_days, 30);
+        assert_eq!(facts.report.closed_copies, 90);
+    }
+
+    /// PASS: changing only a failing report's verdict leaves failure reasons and is rejected.
+    #[test]
+    fn fail_report_edited_to_pass_with_failure_reasons_is_rejected() {
+        let edited = edit_report_bytes(&qualification_report_bytes("fail"), |report| {
+            report["verdict"] = serde_json::json!("pass");
+        });
+        assert_invalid_report(&edited, "reasons");
+    }
+
+    /// PASS: a report version unknown to this service cannot become promotion evidence.
+    #[test]
+    fn wrong_qualification_report_version_is_rejected() {
+        let edited = edit_report_bytes(&qualification_report_bytes("pass"), |report| {
+            report["version"] = serde_json::json!(2);
+        });
+        assert_invalid_report(&edited, "version");
+    }
+
+    /// PASS: a report without exact replay cannot become promotion evidence.
+    #[test]
+    fn inexact_qualification_replay_is_rejected() {
+        let edited = edit_report_bytes(&qualification_report_bytes("pass"), |report| {
+            report["replay"]["exact"] = serde_json::json!(false);
+        });
+        assert_invalid_report(&edited, "not exact");
+    }
+
+    /// PASS: a retained report inconsistency is persistent and demotes an armed account.
+    #[test]
+    fn inconsistent_qualification_report_is_a_persistent_failure() {
+        let probe = all_pass();
+        let promotion = reviewed(true);
+        let mut inputs = inputs(
+            "live_tiny",
+            "live_tiny",
+            CheckOutcome::Pass,
+            &promotion,
+            &probe,
+        );
+        inputs
+            .qualification
+            .as_mut()
+            .expect("qualification fixture")
+            .report
+            .replay
+            .exact = false;
+
+        assert_eq!(
+            qualification_outcome(&inputs),
+            CheckOutcome::PersistentFail("qualification report replay is not exact")
+        );
+        assert!(matches!(
+            evaluate_mode(&inputs),
+            ModeDecision::SetEffective { mode: "off", ref reason }
+                if reason.contains("qualification_report") && reason.contains("not exact")
+        ));
+    }
+
+    /// PASS: every failing promotion metric contradicts a Pass verdict and is rejected.
+    #[test]
+    fn pass_report_with_failing_gate_metrics_is_rejected() {
+        for (field, value, reason) in [
+            ("complete_days", serde_json::json!(29), "complete-days"),
+            ("closed_copies", serde_json::json!(89), "closed-copies"),
+            ("lcb_5pct_decimal", serde_json::json!("0"), "LCB_5pct"),
+            (
+                "promotion_max_drawdown_fraction",
+                serde_json::json!("0.1"),
+                "promotion-drawdown",
+            ),
+            (
+                "paper_p95_delay_ms",
+                serde_json::json!(2_001),
+                "paper-delay",
+            ),
+        ] {
+            let edited = edit_report_bytes(&qualification_report_bytes("pass"), |report| {
+                report[field] = value;
+            });
+            assert_invalid_report(&edited, reason);
+        }
+    }
+
     #[test]
     fn one_byte_report_tamper_is_a_persistent_failure() {
         let original_bytes = qualification_report_bytes("pass");
@@ -876,7 +999,7 @@ mod tests {
         let reviewed_bytes = qualification_report_bytes("fail");
         let reviewed_blake3 = blake3::hash(&reviewed_bytes).to_hex().to_string();
         let forged = load_report_bytes(&qualification_report_bytes("pass"));
-        assert_eq!(forged.verdict, QualificationVerdict::Pass);
+        assert_eq!(forged.report.verdict, QualificationVerdict::Pass);
         assert_ne!(forged.report_blake3, reviewed_blake3);
 
         let promotion = PromotionFacts {
@@ -937,7 +1060,7 @@ mod tests {
         let promotion = reviewed(true);
         let mut not_pass = inputs("live_tiny", "off", CheckOutcome::Pass, &promotion, &probe);
         let mut report = passing_qualification();
-        report.verdict = QualificationVerdict::Fail;
+        report.report.verdict = QualificationVerdict::Fail;
         not_pass.qualification = Some(report);
         assert!(matches!(
             qualification_outcome(&not_pass),
