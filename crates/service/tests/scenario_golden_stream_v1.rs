@@ -645,6 +645,7 @@ impl LiveOrderVenue for GoldenLiveVenue {
                 schema_version: 1,
                 parser_version: 1,
                 evidence: Vec::new(),
+                request_descriptor_hashes: Vec::new(),
             })
         })
     }
