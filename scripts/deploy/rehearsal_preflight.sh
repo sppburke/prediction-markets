@@ -8,11 +8,10 @@ env_file=$1
 [[ -f "$env_file" ]] || { echo "FATAL: missing rehearsal environment: $env_file" >&2; exit 1; }
 command -v psql >/dev/null || { echo "FATAL: psql not installed" >&2; exit 1; }
 command -v curl >/dev/null || { echo "FATAL: curl not installed" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "FATAL: python3 not installed" >&2; exit 1; }
 
-set -a
 # shellcheck disable=SC1090
 source "$env_file"
-set +a
 : "${SUPABASE_DB_URL:?SUPABASE_DB_URL is required for the privilege matrix}"
 : "${PE_SUPABASE_URL:?PE_SUPABASE_URL is required}"
 : "${PE_SUPABASE_ANON_KEY:?PE_SUPABASE_ANON_KEY is required}"
@@ -21,12 +20,37 @@ set +a
   echo "FATAL: rehearsal secret slot does not contain the publishable key" >&2
   exit 1
 }
+python3 - "$PE_SUPABASE_SECRET_KEY" <<'PY'
+import base64, json, re, sys
+
+key = sys.argv[1]
+if key.startswith("sb_publishable_") and len(key) > len("sb_publishable_"):
+    raise SystemExit(0)
+if key.startswith("sb_secret_"):
+    raise SystemExit("rehearsal key is a modern secret key, not a publishable key")
+parts = key.split(".")
+if len(parts) != 3 or not all(re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts):
+    raise SystemExit("rehearsal key is neither sb_publishable_* nor a legacy anon JWT")
+try:
+    payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise SystemExit("rehearsal legacy JWT payload is malformed") from error
+if not isinstance(payload, dict) or payload.get("role") != "anon":
+    raise SystemExit("rehearsal legacy JWT role is not anon")
+PY
 
 # shellcheck source=generation_common.sh
 source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+
+rehearsal_psql() {
+  env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" PGDATABASE="$SUPABASE_DB_URL" psql -X "$@"
+}
+psql_service_db() {
+  rehearsal_psql "$@"
+}
 verify_legacy_service_contract
 
-psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+rehearsal_psql -v ON_ERROR_STOP=1 <<'SQL'
 do $$
 declare
   table_name text;
@@ -81,20 +105,49 @@ SQL
 marker="pe-rehearsal-canary-557"
 auth=(-H "apikey: $PE_SUPABASE_SECRET_KEY" -H "Authorization: Bearer $PE_SUPABASE_SECRET_KEY")
 json=(-H 'Content-Type: application/json' -H 'Prefer: return=representation')
+canary_body=
+
+cleanup_canary_rows() {
+  rehearsal_psql -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+delete from public.paper_fills
+ where idempotency_key = 'pe-rehearsal-canary-557';
+delete from public.supabase_sink_hwm
+ where id = 2 and last_event_seq = -557;
+delete from public.wallet_lifecycle_events
+ where reason = 'pe-rehearsal-canary-557';
+delete from public.service_watchlist
+ where wallet_hex = '0x0000000000000000000000000000000000000557'
+   and rank = 557 and leader_score_bps = 557;
+SQL
+}
+
+cleanup_on_exit() {
+  local original_status=$? cleanup_status=0
+  trap - EXIT
+  rm -f "${canary_body:-}"
+  cleanup_canary_rows || cleanup_status=$?
+  if ((cleanup_status != 0)); then
+    echo "FATAL: rehearsal canary cleanup failed" >&2
+    exit "$cleanup_status"
+  fi
+  exit "$original_status"
+}
+trap cleanup_on_exit EXIT
+cleanup_canary_rows
 
 refused() {
-  local path=$1 payload=$2 body status
-  body=$(mktemp)
-  trap 'rm -f "$body"' RETURN
-  status=$(curl --silent --show-error --output "$body" --write-out '%{http_code}' \
+  local path=$1 payload=$2 status
+  canary_body=$(mktemp)
+  status=$(env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
+    curl --disable --silent --show-error --output "$canary_body" --write-out '%{http_code}' \
     -X POST "${PE_SUPABASE_URL%/}$path" "${auth[@]}" "${json[@]}" --data "$payload")
   [[ "$status" == 401 || "$status" == 403 ]] || {
     echo "FATAL: rehearsal canary $path returned HTTP $status, expected 401/403" >&2
-    sed -n '1,5p' "$body" >&2
+    sed -n '1,5p' "$canary_body" >&2
     exit 1
   }
-  rm -f "$body"
-  trap - RETURN
+  rm -f "$canary_body"
+  canary_body=
 }
 
 refused '/rest/v1/paper_fills' \
@@ -107,7 +160,7 @@ refused '/rest/v1/wallet_lifecycle_events' \
 refused '/rest/v1/rpc/service_watchlist_replace_v1' \
   '{"expected_token":"2000-01-01T00:00:00Z","entries":[]}'
 
-landed=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+landed=$(rehearsal_psql -v ON_ERROR_STOP=1 -Atc \
   "select (select count(*) from paper_fills where idempotency_key = '$marker') +
           (select count(*) from supabase_sink_hwm where id = 2) +
           (select count(*) from wallet_lifecycle_events where reason = '$marker') +
@@ -116,4 +169,5 @@ landed=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
 [[ "$landed" == 0 ]] || { echo "FATAL: $landed rehearsal canary row(s) landed" >&2; exit 1; }
 
 echo "rehearsal privilege matrix: PASS"
+echo "rehearsal publishable-key class: PASS"
 echo "rehearsal non-mutating canaries: PASS (all 401/403; landed=0)"
