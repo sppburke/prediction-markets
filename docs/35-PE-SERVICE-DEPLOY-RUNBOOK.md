@@ -338,9 +338,11 @@ sync).
 Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
 superseded values are compatibility data and never enter corrected economics. The old 17-name
 contract is verified before the guarded mutation. Only after the physical Start does the driver
-install the financial schema, seed the Start identity, migrate to `ConfigEra::Financial15`, adopt the
-reviewed files, and start the service. An optional `risk_halt_release_hash` remains separate incident
-control. Do not apply the 17→15 boundary early.
+install the financial authority and multi-account live schemas, seed the Start identity, migrate to
+`ConfigEra::Financial15`, refresh `wallet_live_stats_mv`, adopt the reviewed files, and start the
+service. The live-schema boundary converts both `live_positions` quantity columns from the deployed
+`bigint` shape to `numeric` without changing existing whole-contract values. An optional
+`risk_halt_release_hash` remains separate incident control. Do not apply the 17→15 boundary early.
 
 Run the exact reviewed driver command on the production host:
 
@@ -403,9 +405,13 @@ records the remote census and all three log identities, and invokes the staged n
 synchronized receipt; it does not mutate them.
 
 From `guarded`, the driver archives/resets the remote paper state, invokes the network-free local
-reset/Start, installs and seeds the Start-bound authority schema, applies the 15-name configuration
-migration, adopts the reviewed files, starts the service once, records `started`, and exits. A rerun
-from `started` performs the first invocation-fresh verification and records `verified`.
+reset/Start, and then records the post-Start database boundaries in this order:
+`authority-schema-intent → authority-schema-installed → live-schema-intent →
+live-schema-installed → authority-start-seeded → financial-config-migration-intent →
+financial-config-migrated → wallet-live-stats-refresh-intent →
+wallet-live-stats-refreshed`. It then adopts the reviewed files, starts the service once, records
+`started`, and exits. A rerun from `started` performs the first invocation-fresh verification and
+records `verified`.
 
 `started → verified` checks the installed identities; guarded log-prefix continuity; exact local and
 remote Start/fresh-financial state; applied hot hash; ranking and membership; public projection;
@@ -414,14 +420,19 @@ It also queries the proven installed invocation's numeric-loopback `/health/read
 once and requires HTTP success, `ready: true`, and no issues. Readiness has no wait loop: if either the
 invocation-fresh status proof or that one endpoint response is not already complete, the command fails
 immediately and the operator reruns the same command. There is no soak, dwell, repeated sample, or
-site approval.
+site approval. The public materialized-view evidence at this stage is its durable pre-start refresh
+receipt, not a row comparison against the live `wallet_live_stats` base view: after service start,
+new financial writes may legitimately make that base view newer than the scheduled snapshot.
 
 `--rollback-before-start` is the only rollback route. Rollback-check scans and validates an exact
 manifest-bound complete Start before consulting mutable status or live posture. A complete Start
 forces roll-forward even when the shell manifest or status is missing or stale. Only the no-Start path
 requires the pre-Start posture and may repair a partial final frame; it restores only from the durable
-activation archive and complete SQLite backup before recording `rolled_back`. At or after Start,
-rollback is forbidden: preserve the append-only era and recover with a compatible reader.
+activation archive and complete SQLite backup. After the remote archive restoration it records
+`rollback-wallet-live-stats-refresh-intent → rollback-wallet-live-stats-refreshed` while the service
+is inert, then starts the old service and records `rolled_back`. A no-mutation rollback skips the
+remote restore and refresh. At or after Start, rollback is forbidden: preserve the append-only era and
+recover with a compatible reader.
 
 The driver invokes these early-dispatch service commands; they accept either `--name=value` or
 `--name value` spellings:
@@ -447,8 +458,10 @@ installs checked-in pre-545 schema fixtures pinned to commit `8ea29a9`, creates 
 paper state, runs the production `pe-service --financial-era=prepare` and `start` owners via
 `cargo run -p pe-service --all-features --bin pe-service --`, and passes the returned synchronized
 Start receipt to `seed_financial_start` before applying the configuration migration. It retries every
-transition boundary once and requires the same receipt or exact archive/read-back state, so both
-pull-request and post-merge `main` CI exercise the same legacy input.
+transition boundary once, applies the live schema twice to the legacy `bigint` position shape, proves
+whole quantities survive and fractional quantities round-trip, and requires the materialized and base
+view counts to agree after forward refresh and rollback restoration. Both pull-request and post-merge
+`main` CI therefore exercise the same legacy input.
 
 The offline qualification command is separate from activation and constructs no network client:
 

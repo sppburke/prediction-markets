@@ -685,6 +685,14 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
       die "restored remote census differs from the guarded census"
     manifest_patch_boundary archive-restored '{"archive_restored":true}'
   fi
+  if ! manifest_flag rollback_wallet_live_stats_refreshed; then
+    manifest_patch_boundary rollback-wallet-live-stats-refresh-intent \
+      '{"rollback_wallet_live_stats_refresh_intent":true}'
+    psql_service_db -v ON_ERROR_STOP=1 -c \
+      'refresh materialized view concurrently public.wallet_live_stats_mv;'
+    manifest_patch_boundary rollback-wallet-live-stats-refreshed \
+      '{"rollback_wallet_live_stats_refreshed":true}'
+  fi
   if ! manifest_flag local_restored; then
     [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert before local restore"
     current_local_sha=$(sha256_file "$paper_state")
@@ -810,6 +818,11 @@ if [[ "$state" == guarded ]]; then
     psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
     manifest_patch_boundary authority-schema-installed '{"authority_schema_installed":true}'
   fi
+  if ! manifest_flag live_schema_installed; then
+    manifest_patch_boundary live-schema-intent '{"live_schema_intent":true}'
+    psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql"
+    manifest_patch_boundary live-schema-installed '{"live_schema_installed":true}'
+  fi
   authority_start=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select seed_financial_start($start_seq,'$start_hash');
      select json_build_object('bankroll',(select bankroll_str from paper_bankroll where id=0),
@@ -834,6 +847,14 @@ if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise S
     manifest_patch_boundary financial-config-migration-intent '{"financial_config_migration_intent":true}'
     psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/migrate_service_config_545.sql"
     manifest_patch_boundary financial-config-migrated '{"financial_config_migrated":true}'
+  fi
+  if ! manifest_flag wallet_live_stats_refreshed; then
+    manifest_patch_boundary wallet-live-stats-refresh-intent \
+      '{"wallet_live_stats_refresh_intent":true}'
+    psql_service_db -v ON_ERROR_STOP=1 -c \
+      'refresh materialized view concurrently public.wallet_live_stats_mv;'
+    manifest_patch_boundary wallet-live-stats-refreshed \
+      '{"wallet_live_stats_refreshed":true}'
   fi
   if ! manifest_flag target_config_adopted; then
     manifest_patch_boundary target-config-adopt-intent '{"target_config_adopt_intent":true}'

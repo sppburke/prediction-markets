@@ -125,11 +125,14 @@ pass_step
 start_step "install pre-Start schema and seed Legacy17 plus the release row"
 legacy_schema="$REPO_ROOT/scripts/fixtures/pre545/supabase_paper_state_schema.sql"
 legacy_multi_account_schema="$REPO_ROOT/scripts/fixtures/pre545/supabase_multi_account_live_schema.sql"
+financial_multi_account_schema="$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql"
 [[ -s "$legacy_schema" ]] || die "pre-Start paper-state schema is empty"
 [[ -s "$legacy_multi_account_schema" ]] || die "pre-Start multi-account schema is empty"
+[[ -s "$financial_multi_account_schema" ]] || die "financial multi-account schema is empty"
 psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_schema.sql"
 psql_service_db -v ON_ERROR_STOP=1 -f "$legacy_schema"
 psql_service_db -v ON_ERROR_STOP=1 -f "$legacy_multi_account_schema"
+psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_wallet_live_stats_mv.sql"
 # Retry every installed-schema boundary once against the same PostgreSQL database.
 psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_schema.sql"
 psql_service_db -v ON_ERROR_STOP=1 -f "$legacy_schema"
@@ -185,6 +188,24 @@ values ('legacy-settled-market', '[1,0]'::jsonb, 0.625, 101);
 insert into fill_market_snapshots
   (idempotency_key, captured_at_unix)
 values ('legacy-fill', 100);
+insert into accounts (account_id, is_primary)
+values ('legacy-primary', true);
+insert into live_positions
+  (account_id, market_id, outcome_id, long_contracts, short_contracts, cost_basis)
+values ('legacy-primary', 'legacy-live-market', 0, 7, 3, 1.5);
+SQL
+pass_step
+
+start_step "refresh and prove the public projection before the transition"
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  'refresh materialized view concurrently public.wallet_live_stats_mv;'
+psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+do $$ begin
+  if (select count(*) from public.wallet_live_stats_mv) <> 1
+     or (select count(*) from public.wallet_live_stats) <> 1 then
+    raise exception 'pre-transition public projection does not contain the legacy wallet';
+  end if;
+end $$;
 SQL
 pass_step
 
@@ -404,6 +425,42 @@ psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_s
 # The schema itself is an idempotent boundary.
 psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
 retry_manifest_patch authority-schema-installed '{"authority_schema_installed":true}'
+retry_manifest_patch live-schema-intent '{"live_schema_intent":true}'
+psql_service_db -v ON_ERROR_STOP=1 -f "$financial_multi_account_schema"
+# A retry from the intent receipt must accept the pre-545 bigint shape and the migrated shape.
+psql_service_db -v ON_ERROR_STOP=1 -f "$financial_multi_account_schema"
+retry_manifest_patch live-schema-installed '{"live_schema_installed":true}'
+live_position_types=$(psql_service_db -v ON_ERROR_STOP=1 -F '|' -Atc \
+  "select column_name, data_type
+     from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'live_positions'
+      and column_name in ('long_contracts', 'short_contracts')
+    order by column_name;")
+[[ "$live_position_types" == $'long_contracts|numeric\nshort_contracts|numeric' ]] ||
+  die "live position quantity types did not migrate to numeric: $live_position_types"
+legacy_live_position=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  "select long_contracts::text || '|' || short_contracts::text
+     from live_positions
+    where account_id = 'legacy-primary'
+      and market_id = 'legacy-live-market'
+      and outcome_id = 0;")
+[[ "$legacy_live_position" == '7|3' ]] ||
+  die "legacy whole-contract live position did not survive: $legacy_live_position"
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  "update live_positions
+      set long_contracts = 1.125, short_contracts = 0.375
+    where account_id = 'legacy-primary'
+      and market_id = 'legacy-live-market'
+      and outcome_id = 0;"
+fractional_live_position=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  "select long_contracts::text || '|' || short_contracts::text
+     from live_positions
+    where account_id = 'legacy-primary'
+      and market_id = 'legacy-live-market'
+      and outcome_id = 0;")
+[[ "$fractional_live_position" == '1.125|0.375' ]] ||
+  die "fractional live position did not round-trip exactly: $fractional_live_position"
 # psql does not interpolate variables inside -c strings; feed the statement on standard input.
 seed_start() {
   psql_service_db -v ON_ERROR_STOP=1 -At \
@@ -481,6 +538,26 @@ SQL
 retry_manifest_patch financial-config-migrated '{"financial_config_migrated":true}'
 pass_step
 
+start_step "refresh the public projection at the forward activation boundary"
+retry_manifest_patch wallet-live-stats-refresh-intent \
+  '{"wallet_live_stats_refresh_intent":true}'
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  'refresh materialized view concurrently public.wallet_live_stats_mv;'
+# Model a crash after REFRESH committed but before its completed manifest receipt.
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  'refresh materialized view concurrently public.wallet_live_stats_mv;'
+retry_manifest_patch wallet-live-stats-refreshed '{"wallet_live_stats_refreshed":true}'
+psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+do $$ begin
+  if (select count(*) from public.wallet_live_stats_mv)
+       <> (select count(*) from public.wallet_live_stats)
+     or (select count(*) from public.wallet_live_stats_mv) <> 0 then
+    raise exception 'forward public projection does not equal the fresh base view';
+  end if;
+end $$;
+SQL
+pass_step
+
 start_step "round-trip fractional financial state through archive and restore"
 psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
 update paper_bankroll
@@ -502,10 +579,14 @@ insert into fill_market_snapshots
   (idempotency_key, captured_at_unix)
 values ('financial-fill', 200);
 SQL
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  'refresh materialized view concurrently public.wallet_live_stats_mv;'
 psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
   -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
 psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
   -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  'refresh materialized view concurrently public.wallet_live_stats_mv;'
 psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
 do $$ begin
   if (select count(*) from paper_fills) <> 0
@@ -530,6 +611,15 @@ psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
   -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
 psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-545-fractional \
   -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
+retry_manifest_patch rollback-wallet-live-stats-refresh-intent \
+  '{"rollback_wallet_live_stats_refresh_intent":true}'
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  'refresh materialized view concurrently public.wallet_live_stats_mv;'
+# Model a crash after the rollback REFRESH committed but before its completed receipt.
+psql_service_db -v ON_ERROR_STOP=1 -c \
+  'refresh materialized view concurrently public.wallet_live_stats_mv;'
+retry_manifest_patch rollback-wallet-live-stats-refreshed \
+  '{"rollback_wallet_live_stats_refreshed":true}'
 psql_service_db -v ON_ERROR_STOP=1 -v start_seq="$start_seq" -v start_hash="$start_hash" <<'SQL'
 begin;
 select set_config('pe.start_seq', :'start_seq', true);
@@ -553,7 +643,10 @@ do $$ begin
        select 1 from settled_markets
         where market_id = 'financial-settled-market'
           and credit_applied = 0.625 and prepared_seq = 44
-     ) then
+     ) or (select count(*) from public.wallet_live_stats_mv)
+          <> (select count(*) from public.wallet_live_stats)
+       or (select count(*) from public.wallet_live_stats_mv) <> 1
+     then
     raise exception 'fractional archive/restore round trip changed the financial book';
   end if;
 end $$;

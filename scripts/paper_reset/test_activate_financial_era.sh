@@ -108,6 +108,11 @@ require_text "$DRIVER" 'verify_legacy_service_contract'
 require_text "$DRIVER" 'archive_restored'
 require_text "$DRIVER" 'local_restored'
 require_text "$DRIVER" 'old_service_started'
+require_text "$DRIVER" 'supabase_multi_account_live_schema.sql'
+require_text "$DRIVER" 'live-schema-installed'
+require_text "$DRIVER" 'wallet-live-stats-refreshed'
+require_text "$DRIVER" 'rollback-wallet-live-stats-refreshed'
+require_text "$DRIVER" 'refresh materialized view concurrently public.wallet_live_stats_mv;'
 reject_text "$DRIVER" 'seed_v1_empty.sh'
 reject_text "$DRIVER" 'sleep '
 reject_text "$DRIVER" '--hot-config-hash'
@@ -221,6 +226,18 @@ elif [[ "$file" == *restore_paper_state.sql ]]; then
   count=0; [[ ! -f "$state/restore-count" ]] || count=$(<"$state/restore-count")
   echo $((count + 1)) > "$state/restore-count"
   echo restored > "$state/remote-state"
+elif [[ "$file" == *supabase_multi_account_live_schema.sql ]]; then
+  count=0; [[ ! -f "$state/live-schema-count" ]] || count=$(<"$state/live-schema-count")
+  echo $((count + 1)) > "$state/live-schema-count"
+elif [[ "$sql" == *"refresh materialized view concurrently public.wallet_live_stats_mv"* ]]; then
+  [[ ! -e "$state/materialized-view-fail" ]] || exit 96
+  if [[ -f "$state/remote-state" && $(<"$state/remote-state") == restored ]]; then
+    count=0; [[ ! -f "$state/rollback-refresh-count" ]] || count=$(<"$state/rollback-refresh-count")
+    echo $((count + 1)) > "$state/rollback-refresh-count"
+  else
+    count=0; [[ ! -f "$state/forward-refresh-count" ]] || count=$(<"$state/forward-refresh-count")
+    echo $((count + 1)) > "$state/forward-refresh-count"
+  fi
 elif [[ "$stdin" == *"live % differs from activation"* ]]; then
   [[ -f "$state/remote-state" && $(<"$state/remote-state") == restored ]] || exit 1
 elif [[ "$stdin" == *"anon must exist and must not bypass RLS"* ]]; then
@@ -1037,6 +1054,8 @@ run_driver "$root" --rollback-before-start >/dev/null
   fail "pre-Start rollback did not become durable"
 [[ $(<"$root/test-state/restore-count") -eq 1 && $(<"$root/test-state/start-count") -eq 1 ]] ||
   fail "pre-Start rollback did not restore/restart exactly once"
+[[ $(<"$root/test-state/rollback-refresh-count") -eq 1 ]] ||
+  fail "pre-Start rollback did not refresh the public projection exactly once"
 python3 -c 'import json,sys
 value=json.load(open(sys.argv[1])); assert value["local_restore_skipped"] is True' \
   "$root/pe-financial-era.json" || fail "unchanged local state was restored without a mutation receipt"
@@ -1079,6 +1098,10 @@ set -e
 [[ $status -eq 86 && $(<"$root/test-state/service.active") == true ]] ||
   fail "post-service-start crash seam was not reached"
 [[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "initial activation did not archive once"
+[[ $(<"$root/test-state/live-schema-count") -eq 1 ]] ||
+  fail "initial activation did not install the live financial schema once"
+[[ $(<"$root/test-state/forward-refresh-count") -eq 1 ]] ||
+  fail "initial activation did not refresh the public projection once"
 run_driver "$root" >/dev/null
 [[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "Start recovery repeated remote archive"
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
@@ -1152,8 +1175,10 @@ done
 forward_manifest_boundaries=(
   prepared service-stop-intent service-stopped legacy-contract-verified preparation guarded
   remote-archive-intent remote-archived qualification-start-intent qualification-started
-  authority-schema-intent authority-schema-installed authority-start-seeded
+  authority-schema-intent authority-schema-installed live-schema-intent live-schema-installed
+  authority-start-seeded
   financial-config-migration-intent financial-config-migrated
+  wallet-live-stats-refresh-intent wallet-live-stats-refreshed
   target-config-adopt-intent target-config-adopted
   target-environment-adopt-intent target-environment-adopted
   target-binary-adopt-intent target-binary-adopted
@@ -1182,6 +1207,10 @@ for boundary in "${forward_boundaries[@]}"; do
   [[ $(<"$root/test-state/stop-count") -eq 1 ]] || fail "$boundary stopped the service more than once"
   [[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "$boundary archived the remote book more than once"
   [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the service more than once"
+  [[ -f "$root/test-state/live-schema-count" && $(<"$root/test-state/live-schema-count") -ge 1 ]] ||
+    fail "$boundary did not install the live financial schema"
+  [[ -f "$root/test-state/forward-refresh-count" && $(<"$root/test-state/forward-refresh-count") -ge 1 ]] ||
+    fail "$boundary did not refresh the public projection"
 done
 
 # Scenario FE-ROLLBACK-MATRIX-09
@@ -1191,6 +1220,7 @@ done
 # FAIL: retry restores while active, repeats a transition, or loses an equality proof.
 rollback_manifest_boundaries=(
   rollback-service-stopped rolling_back rollback-archive-restore-intent archive-restored
+  rollback-wallet-live-stats-refresh-intent rollback-wallet-live-stats-refreshed
   rollback-local-mutation-observed rollback-local-restore-intent local-restored
   rollback-old-service-start-intent old-service-started rolled_back
 )
@@ -1224,6 +1254,8 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "rollback crash boundary $boundary did not converge"
   [[ $(<"$root/test-state/restore-count") -eq 1 ]] || fail "$boundary restored the archive more than once"
   [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the old service more than once"
+  [[ -f "$root/test-state/rollback-refresh-count" && $(<"$root/test-state/rollback-refresh-count") -ge 1 ]] ||
+    fail "$boundary did not refresh the restored public projection"
 done
 
 echo "PASS: FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
