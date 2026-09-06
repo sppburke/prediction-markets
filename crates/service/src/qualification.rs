@@ -3490,6 +3490,101 @@ async fn replayed_risk_prices(
     Ok(prices)
 }
 
+fn risk_source_tail_sequence(
+    evidence: &WinnerFollowRiskInputEvidence,
+    source: &BTreeMap<u64, SourceObservation>,
+) -> Result<EventSeq, QualificationError> {
+    let tail = evidence.source_tail.ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "risk price attempt has no source-log tail binding".to_owned(),
+        )
+    })?;
+    if source
+        .get(&tail.sequence.0)
+        .is_none_or(|observation| observation.receipt != tail)
+    {
+        return insufficient("risk price attempt source tail is absent from the sealed prefix");
+    }
+    if evidence
+        .price_receipts
+        .iter()
+        .any(|receipt| receipt.sequence > tail.sequence)
+    {
+        return insufficient("risk price receipt follows its bound source-log tail");
+    }
+    Ok(tail.sequence)
+}
+
+async fn applicable_risk_price_receipts(
+    evaluated_at_unix_ms: i64,
+    positions: &[PaperPositionRow],
+    source: &BTreeMap<u64, SourceObservation>,
+    source_tail_sequence: EventSeq,
+) -> Vec<AppendReceipt> {
+    let mut requested = positions
+        .iter()
+        .map(|position| position.market_id.to_string())
+        .collect::<Vec<_>>();
+    requested.sort();
+    requested.dedup();
+    let candidates = source
+        .range(..=source_tail_sequence.0)
+        .rev()
+        .filter(|(_, observation)| {
+            observation.source_id == GAMMA_MARKETS_SOURCE_ID
+                && observation.schema_version == GAMMA_MARKETS_SCHEMA_VERSION
+                && observation.parser_version == GAMMA_MARKETS_PARSER_VERSION
+        })
+        .map(|(_, observation)| observation.clone())
+        .collect::<Vec<_>>();
+    let mut selected = HashMap::new();
+    for observation in candidates {
+        if observation.received_unix_ms > evaluated_at_unix_ms
+            || evaluated_at_unix_ms
+                .checked_sub(observation.received_unix_ms)
+                .is_none_or(|age_ms| age_ms >= 60_000)
+        {
+            continue;
+        }
+        let Ok(replayed) = GammaMarketsClient::new(
+            "https://offline.invalid".to_owned(),
+            RecordedPageFetcher {
+                payload: observation.payload.clone(),
+            },
+        )
+        .with_batch_size(requested.len().max(1))
+        .fetch_markets_with_pages(&requested, MarketFilter::OpenOnly)
+        .await
+        else {
+            continue;
+        };
+        if replayed.pages.len() != 1 || replayed.pages[0].1 != observation.payload {
+            continue;
+        }
+        for row in replayed.markets.markets.into_values() {
+            if row.outcome_prices.is_none() {
+                continue;
+            }
+            let market = MarketId(VenueMarketId(row.condition_id));
+            for position in positions
+                .iter()
+                .filter(|position| position.market_id == market)
+            {
+                selected
+                    .entry((position.market_id.clone(), position.outcome_id))
+                    .or_insert(observation.receipt);
+            }
+        }
+        if selected.len() == positions.len() {
+            break;
+        }
+    }
+    let mut receipts = selected.into_values().collect::<Vec<_>>();
+    receipts.sort_by_key(|receipt| receipt.sequence);
+    receipts.dedup();
+    receipts
+}
+
 fn source_receipt<'a>(
     source: &'a BTreeMap<u64, SourceObservation>,
     receipt: AppendReceipt,
@@ -4784,6 +4879,7 @@ async fn replay_unavailable_risk_inputs(
     };
     let evaluated_at_unix = evidence.evaluated_at_unix_ms.div_euclid(1_000);
     let snapshot = replayed_financial_snapshot(&replay, evaluated_at_unix)?;
+    let source_tail_sequence = risk_source_tail_sequence(evidence, context.source)?;
     let current_prices = match replayed_risk_prices(
         &evidence.price_receipts,
         evidence.evaluated_at_unix_ms,
@@ -4793,6 +4889,29 @@ async fn replay_unavailable_risk_inputs(
     .await
     {
         Ok(prices) => prices,
+        Err(RiskPriceReplayError::Unavailable(RiskInputsUnavailable::PriceMissing)) => {
+            let applicable = applicable_risk_price_receipts(
+                evidence.evaluated_at_unix_ms,
+                &snapshot.positions,
+                context.source,
+                source_tail_sequence,
+            )
+            .await;
+            let recorded = evidence
+                .price_receipts
+                .iter()
+                .map(|receipt| receipt_key(*receipt))
+                .collect::<HashSet<_>>();
+            if applicable
+                .iter()
+                .any(|receipt| !recorded.contains(&receipt_key(*receipt)))
+            {
+                return insufficient(
+                    "risk PriceMissing evidence omits an applicable source price receipt",
+                );
+            }
+            return Ok(Some(RiskInputsUnavailable::PriceMissing));
+        }
         Err(RiskPriceReplayError::Unavailable(cause)) => return Ok(Some(cause)),
         Err(RiskPriceReplayError::Insufficient(reason)) => return insufficient(reason),
     };
@@ -6774,7 +6893,8 @@ mod tests {
             cause: RiskInputsUnavailable::PriceMissing,
             evidence: WinnerFollowRiskInputEvidence {
                 financial_prefix: Some(*financial_prefix),
-                price_receipts: economic.risk.price_receipts.clone(),
+                price_receipts: Vec::new(),
+                source_tail: economic.risk.price_receipts.last().copied(),
                 evaluated_at_unix_ms: economic.risk.evaluated_at_unix_ms,
                 proposed_debit: economic.balance.worst_case_debit,
                 per_trade_cap_bps: economic.risk.snapshot.per_trade_cap_bps,
@@ -6796,8 +6916,78 @@ mod tests {
             )
             .await,
             Err(QualificationError::InsufficientEvidence(reason))
-                if reason.contains("causal replay produced None")
+                if reason.contains("omits an applicable source price receipt")
         ));
+    }
+
+    /// PASS: a malformed strict price records its consumed Gamma receipt and replays as the same
+    /// typed PriceMissing decline from the bound source tail.
+    #[tokio::test]
+    async fn winner_follow_replay_accepts_receipt_backed_missing_price_decline() {
+        const OPEN_CONDITION: &str =
+            "0x5c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ef";
+        let mut fixture = receipt_backed_decline_fixture().await;
+        fixture.source.get_mut(&1007).unwrap().payload = serde_json::to_vec(&serde_json::json!([{
+            "conditionId": OPEN_CONDITION,
+            "active": true,
+            "closed": false,
+            "outcomePrices": "[\"1.1\",\"-0.1\"]"
+        }]))
+        .unwrap();
+        let decision = fixture.decision.clone();
+        let mut row = DecisionPendingRow {
+            source_trade_id: decision.continuation.facts.source_trade_id.clone(),
+            semantic_revision: decision.continuation.facts.semantic_revision.clone(),
+            wallet: decision.continuation.facts.wallet,
+            source_epoch: decision.continuation.facts.source_epoch,
+            frozen_inputs_json: {
+                let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
+                format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap())
+            },
+            post_commit_inputs_json: String::new(),
+            state: DecisionPendingState::Terminal,
+            terminal_disposition: Some("no_fill".to_owned()),
+            updated_at_unix: 1_800_000_011,
+        };
+        let mut body = decision.post_boundary.body;
+        let decline = body.terminal.decline.as_mut().unwrap();
+        let (economic, financial_prefix) = match &decline.inputs {
+            WinnerFollowDecisionInputs::Evaluated {
+                economic,
+                financial_prefix,
+            } => Some((economic, financial_prefix)),
+            WinnerFollowDecisionInputs::RiskInputsUnavailable { .. } => None,
+        }
+        .expect("receipt-backed fixture must contain evaluated inputs");
+        let price_receipt = economic.risk.price_receipts[0];
+        decline.outcome =
+            pe_strategy_winner_follow::WinnerFollowDeclineAudit::RiskInputsUnavailable;
+        decline.inputs = WinnerFollowDecisionInputs::RiskInputsUnavailable {
+            cause: RiskInputsUnavailable::PriceMissing,
+            evidence: WinnerFollowRiskInputEvidence {
+                financial_prefix: Some(*financial_prefix),
+                price_receipts: vec![price_receipt],
+                source_tail: Some(price_receipt),
+                evaluated_at_unix_ms: economic.risk.evaluated_at_unix_ms,
+                proposed_debit: economic.balance.worst_case_debit,
+                per_trade_cap_bps: economic.risk.snapshot.per_trade_cap_bps,
+            },
+        };
+        row.post_commit_inputs_json = serde_json::to_string(
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+        )
+        .unwrap();
+        let replayed = replay_decision_pending(&row).unwrap();
+
+        bind_final_receipts(
+            &[replayed],
+            &[],
+            &fixture.observations,
+            &fixture.start,
+            &fixture.context(),
+        )
+        .await
+        .unwrap();
     }
 
     fn test_economic(

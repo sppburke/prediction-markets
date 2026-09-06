@@ -74,6 +74,14 @@ pub struct MidPriceObservation {
     pub observed_unix: i64,
 }
 
+/// One strict price acquisition, including the evidence available when validation fails.
+#[derive(Debug)]
+pub(crate) struct StrictMidPriceAttempt {
+    pub evaluated_at: OffsetDateTime,
+    pub price_receipts: Vec<AppendReceipt>,
+    pub result: Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable>,
+}
+
 /// Thread-safe TTL cache of open-market mid prices. Generic over the fetcher so
 /// tests can inject a `FixtureFetcher`; production uses [`ReqwestFetcher`].
 pub struct MidPriceCache<F: PageFetcher = ReqwestFetcher> {
@@ -181,57 +189,84 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         &self,
         ids: &[MarketOutcomeId],
     ) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
-        self.fetch_mids_strict_at(ids, OffsetDateTime::now_utc())
+        self.fetch_mids_strict_attempt(ids).await.result
+    }
+
+    pub(crate) async fn fetch_mids_strict_attempt(
+        &self,
+        ids: &[MarketOutcomeId],
+    ) -> StrictMidPriceAttempt {
+        self.fetch_mids_strict_with_clock(ids, OffsetDateTime::now_utc)
             .await
     }
 
-    async fn fetch_mids_strict_at(
+    pub(crate) async fn fetch_mids_strict_with_clock<C>(
         &self,
         ids: &[MarketOutcomeId],
-        now: OffsetDateTime,
-    ) -> Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable> {
+        clock: C,
+    ) -> StrictMidPriceAttempt
+    where
+        C: FnOnce() -> OffsetDateTime,
+    {
         let mut markets = ids.iter().map(|id| id.market().clone()).collect::<Vec<_>>();
         markets.sort_by_key(ToString::to_string);
         markets.dedup();
         let _ = self.ensure_entries(&markets).await;
 
+        // The response pages are durably appended by `ensure_entries`. Take the one risk clock
+        // only after that await so a newly fetched observation cannot be newer than its validator.
+        let evaluated_at = clock();
         let map = self.inner.lock().await;
-        let mut output = BTreeMap::new();
-        for id in ids {
-            let entry = map
-                .get(id.market())
-                .ok_or(RiskInputsUnavailable::PriceMissing)?;
-            if entry.conflicting {
-                return Err(RiskInputsUnavailable::PriceConflict);
+        let mut price_receipts = ids
+            .iter()
+            .filter_map(|id| map.get(id.market()).and_then(|entry| entry.receipt))
+            .collect::<Vec<_>>();
+        price_receipts.sort_by_key(|receipt| receipt.sequence);
+        price_receipts.dedup();
+        let result = (|| {
+            let mut output = BTreeMap::new();
+            for id in ids {
+                let entry = map
+                    .get(id.market())
+                    .ok_or(RiskInputsUnavailable::PriceMissing)?;
+                if entry.conflicting {
+                    return Err(RiskInputsUnavailable::PriceConflict);
+                }
+                if entry.observed_at > evaluated_at {
+                    return Err(RiskInputsUnavailable::PriceFuture);
+                }
+                if evaluated_at - entry.observed_at
+                    >= time::Duration::seconds(
+                        i64::try_from(TTL.as_secs())
+                            .map_err(|_| RiskInputsUnavailable::Overflow)?,
+                    )
+                {
+                    return Err(RiskInputsUnavailable::PriceStale);
+                }
+                let receipt = entry.receipt.ok_or(RiskInputsUnavailable::PriceMissing)?;
+                let outcome = usize::from(id.outcome().0);
+                let price = entry
+                    .strict_mids
+                    .as_ref()
+                    .and_then(|prices| prices.get(outcome))
+                    .copied()
+                    .ok_or(RiskInputsUnavailable::PriceMissing)?;
+                output.insert(
+                    (id.market().to_string(), id.outcome().0),
+                    MidPriceObservation {
+                        price,
+                        receipt,
+                        observed_unix: entry.observed_at.unix_timestamp(),
+                    },
+                );
             }
-            if entry.observed_at > now {
-                return Err(RiskInputsUnavailable::PriceFuture);
-            }
-            if now - entry.observed_at
-                >= time::Duration::seconds(
-                    i64::try_from(TTL.as_secs()).map_err(|_| RiskInputsUnavailable::Overflow)?,
-                )
-            {
-                return Err(RiskInputsUnavailable::PriceStale);
-            }
-            let receipt = entry.receipt.ok_or(RiskInputsUnavailable::PriceMissing)?;
-            let outcome = usize::from(id.outcome().0);
-            let price = entry
-                .strict_mids
-                .as_ref()
-                .and_then(|prices| prices.get(outcome))
-                .copied()
-                .ok_or(RiskInputsUnavailable::PriceMissing)?;
-            output.insert(
-                (id.market().to_string(), id.outcome().0),
-                MidPriceObservation {
-                    price,
-                    receipt,
-                    observed_unix: entry.observed_at.unix_timestamp(),
-                },
-            );
+            Ok(output)
+        })();
+        StrictMidPriceAttempt {
+            evaluated_at,
+            price_receipts,
+            result,
         }
-        Ok(output)
     }
 
     /// Serve fresh [`CachedEntry`]s for `market_ids` from the cache and fetch the stale/missing ones
@@ -370,9 +405,13 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::activity_ingest::ActivityIngest;
+    use crate::health::new_shared_health_with_ws;
+    use crate::source_event_sink::SourceEventSink;
     use pe_core_types::{EventSeq, OutcomeId};
     use pe_source_polymarket_public::FixtureFetcher;
     use time::macros::datetime;
+    use tokio::sync::mpsc;
 
     fn mid(s: &str) -> MarketId {
         s.parse().unwrap()
@@ -443,8 +482,16 @@ mod tests {
         )
         .await;
         let ids = [outcome("0xstrict", 0), outcome("0xstrict", 1)];
-        let first = cache.fetch_mids_strict_at(&ids, now).await.unwrap();
-        let second = cache.fetch_mids_strict_at(&ids, now).await.unwrap();
+        let first = cache
+            .fetch_mids_strict_with_clock(&ids, || now)
+            .await
+            .result
+            .unwrap();
+        let second = cache
+            .fetch_mids_strict_with_clock(&ids, || now)
+            .await
+            .result
+            .unwrap();
         assert_eq!(first, second);
         assert_eq!(
             first.get(&("0xstrict".to_owned(), 0)).unwrap().receipt,
@@ -464,8 +511,9 @@ mod tests {
         let now = datetime!(2026-09-05 12:00 UTC);
         assert_eq!(
             cache
-                .fetch_mids_strict_at(&[outcome("missing", 0)], now)
-                .await,
+                .fetch_mids_strict_with_clock(&[outcome("missing", 0)], || now)
+                .await
+                .result,
             Err(RiskInputsUnavailable::PriceMissing)
         );
         insert_strict_entry(
@@ -479,15 +527,17 @@ mod tests {
         .await;
         assert_eq!(
             cache
-                .fetch_mids_strict_at(&[outcome("incomplete", 1)], now)
-                .await,
+                .fetch_mids_strict_with_clock(&[outcome("incomplete", 1)], || now)
+                .await
+                .result,
             Err(RiskInputsUnavailable::PriceMissing)
         );
         insert_strict_entry(&cache, "malformed", None, now, Some(receipt(2)), false).await;
         assert_eq!(
             cache
-                .fetch_mids_strict_at(&[outcome("malformed", 0)], now)
-                .await,
+                .fetch_mids_strict_with_clock(&[outcome("malformed", 0)], || now)
+                .await
+                .result,
             Err(RiskInputsUnavailable::PriceMissing)
         );
         insert_strict_entry(
@@ -501,8 +551,9 @@ mod tests {
         .await;
         assert_eq!(
             cache
-                .fetch_mids_strict_at(&[outcome("unrecorded", 0)], now)
-                .await,
+                .fetch_mids_strict_with_clock(&[outcome("unrecorded", 0)], || now)
+                .await
+                .result,
             Err(RiskInputsUnavailable::PriceMissing)
         );
     }
@@ -525,8 +576,9 @@ mod tests {
         .await;
         assert_eq!(
             cache
-                .fetch_mids_strict_at(&[outcome("stale", 0)], now)
-                .await,
+                .fetch_mids_strict_with_clock(&[outcome("stale", 0)], || now)
+                .await
+                .result,
             Err(RiskInputsUnavailable::PriceStale)
         );
         insert_strict_entry(
@@ -538,12 +590,14 @@ mod tests {
             false,
         )
         .await;
+        let future_attempt = cache
+            .fetch_mids_strict_with_clock(&[outcome("future", 0)], || now)
+            .await;
         assert_eq!(
-            cache
-                .fetch_mids_strict_at(&[outcome("future", 0)], now)
-                .await,
+            future_attempt.result,
             Err(RiskInputsUnavailable::PriceFuture)
         );
+        assert_eq!(future_attempt.price_receipts, vec![receipt(2)]);
         insert_strict_entry(
             &cache,
             "conflict",
@@ -555,10 +609,48 @@ mod tests {
         .await;
         assert_eq!(
             cache
-                .fetch_mids_strict_at(&[outcome("conflict", 0)], now)
-                .await,
+                .fetch_mids_strict_with_clock(&[outcome("conflict", 0)], || now)
+                .await
+                .result,
             Err(RiskInputsUnavailable::PriceConflict)
         );
+    }
+
+    /// PASS: a cold-cache Gamma response is recorded before the strict freshness clock is taken,
+    /// and a later strict failure retains the response receipt it consumed.
+    #[tokio::test]
+    async fn strict_cold_fetch_uses_post_response_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let mut fx = HashMap::new();
+        fx.insert(
+            url(BASE, "0xcold"),
+            br#"[{"conditionId":"0xcold","outcomePrices":"[\"0.62\",\"0.38\"]"}]"#.to_vec(),
+        );
+        let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_owned())
+            .with_source_log(source_log);
+
+        let result = cache.fetch_mids_strict(&[outcome("0xcold", 0)]).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let failed = cache
+            .fetch_mids_strict_attempt(&[outcome("0xcold", 2)])
+            .await;
+        assert_eq!(failed.result, Err(RiskInputsUnavailable::PriceMissing));
+        assert_eq!(failed.price_receipts.len(), 1);
+        ingest.abort();
+        let _ = ingest.await;
     }
 
     #[tokio::test]

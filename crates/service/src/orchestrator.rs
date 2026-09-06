@@ -852,35 +852,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         signal: &LeaderSignal,
         proposed_debit: CollateralAmount,
         per_trade_cap_bps: i32,
-        evaluated_at: OffsetDateTime,
     ) -> Result<(pe_execution_core::RiskAudit, pe_event_log::AppendReceipt), ActivePaperRiskFailure>
     {
-        let evaluated_at_unix_ms = evaluated_at
-            .unix_timestamp_nanos()
-            .checked_div(1_000_000)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or_else(|| ActivePaperRiskFailure {
-                cause: RiskInputsUnavailable::Overflow,
-                evidence: WinnerFollowRiskInputEvidence {
-                    financial_prefix: None,
-                    price_receipts: Vec::new(),
-                    evaluated_at_unix_ms: i64::MAX,
-                    proposed_debit,
-                    per_trade_cap_bps,
-                },
-            })?;
         let mut attempt = WinnerFollowRiskInputEvidence {
             financial_prefix: None,
             price_receipts: Vec::new(),
-            evaluated_at_unix_ms,
+            source_tail: None,
+            evaluated_at_unix_ms: i64::MAX,
             proposed_debit,
             per_trade_cap_bps,
         };
-        let paper_log_path = self
-            .financial_log_paths
-            .as_ref()
-            .map(|(path, _)| path.clone())
-            .ok_or_else(|| {
+        let (paper_log_path, source_log_path) =
+            self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
                 ActivePaperRiskFailure::new(
                     RiskInputsUnavailable::SnapshotSequenceMismatch,
                     &attempt,
@@ -908,27 +891,48 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 )
             })?;
         attempt.financial_prefix = Some(financial_prefix);
-        let now = evaluated_at.unix_timestamp();
-        let snapshot = self.paper_state.financial_snapshot(now).map_err(|_| {
-            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
-        })?;
-        let ids = snapshot
-            .positions
+        let ids = self
+            .paper_state
+            .paper_positions()
+            .map_err(|_| {
+                ActivePaperRiskFailure::new(
+                    RiskInputsUnavailable::SnapshotSequenceMismatch,
+                    &attempt,
+                )
+            })?
             .iter()
             .map(|position| MarketOutcomeId::new(position.market_id.clone(), position.outcome_id))
             .collect::<Vec<_>>();
-        let observed = self
-            .mid_price_cache
-            .fetch_mids_strict(&ids)
-            .await
+        let mid_price_cache = self.mid_price_cache.clone();
+        let price_attempt = mid_price_cache
+            .fetch_mids_strict_with_clock(&ids, || self.financial_now())
+            .await;
+        attempt
+            .price_receipts
+            .clone_from(&price_attempt.price_receipts);
+        let evaluated_at = price_attempt.evaluated_at;
+        let evaluated_at_unix_ms = evaluated_at
+            .unix_timestamp_nanos()
+            .checked_div(1_000_000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| {
+                ActivePaperRiskFailure::new(RiskInputsUnavailable::Overflow, &attempt)
+            })?;
+        attempt.evaluated_at_unix_ms = evaluated_at_unix_ms;
+        let source_tail = Scanner::verify(&source_log_path).map_err(|_| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
+        let source_tail_sequence = source_tail.last_sequence.ok_or_else(|| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
+        attempt.source_tail = Some(pe_event_log::AppendReceipt {
+            sequence: source_tail_sequence,
+            this_hash: source_tail.last_hash,
+        });
+        let observed = price_attempt
+            .result
             .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?;
-        let mut price_receipts = observed
-            .values()
-            .map(|value| value.receipt)
-            .collect::<Vec<_>>();
-        price_receipts.sort_by_key(|receipt| receipt.sequence);
-        price_receipts.dedup();
-        attempt.price_receipts.clone_from(&price_receipts);
+        let price_receipts = attempt.price_receipts.clone();
         let prices = observed
             .into_iter()
             .map(|((market, outcome), value)| {
@@ -941,6 +945,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 )
             })
             .collect::<HashMap<_, _>>();
+        let now = evaluated_at.unix_timestamp();
+        let snapshot = self.paper_state.financial_snapshot(now).map_err(|_| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
 
         let base = crate::risk_inputs::build_paper_risk_base(
             &era,
@@ -2989,14 +2997,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .config()
             .per_trade_cap
             .resolve_bps(TradingMode::LiveTiny);
-        let risk_evaluated_at = self.financial_now();
         let (risk, risk_financial_prefix) = match self
-            .active_paper_risk_snapshot(
-                &signal,
-                planned_worst_case_all_in_debit,
-                per_trade_cap_bps,
-                risk_evaluated_at,
-            )
+            .active_paper_risk_snapshot(&signal, planned_worst_case_all_in_debit, per_trade_cap_bps)
             .await
         {
             Ok(risk) => risk,
