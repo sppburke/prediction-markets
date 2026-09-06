@@ -229,11 +229,18 @@ pub struct OrchestratorConfig {
 #[derive(Debug, Default)]
 pub struct ScenarioHooks {
     pub age_clock: std::sync::Mutex<std::collections::VecDeque<OffsetDateTime>>,
+    pub admission_artifacts:
+        std::sync::Mutex<std::collections::VecDeque<pe_execution_core::LiveAdmissionArtifact>>,
+    pub financial_clock_unix: std::sync::atomic::AtomicI64,
     pub fail_next_stage_seed: std::sync::atomic::AtomicBool,
     pub fail_next_no_copy_commit: std::sync::atomic::AtomicBool,
 }
 
-pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
+pub struct Orchestrator<
+    F: PageFetcher + Send + Sync,
+    B: ClobBookFetcher,
+    S: SupabaseStateTrait + Clone = SupabaseStateClient,
+> {
     /// Deterministic bucket state shared by acknowledged production commits and scenario checks.
     bucket_engine: BucketCommitEngine,
     live_watchlist: LiveWatchlist,
@@ -271,7 +278,7 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // Authoritative Supabase paper-state client (issue #397). In the financial era, `Some` owns
     // the Prepared-sequenced authority mutation before the local projection and Final append.
     // `None` is the legacy SQLite-authoritative path.
-    supabase_state: Option<SupabaseStateClient>,
+    supabase_state: Option<S>,
     // Supabase-authoritative runtime config (#398 WS1). `Some` in production; the per-event
     // rebuild at the top of `handle_trade` reads one snapshot. `None` in tests (boot config).
     runtime_config: Option<LiveRuntimeConfig>,
@@ -343,13 +350,33 @@ pub enum OrchestratorRunError {
     PaperDurabilityUncertain,
 }
 
-impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
+impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + Clone>
+    Orchestrator<F, B, S>
+{
+    fn financial_now(&self) -> OffsetDateTime {
+        #[cfg(feature = "scenario")]
+        if let Some(unix) = self
+            .scenario_hooks
+            .as_ref()
+            .map(|hooks| {
+                hooks
+                    .financial_clock_unix
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .filter(|unix| *unix != 0)
+            && let Ok(now) = OffsetDateTime::from_unix_timestamp(unix)
+        {
+            return now;
+        }
+        OffsetDateTime::now_utc()
+    }
+
     fn append_paper_record(
         &mut self,
         record: &PaperLogRecord,
     ) -> Result<pe_event_log::AppendReceipt, String> {
         let payload = serde_json::to_vec(record).map_err(|error| error.to_string())?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.financial_now();
         self.paper_writer
             .append_synced(EnvelopeIn {
                 source_id: SourceId("pe-service.paper".to_owned()),
@@ -661,6 +688,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .apply_prepared_resolution(&request)
             .await
             .map_err(|error| error.to_string())?;
+        self.bankroll = canonical.bankroll;
         let result = crate::paper_recovery::FinancialResult::Resolution { canonical };
         let PaperLogRecord::FinancialPrepared { payload, .. } = &prepared_record else {
             return Err("internal financial Prepared kind mismatch".to_owned());
@@ -811,7 +839,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             crate::paper_recovery::scan_paper_log(paper_log_path)
                 .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?,
         );
-        let evaluated_at = OffsetDateTime::now_utc();
+        let evaluated_at = self.financial_now();
         let now = evaluated_at.unix_timestamp();
         let evaluated_at_unix_ms = evaluated_at
             .unix_timestamp_nanos()
@@ -929,7 +957,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         .map_err(|error| error.to_string())?;
         let cash_before = CollateralAmount::from_decimal_exact(
             self.paper_state
-                .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
+                .financial_snapshot(self.financial_now().unix_timestamp())
                 .map_err(|error| error.to_string())?
                 .cash,
         )
@@ -1325,6 +1353,44 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             book_fetcher,
         )
     }
+}
+
+impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + Clone>
+    Orchestrator<F, B, S>
+{
+    /// Scenario constructor for the same orchestrator with an in-memory financial authority.
+    #[cfg(feature = "scenario")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_authority(
+        live_watchlist: LiveWatchlist,
+        config: OrchestratorConfig,
+        strategy: WinnerFollowStrategy,
+        paper_writer: Writer,
+        paper_state: Arc<PaperStateDb>,
+        leader_ledger: PositionLedger,
+        health: SharedHealth,
+        mid_price_cache: MidPriceCache<F>,
+        control_rx: mpsc::Receiver<OrchestratorControl>,
+        snapshot_sink: Option<SnapshotHandle>,
+        supabase_state: S,
+        book_fetcher: Arc<B>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::new_inner(
+            live_watchlist,
+            config,
+            strategy,
+            paper_writer,
+            paper_state,
+            leader_ledger,
+            health,
+            mid_price_cache,
+            control_rx,
+            None,
+            snapshot_sink,
+            Some(supabase_state),
+            book_fetcher,
+        )
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
@@ -1339,7 +1405,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         control_rx: mpsc::Receiver<OrchestratorControl>,
         _sink: Option<SinkHandle>,
         snapshot_sink: Option<SnapshotHandle>,
-        supabase_state: Option<SupabaseStateClient>,
+        supabase_state: Option<S>,
         book_fetcher: Arc<B>,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
@@ -2404,31 +2470,42 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // One admission read owns market mapping, venue rules, fees, and scheduled end for both
         // paper and live. Its three raw responses are already synchronized in the source log.
         let condition_id = pe_core_types::PolymarketConditionId(signal.market_id.to_string());
-        let admission = match &self.admission_builder {
-            Some(builder) => match builder
-                .build(&condition_id, OffsetDateTime::now_utc())
-                .await
-            {
-                Ok(admission) => admission,
-                Err(error) => {
-                    info!(%error, market = %signal.market_id, "market admission failed closed");
-                    self.no_fill_or_rollback(
-                        &trade,
-                        &leader_row,
-                        None,
-                        "market_admission_unavailable",
-                        &rb,
-                        Some(&signal.market_id),
-                        decision_evidence.as_ref(),
-                    )
-                    .await;
+        #[cfg(feature = "scenario")]
+        let scenario_admission = self
+            .scenario_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.admission_artifacts.lock().ok()?.pop_front());
+        #[cfg(not(feature = "scenario"))]
+        let scenario_admission = None;
+        let admission = if let Some(admission) = scenario_admission {
+            admission
+        } else {
+            match &self.admission_builder {
+                Some(builder) => match builder
+                    .build(&condition_id, OffsetDateTime::now_utc())
+                    .await
+                {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        info!(%error, market = %signal.market_id, "market admission failed closed");
+                        self.no_fill_or_rollback(
+                            &trade,
+                            &leader_row,
+                            None,
+                            "market_admission_unavailable",
+                            &rb,
+                            Some(&signal.market_id),
+                            decision_evidence.as_ref(),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+                None => {
+                    error!(market = %signal.market_id, "active financial era has no admission builder");
+                    self.intake_stopped = true;
                     return;
                 }
-            },
-            None => {
-                error!(market = %signal.market_id, "active financial era has no admission builder");
-                self.intake_stopped = true;
-                return;
             }
         };
 
