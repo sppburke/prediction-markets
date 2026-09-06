@@ -2966,7 +2966,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .config()
             .per_trade_cap
             .resolve_bps(TradingMode::LiveTiny);
-        let (risk, risk_financial_prefix) = match self
+        let (risk, _) = match self
             .active_paper_risk_snapshot(&signal, planned_worst_case_all_in_debit, per_trade_cap_bps)
             .await
         {
@@ -3036,7 +3036,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     &e,
                     WinnerFollowDecisionInputs::Evaluated {
                         economic: Box::new(economic),
-                        financial_prefix: risk_financial_prefix,
                     },
                     &rb,
                     Some(&signal.market_id),

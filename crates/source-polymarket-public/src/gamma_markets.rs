@@ -470,6 +470,49 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
     }
 }
 
+/// Parsed identity of the canonical open-only condition request emitted by the Gamma client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GammaOpenConditionRequest {
+    /// Gamma API base URL before the canonical `/markets` path.
+    pub base_url: String,
+    /// Requested `condition_ids` in canonical repeat-key order.
+    pub condition_ids: Vec<String>,
+}
+
+impl GammaOpenConditionRequest {
+    /// Parse an exact canonical open-only condition request.
+    pub fn parse(request_url: &str) -> Option<Self> {
+        let (base_url, query) = request_url.split_once("/markets?")?;
+        if base_url.is_empty() {
+            return None;
+        }
+        let parts = query.split('&').collect::<Vec<_>>();
+        let (limit, conditions) = parts.split_last()?;
+        if *limit != format!("limit={GAMMA_BATCH_LIMIT_PARAM}") || conditions.is_empty() {
+            return None;
+        }
+        let condition_ids = conditions
+            .iter()
+            .map(|part| part.strip_prefix("condition_ids=").map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        if condition_ids.iter().any(String::is_empty) {
+            return None;
+        }
+        let request = Self {
+            base_url: base_url.to_owned(),
+            condition_ids,
+        };
+        (request_url
+            == build_batch_url(
+                &request.base_url,
+                &request.condition_ids,
+                "",
+                GAMMA_BATCH_LIMIT_PARAM,
+            ))
+        .then_some(request)
+    }
+}
+
 /// Build the repeat-key batch URL: `{base}/markets?condition_ids=A&condition_ids=B[&closed=true]&limit=N`.
 ///
 /// Query-param order is `condition_ids…` → `&closed=true` → `&limit=` (matches the proven
@@ -857,10 +900,47 @@ mod tests {
 
     #[test]
     fn build_batch_url_repeat_key_open() {
-        let url = build_batch_url("https://g", &ids(&["0xA", "0xB"]), "", 500);
+        let url = build_batch_url(
+            "https://g",
+            &ids(&["0xA", "0xB"]),
+            "",
+            GAMMA_BATCH_LIMIT_PARAM,
+        );
         assert_eq!(
             url,
-            "https://g/markets?condition_ids=0xA&condition_ids=0xB&limit=500"
+            format!(
+                "https://g/markets?condition_ids=0xA&condition_ids=0xB&limit={GAMMA_BATCH_LIMIT_PARAM}"
+            )
+        );
+        assert_eq!(
+            GammaOpenConditionRequest::parse(&url),
+            Some(GammaOpenConditionRequest {
+                base_url: "https://g".to_owned(),
+                condition_ids: ids(&["0xA", "0xB"]),
+            })
+        );
+    }
+
+    #[test]
+    fn open_condition_request_rejects_noncanonical_grammar() {
+        let alternate_limit = GAMMA_BATCH_LIMIT_PARAM.checked_add(1).unwrap();
+        assert!(
+            GammaOpenConditionRequest::parse(&format!(
+                "https://g/markets?condition_ids=0xA&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+            ))
+            .is_none()
+        );
+        assert!(
+            GammaOpenConditionRequest::parse(&format!(
+                "https://g/markets?condition_ids=0xA&limit={GAMMA_BATCH_LIMIT_PARAM}&condition_ids=0xB"
+            ))
+            .is_none()
+        );
+        assert!(
+            GammaOpenConditionRequest::parse(&format!(
+                "https://g/markets?condition_ids=0xA&limit={alternate_limit}"
+            ))
+            .is_none()
         );
     }
 
