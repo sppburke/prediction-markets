@@ -67,12 +67,17 @@ sha256_file() {
 # either a database name or a PostgreSQL connection URI, so the existing SUPABASE_DB_URL contract
 # remains unchanged while every caller supplies only non-secret psql options on the command line.
 # libpq does not expand a connection URL placed in PGDATABASE (verified against PostgreSQL 16:
-# it dials the local socket instead). Split the URL into the libpq environment variables so
-# the credentials never appear in a process argument list and the connection still works.
+# it dials the local socket instead). `pg_url_env VARIABLE_NAME` reads the URL from the named
+# environment variable inside the parser itself and prints shell-quoted `export` assignments for
+# the libpq variables; `psql_url VARIABLE_NAME [psql args...]` evaluates them inside a child shell
+# that then replaces itself with psql. Neither the URL nor `PGPASSWORD=...` appears in any process
+# argument list, function argument, or shell trace.
 pg_url_env() {
+  local url_variable=$1
+  export "$url_variable"
   python3 -c '
-import sys, urllib.parse as u
-p = u.urlsplit(sys.argv[1])
+import os, shlex, sys, urllib.parse as u
+p = u.urlsplit(os.environ[sys.argv[1]].strip())
 if p.scheme not in ("postgres", "postgresql"):
     raise SystemExit("database URL must use the postgres scheme")
 q = dict(u.parse_qsl(p.query))
@@ -81,21 +86,18 @@ pairs = [("PGHOST", p.hostname or ""), ("PGPORT", str(p.port) if p.port else "")
          ("PGDATABASE", u.unquote(p.path.lstrip("/")) or "postgres"), ("PGSSLMODE", q.get("sslmode", ""))]
 for key, value in pairs:
     if value:
-        print(f"{key}={value}")
-' "$1"
+        print(f"export {key}={shlex.quote(value)}")
+' "$url_variable"
 }
 
 psql_url() {
-  local url=$1; shift
-  local -a pgenv=()
-  mapfile -t pgenv < <(pg_url_env "$url")
-  (( ${#pgenv[@]} > 0 )) || die "database URL yielded no connection parameters"
-  env "${pgenv[@]}" psql "$@"
+  local url_variable=$1; shift
+  bash -c 'eval "$(cat <&3)"; exec 3<&-; exec psql "$@"' psql "$@" 3< <(pg_url_env "$url_variable")
 }
 
 psql_service_db() {
   : "${SUPABASE_DB_URL:?SUPABASE_DB_URL is required}"
-  psql_url "$SUPABASE_DB_URL" "$@"
+  psql_url SUPABASE_DB_URL "$@"
 }
 
 manifest_get() {

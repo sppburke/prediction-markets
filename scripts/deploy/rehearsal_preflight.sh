@@ -43,9 +43,9 @@ PY
 source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
 
 rehearsal_psql() {
-  local -a pgenv=()
-  mapfile -t pgenv < <(pg_url_env "$SUPABASE_DB_URL")
-  env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" "${pgenv[@]}" psql -X "$@"
+  env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
+    bash -c 'eval "$(cat <&3)"; exec 3<&-; exec psql -X "$@"' psql "$@" \
+    3< <(pg_url_env SUPABASE_DB_URL)
 }
 psql_service_db() {
   rehearsal_psql "$@"

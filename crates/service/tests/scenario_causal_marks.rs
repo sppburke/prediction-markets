@@ -363,6 +363,8 @@ fn emitted_marks(paper_path: &std::path::Path) -> Vec<pe_service::paper_recovery
         .collect()
 }
 
+/// FAIL: the quiet-day mark records the paper-log tail (or any Prepared sequence) instead of `None`,
+/// or its equity drifts from the prior mark with no financial fact in between.
 /// PASS: a real orchestrator `DailyBoundary` on a quiet day emits a mark whose financial prefix
 /// is `None`, even though `QualificationStarted` is the current physical paper-log tail.
 #[tokio::test]
@@ -426,6 +428,8 @@ async fn quiet_boundary_records_no_causal_prepared_prefix() {
     assert_eq!(marks[0].financial_prefix_seq, offline.last_prepared_seq);
 }
 
+/// FAIL: the pre-cutoff observation's fill is missing from the mark's debit or positions, or the
+/// mark's `financial_prefix_seq` is the Final/tail sequence rather than the causal Prepared sequence.
 /// PASS: W at C-2 blocks boundary B until its durable bucket acknowledgement; after a complete
 /// page P>B, a causal resolution observation, and late Fill/Resolution Finals, the real boundary
 /// handler and a fresh offline reconstruction both select the last causal Prepared sequence.

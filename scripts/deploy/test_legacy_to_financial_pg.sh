@@ -33,7 +33,7 @@ pass_step() {
 }
 
 psql_admin() {
-  psql_url "$PG_ADMIN_URL" "$@"
+  psql_url PG_ADMIN_URL "$@"
 }
 
 start_step "create isolated roles and legacy database"
