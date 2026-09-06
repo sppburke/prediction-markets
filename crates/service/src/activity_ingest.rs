@@ -742,8 +742,14 @@ impl Coordinator {
             if !self.sink.try_reopen() {
                 continue;
             }
+            if let Err(error) = self.source_receipts.catch_up_verified_tail() {
+                warn!(%error,
+                    "reopened source log could not catch the source receipt index up to its verified tail");
+                return Err(Shutdown);
+            }
             match self.sink.append_durable(duplicate_envelope(&envelope)) {
                 Ok(receipt) => {
+                    let receipt = self.index_synced_append(receipt, &envelope)?;
                     self.set_health(|h| {
                         h.ws_sink_poisoned = false;
                         h.source_durability_uncertain = false;
@@ -751,7 +757,7 @@ impl Coordinator {
                     });
                     info!(trade = %label,
                         "source log recovered; held payload appended durably");
-                    return self.index_synced_append(receipt, &envelope);
+                    return Ok(receipt);
                 }
                 Err(error) => {
                     warn!(error = %error, "source log re-poisoned immediately after reopen");
@@ -993,6 +999,80 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["0xa".to_string(), "0xb".to_string()]);
+    }
+
+    /// PASS: synchronization uncertainty leaves a complete frame N for reopen, the receipt index
+    /// catches N up before the held payload retries as N+1, and later appends remain acknowledged
+    /// and addressable without an index gap.
+    #[tokio::test(start_paused = true)]
+    async fn coordinator_catches_index_up_after_complete_sync_fault_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        drop(SourceEventSink::open(&path).unwrap());
+        let source_receipts = SourceReceiptIndex::replay(&path).unwrap();
+        let mut sink = SourceEventSink::open(&path).unwrap();
+        sink.fail_next_sync();
+        let (fan_in_tx, fan_in_rx) = mpsc::channel(8);
+        let (trigger_tx, mut trigger_rx) = mpsc::channel(8);
+        let (_source_log, source_rx) = SourceLogHandle::channel(8);
+        let health = new_shared_health_with_ws(false, true, 90);
+        let task = tokio::spawn(
+            Coordinator {
+                sink,
+                trigger_tx,
+                health: health.clone(),
+                fan_in: fan_in_rx,
+                source_rx: source_rx.rx,
+                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipts: source_receipts.clone(),
+                #[cfg(feature = "scenario")]
+                reader_append_gate: None,
+            }
+            .run(),
+        );
+
+        fan_in_tx.send(observation("0xa")).await.unwrap();
+        settle().await;
+        assert!(health.lock().unwrap().ws_sink_poisoned);
+        assert!(trigger_rx.try_recv().is_err());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        let retried = trigger_rx.recv().await.unwrap();
+        assert_eq!(retried.receipt.sequence, pe_core_types::EventSeq(1));
+        assert!(!health.lock().unwrap().ws_sink_poisoned);
+
+        let replayed_after_recovery = LogReader::replay(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(replayed_after_recovery.len(), 2);
+        for (sequence, envelope) in &replayed_after_recovery {
+            let receipt = AppendReceipt {
+                sequence: *sequence,
+                this_hash: envelope.this_hash,
+            };
+            let indexed = source_receipts.source_envelope(receipt).unwrap();
+            assert_eq!(indexed.payload, observation("0xa").payload);
+        }
+
+        fan_in_tx.send(observation("0xb")).await.unwrap();
+        let continued = trigger_rx.recv().await.unwrap();
+        assert_eq!(continued.receipt.sequence, pe_core_types::EventSeq(2));
+        assert_eq!(
+            source_receipts
+                .source_envelope(continued.receipt)
+                .unwrap()
+                .payload,
+            observation("0xb").payload
+        );
+
+        drop(fan_in_tx);
+        task.await.unwrap();
+        assert_eq!(
+            source_receipts.snapshot(),
+            SourceReceiptIndex::replay(&path).unwrap().snapshot()
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -22,10 +22,8 @@ use pe_execution_core::live_executor::{
     classify_live_admission,
 };
 use pe_execution_core::{
-    AdmissionReceipts, EconomicInputs, EconomicPrepared, LiveAdmissionArtifact,
-    LiveAdmissionVerdict, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingModeAudit,
+    EconomicPrepared, LiveAdmissionVerdict, ObservationEvidence, RiskAudit, RiskDecisionAudit,
 };
-use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{
     DecisionPendingRow, DecisionPendingState, FillRow, FinancialSnapshot, PaperPositionRow,
@@ -34,9 +32,6 @@ use pe_paper_state::{
 use pe_position_ledger::{
     AppliedEffect, LedgerMutation, PositionLedger, SecondVerdict, classify_complete_second,
 };
-use pe_resolver_card::{
-    VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
-};
 #[cfg(test)]
 use pe_risk_engine::RiskSnapshot;
 use pe_risk_engine::{
@@ -44,19 +39,20 @@ use pe_risk_engine::{
     aggregate_resolution_credit, evaluate_risk, nearest_rank_p95,
 };
 use pe_source_polymarket_public::ClassifiedPricesHistory;
-#[cfg(test)]
-use pe_source_polymarket_public::GAMMA_BATCH_LIMIT_PARAM;
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
-    ClobPricesHistoryClient, FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION,
-    GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION,
-    LIVE_MARKET_SCHEMA_VERSION, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
+    ClobPricesHistoryClient, FixtureFetcher, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
     aggregate_activity_rows, parse_activity_response, parse_activity_row,
-    parse_activity_trade_observation, parse_clob_market, validate_live_market,
+    parse_activity_trade_observation, parse_clob_market,
+};
+#[cfg(test)]
+use pe_source_polymarket_public::{
+    GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
+    validate_live_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
-use pe_venue_polymarket::{BuySizing, LadderError, parse_compact_market, plan_sized_buy};
 use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -65,6 +61,9 @@ use crate::bucket_commit::{DecisionContinuationV3, PageOccurrence};
 use crate::config::ServiceConfig;
 use crate::decision_replay::{
     WinnerFollowDecisionInputs, WinnerFollowRiskInputEvidence, replay_decision_pending,
+};
+use crate::live_fanout::{
+    EconomicReplayError, RecordedEconomicSource, replay_source_backed_economic,
 };
 #[cfg(test)]
 use crate::mid_price_cache::{
@@ -3409,255 +3408,6 @@ async fn replayed_risk_prices(
     })
 }
 
-fn source_receipt<'a>(
-    source: &'a BTreeMap<u64, SourceObservation>,
-    receipt: AppendReceipt,
-    source_id: &str,
-    schema_version: u32,
-    parser_version: u32,
-    prepared_received_unix_ms: i64,
-) -> Result<&'a SourceObservation, QualificationError> {
-    let observation = source
-        .get(&receipt.sequence.0)
-        .filter(|observation| observation.receipt == receipt)
-        .ok_or_else(|| {
-            QualificationError::InsufficientEvidence(format!(
-                "{source_id} receipt is absent from the sealed source prefix"
-            ))
-        })?;
-    if observation.source_id != source_id
-        || observation.schema_version != schema_version
-        || observation.parser_version != parser_version
-        || observation.content_type != ContentType::Json
-        || observation.received_unix_ms > prepared_received_unix_ms
-    {
-        return insufficient(format!(
-            "{source_id} receipt has the wrong source contract or is noncausal"
-        ));
-    }
-    Ok(observation)
-}
-
-fn replayed_admission(
-    economic: &EconomicPrepared,
-    context: &RiskReplayContext<'_>,
-) -> Result<LiveAdmissionArtifact, QualificationError> {
-    const CLOB_LONG_SOURCE_ID: &str = "polymarket.clob.markets";
-    const CLOB_COMPACT_SOURCE_ID: &str = "polymarket.clob.compact-market";
-    const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
-
-    let receipts = economic.admission.receipts;
-    if [
-        receipts.gamma.sequence,
-        receipts.clob_long.sequence,
-        receipts.clob_compact.sequence,
-        economic.book_receipt.sequence,
-    ]
-    .into_iter()
-    .collect::<HashSet<_>>()
-    .len()
-        != 4
-    {
-        return insufficient("economic admission and book receipts are not unique");
-    }
-    let gamma = source_receipt(
-        context.source,
-        receipts.gamma,
-        GAMMA_MARKETS_SOURCE_ID,
-        GAMMA_MARKETS_SCHEMA_VERSION,
-        GAMMA_MARKETS_PARSER_VERSION,
-        context.prepared_received_unix_ms,
-    )?;
-    let clob_long = source_receipt(
-        context.source,
-        receipts.clob_long,
-        CLOB_LONG_SOURCE_ID,
-        LIVE_MARKET_SCHEMA_VERSION,
-        LIVE_MARKET_PARSER_VERSION,
-        context.prepared_received_unix_ms,
-    )?;
-    let clob_compact = source_receipt(
-        context.source,
-        receipts.clob_compact,
-        CLOB_COMPACT_SOURCE_ID,
-        LIVE_MARKET_SCHEMA_VERSION,
-        LIVE_MARKET_PARSER_VERSION,
-        context.prepared_received_unix_ms,
-    )?;
-    if economic.admission.market.freshness_window_secs != LIVE_MARKET_FRESHNESS_SECS
-        || economic.admission.market.observed_at_unix < 0
-        || economic
-            .admission
-            .market
-            .observed_at_unix
-            .checked_mul(1_000)
-            .is_none_or(|observed| observed > gamma.received_unix_ms)
-    {
-        return insufficient("economic admission clock or freshness contract is invalid");
-    }
-    let market = validate_live_market(
-        &gamma.payload,
-        &clob_long.payload,
-        &economic.market.condition_id,
-        economic.admission.market.observed_at_unix,
-        LIVE_MARKET_FRESHNESS_SECS,
-    )
-    .map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "economic long-market replay failed: {error}"
-        ))
-    })?;
-    let compact = parse_compact_market(
-        &clob_compact.payload,
-        &economic.market.condition_id,
-        &market.ordered_outcome_token_ids,
-    )
-    .map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "economic compact-market replay failed: {error}"
-        ))
-    })?;
-    if compact.minimum_order_size != market.minimum_order_size
-        || compact.minimum_tick_size != market.minimum_tick_size
-        || compact.neg_risk != market.neg_risk
-    {
-        return insufficient("economic compact and long market rules disagree");
-    }
-    let settlement = VenueSettlementRecord {
-        schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
-        condition_id: economic.market.condition_id.clone(),
-        status: VenueResolutionStatus::Unresolved,
-        raw_evidence_hash: blake3::hash(&clob_long.payload).to_hex().to_string(),
-        source_timestamp_unix: None,
-        observed_at_unix: market.observed_at_unix,
-        parser_version: 1,
-        freshness_window_secs: LIVE_MARKET_FRESHNESS_SECS,
-    };
-    Ok(LiveAdmissionArtifact {
-        market,
-        settlement,
-        fee_schedule: compact.fee_schedule,
-        receipts: AdmissionReceipts {
-            gamma: receipts.gamma,
-            clob_long: receipts.clob_long,
-            clob_compact: receipts.clob_compact,
-        },
-    })
-}
-
-fn replayed_sized_plan(
-    economic: &EconomicPrepared,
-    admission: &LiveAdmissionArtifact,
-    cash_before: CollateralAmount,
-    context: &RiskReplayContext<'_>,
-) -> Result<pe_venue_polymarket::SizedBuyPlan, QualificationError> {
-    let book_observation = source_receipt(
-        context.source,
-        economic.book_receipt,
-        "polymarket.clob.book",
-        1,
-        1,
-        context.prepared_received_unix_ms,
-    )?;
-    let book = crate::clob_book::OrderBook::from_book_json(&book_observation.payload).map_err(
-        |error| {
-            QualificationError::InsufficientEvidence(format!(
-                "economic book replay failed: {error}"
-            ))
-        },
-    )?;
-    let asks = book.ladder().ok_or_else(|| {
-        QualificationError::InsufficientEvidence(
-            "economic book cannot form the production ladder".to_owned(),
-        )
-    })?;
-    let best_ask = asks.first().map(|ask| ask.price).ok_or_else(|| {
-        QualificationError::InsufficientEvidence("economic book has no eligible asks".to_owned())
-    })?;
-    let impact_ceiling = recorded_impact_ceiling(best_ask, economic.balance.price_impact_cap_bps)?;
-    let allocate = |price: Price| {
-        let SizingModeAudit::Kelly {
-            fraction,
-            probability,
-        } = economic.sizing.mode
-        else {
-            return Err(LadderError::KellySizing);
-        };
-        let quantity = size_contracts(&KellyInput {
-            p: probability,
-            c: price,
-            kelly_fraction: fraction,
-            bankroll: cash_before.to_decimal(),
-        })
-        .map_err(|_| LadderError::KellySizing)?;
-        ShareAmount::from_whole(quantity.0).map_err(|_| LadderError::Amount)
-    };
-    let sizing = match economic.sizing.mode {
-        SizingModeAudit::Dollar { usd } => {
-            let budget = CollateralAmount::from_decimal_exact(
-                usd.max(Decimal::ZERO)
-                    .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
-            )
-            .map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "economic Dollar budget is invalid: {error}"
-                ))
-            })?;
-            if budget != economic.sizing.budget {
-                return insufficient("economic Dollar budget differs from its sizing mode");
-            }
-            BuySizing::Dollar { budget }
-        }
-        SizingModeAudit::Contract { contracts } => BuySizing::Contract { contracts },
-        SizingModeAudit::Kelly { .. } => BuySizing::Kelly {
-            allocate: &allocate,
-            slippage_rate: economic.sizing.slippage_rate,
-        },
-    };
-    let proportional_cap = CollateralAmount::from_decimal_exact(
-        cash_before
-            .to_decimal()
-            .checked_mul(Decimal::from(economic.risk.snapshot.per_trade_cap_bps))
-            .and_then(|value| value.checked_div(Decimal::from(10_000u32)))
-            .ok_or_else(|| {
-                QualificationError::InsufficientEvidence(
-                    "economic per-trade cap arithmetic overflow".to_owned(),
-                )
-            })?
-            .max(Decimal::ZERO)
-            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
-    )
-    .map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "economic per-trade cap is invalid: {error}"
-        ))
-    })?;
-    let sized = plan_sized_buy(
-        &asks,
-        admission.fee_schedule,
-        sizing,
-        &[cash_before, proportional_cap],
-        admission.market.minimum_order_size,
-        admission.market.minimum_tick_size,
-        economic.balance.band_floor,
-        economic.balance.band_ceiling_exclusive,
-        economic.balance.chase_ceiling,
-        impact_ceiling,
-    )
-    .map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "economic sized-plan replay failed: {error}"
-        ))
-    })?;
-    if sized.budget != economic.sizing.budget
-        || sized.reserve != economic.fee.reserve
-        || pe_execution_core::LadderPlanAudit::new(&sized.ladder) != economic.ladder
-    {
-        return insufficient("economic ladder, sizing, or cap decision differs from replay");
-    }
-    Ok(sized)
-}
-
 fn replayed_risk_base(
     leader_wallet: pe_core_types::WalletAddress,
     market_id: &str,
@@ -3763,8 +3513,31 @@ async fn verify_economic(
     {
         return insufficient("risk evaluation clock is outside its causal paper interval");
     }
-    let admission = replayed_admission(economic, context)?;
-    let sized = replayed_sized_plan(economic, &admission, cash_before, context)?;
+    let source_backed_economic = replay_source_backed_economic(
+        economic,
+        context.prepared_received_unix_ms,
+        cash_before,
+        |receipt| {
+            let observation = context
+                .source
+                .get(&receipt.sequence.0)
+                .filter(|observation| observation.receipt == receipt)
+                .ok_or_else(|| {
+                    EconomicReplayError(
+                        "economic receipt is absent from the sealed source prefix".to_owned(),
+                    )
+                })?;
+            Ok(RecordedEconomicSource {
+                payload: observation.payload.clone(),
+                received_unix_ms: observation.received_unix_ms,
+                source_id: observation.source_id.clone(),
+                schema_version: observation.schema_version,
+                parser_version: observation.parser_version,
+                content_type: observation.content_type.clone(),
+            })
+        },
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
     let evaluated_at_unix = economic.risk.evaluated_at_unix_ms.div_euclid(1_000);
     let snapshot = replayed_financial_snapshot(context, evaluated_at_unix)?;
     let current_prices = replayed_risk_prices(
@@ -3778,11 +3551,9 @@ async fn verify_economic(
     let active_halts = active_risk_halts(&era);
     let latency_was_active =
         active_halts.contains(&(RiskHaltOwner::Paper, RiskHaltCause::CopyLatency));
-    let proposed_debit = sized.worst_case_all_in_debit().map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "proposed risk debit reconstruction failed: {error}"
-        ))
-    })?;
+    let proposed_debit = source_backed_economic
+        .proposed_debit()
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
     let base = replayed_risk_base(
         operation.leader_wallet,
         &economic.market.market_id,
@@ -3835,73 +3606,9 @@ async fn verify_economic(
         price_receipts: economic.risk.price_receipts.clone(),
         evaluated_at_unix_ms: economic.risk.evaluated_at_unix_ms,
     };
-    let recomposed = EconomicPrepared::compose(EconomicInputs {
-        market: economic.market.clone(),
-        admission: &admission,
-        plan: &sized.ladder,
-        book_receipt: economic.book_receipt,
-        observation: economic.observation.clone(),
-        sizing_mode: economic.sizing.mode,
-        budget: sized.budget,
-        slippage_rate: economic.sizing.slippage_rate,
-        risk,
-        cash_before,
-        price_impact_cap_bps: economic.balance.price_impact_cap_bps,
-        chase_ceiling: economic.balance.chase_ceiling,
-        band_floor: economic.balance.band_floor,
-        band_ceiling_exclusive: economic.balance.band_ceiling_exclusive,
-        applied_configuration_hash: context.start_hot_config_hash.to_owned(),
-    })
-    .map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "EconomicPrepared canonical composition failed: {error}"
-        ))
-    })?;
-    let recomposed_hash = recomposed.core_hash().map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "recomposed economic core hash failed: {error}"
-        ))
-    })?;
-    let recorded_hash = economic.core_hash().map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "recorded economic core hash failed: {error}"
-        ))
-    })?;
-    if &recomposed != economic || recomposed_hash != recorded_hash {
-        return insufficient("EconomicPrepared differs from raw-evidence canonical replay");
-    }
-    Ok(recomposed)
-}
-
-fn recorded_impact_ceiling(best_ask: Price, cap_bps: i32) -> Result<Price, QualificationError> {
-    let cap_bps = u32::try_from(cap_bps)
-        .ok()
-        .filter(|cap| (1..=10_000).contains(cap))
-        .ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "EconomicPrepared price-impact cap is outside 1..=10000".to_owned(),
-            )
-        })?;
-    let numerator = 10_000u32.checked_add(cap_bps).ok_or_else(|| {
-        QualificationError::InsufficientEvidence(
-            "EconomicPrepared price-impact cap overflow".to_owned(),
-        )
-    })?;
-    let ceiling = best_ask
-        .0
-        .checked_mul(Decimal::from(numerator))
-        .and_then(|value| value.checked_div(Decimal::from(10_000u32)))
-        .map(|value| value.min(Decimal::ONE))
-        .ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "EconomicPrepared price-impact arithmetic overflow".to_owned(),
-            )
-        })?;
-    Price::new(ceiling).map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "EconomicPrepared price-impact ceiling is invalid: {error}"
-        ))
-    })
+    source_backed_economic
+        .recompose(economic, risk, context.start_hot_config_hash.to_owned())
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))
 }
 
 fn apply_fill_position(
@@ -5528,14 +5235,21 @@ mod tests {
     use pe_event_log::EventEnvelope;
     use pe_execution_core::live_journal::{LivePositionEvidenceAudit, LivePositionPageAudit};
     use pe_execution_core::{
+        AdmissionReceipts, EconomicInputs, LiveAdmissionArtifact, SizingModeAudit,
+    };
+    use pe_execution_core::{
         BalanceAudit, ECONOMIC_PREPARED_VERSION, FeeAudit, LadderAskAudit, LadderPlanAudit,
         LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
         LiveControlMode, LiveFillProjectionIdentity, LiveJournal, LiveJournalPayload,
         LiveMarketEvidenceAudit, LiveOrderIdentity, LiveOrderPreparedAudit, MarketSelection,
         ObservationEvidence, SizingAudit,
     };
+    use pe_resolver_card::{
+        VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+    };
     use pe_venue_polymarket::{
-        CanaryV2Client, CompactFeeSchedule, PreparedPolymarketBuy, SDK_VERSION,
+        BuySizing, CanaryV2Client, CompactFeeSchedule, PreparedPolymarketBuy, SDK_VERSION,
+        parse_compact_market, plan_sized_buy,
     };
     use rust_decimal_macros::dec;
 
