@@ -35,8 +35,9 @@ use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
 use pe_source_polymarket_public::{
-    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
-    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, validate_live_market,
+    GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
+    validate_live_market,
 };
 use pe_venue_polymarket::{
     CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
@@ -876,7 +877,7 @@ impl LiveAdmissionBuilder {
         now: OffsetDateTime,
     ) -> Result<LiveAdmissionArtifact, LiveVenueAdapterError> {
         let gamma_url = format!(
-            "{}/markets?condition_ids={}&limit=500&include_tag=true",
+            "{}/markets?condition_ids={}&limit={GAMMA_BATCH_LIMIT_PARAM}&include_tag=true",
             self.gamma_base_url, condition_id.0
         );
         let clob_url = format!("{}/markets/{}", self.clob_base_url, condition_id.0);
