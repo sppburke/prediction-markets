@@ -195,7 +195,6 @@ pub struct QualificationEvidenceReport {
     pub artifact_blake3: Option<String>,
     pub static_config_hash: Option<String>,
     pub hot_config_hash: Option<String>,
-    pub policy_hash: Option<String>,
     pub financial_semantic_version: Option<u32>,
     pub economic_core_hashes: Vec<String>,
 }
@@ -305,7 +304,6 @@ impl QualificationReport {
                 artifact_blake3: None,
                 static_config_hash: None,
                 hot_config_hash: None,
-                policy_hash: None,
                 financial_semantic_version: None,
                 economic_core_hashes: Vec::new(),
             },
@@ -1322,7 +1320,6 @@ async fn verify_qualification(
             artifact_blake3: Some(start.artifact_blake3.clone()),
             static_config_hash: Some(start.static_config_hash.clone()),
             hot_config_hash: Some(start.hot_config_hash.clone()),
-            policy_hash: Some(start.policy_hash.clone()),
             financial_semantic_version: Some(start.financial_semantic_version),
             economic_core_hashes: economic_hashes,
         },
@@ -1385,7 +1382,6 @@ fn insufficient_seal_report(
             artifact_blake3: Some(start.artifact_blake3.clone()),
             static_config_hash: Some(start.static_config_hash.clone()),
             hot_config_hash: Some(start.hot_config_hash.clone()),
-            policy_hash: Some(start.policy_hash.clone()),
             financial_semantic_version: Some(start.financial_semantic_version),
             economic_core_hashes: Vec::new(),
         },
@@ -3648,7 +3644,6 @@ pub struct FinancialEraManifest {
     pub artifact_blake3: String,
     pub static_config_hash: String,
     pub ranking_batch_id: i64,
-    pub policy_hash: String,
     pub membership: Vec<pe_core_types::WalletAddress>,
     pub schema_version: u32,
     pub parser_version: u32,
@@ -3779,17 +3774,7 @@ fn validate_financial_manifest(
     {
         return insufficient("financial-era manifest kind or configured paths differ");
     }
-    if !is_lower_hex_64(&manifest.policy_hash) {
-        return insufficient("financial-era policy hash must be exactly 64 lowercase hex digits");
-    }
     Ok(())
-}
-
-fn is_lower_hex_64(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn read_financial_config_rows(path: Option<&Path>) -> Result<Vec<ConfigRow>, QualificationError> {
@@ -4110,7 +4095,6 @@ fn prepare_financial_era(
         generation: manifest.generation.clone(),
         activation_id: manifest.activation_id.clone(),
         ranking_batch_id: manifest.ranking_batch_id,
-        policy_hash: manifest.policy_hash.clone(),
         membership: manifest.membership.clone(),
         membership_proofs_hash,
         schema_version: manifest.schema_version,
@@ -4402,7 +4386,6 @@ mod tests {
             generation: "g557".to_owned(),
             activation_id: "act-557".to_owned(),
             ranking_batch_id: 7,
-            policy_hash: "policy".to_owned(),
             membership: vec![WalletAddress::from_hex(&format!("0x{}", "1".repeat(40))).unwrap()],
             membership_proofs_hash: "membership".to_owned(),
             schema_version: 3,
@@ -5851,7 +5834,6 @@ mod tests {
             artifact_blake3: "a".repeat(64),
             static_config_hash: "b".repeat(64),
             ranking_batch_id: 545,
-            policy_hash: "d".repeat(64),
             membership: Vec::new(),
             schema_version: 3,
             parser_version: 1,
@@ -5914,7 +5896,14 @@ mod tests {
             preparation.start.hot_config_hash,
             derive_hot_config_hash(&config_rows, &config).unwrap()
         );
-        assert!(is_lower_hex_64(&preparation.start.membership_proofs_hash));
+        assert_eq!(preparation.start.membership_proofs_hash.len(), 64);
+        assert!(
+            preparation
+                .start
+                .membership_proofs_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
         let after = paths
             .iter()
             .map(|path| fs::read(path).unwrap())
