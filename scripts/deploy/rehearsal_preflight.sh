@@ -3,6 +3,9 @@
 
 set -euo pipefail
 
+# shellcheck source=generation_common.sh
+source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+
 [[ $# -eq 1 ]] || { echo "usage: $0 SANITIZED_REHEARSAL_ENV" >&2; exit 2; }
 env_file=$1
 [[ -f "$env_file" ]] || { echo "FATAL: missing sanitized rehearsal environment: $env_file" >&2; exit 1; }
@@ -10,20 +13,31 @@ command -v psql >/dev/null || { echo "FATAL: psql not installed" >&2; exit 1; }
 command -v curl >/dev/null || { echo "FATAL: curl not installed" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "FATAL: python3 not installed" >&2; exit 1; }
 
-# shellcheck disable=SC1090
-source "$env_file"
-: "${SUPABASE_DB_URL:?SUPABASE_DB_URL is required for the privilege matrix}"
-: "${PE_SUPABASE_URL:?PE_SUPABASE_URL is required}"
-: "${PE_SUPABASE_ANON_KEY:?PE_SUPABASE_ANON_KEY is required}"
-: "${PE_SUPABASE_SECRET_KEY:?publishable key must occupy PE_SUPABASE_SECRET_KEY}"
-[[ "$PE_SUPABASE_SECRET_KEY" == "$PE_SUPABASE_ANON_KEY" ]] || {
-  echo "FATAL: rehearsal secret slot does not contain the publishable key" >&2
-  exit 1
-}
-python3 - "$PE_SUPABASE_SECRET_KEY" <<'PY'
-import base64, json, re, sys
+# A traced operator shell must not print credential-bearing assignments or HTTP headers.
+[[ $- != *x* ]] || set +x
+mapfile -d '' -t rehearsal_environment < <(
+  env_file_values "$env_file" PE_SUPABASE_URL PE_SUPABASE_ANON_KEY PE_SUPABASE_SECRET_KEY &&
+    printf '__PE_ENV_FILE_PARSED__\0'
+)
+last_environment_index=$((${#rehearsal_environment[@]} - 1))
+if ((last_environment_index < 0)) ||
+   [[ ${rehearsal_environment[$last_environment_index]} != __PE_ENV_FILE_PARSED__ ]]; then
+  die "could not parse the sanitized rehearsal environment"
+fi
+unset 'rehearsal_environment[last_environment_index]'
+for assignment in "${rehearsal_environment[@]}"; do
+  export "${assignment?}"
+done
 
-key = sys.argv[1]
+python3 -c '
+import base64, json, os, re, sys
+
+required = ("SUPABASE_DB_URL", "PE_SUPABASE_URL", "PE_SUPABASE_ANON_KEY", "PE_SUPABASE_SECRET_KEY")
+if any(not os.environ.get(name) for name in required):
+    raise SystemExit("rehearsal database and Supabase values are required")
+if os.environ["PE_SUPABASE_SECRET_KEY"] != os.environ["PE_SUPABASE_ANON_KEY"]:
+    raise SystemExit("rehearsal secret slot does not contain the publishable key")
+key = os.environ["PE_SUPABASE_SECRET_KEY"]
 if key.startswith("sb_publishable_") and len(key) > len("sb_publishable_"):
     raise SystemExit(0)
 if key.startswith("sb_secret_"):
@@ -37,10 +51,7 @@ except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
     raise SystemExit("rehearsal legacy JWT payload is malformed") from error
 if not isinstance(payload, dict) or payload.get("role") != "anon":
     raise SystemExit("rehearsal legacy JWT role is not anon")
-PY
-
-# shellcheck source=generation_common.sh
-source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+'
 
 rehearsal_psql() {
   env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" \

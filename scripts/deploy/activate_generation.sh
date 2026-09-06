@@ -173,15 +173,18 @@ verify_staged_artifacts() {
 }
 
 env_value() {
-  local file=$1 name=$2
-  (
-    set +u
-    set -a
-    # shellcheck disable=SC1090
-    source "$file"
-    set +a
-    printf '%s' "${!name-}"
+  local file=$1 name=$2 assignment
+  local -a parsed
+  mapfile -d '' -t parsed < <(
+    env_file_values "$file" "$name" && printf '__PE_ENV_FILE_PARSED__\0'
   )
+  ((${#parsed[@]} >= 1)) || return 1
+  [[ ${parsed[-1]} == __PE_ENV_FILE_PARSED__ ]] || return 1
+  unset 'parsed[-1]'
+  for assignment in "${parsed[@]}"; do
+    [[ $assignment == "$name="* ]] || return 1
+    printf '%s' "${assignment#*=}"
+  done
 }
 
 toml_value() {
@@ -518,13 +521,28 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   verify_staged_artifacts rehearsal_environment "rehearsal environment" \
     rehearsal_config "rehearsal config" binary "rehearsal binary"
   prepare_started_unix=$(date -u +%s)
+  rehearsal_test_environment=()
+  if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]]; then
+    rehearsal_test_environment=(
+      "PE_ACTIVATION_TESTING=1" "PE_ACTIVATION_TEST_ROOT=$PE_ACTIVATION_TEST_ROOT"
+    )
+  fi
   (
-    set -a
-    # shellcheck disable=SC1090
-    source "$rehearsal_env"
-    set +a
     cd "$SERVICE_ROOT"
-    "$staged_binary" "$rehearsal_config" --exit-after-anchors
+    env -i "${rehearsal_test_environment[@]}" python3 -c '
+import os,sys
+environment=dict(os.environ)
+raw=b"".join(iter(lambda: os.read(3,65536),b""))
+parts=raw.split(b"\0")
+if len(parts) < 2 or parts[-2:] != [b"__PE_ENV_FILE_PARSED__",b""]:
+    raise SystemExit("could not parse the rehearsal environment")
+for part in parts[:-2]:
+    name,separator,value=part.partition(b"=")
+    if not separator: raise SystemExit("invalid parsed rehearsal environment")
+    environment[name.decode("ascii")]=value.decode("utf-8")
+os.execve(sys.argv[1],sys.argv[1:],environment)' \
+      "$staged_binary" "$rehearsal_config" --exit-after-anchors \
+      3< <(env_file_values "$rehearsal_env" && printf '__PE_ENV_FILE_PARSED__\0')
   )
   # A version-two main is never adopted from table counts alone. Re-entering the
   # binary completes or verifies the machine-owned migration through installed.

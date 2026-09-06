@@ -404,6 +404,10 @@ db.execute("delete from meta"); db.execute("insert into meta values(\"financial_
 db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.commit(); db.close()' \
       "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/paper_state.db"
     : > "$state/complete-start"
+    if [[ -f "$state/replace-target-binary-after-start" ]]; then
+      mv "$PE_ACTIVATION_TEST_ROOT/target/pe-service.next" \
+        "$PE_ACTIVATION_TEST_ROOT/target/pe-service"
+    fi
     echo '{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     ;;
   *--financial-era=rollback-check*)
@@ -523,11 +527,21 @@ setup_rehearsal_fixture() {
   printf '%s\n' "PE_POLYMARKET_ACTIVITY_WS_ENABLED=$websocket_enabled" >> "$target/service.env"
   printf '%s\n' "$injection" > "$root/test-state/injection"
   cp "$target/pe-service" "$release/target/release/pe-service"
+  cp "$COMMON" "$release/scripts/deploy/generation_common.sh"
   cat > "$release/scripts/deploy/rehearsal_preflight.sh" <<'SH'
 #!/bin/bash
 set -euo pipefail
 [[ -f "$1" ]]
-: "${SUPABASE_DB_URL:?rehearsal preflight did not receive its explicit database authority}"
+source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+env_file_values "$1" PE_SUPABASE_URL PE_SUPABASE_ANON_KEY PE_SUPABASE_SECRET_KEY >/dev/null
+fixture_root=$(dirname "$(dirname "$1")")
+export PE_ACTIVATION_TEST_ROOT="$fixture_root"
+export SUPABASE_DB_URL
+python3 -c 'import os; raise SystemExit(0 if os.environ.get("SUPABASE_DB_URL") else 1)'
+psql_url SUPABASE_DB_URL -Atc 'select 1' >/dev/null
+if [[ -f "$fixture_root/test-state/replace-rehearsal-target-binary" ]]; then
+  mv "$fixture_root/target/pe-service.next" "$fixture_root/target/pe-service"
+fi
 SH
   chmod +x "$release/scripts/deploy/rehearsal_preflight.sh"
   cat > "$root/bin/curl" <<'SH'
@@ -595,6 +609,76 @@ run_rehearsal_fixture() {
     "$REHEARSAL" --target-config "$root/target/service.toml" \
     --target-environment "$root/target/service.env" \
     1111111111111111111111111111111111111111
+}
+
+run_with_proc_sweep() {
+  local output=$1 trace=$2; shift 2
+  local command_pid monitor_pid status
+  "$@" >> "$output" 2>> "$trace" &
+  command_pid=$!
+  TRACE_SENTINEL_DATABASE_URL="$SENTINEL_DATABASE_URL" \
+    TRACE_SENTINEL_SECRET_KEY="$SENTINEL_SECRET_KEY" \
+    TRACE_SWEEP_PID="$command_pid" TRACE_SWEEP_RESULT="$output.proc-sweep" \
+    python3 -c 'import glob,os,time
+needles=(os.environ["TRACE_SENTINEL_DATABASE_URL"].encode(),
+         os.environ["TRACE_SENTINEL_SECRET_KEY"].encode())
+watched=int(os.environ["TRACE_SWEEP_PID"]); result=os.environ["TRACE_SWEEP_RESULT"]
+found=[]
+while os.path.exists(f"/proc/{watched}"):
+    for path in glob.glob("/proc/[0-9]*/cmdline"):
+        try: value=open(path,"rb").read()
+        except OSError: continue
+        if any(needle in value for needle in needles): found.append(path)
+    time.sleep(0.001)
+with open(result,"w",encoding="utf-8") as output:
+    output.write("\n".join(sorted(set(found))))' &
+  monitor_pid=$!
+  if wait "$command_pid"; then status=0; else status=$?; fi
+  wait "$monitor_pid"
+  [[ ! -s "$output.proc-sweep" ]] || fail "credential appeared in a process command line"
+  return "$status"
+}
+
+assert_trace_has_no_sentinels() {
+  local trace=$1
+  TRACE_SENTINEL_DATABASE_URL="$SENTINEL_DATABASE_URL" \
+    TRACE_SENTINEL_SECRET_KEY="$SENTINEL_SECRET_KEY" TRACE_PATH="$trace" \
+    python3 -c 'import os
+value=open(os.environ["TRACE_PATH"],"rb").read()
+needles=(os.environ["TRACE_SENTINEL_DATABASE_URL"].encode(),
+         os.environ["TRACE_SENTINEL_SECRET_KEY"].encode())
+offending=[]
+for line in value.splitlines():
+    if any(needle in line for needle in needles):
+        for needle in needles: line=line.replace(needle,b"<credential>")
+        offending.append(line.decode("utf-8",errors="replace"))
+if offending:
+    print("\n".join(offending),file=__import__("sys").stderr)
+    raise SystemExit(1)' ||
+    fail "credential appeared in bash xtrace output"
+}
+
+run_rehearsal_traced() {
+  local root=$1
+  PATH="$root/bin:$PATH" \
+  PE_ACTIVATION_MANIFEST="$root/pe-activation.json" \
+  PE_REHEARSAL_ROOT="$root/rehearsal" \
+  PE_REHEARSAL_RELEASE_ROOT="$root/release" \
+  PE_REHEARSAL_COPY_DIR="$root/rehearsal/copy" \
+  PE_REHEARSAL_BIND=127.0.0.1:19001 \
+  PE_REHEARSAL_TIMEOUT_SECS=10 PE_REHEARSAL_POLL_SECS=1 \
+  PE_REHEARSAL_EVIDENCE_HASH_FILE="$root/rehearsal/evidence.json" \
+  SUPABASE_DB_URL="$SENTINEL_DATABASE_URL" \
+    bash -x "$REHEARSAL" --target-config "$root/target/service.toml" \
+    --target-environment "$root/target/service.env" \
+    1111111111111111111111111111111111111111
+}
+
+run_driver_traced() {
+  local root=$1
+  PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" \
+    SUPABASE_DB_URL="$SENTINEL_DATABASE_URL" PATH="$root/bin:$PATH" \
+    bash -x "$DRIVER" "${DRIVER_ARGS[@]}"
 }
 
 # Scenario REHEARSAL-BINDINGS-01
@@ -709,6 +793,116 @@ assert rows["service_log_prefix_length"].isdigit()
 assert len(rows["service_log_prefix_sha256"])==64' "$root/rehearsal/evidence.json" ||
     fail "late $injection result did not bind the refusing final scan"
 done
+
+# Scenario ENV-DATA-05
+# Preconditions: the reviewed target environment contains a shell command that reads the inherited
+# database authority. PASS: both rehearsal and activation fail at that physical line and no command
+# executes. FAIL: the credential is written or either workflow crosses its first durable boundary.
+root=$TEST_TMP/environment-data
+setup_rehearsal_fixture "$root" true none
+printf 'printf '\''%%s\\n'\'' "$SUPABASE_DB_URL" > %s\n' "$root/exfiltrated-url" \
+  >> "$root/target/service.env"
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'service.env:7: invalid environment assignment'* ]] ||
+  fail "rehearsal did not fail closed on shell syntax: $output"
+[[ ! -e "$root/exfiltrated-url" ]] || fail "rehearsal executed the target environment"
+driver_args "$root"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'service.env:7: invalid environment assignment'* ]] ||
+  fail "financial driver did not fail closed on shell syntax: $output"
+[[ ! -e "$root/exfiltrated-url" && ! -e "$root/pe-financial-era.json" ]] ||
+  fail "target environment shell syntax crossed the financial prepared boundary"
+
+# Scenario ENV-DB-AUTHORITY-06
+# Preconditions: a syntactically valid target entry names an attacker database URL.
+# PASS: rehearsal and the complete driver still reach every psql call through the inherited URL's
+# parsed PG* values. FAIL: sourcing the target redirects either workflow or prevents convergence.
+root=$TEST_TMP/environment-db-authority
+setup_rehearsal_fixture "$root" true none
+printf "%s\n" "SUPABASE_DB_URL='postgresql://attacker/other'" >> "$root/target/service.env"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "target database override redirected rehearsal: $output"
+write_shims "$root"
+driver_args "$root"
+drive_to_verified "$root" || fail "target database override redirected the financial driver"
+
+# Scenario REHEARSAL-REVIEWED-BYTES-07
+# Preconditions: the target binary is copied, then preflight atomically replaces its original path.
+# PASS: the private reviewed copy runs to PASS and the replacement never executes.
+# FAIL: the post-validation target path remains the execution authority.
+root=$TEST_TMP/rehearsal-reviewed-bytes
+setup_rehearsal_fixture "$root" true none
+reviewed_sha=$(sha256sum "$root/target/pe-service" | awk '{print $1}')
+printf '%s\n' '#!/usr/bin/env bash' ": > '$root/replacement-executed'" 'exit 97' \
+  > "$root/target/pe-service.next"
+chmod +x "$root/target/pe-service.next"
+touch "$root/test-state/replace-rehearsal-target-binary"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* && ! -e "$root/replacement-executed" ]] ||
+  fail "rehearsal did not execute its private reviewed binary: $output"
+python3 -c 'import hashlib,json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8"))
+assert e["artifact_sha256"] == sys.argv[2]
+assert hashlib.sha256(open(sys.argv[3],"rb").read()).hexdigest() != sys.argv[2]' \
+  "$root/rehearsal/evidence.json" "$reviewed_sha" "$root/target/pe-service" ||
+  fail "rehearsal evidence did not bind the copied binary"
+
+# Scenario FE-ADOPT-REVIEWED-BYTES-08
+# Preconditions: the target process atomically replaces its source path after Start but before adopt.
+# PASS: digest-bound adoption refuses without replacing the installed service binary.
+# FAIL: the replacement becomes the installed executable before the later verification catches it.
+root=$TEST_TMP/financial-reviewed-bytes
+setup_fixture "$root"
+driver_args "$root"
+installed_before=$(sha256sum "$root/prediction-markets/target/release/pe-service" | awk '{print $1}')
+printf '%s\n' '#!/usr/bin/env bash' 'exit 97' > "$root/target/pe-service.next"
+chmod +x "$root/target/pe-service.next"
+touch "$root/test-state/replace-target-binary-after-start"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'source hash changed before adoption'* ]] ||
+  fail "financial driver did not refuse replaced target bytes: $output"
+[[ "$installed_before" == "$(sha256sum "$root/prediction-markets/target/release/pe-service" | awk '{print $1}')" ]] ||
+  fail "financial driver replaced the service binary before detecting target drift"
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+assert value.get("target_binary_adopted") is not True' "$root/pe-financial-era.json" ||
+  fail "financial driver receipted a refused binary adoption"
+
+# Scenario CREDENTIAL-PRIVATE-09
+# Preconditions: complete rehearsal and activation paths use sentinel database and service-role
+# credentials under bash -x. PASS: both converge while repeated /proc cmdline sweeps and the complete
+# trace contain neither sentinel. FAIL: any validator, fd bridge, or child environment uses argv.
+SENTINEL_DATABASE_URL='postgresql://harness:harness@127.0.0.1:1/harness?application_name=SENTINEL_URL_545'
+SENTINEL_SECRET_KEY='sb_secret_SENTINEL_545'
+root=$TEST_TMP/credential-private
+setup_rehearsal_fixture "$root" true none
+sed -i "s/sb_secret_test_service_role/$SENTINEL_SECRET_KEY/" "$root/target/service.env"
+trace="$root/complete.xtrace"
+output="$root/complete.output"
+: > "$trace"
+: > "$output"
+run_with_proc_sweep "$output" "$trace" run_rehearsal_traced "$root" ||
+  fail "sentinel rehearsal did not complete"
+grep -q REHEARSAL545_PASS "$output" || fail "sentinel rehearsal did not pass"
+write_shims "$root"
+driver_args "$root"
+run_with_proc_sweep "$output" "$trace" run_driver_traced "$root" ||
+  fail "sentinel financial activation did not reach started"
+touch "$root/prediction-markets/gen/g557/status.json"
+run_with_proc_sweep "$output" "$trace" run_driver_traced "$root" ||
+  fail "sentinel financial activation did not reach verified"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+  "$root/pe-financial-era.json") == verified ]] || fail "sentinel financial activation did not verify"
+assert_trace_has_no_sentinels "$trace"
 
 # Scenario FE-DERIVED-IDENTITIES-00
 # Preconditions: a production-schema #557 manifest and otherwise-valid driver arguments.

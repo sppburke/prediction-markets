@@ -4,6 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+export PE_TEST_GENERATION_COMMON="$SCRIPT_DIR/generation_common.sh"
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 
@@ -12,9 +13,66 @@ fail() {
   exit 1
 }
 
+# Environment files are parsed as data, including the quoting emitted by the sanitizers.
+parser_env="$TEST_TMP/parser.env"
+printf '%s\n' '# comment' '; comment' 'export QUOTED='"'"'two words'"'" \
+  'PE_SUPABASE_ANON_KEY=sb_publishable_rehearsal' 'UNREQUESTED=hidden' > "$parser_env"
+mapfile -d '' -t parsed < <(
+  bash -c 'source "$1"; env_file_values "$2" QUOTED PE_SUPABASE_ANON_KEY' \
+    bash "$SCRIPT_DIR/generation_common.sh" "$parser_env" && printf '__PARSED__\0'
+)
+[[ ${parsed[*]} == 'QUOTED=two words PE_SUPABASE_ANON_KEY=sb_publishable_rehearsal __PARSED__' ]] ||
+  fail "strict environment parser did not preserve requested quoted values"
+parser_leak="$TEST_TMP/parser-leak"
+printf 'printf '\''%%s\\n'\'' "$SUPABASE_DB_URL" > %s\n' "$parser_leak" >> "$parser_env"
+set +e
+bash -c 'source "$1"; env_file_values "$2" PE_SUPABASE_ANON_KEY' \
+  bash "$SCRIPT_DIR/generation_common.sh" "$parser_env" >/dev/null 2> "$TEST_TMP/parser.err"
+status=$?
+set -e
+[[ $status -ne 0 && ! -e "$parser_leak" ]] || fail "environment parser executed shell syntax"
+grep -q 'parser.env:6: invalid environment assignment' "$TEST_TMP/parser.err" ||
+  fail "environment parser did not report the offending physical line"
+
+# An expected digest is checked on the copied temporary bytes before the destination rename.
+adopt_source="$TEST_TMP/adopt-source"
+adopt_destination="$TEST_TMP/adopt-destination"
+printf '%s\n' reviewed > "$adopt_source"
+reviewed_digest=$(sha256sum "$adopt_source" | awk '{print $1}')
+printf '%s\n' installed-old > "$adopt_destination"
+installed_digest=$(sha256sum "$adopt_destination" | awk '{print $1}')
+printf '%s\n' replacement > "$adopt_source"
+set +e
+PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$TEST_TMP" bash -c \
+  'source "$1"; atomic_adopt "$2" "$3" 0600 expected-digest "$4"' \
+  bash "$SCRIPT_DIR/generation_common.sh" "$adopt_source" "$adopt_destination" "$reviewed_digest" \
+  >/dev/null 2> "$TEST_TMP/adopt.err"
+status=$?
+set -e
+[[ $status -ne 0 && "$(sha256sum "$adopt_destination" | awk '{print $1}')" == "$installed_digest" ]] ||
+  fail "digest-bound adoption replaced the destination with unreviewed bytes"
+grep -q 'source hash changed before adoption' "$TEST_TMP/adopt.err" ||
+  fail "digest-bound adoption refusal was not explicit"
+
 write_shims() {
   local bin=$1
   mkdir -p "$bin"
+
+  cat > "$bin/env_file_tool" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+source "${PE_TEST_GENERATION_COMMON:?}"
+if [[ $# -eq 1 ]]; then
+  env_file_values "$1"
+elif [[ $# -eq 2 ]]; then
+  env_file_values "$1" "$2" | python3 -c 'import sys
+parts=[part for part in sys.stdin.buffer.read().split(b"\0") if part]
+if len(parts) > 1: raise SystemExit(1)
+if parts: sys.stdout.buffer.write(parts[0].split(b"=",1)[1])'
+else
+  exit 2
+fi
+SH
 
   cat > "$bin/b3sum" <<'SH'
 #!/usr/bin/env bash
@@ -242,8 +300,7 @@ increment_count() {
 write_service_environment() {
   local proc=$1 service=$2 credential=/run/credentials/pe-service.service
   [[ ! -e "$state/post-start-credential-wrong" ]] || credential=/wrong
-  (cd "$service" && env -i /bin/bash -c \
-    'set -a; source "$1"; set +a; exec env -0' bash "$service/.env") > "$proc/environ"
+  "$root/bin/env_file_tool" "$service/.env" > "$proc/environ"
   printf '%s\0' \
     "CREDENTIALS_DIRECTORY=$credential" \
     "HOME=$root/home" \
@@ -313,9 +370,9 @@ start_service() {
   refresh_service_process
   env_file="$root/prediction-markets/.env"
   if [[ -f "$env_file" ]]; then
-    set -a; source "$env_file"; set +a
-    mkdir -p "$(dirname "$PE_STATUS_PATH")"
-    cat > "$PE_STATUS_PATH" <<JSON
+    status_path=$("$root/bin/env_file_tool" "$env_file" PE_STATUS_PATH)
+    mkdir -p "$(dirname "$status_path")"
+    cat > "$status_path" <<JSON
 {"revision":"0123456789abcdef0123456789abcdef01234567","updated_at":"2033-05-18T03:33:20Z","bankroll":"1000.00","fills_total":0,"settled_total":0,"tasks":[{"name":"activity_ingest","state":"running","class":"critical"},{"name":"public_activity_poll","state":"running","class":"critical"},{"name":"orchestrator","state":"running","class":"critical"},{"name":"resolution_poller","state":"running","class":"critical"},{"name":"watchlist_refresh","state":"running","class":"critical"},{"name":"status_writer","state":"running","class":"critical"},{"name":"http_server","state":"running","class":"critical"}],"watchlist_projection":{"applied":"2000-01-01T00:00:00Z","last_error":null}}
 JSON
   fi
@@ -441,14 +498,9 @@ NON_PE_BASE='source value'
 export PE_X=
 PE_QUOTED_VALUE="quoted \${NON_PE_BASE} with spaces"
 NON_PE_QUOTED_VALUE="non-PE quoted value"
-EXPORTED_ARRAY=(one two)
-export EXPORTED_ARRAY
-exported_fixture_function() { :; }
-export -f exported_fixture_function
 EOF
-  # fake /proc: the running process has the shell-evaluated installed environment and executable.
-  (cd "$service" && env -i /bin/bash -c \
-    'set -a; source "$1"; set +a; exec env -0' bash "$service/.env") > "$root/proc/1234/environ"
+  # fake /proc: the running process has the data-parsed installed environment and executable.
+  "$root/bin/env_file_tool" "$service/.env" > "$root/proc/1234/environ"
   printf '%s\0' \
     'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \
     "HOME=$root/home" \
@@ -794,9 +846,6 @@ corrupt_new_process() {
     ld-preload) printf 'LD_PRELOAD=/tmp/not-allowed.so\0' >> "$proc/environ" ;;
     ld-library-path) printf 'LD_LIBRARY_PATH=/tmp/not-allowed\0' >> "$proc/environ" ;;
     unlisted-non-pe) printf 'UNLISTED_NON_PE=1\0' >> "$proc/environ" ;;
-    file-ld-preload)
-      : > "$root/test-state/file-loader-enabled"
-      ;;
     credential) python3 - "$proc/environ" <<'PY'
 import sys
 path=sys.argv[1]
@@ -830,8 +879,7 @@ PY
 restore_fake_process() {
   local root=$1 service="$1/prediction-markets" proc="$1/proc/1234"
   printf '%s\0%s\0' "$service/target/release/pe-service" "smoke-test/service.toml" > "$proc/cmdline"
-  (cd "$service" && env -i /bin/bash -c \
-    'set -a; source "$1"; set +a; exec env -0' bash "$service/.env") > "$proc/environ"
+  "$root/bin/env_file_tool" "$service/.env" > "$proc/environ"
   printf '%s\0' \
     'CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service' \
     "HOME=$root/home" \
@@ -856,14 +904,8 @@ restore_fake_process() {
 refuse_post_start_process() {
   local phase=$1 kind=$2 message=$3 root rc state marker
   root=$(make_case "post-start-$phase-$kind")
-  if [[ "$kind" == file-ld-preload ]]; then
-    printf 'if [[ -e %q ]]; then export LD_PRELOAD=/tmp/not-allowed.so; fi\n' \
-      "$root/test-state/file-loader-enabled" >> "$root/input/service.env"
-  fi
   if [[ "$phase" == started ]]; then
-    if [[ "$kind" == file-ld-preload ]]; then
-      : > "$root/test-state/file-loader-enabled"
-    elif [[ "$kind" == snapshot ]]; then
+    if [[ "$kind" == snapshot ]]; then
       marker="$root/test-state/snapshot-change-after-first-show"
       : > "$marker"
     else
@@ -905,16 +947,6 @@ assert isinstance(refusals,list) and len(refusals) == 1
 assert refusals[0].get("at") == "2033-05-18T03:33:20Z"
 assert sys.argv[2] in refusals[0].get("reason","")
 PY
-  if [[ "$kind" == file-ld-preload ]]; then
-    rollback "$root" >/dev/null
-    state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
-      "$root/pe-activation.json")
-    [[ "$state" == rolled_back ]] || fail "$kind $phase refusal did not recover by rollback"
-    [[ "$(<"$root/test-state/service.active")" == true &&
-       "$(<"$root/test-state/service.enabled")" == true ]] ||
-      fail "$kind $phase rollback did not restore the old service"
-    return
-  fi
   restore_fake_process "$root"
   if ! activate "$root" activation-557 >"$root/$phase-repaired.out" 2>"$root/$phase-repaired.err"; then
     sed -n '1,120p' "$root/$phase-repaired.err" >&2
@@ -931,8 +963,6 @@ for phase in started verified; do
   refuse_post_start_process "$phase" ld-preload \
     "does not run the generation binary, service config and environment"
   refuse_post_start_process "$phase" ld-library-path \
-    "does not run the generation binary, service config and environment"
-  refuse_post_start_process "$phase" file-ld-preload \
     "does not run the generation binary, service config and environment"
   refuse_post_start_process "$phase" unlisted-non-pe \
     "does not run the generation binary, service config and environment"
