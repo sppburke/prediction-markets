@@ -394,6 +394,10 @@ esac
 SH
 
   chmod +x "$bin"/*
+  # The rehearsal preflight runs psql/curl under `env -i`, so the shims cannot read the
+  # harness root from the environment: bake it into the generated files instead.
+  local root=${bin%/bin}
+  sed -i "s|\${PE_ACTIVATION_TEST_ROOT:?}|$root|g; s|\$PE_ACTIVATION_TEST_ROOT/|$root/|g" "$bin"/*
 }
 
 make_case() {
