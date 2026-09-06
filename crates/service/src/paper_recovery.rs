@@ -619,9 +619,14 @@ pub fn oldest_unmatched_prepared(era: &PaperEra) -> Option<&ScannedPaperFrame> {
 mod paper_log_tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use pe_copy_signal_engine::{SignalConfig, TradeProvenance};
     use pe_core_types::{
-        BasisPoints, ContractQty, KellyFraction, MarketId, PolymarketTokenId, Probability,
-        ReceivedAt, Side, SourceId, SourceTimestamp, StrategyId, VenueMarketId,
+        BasisPoints, ContractQty, KellyFraction, LeaderAction, MarketId, OutcomeId,
+        PolymarketTokenId, Probability, ProbabilityPpm, ReceivedAt, ReconstructionQuality, Side,
+        SourceId, SourceTimestamp, StrategyId, VenueMarketId,
     };
     use pe_event_log::{ContentType, EnvelopeIn, Writer};
     use pe_execution_core::{
@@ -633,13 +638,25 @@ mod paper_log_tests {
         VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
     };
     use pe_risk_engine::RiskSnapshot;
+    use pe_source_polymarket_public::FixtureFetcher;
+    use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
+    use pe_trader_index::Watchlist;
     use pe_venue_core::OrderIntent;
     use pe_venue_polymarket::CompactFeeSchedule;
     use rust_decimal_macros::dec;
     use tempfile::tempdir;
     use time::OffsetDateTime;
+    use tokio::sync::mpsc;
 
     use super::*;
+    use crate::bucket_commit::{DecisionContinuationFacts, FrozenDecisionBasis};
+    use crate::clob_book::FixtureClobBookFetcher;
+    use crate::entry_gate::CopyEntryGateConfig;
+    use crate::health::new_shared_health;
+    use crate::live_watchlist::LiveWatchlist;
+    use crate::mid_price_cache::MidPriceCache;
+    use crate::orchestrator::{Orchestrator, OrchestratorConfig};
+    use crate::runtime_config::RuntimeConfig;
 
     fn receipt(sequence: u64) -> AppendReceipt {
         AppendReceipt {
@@ -658,6 +675,144 @@ mod paper_log_tests {
 
     fn wallet() -> WalletAddress {
         WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap()
+    }
+
+    fn origin_main_wallet() -> WalletAddress {
+        WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap()
+    }
+
+    /// PASS: after the financial Start resets only financial projections, the production
+    /// orchestrator constructor validates and boots over a retained body-hashed v2 terminal row.
+    #[test]
+    fn post_start_boot_accepts_retained_legacy_terminal_decision() {
+        const LEGACY_TERMINAL: &str =
+            include_str!("../tests/fixtures/decision_replay_origin_main_v2_terminal.json");
+
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("paper-state.sqlite");
+        let paper_state = Arc::new(PaperStateDb::open(&state_path).unwrap());
+        let applied_configuration: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "era": "legacy17",
+            "active_watchlist_size": 100,
+            "mode": "paper",
+            "max_fill_price": "0.85",
+            "min_fill_price": "0.15",
+            "min_resolution_horizon_secs": 60,
+            "max_resolution_horizon_secs": 172_800,
+            "price_impact_cap_bps": 100,
+            "flip_human_approved": false,
+            "kelly_fraction_above_default_human_approved": false,
+            "kelly_fraction_override": null,
+            "per_trade_cap": {"kind": "mode_default"},
+            "slippage_rate": "0.01",
+            "sizing_mode": {"kind": "kelly"},
+            "sizing_dollar_usd": "0",
+            "sizing_contracts": 0,
+            "legacy_compatibility": {
+                "fill_mode": "clob_best_ask",
+                "polymarket_fee_rate": "0.04"
+            }
+        }))
+        .unwrap();
+        let applied_configuration_hash = applied_configuration.canonical_hash();
+        assert_eq!(
+            applied_configuration_hash,
+            "f602cee694f90f8e48cdd43e70d6d9398879a9991662492af82ec4f7df31b222"
+        );
+        let facts = DecisionContinuationFacts {
+            source_trade_id: SourceTradeId("g2:fill".to_owned()),
+            semantic_revision: "semantic-v2".to_owned(),
+            transaction_hash: "0xtransaction".to_owned(),
+            wallet: origin_main_wallet(),
+            source_epoch: 1_700_000_000,
+            market_id: MarketId(VenueMarketId(format!("0x{}", "2".repeat(40)))),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            price: Price(dec!(0.40)),
+            share_amount: ShareAmount::from_whole(10).unwrap(),
+            provenance: TradeProvenance::RestPoll,
+            pre_bucket_action: LeaderAction::Entry,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+            gate_result: "admitted".to_owned(),
+            applied_configuration_hash: applied_configuration_hash.clone(),
+            applied_configuration,
+            frozen_basis: FrozenDecisionBasis {
+                win_rate_p: Probability::ZERO,
+                bankroll: Decimal::ZERO,
+            },
+            decision_inputs: serde_json::json!({"fixed_end": 1_700_000_010_i64, "pages": 1}),
+        };
+        let facts_json = serde_json::to_string(&facts).unwrap();
+        let frozen_inputs_json =
+            format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap());
+
+        let connection = rusqlite::Connection::open(&state_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO decision_pending
+                    (source_trade_id, semantic_revision, wallet_hex, source_epoch,
+                     frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition,
+                     updated_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'terminal', 'fill', ?7)",
+                rusqlite::params![
+                    facts.source_trade_id.0,
+                    facts.semantic_revision,
+                    facts.wallet.to_string(),
+                    facts.source_epoch,
+                    frozen_inputs_json,
+                    LEGACY_TERMINAL,
+                    1_700_000_001_i64,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        paper_state
+            .reset_financial_era(
+                receipt(20),
+                CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(paper_state.decision_pending_history().unwrap().len(), 1);
+
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let result = Orchestrator::new(
+            LiveWatchlist::new(Watchlist {
+                entries: Vec::new(),
+                snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                active_count: 0,
+                incubator_count: 0,
+            }),
+            OrchestratorConfig {
+                bankroll: dec!(100),
+                mode: ExecutionMode::Paper,
+                signal_config: SignalConfig::default(),
+                max_resolution_horizon_secs: 0,
+                min_resolution_horizon_secs: 0,
+                max_fill_price: Decimal::ZERO,
+                min_fill_price: Decimal::ZERO,
+                price_impact_cap_bps: 100,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+                watchlist_writer_lock: None,
+                entry_gate_config: CopyEntryGateConfig,
+                runtime_config: None,
+                live_accounts: None,
+            },
+            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+            Writer::open(dir.path().join("paper.log")).unwrap(),
+            paper_state,
+            PositionLedger::new(),
+            new_shared_health(false),
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new()),
+            control_rx,
+            None,
+            None,
+            None,
+            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
     }
 
     fn economic() -> EconomicPrepared {
