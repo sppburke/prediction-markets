@@ -194,6 +194,7 @@ async fn main() -> Result<()> {
         let options = pe_service::qualification::QualifyOptions {
             paper_log: PathBuf::from(required_arg_value(&args, "--paper-log")?),
             source_log: PathBuf::from(required_arg_value(&args, "--source-log")?),
+            live_journal: optional_arg_value(&args, "--live-journal").map(PathBuf::from),
             paper_state: PathBuf::from(required_arg_value(&args, "--paper-state")?),
             seal_hash: required_arg_value(&args, "--seal-hash")?,
             output: PathBuf::from(required_arg_value(&args, "--output")?),
