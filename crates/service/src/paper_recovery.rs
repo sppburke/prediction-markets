@@ -686,6 +686,8 @@ mod paper_log_tests {
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,
+                price_receipts: Vec::new(),
+                evaluated_at_unix_ms: 1_800_000_000_000,
             },
             balance: BalanceAudit {
                 cash_before: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),

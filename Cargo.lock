@@ -3816,6 +3816,7 @@ dependencies = [
  "pe-core-types",
  "pe-event-log",
  "pe-execution-core",
+ "pe-kelly-sizer",
  "pe-paper-pnl",
  "pe-paper-state",
  "pe-position-ledger",

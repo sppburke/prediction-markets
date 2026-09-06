@@ -75,6 +75,11 @@ pub enum RiskDecisionAudit {
 pub struct RiskAudit {
     pub snapshot: RiskSnapshot,
     pub decision: RiskDecisionAudit,
+    /// Source-log receipts of every current-price observation consumed by `snapshot`, sorted by
+    /// sequence and deduplicated.
+    pub price_receipts: Vec<AppendReceipt>,
+    /// Clock used to evaluate the snapshot's PnL and latency windows.
+    pub evaluated_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +328,8 @@ mod tests {
                 concentration_caps: None,
             },
             decision: RiskDecisionAudit::Approved,
+            price_receipts: vec![receipt(5), receipt(6)],
+            evaluated_at_unix_ms: 1_800_000_000_000,
         }
     }
 
@@ -387,6 +394,8 @@ mod tests {
         assert_eq!(prepared.sizing.all_in_price.0, dec!(0.5151));
         assert_eq!(prepared.book_receipt, receipt(4));
         assert_eq!(prepared.admission.receipts.gamma, receipt(1));
+        assert_eq!(prepared.risk.price_receipts, vec![receipt(5), receipt(6)]);
+        assert_eq!(prepared.risk.evaluated_at_unix_ms, 1_800_000_000_000);
         assert!(prepared.fee.reserve >= prepared.fee.expected_fee);
     }
 
@@ -403,5 +412,21 @@ mod tests {
             EconomicPrepared::compose(inputs),
             Err(EconomicError::MissingBookReceipt)
         ));
+    }
+
+    #[test]
+    fn core_hash_binds_risk_replay_inputs() {
+        let admission = admission();
+        let plan = plan();
+        let prepared = EconomicPrepared::compose(inputs(&admission, &plan)).unwrap();
+        let original = prepared.core_hash().unwrap();
+
+        let mut changed_receipt = prepared.clone();
+        changed_receipt.risk.price_receipts[0] = receipt(7);
+        assert_ne!(changed_receipt.core_hash().unwrap(), original);
+
+        let mut changed_clock = prepared;
+        changed_clock.risk.evaluated_at_unix_ms += 1;
+        assert_ne!(changed_clock.core_hash().unwrap(), original);
     }
 }
