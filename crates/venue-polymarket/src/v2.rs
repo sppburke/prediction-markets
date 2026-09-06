@@ -27,6 +27,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::fee::signed_price;
+
 pub const CLOB_V2_HOST: &str = "https://clob.polymarket.com";
 pub const SDK_VERSION: &str = "0.7.0";
 pub const SDK_ARCHIVE_SHA256: &str =
@@ -222,6 +224,11 @@ impl CanaryV2Client {
         {
             return Err(CanaryV2Error::Request);
         }
+        let requested_signed_price = signed_price(request.maximum_collateral, request.shares)
+            .map_err(|_| CanaryV2Error::Request)?;
+        if requested_signed_price < request.limit_price {
+            return Err(CanaryV2Error::Request);
+        }
         let token_id = U256::from_str(&request.token_id.0)
             .map_err(|e| CanaryV2Error::Client(e.to_string()))?;
         let tick_size = TickSize::try_from(request.tick_size.0)
@@ -262,6 +269,8 @@ impl CanaryV2Client {
         let wallet = self.deposit_wallet.to_string();
         let maker_collateral = amount_from_u256(&order.makerAmount)?;
         let taker_shares = share_from_u256(&order.takerAmount)?;
+        let actual_signed_price = signed_price(maker_collateral, taker_shares)
+            .map_err(|_| CanaryV2Error::PreparedMismatch)?;
         if maker != wallet
             || signer != wallet
             || order.tokenId != token_id
@@ -269,6 +278,8 @@ impl CanaryV2Client {
             || order.signatureType != SignatureType::Poly1271 as u8
             || maker_collateral != request.maximum_collateral
             || taker_shares != request.shares
+            || actual_signed_price != requested_signed_price
+            || actual_signed_price < request.limit_price
             || payload.expiration != U256::ZERO
             || order.metadata != B256::ZERO
             || !supported_builder_code(order.builder)
@@ -1158,6 +1169,14 @@ mod tests {
 
         assert_eq!(submission.prepared().maker_collateral.atomic(), 512_345);
         assert_eq!(submission.prepared().taker_shares.atomic(), 5_123_400);
+        assert!(
+            signed_price(
+                submission.prepared().maker_collateral,
+                submission.prepared().taker_shares,
+            )
+            .unwrap()
+                > submission.prepared().limit_price
+        );
         assert_eq!(order.makerAmount, U256::from(512_345u64));
         assert_eq!(order.takerAmount, U256::from(5_123_400u64));
         assert_eq!(order.builder, B256::ZERO);

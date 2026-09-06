@@ -1,8 +1,9 @@
 //! Shared collateral-path executable-ask planner (#545).
 //!
 //! Ordinary BUYs sign an exact collateral principal. The expected paper quantity is the sum of
-//! improved ask quantities, while `shares` is the minimum taker quantity signed at the worst
-//! accepted tick. The isolated canary keeps its exact-share behavior through
+//! improved ask quantities, while `shares` is the minimum taker quantity derived at the worst
+//! accepted tick. Flooring can put the actual signed maker/taker ratio just above that walked ask.
+//! The isolated canary keeps its exact-share behavior through
 //! [`plan_exact_shares`], which uses the same private ask walk.
 
 use pe_core_types::{CollateralAmount, Price, ShareAmount};
@@ -11,7 +12,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use crate::canary_market::AskLevel;
 use crate::fee::{
     CompactFeeSchedule, FeeError, fee_reserve, principal_for_budget, principal_implied_shares,
-    taker_fee,
+    signed_price, taker_fee,
 };
 
 const ATOMICS_PER_SHARE: u64 = 1_000_000;
@@ -51,7 +52,7 @@ pub struct LadderPlan {
     /// Expected improved quantities at each crossed ask.
     pub used_asks: Vec<AskLevel>,
     pub best_ask: Price,
-    /// Worst accepted tick and therefore the signed price.
+    /// Worst walked ask accepted by this plan.
     pub limit_price: Price,
     /// Signed minimum taker quantity, `floor_atomic(principal / limit_price)`.
     pub shares: ShareAmount,
@@ -60,6 +61,11 @@ pub struct LadderPlan {
 }
 
 impl LadderPlan {
+    /// Actual price encoded by the exact signed maker principal and minimum taker shares.
+    pub fn signed_price(&self) -> Result<Price, LadderError> {
+        signed_price(self.worst_case_debit, self.shares).map_err(LadderError::Fee)
+    }
+
     pub fn expected_shares(&self) -> Result<ShareAmount, LadderError> {
         self.used_asks
             .iter()
@@ -392,7 +398,7 @@ fn aggregate_all_in_price(
     schedule: CompactFeeSchedule,
     slippage_rate: Decimal,
 ) -> Result<Price, LadderError> {
-    let fee = taker_fee(schedule, plan.shares, plan.limit_price)?;
+    let fee = taker_fee(schedule, plan.shares, plan.signed_price()?)?;
     let all_in = plan
         .worst_case_debit
         .checked_add(fee)
@@ -450,13 +456,17 @@ fn plan_principal_buy_with_scale(
     if shares == ShareAmount::ZERO {
         return Err(LadderError::NothingAffordable);
     }
-    Ok(LadderPlan {
+    let plan = LadderPlan {
         used_asks: walked.used_asks,
         best_ask: walked.best_ask,
         limit_price: walked.limit_price,
         shares,
         worst_case_debit: principal,
-    })
+    };
+    if plan.signed_price()? < plan.limit_price {
+        return Err(LadderError::Amount);
+    }
+    Ok(plan)
 }
 
 /// Exact-share compatibility adapter used by the isolated canary.
@@ -850,6 +860,29 @@ mod tests {
     }
 
     #[test]
+    fn production_dollar_shape_keeps_walked_ask_below_the_signed_ratio() {
+        let budget = CollateralAmount::from_decimal_exact(dec!(25)).unwrap();
+        let plan = plan_sized_buy(
+            &[level(dec!(0.33), dec!(100))],
+            CompactFeeSchedule::Zero,
+            BuySizing::Dollar { budget },
+            &[budget],
+            ShareAmount::from_whole(1).unwrap(),
+            price(dec!(0.01)),
+            Price::ZERO,
+            Price::ONE,
+            price(dec!(0.33)),
+            price(dec!(0.33)),
+        )
+        .unwrap();
+
+        assert_eq!(plan.ladder.limit_price, price(dec!(0.33)));
+        assert_eq!(plan.ladder.shares.to_decimal(), dec!(75.7575));
+        assert_eq!(plan.ladder.worst_case_debit, budget);
+        assert!(plan.ladder.signed_price().unwrap() > plan.ladder.limit_price);
+    }
+
+    #[test]
     fn principal_plus_reserve_cap_accepts_equality_and_rejects_one_atomic_less() {
         let asks = vec![level(dec!(0.40), dec!(100))];
         let schedule = CompactFeeSchedule::Taker { rate: dec!(0.04) };
@@ -920,6 +953,34 @@ mod tests {
             .to_decimal(),
             dec!(0.33864)
         );
+    }
+
+    #[test]
+    fn kelly_plan_keeps_non_divisible_principal_and_signed_ratio_consistent() {
+        let allocate = |_all_in_price: Price| {
+            ShareAmount::from_decimal_exact(dec!(6.66668)).map_err(|_| LadderError::KellySizing)
+        };
+        let plan = plan_sized_buy(
+            &[level(dec!(0.15), dec!(100))],
+            CompactFeeSchedule::Taker { rate: dec!(0.04) },
+            BuySizing::Kelly {
+                allocate: &allocate,
+                slippage_rate: Decimal::ZERO,
+            },
+            &[],
+            ShareAmount::from_whole(1).unwrap(),
+            price(dec!(0.01)),
+            Price::ZERO,
+            Price::ONE,
+            price(dec!(0.15)),
+            price(dec!(0.15)),
+        )
+        .unwrap();
+
+        assert_eq!(plan.ladder.limit_price, price(dec!(0.15)));
+        assert_eq!(plan.ladder.shares.to_decimal(), dec!(6.6666));
+        assert_eq!(plan.ladder.worst_case_debit.to_decimal(), dec!(1.000002));
+        assert!(plan.ladder.signed_price().unwrap() > plan.ladder.limit_price);
     }
 
     #[test]
