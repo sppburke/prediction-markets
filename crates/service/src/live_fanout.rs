@@ -19,7 +19,7 @@ use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader
 use pe_execution_core::live_journal::{
     LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
     PolygonFinalityClassification, SanitizedHttpRequestDescriptor, classify_polygon_finality,
-    verify_http_response_request, verify_polygon_reconciliation,
+    verify_http_response_request, verify_polygon_finalized, verify_polygon_reconciliation,
 };
 use pe_execution_core::{
     CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs, EconomicPrepared,
@@ -28,7 +28,7 @@ use pe_execution_core::{
     LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit, LiveModeTransitionReason,
     LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome, LiveOrderReconciliationAudit,
     LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveVenueReconciledOutcome,
-    MarkKind, MatchedLogIdentity, OrderFillFinalizedAudit, PreparedOrderFact, RedemptionAttempt,
+    MarkKind, OrderFillFinalizedAudit, PreparedOrderFact, RedemptionAttempt,
     RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput, RiskAudit,
     RiskDecisionAudit, SizingModeAudit, http_attempt_hashes, prepared_order_fact_matches,
     reconstruct_redemption_attempts, recovery_inventory, redemption_posture, replay_account,
@@ -46,11 +46,10 @@ use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowError, WinnerFollowStrategy,
 };
 use pe_venue_polymarket::{
-    BuySizing, CustodyKind, DecodedOrderFill, LadderError, MatchedReceipt, ReceiptError,
-    RedemptionTransport, RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy,
-    build_redemption_call, canonical_block_matches, decode_order_fills, fee_within_reserve,
-    parse_chain_id_response, parse_finalized_block_response, parse_receipt_response,
-    plan_sized_buy, sign_deposit_wallet_redemption,
+    BuySizing, CustodyKind, LadderError, MatchedReceipt, ReceiptError, RedemptionTransport,
+    RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy, build_redemption_call,
+    canonical_block_matches, parse_chain_id_response, parse_finalized_block_response,
+    parse_receipt_response, plan_sized_buy, sign_deposit_wallet_redemption,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
@@ -378,6 +377,7 @@ pub struct PendingOrderFinality {
     pub prepared_journal_seq: u64,
     pub prepared: Box<pe_execution_core::LiveOrderPreparedAudit>,
     pub transaction_hashes: Vec<String>,
+    pub immutable_receipts: BTreeMap<String, MatchedReceipt>,
 }
 
 /// Exact result of one no-retry finality batch. Pending/conflict evidence is journaled through the
@@ -548,6 +548,7 @@ fn order_finality_result(
         &collected.head,
         &collected.receipts,
         &collected.blocks,
+        &order.immutable_receipts,
     ) {
         PolygonFinalityClassification::Pending { reason } => OrderFinalityDisposition::Pending {
             reason,
@@ -798,6 +799,7 @@ async fn run_recovery_pass(
             prepared_journal_seq: order.inventory.prepared_journal_seq,
             prepared,
             transaction_hashes: order.transaction_hashes,
+            immutable_receipts: order.immutable_receipts,
         });
         finality_targets.push((order.inventory.account_id, target));
     }
@@ -2052,10 +2054,14 @@ pub(crate) fn derive_projection_rows_with_sources(
                         .get(&key)
                         .map(|hashes| hashes.iter().cloned().collect::<Vec<_>>())
                         .unwrap_or_default();
-                    let immutable =
-                        verify_polygon_reconciliation(prepared, &transaction_hashes, reconciled)
-                            .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?;
                     let state = polygon_finality.entry(key.clone()).or_default();
+                    let immutable = verify_polygon_reconciliation(
+                        prepared,
+                        &transaction_hashes,
+                        reconciled,
+                        &state.immutable_receipts,
+                    )
+                    .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?;
                     match &reconciled.outcome {
                         LiveJournalOrderOutcome::FinalityPending { .. } => {
                             if matches!(
@@ -2111,24 +2117,16 @@ pub(crate) fn derive_projection_rows_with_sources(
                 {
                     return Err(ProjectionReducerError::FinalityConflictFrozen);
                 }
-                if (*terminal && !fills.contains_key(&key))
-                    || finalized.principal != prepared_audit.economic.sizing.principal
-                    || finalized.principal != prepared_audit.prepared.maker_collateral
-                    || prepared_audit.economic.ladder.minimum_shares
-                        != prepared_audit.prepared.taker_shares
-                    || finalized.quantity < prepared_audit.economic.ladder.minimum_shares
-                    || !fee_within_reserve(finalized.fee, prepared_audit.economic.fee.reserve)
-                {
+                if *terminal && !fills.contains_key(&key) {
                     return Err(ProjectionReducerError::InvalidFinalizedFill);
                 }
                 let finality_state = polygon_finality.entry(key.clone()).or_default();
-                let finalized_receipts =
-                    verify_finalized_evidence(finalized, &prepared_audit.prepared)?;
-                for (hash, prior) in &finality_state.immutable_receipts {
-                    if finalized_receipts.get(hash) != Some(prior) {
-                        return Err(ProjectionReducerError::FinalityObservationConflict);
-                    }
-                }
+                verify_polygon_finalized(
+                    prepared_audit,
+                    finalized,
+                    &finality_state.immutable_receipts,
+                )
+                .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?;
                 finality_state.phase = PolygonFinalityPhase::Finalized;
                 if resolutions.contains_key(&prepared_audit.prepared.condition_id.0) {
                     return Err(ProjectionReducerError::FillAfterResolution);
@@ -3080,221 +3078,6 @@ fn merge_immutable_receipts(
                 retained.insert(hash, receipt);
             }
         }
-    }
-    Ok(())
-}
-
-fn verify_finalized_evidence(
-    finalized: &OrderFillFinalizedAudit,
-    prepared: &pe_venue_polymarket::PreparedPolymarketBuy,
-) -> Result<BTreeMap<String, MatchedReceipt>, ProjectionReducerError> {
-    let mut chain = None;
-    let mut receipts = BTreeMap::new();
-    for attempt in &finalized.receipts {
-        let response = strict_polygon_response(attempt)?;
-        match response.endpoint_kind.as_str() {
-            "polygon-chain-id" => {
-                require_rpc_request(response, "eth_chainId", &serde_json::json!([]))?;
-                if chain
-                    .replace(
-                        parse_chain_id_response(&response.body)
-                            .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?,
-                    )
-                    .is_some()
-                {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            "polygon-transaction-receipt" => {
-                let params = rpc_params(response)?;
-                let hash = params
-                    .as_array()
-                    .filter(|items| items.len() == 1)
-                    .and_then(|items| items.first())
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or(ProjectionReducerError::InvalidFinalityEvidence)?;
-                require_rpc_request(
-                    response,
-                    "eth_getTransactionReceipt",
-                    &serde_json::json!([hash]),
-                )?;
-                let receipt = parse_receipt_response(&response.body, hash)
-                    .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?
-                    .ok_or(ProjectionReducerError::InvalidFinalityEvidence)?;
-                if receipts.insert(hash.to_owned(), receipt).is_some() {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            _ => return Err(ProjectionReducerError::InvalidFinalityEvidence),
-        }
-    }
-    if chain != Some(pe_venue_polymarket::FINALIZED_CHAIN_ID) || receipts.is_empty() {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-    }
-
-    let mut head = None;
-    let mut canonical_blocks = BTreeMap::new();
-    for attempt in &finalized.blocks {
-        let response = strict_polygon_response(attempt)?;
-        match response.endpoint_kind.as_str() {
-            "polygon-finalized-block" => {
-                require_rpc_request(
-                    response,
-                    "eth_getBlockByNumber",
-                    &serde_json::json!(["finalized", false]),
-                )?;
-                let parsed = parse_finalized_block_response(&response.body)
-                    .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?;
-                if head.replace(parsed).is_some() {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            "polygon-canonical-block" => {
-                let params = rpc_params(response)?;
-                let number = params
-                    .as_array()
-                    .filter(|items| {
-                        items.len() == 2 && items.get(1) == Some(&serde_json::Value::Bool(false))
-                    })
-                    .and_then(|items| items.first())
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|raw| raw.strip_prefix("0x"))
-                    .and_then(|raw| u64::from_str_radix(raw, 16).ok())
-                    .ok_or(ProjectionReducerError::InvalidFinalityEvidence)?;
-                require_rpc_request(
-                    response,
-                    "eth_getBlockByNumber",
-                    &serde_json::json!([format!("0x{number:x}"), false]),
-                )?;
-                if canonical_blocks.insert(number, response).is_some() {
-                    return Err(ProjectionReducerError::InvalidFinalityEvidence);
-                }
-            }
-            _ => return Err(ProjectionReducerError::InvalidFinalityEvidence),
-        }
-    }
-    let head = head.ok_or(ProjectionReducerError::InvalidFinalityEvidence)?;
-    if finalized.finalized_head != head.number {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-    }
-
-    let mut required_lower = BTreeSet::new();
-    let mut fills = BTreeMap::<(String, u64), DecodedOrderFill>::new();
-    for receipt in receipts.values() {
-        if receipt.block_number > head.number {
-            return Err(ProjectionReducerError::InvalidFinalityEvidence);
-        }
-        if receipt.block_number == head.number {
-            if receipt.block_hash != head.hash {
-                return Err(ProjectionReducerError::InvalidFinalityEvidence);
-            }
-        } else {
-            required_lower.insert(receipt.block_number);
-            let response = canonical_blocks
-                .get(&receipt.block_number)
-                .ok_or(ProjectionReducerError::InvalidFinalityEvidence)?;
-            canonical_block_matches(&response.body, receipt.block_number, &receipt.block_hash)
-                .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?;
-        }
-        for fill in decode_order_fills(receipt, prepared)
-            .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)?
-        {
-            let identity = (fill.transaction_hash.clone(), fill.log_index);
-            match fills.get(&identity) {
-                Some(existing) if existing == &fill => {}
-                Some(_) => return Err(ProjectionReducerError::InvalidFinalityEvidence),
-                None => {
-                    fills.insert(identity, fill);
-                }
-            }
-        }
-    }
-    if required_lower != canonical_blocks.keys().copied().collect() || fills.is_empty() {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-    }
-    let (principal, quantity, fee) = fills.values().try_fold(
-        (
-            CollateralAmount::ZERO,
-            ShareAmount::ZERO,
-            CollateralAmount::ZERO,
-        ),
-        |(principal, quantity, fee), fill| {
-            Ok::<_, ProjectionReducerError>((
-                principal
-                    .checked_add(fill.principal)
-                    .map_err(|_| ProjectionReducerError::Arithmetic)?,
-                quantity
-                    .checked_add(fill.quantity)
-                    .map_err(|_| ProjectionReducerError::Arithmetic)?,
-                fee.checked_add(fill.fee)
-                    .map_err(|_| ProjectionReducerError::Arithmetic)?,
-            ))
-        },
-    )?;
-    let matched_logs = fills
-        .into_keys()
-        .map(|(transaction_hash, log_index)| MatchedLogIdentity {
-            transaction_hash,
-            log_index,
-        })
-        .collect::<Vec<_>>();
-    if finalized.chain_id != chain.unwrap_or_default()
-        || finalized.principal != principal
-        || finalized.quantity != quantity
-        || finalized.fee != fee
-        || finalized.matched_logs != matched_logs
-    {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-    }
-    Ok(receipts)
-}
-
-fn strict_polygon_response(
-    attempt: &RawHttpAttempt,
-) -> Result<&pe_core_types::RawHttpResponse, ProjectionReducerError> {
-    let RawHttpAttempt::Response(response) = attempt else {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-    };
-    if response.source_id != "polygon-receipt-rpc"
-        || response.method != "POST"
-        || !(200..300).contains(&response.status)
-        || response.attempt_ordinal != 1
-        || response.schema_version != 1
-        || response.parser_version != 1
-        || response.path.is_empty()
-        || response.adapter_version.is_empty()
-    {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-    }
-    Ok(response)
-}
-
-fn rpc_params(
-    response: &pe_core_types::RawHttpResponse,
-) -> Result<serde_json::Value, ProjectionReducerError> {
-    if response.ordered_query.len() != 2
-        || response.ordered_query[0].0 != "rpc_method"
-        || response.ordered_query[1].0 != "rpc_params"
-    {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
-    }
-    serde_json::from_str(&response.ordered_query[1].1)
-        .map_err(|_| ProjectionReducerError::InvalidFinalityEvidence)
-}
-
-fn require_rpc_request(
-    response: &pe_core_types::RawHttpResponse,
-    method: &str,
-    params: &serde_json::Value,
-) -> Result<(), ProjectionReducerError> {
-    if response
-        .ordered_query
-        .first()
-        .map(|pair| (pair.0.as_str(), pair.1.as_str()))
-        != Some(("rpc_method", method))
-        || rpc_params(response)? != *params
-    {
-        return Err(ProjectionReducerError::InvalidFinalityEvidence);
     }
     Ok(())
 }
@@ -5829,7 +5612,8 @@ mod tests {
         LiveAdmissionArtifactAudit, LiveOrderRejectKind, LivePostClassification,
         LivePostParseError, LiveVenueAccountReadError, LiveVenueAccountState,
         LiveVenuePreparationError, LiveVenuePrepareRequest, LiveVenuePrepared,
-        LiveVenueReconciliation, LiveVenueReconciliationError, MarketSelection, SizingAudit,
+        LiveVenueReconciliation, LiveVenueReconciliationError, MarketSelection, MatchedLogIdentity,
+        SizingAudit,
     };
     use pe_paper_state::{DispatchSeedRecord, DispatchTargetSeed};
     use pe_trader_index::Watchlist;
@@ -7472,6 +7256,7 @@ mod tests {
             prepared_journal_seq: 9,
             prepared: finality_prepared(),
             transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+            immutable_receipts: BTreeMap::new(),
         };
         let results = collect_order_finality(&rpc, vec![order.clone(), order]).await;
         assert_eq!(results.len(), 2);
@@ -7571,6 +7356,7 @@ mod tests {
                     prepared_journal_seq: prepared_event.seq,
                     prepared: prepared.clone(),
                     transaction_hashes: vec![transaction_hash.clone()],
+                    immutable_receipts: BTreeMap::new(),
                 }],
             )
             .await
@@ -7686,6 +7472,7 @@ mod tests {
                 prepared_journal_seq: 9,
                 prepared: finality_prepared(),
                 transaction_hashes: vec![second.clone(), first, second],
+                immutable_receipts: BTreeMap::new(),
             }],
         )
         .await;
@@ -7760,6 +7547,7 @@ mod tests {
                 prepared_journal_seq: 9,
                 prepared,
                 transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+                immutable_receipts: BTreeMap::new(),
             }],
         )
         .await;
@@ -7782,6 +7570,7 @@ mod tests {
             prepared_journal_seq: 9,
             prepared: finality_prepared(),
             transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+            immutable_receipts: BTreeMap::new(),
         };
         let equal = FakePolygonRpc::new(100);
         let equal_result = collect_order_finality(&equal, vec![order.clone()]).await;
@@ -7851,6 +7640,7 @@ mod tests {
                     prepared_journal_seq: prepared_event.seq,
                     prepared: prepared.clone(),
                     transaction_hashes: vec![first_hash],
+                    immutable_receipts: BTreeMap::new(),
                 }],
             )
             .await
@@ -7926,6 +7716,7 @@ mod tests {
             prepared_journal_seq: 0,
             prepared: finality_prepared(),
             transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+            immutable_receipts: BTreeMap::new(),
         };
         let mut pending =
             collect_order_finality(&FakePolygonRpc::new(99), vec![order.clone()]).await;
@@ -8088,99 +7879,103 @@ mod tests {
         ));
     }
 
-    /// PASS: a Final cannot rewrite a transaction/log observation that an earlier Pending proved
-    /// immutable at the finalized head, even when the rewritten Final is internally self-consistent.
+    /// PASS: a 2,499,999-principal Pending is recovered into the next real collection pass; the
+    /// same hash/log rewritten to 2,500,000 appends a durable Conflict accepted by both consumers.
     #[tokio::test]
-    async fn finality_pending_freezes_immutable_polygon_observations() {
+    async fn finality_pending_rewrite_appends_conflict_through_both_consumers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
         let account_id = AccountId::new("account").unwrap();
         let prepared = finality_prepared();
-        let first_hash = format!("0x{}", "11".repeat(32));
-        let second_hash = format!("0x{}", "22".repeat(32));
-        let rpc = FakePolygonRpc::new(101).with_transaction_receipts([
-            (
-                first_hash.clone(),
-                include_bytes!("../../venue-polymarket/tests/fixtures/receipts/standard_v2.json")
-                    .to_vec(),
-            ),
-            (
-                second_hash.clone(),
-                br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec(),
-            ),
-        ]);
+        let transaction_hash = format!("0x{}", "11".repeat(32));
+        let baseline = baseline_event(&account_id, 0);
+        journal
+            .append(account_id.clone(), baseline.timestamp, baseline.payload)
+            .unwrap();
+        let prepared_event = journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                LiveJournalPayload::OrderPrepared(prepared.clone()),
+            )
+            .unwrap();
+        journal
+            .append(
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                    &prepared,
+                    transaction_hash.clone(),
+                ))),
+            )
+            .unwrap();
+
         let pending_result = collect_order_finality(
-            &rpc,
+            &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_499_999)),
             vec![PendingOrderFinality {
-                prepared_journal_seq: 2,
+                prepared_journal_seq: prepared_event.seq,
                 prepared: prepared.clone(),
-                transaction_hashes: vec![first_hash.clone(), second_hash.clone()],
+                transaction_hashes: vec![transaction_hash.clone()],
+                immutable_receipts: BTreeMap::new(),
             }],
         )
         .await
         .pop()
         .unwrap();
-        let OrderFinalityDisposition::Pending {
-            reason,
-            evidence: pending_evidence,
-        } = pending_result.disposition
-        else {
-            unreachable!();
-        };
-        let original_final = finalized_fill_event(&account_id, &prepared, 5, 2);
-        let pending = LiveJournalEvent {
-            account_id: account_id.clone(),
-            seq: 4,
-            timestamp: OffsetDateTime::from_unix_timestamp(9).unwrap(),
-            payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
-                identity: prepared.identity.clone(),
-                order_hash: prepared.prepared.order_hash.clone(),
-                source: LiveReconciliationSource::PolygonFinality,
-                outcome: LiveJournalOrderOutcome::FinalityPending { reason },
-                evidence_hashes: http_attempt_hashes(&pending_evidence).unwrap(),
-                evidence: pending_evidence,
-            })),
-        };
-        let mut rewritten_final = original_final;
-        if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut rewritten_final.payload
-            && let Some(RawHttpAttempt::Response(response)) = finalized.receipts.get_mut(1)
-        {
-            let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            body["result"]["logs"][0]["rewritten_after_pending"] = serde_json::json!(true);
-            response.body = serde_json::to_vec(&body).unwrap();
-        }
-        let events = vec![
-            baseline_event(&account_id, 1),
-            LiveJournalEvent {
-                account_id: account_id.clone(),
-                seq: 2,
-                timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
-            },
-            LiveJournalEvent {
-                account_id: account_id.clone(),
-                seq: 3,
-                timestamp: OffsetDateTime::from_unix_timestamp(6).unwrap(),
-                payload: LiveJournalPayload::OrderReconciled(Box::new(
-                    LiveOrderReconciliationAudit {
-                        identity: prepared.identity.clone(),
-                        order_hash: prepared.prepared.order_hash.clone(),
-                        source: LiveReconciliationSource::PostResponse,
-                        outcome: LiveJournalOrderOutcome::Matched {
-                            venue_order_id: "venue-order".to_owned(),
-                            transaction_hashes: vec![first_hash, second_hash],
-                            executed: None,
-                        },
-                        evidence: Vec::new(),
-                        evidence_hashes: Vec::new(),
-                    },
-                )),
-            },
-            pending,
-            rewritten_final,
-        ];
+        assert_eq!(
+            append_order_finality_result(
+                &journal,
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                pending_result,
+            )
+            .unwrap(),
+            FinalityJournalEffect::Pending
+        );
+
+        let inventory = recovery_inventory(&path).unwrap();
+        let recovered = inventory.open_orders.first().unwrap();
+        assert_eq!(recovered.immutable_receipts.len(), 1);
+        assert!(recovered.immutable_receipts.contains_key(&transaction_hash));
+        let changed_result = collect_order_finality(
+            &FakePolygonRpc::new(101),
+            vec![PendingOrderFinality {
+                prepared_journal_seq: recovered.inventory.prepared_journal_seq,
+                prepared: recovered.prepared.clone().unwrap(),
+                transaction_hashes: recovered.transaction_hashes.clone(),
+                immutable_receipts: recovered.immutable_receipts.clone(),
+            }],
+        )
+        .await
+        .pop()
+        .unwrap();
         assert!(matches!(
-            derive_with_baseline_evidence(&account_id, &events, &[]),
-            Err(ProjectionReducerError::FinalityObservationConflict)
+            &changed_result.disposition,
+            OrderFinalityDisposition::Conflict { reason, .. }
+                if reason == "transaction receipt changed after becoming an immutable observation"
         ));
+        assert_eq!(
+            append_order_finality_result(
+                &journal,
+                account_id.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+                changed_result,
+            )
+            .unwrap(),
+            FinalityJournalEffect::Conflict
+        );
+        drop(journal);
+
+        assert!(recovery_inventory(&path).unwrap().open_orders.is_empty());
+        let events = replay_account(&path, &account_id).unwrap();
+        assert!(matches!(
+            &events.last().unwrap().payload,
+            LiveJournalPayload::OrderReconciled(reconciled)
+                if matches!(reconciled.outcome, LiveJournalOrderOutcome::FinalityConflict { .. })
+        ));
+        let projection = derive_with_baseline_evidence(&account_id, &events, &[]).unwrap();
+        assert_eq!(projection.reserved, dec!(2.500120));
     }
 
     fn receipt_with_word(index: usize, value: u64) -> Vec<u8> {
@@ -8203,6 +7998,120 @@ mod tests {
         serde_json::to_vec(&receipt).unwrap()
     }
 
+    /// PASS: malformed, economically rewritten, and prior-Pending-contradicting Finals are rejected
+    /// as invalid finality evidence by both recovery inventory and the strict financial reducer.
+    #[tokio::test]
+    async fn finalized_evidence_parity_matrix_rejects_invalid_finals() {
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = finality_prepared();
+        let transaction_hash = format!("0x{}", "11".repeat(32));
+        let prefix = || {
+            vec![
+                baseline_event(&account_id, 0),
+                LiveJournalEvent {
+                    account_id: account_id.clone(),
+                    seq: 1,
+                    timestamp: OffsetDateTime::UNIX_EPOCH,
+                    payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                },
+                LiveJournalEvent {
+                    account_id: account_id.clone(),
+                    seq: 2,
+                    timestamp: OffsetDateTime::UNIX_EPOCH,
+                    payload: LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                        &prepared,
+                        transaction_hash.clone(),
+                    ))),
+                },
+            ]
+        };
+
+        let mut malformed = prefix();
+        let mut malformed_final = finalized_fill_event(&account_id, &prepared, 3, 1);
+        if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut malformed_final.payload {
+            finalized.receipts.clear();
+            finalized.blocks.clear();
+        }
+        malformed.push(malformed_final);
+
+        let mut economic = prefix();
+        let mut economic_final = finalized_fill_event(&account_id, &prepared, 3, 1);
+        if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut economic_final.payload {
+            finalized.principal = CollateralAmount::from_atomic(2_500_001);
+            let RawHttpAttempt::Response(response) = finalized.receipts.get_mut(1).unwrap() else {
+                unreachable!();
+            };
+            response.body = receipt_with_word(2, 2_500_001);
+        }
+        economic.push(economic_final);
+
+        let pending_result = collect_order_finality(
+            &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_499_999)),
+            vec![PendingOrderFinality {
+                prepared_journal_seq: 1,
+                prepared: prepared.clone(),
+                transaction_hashes: vec![transaction_hash.clone()],
+                immutable_receipts: BTreeMap::new(),
+            }],
+        )
+        .await
+        .pop()
+        .unwrap();
+        let OrderFinalityDisposition::Pending { reason, evidence } = pending_result.disposition
+        else {
+            unreachable!();
+        };
+        let mut contradicts_pending = prefix();
+        contradicts_pending.push(LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 3,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                identity: prepared.identity.clone(),
+                order_hash: prepared.prepared.order_hash.clone(),
+                source: LiveReconciliationSource::PolygonFinality,
+                outcome: LiveJournalOrderOutcome::FinalityPending { reason },
+                evidence_hashes: http_attempt_hashes(&evidence).unwrap(),
+                evidence,
+            })),
+        });
+        contradicts_pending.push(finalized_fill_event(&account_id, &prepared, 4, 1));
+
+        for (case, events) in [
+            ("malformed", malformed),
+            ("economic_change", economic),
+            ("prior_pending_contradiction", contradicts_pending),
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("live.log");
+            let journal = LiveJournal::open(&path).unwrap();
+            for event in &events {
+                journal
+                    .append(
+                        event.account_id.clone(),
+                        event.timestamp,
+                        event.payload.clone(),
+                    )
+                    .unwrap();
+            }
+            drop(journal);
+            assert!(
+                matches!(
+                    recovery_inventory(&path),
+                    Err(pe_execution_core::LiveJournalError::InvalidFinalityEvidence)
+                ),
+                "recovery accepted {case}"
+            );
+            assert!(
+                matches!(
+                    derive_with_baseline_evidence(&account_id, &events, &[]),
+                    Err(ProjectionReducerError::InvalidFinalityEvidence)
+                ),
+                "strict reducer accepted {case}"
+            );
+        }
+    }
+
     async fn one_finality_disposition(rpc: &FakePolygonRpc) -> OrderFinalityDisposition {
         collect_order_finality(
             rpc,
@@ -8210,6 +8119,7 @@ mod tests {
                 prepared_journal_seq: 9,
                 prepared: finality_prepared(),
                 transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+                immutable_receipts: BTreeMap::new(),
             }],
         )
         .await
@@ -8260,6 +8170,7 @@ mod tests {
                 prepared_journal_seq: 9,
                 prepared: finality_prepared(),
                 transaction_hashes: vec![first, second],
+                immutable_receipts: BTreeMap::new(),
             }],
         )
         .await;
