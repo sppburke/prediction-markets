@@ -25,6 +25,7 @@ use pe_execution_core::{
     EconomicPrepared, LiveAdmissionVerdict, ObservationEvidence, RiskAudit, RiskDecisionAudit,
     SizingModeAudit,
 };
+#[cfg(test)]
 use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST};
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{
@@ -4384,15 +4385,7 @@ fn verify_winner_follow_economic_policy(
         pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config());
     let expected_sizing = match strategy.config().sizing_mode {
         pe_strategy_winner_follow::SizingMode::Kelly => SizingModeAudit::Kelly {
-            fraction: strategy
-                .config()
-                .kelly_fraction_override
-                .unwrap_or(match mode {
-                    pe_strategy_winner_follow::ExecutionMode::LiveTiny
-                    | pe_strategy_winner_follow::ExecutionMode::Promoted => KELLY_NORMAL,
-                    pe_strategy_winner_follow::ExecutionMode::Paper
-                    | pe_strategy_winner_follow::ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
-                }),
+            fraction: strategy.effective_kelly_fraction(mode),
             probability: frozen.frozen_basis.win_rate_p,
         },
         pe_strategy_winner_follow::SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },

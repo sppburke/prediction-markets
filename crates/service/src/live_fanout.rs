@@ -11,9 +11,10 @@ use std::time::Duration;
 use age::x25519::Identity;
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    AccountId, CollateralAmount, KellyFraction, MarketId, MarketOutcomeId, OutcomeId,
-    PolymarketConditionId, Price, Probability, RawHttpAttempt, ReceivedAt, ShareAmount, Side,
-    SourceId, SourceTimestamp, VenueMarketId, WalletAddress,
+    AccountId, CollateralAmount, LeaderAction, MarketId, MarketOutcomeId, OutcomeId,
+    PolymarketConditionId, Price, Probability, ProbabilityPpm, RawHttpAttempt, ReceivedAt,
+    ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId, TraderId,
+    VenueId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope};
 use pe_execution_core::live_executor::{
@@ -45,10 +46,12 @@ use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityAssetMapping, BinaryPayoutVector, ClobPayoutResolution, ClobPricesHistoryClient,
-    FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
-    GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
-    PositionClassification, ReconciliationFetcher, fetch_complete_positions, parse_clob_market,
+    ActivityAssetMapping, ActivityParseContext, ActivityTransport, ActivityType,
+    BinaryPayoutVector, ClobPayoutResolution, ClobPricesHistoryClient, FixtureFetcher,
+    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
+    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, PositionClassification,
+    ReconciliationFetcher, aggregate_activity_rows, fetch_complete_positions,
+    parse_activity_response, parse_activity_trade_observation, parse_clob_market,
     validate_live_market,
 };
 use pe_strategy_winner_follow::{
@@ -977,7 +980,7 @@ async fn run_dispatch_pass(state: &mut FanoutState) -> Result<(), FanoutError> {
                 &seed,
                 &target,
                 &frozen.signal,
-                frozen.observation.as_ref(),
+                &frozen.observation,
                 OffsetDateTime::now_utc(),
             )
             .await?;
@@ -1685,13 +1688,27 @@ where
 struct FrozenSignal {
     schema_version: u16,
     signal: LeaderSignal,
-    #[serde(default)]
-    observation: Option<ObservationEvidence>,
+    observation: ObservationEvidence,
 }
 
 fn parse_frozen_signal(seed: &DispatchSeedRow) -> Result<FrozenSignal, FanoutError> {
-    let frozen: FrozenSignal = serde_json::from_str(&seed.signal_json)
+    let value: serde_json::Value = serde_json::from_str(&seed.signal_json)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+        && value
+            .get("observation")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(FanoutError::Signal(
+            "schema-one live dispatch seed lacks observation evidence; activation requires no open live work"
+                .to_owned(),
+        ));
+    }
+    let frozen: FrozenSignal =
+        serde_json::from_value(value).map_err(|error| FanoutError::Signal(error.to_string()))?;
     if frozen.schema_version != 1 {
         return Err(FanoutError::Signal("unsupported schema version".to_owned()));
     }
@@ -1710,7 +1727,7 @@ async fn process_target(
     seed: &DispatchSeedRow,
     target: &DispatchTargetRow,
     signal: &LeaderSignal,
-    observation: Option<&ObservationEvidence>,
+    observation: &ObservationEvidence,
     now: OffsetDateTime,
 ) -> Result<PassControl, FanoutError> {
     let accounts = state.config.live_accounts.snapshot();
@@ -2075,9 +2092,7 @@ async fn process_target(
         .map_err(|_| FanoutError::Signal("outcome index exceeds u8".to_owned()))?;
     let sizing_mode = match strategy_config.sizing_mode {
         SizingMode::Kelly => SizingModeAudit::Kelly {
-            fraction: strategy_config
-                .kelly_fraction_override
-                .unwrap_or(KellyFraction(Decimal::new(25, 2))),
+            fraction: strategy.effective_kelly_fraction(ExecutionMode::LiveTiny),
             probability,
         },
         SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },
@@ -2094,7 +2109,7 @@ async fn process_target(
         admission: &admission,
         plan: &plan,
         book_receipt,
-        observation: observation.cloned(),
+        observation: Some(observation.clone()),
         sizing_mode,
         budget: sized.budget,
         slippage_rate: strategy_config.slippage_rate,
@@ -2989,9 +3004,158 @@ where
     Ok(observation)
 }
 
+#[derive(Clone, Copy)]
+struct LiveObservationBinding<'a> {
+    account_id: &'a AccountId,
+    identity: &'a LiveOrderIdentity,
+}
+
+fn source_time_from_millis(received_unix_ms: i64) -> Result<OffsetDateTime, EconomicReplayError> {
+    OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(received_unix_ms)
+            .checked_mul(1_000_000)
+            .ok_or_else(|| economic_replay_error("economic observation clock overflow"))?,
+    )
+    .map_err(|_| economic_replay_error("economic observation clock is outside the supported range"))
+}
+
+fn validate_live_observation_trade(
+    economic: &EconomicPrepared,
+    complete_bound: &RecordedEconomicSource,
+    selected: &RecordedEconomicSource,
+    binding: LiveObservationBinding<'_>,
+) -> Result<(), EconomicReplayError> {
+    let projection =
+        binding.identity.fill_projection.as_deref().ok_or_else(|| {
+            economic_replay_error("current live observation has no fill projection")
+        })?;
+    let source_trade_id = projection.source_trade_id.as_deref().ok_or_else(|| {
+        economic_replay_error("current live fill projection has no source trade identity")
+    })?;
+    let leader = WalletAddress::from_hex(&projection.leader_wallet)
+        .map_err(|_| economic_replay_error("current live fill projection has an invalid leader"))?;
+    let received_at = source_time_from_millis(complete_bound.received_unix_ms)?;
+    let window = parse_activity_response(
+        &complete_bound.payload,
+        leader,
+        &ActivityParseContext {
+            source_id: SourceId(complete_bound.source_id.clone()),
+            observed_at: SourceTimestamp(received_at),
+            received_at: ReceivedAt(received_at),
+            transport: ActivityTransport::Replay,
+        },
+    )
+    .map_err(|error| {
+        economic_replay_error(format!(
+            "economic observation complete activity parse failed: {error}"
+        ))
+    })?;
+    let aggregates = aggregate_activity_rows(&window.rows).map_err(|error| {
+        economic_replay_error(format!(
+            "economic observation activity aggregate failed: {error}"
+        ))
+    })?;
+    let mut matching = aggregates
+        .iter()
+        .filter(|aggregate| aggregate.group_id.key().0 == source_trade_id);
+    let aggregate = matching.next().ok_or_else(|| {
+        economic_replay_error(
+            "economic observation REST evidence does not contain the recorded trade",
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(economic_replay_error(
+            "economic observation REST evidence contains duplicate recorded trades",
+        ));
+    }
+    let components = aggregate.group_id.components();
+    let outcome_id = u16::try_from(projection.outcome_id).map_err(|_| {
+        economic_replay_error("current live fill projection has an invalid outcome")
+    })?;
+    let trade_price = aggregate.volume_weighted_price().map_err(|error| {
+        economic_replay_error(format!(
+            "economic observation trade price replay failed: {error}"
+        ))
+    })?;
+    let projection_matches_economic = projection.market_id == economic.market.market_id
+        && outcome_id == u16::from(economic.market.outcome_index)
+        && projection.side == "buy"
+        && economic.market.side == Side::Buy;
+    let activity_matches_projection = components.activity_type == ActivityType::Trade
+        && components.wallet == leader
+        && components
+            .condition_id
+            .as_ref()
+            .is_some_and(|condition| condition.0 == projection.market_id)
+        && components.outcome == Some(OutcomeId(outcome_id))
+        && components.side == Some(Side::Buy);
+    if !projection_matches_economic || !activity_matches_projection {
+        return Err(economic_replay_error(
+            "economic observation trade identity differs from the live admission",
+        ));
+    }
+
+    if selected.source_id == crate::activity_ingest::ACTIVITY_WS_SOURCE_ID {
+        let websocket = parse_activity_trade_observation(&selected.payload).map_err(|error| {
+            economic_replay_error(format!(
+                "economic observation websocket parse failed: {error}"
+            ))
+        })?;
+        if websocket.wallet != leader
+            || websocket.group_id.key().0 != source_trade_id
+            || websocket.source_time != aggregate.source_time
+        {
+            return Err(economic_replay_error(
+                "economic observation websocket differs from the reconciled trade",
+            ));
+        }
+    }
+
+    let market_id = MarketId(VenueMarketId(projection.market_id.clone()));
+    let source_trade_id = SourceTradeId(source_trade_id.to_owned());
+    let observed_at = aggregate.source_time.0;
+    let decision_matches = (0_u8..=100).any(|quality_value| {
+        let Ok(reconstruction_quality) = ReconstructionQuality::new(quality_value) else {
+            return false;
+        };
+        let signal = LeaderSignal {
+            leader: TraderId(leader),
+            venue: VenueId::polymarket(),
+            market_id: market_id.clone(),
+            outcome_id: OutcomeId(outcome_id),
+            action: LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: trade_price,
+            leader_size: aggregate.share_sum,
+            observed_at,
+            received_at: observed_at,
+            reconstruction_quality,
+            source_trade_id: source_trade_id.clone(),
+            action_confidence_ppm: ProbabilityPpm(u32::from(quality_value) * 10_000),
+        };
+        hash_json(&(
+            "prediction-edge/live-decision/v1",
+            &signal,
+            binding.account_id.as_str(),
+            &binding.identity.config_hash,
+            &binding.identity.quote_id,
+            &binding.identity.evidence_hashes,
+        ))
+        .is_ok_and(|hash| hash == binding.identity.decision_hash)
+    });
+    if !decision_matches {
+        return Err(economic_replay_error(
+            "economic observation quantity, price, or source clock differs from the recorded live signal",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_economic_observation<L>(
+    economic: &EconomicPrepared,
     observation: &ObservationEvidence,
     evidence_cutoff_unix_ms: i64,
+    live_binding: Option<LiveObservationBinding<'_>>,
     lookup: &mut L,
 ) -> Result<(), EconomicReplayError>
 where
@@ -3045,23 +3209,43 @@ where
             "economic observation receive clock is inconsistent with its receipts",
         ));
     }
+    if selected.received_unix_ms > complete_bound.received_unix_ms {
+        return Err(economic_replay_error(
+            "economic observation receive clock is after its complete-read bound",
+        ));
+    }
+    if let Some(binding) = live_binding {
+        validate_live_observation_trade(economic, &complete_bound, &selected, binding)?;
+    }
     Ok(())
 }
 
 /// Rebuild admission, compact fee authority, and the signed `/book` ladder from four exact
 /// receipts. Qualification supplies its sealed-prefix lookup; live replay supplies its scoped
 /// source-index lookup. No copied fee, reserve, quantity, or ladder field is trusted here.
-pub(crate) fn replay_source_backed_economic<L>(
+fn replay_source_backed_economic_with_live_binding<L>(
     economic: &EconomicPrepared,
     evidence_cutoff_unix_ms: i64,
     cash_before: CollateralAmount,
+    live_binding: Option<LiveObservationBinding<'_>>,
     mut lookup: L,
 ) -> Result<SourceBackedEconomicReplay, EconomicReplayError>
 where
     L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
 {
+    if live_binding.is_some() && economic.observation.is_none() {
+        return Err(economic_replay_error(
+            "current live economic admission has no observation evidence",
+        ));
+    }
     if let Some(observation) = &economic.observation {
-        validate_economic_observation(observation, evidence_cutoff_unix_ms, &mut lookup)?;
+        validate_economic_observation(
+            economic,
+            observation,
+            evidence_cutoff_unix_ms,
+            live_binding,
+            &mut lookup,
+        )?;
     }
     let receipts = economic.admission.receipts;
     if [
@@ -3256,6 +3440,24 @@ where
     })
 }
 
+pub(crate) fn replay_source_backed_economic<L>(
+    economic: &EconomicPrepared,
+    evidence_cutoff_unix_ms: i64,
+    cash_before: CollateralAmount,
+    lookup: L,
+) -> Result<SourceBackedEconomicReplay, EconomicReplayError>
+where
+    L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
+{
+    replay_source_backed_economic_with_live_binding(
+        economic,
+        evidence_cutoff_unix_ms,
+        cash_before,
+        None,
+        lookup,
+    )
+}
+
 fn recorded_impact_ceiling(best_ask: Price, cap_bps: i32) -> Result<Price, EconomicReplayError> {
     let cap_bps = u32::try_from(cap_bps)
         .ok()
@@ -3364,6 +3566,14 @@ fn verify_replayed_live_risk_with_index(
     if derived.baseline_sequence.is_none() {
         return Ok(());
     }
+    if admission.economic.observation.is_none() {
+        return Err(ProjectionReducerError::InvalidRiskEvidence);
+    }
+    let projection = admission
+        .identity
+        .fill_projection
+        .as_deref()
+        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
     let evaluated_at_unix_ms = admission.economic.risk.evaluated_at_unix_ms;
     let cash_before = CollateralAmount::from_decimal_exact(
         derived
@@ -3371,10 +3581,14 @@ fn verify_replayed_live_risk_with_index(
             .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
     )
     .map_err(|_| ProjectionReducerError::Arithmetic)?;
-    let source_backed_economic = replay_source_backed_economic(
+    let source_backed_economic = replay_source_backed_economic_with_live_binding(
         &admission.economic,
         evaluated_at_unix_ms,
         cash_before,
+        Some(LiveObservationBinding {
+            account_id,
+            identity: &admission.identity,
+        }),
         |receipt| {
             let envelope = match source_receipts {
                 Some(index) => index
@@ -3435,11 +3649,6 @@ fn verify_replayed_live_risk_with_index(
     )
     .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     let paper_era = paper_era(paper_prefix.to_vec());
-    let projection = admission
-        .identity
-        .fill_projection
-        .as_deref()
-        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
     let per_trade_cap_bps = admission.economic.risk.snapshot.per_trade_cap_bps;
     if !(1..=10_000).contains(&per_trade_cap_bps) {
         return Err(ProjectionReducerError::InvalidRiskEvidence);
@@ -8109,13 +8318,7 @@ mod tests {
         now: OffsetDateTime,
     ) -> (AppendReceipt, String) {
         let prepared = finality_prepared();
-        let condition_id = prepared
-            .identity
-            .fill_projection
-            .as_ref()
-            .unwrap()
-            .market_id
-            .clone();
+        let condition_id = prepared.economic.market.market_id.clone();
         let source =
             gamma_risk_price_source(fixture_receipt(0), &condition_id, ["0.9", "0.1"], now);
         let input = EnvelopeIn {
@@ -8174,6 +8377,14 @@ mod tests {
         let mut prior = finality_prepared();
         prior.economic.admission.market.observed_at_unix = now.unix_timestamp();
         prior.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
+        let _ = bind_activity_observation(
+            &mut prior,
+            &account_id,
+            fixture_receipt(5),
+            fixture_receipt(6),
+            now,
+            now,
+        );
         let events = vec![
             baseline_event(&account_id, 0),
             approved_admission_event(&account_id, &prior, 1, now),
@@ -8188,7 +8399,7 @@ mod tests {
         ];
         let price_receipt = fixture_receipt(200);
         let mut sources = baseline_sources(&account_id);
-        sources.extend(economic_source_envelopes(&prior.economic, now));
+        sources.extend(economic_source_envelopes(&prior, now));
         let derived = derive_projection_rows_with_sources(&account_id, &events, &sources).unwrap();
         let condition_id = derived.positions[0].market_id.clone();
         sources.push(gamma_risk_price_source(
@@ -8210,6 +8421,14 @@ mod tests {
         candidate.economic.admission.market.observed_at_unix = now.unix_timestamp();
         candidate.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         candidate.identity = projection_identity("risk-candidate");
+        let _ = bind_activity_observation(
+            &mut candidate,
+            &account_id,
+            fixture_receipt(5),
+            fixture_receipt(6),
+            now,
+            now,
+        );
         candidate.economic.balance.cash_before =
             CollateralAmount::from_decimal_exact(derived.economic_cash.unwrap()).unwrap();
         let projection = candidate.identity.fill_projection.as_ref().unwrap();
@@ -8617,22 +8836,29 @@ mod tests {
     }
 
     fn observation_replay_fixture() -> (
-        EconomicPrepared,
+        Box<pe_execution_core::LiveOrderPreparedAudit>,
+        AccountId,
         Vec<(AppendReceipt, RecordedEconomicSource)>,
     ) {
-        let mut economic = finality_prepared().economic;
-        economic.admission.market.observed_at_unix = 20;
-        economic.admission.settlement.observed_at_unix = 20;
-        economic.risk.snapshot.per_trade_cap_bps = 10_000;
-        economic.risk.evaluated_at_unix_ms = 30_000;
+        let mut prepared = finality_prepared();
+        prepared.economic.admission.market.observed_at_unix = 20;
+        prepared.economic.admission.settlement.observed_at_unix = 20;
+        prepared.economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        prepared.economic.risk.evaluated_at_unix_ms = 30_000;
         let source_receipt = fixture_receipt(5);
         let complete_bound_receipt = fixture_receipt(6);
-        economic.observation = Some(ObservationEvidence {
+        let account_id = AccountId::new("account").unwrap();
+        let source_time = OffsetDateTime::from_unix_timestamp(18).unwrap();
+        let observed_at = OffsetDateTime::from_unix_timestamp(19).unwrap();
+        let (websocket, rest) = bind_activity_observation(
+            &mut prepared,
+            &account_id,
             source_receipt,
             complete_bound_receipt,
-            observed_unix_ms: 19_000,
-            provenance: "activity_ws".to_owned(),
-        });
+            observed_at,
+            source_time,
+        );
+        let economic = &prepared.economic;
         let payloads = economic_source_payloads(&economic.market.condition_id.0);
         let receipts = [
             economic.admission.receipts.gamma,
@@ -8668,7 +8894,7 @@ mod tests {
             (
                 source_receipt,
                 RecordedEconomicSource {
-                    payload: br#"{"event":"trade"}"#.to_vec(),
+                    payload: websocket,
                     received_unix_ms: 19_000,
                     source_id: crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned(),
                     schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
@@ -8679,7 +8905,7 @@ mod tests {
             (
                 complete_bound_receipt,
                 RecordedEconomicSource {
-                    payload: br#"[]"#.to_vec(),
+                    payload: rest,
                     received_unix_ms: 20_000,
                     source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
                     schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
@@ -8688,17 +8914,23 @@ mod tests {
                 },
             ),
         ]);
-        (economic, sources)
+        (prepared, account_id, sources)
     }
 
     fn replay_observation_fixture(
-        economic: &EconomicPrepared,
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        account_id: &AccountId,
         sources: &[(AppendReceipt, RecordedEconomicSource)],
     ) -> Result<SourceBackedEconomicReplay, EconomicReplayError> {
-        replay_source_backed_economic(
+        let economic = &prepared.economic;
+        replay_source_backed_economic_with_live_binding(
             economic,
             economic.risk.evaluated_at_unix_ms,
             CollateralAmount::from_atomic(10_000_000),
+            Some(LiveObservationBinding {
+                account_id,
+                identity: &prepared.identity,
+            }),
             |receipt| {
                 sources
                     .iter()
@@ -8714,15 +8946,15 @@ mod tests {
     /// FAIL: either the websocket or REST observation provenance cannot replay from valid inputs.
     #[test]
     fn strict_live_economic_validates_observation_receipts() {
-        let (economic, sources) = observation_replay_fixture();
-        replay_observation_fixture(&economic, &sources).unwrap();
+        let (prepared, account_id, sources) = observation_replay_fixture();
+        replay_observation_fixture(&prepared, &account_id, &sources).unwrap();
 
-        let mut rest_poll = economic.clone();
-        let observation = rest_poll.observation.as_mut().unwrap();
+        let mut rest_poll = prepared.clone();
+        let observation = rest_poll.economic.observation.as_mut().unwrap();
         observation.source_receipt = observation.complete_bound_receipt;
         observation.observed_unix_ms = 20_000;
         observation.provenance = "rest_poll".to_owned();
-        replay_observation_fixture(&rest_poll, &sources).unwrap();
+        replay_observation_fixture(&rest_poll, &account_id, &sources).unwrap();
     }
 
     /// PASS: removing either observation receipt, changing its source contract or provenance,
@@ -8730,8 +8962,8 @@ mod tests {
     /// FAIL: any missing, future, or tampered observation evidence remains replayable.
     #[test]
     fn strict_live_economic_rejects_absent_or_tampered_observation_receipts() {
-        let (economic, sources) = observation_replay_fixture();
-        let observation = economic.observation.as_ref().unwrap();
+        let (prepared, account_id, sources) = observation_replay_fixture();
+        let observation = prepared.economic.observation.as_ref().unwrap();
         for missing_receipt in [
             observation.source_receipt,
             observation.complete_bound_receipt,
@@ -8741,7 +8973,7 @@ mod tests {
                 .filter(|(receipt, _)| *receipt != missing_receipt)
                 .cloned()
                 .collect::<Vec<_>>();
-            assert!(replay_observation_fixture(&economic, &missing).is_err());
+            assert!(replay_observation_fixture(&prepared, &account_id, &missing).is_err());
         }
 
         let mut wrong_contract = sources.clone();
@@ -8751,15 +8983,25 @@ mod tests {
             .unwrap()
             .1
             .source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
-        assert!(replay_observation_fixture(&economic, &wrong_contract).is_err());
+        assert!(replay_observation_fixture(&prepared, &account_id, &wrong_contract).is_err());
 
-        let mut wrong_provenance = economic.clone();
-        wrong_provenance.observation.as_mut().unwrap().provenance = "rest_poll".to_owned();
-        assert!(replay_observation_fixture(&wrong_provenance, &sources).is_err());
+        let mut wrong_provenance = prepared.clone();
+        wrong_provenance
+            .economic
+            .observation
+            .as_mut()
+            .unwrap()
+            .provenance = "rest_poll".to_owned();
+        assert!(replay_observation_fixture(&wrong_provenance, &account_id, &sources).is_err());
 
-        let mut wrong_clock = economic.clone();
-        wrong_clock.observation.as_mut().unwrap().observed_unix_ms += 1;
-        assert!(replay_observation_fixture(&wrong_clock, &sources).is_err());
+        let mut wrong_clock = prepared.clone();
+        wrong_clock
+            .economic
+            .observation
+            .as_mut()
+            .unwrap()
+            .observed_unix_ms += 1;
+        assert!(replay_observation_fixture(&wrong_clock, &account_id, &sources).is_err());
 
         for future_receipt in [
             observation.source_receipt,
@@ -8771,8 +9013,122 @@ mod tests {
                 .find(|(receipt, _)| *receipt == future_receipt)
                 .unwrap()
                 .1
-                .received_unix_ms = economic.risk.evaluated_at_unix_ms + 1;
-            assert!(replay_observation_fixture(&economic, &future_source).is_err());
+                .received_unix_ms = prepared.economic.risk.evaluated_at_unix_ms + 1;
+            assert!(replay_observation_fixture(&prepared, &account_id, &future_source).is_err());
+        }
+
+        let mut missing = prepared.clone();
+        missing.economic.observation = None;
+        assert!(replay_observation_fixture(&missing, &account_id, &sources).is_err());
+    }
+
+    /// PASS: current live replay rejects malformed websocket evidence and websocket payloads that
+    /// identify a different wallet or trade, even when the referenced receipt metadata is valid.
+    /// FAIL: any selected payload that cannot reproduce the recorded trade remains replayable.
+    #[test]
+    fn strict_live_economic_rejects_malformed_or_different_selected_trade() {
+        let (prepared, account_id, sources) = observation_replay_fixture();
+        let selected = prepared
+            .economic
+            .observation
+            .as_ref()
+            .unwrap()
+            .source_receipt;
+        for payload in [
+            br#"{"malformed":true}"#.to_vec(),
+            serde_json::to_vec(&serde_json::json!({
+                "proxyWallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "timestamp": 18,
+                "conditionId": prepared.economic.market.condition_id.0,
+                "asset": prepared.economic.market.token_id.0,
+                "side": "BUY",
+                "size": "10.000000",
+                "price": "0.80",
+                "transactionHash": format!("0x{}", "55".repeat(32)),
+                "outcomeIndex": 0,
+                "outcome": "Yes"
+            }))
+            .unwrap(),
+            activity_payload_pair(
+                &prepared.economic,
+                OffsetDateTime::from_unix_timestamp(18).unwrap(),
+                WalletAddress([0xaa; 20]),
+                &format!("0x{}", "66".repeat(32)),
+            )
+            .0,
+        ] {
+            let mut changed = sources.clone();
+            changed
+                .iter_mut()
+                .find(|(receipt, _)| *receipt == selected)
+                .unwrap()
+                .1
+                .payload = payload;
+            assert!(replay_observation_fixture(&prepared, &account_id, &changed).is_err());
+        }
+    }
+
+    /// PASS: current live replay rejects a syntactically valid complete REST page that is
+    /// unrelated to the selected websocket trade.
+    /// FAIL: receipt metadata alone allows an unrelated REST page to satisfy the binding.
+    #[test]
+    fn strict_live_economic_rejects_unrelated_rest_page() {
+        let (prepared, account_id, mut sources) = observation_replay_fixture();
+        let bound = prepared
+            .economic
+            .observation
+            .as_ref()
+            .unwrap()
+            .complete_bound_receipt;
+        let unrelated = activity_payload_pair(
+            &prepared.economic,
+            OffsetDateTime::from_unix_timestamp(18).unwrap(),
+            WalletAddress([0xaa; 20]),
+            &format!("0x{}", "66".repeat(32)),
+        )
+        .1;
+        sources
+            .iter_mut()
+            .find(|(receipt, _)| *receipt == bound)
+            .unwrap()
+            .1
+            .payload = unrelated;
+        assert!(replay_observation_fixture(&prepared, &account_id, &sources).is_err());
+    }
+
+    /// PASS: changing only the REST trade's exact quantity, price, or source clock leaves its
+    /// group identity intact but breaks the recorded live decision binding.
+    /// FAIL: strict replay accepts different economic signal inputs under the same trade id.
+    #[test]
+    fn strict_live_economic_binds_trade_quantity_price_and_source_clock() {
+        let (prepared, account_id, sources) = observation_replay_fixture();
+        let bound = prepared
+            .economic
+            .observation
+            .as_ref()
+            .unwrap()
+            .complete_bound_receipt;
+        for (field, value) in [
+            ("size", serde_json::json!("9.000000")),
+            ("price", serde_json::json!("0.70")),
+            ("timestamp", serde_json::json!(17)),
+        ] {
+            let mut changed = sources.clone();
+            let source = &mut changed
+                .iter_mut()
+                .find(|(receipt, _)| *receipt == bound)
+                .unwrap()
+                .1;
+            let mut payload: serde_json::Value = serde_json::from_slice(&source.payload).unwrap();
+            payload.as_array_mut().unwrap()[0]
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), value);
+            source.payload = serde_json::to_vec(&payload).unwrap();
+            assert!(
+                replay_observation_fixture(&prepared, &account_id, &changed).is_err(),
+                "{field}"
+            );
         }
     }
 
@@ -9593,6 +9949,103 @@ mod tests {
         }
     }
 
+    fn activity_payload_pair(
+        economic: &EconomicPrepared,
+        source_time: OffsetDateTime,
+        wallet: WalletAddress,
+        transaction_hash: &str,
+    ) -> (Vec<u8>, Vec<u8>, SourceTradeId) {
+        let common = serde_json::json!({
+            "proxyWallet": wallet.to_string(),
+            "timestamp": source_time.unix_timestamp(),
+            "conditionId": economic.market.condition_id.0,
+            "asset": economic.market.token_id.0,
+            "side": "BUY",
+            "size": "10.000000",
+            "price": economic.balance.chase_ceiling.0.to_string(),
+            "transactionHash": transaction_hash,
+            "outcomeIndex": economic.market.outcome_index,
+            "outcome": "Yes",
+        });
+        let websocket = serde_json::to_vec(&common).unwrap();
+        let mut rest = common;
+        let object = rest.as_object_mut().unwrap();
+        object.insert("type".to_owned(), serde_json::json!("TRADE"));
+        object.insert("usdcSize".to_owned(), serde_json::json!("8.000000"));
+        object.insert("isCombo".to_owned(), serde_json::json!(false));
+        let rest = serde_json::to_vec(&vec![rest]).unwrap();
+        let source_trade_id = parse_activity_trade_observation(&websocket)
+            .unwrap()
+            .group_id
+            .key()
+            .clone();
+        (websocket, rest, source_trade_id)
+    }
+
+    fn bind_activity_observation(
+        prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
+        account_id: &AccountId,
+        source_receipt: AppendReceipt,
+        complete_bound_receipt: AppendReceipt,
+        observed_at: OffsetDateTime,
+        source_time: OffsetDateTime,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let leader = WalletAddress([0xaa; 20]);
+        let (websocket, rest, source_trade_id) = activity_payload_pair(
+            &prepared.economic,
+            source_time,
+            leader,
+            &format!("0x{}", "55".repeat(32)),
+        );
+        let signal = LeaderSignal {
+            leader: TraderId(leader),
+            venue: VenueId::polymarket(),
+            market_id: MarketId(VenueMarketId(prepared.economic.market.market_id.clone())),
+            outcome_id: OutcomeId(u16::from(prepared.economic.market.outcome_index)),
+            action: LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: prepared.economic.balance.chase_ceiling,
+            leader_size: ShareAmount::from_whole(10).unwrap(),
+            observed_at: source_time,
+            received_at: source_time,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            source_trade_id: source_trade_id.clone(),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+        };
+        prepared.identity.fill_projection = Some(Box::new(LiveFillProjectionIdentity {
+            leader_wallet: leader.to_string(),
+            source_trade_id: Some(source_trade_id.0),
+            market_id: prepared.economic.market.market_id.clone(),
+            outcome_id: i64::from(prepared.economic.market.outcome_index),
+            side: "buy".to_owned(),
+        }));
+        prepared.identity.decision_hash = hash_json(&(
+            "prediction-edge/live-decision/v1",
+            &signal,
+            account_id.as_str(),
+            &prepared.identity.config_hash,
+            &prepared.identity.quote_id,
+            &prepared.identity.evidence_hashes,
+        ))
+        .unwrap();
+        prepared.economic.observation = Some(ObservationEvidence {
+            source_receipt,
+            complete_bound_receipt,
+            observed_unix_ms: unix_millis_i64(observed_at),
+            provenance: "activity_ws".to_owned(),
+        });
+        (websocket, rest)
+    }
+
+    fn fixture_observation_evidence() -> ObservationEvidence {
+        ObservationEvidence {
+            source_receipt: fixture_receipt(5),
+            complete_bound_receipt: fixture_receipt(6),
+            observed_unix_ms: 0,
+            provenance: "activity_ws".to_owned(),
+        }
+    }
+
     fn projection_identity(dispatch_id: &str) -> LiveOrderIdentity {
         let signal = projection_signal();
         let account_id = AccountId::new("account").unwrap();
@@ -10246,9 +10699,10 @@ mod tests {
     }
 
     fn economic_source_envelopes(
-        economic: &EconomicPrepared,
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
         received_at: OffsetDateTime,
     ) -> Vec<EventEnvelope> {
+        let economic = &prepared.economic;
         let payloads = economic_source_payloads_with_end(
             &economic.market.condition_id.0,
             economic.admission.scheduled_end_unix,
@@ -10265,21 +10719,48 @@ mod tests {
             CLOB_COMPACT_MARKET_SOURCE_ID,
             CLOB_BOOK_SOURCE_ID,
         ];
-        receipts
+        let mut sources = receipts
             .into_iter()
             .zip(source_ids)
             .zip(payloads)
             .map(|((receipt, source_id), payload)| {
                 source_envelope(receipt, source_id, payload, received_at)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let observation = economic.observation.as_ref().unwrap();
+        let (websocket, rest, _) = activity_payload_pair(
+            economic,
+            received_at,
+            WalletAddress([0xaa; 20]),
+            &format!("0x{}", "55".repeat(32)),
+        );
+        for (receipt, source_id, payload) in [
+            (
+                observation.source_receipt,
+                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+                websocket,
+            ),
+            (
+                observation.complete_bound_receipt,
+                crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+                rest,
+            ),
+        ] {
+            let mut envelope = source_envelope(receipt, source_id, payload, received_at);
+            envelope.schema_version = pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION;
+            envelope.parser_version = pe_source_polymarket_public::ACTIVITY_PARSER_VERSION;
+            sources.push(envelope);
+        }
+        sources
     }
 
     async fn append_economic_sources(
         state: &FanoutState,
-        economic: &mut EconomicPrepared,
+        prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
+        account_id: &AccountId,
         received_at: OffsetDateTime,
     ) {
+        let economic = &mut prepared.economic;
         let payloads = economic_source_payloads_with_end(
             &economic.market.condition_id.0,
             economic.admission.scheduled_end_unix,
@@ -10319,6 +10800,42 @@ mod tests {
         economic.admission.settlement.observed_at_unix = received_at.unix_timestamp();
         economic.admission.settlement.raw_evidence_hash =
             blake3::hash(&payloads[1]).to_hex().to_string();
+        let (websocket, rest, _) = activity_payload_pair(
+            economic,
+            received_at,
+            WalletAddress([0xaa; 20]),
+            &format!("0x{}", "55".repeat(32)),
+        );
+        let mut observation_receipts = Vec::new();
+        for (source_id, payload) in [
+            (crate::activity_ingest::ACTIVITY_WS_SOURCE_ID, websocket),
+            (crate::trade_poller::ACTIVITY_POLL_SOURCE_ID, rest),
+        ] {
+            observation_receipts.push(
+                state
+                    .config
+                    .source_log
+                    .append(EnvelopeIn {
+                        source_id: SourceId(source_id.to_owned()),
+                        schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                        parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                        observed_at: SourceTimestamp(received_at),
+                        received_at: ReceivedAt(received_at),
+                        content_type: ContentType::Json,
+                        payload,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let _ = bind_activity_observation(
+            prepared,
+            account_id,
+            observation_receipts[0],
+            observation_receipts[1],
+            received_at,
+            received_at,
+        );
     }
 
     fn finality_prepared() -> Box<pe_execution_core::LiveOrderPreparedAudit> {
@@ -10600,7 +11117,7 @@ mod tests {
         prior.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         prior.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         bind_empty_live_risk_to_paper_prefix(state, &mut prior, now);
-        append_economic_sources(state, &mut prior.economic, now).await;
+        append_economic_sources(state, &mut prior, account_id, now).await;
         append_approved_admission(state.config.journal.as_ref(), account_id, &prior, now);
         let prepared = state
             .config
@@ -10661,6 +11178,14 @@ mod tests {
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = unix_millis_i64(now);
         prepared.economic.risk.price_receipts.clear();
+        let _ = bind_activity_observation(
+            &mut prepared,
+            &account_id,
+            fixture_receipt(5),
+            fixture_receipt(6),
+            now,
+            now,
+        );
         if let Some(price_receipt) = risk_price_receipt {
             let (events, derived) =
                 append_recovery_filled_position(state, &account_id, &prepared.account_state, now)
@@ -10710,7 +11235,7 @@ mod tests {
         } else {
             bind_empty_live_risk_to_paper_prefix(state, &mut prepared, now);
         }
-        append_economic_sources(state, &mut prepared.economic, now).await;
+        append_economic_sources(state, &mut prepared, &account_id, now).await;
         // The fake venue returns this prepared order verbatim; the resume path requires it to
         // match the request derived from the admission (ladder debit and identity hashes).
         prepared.prepared.worst_case_debit = prepared.prepared.maker_collateral;
@@ -10752,6 +11277,58 @@ mod tests {
         let derived = derive_projection_rows_for_state(&state, &account_id, &events).unwrap();
         assert_eq!(derived.positions.len(), 1);
         assert_eq!(derived.positions[0].market_id, condition_id);
+    }
+
+    /// PASS: a post-Baseline Approved admission with legacy `None` observation fails strict
+    /// recovery inventory before preparation and leaves the journal with zero order POST facts.
+    /// FAIL: current-era recovery treats the readable legacy shape as executable work.
+    #[tokio::test]
+    async fn current_recovery_rejects_missing_observation_before_post() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut state = fanout_state(
+            &dir,
+            db.clone(),
+            armed_snapshot("acct"),
+            "http://127.0.0.1:9",
+            None,
+        );
+        let account_id = AccountId::new("acct").unwrap();
+        stage(
+            state.config.paper_state.as_ref(),
+            "dispatch-finality",
+            now.unix_timestamp(),
+            &["acct"],
+        );
+        let mut prepared = finality_prepared();
+        prepared.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for(&prepared.identity.dispatch_id, &account_id);
+        prepared.account_state = append_recovery_baseline(
+            &state,
+            &account_id,
+            now,
+            CollateralAmount::from_atomic(10_000_000),
+        )
+        .await;
+        prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
+        prepared.economic.risk.evaluated_at_unix_ms = unix_millis_i64(now);
+        bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
+        append_economic_sources(&state, &mut prepared, &account_id, now).await;
+        prepared.economic.observation = None;
+        append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
+
+        assert!(verified_recovery_inventory(&state).is_err());
+        assert!(run_recovery_pass(&mut state, || now, true).await.is_err());
+        let events = replay_live_account(&state, &account_id).unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event.payload,
+            LiveJournalPayload::OrderPrepared(_) | LiveJournalPayload::OrderPosted(_)
+        )));
+        assert_eq!(
+            db.dispatch_targets("dispatch-finality").unwrap()[0].state,
+            "pending"
+        );
     }
 
     /// PASS: two Approved facts for one account/dispatch conflict before any recovery
@@ -12722,7 +13299,7 @@ mod tests {
                 now.unix_timestamp().saturating_mul(1_000);
             prepared.economic.risk.price_receipts.clear();
             bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
-            append_economic_sources(&state, &mut prepared.economic, now).await;
+            append_economic_sources(&state, &mut prepared, &account_id, now).await;
             if preparation_failed {
                 append_approved_admission(
                     state.config.journal.as_ref(),
@@ -14993,9 +15570,16 @@ mod tests {
         );
         let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
         let target = db.dispatch_targets(&seed.dispatch_id).unwrap().remove(0);
-        let control = process_target(&mut state, &seed, &target, &projection_signal(), None, now)
-            .await
-            .unwrap();
+        let control = process_target(
+            &mut state,
+            &seed,
+            &target,
+            &projection_signal(),
+            &fixture_observation_evidence(),
+            now,
+        )
+        .await
+        .unwrap();
         assert_eq!(control, PassControl::StopSeed);
         assert_eq!(
             db.dispatch_targets("seed-stale").unwrap()[0].state,
@@ -15045,9 +15629,16 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
         let target = db.dispatch_targets(&seed.dispatch_id).unwrap().remove(0);
-        let control = process_target(&mut state, &seed, &target, &projection_signal(), None, now)
-            .await
-            .unwrap();
+        let control = process_target(
+            &mut state,
+            &seed,
+            &target,
+            &projection_signal(),
+            &fixture_observation_evidence(),
+            now,
+        )
+        .await
+        .unwrap();
         assert_eq!(control, PassControl::FreezePass, "dispatch stays frozen");
         assert_eq!(
             db.dispatch_targets("seed-inflight").unwrap()[0].state,
@@ -15073,6 +15664,14 @@ mod tests {
         );
         let account_id = AccountId::new("acct").unwrap();
         let mut prepared = finality_prepared();
+        let _ = bind_activity_observation(
+            &mut prepared,
+            &account_id,
+            fixture_receipt(5),
+            fixture_receipt(6),
+            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::UNIX_EPOCH,
+        );
         let baseline = baseline_event(&account_id, 0);
         if let LiveJournalPayload::AccountPortfolioMarked(mark) = &baseline.payload {
             prepared.account_state = mark.account_state.clone();
@@ -15127,7 +15726,7 @@ mod tests {
             &seed,
             &target,
             &projection_signal(),
-            None,
+            &fixture_observation_evidence(),
             OffsetDateTime::from_unix_timestamp(20).unwrap(),
         )
         .await
@@ -15190,6 +15789,55 @@ mod tests {
         })
         .unwrap();
         db.flip_dispatch_ready(id, "fill").unwrap();
+    }
+
+    /// PASS: a schema-one pending seed without observation evidence fails before target dispatch;
+    /// the target remains pending and the live journal records no attempted admission or POST.
+    /// FAIL: activation silently upgrades an open legacy seed or reaches account/venue work.
+    #[tokio::test]
+    async fn current_dispatch_seed_requires_observation_before_network_work() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        db.stage_dispatch_seed(&DispatchSeedRecord {
+            dispatch_id: "missing-observation".to_owned(),
+            signal_json: serde_json::to_string(&serde_json::json!({
+                "schema_version": 1,
+                "signal": projection_signal(),
+            }))
+            .unwrap(),
+            source_trade_id: "source-missing-observation".to_owned(),
+            created_at_unix: 1_700_000_000,
+            targets: vec![DispatchTargetSeed {
+                account_id: "acct".to_owned(),
+                credential_bundle_version: 1,
+                credential_key_id: "key".to_owned(),
+            }],
+        })
+        .unwrap();
+        db.flip_dispatch_ready("missing-observation", "fill")
+            .unwrap();
+        let mut state = fanout_state(
+            &dir,
+            db.clone(),
+            armed_snapshot("acct"),
+            "http://127.0.0.1:9",
+            None,
+        );
+
+        assert!(matches!(
+            run_dispatch_pass(&mut state).await,
+            Err(FanoutError::Signal(reason))
+                if reason.contains("activation requires no open live work")
+        ));
+        assert_eq!(
+            db.dispatch_targets("missing-observation").unwrap()[0].state,
+            "pending"
+        );
+        assert!(
+            replay_account(&state.config.journal_path, &AccountId::new("acct").unwrap())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     async fn fixture_pass(db: &PaperStateDb, venue: &FakeVenue, armed: &HashSet<&str>) {

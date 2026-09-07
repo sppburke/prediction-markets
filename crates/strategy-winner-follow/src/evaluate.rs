@@ -208,7 +208,7 @@ impl WinnerFollowStrategy {
             SizingMode::Contract { contracts } => contracts,
             SizingMode::Kelly => {
                 // 4. Kelly fraction.
-                let kf = kelly_fraction(effective_mode, self.config.kelly_fraction_override);
+                let kf = self.effective_kelly_fraction(effective_mode);
 
                 let kelly_input = KellyInput {
                     p,
@@ -235,6 +235,15 @@ impl WinnerFollowStrategy {
 
         // 7. Build OrderIntent.
         Ok(build_order_intent(signal, contracts, signal.leader_price))
+    }
+
+    /// Resolve the configured Kelly fraction for one execution mode.
+    ///
+    /// This is the strategy-owned mode/override policy used by evaluation and by callers that
+    /// must record the exact sizing input before invoking the venue planner.
+    #[must_use]
+    pub fn effective_kelly_fraction(&self, mode: ExecutionMode) -> KellyFraction {
+        kelly_fraction(mode, self.config.kelly_fraction_override)
     }
 }
 
@@ -418,5 +427,34 @@ mod canary_tests {
         let expected = organic_decision_proof_hash(&proof).unwrap();
         proof.evidence_hashes.push("forged".to_owned());
         assert_ne!(organic_decision_proof_hash(&proof).unwrap(), expected);
+    }
+
+    #[test]
+    fn effective_kelly_fraction_owns_mode_defaults_and_override() {
+        let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
+        for mode in [ExecutionMode::Paper, ExecutionMode::Shadow] {
+            assert_eq!(
+                strategy.effective_kelly_fraction(mode),
+                KELLY_PAPER_BACKTEST
+            );
+        }
+        for mode in [ExecutionMode::LiveTiny, ExecutionMode::Promoted] {
+            assert_eq!(strategy.effective_kelly_fraction(mode), KELLY_NORMAL);
+        }
+
+        let override_fraction = KellyFraction(dec!(0.13));
+        let config = WinnerFollowConfig {
+            kelly_fraction_override: Some(override_fraction),
+            ..WinnerFollowConfig::default()
+        };
+        let strategy = WinnerFollowStrategy::new(config);
+        for mode in [
+            ExecutionMode::Paper,
+            ExecutionMode::Shadow,
+            ExecutionMode::LiveTiny,
+            ExecutionMode::Promoted,
+        ] {
+            assert_eq!(strategy.effective_kelly_fraction(mode), override_fraction);
+        }
     }
 }
