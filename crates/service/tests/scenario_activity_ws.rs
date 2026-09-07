@@ -48,37 +48,57 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    routing::{get, post},
+};
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
-    BasisPoints, LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, ReceivedAt,
-    ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
-    VenueMarketId, WalletAddress,
+    BasisPoints, CollateralAmount, LeaderAction, MarketId, OutcomeId, PolymarketConditionId,
+    PolymarketTokenId, Price, ProbabilityPpm, ReceivedAt, ReconstructionQuality, ShareAmount, Side,
+    SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
+use pe_event_log::{ContentType, EnvelopeIn, Reader, Scanner, Writer};
+use pe_execution_core::{AdmissionReceipts, LiveAdmissionArtifact};
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
 };
+use pe_resolver_card::{
+    VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+};
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
-use pe_service::bucket_commit::DecisionContinuationFacts;
-use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
+use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts, PageOccurrence};
+use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook, ReqwestClobBookFetcher};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
-use pe_service::live_accounts::LiveAccounts;
+use pe_service::live_accounts::{
+    AccountRow, CredentialMetaRow, LiveAccounts, LiveAccountsSnapshot,
+};
+use pe_service::live_venue_adapter::LiveAdmissionBuilder;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
-use pe_service::paper_recovery::build_leader_ledger;
+use pe_service::paper_recovery::{
+    PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, QualificationStarted, TailBinding,
+    build_leader_ledger,
+};
+use pe_service::risk_inputs::SourceReceiptIndex;
+use pe_service::runtime_config::RuntimeConfig;
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::trade_parser;
+use pe_service::{config::ServiceConfig, mark_prices::HistoricalMarkAdapter};
 use pe_source_polymarket_public::{
     ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, ACTIVITY_WS_SUBSCRIBE, ActivityWsError,
-    ActivityWsPeer, FixtureFetcher, parse_activity_frame, parse_activity_trade_observation,
+    ActivityWsPeer, FixtureFetcher, LiveMarketEvidence, parse_activity_frame,
+    parse_activity_response, parse_activity_trade_observation,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+use pe_venue_polymarket::CompactFeeSchedule;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -1448,6 +1468,672 @@ async fn r9_stale_acknowledged_bucket_commits_no_copy() {
             .is_seen(&bucket_id("0xsecond", market()))
             .unwrap()
     );
+}
+
+/// PASS: receipt-scoped V3 observation resolution advances the deterministic clock from an age of
+/// 1,999 ms to 2,001 ms before the final sample, so no live dispatch target is staged.
+/// FAIL: the final age sample precedes observation resolution and the armed account receives a
+/// dispatch seed.
+#[tokio::test]
+async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let paper_path = dir.path().join("paper.log");
+    let state_path = dir.path().join("paper.db");
+    let observed_at = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+    let condition = market();
+    let token_id = format!("{condition}-0");
+    let activity = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": leader_wallet().to_string(),
+        "timestamp": observed_at.unix_timestamp(),
+        "conditionId": condition.to_string(),
+        "type": "TRADE",
+        "size": "100",
+        "usdcSize": "50",
+        "transactionHash": "0xresolution-delay",
+        "price": "0.50",
+        "asset": token_id,
+        "side": "BUY",
+        "outcomeIndex": 0,
+        "outcome": "Yes",
+        "isCombo": false
+    }]))
+    .unwrap();
+    let mut source_writer = Writer::open(&source_path).unwrap();
+    let page_receipt = source_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(observed_at),
+            received_at: ReceivedAt(observed_at),
+            content_type: ContentType::Json,
+            payload: activity.clone(),
+        })
+        .unwrap();
+    drop(source_writer);
+    let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+
+    let paper_state = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: observed_at.unix_timestamp(),
+        })
+        .unwrap();
+    support::install_empty_anchor(&paper_state, leader_wallet(), 0);
+
+    let mut runtime = RuntimeConfig::from_service_config(&ServiceConfig::default());
+    runtime.mode = "paper".to_owned();
+    runtime.max_resolution_horizon_secs = 0;
+    runtime.min_resolution_horizon_secs = 0;
+    runtime.price_impact_cap_bps = 100;
+    runtime.sizing_mode = SizingMode::Dollar { usd: dec!(10) };
+    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let start_at = observed_at - time::Duration::seconds(1);
+    let paper_prefix = TailBinding::from(&Scanner::verify(&paper_path).unwrap());
+    let source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+    let start = paper_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: PAPER_LOG_SCHEMA_VERSION,
+            parser_version: 1,
+            observed_at: SourceTimestamp(start_at),
+            received_at: ReceivedAt(start_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+                QualificationStarted {
+                    starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+                    paper_prefix,
+                    source_prefix,
+                    live_prefix: TailBinding {
+                        physical_tail: 0,
+                        last_sequence: None,
+                        last_hash: "00".repeat(32),
+                    },
+                    artifact_blake3: "scenario".to_owned(),
+                    static_config_hash: "scenario".to_owned(),
+                    hot_config_hash: runtime.canonical_hash(),
+                    generation: "scenario".to_owned(),
+                    activation_id: "scenario".to_owned(),
+                    ranking_batch_id: 545,
+                    membership: vec![leader_wallet()],
+                    membership_proofs_hash: "scenario".to_owned(),
+                    schema_version: 3,
+                    parser_version: 1,
+                    financial_semantic_version: 1,
+                },
+            )))
+            .unwrap(),
+        })
+        .unwrap();
+    paper_state
+        .reset_financial_era(
+            start,
+            CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+        )
+        .unwrap();
+
+    let mut accounts = LiveAccountsSnapshot::from_rows(
+        vec![AccountRow {
+            account_id: "latency-test".to_owned(),
+            is_primary: true,
+            enabled: true,
+            execution_order: 0,
+            requested_live_mode: "live_tiny".to_owned(),
+            effective_live_mode: "live_tiny".to_owned(),
+            live_price_impact_cap_bps: 100,
+            custody_wallet_address: None,
+            custody_wallet_kind: None,
+        }],
+        &[CredentialMetaRow {
+            account_id: "latency-test".to_owned(),
+            bundle_version: 1,
+            key_id: "latency-key".to_owned(),
+        }],
+    );
+    accounts.fetched_at_unix = Some(OffsetDateTime::now_utc().unix_timestamp());
+
+    let admission = LiveAdmissionArtifact {
+        market: LiveMarketEvidence {
+            condition_id: PolymarketConditionId(condition.to_string()),
+            ordered_outcome_token_ids: [
+                PolymarketTokenId(token_id.clone()),
+                PolymarketTokenId(format!("{condition}-1")),
+            ],
+            neg_risk: false,
+            minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+            minimum_order_size: ShareAmount::from_whole(1).unwrap(),
+            scheduled_end_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            schema_version: pe_source_polymarket_public::LIVE_MARKET_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::LIVE_MARKET_PARSER_VERSION,
+            freshness_window_secs: 60,
+        },
+        settlement: VenueSettlementRecord {
+            schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+            condition_id: PolymarketConditionId(condition.to_string()),
+            status: VenueResolutionStatus::Unresolved,
+            raw_evidence_hash: "scenario".to_owned(),
+            source_timestamp_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            parser_version: 1,
+            freshness_window_secs: 60,
+        },
+        fee_schedule: CompactFeeSchedule::Zero,
+        receipts: AdmissionReceipts {
+            gamma: page_receipt,
+            clob_long: page_receipt,
+            clob_compact: page_receipt,
+        },
+    };
+    let hooks = Arc::new(ScenarioHooks::default());
+    hooks.age_clock.lock().unwrap().extend([
+        observed_at + time::Duration::milliseconds(1_999),
+        observed_at + time::Duration::milliseconds(1_999),
+    ]);
+    hooks
+        .observation_resolution_advance_millis
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .admission_artifacts
+        .lock()
+        .unwrap()
+        .push_back(admission);
+
+    let book = OrderBook {
+        asks: vec![BookLevel {
+            price: dec!(0.50),
+            size: dec!(10_000),
+        }],
+        response_blake3: "scenario-book".to_owned(),
+        fetched_at_ms: 0,
+        source_receipt: Some(page_receipt),
+    };
+    let (control_tx, control_rx) = mpsc::channel(4);
+    let (source_log, _source_rx) = SourceLogHandle::channel(4);
+    let http = reqwest::Client::new();
+    let mut orchestrator = Orchestrator::new(
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        OrchestratorConfig {
+            bankroll: dec!(10_000),
+            mode: ExecutionMode::Paper,
+            signal_config: SignalConfig::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
+            min_fill_price: Decimal::ZERO,
+            price_impact_cap_bps: 100,
+            entry_gate_config: disabled_entry_gate(),
+            runtime_config: None,
+            live_accounts: Some(LiveAccounts::new(accounts)),
+            activity_ws_enabled: true,
+            copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
+        },
+        WinnerFollowStrategy::new(runtime.winner_follow_config()),
+        paper_writer,
+        Arc::clone(&paper_state),
+        build_leader_ledger(&paper_state).unwrap(),
+        healthy_ws_health(),
+        mid_cache_for(std::slice::from_ref(&condition), "0.50"),
+        control_rx,
+        None,
+        None,
+        None,
+        Arc::new(FixtureClobBookFetcher::new(HashMap::from([(
+            token_id, book,
+        )]))),
+    )
+    .unwrap();
+    orchestrator.set_scenario_hooks(Arc::clone(&hooks));
+    orchestrator
+        .configure_financial_log_paths(
+            paper_path,
+            source_path,
+            LiveAdmissionBuilder::new(
+                http.clone(),
+                "http://unused.invalid",
+                "http://unused.invalid",
+                source_log.clone(),
+            ),
+            Arc::new(HistoricalMarkAdapter::new(
+                http,
+                "http://unused.invalid",
+                source_log,
+            )),
+            source_receipts,
+        )
+        .unwrap();
+    let run = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+
+    let parse_context = pe_source_polymarket_public::ActivityParseContext {
+        source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+        observed_at: SourceTimestamp(observed_at),
+        received_at: ReceivedAt(observed_at),
+        transport: pe_source_polymarket_public::ActivityTransport::Rest,
+    };
+    let aggregates = parse_activity_response(&activity, leader_wallet(), &parse_context)
+        .unwrap()
+        .aggregates()
+        .unwrap();
+    let source_trade_id = aggregates[0].group_id.key().clone();
+    let (committed, acknowledgement) = oneshot::channel();
+    control_tx
+        .send(
+            pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context: Arc::new(BucketDecisionContext {
+                    applied_configuration: runtime,
+                    decision_inputs_json: "{}".to_owned(),
+                    page_occurrences: vec![PageOccurrence {
+                        request_url: "scenario://latency-page".to_owned(),
+                        raw_hash: blake3::hash(&activity).to_hex().to_string(),
+                        receipt: page_receipt,
+                    }],
+                    observed_source_receipts: HashMap::new(),
+                    reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    signal_config: SignalConfig::default(),
+                    copy_eligible: true,
+                    bracket_commit: false,
+                    recorded_at_unix: observed_at.unix_timestamp(),
+                    observation_provenance: HashMap::from([(
+                        source_trade_id.clone(),
+                        TradeProvenance::RestPoll,
+                    )]),
+                    no_copy_dispositions: HashMap::new(),
+                    identity_overrides: HashMap::new(),
+                    identity_unresolved: HashSet::new(),
+                    history_status: None,
+                }),
+                committed,
+            },
+        )
+        .await
+        .unwrap();
+    acknowledgement.await.unwrap().unwrap();
+    drop(control_tx);
+    run.await.unwrap();
+
+    assert!(hooks.age_clock.lock().unwrap().is_empty());
+    assert_eq!(
+        hooks
+            .observation_resolution_advance_millis
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(paper_state.pending_dispatch_seeds().unwrap().is_empty());
+    assert!(
+        paper_state
+            .unfinalized_ready_dispatch_seeds()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        paper_state
+            .no_copy_disposition(&source_trade_id)
+            .unwrap()
+            .map(|(_, _, reason)| reason),
+        Some("stale_fallback_past_copy_budget".to_owned())
+    );
+}
+
+#[derive(Clone)]
+struct WrongMarketBookLoopback {
+    expected_token: String,
+    wrong_condition: String,
+    book_requests: Arc<std::sync::atomic::AtomicUsize>,
+    post_requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn wrong_market_book_response(
+    State(state): State<WrongMarketBookLoopback>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    assert_eq!(
+        query.get("token_id"),
+        Some(&state.expected_token),
+        "runtime fetch requests the admitted outcome token"
+    );
+    state
+        .book_requests
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Json(serde_json::json!({
+        "market": state.wrong_condition,
+        "asset_id": state.expected_token,
+        "asks": [{"price": "0.50", "size": "10000"}]
+    }))
+}
+
+async fn count_wrong_market_order_post(State(state): State<WrongMarketBookLoopback>) {
+    state
+        .post_requests
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// PASS: the production `/book` fetch receives the admitted token with a usable ask ladder under
+/// a different market identity, fails closed, and creates no dispatch seed, paper preparation, or
+/// loopback order POST.
+/// FAIL: token-only validation admits the substituted condition or any downstream dispatch work.
+#[tokio::test]
+async fn clob_book_wrong_market_with_right_asset_stops_dispatch_before_seed_or_post() {
+    let condition = market();
+    let token_id = format!("{condition}-0");
+    let book_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let post_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let loopback_state = WrongMarketBookLoopback {
+        expected_token: token_id.clone(),
+        wrong_condition: market_b().to_string(),
+        book_requests: Arc::clone(&book_requests),
+        post_requests: Arc::clone(&post_requests),
+    };
+    let app = Router::new()
+        .route("/book", get(wrong_market_book_response))
+        .route("/order", post(count_wrong_market_order_post))
+        .with_state(loopback_state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let paper_path = dir.path().join("paper.log");
+    let state_path = dir.path().join("paper.db");
+    let observed_at = OffsetDateTime::now_utc();
+    let activity = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": leader_wallet().to_string(),
+        "timestamp": observed_at.unix_timestamp(),
+        "conditionId": condition.to_string(),
+        "type": "TRADE",
+        "size": "100",
+        "usdcSize": "50",
+        "transactionHash": "0xwrong-market-book",
+        "price": "0.50",
+        "asset": token_id,
+        "side": "BUY",
+        "outcomeIndex": 0,
+        "outcome": "Yes",
+        "isCombo": false
+    }]))
+    .unwrap();
+    let mut source_writer = Writer::open(&source_path).unwrap();
+    let page_receipt = source_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(observed_at),
+            received_at: ReceivedAt(observed_at),
+            content_type: ContentType::Json,
+            payload: activity.clone(),
+        })
+        .unwrap();
+    drop(source_writer);
+    let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+    let source_sink = SourceEventSink::open(&source_path).unwrap();
+    let (source_log, source_rx) = SourceLogHandle::channel(8);
+    let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+    let source_coordinator = tokio::spawn(
+        ActivityIngest::poll_only(
+            source_sink,
+            source_rx,
+            trigger_tx,
+            new_shared_health_with_ws(false, true, 90),
+        )
+        .with_source_receipt_index(source_receipts.clone())
+        .run(),
+    );
+
+    let paper_state = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: observed_at.unix_timestamp(),
+        })
+        .unwrap();
+    support::install_empty_anchor(&paper_state, leader_wallet(), 0);
+    let mut runtime = RuntimeConfig::from_service_config(&ServiceConfig::default());
+    runtime.mode = "paper".to_owned();
+    runtime.max_resolution_horizon_secs = 0;
+    runtime.min_resolution_horizon_secs = 0;
+    runtime.price_impact_cap_bps = 100;
+    runtime.sizing_mode = SizingMode::Dollar { usd: dec!(10) };
+
+    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let start_at = observed_at - time::Duration::seconds(1);
+    let start = paper_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: PAPER_LOG_SCHEMA_VERSION,
+            parser_version: 1,
+            observed_at: SourceTimestamp(start_at),
+            received_at: ReceivedAt(start_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+                QualificationStarted {
+                    starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+                    paper_prefix: TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
+                    source_prefix: TailBinding::from(&Scanner::verify(&source_path).unwrap()),
+                    live_prefix: TailBinding {
+                        physical_tail: 0,
+                        last_sequence: None,
+                        last_hash: "00".repeat(32),
+                    },
+                    artifact_blake3: "scenario".to_owned(),
+                    static_config_hash: "scenario".to_owned(),
+                    hot_config_hash: runtime.canonical_hash(),
+                    generation: "scenario".to_owned(),
+                    activation_id: "scenario".to_owned(),
+                    ranking_batch_id: 545,
+                    membership: vec![leader_wallet()],
+                    membership_proofs_hash: "scenario".to_owned(),
+                    schema_version: 3,
+                    parser_version: 1,
+                    financial_semantic_version: 1,
+                },
+            )))
+            .unwrap(),
+        })
+        .unwrap();
+    paper_state
+        .reset_financial_era(
+            start,
+            CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+        )
+        .unwrap();
+
+    let mut accounts = LiveAccountsSnapshot::from_rows(
+        vec![AccountRow {
+            account_id: "identity-test".to_owned(),
+            is_primary: true,
+            enabled: true,
+            execution_order: 0,
+            requested_live_mode: "live_tiny".to_owned(),
+            effective_live_mode: "live_tiny".to_owned(),
+            live_price_impact_cap_bps: 100,
+            custody_wallet_address: None,
+            custody_wallet_kind: None,
+        }],
+        &[CredentialMetaRow {
+            account_id: "identity-test".to_owned(),
+            bundle_version: 1,
+            key_id: "identity-key".to_owned(),
+        }],
+    );
+    accounts.fetched_at_unix = Some(observed_at.unix_timestamp());
+    let admission = LiveAdmissionArtifact {
+        market: LiveMarketEvidence {
+            condition_id: PolymarketConditionId(condition.to_string()),
+            ordered_outcome_token_ids: [
+                PolymarketTokenId(token_id),
+                PolymarketTokenId(format!("{condition}-1")),
+            ],
+            neg_risk: false,
+            minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+            minimum_order_size: ShareAmount::from_whole(1).unwrap(),
+            scheduled_end_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            schema_version: pe_source_polymarket_public::LIVE_MARKET_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::LIVE_MARKET_PARSER_VERSION,
+            freshness_window_secs: 60,
+        },
+        settlement: VenueSettlementRecord {
+            schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+            condition_id: PolymarketConditionId(condition.to_string()),
+            status: VenueResolutionStatus::Unresolved,
+            raw_evidence_hash: "scenario".to_owned(),
+            source_timestamp_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            parser_version: 1,
+            freshness_window_secs: 60,
+        },
+        fee_schedule: CompactFeeSchedule::Zero,
+        receipts: AdmissionReceipts {
+            gamma: page_receipt,
+            clob_long: page_receipt,
+            clob_compact: page_receipt,
+        },
+    };
+    let hooks = Arc::new(ScenarioHooks::default());
+    hooks
+        .admission_artifacts
+        .lock()
+        .unwrap()
+        .push_back(admission);
+
+    let (control_tx, control_rx) = mpsc::channel(4);
+    let http = reqwest::Client::new();
+    let book_fetcher = ReqwestClobBookFetcher::new(http.clone())
+        .with_base_url(format!("http://{address}"))
+        .with_source_log(source_log.clone());
+    let mut orchestrator = Orchestrator::new(
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        OrchestratorConfig {
+            bankroll: dec!(10_000),
+            mode: ExecutionMode::Paper,
+            signal_config: SignalConfig::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
+            min_fill_price: Decimal::ZERO,
+            price_impact_cap_bps: 100,
+            entry_gate_config: disabled_entry_gate(),
+            runtime_config: None,
+            live_accounts: Some(LiveAccounts::new(accounts)),
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
+        },
+        WinnerFollowStrategy::new(runtime.winner_follow_config()),
+        paper_writer,
+        Arc::clone(&paper_state),
+        build_leader_ledger(&paper_state).unwrap(),
+        healthy_ws_health(),
+        mid_cache_for(std::slice::from_ref(&condition), "0.50"),
+        control_rx,
+        None,
+        None,
+        None,
+        Arc::new(book_fetcher),
+    )
+    .unwrap();
+    orchestrator.set_scenario_hooks(Arc::clone(&hooks));
+    orchestrator
+        .configure_financial_log_paths(
+            paper_path.clone(),
+            source_path,
+            LiveAdmissionBuilder::new(
+                http.clone(),
+                "http://unused.invalid",
+                "http://unused.invalid",
+                source_log.clone(),
+            ),
+            Arc::new(HistoricalMarkAdapter::new(
+                http,
+                "http://unused.invalid",
+                source_log,
+            )),
+            source_receipts,
+        )
+        .unwrap();
+    let run = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+    let parse_context = pe_source_polymarket_public::ActivityParseContext {
+        source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+        observed_at: SourceTimestamp(observed_at),
+        received_at: ReceivedAt(observed_at),
+        transport: pe_source_polymarket_public::ActivityTransport::Rest,
+    };
+    let aggregates = parse_activity_response(&activity, leader_wallet(), &parse_context)
+        .unwrap()
+        .aggregates()
+        .unwrap();
+    let source_trade_id = aggregates[0].group_id.key().clone();
+    let (committed, acknowledgement) = oneshot::channel();
+    control_tx
+        .send(
+            pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context: Arc::new(BucketDecisionContext {
+                    applied_configuration: runtime,
+                    decision_inputs_json: "{}".to_owned(),
+                    page_occurrences: vec![PageOccurrence {
+                        request_url: "scenario://wrong-market-page".to_owned(),
+                        raw_hash: blake3::hash(&activity).to_hex().to_string(),
+                        receipt: page_receipt,
+                    }],
+                    observed_source_receipts: HashMap::new(),
+                    reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    signal_config: SignalConfig::default(),
+                    copy_eligible: true,
+                    bracket_commit: false,
+                    recorded_at_unix: observed_at.unix_timestamp(),
+                    observation_provenance: HashMap::from([(
+                        source_trade_id,
+                        TradeProvenance::RestPoll,
+                    )]),
+                    no_copy_dispositions: HashMap::new(),
+                    identity_overrides: HashMap::new(),
+                    identity_unresolved: HashSet::new(),
+                    history_status: None,
+                }),
+                committed,
+            },
+        )
+        .await
+        .unwrap();
+    acknowledgement.await.unwrap().unwrap();
+    drop(control_tx);
+    run.await.unwrap();
+
+    assert_eq!(book_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(post_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(paper_state.pending_dispatch_seeds().unwrap().is_empty());
+    assert!(
+        paper_state
+            .unfinalized_ready_dispatch_seeds()
+            .unwrap()
+            .is_empty()
+    );
+    let financial_prepared = pe_service::paper_recovery::scan_paper_log(&paper_path)
+        .unwrap()
+        .into_iter()
+        .filter(|frame| {
+            matches!(
+                frame.frame,
+                pe_service::paper_recovery::PaperLogFrame::Record(
+                    PaperLogRecord::FinancialPrepared { .. }
+                )
+            )
+        })
+        .count();
+    assert_eq!(financial_prepared, 0);
+
+    source_coordinator.abort();
+    server.abort();
 }
 
 // ── R10: shutdown paths ───────────────────────────────────────────────────────

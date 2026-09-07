@@ -5,7 +5,6 @@
 //! make storage/replay output canonical; it never selects a causal winner.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, PositionState, SignalConfig, TradeProvenance};
@@ -13,7 +12,7 @@ use pe_core_types::{
     LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, Probability, ProbabilityPpm,
     ReconstructionQuality, ShareAmount, Side, SourceTradeId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, Reader};
+use pe_event_log::AppendReceipt;
 use pe_execution_core::ObservationEvidence;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, ActivityGroupState, AnchorInstallRecord,
@@ -35,6 +34,7 @@ use serde_json::{Value, json};
 
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::position_seeder::{AnchorInstall, ledger_capture};
+use crate::risk_inputs::SourceReceiptIndex;
 use crate::runtime_config::RuntimeConfig;
 
 /// Decision inputs already read before the atomic bucket commit.
@@ -211,43 +211,18 @@ impl DecisionContinuationV3 {
         &self.page_occurrences
     }
 
-    /// Resolve every V3 receipt against the verified source log and derive observation time from
-    /// the selected envelope. No timestamp copied into continuation JSON is trusted (#545).
-    pub fn observation_from_source_log(
+    /// Resolve every V3 receipt through the boot-owned verified source-receipt index and derive
+    /// observation time from the selected receipt. No timestamp copied into continuation JSON is
+    /// trusted, and the growing source log is never replayed on this hot path (#545).
+    pub fn observation_from_receipt_index(
         &self,
-        source_log_path: &Path,
+        source_receipts: &SourceReceiptIndex,
     ) -> Result<Option<ObservationEvidence>, DecisionContinuationError> {
         let Some(selected) = self.observation_receipt() else {
             return Ok(None);
         };
-        let wanted = self
-            .page_occurrences
-            .iter()
-            .map(|page| page.receipt)
-            .chain(self.observed_source_receipt)
-            .collect::<Vec<_>>();
-        let mut matched = BTreeMap::new();
-        for item in Reader::replay(source_log_path)? {
-            let (_sequence, envelope) = item?;
-            let Some(receipt) = wanted
-                .iter()
-                .find(|receipt| receipt.sequence == envelope.seq)
-            else {
-                continue;
-            };
-            if receipt.this_hash != envelope.this_hash {
-                return Err(DecisionContinuationError::SourceReceiptMismatch {
-                    sequence: envelope.seq.0,
-                });
-            }
-            matched.insert(envelope.seq, envelope);
-        }
         for page in &self.page_occurrences {
-            let envelope = matched.get(&page.receipt.sequence).ok_or(
-                DecisionContinuationError::SourceReceiptMissing {
-                    sequence: page.receipt.sequence.0,
-                },
-            )?;
+            let envelope = source_receipts.source_envelope(page.receipt)?;
             if envelope.source_id.0 != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
                 || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
                 || envelope.parser_version != ACTIVITY_PARSER_VERSION
@@ -259,11 +234,7 @@ impl DecisionContinuationV3 {
             }
         }
         if let Some(websocket) = self.observed_source_receipt {
-            let envelope = matched.get(&websocket.sequence).ok_or(
-                DecisionContinuationError::SourceReceiptMissing {
-                    sequence: websocket.sequence.0,
-                },
-            )?;
+            let envelope = source_receipts.source_envelope(websocket)?;
             let activity = parse_activity_trade_observation(&envelope.payload).map_err(|_| {
                 DecisionContinuationError::SourceReceiptMismatch {
                     sequence: websocket.sequence.0,
@@ -280,18 +251,7 @@ impl DecisionContinuationV3 {
                 });
             }
         }
-        let selected_envelope = matched.get(&selected.sequence).ok_or(
-            DecisionContinuationError::SourceReceiptMissing {
-                sequence: selected.sequence.0,
-            },
-        )?;
-        let observed_unix_ms = selected_envelope
-            .received_at
-            .0
-            .unix_timestamp_nanos()
-            .checked_div(1_000_000)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(DecisionContinuationError::SourceReceiveTimeRange)?;
+        let observed_unix_ms = source_receipts.received_millis(selected)?;
         self.observation_at(observed_unix_ms)
             .ok_or(DecisionContinuationError::SourceReceiptMismatch {
                 sequence: selected.sequence.0,
@@ -310,14 +270,10 @@ pub enum DecisionContinuationError {
     DurableMismatch,
     #[error("frozen continuation has invalid source epoch {0}")]
     SourceEpoch(i64),
-    #[error("source log: {0}")]
-    SourceLog(#[from] pe_event_log::LogError),
-    #[error("source receipt sequence {sequence} is absent")]
-    SourceReceiptMissing { sequence: u64 },
+    #[error("source receipt lookup failed: {0}")]
+    SourceReceiptLookup(#[from] crate::risk_inputs::RiskInputsUnavailable),
     #[error("source receipt sequence {sequence} does not match its frozen evidence")]
     SourceReceiptMismatch { sequence: u64 },
-    #[error("source receipt receive time is outside the supported millisecond range")]
-    SourceReceiveTimeRange,
 }
 
 impl DecisionContinuationV3 {
@@ -1762,8 +1718,11 @@ fn touched_leader_rows(
 mod continuation_v3_tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::fs::OpenOptions;
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
     use pe_core_types::{EventSeq, Probability, ReceivedAt, SourceId, SourceTimestamp};
-    use pe_event_log::{ContentType, EnvelopeIn, Writer};
+    use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
     use pe_paper_state::DecisionPendingState;
     use rust_decimal_macros::dec;
     use serde_json::json;
@@ -1896,10 +1855,11 @@ mod continuation_v3_tests {
         assert_eq!(decoded.observation_at(1_700_000_000_004), None);
     }
 
-    /// PASS: polling observation time and hashes are recovered from verified source envelopes;
-    /// tampering a frozen raw-page hash fails closed.
+    /// PASS: polling observation time and hashes are recovered through exact receipt-index reads
+    /// even when an unrelated interior frame is unreadable; tampering a frozen raw-page hash
+    /// still fails closed.
     #[test]
-    fn source_log_is_the_observation_time_and_hash_owner() {
+    fn receipt_index_is_the_scoped_observation_time_and_hash_owner() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.log");
         let mut writer = Writer::open(&path).unwrap();
@@ -1918,10 +1878,37 @@ mod continuation_v3_tests {
                 .unwrap()
         };
         let first_payload = br#"[{"page":1}]"#;
+        let unrelated_payload = br#"[{"unrelated":true}]"#;
         let second_payload = br#"[{"page":2}]"#;
         let first = append(&mut writer, first_payload, 1_700_000_001);
+        let _unrelated = append(&mut writer, unrelated_payload, 1_700_000_001);
         let second = append(&mut writer, second_payload, 1_700_000_002);
         drop(writer);
+        let offsets = Reader::replay_with_offsets(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let source_receipts = SourceReceiptIndex::replay(&path).unwrap();
+
+        // Corrupt only the unrelated frame after boot built the verified index. A complete-log
+        // replay now fails, while direct reads of the two receipt-bound page frames remain valid.
+        let corrupt_at = offsets[1].0.checked_add(4).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&[byte[0] ^ 0xff]).unwrap();
+        file.sync_all().unwrap();
+        assert!(
+            Reader::replay(&path).is_err(),
+            "complete replay sees the corrupt neighbor"
+        );
+
         let value = DecisionContinuationV3::new(
             facts(json!({"fixed_end": 1_700_000_010_i64})),
             None,
@@ -1940,7 +1927,9 @@ mod continuation_v3_tests {
         );
         let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(
-            decoded.observation_from_source_log(&path).unwrap(),
+            decoded
+                .observation_from_receipt_index(&source_receipts)
+                .unwrap(),
             Some(ObservationEvidence {
                 source_receipt: second,
                 complete_bound_receipt: second,
@@ -1952,7 +1941,7 @@ mod continuation_v3_tests {
         let mut tampered = decoded;
         tampered.page_occurrences[1].raw_hash = "00".repeat(32);
         assert!(matches!(
-            tampered.observation_from_source_log(&path),
+            tampered.observation_from_receipt_index(&source_receipts),
             Err(DecisionContinuationError::SourceReceiptMismatch { .. })
         ));
     }

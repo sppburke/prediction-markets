@@ -236,15 +236,20 @@ struct RawLevel {
     size: String,
 }
 
-/// Fetches a token's CLOB order book. Implemented by [`ReqwestClobBookFetcher`]
+/// Fetches a condition outcome's CLOB order book. Implemented by [`ReqwestClobBookFetcher`]
 /// (production) and [`FixtureClobBookFetcher`] (deterministic tests), mirroring
 /// the `PageFetcher` / `CLOBClient` trait-plus-fixture pattern used elsewhere in
 /// the workspace. `&self` (not `&mut`) so an `Arc` can be shared across tasks;
 /// rate limiting uses interior mutability.
 #[allow(async_fn_in_trait)]
 pub trait ClobBookFetcher {
-    /// Fetch and parse the ask side of `token_id`'s order book.
-    async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError>;
+    /// Fetch and parse the ask side of `token_id`'s order book, binding any response market
+    /// identity to `condition_id`.
+    async fn fetch_book(
+        &self,
+        condition_id: &str,
+        token_id: &str,
+    ) -> Result<OrderBook, ClobBookError>;
 }
 
 /// Production [`ClobBookFetcher`] over the public CLOB REST `/book` endpoint.
@@ -317,7 +322,11 @@ impl ReqwestClobBookFetcher {
 }
 
 impl ClobBookFetcher for ReqwestClobBookFetcher {
-    async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError> {
+    async fn fetch_book(
+        &self,
+        condition_id: &str,
+        token_id: &str,
+    ) -> Result<OrderBook, ClobBookError> {
         self.rate_limit_gate().await;
         let url = format!("{}/book?token_id={token_id}", self.base_url);
         let resp = self
@@ -354,16 +363,20 @@ impl ClobBookFetcher for ReqwestClobBookFetcher {
         if !status.is_success() {
             return Err(ClobBookError::Status(status.as_u16()));
         }
-        let mut book = parse_requested_book(&body, token_id)?;
+        let mut book = parse_requested_book(&body, condition_id, token_id)?;
         book.fetched_at_ms = now_unix_ms();
         book.source_receipt = source_receipt;
         Ok(book)
     }
 }
 
-fn parse_requested_book(body: &[u8], token_id: &str) -> Result<OrderBook, ClobBookError> {
+fn parse_requested_book(
+    body: &[u8],
+    condition_id: &str,
+    token_id: &str,
+) -> Result<OrderBook, ClobBookError> {
     let parsed = OrderBook::from_book_json_with_identity(body)?;
-    parsed.validate_identity(token_id, None)?;
+    parsed.validate_identity(token_id, Some(condition_id))?;
     Ok(parsed.into_order_book())
 }
 
@@ -387,7 +400,11 @@ impl FixtureClobBookFetcher {
 }
 
 impl ClobBookFetcher for FixtureClobBookFetcher {
-    async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError> {
+    async fn fetch_book(
+        &self,
+        _condition_id: &str,
+        token_id: &str,
+    ) -> Result<OrderBook, ClobBookError> {
         let mut book = self
             .books
             .get(token_id)
@@ -526,10 +543,31 @@ mod tests {
     fn requested_book_rejects_asset_identity_substitution() {
         let error = parse_requested_book(
             br#"{"asset_id":"other-token","asks":[{"price":"0.5","size":"5"}]}"#,
+            "expected-condition",
             "requested-token",
         )
         .unwrap_err();
         assert!(matches!(error, ClobBookError::AssetIdentity { .. }));
+    }
+
+    /// PASS: the production fetch-side parser rejects a successful `/book` body carrying the
+    /// requested asset under a different market, even when its ask ladder is usable.
+    #[test]
+    fn requested_book_rejects_market_identity_substitution() {
+        let accepted = parse_requested_book(
+            br#"{"market":"expected-condition","asset_id":"requested-token","asks":[{"price":"0.5","size":"5"}]}"#,
+            "expected-condition",
+            "requested-token",
+        )
+        .unwrap();
+        assert_eq!(accepted.best_ask(), Some(dec!(0.5)));
+        let error = parse_requested_book(
+            br#"{"market":"other-condition","asset_id":"requested-token","asks":[{"price":"0.5","size":"5"}]}"#,
+            "expected-condition",
+            "requested-token",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ClobBookError::MarketIdentity { .. }));
     }
 
     #[tokio::test]
@@ -548,14 +586,14 @@ mod tests {
             },
         );
         let fetcher = FixtureClobBookFetcher::new(books);
-        let book = fetcher.fetch_book("tok-1").await.unwrap();
+        let book = fetcher.fetch_book("condition-1", "tok-1").await.unwrap();
         assert_eq!(book.best_ask(), Some(dec!(0.6)));
     }
 
     #[tokio::test]
     async fn fixture_fetcher_unknown_token_is_missing_fixture() {
         let fetcher = FixtureClobBookFetcher::new(HashMap::new());
-        let err = fetcher.fetch_book("nope").await.unwrap_err();
+        let err = fetcher.fetch_book("condition-1", "nope").await.unwrap_err();
         assert!(
             matches!(err, ClobBookError::MissingFixture(_)),
             "got {err:?}"

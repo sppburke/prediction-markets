@@ -498,7 +498,11 @@ impl GoldenBookFetcher {
 }
 
 impl ClobBookFetcher for GoldenBookFetcher {
-    async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError> {
+    async fn fetch_book(
+        &self,
+        _condition_id: &str,
+        token_id: &str,
+    ) -> Result<OrderBook, ClobBookError> {
         let mut book = self
             .books
             .lock()

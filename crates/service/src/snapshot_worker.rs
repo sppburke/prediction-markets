@@ -183,10 +183,11 @@ where
     let liquidity = gamma.and_then(|s| s.liquidity);
     let volume = gamma.and_then(|s| s.volume);
     let token = gamma.and_then(|s| s.clob_token_ids.get(usize::from(req.outcome_id.0)).cloned());
+    let condition_id = req.market_id.to_string();
 
     // CLOB /book → absorbable depth + raw asks. Best-effort: failure/absent token ⇒ partial.
     let (absorbable_usd_100bps, ask_levels_json) = match token.as_deref() {
-        Some(token_id) => match book_fetcher.fetch_book(token_id).await {
+        Some(token_id) => match book_fetcher.fetch_book(&condition_id, token_id).await {
             Ok(book) => (
                 absorbable_usd_within_bps(&book, ABSORBABLE_DEPTH_BPS),
                 ask_levels_json(&book),

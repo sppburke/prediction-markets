@@ -1372,7 +1372,7 @@ mod tests {
         let book = crate::clob_book::ReqwestClobBookFetcher::new(client)
             .with_base_url(base)
             .with_source_log(source_log.clone())
-            .fetch_book("11")
+            .fetch_book(ADMISSION_CONDITION, "11")
             .await
             .unwrap();
 

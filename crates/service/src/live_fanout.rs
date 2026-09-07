@@ -1846,7 +1846,12 @@ async fn process_target(
     {
         return Ok(PassControl::StopSeed);
     }
-    let book = match state.config.book_fetcher.fetch_book(&token_id.0).await {
+    let book = match state
+        .config
+        .book_fetcher
+        .fetch_book(&condition_id.0, &token_id.0)
+        .await
+    {
         Ok(book) => book,
         Err(error) => {
             warn!(account_id = %target.account_id, error = %error, "fresh per-account ladder unavailable; seed paused");

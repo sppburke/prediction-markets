@@ -542,9 +542,13 @@ struct CountingBookFetcher {
 }
 
 impl ClobBookFetcher for CountingBookFetcher {
-    async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError> {
+    async fn fetch_book(
+        &self,
+        condition_id: &str,
+        token_id: &str,
+    ) -> Result<OrderBook, ClobBookError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.fetch_book(token_id).await
+        self.inner.fetch_book(condition_id, token_id).await
     }
 }
 
@@ -826,7 +830,11 @@ async fn leader_haircut_mode_records_haircut_fill() {
 struct PanicBookFetcher;
 
 impl ClobBookFetcher for PanicBookFetcher {
-    async fn fetch_book(&self, _token_id: &str) -> Result<OrderBook, ClobBookError> {
+    async fn fetch_book(
+        &self,
+        _condition_id: &str,
+        _token_id: &str,
+    ) -> Result<OrderBook, ClobBookError> {
         panic!("hard gate: the /book fetcher must not be called");
     }
 }

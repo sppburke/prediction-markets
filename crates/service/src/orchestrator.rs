@@ -246,6 +246,9 @@ pub struct OrchestratorConfig {
 #[derive(Debug, Default)]
 pub struct ScenarioHooks {
     pub age_clock: std::sync::Mutex<std::collections::VecDeque<OffsetDateTime>>,
+    /// Deterministically advance the next queued age sample after one successful observation
+    /// resolution. This models receipt I/O latency without sleeping in scenario tests.
+    pub observation_resolution_advance_millis: std::sync::atomic::AtomicI64,
     pub admission_artifacts:
         std::sync::Mutex<std::collections::VecDeque<pe_execution_core::LiveAdmissionArtifact>>,
     pub boundary_mark_prices:
@@ -964,20 +967,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         admission: &pe_execution_core::LiveAdmissionArtifact,
         plan: &LadderPlan,
         book_receipt: pe_event_log::AppendReceipt,
-        continuation: &DecisionContinuationV3,
+        observation: &pe_execution_core::ObservationEvidence,
         probability: Probability,
         budget: CollateralAmount,
         risk: pe_execution_core::RiskAudit,
         applied_configuration_hash: String,
     ) -> Result<pe_execution_core::EconomicPrepared, String> {
-        let (_, source_log_path) = self
-            .financial_log_paths
-            .as_ref()
-            .ok_or_else(|| "active fill has no verified financial log paths".to_owned())?;
-        let observation = continuation
-            .observation_from_source_log(source_log_path)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "active fill lacks verified observation evidence".to_owned())?;
         let outcome_index = u8::try_from(signal.outcome_id.0)
             .ok()
             .filter(|value| *value <= 1)
@@ -1029,7 +1024,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             admission,
             plan,
             book_receipt,
-            observation: Some(observation),
+            observation: Some(observation.clone()),
             sizing_mode,
             budget,
             slippage_rate: self.strategy.config().slippage_rate,
@@ -1606,6 +1601,29 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         OffsetDateTime::now_utc()
     }
 
+    /// Apply the scenario-only elapsed time attributed to receipt-scoped observation resolution.
+    #[cfg(feature = "scenario")]
+    fn apply_observation_resolution_clock_advance(&self) {
+        let Some(hooks) = self.scenario_hooks.as_ref() else {
+            return;
+        };
+        let advance_millis = hooks
+            .observation_resolution_advance_millis
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        if advance_millis == 0 {
+            return;
+        }
+        let mut clock = hooks
+            .age_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(next) = clock.front_mut()
+            && let Some(advanced) = next.checked_add(time::Duration::milliseconds(advance_millis))
+        {
+            *next = advanced;
+        }
+    }
+
     fn load_pending_continuation(
         &mut self,
         source_trade_id: &SourceTradeId,
@@ -1772,7 +1790,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         };
         let book = match tokio::time::timeout(
             Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
-            self.book_fetcher.fetch_book(&token_id),
+            self.book_fetcher
+                .fetch_book(&admission.market.condition_id.0, &token_id),
         )
         .await
         {
@@ -2074,7 +2093,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn stage_dispatch_if_targeted(
         &self,
         signal: &LeaderSignal,
-        continuation: Option<&DecisionContinuationV3>,
+        observation: &pe_execution_core::ObservationEvidence,
         evidence: &mut Option<DecisionEvidenceAccumulator>,
     ) -> Result<Option<String>, ()> {
         let Some(live) = self.live_accounts.as_ref() else {
@@ -2096,42 +2115,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         if armed.is_empty() {
             return Ok(None);
         }
-        let observation = match continuation {
-            Some(continuation) => {
-                let Some((_, source_log_path)) = self.financial_log_paths.as_ref() else {
-                    error!(
-                        trade = %signal.source_trade_id,
-                        "live dispatch has no verified source-log owner"
-                    );
-                    return Err(());
-                };
-                match continuation.observation_from_source_log(source_log_path) {
-                    Ok(Some(observation)) => observation,
-                    Ok(None) => {
-                        error!(
-                            trade = %signal.source_trade_id,
-                            "live dispatch continuation has no version-three observation"
-                        );
-                        return Err(());
-                    }
-                    Err(error) => {
-                        error!(
-                            %error,
-                            trade = %signal.source_trade_id,
-                            "live dispatch observation verification failed"
-                        );
-                        return Err(());
-                    }
-                }
-            }
-            None => {
-                error!(
-                    trade = %signal.source_trade_id,
-                    "live dispatch has no durable decision continuation"
-                );
-                return Err(());
-            }
-        };
         let dispatch_id = pe_strategy_winner_follow::build_idempotency_key(signal);
         let targets = armed
             .iter()
@@ -2877,6 +2860,35 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // ── Shared gates end here. Stage the dispatch aggregate (#508 Decision 10) ──
         // Every rejection ABOVE suppressed all destinations pre-staging (no aggregate).
         // Every decision BELOW is paper-only and must never suppress live targets.
+        // Resolve and verify the V3 observation ONCE through exact indexed receipt reads before
+        // taking the final age sample. Both live staging and paper composition consume this same
+        // value; neither may replay the growing source log or introduce unchecked latency after
+        // the sample.
+        let Some(continuation) = pending.as_ref() else {
+            error!(trade = %trade.source_trade_id, "dispatch has no durable decision continuation");
+            self.rollback_admission(&rb, Some(&signal.market_id));
+            return;
+        };
+        let Some(source_receipts) = self.source_receipts.as_ref() else {
+            error!(trade = %trade.source_trade_id, "dispatch has no verified source-receipt index");
+            self.rollback_admission(&rb, Some(&signal.market_id));
+            return;
+        };
+        let observation = match continuation.observation_from_receipt_index(source_receipts) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => {
+                error!(trade = %trade.source_trade_id, "dispatch continuation has no version-three observation");
+                self.rollback_admission(&rb, Some(&signal.market_id));
+                return;
+            }
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "dispatch observation verification failed");
+                self.rollback_admission(&rb, Some(&signal.market_id));
+                return;
+            }
+        };
+        #[cfg(feature = "scenario")]
+        self.apply_observation_resolution_clock_advance();
         // #546: re-check the copy budget with a FRESH time sample immediately before
         // staging. Channel and awaited-gate delay (book fetch, resolution lookup, the
         // admission hold) must not turn an observation that was fresh at the early gate
@@ -2900,19 +2912,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return;
         }
 
-        let dispatch_id = match self.stage_dispatch_if_targeted(
-            &signal,
-            pending.as_ref(),
-            &mut decision_evidence,
-        ) {
-            Ok(id) => id,
-            Err(()) => {
-                // Staging failed: abandoned unseen. #511: exact in-memory rollback so
-                // the held-cursor redelivery re-admits byte-identically.
-                self.rollback_admission(&rb, Some(&signal.market_id));
-                return;
-            }
-        };
+        let dispatch_id =
+            match self.stage_dispatch_if_targeted(&signal, &observation, &mut decision_evidence) {
+                Ok(id) => id,
+                Err(()) => {
+                    // Staging failed: abandoned unseen. #511: exact in-memory rollback so
+                    // the held-cursor redelivery re-admits byte-identically.
+                    self.rollback_admission(&rb, Some(&signal.market_id));
+                    return;
+                }
+            };
 
         // Relocated hold/already-filled gate (#508; historically pre-first-BUY): a paper
         // position we already hold skips the PAPER order only — live targets in the staged
@@ -2969,11 +2978,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             self.intake_stopped = true;
             return;
         };
-        let Some(continuation) = pending.as_ref() else {
-            error!(trade = %trade.source_trade_id, "active fill has no durable continuation");
-            self.intake_stopped = true;
-            return;
-        };
         let per_trade_cap_bps = self
             .strategy
             .config()
@@ -3017,7 +3021,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &admission,
             plan,
             book_receipt,
-            continuation,
+            &observation,
             p,
             plan_budget,
             risk,

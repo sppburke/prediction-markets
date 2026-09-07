@@ -40,7 +40,10 @@ async fn clob_book_fixture_roundtrip() {
     );
     let fetcher = FixtureClobBookFetcher::new(books);
 
-    let book = fetcher.fetch_book("winning-outcome-token").await.unwrap();
+    let book = fetcher
+        .fetch_book("fixture-condition", "winning-outcome-token")
+        .await
+        .unwrap();
     assert_eq!(book.asks.len(), 2, "expected the two configured ask levels");
     assert_eq!(
         book.best_ask(),
@@ -48,7 +51,10 @@ async fn clob_book_fixture_roundtrip() {
         "best ask is the lowest price"
     );
 
-    let missing = fetcher.fetch_book("never-traded-token").await.unwrap_err();
+    let missing = fetcher
+        .fetch_book("fixture-condition", "never-traded-token")
+        .await
+        .unwrap_err();
     assert!(
         matches!(missing, ClobBookError::MissingFixture(_)),
         "expected MissingFixture for an unconfigured token, got {missing:?}"
