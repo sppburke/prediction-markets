@@ -571,18 +571,20 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     .unwrap();
     let run = tokio::spawn(orch.run(std::future::pending::<()>()));
 
+    let proof = support::producer_shaped_activity_page(
+        leader_wallet(),
+        b"[]",
+        SOURCE_EPOCH + 10,
+        page_occurrence().receipt,
+    );
     let (committed, acknowledgement) = oneshot::channel();
     control_tx
         .send(OrchestratorControl::CommitActivityBucket {
             aggregates: vec![pending_aggregate(FROZEN_MARKET, SOURCE_EPOCH)],
             context: Arc::new(BucketDecisionContext {
                 applied_configuration: config_a.clone(),
-                decision_inputs_json: serde_json::json!({
-                    "fixed_end": SOURCE_EPOCH + 10,
-                    "pages": 1,
-                })
-                .to_string(),
-                page_occurrences: vec![page_occurrence()],
+                decision_inputs_json: proof.0,
+                page_occurrences: vec![proof.1],
                 observed_source_receipts: HashMap::new(),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                 signal_config: SignalConfig::default(),

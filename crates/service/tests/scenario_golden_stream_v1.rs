@@ -8,6 +8,8 @@
     clippy::arithmetic_side_effects
 )]
 
+mod support;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -36,7 +38,7 @@ use pe_resolver_card::{
 };
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
-use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext, PageOccurrence};
+use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use pe_service::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
 use pe_service::decision_replay::{DecisionPostBoundaryEvidence, replay_decision_pending};
 use pe_service::entry_gate::CopyEntryGateConfig;
@@ -66,11 +68,9 @@ use pe_service::supabase_state::{
     SupabaseStateTrait,
 };
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityParseContext, ActivityRequestBounds,
-    ActivityTransport, BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION,
+    ActivityParseContext, ActivityTransport, BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION,
     CLOB_RESOLUTION_SCHEMA_VERSION, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
-    PageFetcher, PolymarketEndpoint, ReconciliationPageEvidence, canonical_page_hash,
-    parse_activity_response, validate_live_market,
+    PageFetcher, parse_activity_response, validate_live_market,
 };
 use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
@@ -170,51 +170,6 @@ fn golden_source_unix(anchor_cutoff: i64, index: usize) -> i64 {
             + 3_600
             + i64::try_from(within_day).unwrap() * 10
     }
-}
-
-/// The producer's complete-read proof for one short activity page at offset zero: the request the
-/// poller issues for a fixed end with no lower bound, the page evidence it records for that
-/// response, and the durable decision inputs that carry them.
-fn producer_shaped_activity_page(
-    wallet: WalletAddress,
-    payload: &[u8],
-    fixed_end: i64,
-    receipt: AppendReceipt,
-) -> (String, PageOccurrence) {
-    let request_url = PolymarketEndpoint::UserPositionActivityPage {
-        user: wallet.to_string(),
-        end: fixed_end,
-        start: None,
-        offset: 0,
-    }
-    .url("https://data-api.polymarket.com");
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(payload).unwrap();
-    let raw_hash = blake3::hash(payload).to_hex().to_string();
-    let evidence = ReconciliationPageEvidence {
-        request_url: request_url.clone(),
-        bounds: Some(ActivityRequestBounds {
-            start: None,
-            end: fixed_end,
-        }),
-        partition: None,
-        offset: 0,
-        row_count: u32::try_from(rows.len()).unwrap(),
-        canonical_page_hash: canonical_page_hash(payload).unwrap(),
-        raw_page_hash: raw_hash.clone(),
-        received_at: ReceivedAt(OffsetDateTime::from_unix_timestamp(fixed_end).unwrap()),
-        schema_version: ACTIVITY_SCHEMA_VERSION,
-        parser_version: ACTIVITY_PARSER_VERSION,
-    };
-    let decision_inputs_json =
-        serde_json::json!({"fixed_end": fixed_end, "pages": [evidence]}).to_string();
-    (
-        decision_inputs_json,
-        PageOccurrence {
-            request_url,
-            raw_hash,
-            receipt,
-        },
-    )
 }
 
 #[derive(Clone)]
@@ -1912,7 +1867,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             if index == 0 {
                 first_admission = Some(recorded.admission.clone());
             }
-            let (decision_inputs_json, page_occurrence) = producer_shaped_activity_page(
+            let (decision_inputs_json, page_occurrence) = support::producer_shaped_activity_page(
                 bodies.wallet,
                 &bodies.activity,
                 source_unix,

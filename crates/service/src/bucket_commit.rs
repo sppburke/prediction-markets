@@ -712,6 +712,11 @@ impl DecisionContinuationV3 {
             if page_occurrences.is_empty() {
                 return Err(DecisionContinuationError::DurableMismatch);
             }
+            let proof: CompleteActivityReadWire =
+                serde_json::from_value(continuation.facts.decision_inputs.clone())?;
+            if proof.fixed_end.is_none() || proof.pages.as_ref().is_none_or(Vec::is_empty) {
+                return Err(DecisionContinuationError::DurableMismatch);
+            }
             let mut previous = None;
             for page in page_occurrences {
                 if previous.is_some_and(|sequence| page.receipt.sequence <= sequence) {
@@ -2490,6 +2495,39 @@ mod continuation_v3_tests {
                 .to_string()
                 .contains("decision continuation is missing its complete activity read proof")
         );
+    }
+
+    /// PASS: V3 decode requires the producer's fixed end and at least one page-evidence record.
+    /// FAIL: increasing page receipts alone make a proof-free V3 durable row executable.
+    #[test]
+    fn v3_decode_requires_rich_complete_read_proof() {
+        let payload = b"[]";
+        let (occurrence, evidence) =
+            activity_page_fixture(payload, Some(1_699_999_999), 1_700_000_000, 0, receipt(1));
+        let valid = DecisionContinuationV3::new(
+            facts(complete_read_inputs(
+                1_700_000_000,
+                std::slice::from_ref(&evidence),
+            )),
+            None,
+            vec![occurrence.clone()],
+        );
+        DecisionContinuationV3::from_durable(&durable(&valid)).unwrap();
+
+        let pages_without_fixed_end = json!({"pages": [evidence]});
+        for decision_inputs in [
+            json!({}),
+            json!({"fixed_end": 1_700_000_000}),
+            json!({"fixed_end": 1_700_000_000, "pages": []}),
+            pages_without_fixed_end,
+        ] {
+            let invalid =
+                DecisionContinuationV3::new(facts(decision_inputs), None, vec![occurrence.clone()]);
+            assert!(matches!(
+                DecisionContinuationV3::from_durable(&durable(&invalid)),
+                Err(DecisionContinuationError::DurableMismatch)
+            ));
+        }
     }
 
     /// PASS: the shared owner accepts a source-shaped short terminal page and rejects the same

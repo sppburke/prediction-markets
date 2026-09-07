@@ -69,7 +69,7 @@ use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
-use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts, PageOccurrence};
+use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts};
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook, ReqwestClobBookFetcher};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
@@ -1720,6 +1720,12 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
         .aggregates()
         .unwrap();
     let source_trade_id = aggregates[0].group_id.key().clone();
+    let (decision_inputs_json, occurrence) = support::producer_shaped_activity_page(
+        leader_wallet(),
+        &activity,
+        observed_at.unix_timestamp(),
+        page_receipt,
+    );
     let (committed, acknowledgement) = oneshot::channel();
     control_tx
         .send(
@@ -1727,12 +1733,8 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
                 aggregates,
                 context: Arc::new(BucketDecisionContext {
                     applied_configuration: runtime,
-                    decision_inputs_json: "{}".to_owned(),
-                    page_occurrences: vec![PageOccurrence {
-                        request_url: "scenario://latency-page".to_owned(),
-                        raw_hash: blake3::hash(&activity).to_hex().to_string(),
-                        receipt: page_receipt,
-                    }],
+                    decision_inputs_json,
+                    page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                     signal_config: SignalConfig::default(),
@@ -2061,6 +2063,12 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
         .aggregates()
         .unwrap();
     let source_trade_id = aggregates[0].group_id.key().clone();
+    let (decision_inputs_json, occurrence) = support::producer_shaped_activity_page(
+        leader_wallet(),
+        &activity,
+        observed_at.unix_timestamp(),
+        page_receipt,
+    );
     let (committed, acknowledgement) = oneshot::channel();
     control_tx
         .send(
@@ -2068,12 +2076,8 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
                 aggregates,
                 context: Arc::new(BucketDecisionContext {
                     applied_configuration: runtime,
-                    decision_inputs_json: "{}".to_owned(),
-                    page_occurrences: vec![PageOccurrence {
-                        request_url: "scenario://wrong-market-page".to_owned(),
-                        raw_hash: blake3::hash(&activity).to_hex().to_string(),
-                        receipt: page_receipt,
-                    }],
+                    decision_inputs_json,
+                    page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                     signal_config: SignalConfig::default(),

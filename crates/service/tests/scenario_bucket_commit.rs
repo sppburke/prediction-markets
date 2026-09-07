@@ -4,6 +4,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -17,7 +19,6 @@ use pe_paper_state::{
 use pe_position_ledger::{AppliedEffect, LedgerEffect, PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
     BucketCommitEngine, BucketDecisionContext, DecisionContinuationV3, IdentityOverride,
-    PageOccurrence,
 };
 use pe_service::decision_replay::{
     AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
@@ -171,19 +172,21 @@ fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
     }
 }
 fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
+    let proof = support::producer_shaped_activity_page(
+        wallet(),
+        b"[]",
+        epoch,
+        pe_event_log::AppendReceipt {
+            sequence: pe_core_types::EventSeq(u64::try_from(epoch).unwrap()),
+            this_hash: blake3::hash(format!("receipt-{epoch}").as_bytes()),
+        },
+    );
     BucketDecisionContext {
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
         ),
-        decision_inputs_json: "{\"source_window\":\"complete\"}".to_owned(),
-        page_occurrences: vec![PageOccurrence {
-            request_url: format!("https://fixture.invalid/activity?epoch={epoch}"),
-            raw_hash: blake3::hash(&epoch.to_le_bytes()).to_hex().to_string(),
-            receipt: pe_event_log::AppendReceipt {
-                sequence: pe_core_types::EventSeq(u64::try_from(epoch).unwrap()),
-                this_hash: blake3::hash(format!("receipt-{epoch}").as_bytes()),
-            },
-        }],
+        decision_inputs_json: proof.0,
+        page_occurrences: vec![proof.1],
         observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),

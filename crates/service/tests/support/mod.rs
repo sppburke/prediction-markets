@@ -18,7 +18,9 @@ use pe_service::config::ServiceConfig;
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::runtime_config::RuntimeConfig;
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityTransport, parse_activity_response,
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityParseContext, ActivityRequestBounds,
+    ActivityTransport, PolymarketEndpoint, ReconciliationPageEvidence, canonical_page_hash,
+    parse_activity_response,
 };
 use pe_venue_core::OrderIntent;
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,51 @@ pub struct LegacyPaperFill {
     pub simulated_at: SourceTimestamp,
     #[serde(default)]
     pub fill_source: LegacyFillSource,
+}
+
+/// The producer's complete-read proof for one short activity page at offset zero: the request the
+/// poller issues for a fixed end with no lower bound, the page evidence it records for that
+/// response, and the durable decision inputs that carry them.
+pub fn producer_shaped_activity_page(
+    wallet: pe_core_types::WalletAddress,
+    payload: &[u8],
+    fixed_end: i64,
+    receipt: AppendReceipt,
+) -> (String, PageOccurrence) {
+    let request_url = PolymarketEndpoint::UserPositionActivityPage {
+        user: wallet.to_string(),
+        end: fixed_end,
+        start: None,
+        offset: 0,
+    }
+    .url("https://data-api.polymarket.com");
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(payload).unwrap();
+    let raw_hash = blake3::hash(payload).to_hex().to_string();
+    let evidence = ReconciliationPageEvidence {
+        request_url: request_url.clone(),
+        bounds: Some(ActivityRequestBounds {
+            start: None,
+            end: fixed_end,
+        }),
+        partition: None,
+        offset: 0,
+        row_count: u32::try_from(rows.len()).unwrap(),
+        canonical_page_hash: canonical_page_hash(payload).unwrap(),
+        raw_page_hash: raw_hash.clone(),
+        received_at: ReceivedAt(time::OffsetDateTime::from_unix_timestamp(fixed_end).unwrap()),
+        schema_version: ACTIVITY_SCHEMA_VERSION,
+        parser_version: ACTIVITY_PARSER_VERSION,
+    };
+    let decision_inputs_json =
+        serde_json::json!({"fixed_end": fixed_end, "pages": [evidence]}).to_string();
+    (
+        decision_inputs_json,
+        PageOccurrence {
+            request_url,
+            raw_hash,
+            receipt,
+        },
+    )
 }
 
 pub fn page_occurrence() -> PageOccurrence {
@@ -156,14 +203,20 @@ pub async fn send_trade_bucket_with_config(
         .first()
         .map(|aggregate| HashMap::from([(aggregate.group_id.key().clone(), trade.provenance)]))
         .unwrap_or_default();
+    let (decision_inputs_json, occurrence) = producer_shaped_activity_page(
+        trade.wallet,
+        &body,
+        trade.observed_at.unix_timestamp(),
+        page_occurrence().receipt,
+    );
     let (committed, acknowledged) = oneshot::channel();
     control
         .send(OrchestratorControl::CommitActivityBucket {
             aggregates,
             context: Arc::new(BucketDecisionContext {
                 applied_configuration,
-                decision_inputs_json: "{}".to_owned(),
-                page_occurrences: vec![page_occurrence()],
+                decision_inputs_json,
+                page_occurrences: vec![occurrence],
                 observed_source_receipts: HashMap::new(),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                 signal_config: SignalConfig::default(),
