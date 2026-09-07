@@ -9989,6 +9989,10 @@ mod tests {
         source_time: OffsetDateTime,
     ) -> (Vec<u8>, Vec<u8>) {
         let leader = WalletAddress([0xaa; 20]);
+        // The activity payload carries the trade time in whole seconds; the recorded signal must
+        // use the same instant so strict replay's reconstruction hashes to the recorded decision.
+        let source_time =
+            OffsetDateTime::from_unix_timestamp(source_time.unix_timestamp()).unwrap();
         let (websocket, rest, source_trade_id) = activity_payload_pair(
             &prepared.economic,
             source_time,
