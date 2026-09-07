@@ -344,6 +344,33 @@ pub struct DecisionPendingRow {
     pub updated_at_unix: i64,
 }
 
+type DecisionPendingTuple = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+);
+
+fn decision_pending_row(row: DecisionPendingTuple) -> Result<DecisionPendingRow, PaperStateError> {
+    let (id, revision, wallet, epoch, frozen, post, state, terminal, updated) = row;
+    Ok(DecisionPendingRow {
+        source_trade_id: SourceTradeId(id),
+        semantic_revision: revision,
+        wallet: parse_wallet(&wallet)?,
+        source_epoch: epoch,
+        frozen_inputs_json: frozen,
+        post_commit_inputs_json: post,
+        state: parse_pending_state(&state)?,
+        terminal_disposition: terminal,
+        updated_at_unix: updated,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionPendingState {
     Open,
@@ -1888,20 +1915,39 @@ impl PaperStateDb {
         })?;
         let mut history = Vec::new();
         for row in rows {
-            let (id, revision, wallet, epoch, frozen, post, state, terminal, updated) = row?;
-            history.push(DecisionPendingRow {
-                source_trade_id: SourceTradeId(id),
-                semantic_revision: revision,
-                wallet: parse_wallet(&wallet)?,
-                source_epoch: epoch,
-                frozen_inputs_json: frozen,
-                post_commit_inputs_json: post,
-                state: parse_pending_state(&state)?,
-                terminal_disposition: terminal,
-                updated_at_unix: updated,
-            });
+            history.push(decision_pending_row(row?)?);
         }
         Ok(history)
+    }
+
+    /// Read one durable decision continuation by its source trade id (`None` when absent).
+    pub fn decision_pending_for(
+        &self,
+        source_trade_id: &SourceTradeId,
+    ) -> Result<Option<DecisionPendingRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+                    frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
+                    updated_at_unix \
+             FROM decision_pending WHERE source_trade_id = ?1",
+        )?;
+        let mut rows = statement.query_map([source_trade_id.0.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+        rows.next()
+            .map(|row| decision_pending_row(row?))
+            .transpose()
     }
 
     /// Select the immutable decision evidence named by an ordered source-prefix replay.

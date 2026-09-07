@@ -1,6 +1,6 @@
 //! Strictly sequential ordinary-live dispatch consumer (#508 Decision 10).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -212,7 +212,10 @@ fn derive_projection_rows_for_state(
     let source_envelopes = source_envelopes_for_live_events(&state.config.source_receipts, events)?;
     let paper_frames = scan_paper_log(&state.config.paper_log_path)
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-    let observation_pages = live_observation_page_index(&state.config.paper_state)?;
+    let observation_pages = live_observation_page_index(
+        &state.config.paper_state,
+        &referenced_source_trade_ids(events),
+    )?;
     verify_replayed_live_risks(
         account_id,
         &state.config.journal_path,
@@ -455,10 +458,6 @@ pub async fn run_live_fanout_until(
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
     let paper_frames = scan_paper_log(&state.config.paper_log_path)
         .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
-    let observation_pages =
-        live_observation_page_index(&state.config.paper_state).map_err(|_| {
-            FanoutError::Signal("live observation continuation evidence is invalid".to_owned())
-        })?;
     let inventory = pe_execution_core::live_journal::recovery_inventory_with_admission_verifier(
         &state.config.journal_path,
         state.config.era_live_prefix.as_ref(),
@@ -476,6 +475,11 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
             let source_envelopes =
                 source_envelopes_for_live_events(&state.config.source_receipts, &scoped_events)
                     .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
+            let observation_pages = live_observation_page_index(
+                &state.config.paper_state,
+                &referenced_source_trade_ids(std::slice::from_ref(event)),
+            )
+            .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
             verify_replayed_live_risk_with_index(
                 &event.account_id,
                 &state.config.journal_path,
@@ -3024,22 +3028,38 @@ struct LiveObservationBinding<'a> {
 
 type LiveObservationPageIndex = HashMap<SourceTradeId, DecisionContinuationV3>;
 
+/// Source trade ids named by the admissions in `events` (the only continuations replay needs).
+fn referenced_source_trade_ids(events: &[LiveJournalEvent]) -> HashSet<SourceTradeId> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            LiveJournalPayload::AdmissionEvaluated(admission) => admission
+                .identity
+                .fill_projection
+                .as_ref()
+                .and_then(|projection| projection.source_trade_id.clone())
+                .map(SourceTradeId),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The durable V3 continuations for exactly the referenced source trades, read one row each.
 fn live_observation_page_index(
     paper_state: &PaperStateDb,
+    source_trade_ids: &HashSet<SourceTradeId>,
 ) -> Result<LiveObservationPageIndex, ProjectionReducerError> {
-    let rows = paper_state
-        .decision_pending_history()
-        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-    let mut pages = HashMap::with_capacity(rows.len());
-    for row in rows {
+    let mut pages = HashMap::with_capacity(source_trade_ids.len());
+    for source_trade_id in source_trade_ids {
+        let Some(row) = paper_state
+            .decision_pending_for(source_trade_id)
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?
+        else {
+            continue;
+        };
         let continuation = DecisionContinuationV3::from_durable(&row)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-        if pages
-            .insert(continuation.facts.source_trade_id.clone(), continuation)
-            .is_some()
-        {
-            return Err(ProjectionReducerError::InvalidRiskEvidence);
-        }
+        pages.insert(continuation.facts.source_trade_id.clone(), continuation);
     }
     Ok(pages)
 }
