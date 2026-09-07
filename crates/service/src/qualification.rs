@@ -8174,11 +8174,11 @@ mod tests {
         assert_eq!(observation.complete_bound_receipt, complete_bound_receipt);
     }
 
-    /// PASS: qualification cannot decode a current V3 continuation whose producer-owned logical
-    /// page proof was replaced with an unrelated object.
-    /// FAIL: a valid page occurrence alone makes the durable decision replayable.
+    /// PASS: a current V3 continuation whose producer-owned logical page proof was replaced with an
+    /// unrelated object makes mandatory qualification source verification fail closed.
+    /// FAIL: a valid one-page payload is accepted solely from its occurrence URL/hash/receipt.
     #[test]
-    fn qualification_decode_rejects_current_v3_without_logical_read_proof() {
+    fn qualification_source_verifier_rejects_current_v3_without_logical_read_proof() {
         let mut target = activity_row("0xtarget", "target", "10", "5.2", "0xtx", 51);
         target["price"] = serde_json::json!("0.52");
         let payload = activity_payload(vec![target]);
@@ -8196,18 +8196,13 @@ mod tests {
         continuation.facts.share_amount = ShareAmount::from_whole(10).unwrap();
         continuation.facts.decision_inputs = serde_json::json!({"unrelated": true});
         continuation.page_occurrences = vec![page_occurrence(&source, "page", &payload)];
-        let row = DecisionPendingRow {
-            source_trade_id: continuation.facts.source_trade_id.clone(),
-            semantic_revision: continuation.facts.semantic_revision.clone(),
-            wallet: continuation.facts.wallet,
-            source_epoch: continuation.facts.source_epoch,
-            frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
-            post_commit_inputs_json: String::new(),
-            state: DecisionPendingState::Open,
-            terminal_disposition: None,
-            updated_at_unix: continuation.facts.source_epoch,
-        };
-        assert!(DecisionContinuationV3::from_durable(&row).is_err());
+        let decision = replayed_no_copy_decision(&continuation);
+
+        assert!(matches!(
+            verify_decision_source_inputs(&decision, &BTreeMap::from([(1, source)])),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("missing its complete activity read proof")
+        ));
     }
 
     /// PASS: cursor overlap may repeat a pre-Start trade in the first post-Start complete read,
