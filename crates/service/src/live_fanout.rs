@@ -70,6 +70,9 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
 use crate::activity_ingest::SourceLogHandle;
+use crate::bucket_commit::DecisionContinuationV3;
+#[cfg(test)]
+use crate::bucket_commit::PageOccurrence;
 use crate::clob_book::{
     CLOB_BOOK_PARSER_VERSION, CLOB_BOOK_SCHEMA_VERSION, CLOB_BOOK_SOURCE_ID, ClobBookFetcher,
     ReqwestClobBookFetcher,
@@ -209,6 +212,7 @@ fn derive_projection_rows_for_state(
     let source_envelopes = source_envelopes_for_live_events(&state.config.source_receipts, events)?;
     let paper_frames = scan_paper_log(&state.config.paper_log_path)
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let observation_pages = live_observation_page_index(&state.config.paper_state)?;
     verify_replayed_live_risks(
         account_id,
         &state.config.journal_path,
@@ -216,6 +220,7 @@ fn derive_projection_rows_for_state(
         &source_envelopes,
         Some(&state.config.source_receipts),
         &paper_frames,
+        &observation_pages,
     )?;
     derive_projection_rows_with_sources(account_id, events, &source_envelopes)
 }
@@ -450,6 +455,10 @@ pub async fn run_live_fanout_until(
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
     let paper_frames = scan_paper_log(&state.config.paper_log_path)
         .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
+    let observation_pages =
+        live_observation_page_index(&state.config.paper_state).map_err(|_| {
+            FanoutError::Signal("live observation continuation evidence is invalid".to_owned())
+        })?;
     let inventory = pe_execution_core::live_journal::recovery_inventory_with_admission_verifier(
         &state.config.journal_path,
         state.config.era_live_prefix.as_ref(),
@@ -467,13 +476,17 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
             let source_envelopes =
                 source_envelopes_for_live_events(&state.config.source_receipts, &scoped_events)
                     .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
-            verify_replayed_live_risk(
+            verify_replayed_live_risk_with_index(
                 &event.account_id,
                 &state.config.journal_path,
                 &account_prefix,
                 admission.as_ref(),
-                &source_envelopes,
-                &paper_frames,
+                LiveReplayEvidence {
+                    source_envelopes: &source_envelopes,
+                    source_receipts: Some(&state.config.source_receipts),
+                    paper_frames: &paper_frames,
+                    observation_pages: &observation_pages,
+                },
             )
             .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)
         },
@@ -3006,6 +3019,29 @@ where
 struct LiveObservationBinding<'a> {
     account_id: &'a AccountId,
     identity: &'a LiveOrderIdentity,
+    continuation: &'a DecisionContinuationV3,
+}
+
+type LiveObservationPageIndex = HashMap<SourceTradeId, DecisionContinuationV3>;
+
+fn live_observation_page_index(
+    paper_state: &PaperStateDb,
+) -> Result<LiveObservationPageIndex, ProjectionReducerError> {
+    let rows = paper_state
+        .decision_pending_history()
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let mut pages = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let continuation = DecisionContinuationV3::from_durable(&row)
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+        if pages
+            .insert(continuation.facts.source_trade_id.clone(), continuation)
+            .is_some()
+        {
+            return Err(ProjectionReducerError::InvalidRiskEvidence);
+        }
+    }
+    Ok(pages)
 }
 
 fn source_time_from_millis(received_unix_ms: i64) -> Result<OffsetDateTime, EconomicReplayError> {
@@ -3019,7 +3055,7 @@ fn source_time_from_millis(received_unix_ms: i64) -> Result<OffsetDateTime, Econ
 
 fn validate_live_observation_trade(
     economic: &EconomicPrepared,
-    complete_bound: &RecordedEconomicSource,
+    complete_read: &[RecordedEconomicSource],
     selected: &RecordedEconomicSource,
     binding: LiveObservationBinding<'_>,
 ) -> Result<(), EconomicReplayError> {
@@ -3032,23 +3068,27 @@ fn validate_live_observation_trade(
     })?;
     let leader = WalletAddress::from_hex(&projection.leader_wallet)
         .map_err(|_| economic_replay_error("current live fill projection has an invalid leader"))?;
-    let received_at = source_time_from_millis(complete_bound.received_unix_ms)?;
-    let window = parse_activity_response(
-        &complete_bound.payload,
-        leader,
-        &ActivityParseContext {
-            source_id: SourceId(complete_bound.source_id.clone()),
-            observed_at: SourceTimestamp(received_at),
-            received_at: ReceivedAt(received_at),
-            transport: ActivityTransport::Replay,
-        },
-    )
-    .map_err(|error| {
-        economic_replay_error(format!(
-            "economic observation complete activity parse failed: {error}"
-        ))
-    })?;
-    let aggregates = aggregate_activity_rows(&window.rows).map_err(|error| {
+    let mut rows = Vec::new();
+    for page in complete_read {
+        let received_at = source_time_from_millis(page.received_unix_ms)?;
+        let window = parse_activity_response(
+            &page.payload,
+            leader,
+            &ActivityParseContext {
+                source_id: SourceId(page.source_id.clone()),
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                transport: ActivityTransport::Replay,
+            },
+        )
+        .map_err(|error| {
+            economic_replay_error(format!(
+                "economic observation complete activity parse failed: {error}"
+            ))
+        })?;
+        rows.extend(window.rows);
+    }
+    let aggregates = aggregate_activity_rows(&rows).map_err(|error| {
         economic_replay_error(format!(
             "economic observation activity aggregate failed: {error}"
         ))
@@ -3213,7 +3253,46 @@ where
         ));
     }
     if let Some(binding) = live_binding {
-        validate_live_observation_trade(economic, &complete_bound, &selected, binding)?;
+        let Some(greatest_page) = binding
+            .continuation
+            .page_occurrences()
+            .iter()
+            .max_by_key(|page| page.receipt.sequence)
+        else {
+            return Err(economic_replay_error(
+                "economic observation continuation has no complete-read pages",
+            ));
+        };
+        if greatest_page.receipt != observation.complete_bound_receipt {
+            return Err(economic_replay_error(
+                "economic observation completeness bound is not the greatest page receipt",
+            ));
+        }
+        if binding.continuation.observation_receipt() != Some(observation.source_receipt)
+            || binding.continuation.complete_bound() != Some(observation.complete_bound_receipt)
+        {
+            return Err(economic_replay_error(
+                "economic observation receipts differ from the durable continuation",
+            ));
+        }
+        let mut complete_read = Vec::with_capacity(binding.continuation.page_occurrences().len());
+        for page in binding.continuation.page_occurrences() {
+            let source = exact_economic_source(
+                page.receipt,
+                crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                evidence_cutoff_unix_ms,
+                lookup,
+            )?;
+            if blake3::hash(&source.payload).to_hex().as_str() != page.raw_hash {
+                return Err(economic_replay_error(
+                    "economic observation activity page payload differs from its continuation",
+                ));
+            }
+            complete_read.push(source);
+        }
+        validate_live_observation_trade(economic, &complete_read, &selected, binding)?;
     }
     Ok(())
 }
@@ -3549,17 +3628,26 @@ fn replay_live_risk_prices(
     })
 }
 
+#[derive(Clone, Copy)]
+struct LiveReplayEvidence<'a> {
+    source_envelopes: &'a [EventEnvelope],
+    source_receipts: Option<&'a SourceReceiptIndex>,
+    paper_frames: &'a [ScannedPaperFrame],
+    observation_pages: &'a LiveObservationPageIndex,
+}
+
 fn verify_replayed_live_risk_with_index(
     account_id: &AccountId,
     live_journal_path: &Path,
     preceding_events: &[LiveJournalEvent],
     admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
-    source_envelopes: &[EventEnvelope],
-    source_receipts: Option<&SourceReceiptIndex>,
-    paper_frames: &[ScannedPaperFrame],
+    evidence: LiveReplayEvidence<'_>,
 ) -> Result<(), ProjectionReducerError> {
-    let derived =
-        derive_projection_rows_with_sources(account_id, preceding_events, source_envelopes)?;
+    let derived = derive_projection_rows_with_sources(
+        account_id,
+        preceding_events,
+        evidence.source_envelopes,
+    )?;
     // Pre-Baseline history remains audit-only and owns no financial state.
     if derived.baseline_sequence.is_none() {
         return Ok(());
@@ -3572,6 +3660,24 @@ fn verify_replayed_live_risk_with_index(
         .fill_projection
         .as_deref()
         .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+    let source_trade_id = SourceTradeId(
+        projection
+            .source_trade_id
+            .clone()
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
+    );
+    let continuation = evidence
+        .observation_pages
+        .get(&source_trade_id)
+        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+    if continuation.facts.wallet.to_string() != projection.leader_wallet
+        || continuation.facts.market_id.to_string() != projection.market_id
+        || i64::from(continuation.facts.outcome_id.0) != projection.outcome_id
+        || continuation.facts.side != Side::Buy
+        || projection.side != "buy"
+    {
+        return Err(ProjectionReducerError::InvalidRiskEvidence);
+    }
     let evaluated_at_unix_ms = admission.economic.risk.evaluated_at_unix_ms;
     let cash_before = CollateralAmount::from_decimal_exact(
         derived
@@ -3586,13 +3692,15 @@ fn verify_replayed_live_risk_with_index(
         Some(LiveObservationBinding {
             account_id,
             identity: &admission.identity,
+            continuation,
         }),
         |receipt| {
-            let envelope = match source_receipts {
+            let envelope = match evidence.source_receipts {
                 Some(index) => index
                     .source_envelope(receipt)
                     .map_err(|error| EconomicReplayError(error.to_string()))?,
-                None => source_envelopes
+                None => evidence
+                    .source_envelopes
                     .iter()
                     .find(|envelope| {
                         envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
@@ -3636,12 +3744,12 @@ fn verify_replayed_live_risk_with_index(
         &derived.positions,
         &admission.economic.risk.price_receipts,
         evaluated_at_unix_ms,
-        source_envelopes,
-        source_receipts,
+        evidence.source_envelopes,
+        evidence.source_receipts,
     )
     .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     let paper_prefix = paper_prefix_at_financial_prefix(
-        paper_frames,
+        evidence.paper_frames,
         admission.economic.risk.financial_prefix,
         evaluated_at_unix_ms,
     )
@@ -3681,6 +3789,83 @@ fn verify_replayed_live_risk_with_index(
     Ok(())
 }
 
+#[cfg(test)]
+fn single_page_observation_index(
+    admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
+    source_envelopes: &[EventEnvelope],
+) -> Result<LiveObservationPageIndex, ProjectionReducerError> {
+    let observation = admission
+        .economic
+        .observation
+        .as_ref()
+        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+    let projection = admission
+        .identity
+        .fill_projection
+        .as_deref()
+        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+    let source_trade_id = SourceTradeId(
+        projection
+            .source_trade_id
+            .clone()
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
+    );
+    let bound = source_envelopes
+        .iter()
+        .find(|source| {
+            source.seq == observation.complete_bound_receipt.sequence
+                && source.this_hash == observation.complete_bound_receipt.this_hash
+        })
+        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+    let outcome = u16::try_from(projection.outcome_id)
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let configuration = crate::runtime_config::RuntimeConfig::from_service_config(
+        &crate::config::ServiceConfig::default(),
+    );
+    let continuation = DecisionContinuationV3::new(
+        crate::bucket_commit::DecisionContinuationFacts {
+            source_trade_id: source_trade_id.clone(),
+            semantic_revision: "live-replay-test".to_owned(),
+            transaction_hash: "live-replay-test".to_owned(),
+            wallet: WalletAddress::from_hex(&projection.leader_wallet)
+                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
+            source_epoch: observation.observed_unix_ms.div_euclid(1_000),
+            market_id: MarketId(VenueMarketId(projection.market_id.clone())),
+            outcome_id: OutcomeId(outcome),
+            side: Side::Buy,
+            price: admission.economic.balance.chase_ceiling,
+            share_amount: ShareAmount::from_whole(10)
+                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
+            provenance: if observation.provenance == "activity_ws" {
+                pe_copy_signal_engine::TradeProvenance::ActivityWs
+            } else {
+                pe_copy_signal_engine::TradeProvenance::RestPoll
+            },
+            pre_bucket_action: LeaderAction::Entry,
+            reconstruction_quality: ReconstructionQuality::new(100)
+                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+            gate_result: "admitted".to_owned(),
+            applied_configuration_hash: configuration.canonical_hash(),
+            applied_configuration: configuration,
+            frozen_basis: crate::bucket_commit::FrozenDecisionBasis {
+                win_rate_p: Probability::new(Decimal::ONE)
+                    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
+                bankroll: Decimal::ONE,
+            },
+            decision_inputs: serde_json::Value::Null,
+        },
+        (observation.provenance == "activity_ws").then_some(observation.source_receipt),
+        vec![PageOccurrence {
+            request_url: "test://single-page".to_owned(),
+            raw_hash: bound.raw_payload_hash.to_hex().to_string(),
+            receipt: observation.complete_bound_receipt,
+        }],
+    );
+    Ok(HashMap::from([(source_trade_id, continuation)]))
+}
+
+#[cfg(test)]
 fn verify_replayed_live_risk(
     account_id: &AccountId,
     live_journal_path: &Path,
@@ -3689,14 +3874,18 @@ fn verify_replayed_live_risk(
     source_envelopes: &[EventEnvelope],
     paper_frames: &[ScannedPaperFrame],
 ) -> Result<(), ProjectionReducerError> {
+    let observation_pages = single_page_observation_index(admission, source_envelopes)?;
     verify_replayed_live_risk_with_index(
         account_id,
         live_journal_path,
         preceding_events,
         admission,
-        source_envelopes,
-        None,
-        paper_frames,
+        LiveReplayEvidence {
+            source_envelopes,
+            source_receipts: None,
+            paper_frames,
+            observation_pages: &observation_pages,
+        },
     )
 }
 
@@ -3707,6 +3896,7 @@ fn verify_replayed_live_risks(
     source_envelopes: &[EventEnvelope],
     source_receipts: Option<&SourceReceiptIndex>,
     paper_frames: &[ScannedPaperFrame],
+    observation_pages: &LiveObservationPageIndex,
 ) -> Result<(), ProjectionReducerError> {
     for (event_index, event) in events.iter().enumerate() {
         let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload else {
@@ -3717,9 +3907,12 @@ fn verify_replayed_live_risks(
             live_journal_path,
             &events[..event_index],
             admission,
-            source_envelopes,
-            source_receipts,
-            paper_frames,
+            LiveReplayEvidence {
+                source_envelopes,
+                source_receipts,
+                paper_frames,
+                observation_pages,
+            },
         )?;
     }
     Ok(())
@@ -8837,6 +9030,7 @@ mod tests {
         Box<pe_execution_core::LiveOrderPreparedAudit>,
         AccountId,
         Vec<(AppendReceipt, RecordedEconomicSource)>,
+        DecisionContinuationV3,
     ) {
         let mut prepared = finality_prepared();
         prepared.economic.admission.market.observed_at_unix = 20;
@@ -8856,6 +9050,7 @@ mod tests {
             observed_at,
             source_time,
         );
+        let rest_hash = blake3::hash(&rest).to_hex().to_string();
         let economic = &prepared.economic;
         let payloads = economic_source_payloads(&economic.market.condition_id.0);
         let receipts = [
@@ -8912,13 +9107,80 @@ mod tests {
                 },
             ),
         ]);
-        (prepared, account_id, sources)
+        let continuation = observation_continuation(
+            &prepared,
+            18,
+            vec![PageOccurrence {
+                request_url: "https://data-api.polymarket.com/activity?offset=0".to_owned(),
+                raw_hash: rest_hash,
+                receipt: complete_bound_receipt,
+            }],
+        );
+        (prepared, account_id, sources, continuation)
+    }
+
+    fn observation_continuation(
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        source_epoch: i64,
+        page_occurrences: Vec<PageOccurrence>,
+    ) -> DecisionContinuationV3 {
+        observation_continuation_for(
+            &prepared.identity,
+            &prepared.economic,
+            source_epoch,
+            page_occurrences,
+        )
+    }
+
+    fn observation_continuation_for(
+        identity: &LiveOrderIdentity,
+        economic: &EconomicPrepared,
+        source_epoch: i64,
+        page_occurrences: Vec<PageOccurrence>,
+    ) -> DecisionContinuationV3 {
+        let projection = identity.fill_projection.as_deref().unwrap();
+        let observation = economic.observation.as_ref().unwrap();
+        let configuration =
+            crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
+        DecisionContinuationV3::new(
+            crate::bucket_commit::DecisionContinuationFacts {
+                source_trade_id: SourceTradeId(projection.source_trade_id.clone().unwrap()),
+                semantic_revision: "live-replay-test".to_owned(),
+                transaction_hash: "live-replay-test".to_owned(),
+                wallet: WalletAddress::from_hex(&projection.leader_wallet).unwrap(),
+                source_epoch,
+                market_id: MarketId(VenueMarketId(projection.market_id.clone())),
+                outcome_id: OutcomeId(u16::try_from(projection.outcome_id).unwrap()),
+                side: Side::Buy,
+                price: economic.balance.chase_ceiling,
+                share_amount: ShareAmount::from_whole(10).unwrap(),
+                provenance: if observation.provenance == "activity_ws" {
+                    pe_copy_signal_engine::TradeProvenance::ActivityWs
+                } else {
+                    pe_copy_signal_engine::TradeProvenance::RestPoll
+                },
+                pre_bucket_action: LeaderAction::Entry,
+                reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                action_confidence_ppm: ProbabilityPpm(1_000_000),
+                gate_result: "admitted".to_owned(),
+                applied_configuration_hash: configuration.canonical_hash(),
+                applied_configuration: configuration,
+                frozen_basis: crate::bucket_commit::FrozenDecisionBasis {
+                    win_rate_p: Probability::new(dec!(0.6)).unwrap(),
+                    bankroll: dec!(100),
+                },
+                decision_inputs: serde_json::json!({"fixture": "live-replay"}),
+            },
+            (observation.provenance == "activity_ws").then_some(observation.source_receipt),
+            page_occurrences,
+        )
     }
 
     fn replay_observation_fixture(
         prepared: &pe_execution_core::LiveOrderPreparedAudit,
         account_id: &AccountId,
         sources: &[(AppendReceipt, RecordedEconomicSource)],
+        continuation: &DecisionContinuationV3,
     ) -> Result<SourceBackedEconomicReplay, EconomicReplayError> {
         let economic = &prepared.economic;
         replay_source_backed_economic_with_live_binding(
@@ -8928,6 +9190,7 @@ mod tests {
             Some(LiveObservationBinding {
                 account_id,
                 identity: &prepared.identity,
+                continuation,
             }),
             |receipt| {
                 sources
@@ -8939,20 +9202,418 @@ mod tests {
         )
     }
 
+    fn activity_page_fragment(
+        template: &serde_json::Value,
+        size: &str,
+        price: &str,
+        usdc_size: &str,
+    ) -> Vec<u8> {
+        let mut row = template.clone();
+        let object = row.as_object_mut().unwrap();
+        object.insert("size".to_owned(), serde_json::json!(size));
+        object.insert("price".to_owned(), serde_json::json!(price));
+        object.insert("usdcSize".to_owned(), serde_json::json!(usdc_size));
+        serde_json::to_vec(&vec![row]).unwrap()
+    }
+
+    fn bind_reconciled_activity_decision(
+        prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
+        account_id: &AccountId,
+        source_time: OffsetDateTime,
+        price: Price,
+        shares: ShareAmount,
+    ) {
+        prepared.identity.decision_hash = reconciled_activity_decision_hash(
+            &prepared.identity,
+            account_id,
+            source_time,
+            price,
+            shares,
+        );
+    }
+
+    fn reconciled_activity_decision_hash(
+        identity: &LiveOrderIdentity,
+        account_id: &AccountId,
+        source_time: OffsetDateTime,
+        price: Price,
+        shares: ShareAmount,
+    ) -> String {
+        let projection = identity.fill_projection.as_deref().unwrap();
+        let source_trade_id = SourceTradeId(projection.source_trade_id.clone().unwrap());
+        let signal = LeaderSignal {
+            leader: TraderId(WalletAddress::from_hex(&projection.leader_wallet).unwrap()),
+            venue: VenueId::polymarket(),
+            market_id: MarketId(VenueMarketId(projection.market_id.clone())),
+            outcome_id: OutcomeId(u16::try_from(projection.outcome_id).unwrap()),
+            action: LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: price,
+            leader_size: shares,
+            observed_at: source_time,
+            received_at: source_time,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            source_trade_id,
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+        };
+        hash_json(&(
+            "prediction-edge/live-decision/v1",
+            &signal,
+            account_id.as_str(),
+            &identity.config_hash,
+            &identity.quote_id,
+            &identity.evidence_hashes,
+        ))
+        .unwrap()
+    }
+
+    fn multipage_observation_replay_fixture(
+        websocket_assisted: bool,
+        split_group: bool,
+    ) -> (
+        Box<pe_execution_core::LiveOrderPreparedAudit>,
+        AccountId,
+        Vec<(AppendReceipt, RecordedEconomicSource)>,
+        DecisionContinuationV3,
+    ) {
+        let (mut prepared, account_id, mut sources, _) = observation_replay_fixture();
+        let original_bound = prepared
+            .economic
+            .observation
+            .as_ref()
+            .unwrap()
+            .complete_bound_receipt;
+        let original_page = sources
+            .iter()
+            .find(|(receipt, _)| *receipt == original_bound)
+            .map(|(_, source)| source.payload.clone())
+            .unwrap();
+        let template = serde_json::from_slice::<Vec<serde_json::Value>>(&original_page)
+            .unwrap()
+            .remove(0);
+        sources.retain(|(receipt, _)| *receipt != original_bound);
+
+        let (first_payload, final_payload) = if split_group {
+            (
+                activity_page_fragment(&template, "4.000000", "0.40", "1.600000"),
+                activity_page_fragment(&template, "6.000000", "0.60", "3.600000"),
+            )
+        } else {
+            (
+                activity_page_fragment(&template, "10.000000", "0.52", "5.200000"),
+                serde_json::to_vec(&Vec::<serde_json::Value>::new()).unwrap(),
+            )
+        };
+        let first_receipt = original_bound;
+        let final_receipt = fixture_receipt(original_bound.sequence.0 + 1);
+        let page_source = |payload, received_unix_ms| RecordedEconomicSource {
+            payload,
+            received_unix_ms,
+            source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            content_type: ContentType::Json,
+        };
+        sources.extend([
+            (first_receipt, page_source(first_payload.clone(), 20_000)),
+            (final_receipt, page_source(final_payload.clone(), 21_000)),
+        ]);
+
+        let source_time = OffsetDateTime::from_unix_timestamp(18).unwrap();
+        bind_reconciled_activity_decision(
+            &mut prepared,
+            &account_id,
+            source_time,
+            Price(dec!(0.52)),
+            ShareAmount::from_whole(10).unwrap(),
+        );
+        let selected_receipt = if websocket_assisted {
+            prepared
+                .economic
+                .observation
+                .as_ref()
+                .unwrap()
+                .source_receipt
+        } else {
+            final_receipt
+        };
+        prepared.economic.observation = Some(ObservationEvidence {
+            source_receipt: selected_receipt,
+            complete_bound_receipt: final_receipt,
+            observed_unix_ms: if websocket_assisted { 19_000 } else { 21_000 },
+            provenance: if websocket_assisted {
+                "activity_ws".to_owned()
+            } else {
+                "rest_poll".to_owned()
+            },
+        });
+        let continuation = observation_continuation(
+            &prepared,
+            18,
+            vec![
+                PageOccurrence {
+                    request_url: "https://data-api.polymarket.com/activity?offset=0".to_owned(),
+                    raw_hash: blake3::hash(&first_payload).to_hex().to_string(),
+                    receipt: first_receipt,
+                },
+                PageOccurrence {
+                    request_url: "https://data-api.polymarket.com/activity?offset=500".to_owned(),
+                    raw_hash: blake3::hash(&final_payload).to_hex().to_string(),
+                    receipt: final_receipt,
+                },
+            ],
+        );
+        (prepared, account_id, sources, continuation)
+    }
+
     /// PASS: strict economic replay resolves both observation receipts, their ordered receive
     /// clocks, source contracts, and websocket provenance before accepting the economic record.
     /// FAIL: either the websocket or REST observation provenance cannot replay from valid inputs.
     #[test]
     fn strict_live_economic_validates_observation_receipts() {
-        let (prepared, account_id, sources) = observation_replay_fixture();
-        replay_observation_fixture(&prepared, &account_id, &sources).unwrap();
+        let (prepared, account_id, sources, continuation) = observation_replay_fixture();
+        replay_observation_fixture(&prepared, &account_id, &sources, &continuation).unwrap();
 
         let mut rest_poll = prepared.clone();
         let observation = rest_poll.economic.observation.as_mut().unwrap();
         observation.source_receipt = observation.complete_bound_receipt;
         observation.observed_unix_ms = 20_000;
         observation.provenance = "rest_poll".to_owned();
-        replay_observation_fixture(&rest_poll, &account_id, &sources).unwrap();
+        let rest_continuation =
+            observation_continuation(&rest_poll, 18, continuation.page_occurrences().to_vec());
+        replay_observation_fixture(&rest_poll, &account_id, &sources, &rest_continuation).unwrap();
+    }
+
+    /// PASS: post-Baseline strict live replay reconstructs both REST-only and websocket-assisted
+    /// decisions from all offset-0/offset-500 pages, whether the group is split across them or is
+    /// present only on the non-final page; each reconstruction matches the recorded decision hash.
+    /// FAIL: replay uses only the complete-bound page or requires that page to contain the trade.
+    #[test]
+    fn strict_live_economic_reconstructs_complete_multipage_activity_reads() {
+        for websocket_assisted in [false, true] {
+            for split_group in [false, true] {
+                let (prepared, account_id, sources, continuation) =
+                    multipage_observation_replay_fixture(websocket_assisted, split_group);
+                replay_observation_fixture(&prepared, &account_id, &sources, &continuation)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// PASS: the post-Baseline live-risk verifier accepts both REST-only and websocket-assisted
+    /// admissions after rebuilding a split offset-0/offset-500 group from its durable V3 page
+    /// occurrences and matching the resulting decision hash.
+    /// FAIL: the production strict-recovery path still validates only the final activity page.
+    #[test]
+    fn strict_live_economic_reconstructs_post_baseline_multipage_admissions() {
+        for websocket_assisted in [false, true] {
+            for split_group in [false, true] {
+                let (dir, account_id, events, mut sources, paper_frames, mut admission) =
+                    reconstructed_live_risk_fixture();
+                let observation = admission.economic.observation.as_ref().unwrap().clone();
+                let first_receipt = observation.complete_bound_receipt;
+                let original_page = sources
+                    .iter()
+                    .find(|source| {
+                        source.seq == first_receipt.sequence
+                            && source.this_hash == first_receipt.this_hash
+                    })
+                    .map(|source| source.payload.clone())
+                    .unwrap();
+                let template = serde_json::from_slice::<Vec<serde_json::Value>>(&original_page)
+                    .unwrap()
+                    .remove(0);
+                let (first_payload, final_payload) = if split_group {
+                    (
+                        activity_page_fragment(&template, "4.000000", "0.40", "1.600000"),
+                        activity_page_fragment(&template, "6.000000", "0.60", "3.600000"),
+                    )
+                } else {
+                    (
+                        activity_page_fragment(&template, "10.000000", "0.52", "5.200000"),
+                        serde_json::to_vec(&Vec::<serde_json::Value>::new()).unwrap(),
+                    )
+                };
+                let first = sources
+                    .iter_mut()
+                    .find(|source| {
+                        source.seq == first_receipt.sequence
+                            && source.this_hash == first_receipt.this_hash
+                    })
+                    .unwrap();
+                first.payload = first_payload.clone();
+                first.raw_payload_hash = blake3::hash(&first_payload);
+
+                let final_receipt = fixture_receipt(first_receipt.sequence.0 + 1);
+                let received_at = OffsetDateTime::from_unix_timestamp(20).unwrap();
+                let mut final_page = source_envelope(
+                    final_receipt,
+                    crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+                    final_payload.clone(),
+                    received_at,
+                );
+                final_page.schema_version = pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION;
+                final_page.parser_version = pe_source_polymarket_public::ACTIVITY_PARSER_VERSION;
+                sources.push(final_page);
+                if !websocket_assisted {
+                    sources.retain(|source| {
+                        source.source_id.0 != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+                    });
+                }
+
+                let selected_receipt = if websocket_assisted {
+                    observation.source_receipt
+                } else {
+                    final_receipt
+                };
+                admission.economic.observation = Some(ObservationEvidence {
+                    source_receipt: selected_receipt,
+                    complete_bound_receipt: final_receipt,
+                    observed_unix_ms: 20_000,
+                    provenance: if websocket_assisted {
+                        "activity_ws".to_owned()
+                    } else {
+                        "rest_poll".to_owned()
+                    },
+                });
+                admission.identity.decision_hash = reconciled_activity_decision_hash(
+                    &admission.identity,
+                    &account_id,
+                    received_at,
+                    Price(dec!(0.52)),
+                    ShareAmount::from_whole(10).unwrap(),
+                );
+                let continuation = observation_continuation_for(
+                    &admission.identity,
+                    &admission.economic,
+                    20,
+                    vec![
+                        PageOccurrence {
+                            request_url: "https://data-api.polymarket.com/activity?offset=0"
+                                .to_owned(),
+                            raw_hash: blake3::hash(&first_payload).to_hex().to_string(),
+                            receipt: first_receipt,
+                        },
+                        PageOccurrence {
+                            request_url: "https://data-api.polymarket.com/activity?offset=500"
+                                .to_owned(),
+                            raw_hash: blake3::hash(&final_payload).to_hex().to_string(),
+                            receipt: final_receipt,
+                        },
+                    ],
+                );
+                let source_trade_id = continuation.facts.source_trade_id.clone();
+                let observation_pages = HashMap::from([(source_trade_id, continuation)]);
+
+                verify_replayed_live_risk_with_index(
+                    &account_id,
+                    &dir.path().join("live.journal"),
+                    &events,
+                    &admission,
+                    LiveReplayEvidence {
+                        source_envelopes: &sources,
+                        source_receipts: None,
+                        paper_frames: &paper_frames,
+                        observation_pages: &observation_pages,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// PASS: two byte-identical retained page occurrences both contribute to strict replay, so the
+    /// reconstructed quantity and decision hash preserve occurrence multiplicity.
+    /// FAIL: replay deduplicates identical page bytes and reconstructs only half the trade.
+    #[test]
+    fn strict_live_economic_preserves_repeated_page_multiplicity() {
+        let (mut prepared, account_id, mut sources, mut continuation) =
+            multipage_observation_replay_fixture(true, false);
+        let first_receipt = continuation.page_occurrences()[0].receipt;
+        let template = sources
+            .iter()
+            .find(|(receipt, _)| *receipt == first_receipt)
+            .map(|(_, source)| {
+                serde_json::from_slice::<Vec<serde_json::Value>>(&source.payload)
+                    .unwrap()
+                    .remove(0)
+            })
+            .unwrap();
+        let repeated = activity_page_fragment(&template, "5.000000", "0.52", "2.600000");
+        let mut page_occurrences = continuation.page_occurrences().to_vec();
+        for page in &mut page_occurrences {
+            page.raw_hash = blake3::hash(&repeated).to_hex().to_string();
+            sources
+                .iter_mut()
+                .find(|(receipt, _)| *receipt == page.receipt)
+                .unwrap()
+                .1
+                .payload = repeated.clone();
+        }
+        bind_reconciled_activity_decision(
+            &mut prepared,
+            &account_id,
+            OffsetDateTime::from_unix_timestamp(18).unwrap(),
+            Price(dec!(0.52)),
+            ShareAmount::from_whole(10).unwrap(),
+        );
+        continuation = observation_continuation(&prepared, 18, page_occurrences);
+
+        replay_observation_fixture(&prepared, &account_id, &sources, &continuation).unwrap();
+    }
+
+    /// PASS: strict replay fails closed when any retained page is absent or substituted, when only
+    /// a page-local partial group is offered, and when the declared completeness bound is not the
+    /// greatest retained page receipt.
+    /// FAIL: incomplete or differently bound page evidence reproduces an authentic admission.
+    #[test]
+    fn strict_live_economic_rejects_incomplete_or_substituted_multipage_reads() {
+        let (prepared, account_id, sources, continuation) =
+            multipage_observation_replay_fixture(true, true);
+        let first_receipt = continuation.page_occurrences()[0].receipt;
+
+        let missing = sources
+            .iter()
+            .filter(|(receipt, _)| *receipt != first_receipt)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            replay_observation_fixture(&prepared, &account_id, &missing, &continuation).is_err()
+        );
+
+        let mut substituted = sources.clone();
+        substituted
+            .iter_mut()
+            .find(|(receipt, _)| *receipt == first_receipt)
+            .unwrap()
+            .1
+            .payload = serde_json::to_vec(&Vec::<serde_json::Value>::new()).unwrap();
+        assert!(
+            replay_observation_fixture(&prepared, &account_id, &substituted, &continuation,)
+                .is_err()
+        );
+
+        let mut page_local_occurrences = continuation.page_occurrences().to_vec();
+        page_local_occurrences.remove(0);
+        let page_local = observation_continuation(&prepared, 18, page_local_occurrences);
+        assert!(replay_observation_fixture(&prepared, &account_id, &sources, &page_local).is_err());
+
+        let mut wrong_bound_prepared = prepared.clone();
+        wrong_bound_prepared
+            .economic
+            .observation
+            .as_mut()
+            .unwrap()
+            .complete_bound_receipt = first_receipt;
+        let wrong_bound = observation_continuation(
+            &wrong_bound_prepared,
+            18,
+            continuation.page_occurrences().to_vec(),
+        );
+        assert!(
+            replay_observation_fixture(&wrong_bound_prepared, &account_id, &sources, &wrong_bound,)
+                .is_err()
+        );
     }
 
     /// PASS: removing either observation receipt, changing its source contract or provenance,
@@ -8960,7 +9621,7 @@ mod tests {
     /// FAIL: any missing, future, or tampered observation evidence remains replayable.
     #[test]
     fn strict_live_economic_rejects_absent_or_tampered_observation_receipts() {
-        let (prepared, account_id, sources) = observation_replay_fixture();
+        let (prepared, account_id, sources, continuation) = observation_replay_fixture();
         let observation = prepared.economic.observation.as_ref().unwrap();
         for missing_receipt in [
             observation.source_receipt,
@@ -8971,7 +9632,10 @@ mod tests {
                 .filter(|(receipt, _)| *receipt != missing_receipt)
                 .cloned()
                 .collect::<Vec<_>>();
-            assert!(replay_observation_fixture(&prepared, &account_id, &missing).is_err());
+            assert!(
+                replay_observation_fixture(&prepared, &account_id, &missing, &continuation)
+                    .is_err()
+            );
         }
 
         let mut wrong_contract = sources.clone();
@@ -8981,7 +9645,10 @@ mod tests {
             .unwrap()
             .1
             .source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
-        assert!(replay_observation_fixture(&prepared, &account_id, &wrong_contract).is_err());
+        assert!(
+            replay_observation_fixture(&prepared, &account_id, &wrong_contract, &continuation)
+                .is_err()
+        );
 
         let mut wrong_provenance = prepared.clone();
         wrong_provenance
@@ -8990,7 +9657,10 @@ mod tests {
             .as_mut()
             .unwrap()
             .provenance = "rest_poll".to_owned();
-        assert!(replay_observation_fixture(&wrong_provenance, &account_id, &sources).is_err());
+        assert!(
+            replay_observation_fixture(&wrong_provenance, &account_id, &sources, &continuation)
+                .is_err()
+        );
 
         let mut wrong_clock = prepared.clone();
         wrong_clock
@@ -8999,7 +9669,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .observed_unix_ms += 1;
-        assert!(replay_observation_fixture(&wrong_clock, &account_id, &sources).is_err());
+        assert!(
+            replay_observation_fixture(&wrong_clock, &account_id, &sources, &continuation).is_err()
+        );
 
         for future_receipt in [
             observation.source_receipt,
@@ -9012,12 +9684,17 @@ mod tests {
                 .unwrap()
                 .1
                 .received_unix_ms = prepared.economic.risk.evaluated_at_unix_ms + 1;
-            assert!(replay_observation_fixture(&prepared, &account_id, &future_source).is_err());
+            assert!(
+                replay_observation_fixture(&prepared, &account_id, &future_source, &continuation,)
+                    .is_err()
+            );
         }
 
         let mut missing = prepared.clone();
         missing.economic.observation = None;
-        assert!(replay_observation_fixture(&missing, &account_id, &sources).is_err());
+        assert!(
+            replay_observation_fixture(&missing, &account_id, &sources, &continuation).is_err()
+        );
     }
 
     /// PASS: current live replay rejects malformed websocket evidence and websocket payloads that
@@ -9025,7 +9702,7 @@ mod tests {
     /// FAIL: any selected payload that cannot reproduce the recorded trade remains replayable.
     #[test]
     fn strict_live_economic_rejects_malformed_or_different_selected_trade() {
-        let (prepared, account_id, sources) = observation_replay_fixture();
+        let (prepared, account_id, sources, continuation) = observation_replay_fixture();
         let selected = prepared
             .economic
             .observation
@@ -9062,7 +9739,10 @@ mod tests {
                 .unwrap()
                 .1
                 .payload = payload;
-            assert!(replay_observation_fixture(&prepared, &account_id, &changed).is_err());
+            assert!(
+                replay_observation_fixture(&prepared, &account_id, &changed, &continuation)
+                    .is_err()
+            );
         }
     }
 
@@ -9071,7 +9751,7 @@ mod tests {
     /// FAIL: receipt metadata alone allows an unrelated REST page to satisfy the binding.
     #[test]
     fn strict_live_economic_rejects_unrelated_rest_page() {
-        let (prepared, account_id, mut sources) = observation_replay_fixture();
+        let (prepared, account_id, mut sources, continuation) = observation_replay_fixture();
         let bound = prepared
             .economic
             .observation
@@ -9091,7 +9771,9 @@ mod tests {
             .unwrap()
             .1
             .payload = unrelated;
-        assert!(replay_observation_fixture(&prepared, &account_id, &sources).is_err());
+        assert!(
+            replay_observation_fixture(&prepared, &account_id, &sources, &continuation).is_err()
+        );
     }
 
     /// PASS: changing only the REST trade's exact quantity, price, or source clock leaves its
@@ -9099,7 +9781,7 @@ mod tests {
     /// FAIL: strict replay accepts different economic signal inputs under the same trade id.
     #[test]
     fn strict_live_economic_binds_trade_quantity_price_and_source_clock() {
-        let (prepared, account_id, sources) = observation_replay_fixture();
+        let (prepared, account_id, sources, continuation) = observation_replay_fixture();
         let bound = prepared
             .economic
             .observation
@@ -9124,7 +9806,8 @@ mod tests {
                 .insert(field.to_owned(), value);
             source.payload = serde_json::to_vec(&payload).unwrap();
             assert!(
-                replay_observation_fixture(&prepared, &account_id, &changed).is_err(),
+                replay_observation_fixture(&prepared, &account_id, &changed, &continuation)
+                    .is_err(),
                 "{field}"
             );
         }
@@ -9988,17 +10671,33 @@ mod tests {
         observed_at: OffsetDateTime,
         source_time: OffsetDateTime,
     ) -> (Vec<u8>, Vec<u8>) {
+        bind_activity_observation_with_transaction(
+            prepared,
+            account_id,
+            source_receipt,
+            complete_bound_receipt,
+            observed_at,
+            source_time,
+            &format!("0x{}", "55".repeat(32)),
+        )
+    }
+
+    fn bind_activity_observation_with_transaction(
+        prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
+        account_id: &AccountId,
+        source_receipt: AppendReceipt,
+        complete_bound_receipt: AppendReceipt,
+        observed_at: OffsetDateTime,
+        source_time: OffsetDateTime,
+        transaction_hash: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
         let leader = WalletAddress([0xaa; 20]);
         // The activity payload carries the trade time in whole seconds; the recorded signal must
         // use the same instant so strict replay's reconstruction hashes to the recorded decision.
         let source_time =
             OffsetDateTime::from_unix_timestamp(source_time.unix_timestamp()).unwrap();
-        let (websocket, rest, source_trade_id) = activity_payload_pair(
-            &prepared.economic,
-            source_time,
-            leader,
-            &format!("0x{}", "55".repeat(32)),
-        );
+        let (websocket, rest, source_trade_id) =
+            activity_payload_pair(&prepared.economic, source_time, leader, transaction_hash);
         let signal = LeaderSignal {
             leader: TraderId(leader),
             venue: VenueId::polymarket(),
@@ -10037,6 +10736,13 @@ mod tests {
             provenance: "activity_ws".to_owned(),
         });
         (websocket, rest)
+    }
+
+    fn activity_transaction_hash(identity: &LiveOrderIdentity) -> String {
+        format!(
+            "0x{}",
+            blake3::hash(identity.dispatch_id.as_bytes()).to_hex()
+        )
     }
 
     fn fixture_observation_evidence() -> ObservationEvidence {
@@ -10762,6 +11468,7 @@ mod tests {
         account_id: &AccountId,
         received_at: OffsetDateTime,
     ) {
+        let transaction_hash = activity_transaction_hash(&prepared.identity);
         let economic = &mut prepared.economic;
         let payloads = economic_source_payloads_with_end(
             &economic.market.condition_id.0,
@@ -10806,7 +11513,7 @@ mod tests {
             economic,
             received_at,
             WalletAddress([0xaa; 20]),
-            &format!("0x{}", "55".repeat(32)),
+            &transaction_hash,
         );
         let mut observation_receipts = Vec::new();
         for (source_id, payload) in [
@@ -10830,14 +11537,73 @@ mod tests {
                     .unwrap(),
             );
         }
-        let _ = bind_activity_observation(
+        let _ = bind_activity_observation_with_transaction(
             prepared,
             account_id,
             observation_receipts[0],
             observation_receipts[1],
             received_at,
             received_at,
+            &transaction_hash,
         );
+        record_observation_continuation(state, prepared, received_at);
+    }
+
+    fn record_observation_continuation(
+        state: &FanoutState,
+        prepared: &pe_execution_core::LiveOrderPreparedAudit,
+        source_time: OffsetDateTime,
+    ) {
+        let observation = prepared.economic.observation.as_ref().unwrap();
+        let complete_bound = state
+            .config
+            .source_receipts
+            .source_envelope(observation.complete_bound_receipt)
+            .unwrap();
+        let continuation = observation_continuation(
+            prepared,
+            source_time.unix_timestamp(),
+            vec![PageOccurrence {
+                request_url: "https://data-api.polymarket.com/activity?offset=0".to_owned(),
+                raw_hash: complete_bound.raw_payload_hash.to_hex().to_string(),
+                receipt: observation.complete_bound_receipt,
+            }],
+        );
+        let frozen_inputs_json = serde_json::to_string(&continuation).unwrap();
+        state
+            .config
+            .paper_state
+            .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                wallet: continuation.facts.wallet,
+                source_epoch: continuation.facts.source_epoch,
+                dispositions: vec![pe_paper_state::ActivityDispositionRecord {
+                    source_trade_id: continuation.facts.source_trade_id.clone(),
+                    transaction_hash: continuation.facts.transaction_hash.clone(),
+                    wallet: continuation.facts.wallet,
+                    source_epoch: continuation.facts.source_epoch,
+                    semantic_revision: continuation.facts.semantic_revision.clone(),
+                    activity_type: "trade".to_owned(),
+                    disposition: "decision_pending".to_owned(),
+                    proof_json: serde_json::json!({"fixture": "live-replay"}).to_string(),
+                    no_copy: None,
+                }],
+                leader_positions: Vec::new(),
+                gate_results: Vec::new(),
+                history_effects: Vec::new(),
+                history_status: None,
+                pending: vec![pe_paper_state::DecisionPendingRecord {
+                    source_trade_id: continuation.facts.source_trade_id.clone(),
+                    semantic_revision: continuation.facts.semantic_revision.clone(),
+                    wallet: continuation.facts.wallet,
+                    source_epoch: continuation.facts.source_epoch,
+                    frozen_inputs_json,
+                    updated_at_unix: source_time.unix_timestamp(),
+                }],
+                fence: None,
+                reanchor: None,
+                advance_cursor: false,
+            })
+            .unwrap();
     }
 
     fn finality_prepared() -> Box<pe_execution_core::LiveOrderPreparedAudit> {
