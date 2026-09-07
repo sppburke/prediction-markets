@@ -3,7 +3,7 @@
 //! This module deliberately owns no HTTP client. It consumes only verified framed logs and the
 //! read-only paper-state projection, and emits canonical compact JSON with a trailing line feed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,25 +42,27 @@ use pe_risk_engine::{
     aggregate_resolution_credit, evaluate_risk, nearest_rank_p95,
 };
 use pe_source_polymarket_public::ClassifiedPricesHistory;
-use pe_source_polymarket_public::{
-    ACTIVITY_MAX_OFFSET, ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
-    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
-    ClobPricesHistoryClient, FixtureFetcher, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
-    aggregate_activity_rows, parse_activity_response, parse_activity_row,
-    parse_activity_trade_observation, parse_clob_market,
-};
 #[cfg(test)]
 use pe_source_polymarket_public::{
-    GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
-    GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
+    ACTIVITY_MAX_OFFSET, GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION,
+    GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION,
+    LIVE_MARKET_SCHEMA_VERSION, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
     validate_live_market,
+};
+use pe_source_polymarket_public::{
+    ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
+    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
+    ClobPricesHistoryClient, FixtureFetcher, aggregate_activity_rows, parse_activity_response,
+    parse_activity_row, parse_activity_trade_observation, parse_clob_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
 use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::bucket_commit::{DecisionContinuationV3, PageOccurrence};
+#[cfg(test)]
+use crate::bucket_commit::PageOccurrence;
+use crate::bucket_commit::{CompleteActivityPage, DecisionContinuationV3};
 use crate::config::ServiceConfig;
 use crate::decision_replay::{
     WinnerFollowDecisionInputs, WinnerFollowRiskInputEvidence, replay_decision_pending,
@@ -1934,17 +1936,8 @@ fn decision_rows_from_source_observations(
 
 #[derive(Debug, Clone)]
 struct CompleteActivityReadScope {
-    fixed_end: Option<i64>,
-    requested_wallet: pe_core_types::WalletAddress,
-    pages: Option<Vec<ReconciliationPageEvidence>>,
-    page_occurrences: Vec<PageOccurrence>,
+    continuation: DecisionContinuationV3,
     decisions: HashMap<pe_core_types::SourceTradeId, Option<AppendReceipt>>,
-}
-
-#[derive(Deserialize)]
-struct CompleteActivityReadWire {
-    fixed_end: Option<i64>,
-    pages: Option<Vec<ReconciliationPageEvidence>>,
 }
 
 fn complete_activity_read_scopes(
@@ -1986,25 +1979,12 @@ fn complete_activity_read_scopes(
         {
             return insufficient("decision source receipt does not match the sealed source prefix");
         }
-        let wire: CompleteActivityReadWire = serde_json::from_value(
-            continuation.facts.decision_inputs.clone(),
-        )
-        .map_err(|error| {
-            QualificationError::InsufficientEvidence(format!(
-                "decision complete activity read is invalid: {error}"
-            ))
-        })?;
-        if wire.fixed_end.is_some() != wire.pages.is_some() {
-            return insufficient("decision complete activity read proof is partial");
-        }
-        let page_occurrences = continuation.page_occurrences().to_vec();
         if let Some(existing) = reads
             .iter_mut()
-            .find(|read| read.page_occurrences == page_occurrences)
+            .find(|read| read.continuation.page_occurrences() == continuation.page_occurrences())
         {
-            if existing.fixed_end != wire.fixed_end
-                || existing.requested_wallet != continuation.facts.wallet
-                || existing.pages != wire.pages
+            if existing.continuation.facts.wallet != continuation.facts.wallet
+                || existing.continuation.facts.decision_inputs != continuation.facts.decision_inputs
             {
                 return insufficient(
                     "decision continuations disagree about one complete activity read",
@@ -2023,27 +2003,24 @@ fn complete_activity_read_scopes(
             continue;
         }
         if reads.iter().any(|read| {
-            read.page_occurrences.iter().any(|existing| {
-                page_occurrences
+            read.continuation.page_occurrences().iter().any(|existing| {
+                continuation
+                    .page_occurrences()
                     .iter()
                     .any(|candidate| candidate.receipt.sequence == existing.receipt.sequence)
             })
         }) {
             return insufficient("complete activity reads overlap source page receipts");
         }
+        let observed_source_receipt = continuation.observed_source_receipt;
         reads.push(CompleteActivityReadScope {
-            fixed_end: wire.fixed_end,
-            requested_wallet: continuation.facts.wallet,
-            pages: wire.pages,
-            page_occurrences,
-            decisions: HashMap::from([(
-                row.source_trade_id.clone(),
-                continuation.observed_source_receipt,
-            )]),
+            continuation,
+            decisions: HashMap::from([(row.source_trade_id.clone(), observed_source_receipt)]),
         });
     }
     reads.sort_by_key(|read| {
-        read.page_occurrences
+        read.continuation
+            .page_occurrences()
             .last()
             .map_or(0, |page| page.receipt.sequence.0)
     });
@@ -2112,265 +2089,6 @@ fn validate_activity_page_contract(
     Ok(())
 }
 
-fn joined_read_pages<'a>(
-    read: &'a CompleteActivityReadScope,
-    pages: &'a [ReconciliationPageEvidence],
-) -> Result<Vec<(&'a PageOccurrence, &'a ReconciliationPageEvidence)>, QualificationError> {
-    if read.page_occurrences.len() != pages.len() {
-        return insufficient("complete activity read page multiplicity is inconsistent");
-    }
-    let mut evidence = BTreeMap::<(String, String), VecDeque<&ReconciliationPageEvidence>>::new();
-    for page in pages {
-        evidence
-            .entry((page.request_url.clone(), page.raw_page_hash.clone()))
-            .or_default()
-            .push_back(page);
-    }
-    let mut joined = Vec::with_capacity(read.page_occurrences.len());
-    for occurrence in &read.page_occurrences {
-        let key = (occurrence.request_url.clone(), occurrence.raw_hash.clone());
-        let page = evidence
-            .get_mut(&key)
-            .and_then(VecDeque::pop_front)
-            .ok_or_else(|| {
-                QualificationError::InsufficientEvidence(
-                    "complete activity read page occurrence has no page evidence".to_owned(),
-                )
-            })?;
-        joined.push((occurrence, page));
-    }
-    if evidence.values().any(|pages| !pages.is_empty()) {
-        return insufficient("complete activity read has unbound page evidence");
-    }
-    Ok(joined)
-}
-
-fn complete_activity_read_rows(
-    read: &CompleteActivityReadScope,
-    observations: &BTreeMap<u64, SourceObservation>,
-) -> Result<Vec<pe_source_polymarket_public::NormalizedActivity>, QualificationError> {
-    struct Segment {
-        rows: Vec<pe_source_polymarket_public::NormalizedActivity>,
-        children: Vec<(Option<i64>, i64)>,
-    }
-
-    let (Some(fixed_end), Some(pages)) = (read.fixed_end, read.pages.as_deref()) else {
-        let [occurrence] = read.page_occurrences.as_slice() else {
-            return insufficient(
-                "legacy complete activity read lacks one terminal page occurrence",
-            );
-        };
-        let observation = decision_source_receipt(observations, occurrence.receipt)?;
-        if observation.source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
-            return insufficient("legacy complete activity read page has the wrong source id");
-        }
-        validate_activity_page_contract(observation)?;
-        if blake3::hash(&observation.payload).to_hex().as_str() != occurrence.raw_hash {
-            return insufficient("legacy complete activity read page payload hash differs");
-        }
-        let window = parse_activity_response(
-            &observation.payload,
-            read.requested_wallet,
-            &ActivityParseContext {
-                source_id: SourceId(observation.source_id.clone()),
-                observed_at: observation.observed_at.clone(),
-                received_at: observation.received_at.clone(),
-                transport: ActivityTransport::Replay,
-            },
-        )
-        .map_err(|error| {
-            QualificationError::InsufficientEvidence(format!(
-                "legacy complete activity read page parse failed: {error}"
-            ))
-        })?;
-        if u32::try_from(window.rows.len())
-            .ok()
-            .is_none_or(|row_count| row_count >= RECONCILIATION_PAGE_LIMIT)
-        {
-            return insufficient("legacy complete activity read has no terminal page");
-        }
-        return Ok(window.rows);
-    };
-
-    let joined = joined_read_pages(read, pages)?;
-    let mut grouped_pages =
-        BTreeMap::<(Option<i64>, i64), Vec<(&PageOccurrence, &ReconciliationPageEvidence)>>::new();
-    for (occurrence, page) in joined {
-        let bounds = page.bounds.ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "complete activity read page has no activity bounds".to_owned(),
-            )
-        })?;
-        if page.partition.is_some()
-            || page.schema_version != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
-            || page.parser_version != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
-            || page.row_count > RECONCILIATION_PAGE_LIMIT
-            || bounds.end > fixed_end
-        {
-            return insufficient("complete activity read page evidence is invalid");
-        }
-        grouped_pages
-            .entry((bounds.start, bounds.end))
-            .or_default()
-            .push((occurrence, page));
-    }
-    if grouped_pages.keys().map(|(_, end)| *end).max() != Some(fixed_end) {
-        return insufficient("complete activity read does not reach its fixed end");
-    }
-
-    let mut segments = BTreeMap::new();
-    for ((start, end), mut pages) in grouped_pages {
-        pages.sort_by_key(|(_, page)| page.offset);
-        let page_count = u32::try_from(pages.len()).map_err(|_| {
-            QualificationError::InsufficientEvidence(
-                "complete activity read page count overflow".to_owned(),
-            )
-        })?;
-        for (index, (_, page)) in pages.iter().enumerate() {
-            let index = u32::try_from(index).map_err(|_| {
-                QualificationError::InsufficientEvidence(
-                    "complete activity read page count overflow".to_owned(),
-                )
-            })?;
-            if page.offset != index.saturating_mul(RECONCILIATION_PAGE_LIMIT)
-                || (index + 1 < page_count && page.row_count != RECONCILIATION_PAGE_LIMIT)
-            {
-                return insufficient("complete activity read page offsets are incomplete");
-            }
-        }
-        let Some((_, terminal)) = pages.last() else {
-            return insufficient("complete activity read contains an empty segment");
-        };
-        let saturated = terminal.offset == ACTIVITY_MAX_OFFSET
-            && terminal.row_count == RECONCILIATION_PAGE_LIMIT;
-        if terminal.row_count == RECONCILIATION_PAGE_LIMIT && !saturated {
-            return insufficient("complete activity read segment has no terminal page");
-        }
-        let mut segment_rows = Vec::new();
-        for (occurrence, page) in pages {
-            let observation = decision_source_receipt(observations, occurrence.receipt)?;
-            if observation.source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
-                return insufficient("complete activity read page has the wrong source id");
-            }
-            validate_activity_page_contract(observation)?;
-            if blake3::hash(&observation.payload).to_hex().as_str() != occurrence.raw_hash {
-                return insufficient("complete activity read page payload hash differs");
-            }
-            let window = parse_activity_response(
-                &observation.payload,
-                read.requested_wallet,
-                &ActivityParseContext {
-                    source_id: SourceId(observation.source_id.clone()),
-                    observed_at: observation.observed_at.clone(),
-                    received_at: observation.received_at.clone(),
-                    transport: ActivityTransport::Replay,
-                },
-            )
-            .map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "complete activity read page parse failed: {error}"
-                ))
-            })?;
-            if u32::try_from(window.rows.len()).ok() != Some(page.row_count)
-                || window.rows.iter().any(|row| {
-                    let timestamp = row.source_time.0.unix_timestamp();
-                    timestamp > end || start.is_some_and(|start| timestamp <= start)
-                })
-            {
-                return insufficient("complete activity read page differs from its bounds/count");
-            }
-            segment_rows.extend(window.rows);
-        }
-
-        let children = if saturated {
-            let boundary = segment_rows
-                .iter()
-                .map(|row| row.source_time.0.unix_timestamp())
-                .min()
-                .ok_or_else(|| {
-                    QualificationError::InsufficientEvidence(
-                        "saturated complete activity read segment has no rows".to_owned(),
-                    )
-                })?;
-            let terminal_start = boundary.checked_sub(1).ok_or_else(|| {
-                QualificationError::InsufficientEvidence(
-                    "complete activity read split boundary underflow".to_owned(),
-                )
-            })?;
-            if (start.is_some_and(|value| value >= terminal_start) && end <= boundary)
-                || boundary > end
-                || start.is_some_and(|value| boundary <= value)
-            {
-                return insufficient("complete activity read has an invalid saturated split");
-            }
-            let mut children = Vec::with_capacity(3);
-            if boundary < end {
-                children.push((Some(boundary), end));
-            }
-            children.push((Some(terminal_start), boundary));
-            if start.is_none_or(|value| value < terminal_start) {
-                children.push((start, terminal_start));
-            }
-            children
-        } else {
-            Vec::new()
-        };
-        segments.insert(
-            (start, end),
-            Segment {
-                rows: segment_rows,
-                children,
-            },
-        );
-    }
-
-    let mut parent_counts = BTreeMap::<(Option<i64>, i64), usize>::new();
-    for segment in segments.values() {
-        for child in &segment.children {
-            if !segments.contains_key(child) {
-                return insufficient("complete activity read is missing a split child segment");
-            }
-            let count = parent_counts.entry(*child).or_default();
-            *count = count.saturating_add(1);
-            if *count > 1 {
-                return insufficient("complete activity read split child has multiple parents");
-            }
-        }
-    }
-    let roots = segments
-        .keys()
-        .filter(|bounds| !parent_counts.contains_key(bounds))
-        .copied()
-        .collect::<Vec<_>>();
-    let [root] = roots.as_slice() else {
-        return insufficient("complete activity read does not have one root segment");
-    };
-    if root.1 != fixed_end {
-        return insufficient("complete activity read root differs from its fixed end");
-    }
-    let mut pending = vec![*root];
-    let mut visited = HashSet::new();
-    while let Some(bounds) = pending.pop() {
-        if !visited.insert(bounds) {
-            return insufficient("complete activity read split graph repeats a segment");
-        }
-        let segment = segments.get(&bounds).ok_or_else(|| {
-            QualificationError::InsufficientEvidence(
-                "complete activity read split segment is absent".to_owned(),
-            )
-        })?;
-        pending.extend(segment.children.iter().copied());
-    }
-    if visited.len() != segments.len() {
-        return insufficient("complete activity read contains an unrelated segment");
-    }
-    Ok(segments
-        .into_values()
-        .filter(|segment| segment.children.is_empty())
-        .flat_map(|segment| segment.rows)
-        .collect())
-}
-
 /// Reconstruct each immutable fixed-end activity read before deriving composite decision keys.
 /// Page occurrences retain multiplicity, saturated parent segments contribute no production rows,
 /// and a group's earliest raw receipt decides whether its production aggregate predates Start.
@@ -2384,7 +2102,8 @@ fn decision_keys_from_source_observations(
     let in_prefix = complete_reads
         .iter()
         .filter(|read| {
-            read.page_occurrences
+            read.continuation
+                .page_occurrences()
                 .iter()
                 .all(|page| page.receipt.sequence <= sealed_sequence)
         })
@@ -2436,12 +2155,27 @@ fn decision_keys_from_source_observations(
 
     let mut revisions = HashMap::<pe_core_types::SourceTradeId, String>::new();
     for read in in_prefix {
-        let rows = complete_activity_read_rows(read, observations)?;
-        for aggregate in aggregate_activity_rows(&rows).map_err(|error| {
-            QualificationError::InsufficientEvidence(format!(
-                "complete activity read aggregate failed: {error}"
-            ))
-        })? {
+        let mut lookup = |receipt| -> Result<_, QualificationError> {
+            let observation = decision_source_receipt(observations, receipt)?;
+            Ok(CompleteActivityPage {
+                payload: observation.payload.clone(),
+                observed_at: observation.observed_at.clone(),
+                received_at: observation.received_at.clone(),
+                source_id: observation.source_id.clone(),
+                schema_version: observation.schema_version,
+                parser_version: observation.parser_version,
+                content_type: observation.content_type.clone(),
+            })
+        };
+        let aggregates = read
+            .continuation
+            .reconstruct_complete_activity_read(&mut lookup)
+            .map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "complete activity read reconstruction failed: {error}"
+                ))
+            })?;
+        for aggregate in aggregates {
             let source_trade_id = aggregate.group_id.key().clone();
             if aggregate.group_id.components().activity_type != ActivityType::Trade
                 || !candidates.contains(&source_trade_id)
@@ -5631,15 +5365,22 @@ mod tests {
         pages: Vec<(PageOccurrence, ReconciliationPageEvidence)>,
         decisions: impl IntoIterator<Item = SourceTradeId>,
     ) -> CompleteActivityReadScope {
-        CompleteActivityReadScope {
-            fixed_end: Some(fixed_end),
-            requested_wallet: WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-                .unwrap(),
-            page_occurrences: pages
+        let mut continuation = classification_fixture().0;
+        continuation.facts.wallet =
+            WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        continuation.facts.decision_inputs = serde_json::json!({
+            "fixed_end": fixed_end,
+            "pages": pages
                 .iter()
-                .map(|(occurrence, _)| occurrence.clone())
-                .collect(),
-            pages: Some(pages.into_iter().map(|(_, evidence)| evidence).collect()),
+                .map(|(_, evidence)| evidence)
+                .collect::<Vec<_>>(),
+        });
+        continuation.page_occurrences = pages
+            .into_iter()
+            .map(|(occurrence, _)| occurrence)
+            .collect();
+        CompleteActivityReadScope {
+            continuation,
             decisions: decisions.into_iter().map(|id| (id, None)).collect(),
         }
     }
