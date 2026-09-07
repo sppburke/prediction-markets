@@ -4,15 +4,17 @@
 //! reaches paper-state in one transaction. Lexical `g2:` order is used only to
 //! make storage/replay output canonical; it never selects a causal winner.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Display;
 use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, PositionState, SignalConfig, TradeProvenance};
 use pe_core_types::{
     LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, Probability, ProbabilityPpm,
-    ReconstructionQuality, ShareAmount, Side, SourceTradeId, WalletAddress,
+    ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
+    WalletAddress,
 };
-use pe_event_log::AppendReceipt;
+use pe_event_log::{AppendReceipt, ContentType};
 use pe_execution_core::ObservationEvidence;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, ActivityGroupState, AnchorInstallRecord,
@@ -25,8 +27,9 @@ use pe_position_ledger::{
     PositionLedger, SecondVerdict, TradeDecision, WalletFenceCause, classify_complete_second,
 };
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
-    parse_activity_trade_observation,
+    ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
+    ActivityParseContext, ActivityTransport, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
+    aggregate_activity_rows, parse_activity_response, parse_activity_trade_observation,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -146,6 +149,37 @@ pub struct DecisionContinuationV3 {
     pub page_occurrences: Vec<PageOccurrence>,
 }
 
+/// One source-log activity page resolved by its frozen V3 receipt.
+pub(crate) struct CompleteActivityPage {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) observed_at: SourceTimestamp,
+    pub(crate) received_at: ReceivedAt,
+    pub(crate) source_id: String,
+    pub(crate) schema_version: u32,
+    pub(crate) parser_version: u32,
+    pub(crate) content_type: ContentType,
+}
+
+/// Fail-closed error from the shared complete-read reconstruction owner.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CompleteActivityReadError(String);
+
+fn complete_activity_read_error(message: impl Into<String>) -> CompleteActivityReadError {
+    CompleteActivityReadError(message.into())
+}
+
+#[derive(Deserialize)]
+struct CompleteActivityReadWire {
+    fixed_end: Option<i64>,
+    pages: Option<Vec<ReconciliationPageEvidence>>,
+}
+
+struct CompleteActivitySegment {
+    rows: Vec<pe_source_polymarket_public::NormalizedActivity>,
+    children: Vec<(Option<i64>, i64)>,
+}
+
 impl DecisionContinuationV3 {
     pub(crate) fn new(
         facts: DecisionContinuationFacts,
@@ -211,6 +245,219 @@ impl DecisionContinuationV3 {
         &self.page_occurrences
     }
 
+    /// Reconstruct one frozen fixed-end activity read from its exact receipt occurrences.
+    ///
+    /// Page evidence is joined with multiplicity, every retained payload is parsed and checked,
+    /// and saturated parent segments contribute no production aggregates. Only complete leaves of
+    /// the validated split graph are aggregated, matching the production reconciliation reader.
+    pub(crate) fn reconstruct_complete_activity_read<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<Vec<ActivityAggregate>, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let wire: CompleteActivityReadWire =
+            serde_json::from_value(self.facts.decision_inputs.clone()).map_err(|error| {
+                complete_activity_read_error(format!(
+                    "decision complete activity read is invalid: {error}"
+                ))
+            })?;
+        if wire.fixed_end.is_some() != wire.pages.is_some() {
+            return Err(complete_activity_read_error(
+                "decision complete activity read proof is partial",
+            ));
+        }
+        let rows = match (wire.fixed_end, wire.pages.as_deref()) {
+            (Some(fixed_end), Some(pages)) => {
+                self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?
+            }
+            (None, None) => self.reconstruct_legacy_activity_read(lookup)?,
+            _ => {
+                return Err(complete_activity_read_error(
+                    "decision complete activity read proof is partial",
+                ));
+            }
+        };
+        aggregate_activity_rows(&rows).map_err(|error| {
+            complete_activity_read_error(format!(
+                "complete activity read aggregate failed: {error}"
+            ))
+        })
+    }
+
+    fn reconstruct_legacy_activity_read<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<Vec<pe_source_polymarket_public::NormalizedActivity>, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let [occurrence] = self.page_occurrences.as_slice() else {
+            return Err(complete_activity_read_error(
+                "legacy complete activity read lacks one terminal page occurrence",
+            ));
+        };
+        let source = complete_activity_page(occurrence, lookup)?;
+        let window = parse_complete_activity_page(
+            &source,
+            self.facts.wallet,
+            "legacy complete activity read page parse failed",
+        )?;
+        if u32::try_from(window.rows.len())
+            .ok()
+            .is_none_or(|row_count| row_count >= RECONCILIATION_PAGE_LIMIT)
+        {
+            return Err(complete_activity_read_error(
+                "legacy complete activity read has no terminal page",
+            ));
+        }
+        Ok(window.rows)
+    }
+
+    fn reconstruct_rich_activity_read<L, E>(
+        &self,
+        fixed_end: i64,
+        pages: &[ReconciliationPageEvidence],
+        lookup: &mut L,
+    ) -> Result<Vec<pe_source_polymarket_public::NormalizedActivity>, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let joined = joined_read_pages(&self.page_occurrences, pages)?;
+        let mut grouped_pages = BTreeMap::<
+            (Option<i64>, i64),
+            Vec<(&PageOccurrence, &ReconciliationPageEvidence)>,
+        >::new();
+        for (occurrence, page) in joined {
+            let bounds = page.bounds.ok_or_else(|| {
+                complete_activity_read_error("complete activity read page has no activity bounds")
+            })?;
+            if page.partition.is_some()
+                || page.schema_version != ACTIVITY_SCHEMA_VERSION
+                || page.parser_version != ACTIVITY_PARSER_VERSION
+                || page.row_count > RECONCILIATION_PAGE_LIMIT
+                || bounds.end > fixed_end
+            {
+                return Err(complete_activity_read_error(
+                    "complete activity read page evidence is invalid",
+                ));
+            }
+            grouped_pages
+                .entry((bounds.start, bounds.end))
+                .or_default()
+                .push((occurrence, page));
+        }
+        if grouped_pages.keys().map(|(_, end)| *end).max() != Some(fixed_end) {
+            return Err(complete_activity_read_error(
+                "complete activity read does not reach its fixed end",
+            ));
+        }
+
+        let mut segments = BTreeMap::new();
+        for ((start, end), mut pages) in grouped_pages {
+            pages.sort_by_key(|(_, page)| page.offset);
+            let page_count = u32::try_from(pages.len()).map_err(|_| {
+                complete_activity_read_error("complete activity read page count overflow")
+            })?;
+            for (index, (_, page)) in pages.iter().enumerate() {
+                let index = u32::try_from(index).map_err(|_| {
+                    complete_activity_read_error("complete activity read page count overflow")
+                })?;
+                if page.offset != index.saturating_mul(RECONCILIATION_PAGE_LIMIT)
+                    || (index + 1 < page_count && page.row_count != RECONCILIATION_PAGE_LIMIT)
+                {
+                    return Err(complete_activity_read_error(
+                        "complete activity read page offsets are incomplete",
+                    ));
+                }
+            }
+            let Some((_, terminal)) = pages.last() else {
+                return Err(complete_activity_read_error(
+                    "complete activity read contains an empty segment",
+                ));
+            };
+            let saturated = terminal.offset == ACTIVITY_MAX_OFFSET
+                && terminal.row_count == RECONCILIATION_PAGE_LIMIT;
+            if terminal.row_count == RECONCILIATION_PAGE_LIMIT && !saturated {
+                return Err(complete_activity_read_error(
+                    "complete activity read segment has no terminal page",
+                ));
+            }
+            let mut segment_rows = Vec::new();
+            for (occurrence, page) in pages {
+                let source = complete_activity_page(occurrence, lookup)?;
+                let window = parse_complete_activity_page(
+                    &source,
+                    self.facts.wallet,
+                    "complete activity read page parse failed",
+                )?;
+                if u32::try_from(window.rows.len()).ok() != Some(page.row_count)
+                    || window.rows.iter().any(|row| {
+                        let timestamp = row.source_time.0.unix_timestamp();
+                        timestamp > end || start.is_some_and(|start| timestamp <= start)
+                    })
+                {
+                    return Err(complete_activity_read_error(
+                        "complete activity read page differs from its bounds/count",
+                    ));
+                }
+                segment_rows.extend(window.rows);
+            }
+
+            let children = if saturated {
+                let boundary = segment_rows
+                    .iter()
+                    .map(|row| row.source_time.0.unix_timestamp())
+                    .min()
+                    .ok_or_else(|| {
+                        complete_activity_read_error(
+                            "saturated complete activity read segment has no rows",
+                        )
+                    })?;
+                let terminal_start = boundary.checked_sub(1).ok_or_else(|| {
+                    complete_activity_read_error("complete activity read split boundary underflow")
+                })?;
+                if (start.is_some_and(|value| value >= terminal_start) && end <= boundary)
+                    || boundary > end
+                    || start.is_some_and(|value| boundary <= value)
+                {
+                    return Err(complete_activity_read_error(
+                        "complete activity read has an invalid saturated split",
+                    ));
+                }
+                let mut children = Vec::with_capacity(3);
+                if boundary < end {
+                    children.push((Some(boundary), end));
+                }
+                children.push((Some(terminal_start), boundary));
+                if start.is_none_or(|value| value < terminal_start) {
+                    children.push((start, terminal_start));
+                }
+                children
+            } else {
+                Vec::new()
+            };
+            segments.insert(
+                (start, end),
+                CompleteActivitySegment {
+                    rows: segment_rows,
+                    children,
+                },
+            );
+        }
+
+        validate_complete_activity_segment_graph(fixed_end, &segments)?;
+        Ok(segments
+            .into_values()
+            .filter(|segment| segment.children.is_empty())
+            .flat_map(|segment| segment.rows)
+            .collect())
+    }
+
     /// Resolve every V3 receipt through the boot-owned verified source-receipt index and derive
     /// observation time from the selected receipt. No timestamp copied into continuation JSON is
     /// trusted, and the growing source log is never replayed on this hot path (#545).
@@ -258,6 +505,148 @@ impl DecisionContinuationV3 {
             })
             .map(Some)
     }
+}
+
+fn joined_read_pages<'a>(
+    occurrences: &'a [PageOccurrence],
+    pages: &'a [ReconciliationPageEvidence],
+) -> Result<Vec<(&'a PageOccurrence, &'a ReconciliationPageEvidence)>, CompleteActivityReadError> {
+    if occurrences.len() != pages.len() {
+        return Err(complete_activity_read_error(
+            "complete activity read page multiplicity is inconsistent",
+        ));
+    }
+    let mut evidence = BTreeMap::<(String, String), VecDeque<&ReconciliationPageEvidence>>::new();
+    for page in pages {
+        evidence
+            .entry((page.request_url.clone(), page.raw_page_hash.clone()))
+            .or_default()
+            .push_back(page);
+    }
+    let mut joined = Vec::with_capacity(occurrences.len());
+    for occurrence in occurrences {
+        let key = (occurrence.request_url.clone(), occurrence.raw_hash.clone());
+        let page = evidence
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .ok_or_else(|| {
+                complete_activity_read_error(
+                    "complete activity read page occurrence has no page evidence",
+                )
+            })?;
+        joined.push((occurrence, page));
+    }
+    if evidence.values().any(|pages| !pages.is_empty()) {
+        return Err(complete_activity_read_error(
+            "complete activity read has unbound page evidence",
+        ));
+    }
+    Ok(joined)
+}
+
+fn complete_activity_page<L, E>(
+    occurrence: &PageOccurrence,
+    lookup: &mut L,
+) -> Result<CompleteActivityPage, CompleteActivityReadError>
+where
+    L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+    E: Display,
+{
+    let source = lookup(occurrence.receipt).map_err(|error| {
+        complete_activity_read_error(format!(
+            "complete activity read page receipt lookup failed: {error}"
+        ))
+    })?;
+    if source.source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+        || source.schema_version != ACTIVITY_SCHEMA_VERSION
+        || source.parser_version != ACTIVITY_PARSER_VERSION
+        || source.content_type != ContentType::Json
+    {
+        return Err(complete_activity_read_error(
+            "complete activity read page has the wrong source contract",
+        ));
+    }
+    if blake3::hash(&source.payload).to_hex().as_str() != occurrence.raw_hash {
+        return Err(complete_activity_read_error(
+            "complete activity read page payload hash differs",
+        ));
+    }
+    Ok(source)
+}
+
+fn parse_complete_activity_page(
+    source: &CompleteActivityPage,
+    wallet: WalletAddress,
+    error_context: &str,
+) -> Result<pe_source_polymarket_public::NormalizedActivityWindow, CompleteActivityReadError> {
+    parse_activity_response(
+        &source.payload,
+        wallet,
+        &ActivityParseContext {
+            source_id: SourceId(source.source_id.clone()),
+            observed_at: source.observed_at.clone(),
+            received_at: source.received_at.clone(),
+            transport: ActivityTransport::Replay,
+        },
+    )
+    .map_err(|error| complete_activity_read_error(format!("{error_context}: {error}")))
+}
+
+fn validate_complete_activity_segment_graph(
+    fixed_end: i64,
+    segments: &BTreeMap<(Option<i64>, i64), CompleteActivitySegment>,
+) -> Result<(), CompleteActivityReadError> {
+    let mut parent_counts = BTreeMap::<(Option<i64>, i64), usize>::new();
+    for segment in segments.values() {
+        for child in &segment.children {
+            if !segments.contains_key(child) {
+                return Err(complete_activity_read_error(
+                    "complete activity read is missing a split child segment",
+                ));
+            }
+            let count = parent_counts.entry(*child).or_default();
+            *count = count.saturating_add(1);
+            if *count > 1 {
+                return Err(complete_activity_read_error(
+                    "complete activity read split child has multiple parents",
+                ));
+            }
+        }
+    }
+    let roots = segments
+        .keys()
+        .filter(|bounds| !parent_counts.contains_key(bounds))
+        .copied()
+        .collect::<Vec<_>>();
+    let [root] = roots.as_slice() else {
+        return Err(complete_activity_read_error(
+            "complete activity read does not have one root segment",
+        ));
+    };
+    if root.1 != fixed_end {
+        return Err(complete_activity_read_error(
+            "complete activity read root differs from its fixed end",
+        ));
+    }
+    let mut pending = vec![*root];
+    let mut visited = HashSet::new();
+    while let Some(bounds) = pending.pop() {
+        if !visited.insert(bounds) {
+            return Err(complete_activity_read_error(
+                "complete activity read split graph repeats a segment",
+            ));
+        }
+        let segment = segments.get(&bounds).ok_or_else(|| {
+            complete_activity_read_error("complete activity read split segment is absent")
+        })?;
+        pending.extend(segment.children.iter().copied());
+    }
+    if visited.len() != segments.len() {
+        return Err(complete_activity_read_error(
+            "complete activity read contains an unrelated segment",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
