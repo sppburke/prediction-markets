@@ -17,7 +17,7 @@ use pe_core_types::{
     TraderId, VenueId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
-use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
+use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{EquityInputs, RiskSnapshot, TradingMode, current_equity};
@@ -1004,12 +1004,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 pe_execution_core::SizingModeAudit::Contract { contracts }
             }
             SizingMode::Kelly => pe_execution_core::SizingModeAudit::Kelly {
-                fraction: self.strategy.config().kelly_fraction_override.unwrap_or(
-                    match self.mode {
-                        ExecutionMode::LiveTiny | ExecutionMode::Promoted => KELLY_NORMAL,
-                        ExecutionMode::Paper | ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
-                    },
-                ),
+                fraction: self.strategy.effective_kelly_fraction(self.mode),
                 probability,
             },
         };
@@ -1923,14 +1918,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     checked_at_unix_ms: Some(checked_at_unix_ms),
                 })?,
         )?;
-        let kelly_fraction =
-            self.strategy
-                .config()
-                .kelly_fraction_override
-                .unwrap_or(match self.mode {
-                    ExecutionMode::LiveTiny | ExecutionMode::Promoted => KELLY_NORMAL,
-                    ExecutionMode::Paper | ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
-                });
+        let kelly_fraction = self.strategy.effective_kelly_fraction(self.mode);
         let allocate = |price: Price| {
             let quantity = size_contracts(&KellyInput {
                 p: probability,

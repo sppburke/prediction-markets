@@ -41,7 +41,6 @@ use pe_service::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
 use pe_service::decision_replay::{DecisionPostBoundaryEvidence, replay_decision_pending};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
-use pe_service::live_fanout::compose_live_economic;
 use pe_service::live_venue_adapter::LiveAdmissionBuilder;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::mark_prices::HistoricalMarkAdapter;
@@ -2017,7 +2016,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             let first_admission = first_admission.as_ref().unwrap();
             let token_id = first_economic.market.token_id.clone();
             let live_ladder = ladder_from_economic(first_economic);
-            let live_economic = compose_live_economic(EconomicInputs {
+            let live_economic = EconomicPrepared::compose(EconomicInputs {
                 market: first_economic.market.clone(),
                 admission: first_admission,
                 plan: &live_ladder,

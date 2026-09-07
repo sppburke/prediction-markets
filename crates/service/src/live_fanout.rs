@@ -1715,13 +1715,6 @@ fn parse_frozen_signal(seed: &DispatchSeedRow) -> Result<FrozenSignal, FanoutErr
     Ok(frozen)
 }
 
-/// Canonical ordinary-live entry point to the shared economic composer.
-pub fn compose_live_economic(
-    inputs: EconomicInputs<'_>,
-) -> Result<EconomicPrepared, pe_execution_core::EconomicError> {
-    EconomicPrepared::compose(inputs)
-}
-
 async fn process_target(
     state: &mut FanoutState,
     seed: &DispatchSeedRow,
@@ -2103,7 +2096,7 @@ async fn process_target(
         SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },
         SizingMode::Contract { contracts } => SizingModeAudit::Contract { contracts },
     };
-    let economic = compose_live_economic(EconomicInputs {
+    let economic = EconomicPrepared::compose(EconomicInputs {
         market: pe_execution_core::MarketSelection {
             condition_id: admission.market.condition_id.clone(),
             outcome_index,
@@ -8813,7 +8806,7 @@ mod tests {
             provenance: "activity_ws".to_owned(),
         };
         let compose = |observation| {
-            compose_live_economic(EconomicInputs {
+            EconomicPrepared::compose(EconomicInputs {
                 market: template.market.clone(),
                 admission: &replayed.admission,
                 plan: &replayed.sized.ladder,
