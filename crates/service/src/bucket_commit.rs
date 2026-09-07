@@ -1858,6 +1858,8 @@ mod continuation_v3_tests {
     /// PASS: polling observation time and hashes are recovered through exact receipt-index reads
     /// even when an unrelated interior frame is unreadable; tampering a frozen raw-page hash
     /// still fails closed.
+    /// FAIL: a corrupted or missing retained page is accepted, or a valid retained page is
+    /// rejected or resolved against the wrong receipt.
     #[test]
     fn receipt_index_is_the_scoped_observation_time_and_hash_owner() {
         let directory = tempfile::tempdir().unwrap();

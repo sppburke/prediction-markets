@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingMode {
-    /// First live stage; `PerTradeCap::ModeDefault` resolves 25 bps (a boot/backtest
-    /// posture — production retired the per-trade bps caps in #508).
+    /// First live stage; `PerTradeCap::ModeDefault` resolves 25 bps here. The production cap
+    /// policy (reviewed `unlimited`, valid post-activation rows) is canonical in
+    /// `docs/19-WINNER-FOLLOW-STRATEGY.md`.
     LiveTiny,
-    /// After passing promotion gates; `ModeDefault` resolves 100 bps (same retirement).
+    /// After passing promotion gates; `ModeDefault` resolves 100 bps here (same canonical policy).
     Promoted,
 }
 
@@ -76,13 +77,14 @@ pub struct RiskSnapshot {
 
     // ── Proposed trade ──────────────────────────────────────────────────────
     /// Size of the proposed trade as basis points of bankroll.
-    /// Populated by `WinnerFollowStrategy::evaluate` after clamping to `per_trade_cap_bps`.
+    /// Populated by the caller from the venue-planned allocation (the strategy emits the uncapped
+    /// allocation; the venue planner owns sizing caps).
     pub proposed_trade_bps: BasisPoints,
     /// Per-trade size cap in basis points of bankroll.
     ///
-    /// Populated by `WinnerFollowStrategy::evaluate` from the resolved `PerTradeCap` config.
+    /// Populated by the caller from the resolved `PerTradeCap` configuration applied at
+    /// evaluation time and recorded in the snapshot; strict replay reuses the recorded value.
     /// The risk gate fires `PerTradeSizeExceeded` if `proposed_trade_bps > per_trade_cap_bps`.
-    /// Under normal flow this never triggers because the strategy already clamped the contracts.
     ///
     /// Default 25 for serde backwards compatibility with snapshots written before this field existed.
     #[serde(default = "default_per_trade_cap_bps")]
