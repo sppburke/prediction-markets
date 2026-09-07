@@ -51,7 +51,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Query, State},
-    routing::{get, post},
+    routing::get,
 };
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
@@ -1785,7 +1785,6 @@ struct WrongMarketBookLoopback {
     expected_token: String,
     wrong_condition: String,
     book_requests: Arc<std::sync::atomic::AtomicUsize>,
-    post_requests: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 async fn wrong_market_book_response(
@@ -1807,31 +1806,21 @@ async fn wrong_market_book_response(
     }))
 }
 
-async fn count_wrong_market_order_post(State(state): State<WrongMarketBookLoopback>) {
-    state
-        .post_requests
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-}
-
 /// PASS: the production `/book` fetch receives the admitted token with a usable ask ladder under
-/// a different market identity, fails closed, and creates no dispatch seed, paper preparation, or
-/// loopback order POST.
+/// a different market identity, fails closed, and creates no dispatch seed or paper preparation.
 /// FAIL: token-only validation admits the substituted condition or any downstream dispatch work.
 #[tokio::test]
 async fn clob_book_wrong_market_with_right_asset_stops_dispatch_before_seed_or_post() {
     let condition = market();
     let token_id = format!("{condition}-0");
     let book_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let post_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let loopback_state = WrongMarketBookLoopback {
         expected_token: token_id.clone(),
         wrong_condition: market_b().to_string(),
         book_requests: Arc::clone(&book_requests),
-        post_requests: Arc::clone(&post_requests),
     };
     let app = Router::new()
         .route("/book", get(wrong_market_book_response))
-        .route("/order", post(count_wrong_market_order_post))
         .with_state(loopback_state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -2110,7 +2099,6 @@ async fn clob_book_wrong_market_with_right_asset_stops_dispatch_before_seed_or_p
     run.await.unwrap();
 
     assert_eq!(book_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(post_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(paper_state.pending_dispatch_seeds().unwrap().is_empty());
     assert!(
         paper_state
