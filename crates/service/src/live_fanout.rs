@@ -3139,15 +3139,9 @@ fn validate_live_observation_trade(
         }
     }
 
-    let provenance = if selected.source_id == crate::activity_ingest::ACTIVITY_WS_SOURCE_ID {
-        pe_copy_signal_engine::TradeProvenance::ActivityWs
-    } else {
-        pe_copy_signal_engine::TradeProvenance::RestPoll
-    };
     crate::qualification::verify_decision_continuation_facts(
         aggregate,
         &binding.continuation.facts,
-        provenance,
     )
     .map_err(|error| {
         economic_replay_error(format!(
@@ -10498,8 +10492,7 @@ mod tests {
     }
 
     /// PASS: an untampered producer-owned continuation verifies, while changing its frozen
-    /// quality/confidence, price, quantity, epoch, transaction hash, semantic revision, or
-    /// provenance fails closed. The quality case retains a decision hash produced at quality 100,
+    /// quality/confidence, price, quantity, epoch, transaction hash, semantic revision fails closed. The quality case retains a decision hash produced at quality 100,
     /// proving that a different hash-compatible quality cannot authorize the tampered facts.
     /// FAIL: strict replay searches alternative qualities or trusts raw aggregate facts in place
     /// of the immutable continuation.
@@ -10543,10 +10536,6 @@ mod tests {
         let mut changed = continuation.clone();
         changed.facts.semantic_revision = "0".repeat(64);
         rejects("semantic revision", &changed);
-
-        let mut changed = continuation.clone();
-        changed.facts.provenance = pe_copy_signal_engine::TradeProvenance::RestPoll;
-        rejects("provenance", &changed);
     }
 
     /// PASS: payloads that conflict with the copied admission or ladder fail even when presented

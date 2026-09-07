@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pe_copy_signal_engine::{LeaderSignal, PositionState, SignalConfig, TradeProvenance};
+use pe_copy_signal_engine::{LeaderSignal, PositionState, SignalConfig};
 use pe_core_types::{
     AccountId, CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, Price,
     ProbabilityPpm, ReceivedAt, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
@@ -2683,7 +2683,6 @@ fn verify_knockout_causal_inputs(
 pub(crate) fn verify_decision_continuation_facts(
     aggregate: &pe_source_polymarket_public::ActivityAggregate,
     frozen: &DecisionContinuationFacts,
-    provenance: TradeProvenance,
 ) -> Result<(), QualificationError> {
     let components = aggregate.group_id.components();
     if components.activity_type != ActivityType::Trade
@@ -2703,7 +2702,6 @@ pub(crate) fn verify_decision_continuation_facts(
         })? != frozen.price
         || aggregate.source_time.0.unix_timestamp() != frozen.source_epoch
         || aggregate.semantic_revision.as_str() != frozen.semantic_revision
-        || provenance != frozen.provenance
     {
         return insufficient("decision continuation differs from its raw activity aggregate");
     }
@@ -2785,12 +2783,7 @@ fn verify_decision_source_inputs(
     if matching.next().is_some() {
         return insufficient("decision raw pages reconstruct duplicate aggregate identities");
     }
-    let provenance = if continuation.observed_source_receipt == Some(observation.source_receipt) {
-        TradeProvenance::ActivityWs
-    } else {
-        TradeProvenance::RestPoll
-    };
-    verify_decision_continuation_facts(aggregate, frozen, provenance)?;
+    verify_decision_continuation_facts(aggregate, frozen)?;
     Ok(observation)
 }
 
