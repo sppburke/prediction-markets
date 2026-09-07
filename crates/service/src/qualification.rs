@@ -5330,12 +5330,52 @@ mod tests {
             partition: None,
             offset,
             row_count: u32::try_from(row_count).unwrap(),
-            canonical_page_hash: format!("canonical-{url}"),
+            canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(payload).unwrap(),
             raw_page_hash: blake3::hash(payload).to_hex().to_string(),
             received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
             schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
             parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
         }
+    }
+
+    fn activity_request_url(start: Option<i64>, end: i64, offset: u32) -> String {
+        pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
+            user: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            end,
+            start: start.map(|start| start.saturating_add(1)),
+            offset,
+        }
+        .url("https://data-api.polymarket.com")
+    }
+
+    fn activity_page_pair(
+        observation: &SourceObservation,
+        payload: &[u8],
+        start: Option<i64>,
+        end: i64,
+        offset: u32,
+    ) -> (PageOccurrence, ReconciliationPageEvidence) {
+        let url = activity_request_url(start, end, offset);
+        (
+            page_occurrence(observation, &url, payload),
+            page_evidence(&url, payload, start, end, offset),
+        )
+    }
+
+    fn producer_page_evidence(
+        pages: &[(PageOccurrence, ReconciliationPageEvidence)],
+    ) -> Vec<ReconciliationPageEvidence> {
+        let mut evidence = pages
+            .iter()
+            .map(|(_, evidence)| evidence.clone())
+            .collect::<Vec<_>>();
+        evidence.sort_by_key(|page| {
+            let bounds = page
+                .bounds
+                .expect("activity fixture always has request bounds");
+            (bounds.end, bounds.start, page.offset)
+        });
+        evidence
     }
 
     fn page_occurrence(
@@ -5358,12 +5398,10 @@ mod tests {
         let mut continuation = classification_fixture().0;
         continuation.facts.wallet =
             WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let evidence = producer_page_evidence(&pages);
         continuation.facts.decision_inputs = serde_json::json!({
             "fixed_end": fixed_end,
-            "pages": pages
-                .iter()
-                .map(|(_, evidence)| evidence)
-                .collect::<Vec<_>>(),
+            "pages": evidence,
         });
         continuation.page_occurrences = pages
             .into_iter()
@@ -7901,19 +7939,13 @@ mod tests {
         let read = read_scope(
             100,
             vec![
-                (
-                    page_occurrence(&first, "page-0", &first_payload),
-                    page_evidence("page-0", &first_payload, Some(99), 100, 0),
-                ),
-                (
-                    page_occurrence(&second, "page-500", &second_payload),
-                    page_evidence(
-                        "page-500",
-                        &second_payload,
-                        Some(99),
-                        100,
-                        RECONCILIATION_PAGE_LIMIT,
-                    ),
+                activity_page_pair(&first, &first_payload, Some(99), 100, 0),
+                activity_page_pair(
+                    &second,
+                    &second_payload,
+                    Some(99),
+                    100,
+                    RECONCILIATION_PAGE_LIMIT,
                 ),
             ],
             [target_id.clone()],
@@ -7963,29 +7995,20 @@ mod tests {
         let read = read_scope(
             100,
             vec![
-                (
-                    page_occurrence(&first, "page-0", &repeated_payload),
-                    page_evidence("page-0", &repeated_payload, Some(99), 100, 0),
+                activity_page_pair(&first, &repeated_payload, Some(99), 100, 0),
+                activity_page_pair(
+                    &second,
+                    &repeated_payload,
+                    Some(99),
+                    100,
+                    RECONCILIATION_PAGE_LIMIT,
                 ),
-                (
-                    page_occurrence(&second, "page-500", &repeated_payload),
-                    page_evidence(
-                        "page-500",
-                        &repeated_payload,
-                        Some(99),
-                        100,
-                        RECONCILIATION_PAGE_LIMIT,
-                    ),
-                ),
-                (
-                    page_occurrence(&terminal, "page-1000", &terminal_payload),
-                    page_evidence(
-                        "page-1000",
-                        &terminal_payload,
-                        Some(99),
-                        100,
-                        RECONCILIATION_PAGE_LIMIT * 2,
-                    ),
+                activity_page_pair(
+                    &terminal,
+                    &terminal_payload,
+                    Some(99),
+                    100,
+                    RECONCILIATION_PAGE_LIMIT * 2,
                 ),
             ],
             [target_id],
@@ -8018,38 +8041,34 @@ mod tests {
         for index in 0..=ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT {
             let sequence = u64::from(index) + 1;
             let offset = index * RECONCILIATION_PAGE_LIMIT;
-            let url = format!("parent-{offset}");
             let observation = activity_observation(sequence, &parent_payload);
-            pages.push((
-                page_occurrence(&observation, &url, &parent_payload),
-                page_evidence(&url, &parent_payload, None, 100, offset),
+            pages.push(activity_page_pair(
+                &observation,
+                &parent_payload,
+                None,
+                100,
+                offset,
             ));
             observations.insert(sequence, observation);
         }
-        let child_sequence = u64::from(ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT) + 2;
-        let child = activity_observation(child_sequence, &child_payload);
-        pages.push((
-            page_occurrence(&child, "child", &child_payload),
-            page_evidence("child", &child_payload, Some(99), 100, 0),
-        ));
-        observations.insert(child_sequence, child);
-        let older_sequence = child_sequence + 1;
+        let older_sequence = u64::from(ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT) + 2;
         let older_payload = activity_payload(Vec::new());
         let older = activity_observation(older_sequence, &older_payload);
-        pages.push((
-            page_occurrence(&older, "older", &older_payload),
-            page_evidence("older", &older_payload, None, 99, 0),
-        ));
+        pages.push(activity_page_pair(&older, &older_payload, None, 99, 0));
         observations.insert(older_sequence, older);
+        let child_sequence = older_sequence + 1;
+        let child = activity_observation(child_sequence, &child_payload);
+        pages.push(activity_page_pair(&child, &child_payload, Some(99), 100, 0));
+        observations.insert(child_sequence, child);
         let expected = parsed_aggregates(&[&child_payload]).remove(0);
         let target_id = expected.group_id.key().clone();
         let read = read_scope(100, pages, [target_id]);
 
         let source_universe =
-            source_trade_universe(EventSeq(older_sequence), &observations).unwrap();
+            source_trade_universe(EventSeq(child_sequence), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
             None,
-            EventSeq(older_sequence),
+            EventSeq(child_sequence),
             &observations,
             &source_universe,
             &[read],
@@ -8104,30 +8123,23 @@ mod tests {
         for index in 0..=ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT {
             let sequence = u64::from(index) + 1;
             let offset = index * RECONCILIATION_PAGE_LIMIT;
-            let url = format!("root-{offset}");
             let payload = if index == 0 {
                 &first_root_payload
             } else {
                 &other_root_payload
             };
             let observation = activity_observation(sequence, payload);
-            pages.push((
-                page_occurrence(&observation, &url, payload),
-                page_evidence(&url, payload, None, 100, offset),
-            ));
+            pages.push(activity_page_pair(&observation, payload, None, 100, offset));
             observations.insert(sequence, observation);
         }
         let first_child_sequence = u64::from(ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT) + 2;
-        for (sequence, (url, payload, start, end)) in (first_child_sequence..).zip([
-            ("selected-child", &selected_payload, Some(50), 100),
-            ("boundary-child", &boundary_payload, Some(49), 50),
-            ("older-child", &older_payload, None, 49),
+        for (sequence, (payload, start, end)) in (first_child_sequence..).zip([
+            (&older_payload, None, 49),
+            (&boundary_payload, Some(49), 50),
+            (&selected_payload, Some(50), 100),
         ]) {
             let observation = activity_observation(sequence, payload);
-            pages.push((
-                page_occurrence(&observation, url, payload),
-                page_evidence(url, payload, start, end, 0),
-            ));
+            pages.push(activity_page_pair(&observation, payload, start, end, 0));
             observations.insert(sequence, observation);
         }
 
@@ -8148,10 +8160,7 @@ mod tests {
         continuation.facts.share_amount = ShareAmount::from_whole(10).unwrap();
         continuation.facts.decision_inputs = serde_json::json!({
             "fixed_end": 100,
-            "pages": pages
-                .iter()
-                .map(|(_, evidence)| evidence)
-                .collect::<Vec<_>>(),
+            "pages": producer_page_evidence(&pages),
         });
         continuation.page_occurrences = pages
             .into_iter()
@@ -8165,11 +8174,11 @@ mod tests {
         assert_eq!(observation.complete_bound_receipt, complete_bound_receipt);
     }
 
-    /// PASS: replacing a current V3 continuation's producer-owned logical page proof with an
-    /// unrelated object makes mandatory qualification source verification fail closed.
-    /// FAIL: a valid one-page payload is accepted solely from its occurrence URL/hash/receipt.
+    /// PASS: qualification cannot decode a current V3 continuation whose producer-owned logical
+    /// page proof was replaced with an unrelated object.
+    /// FAIL: a valid page occurrence alone makes the durable decision replayable.
     #[test]
-    fn qualification_source_verifier_rejects_current_v3_without_logical_read_proof() {
+    fn qualification_decode_rejects_current_v3_without_logical_read_proof() {
         let mut target = activity_row("0xtarget", "target", "10", "5.2", "0xtx", 51);
         target["price"] = serde_json::json!("0.52");
         let payload = activity_payload(vec![target]);
@@ -8187,13 +8196,18 @@ mod tests {
         continuation.facts.share_amount = ShareAmount::from_whole(10).unwrap();
         continuation.facts.decision_inputs = serde_json::json!({"unrelated": true});
         continuation.page_occurrences = vec![page_occurrence(&source, "page", &payload)];
-        let decision = replayed_no_copy_decision(&continuation);
-
-        assert!(matches!(
-            verify_decision_source_inputs(&decision, &BTreeMap::from([(1, source)])),
-            Err(QualificationError::InsufficientEvidence(reason))
-                if reason.contains("missing its complete activity read proof")
-        ));
+        let row = DecisionPendingRow {
+            source_trade_id: continuation.facts.source_trade_id.clone(),
+            semantic_revision: continuation.facts.semantic_revision.clone(),
+            wallet: continuation.facts.wallet,
+            source_epoch: continuation.facts.source_epoch,
+            frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+            post_commit_inputs_json: String::new(),
+            state: DecisionPendingState::Open,
+            terminal_disposition: None,
+            updated_at_unix: continuation.facts.source_epoch,
+        };
+        assert!(DecisionContinuationV3::from_durable(&row).is_err());
     }
 
     /// PASS: cursor overlap may repeat a pre-Start trade in the first post-Start complete read,
@@ -8228,17 +8242,23 @@ mod tests {
             .clone();
         let pre_read = read_scope(
             100,
-            vec![(
-                page_occurrence(&pre_start, "pre", &pre_start_payload),
-                page_evidence("pre", &pre_start_payload, Some(99), 100, 0),
+            vec![activity_page_pair(
+                &pre_start,
+                &pre_start_payload,
+                Some(99),
+                100,
+                0,
             )],
             [old_id],
         );
         let post_read = read_scope(
             101,
-            vec![(
-                page_occurrence(&post_start, "post", &post_start_payload),
-                page_evidence("post", &post_start_payload, Some(99), 101, 0),
+            vec![activity_page_pair(
+                &post_start,
+                &post_start_payload,
+                Some(99),
+                101,
+                0,
             )],
             [new_id.clone()],
         );
@@ -8280,19 +8300,13 @@ mod tests {
             })
             .unwrap();
         let page_pairs = [
-            (
-                page_occurrence(&first, "page-0", &first_payload),
-                page_evidence("page-0", &first_payload, Some(99), 100, 0),
-            ),
-            (
-                page_occurrence(&second, "page-500", &second_payload),
-                page_evidence(
-                    "page-500",
-                    &second_payload,
-                    Some(99),
-                    100,
-                    RECONCILIATION_PAGE_LIMIT,
-                ),
+            activity_page_pair(&first, &first_payload, Some(99), 100, 0),
+            activity_page_pair(
+                &second,
+                &second_payload,
+                Some(99),
+                100,
+                RECONCILIATION_PAGE_LIMIT,
             ),
         ];
         let (mut continuation, _) = classification_fixture();
@@ -8389,9 +8403,12 @@ mod tests {
             .clone();
         let read = read_scope(
             1_700_000_100,
-            vec![(
-                page_occurrence(&observation, "page", payload),
-                page_evidence("page", payload, Some(1_700_000_099), 1_700_000_100, 0),
+            vec![activity_page_pair(
+                &observation,
+                payload,
+                Some(1_700_000_099),
+                1_700_000_100,
+                0,
             )],
             [target_id.clone()],
         );
@@ -9369,12 +9386,38 @@ mod tests {
         let applied_configuration =
             crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
         let source_trade_id = pe_core_types::SourceTradeId("g2:post-seal".to_owned());
+        let source_epoch = cutoff_unix - 1;
+        let request_url =
+            pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
+                user: decision_wallet.to_string(),
+                end: source_epoch,
+                start: Some(source_epoch),
+                offset: 0,
+            }
+            .url("https://data-api.polymarket.com");
+        let raw_hash = blake3::hash(&late_payload).to_hex().to_string();
+        let page_evidence = ReconciliationPageEvidence {
+            request_url: request_url.clone(),
+            bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                start: Some(source_epoch - 1),
+                end: source_epoch,
+            }),
+            partition: None,
+            offset: 0,
+            row_count: 0,
+            canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(&late_payload)
+                .unwrap(),
+            raw_page_hash: raw_hash.clone(),
+            received_at: ReceivedAt(late_at),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+        };
         let continuation = crate::bucket_commit::DecisionContinuationFacts {
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v3".to_owned(),
             transaction_hash: "0xpost-seal".to_owned(),
             wallet: decision_wallet,
-            source_epoch: cutoff_unix - 1,
+            source_epoch,
             market_id: MarketId(VenueMarketId("market-post-seal".to_owned())),
             outcome_id: OutcomeId(0),
             side: Side::Buy,
@@ -9391,7 +9434,10 @@ mod tests {
                 win_rate_p: Probability::new(dec!(0.6)).unwrap(),
                 bankroll: dec!(100),
             },
-            decision_inputs: serde_json::json!({"post_seal": true}),
+            decision_inputs: serde_json::json!({
+                "fixed_end": source_epoch,
+                "pages": [page_evidence],
+            }),
         };
         let terminal = crate::decision_replay::TerminalDispositionEvidence::no_copy("post_seal");
         let terminal_disposition = terminal.disposition.clone();
@@ -9407,8 +9453,8 @@ mod tests {
                 continuation,
                 None,
                 vec![crate::bucket_commit::PageOccurrence {
-                    request_url: "https://example.invalid/activity?end=86400".to_owned(),
-                    raw_hash: blake3::hash(&late_payload).to_hex().to_string(),
+                    request_url,
+                    raw_hash,
                     receipt: late_receipt,
                 }],
             ))

@@ -3824,10 +3824,19 @@ fn produced_decision_continuation(
         .iter()
         .map(|(occurrence, _)| occurrence.clone())
         .collect::<Vec<_>>();
-    let page_evidence = pages
+    let mut page_evidence = pages
         .into_iter()
         .map(|(_, evidence)| evidence)
         .collect::<Vec<_>>();
+    page_evidence.sort_by_key(|page| {
+        let bounds = page
+            .bounds
+            .unwrap_or(pe_source_polymarket_public::ActivityRequestBounds {
+                start: None,
+                end: i64::MIN,
+            });
+        (bounds.end, bounds.start, page.offset)
+    });
     let fixed_end = page_evidence
         .iter()
         .filter_map(|page| page.bounds.map(|bounds| bounds.end))
@@ -3970,7 +3979,13 @@ fn produced_observation_index(
         })
         .max()
         .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
-    let request_url = "test://single-page".to_owned();
+    let request_url = pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
+        user: wallet.to_string(),
+        end: source_epoch,
+        start: Some(source_epoch),
+        offset: 0,
+    }
+    .url("https://data-api.polymarket.com");
     let raw_hash = bound.raw_payload_hash.to_hex().to_string();
     let page = pe_source_polymarket_public::ReconciliationPageEvidence {
         request_url: request_url.clone(),
@@ -3982,7 +3997,8 @@ fn produced_observation_index(
         offset: 0,
         row_count: u32::try_from(raw_rows.len())
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
-        canonical_page_hash: raw_hash.clone(),
+        canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(&bound.payload)
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
         raw_page_hash: raw_hash.clone(),
         received_at: bound.received_at.clone(),
         schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
@@ -9284,7 +9300,6 @@ mod tests {
             &[rest.as_slice()],
             vec![activity_page_fixture(
                 complete_bound_receipt,
-                "https://data-api.polymarket.com/activity?offset=0",
                 &rest,
                 Some(17),
                 18,
@@ -9418,7 +9433,6 @@ mod tests {
 
     fn activity_page_fixture(
         receipt: AppendReceipt,
-        request_url: &str,
         payload: &[u8],
         start: Option<i64>,
         end: i64,
@@ -9428,23 +9442,32 @@ mod tests {
         PageOccurrence,
         pe_source_polymarket_public::ReconciliationPageEvidence,
     ) {
+        let request_url =
+            pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
+                user: WalletAddress([0xaa; 20]).to_string(),
+                end,
+                start: start.map(|start| start.saturating_add(1)),
+                offset,
+            }
+            .url("https://data-api.polymarket.com");
         let raw_hash = blake3::hash(payload).to_hex().to_string();
         let row_count = serde_json::from_slice::<Vec<serde_json::Value>>(payload)
             .unwrap()
             .len();
         (
             PageOccurrence {
-                request_url: request_url.to_owned(),
+                request_url: request_url.clone(),
                 raw_hash: raw_hash.clone(),
                 receipt,
             },
             pe_source_polymarket_public::ReconciliationPageEvidence {
-                request_url: request_url.to_owned(),
+                request_url,
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
                 partition: None,
                 offset,
                 row_count: u32::try_from(row_count).unwrap(),
-                canonical_page_hash: raw_hash.clone(),
+                canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(payload)
+                    .unwrap(),
                 raw_page_hash: raw_hash,
                 received_at: ReceivedAt(received_at),
                 schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
@@ -9573,39 +9596,34 @@ mod tests {
         let mut pages = Vec::new();
         let mut payloads = Vec::new();
         let mut sequence = first_sequence;
-        let mut append_segment =
-            |label: &str, start: Option<i64>, end: i64, rows: &[serde_json::Value]| {
-                for (page_index, chunk) in rows
-                    .chunks(
-                        usize::try_from(pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT)
-                            .unwrap(),
-                    )
-                    .enumerate()
-                {
-                    let offset = u32::try_from(page_index).unwrap()
-                        * pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT;
-                    let payload = serde_json::to_vec(chunk).unwrap();
-                    let receipt = fixture_receipt(sequence);
-                    sequence += 1;
-                    let request_url = format!(
-                        "https://data-api.polymarket.com/activity?segment={label}&offset={offset}"
-                    );
-                    pages.push(activity_page_fixture(
-                        receipt,
-                        &request_url,
-                        &payload,
-                        start,
-                        end,
-                        offset,
-                        received_at,
-                    ));
-                    payloads.push((receipt, payload));
-                }
-            };
-        append_segment("parent", None, 100, &parent_rows);
-        append_segment("old", None, 49, &old_rows);
-        append_segment("boundary", Some(49), 50, &boundary_rows);
-        append_segment("upper", Some(50), 100, &upper_rows);
+        let mut append_segment = |start: Option<i64>, end: i64, rows: &[serde_json::Value]| {
+            for (page_index, chunk) in rows
+                .chunks(
+                    usize::try_from(pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT)
+                        .unwrap(),
+                )
+                .enumerate()
+            {
+                let offset = u32::try_from(page_index).unwrap()
+                    * pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT;
+                let payload = serde_json::to_vec(chunk).unwrap();
+                let receipt = fixture_receipt(sequence);
+                sequence += 1;
+                pages.push(activity_page_fixture(
+                    receipt,
+                    &payload,
+                    start,
+                    end,
+                    offset,
+                    received_at,
+                ));
+                payloads.push((receipt, payload));
+            }
+        };
+        append_segment(None, 100, &parent_rows);
+        append_segment(None, 49, &old_rows);
+        append_segment(Some(49), 50, &boundary_rows);
+        append_segment(Some(50), 100, &upper_rows);
         let complete_bound_receipt = pages.last().unwrap().0.receipt;
 
         let mut websocket = if selected_on_old_leaf {
@@ -9847,7 +9865,6 @@ mod tests {
             vec![
                 activity_page_fixture(
                     first_receipt,
-                    "https://data-api.polymarket.com/activity?offset=0",
                     &first_payload,
                     Some(17),
                     18,
@@ -9856,7 +9873,6 @@ mod tests {
                 ),
                 activity_page_fixture(
                     final_receipt,
-                    "https://data-api.polymarket.com/activity?offset=500",
                     &final_payload,
                     Some(17),
                     18,
@@ -10017,7 +10033,6 @@ mod tests {
                     vec![
                         activity_page_fixture(
                             first_receipt,
-                            "https://data-api.polymarket.com/activity?offset=0",
                             &first_payload,
                             Some(19),
                             20,
@@ -10026,7 +10041,6 @@ mod tests {
                         ),
                         activity_page_fixture(
                             final_receipt,
-                            "https://data-api.polymarket.com/activity?offset=500",
                             &final_payload,
                             Some(19),
                             20,
@@ -10214,7 +10228,6 @@ mod tests {
             vec![
                 activity_page_fixture(
                     first_receipt,
-                    "https://data-api.polymarket.com/activity?offset=0",
                     &repeated,
                     Some(17),
                     18,
@@ -10223,7 +10236,6 @@ mod tests {
                 ),
                 activity_page_fixture(
                     second_receipt,
-                    "https://data-api.polymarket.com/activity?offset=500",
                     &repeated,
                     Some(17),
                     18,
@@ -10232,7 +10244,6 @@ mod tests {
                 ),
                 activity_page_fixture(
                     terminal_receipt,
-                    "https://data-api.polymarket.com/activity?offset=1000",
                     &terminal_payload,
                     Some(17),
                     18,
@@ -12290,7 +12301,6 @@ mod tests {
             &[complete_bound.payload.as_slice()],
             vec![activity_page_fixture(
                 observation.complete_bound_receipt,
-                "https://data-api.polymarket.com/activity?offset=0",
                 &complete_bound.payload,
                 Some(source_time.unix_timestamp().saturating_sub(1)),
                 source_time.unix_timestamp(),

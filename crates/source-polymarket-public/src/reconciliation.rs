@@ -987,20 +987,25 @@ fn page_evidence(
     raw: &[u8],
     context: PageEvidenceContext<'_>,
 ) -> Result<ReconciliationPageEvidence, serde_json::Error> {
-    let value: serde_json::Value = serde_json::from_slice(raw)?;
-    let canonical = serde_json::to_vec(&value)?;
     Ok(ReconciliationPageEvidence {
         request_url: context.request_url.to_owned(),
         bounds: context.bounds,
         partition: context.partition,
         offset: context.offset,
         row_count: context.row_count,
-        canonical_page_hash: blake3::hash(&canonical).to_hex().to_string(),
+        canonical_page_hash: canonical_page_hash(raw)?,
         raw_page_hash: blake3::hash(raw).to_hex().to_string(),
         received_at: context.received_at,
         schema_version: context.schema_version,
         parser_version: context.parser_version,
     })
+}
+
+/// Hash one JSON page using the reconciliation producer's canonical representation.
+pub fn canonical_page_hash(raw: &[u8]) -> Result<String, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(raw)?;
+    let canonical = serde_json::to_vec(&value)?;
+    Ok(blake3::hash(&canonical).to_hex().to_string())
 }
 
 #[cfg(test)]

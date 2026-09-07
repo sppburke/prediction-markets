@@ -28,8 +28,9 @@ use pe_position_ledger::{
 };
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
-    ActivityParseContext, ActivityTransport, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
-    aggregate_activity_rows, parse_activity_response, parse_activity_trade_observation,
+    ActivityParseContext, ActivityTransport, PolymarketEndpoint, RECONCILIATION_PAGE_LIMIT,
+    ReconciliationPageEvidence, aggregate_activity_rows, canonical_page_hash,
+    parse_activity_response, parse_activity_trade_observation,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -314,10 +315,33 @@ impl DecisionContinuationV3 {
                 || page.schema_version != ACTIVITY_SCHEMA_VERSION
                 || page.parser_version != ACTIVITY_PARSER_VERSION
                 || page.row_count > RECONCILIATION_PAGE_LIMIT
+                || page.offset > ACTIVITY_MAX_OFFSET
                 || bounds.end > fixed_end
             {
                 return Err(complete_activity_read_error(
                     "complete activity read page evidence is invalid",
+                ));
+            }
+            let base_url = occurrence
+                .request_url
+                .split_once("/activity?")
+                .map(|(base_url, _)| base_url)
+                .filter(|base_url| !base_url.is_empty())
+                .ok_or_else(|| {
+                    complete_activity_read_error(
+                        "complete activity read page request URL is invalid",
+                    )
+                })?;
+            let expected_url = PolymarketEndpoint::UserPositionActivityPage {
+                user: self.facts.wallet.to_string(),
+                end: bounds.end,
+                start: bounds.start.map(|start| start.saturating_add(1)),
+                offset: page.offset,
+            }
+            .url(base_url);
+            if occurrence.request_url != expected_url {
+                return Err(complete_activity_read_error(
+                    "complete activity read page request URL differs from its source contract",
                 ));
             }
             grouped_pages
@@ -364,6 +388,17 @@ impl DecisionContinuationV3 {
             let mut segment_rows = Vec::new();
             for (occurrence, page) in pages {
                 let source = complete_activity_page(occurrence, lookup)?;
+                let actual_canonical_hash =
+                    canonical_page_hash(&source.payload).map_err(|error| {
+                        complete_activity_read_error(format!(
+                            "complete activity read canonical page hash failed: {error}"
+                        ))
+                    })?;
+                if actual_canonical_hash != page.canonical_page_hash {
+                    return Err(complete_activity_read_error(
+                        "complete activity read canonical page hash differs",
+                    ));
+                }
                 let window = parse_complete_activity_page(
                     &source,
                     self.facts.wallet,
@@ -675,6 +710,11 @@ impl DecisionContinuationV3 {
         if version == 3 {
             let page_occurrences = continuation.page_occurrences();
             if page_occurrences.is_empty() {
+                return Err(DecisionContinuationError::DurableMismatch);
+            }
+            let proof: CompleteActivityReadWire =
+                serde_json::from_value(continuation.facts.decision_inputs.clone())?;
+            if proof.fixed_end.is_none() || proof.pages.as_ref().is_none_or(Vec::is_empty) {
                 return Err(DecisionContinuationError::DurableMismatch);
             }
             let mut previous = None;
@@ -2111,6 +2151,81 @@ mod continuation_v3_tests {
         }
     }
 
+    fn activity_request_url(start: Option<i64>, end: i64, offset: u32) -> String {
+        PolymarketEndpoint::UserPositionActivityPage {
+            user: "0x1111111111111111111111111111111111111111".to_owned(),
+            end,
+            start: start.map(|start| start.saturating_add(1)),
+            offset,
+        }
+        .url("https://data-api.polymarket.com")
+    }
+
+    fn activity_page_fixture(
+        payload: &[u8],
+        start: Option<i64>,
+        end: i64,
+        offset: u32,
+        receipt: AppendReceipt,
+    ) -> (PageOccurrence, ReconciliationPageEvidence) {
+        let request_url = activity_request_url(start, end, offset);
+        let raw_hash = blake3::hash(payload).to_hex().to_string();
+        let row_count = serde_json::from_slice::<Vec<Value>>(payload).unwrap().len();
+        (
+            PageOccurrence {
+                request_url: request_url.clone(),
+                raw_hash: raw_hash.clone(),
+                receipt,
+            },
+            ReconciliationPageEvidence {
+                request_url,
+                bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
+                partition: None,
+                offset,
+                row_count: u32::try_from(row_count).unwrap(),
+                canonical_page_hash: canonical_page_hash(payload).unwrap(),
+                raw_page_hash: raw_hash,
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+            },
+        )
+    }
+
+    fn complete_read_inputs(fixed_end: i64, pages: &[ReconciliationPageEvidence]) -> Value {
+        json!({"fixed_end": fixed_end, "pages": pages})
+    }
+
+    fn proof_for_occurrences(
+        fixed_end: i64,
+        occurrences: &[PageOccurrence],
+    ) -> Vec<ReconciliationPageEvidence> {
+        let last = occurrences.len().saturating_sub(1);
+        occurrences
+            .iter()
+            .enumerate()
+            .map(|(index, occurrence)| ReconciliationPageEvidence {
+                request_url: occurrence.request_url.clone(),
+                bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                    start: Some(fixed_end.saturating_sub(1)),
+                    end: fixed_end,
+                }),
+                partition: None,
+                offset: u32::try_from(index).unwrap() * RECONCILIATION_PAGE_LIMIT,
+                row_count: if index == last {
+                    0
+                } else {
+                    RECONCILIATION_PAGE_LIMIT
+                },
+                canonical_page_hash: "00".repeat(32),
+                raw_page_hash: occurrence.raw_hash.clone(),
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+            })
+            .collect()
+    }
+
     fn facts(decision_inputs: Value) -> DecisionContinuationFacts {
         let configuration =
             RuntimeConfig::from_service_config(&crate::config::ServiceConfig::default());
@@ -2166,20 +2281,26 @@ mod continuation_v3_tests {
     /// the lower websocket receipt; the caller-supplied time is not persisted in continuation JSON.
     #[test]
     fn v3_observation_uses_lower_receipt_and_preserves_multiplicity() {
+        let fixed_end = 1_700_000_010_i64;
         let pages = vec![
             PageOccurrence {
-                request_url: "https://source/page".to_owned(),
+                request_url: activity_request_url(Some(fixed_end.saturating_sub(1)), fixed_end, 0),
                 raw_hash: "same".to_owned(),
                 receipt: receipt(9),
             },
             PageOccurrence {
-                request_url: "https://source/page".to_owned(),
+                request_url: activity_request_url(
+                    Some(fixed_end.saturating_sub(1)),
+                    fixed_end,
+                    RECONCILIATION_PAGE_LIMIT,
+                ),
                 raw_hash: "same".to_owned(),
                 receipt: receipt(11),
             },
         ];
+        let proof = proof_for_occurrences(fixed_end, &pages);
         let value = DecisionContinuationV3::new(
-            facts(json!({"fixed_end": 1_700_000_010_i64})),
+            facts(complete_read_inputs(fixed_end, &proof)),
             Some(receipt(7)),
             pages,
         );
@@ -2202,14 +2323,17 @@ mod continuation_v3_tests {
     /// observation evidence.
     #[test]
     fn poll_only_v3_and_legacy_v2_have_distinct_observation_semantics() {
+        let fixed_end = 1_700_000_010_i64;
+        let pages = vec![PageOccurrence {
+            request_url: activity_request_url(Some(fixed_end.saturating_sub(1)), fixed_end, 0),
+            raw_hash: "hash".to_owned(),
+            receipt: receipt(4),
+        }];
+        let proof = proof_for_occurrences(fixed_end, &pages);
         let value = DecisionContinuationV3::new(
-            facts(json!({"fixed_end": 1_700_000_010_i64})),
+            facts(complete_read_inputs(fixed_end, &proof)),
             None,
-            vec![PageOccurrence {
-                request_url: "https://source/page".to_owned(),
-                raw_hash: "hash".to_owned(),
-                receipt: receipt(4),
-            }],
+            pages,
         );
         let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(
@@ -2222,7 +2346,7 @@ mod continuation_v3_tests {
             })
         );
 
-        let legacy = facts(json!({"fixed_end": 1_700_000_010_i64}));
+        let legacy = facts(json!({"fixed_end": fixed_end}));
         let mut row = durable(&value);
         row.frozen_inputs_json = legacy_v2_json(&legacy);
         let decoded = DecisionContinuationV3::from_durable(&row).unwrap();
@@ -2286,21 +2410,28 @@ mod continuation_v3_tests {
             "complete replay sees the corrupt neighbor"
         );
 
+        let fixed_end = 1_700_000_010_i64;
+        let occurrences = vec![
+            PageOccurrence {
+                request_url: activity_request_url(Some(fixed_end.saturating_sub(1)), fixed_end, 0),
+                raw_hash: blake3::hash(first_payload).to_hex().to_string(),
+                receipt: first,
+            },
+            PageOccurrence {
+                request_url: activity_request_url(
+                    Some(fixed_end.saturating_sub(1)),
+                    fixed_end,
+                    RECONCILIATION_PAGE_LIMIT,
+                ),
+                raw_hash: blake3::hash(second_payload).to_hex().to_string(),
+                receipt: second,
+            },
+        ];
+        let proof = proof_for_occurrences(fixed_end, &occurrences);
         let value = DecisionContinuationV3::new(
-            facts(json!({"fixed_end": 1_700_000_010_i64})),
+            facts(complete_read_inputs(fixed_end, &proof)),
             None,
-            vec![
-                PageOccurrence {
-                    request_url: "https://source/page/1".to_owned(),
-                    raw_hash: blake3::hash(first_payload).to_hex().to_string(),
-                    receipt: first,
-                },
-                PageOccurrence {
-                    request_url: "https://source/page/2".to_owned(),
-                    raw_hash: blake3::hash(second_payload).to_hex().to_string(),
-                    receipt: second,
-                },
-            ],
+            occurrences,
         );
         let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(
@@ -2364,5 +2495,170 @@ mod continuation_v3_tests {
                 .to_string()
                 .contains("decision continuation is missing its complete activity read proof")
         );
+    }
+
+    /// PASS: V3 decode requires the producer's fixed end and at least one page-evidence record.
+    /// FAIL: increasing page receipts alone make a proof-free V3 durable row executable.
+    #[test]
+    fn v3_decode_requires_rich_complete_read_proof() {
+        let payload = b"[]";
+        let (occurrence, evidence) =
+            activity_page_fixture(payload, Some(1_699_999_999), 1_700_000_000, 0, receipt(1));
+        let valid = DecisionContinuationV3::new(
+            facts(complete_read_inputs(
+                1_700_000_000,
+                std::slice::from_ref(&evidence),
+            )),
+            None,
+            vec![occurrence.clone()],
+        );
+        DecisionContinuationV3::from_durable(&durable(&valid)).unwrap();
+
+        let pages_without_fixed_end = json!({"pages": [evidence]});
+        for decision_inputs in [
+            json!({}),
+            json!({"fixed_end": 1_700_000_000}),
+            json!({"fixed_end": 1_700_000_000, "pages": []}),
+            pages_without_fixed_end,
+        ] {
+            let invalid =
+                DecisionContinuationV3::new(facts(decision_inputs), None, vec![occurrence.clone()]);
+            assert!(matches!(
+                DecisionContinuationV3::from_durable(&durable(&invalid)),
+                Err(DecisionContinuationError::DurableMismatch)
+            ));
+        }
+    }
+
+    /// PASS: the shared owner accepts a source-shaped short terminal page and rejects the same
+    /// retained payload when both continuation URL copies are changed together.
+    /// FAIL: a URL survives by acting only as an equality key inside the continuation.
+    #[test]
+    fn complete_read_validates_source_owned_request_url() {
+        let payload = br#"[
+            {"proxyWallet":"0x1111111111111111111111111111111111111111","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"1","usdcSize":"0.5","price":"0.5","timestamp":"1700000000","transactionHash":"0xtransaction","outcomeIndex":"0"}
+        ]"#;
+        let (occurrence, evidence) =
+            activity_page_fixture(payload, Some(1_699_999_999), 1_700_000_000, 0, receipt(1));
+        let valid = DecisionContinuationV3::new(
+            facts(complete_read_inputs(
+                1_700_000_000,
+                std::slice::from_ref(&evidence),
+            )),
+            None,
+            vec![occurrence.clone()],
+        );
+        let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+        assert_eq!(
+            valid
+                .reconstruct_complete_activity_read(&mut lookup)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let tampered_url = format!("{}&tampered=true", occurrence.request_url);
+        let mut tampered_evidence = evidence;
+        tampered_evidence.request_url.clone_from(&tampered_url);
+        let mut tampered_occurrence = occurrence;
+        tampered_occurrence.request_url = tampered_url;
+        let tampered = DecisionContinuationV3::new(
+            facts(complete_read_inputs(1_700_000_000, &[tampered_evidence])),
+            None,
+            vec![tampered_occurrence],
+        );
+        let error = tampered
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(error.to_string().contains("source contract"));
+    }
+
+    /// PASS: canonical page evidence is recomputed by the producer-owned hash helper, independently
+    /// of the raw-byte hash, and a changed canonical digest fails closed.
+    /// FAIL: valid raw bytes make a forged canonical page hash irrelevant.
+    #[test]
+    fn complete_read_verifies_canonical_page_hash() {
+        let payload = br#"[ {"proxyWallet":"0x1111111111111111111111111111111111111111","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"1","usdcSize":"0.5","price":"0.5","timestamp":"1700000000","transactionHash":"0xtransaction","outcomeIndex":"0"} ]"#;
+        let (occurrence, mut evidence) =
+            activity_page_fixture(payload, Some(1_699_999_999), 1_700_000_000, 0, receipt(1));
+        assert_ne!(evidence.canonical_page_hash, evidence.raw_page_hash);
+        evidence
+            .canonical_page_hash
+            .clone_from(&evidence.raw_page_hash);
+        let continuation = DecisionContinuationV3::new(
+            facts(complete_read_inputs(1_700_000_000, &[evidence])),
+            None,
+            vec![occurrence],
+        );
+        let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+        let error = continuation
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(error.to_string().contains("canonical page hash differs"));
+    }
+
+    /// PASS: no segment may continue to a short page beyond the producer's maximum offset.
+    /// FAIL: consecutive full pages through the maximum make an extra short page replayable.
+    #[test]
+    fn complete_read_rejects_short_page_beyond_maximum_offset() {
+        let row = json!({
+            "proxyWallet": "0x1111111111111111111111111111111111111111",
+            "type": "TRADE",
+            "conditionId": "0xcondition",
+            "asset": "123",
+            "side": "BUY",
+            "size": "1",
+            "usdcSize": "0.5",
+            "price": "0.5",
+            "timestamp": "1700000000",
+            "transactionHash": "0xtransaction",
+            "outcomeIndex": "0"
+        });
+        let full_payload = serde_json::to_vec(
+            &(0..RECONCILIATION_PAGE_LIMIT)
+                .map(|_| row.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let terminal_payload = b"[]";
+        let terminal_offset = ACTIVITY_MAX_OFFSET + RECONCILIATION_PAGE_LIMIT;
+        let mut occurrences = Vec::new();
+        let mut evidence = Vec::new();
+        let mut offset = 0;
+        while offset <= terminal_offset {
+            let payload = if offset == terminal_offset {
+                terminal_payload.as_slice()
+            } else {
+                full_payload.as_slice()
+            };
+            let (occurrence, page) = activity_page_fixture(
+                payload,
+                Some(1_699_999_999),
+                1_700_000_000,
+                offset,
+                receipt(u64::from(offset / RECONCILIATION_PAGE_LIMIT) + 1),
+            );
+            occurrences.push(occurrence);
+            evidence.push(page);
+            offset += RECONCILIATION_PAGE_LIMIT;
+        }
+        let continuation = DecisionContinuationV3::new(
+            facts(complete_read_inputs(1_700_000_000, &evidence)),
+            None,
+            occurrences,
+        );
+        let terminal_sequence = u64::from(terminal_offset / RECONCILIATION_PAGE_LIMIT) + 1;
+        let mut lookup = |page: AppendReceipt| -> Result<_, &str> {
+            let payload = if page.sequence.0 == terminal_sequence {
+                terminal_payload.as_slice()
+            } else {
+                full_payload.as_slice()
+            };
+            Ok(activity_page(payload))
+        };
+        let error = continuation
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(error.to_string().contains("page evidence is invalid"));
     }
 }
