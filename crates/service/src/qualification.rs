@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pe_copy_signal_engine::{LeaderSignal, PositionState, SignalConfig};
+use pe_copy_signal_engine::{LeaderSignal, PositionState, SignalConfig, TradeProvenance};
 use pe_core_types::{
     AccountId, CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, Price,
     ProbabilityPpm, ReceivedAt, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
@@ -62,7 +62,9 @@ use time::OffsetDateTime;
 
 #[cfg(test)]
 use crate::bucket_commit::PageOccurrence;
-use crate::bucket_commit::{CompleteActivityPage, DecisionContinuationV3};
+use crate::bucket_commit::{
+    CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3,
+};
 use crate::config::ServiceConfig;
 use crate::decision_replay::{
     WinnerFollowDecisionInputs, WinnerFollowRiskInputEvidence, replay_decision_pending,
@@ -2676,6 +2678,38 @@ fn verify_knockout_causal_inputs(
     Ok(())
 }
 
+/// Require one production aggregate and its selected transport to reproduce every immutable
+/// activity fact frozen at the decision boundary.
+pub(crate) fn verify_decision_continuation_facts(
+    aggregate: &pe_source_polymarket_public::ActivityAggregate,
+    frozen: &DecisionContinuationFacts,
+    provenance: TradeProvenance,
+) -> Result<(), QualificationError> {
+    let components = aggregate.group_id.components();
+    if components.activity_type != ActivityType::Trade
+        || components.wallet != frozen.wallet
+        || components.transaction_hash != frozen.transaction_hash
+        || components
+            .condition_id
+            .as_ref()
+            .is_none_or(|condition| condition.0 != frozen.market_id.0.0)
+        || components.outcome != Some(frozen.outcome_id)
+        || components.side != Some(frozen.side)
+        || aggregate.share_sum != frozen.share_amount
+        || aggregate.volume_weighted_price().map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "decision aggregate price replay failed: {error}"
+            ))
+        })? != frozen.price
+        || aggregate.source_time.0.unix_timestamp() != frozen.source_epoch
+        || aggregate.semantic_revision.as_str() != frozen.semantic_revision
+        || provenance != frozen.provenance
+    {
+        return insufficient("decision continuation differs from its raw activity aggregate");
+    }
+    Ok(())
+}
+
 fn verify_decision_source_inputs(
     decision: &crate::decision_replay::ReplayedDecision,
     source: &BTreeMap<u64, SourceObservation>,
@@ -2751,27 +2785,12 @@ fn verify_decision_source_inputs(
     if matching.next().is_some() {
         return insufficient("decision raw pages reconstruct duplicate aggregate identities");
     }
-    let components = aggregate.group_id.components();
-    if components.activity_type != ActivityType::Trade
-        || components.wallet != frozen.wallet
-        || components.transaction_hash != frozen.transaction_hash
-        || components
-            .condition_id
-            .as_ref()
-            .is_none_or(|condition| condition.0 != frozen.market_id.0.0)
-        || components.outcome != Some(frozen.outcome_id)
-        || components.side != Some(frozen.side)
-        || aggregate.share_sum != frozen.share_amount
-        || aggregate.volume_weighted_price().map_err(|error| {
-            QualificationError::InsufficientEvidence(format!(
-                "decision aggregate price replay failed: {error}"
-            ))
-        })? != frozen.price
-        || aggregate.source_time.0.unix_timestamp() != frozen.source_epoch
-        || aggregate.semantic_revision.as_str() != frozen.semantic_revision
-    {
-        return insufficient("decision continuation differs from its raw activity aggregate");
-    }
+    let provenance = if continuation.observed_source_receipt == Some(observation.source_receipt) {
+        TradeProvenance::ActivityWs
+    } else {
+        TradeProvenance::RestPoll
+    };
+    verify_decision_continuation_facts(aggregate, frozen, provenance)?;
     Ok(observation)
 }
 
