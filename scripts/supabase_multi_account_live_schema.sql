@@ -144,11 +144,16 @@ create table if not exists public.live_positions (
     references public.accounts(account_id) on delete restrict,
   market_id        text    not null,
   outcome_id       integer not null,
-  long_contracts   bigint  not null default 0,
-  short_contracts  bigint  not null default 0,
+  long_contracts   numeric not null default 0,
+  short_contracts  numeric not null default 0,
   cost_basis       numeric not null default 0,
   primary key (account_id, market_id, outcome_id)
 );
+
+-- #545: preserve legacy whole-contract rows while permitting exact six-decimal shares.
+alter table public.live_positions
+  alter column long_contracts type numeric using long_contracts::numeric,
+  alter column short_contracts type numeric using short_contracts::numeric;
 
 -- One current collateral/admission row per account when live state has been
 -- initialized (#508). No rows are seeded by this migration.

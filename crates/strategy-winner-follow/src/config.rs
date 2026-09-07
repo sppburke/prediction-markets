@@ -3,7 +3,7 @@
 //! Numeric thresholds live in `_GLOSSARY.md` and `19-WINNER-FOLLOW-STRATEGY.md`;
 //! they are stored in the downstream risk/sizing crates. This config holds the
 //! approval flags (admin-mutable at runtime via Supabase `service_config` since #398), plus the
-//! fee-rate and slippage-rate constants used to compute net cost `c` in Kelly sizing.
+//! slippage input carried into the shared venue-owned economic preparation.
 
 use pe_core_types::KellyFraction;
 use pe_risk_engine::snapshot::TradingMode;
@@ -53,12 +53,11 @@ pub enum SizingMode {
     /// Fractional-Kelly sizing (the full `c` / `p` / bankroll math). Default.
     #[default]
     Kelly,
-    /// Fixed USD notional: `max(1, floor(usd / current_price))` contracts. Bypasses only the Kelly
-    /// fraction + price-derived math; the per-trade cap, price-impact book cap, and risk gate still
-    /// apply. The migration target for the legacy `flat_usd_per_trade`.
+    /// Fixed USD allocation: `floor(usd / all_in_price)` contracts. A zero result is rejected;
+    /// the venue planner subsequently enforces the book, collateral, and monetary caps.
     Dollar { usd: Decimal },
-    /// Fixed contract count, then clamped by the per-trade cap, price-impact book cap, and risk
-    /// gate.
+    /// Fixed contract count passed through unchanged. The venue planner rejects, rather than
+    /// shrinks, a request that exceeds any book, collateral, or monetary cap.
     Contract { contracts: u64 },
 }
 
@@ -75,10 +74,6 @@ pub struct WinnerFollowConfig {
     /// Allow Kelly fractions above the mode default (> 0.25). Default: false.
     #[serde(default)]
     pub kelly_fraction_above_default_human_approved: bool,
-    /// Polymarket BUY taker fee rate used to compute net cost `c` in Kelly sizing.
-    /// See `_GLOSSARY.md` `polymarket_fee_rate`. Default: 0.04 (March 2026 model).
-    #[serde(default = "default_polymarket_fee_rate")]
-    pub polymarket_fee_rate: Decimal,
     /// When set, overrides all mode-based Kelly fractions in all contexts (including
     /// production). Defaults to `None` (mode-based selection applies).
     #[serde(default)]
@@ -101,10 +96,6 @@ pub struct WinnerFollowConfig {
     pub sizing_mode: SizingMode,
 }
 
-fn default_polymarket_fee_rate() -> Decimal {
-    Decimal::new(4, 2)
-}
-
 fn default_slippage_rate() -> Decimal {
     Decimal::new(1, 2)
 }
@@ -114,7 +105,6 @@ impl Default for WinnerFollowConfig {
         Self {
             flip_human_approved: false,
             kelly_fraction_above_default_human_approved: false,
-            polymarket_fee_rate: default_polymarket_fee_rate(),
             kelly_fraction_override: None,
             per_trade_cap: PerTradeCap::default(),
             slippage_rate: default_slippage_rate(),

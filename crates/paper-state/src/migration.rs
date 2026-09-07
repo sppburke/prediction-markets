@@ -1048,7 +1048,8 @@ mod tests {
         assert_eq!(MigrationMetadata::read(&path).unwrap(), Some(first.clone()));
         assert!(matches!(
             PaperStateDb::open(&path),
-            Err(PaperStateError::SchemaVersionMismatch { found: 3, .. })
+            Err(PaperStateError::SchemaVersionMismatch { found, .. })
+                if found == crate::SCHEMA_VERSION + 1
         ));
         let mut different = first;
         different

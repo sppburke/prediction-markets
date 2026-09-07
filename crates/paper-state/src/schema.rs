@@ -6,7 +6,10 @@
 
 /// Current on-disk schema version, written to `PRAGMA user_version` on create
 /// and checked on open. Bump when the table layout changes incompatibly.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
+
+/// Schema version whose whole-contract financial columns are migrated once on open.
+pub(crate) const LEGACY_EXACT_MIGRATION_VERSION: i64 = 2;
 
 /// `meta` key under which the event-log reconciliation cursor is stored.
 pub(crate) const META_LAST_APPLIED_EVENT_SEQ: &str = "last_applied_event_seq";
@@ -21,6 +24,12 @@ pub(crate) const META_LAST_APPLIED_EVENT_SEQ: &str = "last_applied_event_seq";
 /// whose frames it counts, is itself local. Advanced at runtime by
 /// `commit_fill_authoritative` on each confirmed successor fill (#510).
 pub(crate) const META_LAST_SUPABASE_APPLIED_EVENT_SEQ: &str = "last_supabase_applied_event_seq";
+
+/// Active financial-era metadata (#545). The Start keys are written as one transaction;
+/// `financial_last_prepared_seq` advances only with a local financial projection commit.
+pub(crate) const META_FINANCIAL_START_SEQ: &str = "financial_start_seq";
+pub(crate) const META_FINANCIAL_START_HASH: &str = "financial_start_hash";
+pub(crate) const META_FINANCIAL_LAST_PREPARED_SEQ: &str = "financial_last_prepared_seq";
 
 /// Single-row `bankroll` table primary key.
 pub(crate) const BANKROLL_ROW_ID: i64 = 0;
@@ -73,17 +82,23 @@ CREATE TABLE IF NOT EXISTS fills (
     market_id       TEXT    NOT NULL,
     outcome_id      INTEGER NOT NULL,
     side            TEXT    NOT NULL CHECK(side IN ('buy', 'sell')),
-    contracts       INTEGER NOT NULL,
+    quantity_str    TEXT    NOT NULL,
     fill_price_str  TEXT    NOT NULL,
-    event_seq       INTEGER NOT NULL
+    principal_str   TEXT    NOT NULL,
+    fee_str         TEXT    NOT NULL,
+    event_seq       INTEGER NOT NULL,
+    prepared_seq    INTEGER NOT NULL,
+    source_receipt_seq INTEGER,
+    source_receipt_hash TEXT,
+    causal_received_at_unix INTEGER
 );
 
 -- Our own net paper positions per (market, outcome).
 CREATE TABLE IF NOT EXISTS positions (
     market_id       TEXT    NOT NULL,
     outcome_id      INTEGER NOT NULL,
-    long_contracts  INTEGER NOT NULL,
-    short_contracts INTEGER NOT NULL,
+    long_str        TEXT    NOT NULL,
+    short_str       TEXT    NOT NULL,
     PRIMARY KEY (market_id, outcome_id)
 );
 
@@ -236,7 +251,7 @@ CREATE TABLE IF NOT EXISTS poll_cursors (
 -- canonical JSON text. SQLite's ordinary (non-STRICT) affinity preserves both storage classes.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT    PRIMARY KEY NOT NULL,
-    value INTEGER NOT NULL
+    value BLOB    NOT NULL
 );
 
 -- Hash-bound activation census captured after remote-authority reload and the
@@ -257,7 +272,9 @@ CREATE TABLE IF NOT EXISTS settled_markets (
     market_id       TEXT    PRIMARY KEY NOT NULL,
     outcome_prices  TEXT    NOT NULL,
     credit_applied  TEXT    NOT NULL,
-    settled_at_unix INTEGER NOT NULL
+    settled_at_unix INTEGER NOT NULL,
+    prepared_seq INTEGER,
+    source_receipt_seq INTEGER
 );
 
 -- Fill-time market-liquidity snapshot (WS2 of issue #350): one best-effort row per

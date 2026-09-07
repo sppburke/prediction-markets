@@ -2,9 +2,10 @@
 //!
 //! `service_config` is parsed as one complete proposal. Missing, duplicate, unknown, malformed,
 //! or cross-field-inconsistent rows reject the proposal without changing any applied field. The
-//! only optional row is `kelly_fraction_override`. Watchlist capacity remains truthful while a
-//! prepared membership transition is pending: the applied snapshot keeps the old capacity until
-//! the structural writer commits the new membership.
+//! only optional economic row is `kelly_fraction_override`; the financial era also permits the
+//! separately owned `risk_halt_release_hash` incident row and excludes it from the economic hash.
+//! Watchlist capacity remains truthful while a prepared membership transition is pending: the
+//! applied snapshot keeps the old capacity until the structural writer commits the new membership.
 
 use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
@@ -19,9 +20,27 @@ use thiserror::Error;
 
 use crate::config::ServiceConfig;
 
-/// Exact hot-key allowlist (#544). Every key is mandatory exactly once except
+/// Exact post-Start hot-key allowlist (#545). Every key is mandatory exactly once except
 /// `kelly_fraction_override`, which may be absent.
-pub const HOT_CONFIG_KEYS: [&str; 17] = [
+pub const HOT_CONFIG_KEYS: [&str; 15] = [
+    "active_watchlist_size",
+    "mode",
+    "max_fill_price",
+    "min_fill_price",
+    "min_resolution_horizon_secs",
+    "max_resolution_horizon_secs",
+    "price_impact_cap_bps",
+    "flip_human_approved",
+    "kelly_fraction_above_default_human_approved",
+    "kelly_fraction_override",
+    "per_trade_cap",
+    "slippage_rate",
+    "sizing_mode",
+    "sizing_dollar_usd",
+    "sizing_contracts",
+];
+
+pub const LEGACY_HOT_CONFIG_KEYS: [&str; 17] = [
     "active_watchlist_size",
     "mode",
     "max_fill_price",
@@ -40,6 +59,13 @@ pub const HOT_CONFIG_KEYS: [&str; 17] = [
     "sizing_dollar_usd",
     "sizing_contracts",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigEra {
+    Legacy17,
+    Financial15,
+}
 
 /// Exact database-row retirement set used by the guarded operator migration (#544).
 pub const REMOVED_CONFIG_KEYS: [&str; 22] = [
@@ -72,6 +98,7 @@ pub const MIN_ACTIVE_WATCHLIST_SIZE: usize = 1;
 pub const MAX_ACTIVE_WATCHLIST_SIZE: usize = 200;
 pub const MIN_PRICE_IMPACT_CAP_BPS: i32 = 1;
 pub const MAX_PRICE_IMPACT_CAP_BPS: i32 = 10_000;
+pub const RISK_HALT_RELEASE_HASH_KEY: &str = "risk_halt_release_hash";
 
 /// The membership cap that has actually been published to the live watchlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,32 +132,6 @@ impl AppliedWatchlistCapacity {
     }
 }
 
-/// Paper fill-price mode (#486).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FillMode {
-    #[default]
-    ClobBestAsk,
-    LeaderHaircut,
-}
-
-impl FillMode {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_lowercase().replace('-', "_").as_str() {
-            "clob_best_ask" | "clobbestask" => Some(Self::ClobBestAsk),
-            "leader_haircut" | "leaderhaircut" => Some(Self::LeaderHaircut),
-            _ => None,
-        }
-    }
-
-    const fn canonical(self) -> &'static str {
-        match self {
-            Self::ClobBestAsk => "clob_best_ask",
-            Self::LeaderHaircut => "leader_haircut",
-        }
-    }
-}
-
 /// One raw `service_config` row returned by PostgREST.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigRow {
@@ -140,27 +141,35 @@ pub struct ConfigRow {
     pub value_type: String,
 }
 
-/// The exact 17-key hot snapshot. It deliberately contains no revision/hash field; the one
-/// canonical applied hash is process status derived from these actual values.
+/// One era-bound hot snapshot. It deliberately contains no revision/hash field; the one
+/// canonical applied hash is process status derived from the active era's exact values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
+    pub era: ConfigEra,
     pub active_watchlist_size: usize,
     pub mode: String,
     pub max_fill_price: Decimal,
     pub min_fill_price: Decimal,
     pub min_resolution_horizon_secs: u64,
     pub max_resolution_horizon_secs: u64,
-    pub fill_mode: FillMode,
     pub price_impact_cap_bps: i32,
     pub flip_human_approved: bool,
     pub kelly_fraction_above_default_human_approved: bool,
-    pub polymarket_fee_rate: Decimal,
     pub kelly_fraction_override: Option<KellyFraction>,
     pub per_trade_cap: PerTradeCap,
     pub slippage_rate: Decimal,
     pub sizing_mode: SizingMode,
     pub sizing_dollar_usd: Decimal,
     pub sizing_contracts: u64,
+    /// Required pre-Start rows retained only so the Legacy17 canonical hash binds all 17 names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_compatibility: Option<LegacyCompatibility>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct LegacyCompatibility {
+    fill_mode: String,
+    polymarket_fee_rate: Decimal,
 }
 
 impl RuntimeConfig {
@@ -175,13 +184,13 @@ impl RuntimeConfig {
             SizingMode::Kelly => (Decimal::ZERO, 0),
         };
         Self {
+            era: ConfigEra::Financial15,
             active_watchlist_size: DEFAULT_ACTIVE_WATCHLIST_SIZE,
             mode: cfg.mode.clone(),
             max_fill_price,
             min_fill_price,
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
-            fill_mode: FillMode::parse(&cfg.fill_mode).unwrap_or_default(),
             // No accepted-zero construction path remains. Production's mandatory boot snapshot
             // replaces this test baseline before any producer can start.
             price_impact_cap_bps: 100,
@@ -189,13 +198,13 @@ impl RuntimeConfig {
             kelly_fraction_above_default_human_approved: cfg
                 .strategy
                 .kelly_fraction_above_default_human_approved,
-            polymarket_fee_rate: cfg.strategy.polymarket_fee_rate,
             kelly_fraction_override: cfg.strategy.kelly_fraction_override,
             per_trade_cap: cfg.strategy.per_trade_cap,
             slippage_rate: cfg.strategy.slippage_rate,
             sizing_mode: cfg.strategy.sizing_mode,
             sizing_dollar_usd,
             sizing_contracts,
+            legacy_compatibility: None,
         }
     }
 
@@ -204,7 +213,6 @@ impl RuntimeConfig {
             flip_human_approved: self.flip_human_approved,
             kelly_fraction_above_default_human_approved: self
                 .kelly_fraction_above_default_human_approved,
-            polymarket_fee_rate: self.polymarket_fee_rate,
             kelly_fraction_override: self.kelly_fraction_override,
             per_trade_cap: self.per_trade_cap,
             slippage_rate: self.slippage_rate,
@@ -214,18 +222,16 @@ impl RuntimeConfig {
 
     /// BLAKE3 of one canonical semantic JSON representation of the values actually applied.
     pub fn canonical_hash(&self) -> String {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "active_watchlist_size": self.active_watchlist_size,
             "mode": self.mode,
             "max_fill_price": decimal_text(self.max_fill_price),
             "min_fill_price": decimal_text(self.min_fill_price),
             "min_resolution_horizon_secs": self.min_resolution_horizon_secs,
             "max_resolution_horizon_secs": self.max_resolution_horizon_secs,
-            "fill_mode": self.fill_mode.canonical(),
             "price_impact_cap_bps": self.price_impact_cap_bps,
             "flip_human_approved": self.flip_human_approved,
             "kelly_fraction_above_default_human_approved": self.kelly_fraction_above_default_human_approved,
-            "polymarket_fee_rate": decimal_text(self.polymarket_fee_rate),
             "kelly_fraction_override": self.kelly_fraction_override.map(|value| decimal_text(value.0)),
             "per_trade_cap": canonical_per_trade_cap(self.per_trade_cap),
             "slippage_rate": decimal_text(self.slippage_rate),
@@ -233,6 +239,11 @@ impl RuntimeConfig {
             "sizing_dollar_usd": decimal_text(self.sizing_dollar_usd),
             "sizing_contracts": self.sizing_contracts,
         });
+        if let Some(legacy) = &self.legacy_compatibility {
+            body["fill_mode"] = serde_json::Value::String(legacy.fill_mode.clone());
+            body["polymarket_fee_rate"] =
+                serde_json::Value::String(decimal_text(legacy.polymarket_fee_rate));
+        }
         blake3::hash(body.to_string().as_bytes())
             .to_hex()
             .to_string()
@@ -320,9 +331,17 @@ pub fn parse_config(
     rows: &[ConfigRow],
     last_good: &RuntimeConfig,
     clob_creds_present: bool,
+    era: ConfigEra,
 ) -> Result<RuntimeConfig, ConfigSnapshotError> {
     let mut map = BTreeMap::<&str, &ConfigRow>::new();
-    let allowlist: HashSet<&str> = HOT_CONFIG_KEYS.into_iter().collect();
+    let era_keys: &[&str] = match era {
+        ConfigEra::Legacy17 => &LEGACY_HOT_CONFIG_KEYS,
+        ConfigEra::Financial15 => &HOT_CONFIG_KEYS,
+    };
+    let mut allowlist: HashSet<&str> = era_keys.iter().copied().collect();
+    if era == ConfigEra::Financial15 {
+        allowlist.insert(RISK_HALT_RELEASE_HASH_KEY);
+    }
     for row in rows {
         if !allowlist.contains(row.key.as_str()) {
             return Err(ConfigSnapshotError::UnknownKey {
@@ -335,10 +354,10 @@ pub fn parse_config(
             });
         }
     }
-    for key in HOT_CONFIG_KEYS {
-        if key != "kelly_fraction_override" && !map.contains_key(key) {
+    for key in era_keys {
+        if *key != "kelly_fraction_override" && !map.contains_key(key) {
             return Err(ConfigSnapshotError::MissingKey {
-                key: key.to_owned(),
+                key: (*key).to_owned(),
             });
         }
     }
@@ -388,12 +407,27 @@ pub fn parse_config(
         );
     }
 
-    let fill_mode = FillMode::parse(raw(&map, "fill_mode")?).ok_or_else(|| {
-        ConfigSnapshotError::InvalidValue {
-            key: "fill_mode".to_owned(),
-            reason: "must be clob_best_ask or leader_haircut".to_owned(),
+    let legacy_compatibility = match era {
+        ConfigEra::Legacy17 => {
+            let fill_mode = match raw(&map, "fill_mode")?
+                .trim()
+                .to_lowercase()
+                .replace('-', "_")
+                .as_str()
+            {
+                "clob_best_ask" | "clobbestask" => "clob_best_ask".to_owned(),
+                "leader_haircut" | "leaderhaircut" => "leader_haircut".to_owned(),
+                _ => return invalid("fill_mode", "must be clob_best_ask or leader_haircut"),
+            };
+            let polymarket_fee_rate = parse_decimal(&map, "polymarket_fee_rate")?;
+            validate_fraction_decimal("polymarket_fee_rate", polymarket_fee_rate)?;
+            Some(LegacyCompatibility {
+                fill_mode,
+                polymarket_fee_rate,
+            })
         }
-    })?;
+        ConfigEra::Financial15 => None,
+    };
     let price_impact_cap_bps = parse(&map, "price_impact_cap_bps")?;
     if !(MIN_PRICE_IMPACT_CAP_BPS..=MAX_PRICE_IMPACT_CAP_BPS).contains(&price_impact_cap_bps) {
         return invalid("price_impact_cap_bps", "must be in 1..=10000");
@@ -402,8 +436,6 @@ pub fn parse_config(
     let flip_human_approved: bool = parse(&map, "flip_human_approved")?;
     let kelly_fraction_above_default_human_approved: bool =
         parse(&map, "kelly_fraction_above_default_human_approved")?;
-    let polymarket_fee_rate = parse_decimal(&map, "polymarket_fee_rate")?;
-    validate_fraction_decimal("polymarket_fee_rate", polymarket_fee_rate)?;
     let slippage_rate = parse_decimal(&map, "slippage_rate")?;
     validate_fraction_decimal("slippage_rate", slippage_rate)?;
 
@@ -470,23 +502,23 @@ pub fn parse_config(
     };
 
     Ok(RuntimeConfig {
+        era,
         active_watchlist_size,
         mode,
         max_fill_price,
         min_fill_price,
         min_resolution_horizon_secs,
         max_resolution_horizon_secs,
-        fill_mode,
         price_impact_cap_bps,
         flip_human_approved,
         kelly_fraction_above_default_human_approved,
-        polymarket_fee_rate,
         kelly_fraction_override,
         per_trade_cap,
         slippage_rate,
         sizing_mode,
         sizing_dollar_usd,
         sizing_contracts,
+        legacy_compatibility,
     })
 }
 
@@ -496,11 +528,13 @@ pub fn load_initial_runtime_config(
     rows: &[ConfigRow],
     cfg: &ServiceConfig,
     clob_creds_present: bool,
+    era: ConfigEra,
 ) -> Result<RuntimeConfig, ConfigSnapshotError> {
     parse_config(
         rows,
         &RuntimeConfig::from_service_config(cfg),
         clob_creds_present,
+        era,
     )
 }
 
@@ -573,11 +607,13 @@ fn expected_value_type(key: &str) -> &'static str {
         "flip_human_approved" | "kelly_fraction_above_default_human_approved" => "bool",
         "max_fill_price"
         | "min_fill_price"
-        | "polymarket_fee_rate"
         | "kelly_fraction_override"
         | "slippage_rate"
         | "sizing_dollar_usd" => "decimal",
-        "mode" | "fill_mode" | "per_trade_cap" | "sizing_mode" => "text",
+        "polymarket_fee_rate" => "decimal",
+        "mode" | "fill_mode" | "per_trade_cap" | "sizing_mode" | RISK_HALT_RELEASE_HASH_KEY => {
+            "text"
+        }
         _ => "",
     }
 }
@@ -687,11 +723,9 @@ mod tests {
             ("min_fill_price", "0.15"),
             ("min_resolution_horizon_secs", "60"),
             ("max_resolution_horizon_secs", "172800"),
-            ("fill_mode", "clob_best_ask"),
             ("price_impact_cap_bps", "100"),
             ("flip_human_approved", "false"),
             ("kelly_fraction_above_default_human_approved", "false"),
-            ("polymarket_fee_rate", "0.04"),
             ("per_trade_cap", "unlimited"),
             ("slippage_rate", "0.01"),
             ("sizing_mode", "dollar"),
@@ -719,7 +753,22 @@ mod tests {
     }
 
     fn parse_rows(rows: &[ConfigRow]) -> Result<RuntimeConfig, ConfigSnapshotError> {
-        parse_config(rows, &baseline(), false)
+        parse_config(rows, &baseline(), false, ConfigEra::Financial15)
+    }
+
+    fn legacy_rows() -> Vec<ConfigRow> {
+        let mut rows = complete_rows();
+        rows.push(ConfigRow {
+            key: "fill_mode".to_owned(),
+            value: "clob_best_ask".to_owned(),
+            value_type: "text".to_owned(),
+        });
+        rows.push(ConfigRow {
+            key: "polymarket_fee_rate".to_owned(),
+            value: "0.04".to_owned(),
+            value_type: "decimal".to_owned(),
+        });
+        rows
     }
 
     fn schema_seed_rows() -> Vec<ConfigRow> {
@@ -751,13 +800,19 @@ mod tests {
         sql.split('\'')
             .enumerate()
             .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
-            .filter(|value| HOT_CONFIG_KEYS.contains(value) || REMOVED_CONFIG_KEYS.contains(value))
+            .filter(|value| {
+                HOT_CONFIG_KEYS.contains(value)
+                    || LEGACY_HOT_CONFIG_KEYS.contains(value)
+                    || REMOVED_CONFIG_KEYS.contains(value)
+                    || *value == "risk_halt_release_hash"
+            })
             .collect()
     }
 
     #[test]
     fn exact_allowlist_and_removed_set() {
-        assert_eq!(HOT_CONFIG_KEYS.len(), 17);
+        assert_eq!(HOT_CONFIG_KEYS.len(), 15);
+        assert_eq!(LEGACY_HOT_CONFIG_KEYS.len(), 17);
         assert_eq!(REMOVED_CONFIG_KEYS.len(), 22);
         assert_eq!(
             HOT_CONFIG_KEYS.into_iter().collect::<HashSet<_>>().len(),
@@ -778,16 +833,16 @@ mod tests {
     }
 
     #[test]
-    fn guarded_migration_checks_allowlist_then_deletes_exact_retirement_set() {
-        let sql = include_str!("../../../scripts/migrate_service_config_544.sql");
+    fn guarded_migration_checks_legacy_preflight_then_deletes_only_two_rows() {
+        let sql = include_str!("../../../scripts/migrate_service_config_545.sql");
         assert!(sql.contains("\\set ON_ERROR_STOP on"));
         let guard = sql
             .split("delete from service_config")
             .next()
             .expect("migration unknown-key guard");
-        let expected_guard: HashSet<_> = HOT_CONFIG_KEYS
+        let expected_guard: HashSet<_> = LEGACY_HOT_CONFIG_KEYS
             .into_iter()
-            .chain(REMOVED_CONFIG_KEYS)
+            .chain(["risk_halt_release_hash"])
             .collect();
         assert_eq!(quoted_keys(guard), expected_guard);
 
@@ -797,7 +852,7 @@ mod tests {
             .expect("migration delete");
         assert_eq!(
             quoted_keys(delete),
-            REMOVED_CONFIG_KEYS.into_iter().collect()
+            ["fill_mode", "polymarket_fee_rate"].into_iter().collect()
         );
     }
 
@@ -809,13 +864,44 @@ mod tests {
         assert_eq!(parsed.per_trade_cap, PerTradeCap::Unlimited);
         assert_eq!(parsed.sizing_mode, SizingMode::Dollar { usd: dec!(25) });
         assert_eq!(parsed.kelly_fraction_override, None);
+        assert_eq!(parsed.era, ConfigEra::Financial15);
+    }
+
+    #[test]
+    fn era_contract_requires_legacy_rows_before_start_and_rejects_them_after_start() {
+        let legacy = legacy_rows();
+        let parsed = parse_config(&legacy, &baseline(), false, ConfigEra::Legacy17).unwrap();
+        assert_eq!(parsed.era, ConfigEra::Legacy17);
+        assert!(parse_config(&legacy, &baseline(), false, ConfigEra::Financial15).is_err());
+        assert!(parse_config(&complete_rows(), &baseline(), false, ConfigEra::Legacy17).is_err());
+    }
+
+    #[test]
+    fn financial_era_permits_incident_release_row_without_changing_economic_hash() {
+        let rows = complete_rows();
+        let baseline = parse_rows(&rows).unwrap();
+        let mut with_release = rows;
+        with_release.push(ConfigRow {
+            key: RISK_HALT_RELEASE_HASH_KEY.to_owned(),
+            value: "release-proof".to_owned(),
+            value_type: "text".to_owned(),
+        });
+        let parsed = parse_rows(&with_release).unwrap();
+        assert_eq!(parsed.canonical_hash(), baseline.canonical_hash());
+        assert!(parse_config(&with_release, &baseline, false, ConfigEra::Legacy17).is_err());
     }
 
     #[test]
     fn new_install_schema_seed_is_a_valid_compiled_snapshot() {
         let rows = schema_seed_rows();
-        let parsed = load_initial_runtime_config(&rows, &ServiceConfig::default(), false).unwrap();
-        assert_eq!(rows.len(), 16);
+        let parsed = load_initial_runtime_config(
+            &rows,
+            &ServiceConfig::default(),
+            false,
+            ConfigEra::Financial15,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 14);
         assert_eq!(parsed.active_watchlist_size, 100);
         assert_eq!(parsed.price_impact_cap_bps, 100);
         assert_eq!(parsed.sizing_mode, SizingMode::Dollar { usd: dec!(25) });
@@ -826,19 +912,35 @@ mod tests {
     #[test]
     fn boot_rejects_missing_or_invalid_mandatory_cap() {
         assert!(matches!(
-            load_initial_runtime_config(&[], &ServiceConfig::default(), false),
+            load_initial_runtime_config(
+                &[],
+                &ServiceConfig::default(),
+                false,
+                ConfigEra::Financial15
+            ),
             Err(ConfigSnapshotError::MissingKey { key }) if key == "active_watchlist_size"
         ));
         let mut missing = complete_rows();
         missing.retain(|row| row.key != "price_impact_cap_bps");
         assert!(matches!(
-            load_initial_runtime_config(&missing, &ServiceConfig::default(), false),
+            load_initial_runtime_config(
+                &missing,
+                &ServiceConfig::default(),
+                false,
+                ConfigEra::Financial15
+            ),
             Err(ConfigSnapshotError::MissingKey { key }) if key == "price_impact_cap_bps"
         ));
         let mut invalid_cap = complete_rows();
         set(&mut invalid_cap, "price_impact_cap_bps", "0");
         assert!(
-            load_initial_runtime_config(&invalid_cap, &ServiceConfig::default(), false).is_err()
+            load_initial_runtime_config(
+                &invalid_cap,
+                &ServiceConfig::default(),
+                false,
+                ConfigEra::Financial15
+            )
+            .is_err()
         );
     }
 
@@ -922,11 +1024,9 @@ mod tests {
             ("min_fill_price", "-0.01"),
             ("min_resolution_horizon_secs", "-1"),
             ("max_resolution_horizon_secs", "never"),
-            ("fill_mode", "midpoint"),
             ("price_impact_cap_bps", "10001"),
             ("flip_human_approved", "yes"),
             ("kelly_fraction_above_default_human_approved", "yes"),
-            ("polymarket_fee_rate", "1.01"),
             ("per_trade_cap", "bps:0"),
             ("slippage_rate", "-0.01"),
             ("sizing_mode", "shares"),
@@ -1022,12 +1122,5 @@ mod tests {
         assert_eq!(snapshot.applied_hash, before);
         assert_eq!(snapshot.rejected.as_ref().unwrap().error, error);
         assert_eq!(snapshot.rejected.as_ref().unwrap().rows, rejected);
-    }
-
-    #[test]
-    fn legacy_fallback_fill_source_still_deserializes() {
-        let source: pe_strategy_winner_follow::FillSource =
-            serde_json::from_str("\"Fallback\"").unwrap();
-        assert_eq!(source, pe_strategy_winner_follow::FillSource::Fallback);
     }
 }

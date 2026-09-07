@@ -1,9 +1,5 @@
 //! `pe-execution-core` — auditable execution primitives for the prediction-edge system.
 //!
-//! The existing dispatcher continues to route ordinary `OrderIntent` values as before:
-//! - `Shadow` / `Paper` → `PaperExecutor` (from `pe-strategy-winner-follow`)
-//! - `LiveTiny` / `Promoted` → fail closed
-//!
 //! The isolated canary actor remains unchanged. The ordinary-live modules expose a separate
 //! two-phase executor, account-tagged journal, and redemption state machine for service wiring.
 
@@ -11,8 +7,7 @@
 
 pub mod canary;
 pub mod canary_actor;
-pub mod dispatcher;
-pub mod error;
+pub mod economic;
 pub mod live_executor;
 pub mod live_journal;
 pub mod redemption_machine;
@@ -30,29 +25,37 @@ pub use canary_actor::{
     CanaryActor, CanaryActorError, CanaryActorHandle, CanaryReconciler, CanarySubmitter,
     RawReconciliation,
 };
-pub use dispatcher::{DispatchResult, ExecutionDispatcher};
-pub use error::ExecutionError;
+pub use economic::{
+    BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicError, EconomicInputs, EconomicPrepared,
+    FeeAudit, MarketSelection, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit,
+    SizingModeAudit,
+};
 pub use live_executor::{
-    FrozenLiveTarget, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutor,
-    LiveExecutorError, LiveModeSnapshot, LiveOrderOutcome, LiveOrderRequest, LiveOrderVenue,
-    LivePostClassification, LivePostFuture, LivePostParseError, LivePrepareResult,
+    FrozenLiveTarget, LiveAccountStateFuture, LiveAdmissionArtifact, LiveAdmissionEvaluationError,
+    LiveExecutor, LiveExecutorError, LiveModeSnapshot, LiveOrderOutcome, LiveOrderRequest,
+    LiveOrderVenue, LivePostClassification, LivePostFuture, LivePostParseError, LivePrepareResult,
     LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
     LiveVenuePreparationError, LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared,
     LiveVenueReconciledOutcome, LiveVenueReconciliation, LiveVenueReconciliationError,
-    PreparedLiveOrder,
+    PreparedLiveOrder, verify_live_admission_evaluation,
 };
 pub use live_journal::{
-    CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit, LiveAccountReadFailure,
-    LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
-    LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode, LiveExecutedAmounts,
-    LiveFeeEvidenceAudit, LiveFillProjectionIdentity, LiveJournal, LiveJournalError,
+    AccountPortfolioMarkedAudit, AdmissionReceipts, CanonicalPositionAudit,
+    CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit, LegacyV1Payload,
+    LiveAccountReadFailure, LiveAccountStateAudit, LiveAdmissionArtifactAudit,
+    LiveAdmissionEvaluationAudit, LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode,
+    LiveExecutedAmounts, LiveFillProjectionIdentity, LiveJournal, LiveJournalError,
     LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveMarketEvidenceAudit,
     LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
     LiveOrderPostAudit, LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure,
     LiveOrderPreparedAudit, LiveOrderReconciliationAudit, LiveOrderRejectKind,
-    LiveReconciliationSource, RedemptionAttemptIdentity, RedemptionCustodyAudit,
+    LiveReconciliationSource, LiveRecoveryInventory, MarkKind, MarkPrice, MatchedLogIdentity,
+    OpenOrderInventoryEntry, OpenOrderRecoveryEntry, OrderFillFinalizedAudit, PreparedOrderFact,
+    RedemptionAttemptIdentity, RedemptionCustodyAudit, RedemptionCustodyReconciledAudit,
     RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
-    RedemptionRequestedAudit, RedemptionTransactionAudit, replay_account,
+    RedemptionRequestedAudit, RedemptionTransactionAudit, ResolutionFinalizedAudit,
+    TerminalAdmissionRecoveryEntry, TerminalAdmissionRecoveryOutcome, http_attempt_hashes,
+    prepared_order_fact_matches, recovery_inventory, replay_account, structural_recovery_inventory,
 };
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,

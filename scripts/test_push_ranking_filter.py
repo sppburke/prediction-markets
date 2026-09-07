@@ -13,6 +13,8 @@ Run: `python3 scripts/test_push_ranking_filter.py`
   or: `pytest scripts/test_push_ranking_filter.py -v`
 """
 import io
+import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -348,6 +350,127 @@ class PublishRequestTest(unittest.TestCase):
             tampered["entries"][0]["wallet_hex"] = "0xchanged"
             with self.assertRaisesRegex(ValueError, "content hash mismatch"):
                 pr.validate_publish_request(tampered)
+
+    def test_atomic_write_fsyncs_file_then_rename_then_parent_directory(self):
+        """PASS: the durable write orders file fsync before rename and directory fsync after it.
+        FAIL: rename can become visible without the containing directory being synchronized."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "request.json"
+            events = []
+            directory_fds = set()
+
+            def fsync_fn(fd):
+                events.append("directory_fsync" if fd in directory_fds else "file_fsync")
+                os.fsync(fd)
+
+            def replace_fn(source, destination):
+                events.append("replace")
+                os.replace(source, destination)
+
+            def directory_open_fn(directory, flags):
+                fd = os.open(directory, flags)
+                directory_fds.add(fd)
+                events.append("directory_open")
+                return fd
+
+            def close_fn(fd):
+                events.append("directory_close")
+                directory_fds.discard(fd)
+                os.close(fd)
+
+            pr._atomic_write_text(
+                path,
+                "durable\n",
+                replace_fn=replace_fn,
+                fsync_fn=fsync_fn,
+                directory_open_fn=directory_open_fn,
+                close_fn=close_fn,
+            )
+            self.assertEqual(
+                events,
+                ["file_fsync", "replace", "directory_open", "directory_fsync",
+                 "directory_close"],
+            )
+            self.assertEqual(path.read_text(), "durable\n")
+        print("PASS: atomic request writes fsync the parent after rename")
+
+    def test_cache_activation_is_bound_into_publish_key(self):
+        """PASS: exact request recovery retains the side/fixed/prior/hash tuple;
+        changing any activation field invalidates the publication key."""
+        activation = {
+            "side_path": "data/side.db",
+            "fixed_path": "data/wallet_cache.db",
+            "prior_cache_backup_path": "data/wallet_cache.prior.db",
+            "expected_sha256": "a" * 64,
+        }
+        baseline = self._request()
+        request = pr.build_publish_request(
+            baseline["batch"], baseline["entries"], baseline["keep_batches"], activation
+        )
+        self.assertEqual(request["cache_activation"], activation)
+        changed = json.loads(json.dumps(request))
+        changed["cache_activation"]["expected_sha256"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+            pr.validate_publish_request(changed)
+        print("PASS: publication key binds the exact cache activation tuple")
+
+    def test_validate_request_cli_returns_only_validated_activation_tuple(self):
+        activation = {
+            "side_path": "data/side.db",
+            "fixed_path": "data/wallet_cache.db",
+            "prior_cache_backup_path": "data/wallet_cache.prior.db",
+            "expected_sha256": "a" * 64,
+        }
+        baseline = self._request()
+        request = pr.build_publish_request(
+            baseline["batch"], baseline["entries"], baseline["keep_batches"], activation
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "request.json"
+            pr.save_publish_request(str(path), request)
+            with (
+                mock.patch.object(sys, "argv", ["push", "--validate-request", str(path)]),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                self.assertEqual(pr.main(), 0)
+            self.assertEqual(stdout.getvalue().splitlines(), list(activation.values()))
+
+            tampered = json.loads(path.read_text())
+            tampered["cache_activation"]["side_path"] = "data/tampered.db"
+            path.write_text(json.dumps(tampered))
+            with (
+                mock.patch.object(sys, "argv", ["push", "--validate-request", str(path)]),
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                self.assertEqual(pr.main(), 1)
+            self.assertIn("content hash mismatch", stderr.getvalue())
+        print("PASS: validation emits the bound tuple and rejects tampering")
+
+    def test_current_batch_snapshot_is_atomic_and_normalized(self):
+        """PASS: cycle start freezes the active batch before any publication write."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "before.json"
+            with (
+                mock.patch.object(sys, "argv", ["push", "--snapshot-current", str(output)]),
+                mock.patch.dict(
+                    os.environ,
+                    {"SUPABASE_URL": "https://x.supabase.co",
+                     "SUPABASE_SECRET_KEY": "secret"},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    pr, "_req",
+                    return_value=(200, [{
+                        "rank": 1, "wallet_hex": "0xABC", "ls_tstat": 3.5,
+                        "survives": True,
+                    }]),
+                ),
+            ):
+                self.assertEqual(pr.main(), 0)
+            self.assertEqual(json.loads(output.read_text()), [{
+                "rank": 1, "score": 3.5, "survives": True, "wallet": "0xabc",
+            }])
+        print("PASS: active published batch snapshot is deterministic")
 
     def test_pending_pointer_is_atomic_repository_relative(self):
         with tempfile.TemporaryDirectory() as tmp, chdir(tmp):

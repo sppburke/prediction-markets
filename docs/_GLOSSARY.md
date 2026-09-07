@@ -32,7 +32,19 @@ End-to-end target from `leader_trade_observed_at` (gateway receive) to `follower
 | p95 | ≤ 2.0 s |
 | p99 | ≤ 3.0 s |
 
-If running p95 over the prior hour exceeds budget by 50 % for two consecutive 5-minute windows, the **copy-latency kill switch** (see `19-WINNER-FOLLOW-STRATEGY.md`) blocks new entries until p95 returns under budget.
+The **copy-latency kill switch** uses nearest-rank p95 values for the last two completed
+prior UTC clock hours (see the canonical `copy_latency_kill_switch_ms` and
+`copy_latency_release_ms` values in `19-WINNER-FOLLOW-STRATEGY.md`). Two consecutive available
+values strictly above the engage threshold activate it. While active, a missing value or a value
+above the release threshold holds it; the first available value at or below the release threshold
+releases it. A missing hour breaks the engage pair while inactive.
+
+Paper samples span the chosen source envelope's `received_at` to the synchronized
+`FinancialFinal` envelope's `received_at`. Live samples span request start to every
+transport-successful `OrderPosted` response's `received_at`, irrespective of HTTP status or later
+classification; transport failures and chain-finality time are excluded. Samples belong to the
+hour containing that endpoint. The paper owner and every live account derive the switch locally;
+any active owner blocks strategy-wide new entries.
 
 > **Two latency metrics, deliberately distinct (#530).** The budget above measures
 > `gateway receive → venue ack` (the service's internal span). The ranker's latency
@@ -309,6 +321,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `activity_ws_normalized_activity_timeout_secs` | 30 | #546: a reader with no normalizer-accepted activity row for this long is not live — while reading it drops its socket at the deadline and re-dials after its own backoff (1, 2, 4 … 60 s, reset only by a normalized row); while blocked on a full fan-in send it keeps the socket and its retained row, derives non-live in health, and drops only after that frame drains. Acknowledgements, keepalives, control frames, unrelated topics, envelope errors, and parser-rejected payloads never refresh it (they advance wire health only). Readiness: 0 live readers or a poisoned sink ⇒ `activity_ws_unavailable`; exactly 1 ⇒ `activity_ws_redundancy_degraded`; unavailable + unhealthy poll ⇒ `copy_admission_blocked` |
 | `poll_unhealthy_error_streak` | 3 | #530: consecutive all-error poll rounds at which the REST source counts unhealthy (round-age bound: 3 × `trade_poll_interval_secs`) |
 | `polymarket_clob_base_url` | `https://clob.polymarket.com` | Polymarket CLOB REST API base URL for order submission and status polling |
+| `polygon_receipt_rpc_url` | `https://polygon.publicnode.com` | Boot-owned, key-free Polygon JSON-RPC endpoint used only for ordinary-live receipt finality. `ServiceConfig` field set by `PE_POLYGON_RECEIPT_RPC_URL`; the code default is owned by [`default_polygon_receipt_rpc_url`](../crates/service/src/config.rs). |
 | `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
 | `clob_book_request_timeout_secs` | 5 | Fixed `crates/service/src/clob_book.rs` constant `CLOB_REQUEST_TIMEOUT_SECS` (no env override): per-request timeout for the public CLOB `/book` liquidity-capture fetch (issue #350 WS2). Deliberately shorter than `polymarket_request_timeout_secs` (10) — the fetch runs off the fill hot path, so a slow book degrades to a partial snapshot rather than blocking a trade. Reuses the existing `polymarket_clob_min_interval_ms` (200) gate. |
@@ -384,12 +397,9 @@ Campaign financial limits and eligibility are canonical in
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe schema-v2 paper-state SQLite mirror. In addition to financial/replay tables, v2 durably owns reconciled activity groups and revisions, first-entry history/results/completeness, `decision_pending`, monotonic wallet fences, position validations, and machine-owned migration metadata. |
-| `paper_fill_haircut_bps` | 500 | BUY-side paper fill haircut (fee + slippage), basis points. Recorded fill `= min(limit·(1 + bps/10_000), 0.999)`. Mirrors the sizing cost `c` in `evaluate` |
-| `paper_fill_slippage_bps` | 100 | SELL-side paper fill slippage (no taker fee), basis points. Recorded fill `= max(limit·(1 − bps/10_000), 0.001)`. Retained for generic executor/replay compatibility; production Winner-Follow rejects SELLs before fill-price resolution. |
-| `fill_mode` | `clob_best_ask` | Hot runtime paper fill-price mode (#486/#544). Every admitted BUY first requires the mandatory price-impact book plan. `clob_best_ask` uses that one usable ladder's exact VWAP as the paper fill basis; `leader_haircut` uses the boot-owned `paper_fill_haircut_bps` only after the book gate succeeds. There is no unusable-book haircut fallback. |
-| `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
-| `gamma_resolution_poll_interval_secs` | 120 | Seconds between Gamma resolution poll rounds in the live service. 2-minute cadence (issue #343) keeps the settled-markets set and "just resolved" wins within ≤2 min of actual resolution; the poll is gated to markets with open unsettled positions and rate-limited (50 ms min-interval), so the frequency increase is bounded by the open-position set, not the full universe |
+| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror. Schema three stores quantities, principal, and fees as exact decimal strings and binds each financial mutation to its prepared sequence and `QualificationStarted` identity. It also durably owns reconciled activity revisions, first-entry evidence, terminal `decision_pending`, monotonic wallet fences, position validations, and machine-owned migration metadata. |
+| `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for Polymarket Gamma market metadata and mark-price reads. Resolution payout evidence comes from the CLOB market endpoint. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms`. |
+| `gamma_resolution_poll_interval_secs` | 120 | Legacy-named cadence for the service's CLOB resolution poll. The poll is limited to conditions with open unsettled positions; Gamma is not a payout authority. |
 | `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market resolves further than this many seconds into the future. 0 disables the upper bound. Guards against locking capital in months-long markets (issue #290). **172_800 since the 2026-07-03 run28 cutover** — the copy-time twin of `ranker_ttr_hours` (48 h ≈ 72 h on paired weekly P&L, `docs/33` §5; was 259_200/72 h). Paired with `min_resolution_horizon_secs` — one resolution lookup serves both. NOTE: the live `service_config` row must be PATCHed at deploy (`on conflict do nothing` never updates an already-seeded row). |
 | `min_resolution_horizon_secs` | 60 | `ServiceConfig` field. Drop entry signals whose market resolves *sooner* than this many seconds from now — a copy cannot realistically fill and hold a market about to resolve. 0 disables the lower bound. `docs/29`: the 1-minute copy floor; sub-minute "breaks down" (issue #339). |
 
@@ -408,40 +418,52 @@ executing the continuation. A changed semantic revision, unprovable activity, in
 or ledger arithmetic failure creates a monotonic `wallet_fences` row. Fenced wallets are removed
 from effective membership/projection and cannot copy; there is no delete owner for a fence.
 
-### Hot runtime configuration (`service_config`, issue #544)
+### Hot runtime configuration (`service_config`, issues #544 and #545)
 
-The service accepts one complete snapshot containing exactly these 17 keys; every key is
-mandatory exactly once except `kelly_fraction_override`, which may be absent:
+The service derives `ConfigEra` once from the verified paper log. Before
+`QualificationStarted`, `Legacy17` accepts the historical complete snapshot only to preserve its
+canonical pre-Start hash; its two superseded values are private compatibility data and never enter
+corrected economics. After Start, `Financial15` accepts exactly the economic names below. In either
+era every era-owned key is mandatory exactly once except `kelly_fraction_override`, which may be
+absent. A separate optional `risk_halt_release_hash` row is incident control and is excluded from
+the economic configuration hash.
 
 `active_watchlist_size`, `mode`, `max_fill_price`, `min_fill_price`,
-`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `fill_mode`,
-`price_impact_cap_bps`, `flip_human_approved`,
-`kelly_fraction_above_default_human_approved`, `polymarket_fee_rate`,
+`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `price_impact_cap_bps`,
+`flip_human_approved`, `kelly_fraction_above_default_human_approved`,
 `kelly_fraction_override`, `per_trade_cap`, `slippage_rate`, `sizing_mode`,
 `sizing_dollar_usd`, and `sizing_contracts`.
 
-Missing, duplicate, unknown, malformed, or cross-field-inconsistent rows reject the whole
-proposal and retain the whole last-good snapshot. The one canonical applied identity is a BLAKE3
-hash of the values actually applied; a pending watchlist-capacity transition continues to hash
-the old applied capacity. Rejected raw rows and their typed error are status evidence, not a
-second revision.
+Missing, duplicate, unknown, malformed, cross-era, or cross-field-inconsistent rows reject the
+whole proposal and retain the whole last-good snapshot. The one canonical applied identity is a
+BLAKE3 hash of that era's values actually applied; a pending watchlist-capacity transition
+continues to hash the old applied capacity. Before a changed economic hash or capacity publishes,
+the orchestrator synchronizes an insufficient-evidence qualification seal. Rejected raw rows and
+their typed error are status evidence, not a second revision.
+
+After `QualificationStarted`, optional text row `risk_halt_release_hash` is incident control, not
+economic configuration. The boot and poll paths partition it before exact-key parsing and exclude
+it from the applied economic hash. A value must be exactly 64 lowercase hexadecimal characters
+and name the append hash of the currently active `RiskHaltChanged` engagement. It may release only
+that same absolute-loss cause, or a latency cause held by a missing sample; the synchronized
+release consumes it. Missing, empty, malformed, stale, already-consumed, or cause-mismatched
+values only warn and change neither economics nor halt state.
 
 The guarded operator migration removes these database rows while preserving the corresponding
 restart-owned `ServiceConfig` TOML/environment contracts where they still exist:
 `bankroll_usd`, `bench_overfetch`, `demotion_cb_alpha`, `demotion_min_trades`,
 `demotion_pnl_window_secs`, `gamma_resolution_poll_interval_secs`,
 `inactivity_hard_cap_secs`, `inactivity_threshold_secs`, `log_retention_days`,
-`maintenance_interval_secs`, `paper_fill_haircut_bps`, `paper_fill_slippage_bps`,
-`status_interval_secs`, `supabase_refresh_interval_secs`, and
+`maintenance_interval_secs`, `status_interval_secs`, `supabase_refresh_interval_secs`, and
 `supabase_sink_reconcile_interval_secs`. It also deletes the retired keys
 `entry_gate_fail_closed`, `position_page_limit`, `position_reseed_interval_secs`,
 `position_size_threshold`, `wallet_market_history_path`,
-`clob_best_ask_fallback_haircut_bps`, and `trade_poll_interval_secs`. Any database key outside
+and `trade_poll_interval_secs`. Any database key outside
 the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` before mutation.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `max_fill_price` | `0.85` | Hot decimal value. Skip a BUY copy whose resolved fill basis is `>=` this (catastrophic payoff geometry near $1). In `clob_best_ask` mode the basis is the mandatory ladder VWAP; `leader_haircut` uses the boot-owned haircut only after that ladder passes. `0` disables this band edge, not the mandatory book gate. Mirrors the issue-#142 backtest `max_signal_price` cap. |
+| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be below this ceiling after the no-chase and price-impact ceilings. `0` disables this band edge, not the mandatory book gate. |
 | `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Skip a BUY copy whose resolved fill basis is `<` this so selection and deployment share the entry band. The boundary itself fills (strict `<` skip). `0` disables this band edge, not the mandatory book gate. |
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
@@ -469,7 +491,7 @@ both tokens and row count agree, retrying one token race before returning typed 
 | `supabase_sink_enabled` | `false` | `ServiceConfig` field. Enables the best-effort paper-fill/settlement sink to Supabase (issue #343). The sink task is spawned only when this is `true` **and** `supabase_url` is non-empty. Requires `supabase_secret_key` — under RLS the anon key can only read, so anon-only writes 403. `PE_SUPABASE_SINK_ENABLED`. |
 | `supabase_sink_channel_capacity` | 256 | `ServiceConfig` field. Bounded mpsc capacity for the trade-path → sink event channel. Backpressure: drop-on-full (the periodic reconcile re-derives dropped fills/settlements from `paper_state`, so a drop self-heals). `PE_SUPABASE_SINK_CHANNEL_CAPACITY`. |
 | `supabase_sink_reconcile_interval_secs` | 300 | `ServiceConfig` field. Seconds between periodic sink reconciles: a contiguous-prefix fill HWM catch-up over `list_fills()` plus a full re-upsert of `list_settled_markets()`, healing any dropped or failed live writes. `PE_SUPABASE_SINK_RECONCILE_INTERVAL_SECS`. |
-| `supabase_authoritative` | `false` | `ServiceConfig` field (issue #397). Makes Supabase the **authoritative system of record** for paper-state's money + book: `paper_bankroll` + `paper_positions` (new tables, anon-read) and the reused `paper_fills` + `settled_markets`. When `true`, a paper fill writes the `commit_fill` RPC first (fail-closed — on error the trade is skipped, the local event log holds the fill and replays on restart), then mirrors to SQLite; resolutions go through the `apply_resolution` RPC; boot runs a catch-up-then-pull; and `run_sink` is **not** spawned (the RPCs are the sole writer of `paper_fills`/`settled_markets`). `seen_trades`/`leader_positions`/`poll_cursors`/`meta` stay local-only. Both RPCs mutate `paper_bankroll` via a single self-referencing UPDATE so the concurrent fill and resolution tasks cannot lose an update. Requires the service-role `supabase_secret_key`. Off by default; set explicitly in `.env`. Schema + RPCs in `scripts/supabase_paper_state_schema.sql`; one-time `--backfill-supabase` before cutover. `PE_SUPABASE_AUTHORITATIVE`. |
+| `supabase_authoritative` | `false` | `ServiceConfig` field (issue #397). Makes Supabase the **authoritative system of record** for paper-state's money + book: `paper_bankroll`, `paper_positions`, `paper_fills`, and `settled_markets`. After `QualificationStarted`, the orchestrator serializes each paper financial mutation as `FinancialPrepared` → Start- and predecessor-bound `commit_fill_v2` or `apply_resolution_v2` → local SQLite projection → `FinancialFinal`. Both RPC requests bind the exact Start receipt and completed prior Prepared sequence; an unmatched Prepared is recovered before any successor. `run_sink` is not spawned in authoritative mode. Requires the service-role `supabase_secret_key`. Off by default; set explicitly in `.env`. Schema + RPCs live in `scripts/supabase_paper_state_schema.sql`; the one-time backfill and legacy frame walk are pre-Start only. `PE_SUPABASE_AUTHORITATIVE`. |
 | `snapshot_channel_capacity` | 256 | `ServiceConfig` field (issue #350 WS2 PR-H). Bounded mpsc capacity for the trade-path → liquidity-snapshot worker channel. Drop-on-full: a full channel drops the snapshot request so the BUY fill path never blocks (capture is best-effort analytics). The snapshot worker is spawned under the same gate as the Supabase sink (`supabase_sink_enabled` + non-empty `supabase_url`). `PE_SNAPSHOT_CHANNEL_CAPACITY`. |
 | `supabase_paper_positions_page_limit` | 1_000 | **Module const** in `supabase_state.rs` (#516). Requested page size for the authoritative boot `paper_positions` pull; the walk advances by the ACTUAL returned length and terminates only on an empty page, so a server `db-max-rows` below this value still pulls everything. |
 | `supabase_paper_positions_max_rows` | 500_000 | **Module const** in `supabase_state.rs` (#516). Inclusive bound on total pulled position rows — turns an ignored/repeating offset into a loud boot failure instead of an unbounded loop. |
@@ -532,9 +554,10 @@ few Polygon PoS contract constants the surviving migration/events paths still
 need were relocated into `crates/bootstrap/src/chain.rs` (each keeps its
 `verified <date> from <source>` comment and a self-validating keccak test):
 
-| Symbol (`pe_bootstrap::chain::*`) | Purpose |
+| Symbol | Purpose |
 |---|---|
-| `ALL_EXCHANGE_CONTRACTS`, `ALL_ORDER_FILLED_TOPICS`, `TOPIC_ORDER_FILLED_V1`, `TOPIC_ORDER_FILLED_V2` | Legacy enum-state synthesis in `migrate::auto_migrate_legacy`. |
+| `pe_venue_polymarket::{CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V2, TOPIC_ORDER_FILLED_V2}` | Sole owner of the surviving V2 exchange identities and topic. Bootstrap re-exports these names for legacy enum-state synthesis rather than duplicating their bytes. |
+| `pe_bootstrap::chain::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, TOPIC_ORDER_FILLED_V1}` | Legacy enum-state synthesis in `migrate::auto_migrate_legacy`; the aggregates include the venue-owned V2 constants. |
 | `normalise_condition_id` | `0x` condition-id canonicalisation shared by the Gamma `/events` sweep (relocated from `dune.rs` in #335). |
 
 Surviving cache/cursor artifacts — legacy, **read-only** on the Dune path:
@@ -565,8 +588,7 @@ call count.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `polymarket_fee_rate` | 0.04 | Polymarket BUY taker fee rate applied in the fee model: `fee_per_share = price × rate` (flat taker fee on notional). Added to `c` to obtain net cost. March 2026 schedule. |
-| `slippage_rate` | 0.01 | Expected proportional fill slippage for BUY orders; `slippage_per_share = price × rate`. Added to `c` alongside the taker fee. Backtest fill is `price × (1 + rate)`; SELL fill is `price × (1 − rate)`. Canonical default: 100 bps. |
+| `slippage_rate` | 0.01 | Expected proportional BUY slippage applied once to the all-in per-share cost after signed principal and the compact-schedule fee. Canonical default: 100 bps. |
 
 ### Service health (`HealthState`)
 
@@ -639,7 +661,9 @@ Written to the rolling full-stream files derived from `jsonl_log_path` (default 
 
 | `kind` | Extra fields | Description |
 |---|---|---|
-| `paper_fill` | `idempotency_key`, `market`, `side`, `contracts`, `fill_price` | A paper-mode simulated fill |
+| `paper_financial_prepared` / `paper_financial_final` | Prepared authority, exact economic record, synchronized receipt, canonical result | The two-frame paper financial protocol. A Final alone proves a completed fill or resolution. Legacy `paper_fill` frames remain readable only before `QualificationStarted`. |
+| `membership_changed` | reason, removed/added wallets, capacity, ranking batch, structural evidence | A synchronized structural membership snapshot. Score-only refresh is unjournaled; durable wallet fences are applied independently and monotonically. |
+| `portfolio_mark` / `qualification_sealed` | mark evidence or sealed-prefix/digest evidence | Qualification observation and immutable seal records. An insufficient-evidence outcome is a seal reason, not another command or state. |
 
 ### Logging conventions (issue #184)
 
@@ -717,32 +741,32 @@ Two flags are first-class:
 
 Both are read by `risk-engine` as part of its pure inputs. As of issue #398 (Decision #2) they are **admin-mutable at runtime** via the Supabase `service_config` table (the single-email-gated admin panel), default-deny, with each edit audit-logged in `service_config.updated_by`/`updated_at` and applied on the next ≤30s config poll. This reverses the prior "signed config change only" rule. `kelly_fraction_above_default_human_approved` is re-checked against the mode ceiling on every poll in `runtime_config::parse_config`, so an above-ceiling override without the flag is cleared rather than applied.
 
-### Promotion criteria — quantified
+### Paper-to-live-tiny qualification — quantified
 
-A leader/strategy promotes from one mode to the next only when ALL of:
+The one sealed observed paper system is eligible for a single manual promotion review only when
+ALL of:
 
 | Comparison | Threshold |
 |---|---|
 | Walk-forward LCB_5pct of follower daily log-growth (after costs) | > 0 |
-| Paper-vs-backtest two-sample KS p-value on daily PnL | ≥ 0.10 |
-| Paper-vs-backtest mean-PnL z-score | abs(z) ≤ 2.0 |
-| Paper-mode observation length | ≥ 30 calendar days AND ≥ 90 closed copied trades |
-| Realized fill rate vs simulated | within 15 % absolute |
-| Observed copy delay p95 | ≤ p95 in production-latency-budget table above |
-| Demotion incidents in window | 0 (a demotion resets the clock) |
+| Exact replay through the recorded seal | Pass with complete evidence |
+| Nonnegative peak-to-trough paper drawdown | strictly less than 0.10 |
+| Observation after the current anchor | ≥ 30 complete UTC days AND ≥ 90 closed copied trades |
+| Paper copy delay | nearest-rank p95 ≤ 2,000 ms |
+| Manual approval | one review after a `Pass` report |
 
-Live-tiny → promoted requires the same gates over a fresh 30-day window with live-tiny capital.
+Quiet days count. The initial partial day does not. An underperformance or inactivity membership
+demotion moves the anchor to the next valid mark and resets the promotion growth, drawdown, close,
+delay, and no-demotion vectors. Normal ranker rotation, capacity change, and score refresh do not.
+There is no extension, interim look, second window, or automatic promotion.
 
 ### Demotion criteria
 
-A leader is demoted (mode steps down: promoted → live-tiny → paper → off) when ANY of:
-
-- live copied PnL underperforms simulation by ≥ 2 standard errors over a 14-day window;
-- p95 copy delay drifts > 1.5× the production budget for two consecutive hourly windows;
-- reconstruction quality drops by ≥ 20 points (out of 100);
-- profit concentration (max single-market %) increases above the eligibility threshold;
-- trader becomes inactive (no trades for ≥ 14 days);
-- copied exits become unreliable (≥ 3 missed/late exits in 30 d).
+Qualification consumes the typed structural membership reasons. Only
+`knockout_underperformance`, `knockout_inactivity`, and `knockout_inactivity_hard_cap` are
+demotion anchors. Risk halts remain owner- and cause-scoped controls; they are not inferred as
+membership demotions. The maintenance statistics and thresholds remain owned by their existing
+configuration and implementation, rather than being redefined by the qualification report.
 
 ### "Very liquid market" threshold (when market orders are permitted)
 
@@ -763,14 +787,12 @@ Otherwise the engine submits limit orders.
 | Polymarket Data API (poll) | 1.5× polling interval | 4× polling interval |
 | Resolver source (NWS final, BLS release, etc.) | per-source SLA in `12-SOURCE-CATALOG.md` | per-source |
 
-### Backtest-vs-paper "close behavior" definition
+### Qualification close behavior
 
-"Behavior is close to simulation" means BOTH:
-
-- KS p-value ≥ 0.10 on daily-PnL distributions;
-- abs(z) ≤ 2.0 on mean-PnL difference, where the standard error is computed by stationary bootstrap with 1_000 resamples.
-
-This applies anywhere the docs say "matches", "close to", or "drift acceptable".
+A closed copy is one unique successful Fill Final after the current qualification anchor whose
+exposure has a causal Resolution Final by the seal. Open positions and missing or noncausal
+resolutions are not samples. Backtest-versus-paper distribution comparisons, resampling, interim
+looks, extensions, and second windows are not promotion inputs.
 
 ### Bootstrap defaults (`pe-bootstrap`)
 
@@ -789,7 +811,7 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_polymarket_wallet_timeout_secs` | 300 | Per-wallet wall-clock budget (seconds) for `pe-bootstrap backfill` / `run`'s Polymarket fetch loop (issue #173). `0` disables the timeout; positive values wrap each `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets that trip the budget are soft-failed (added to `FetchOutcome::failed`); the post-fetch pipeline still runs and `last_polymarket_fetch_at` remains NULL so the next backfill re-queues them. Set via `PE_BOOTSTRAP_POLYMARKET_WALLET_TIMEOUT_SECS`. |
 | `bootstrap_wallet_cache_path` | `"wallet_cache.db"` | SQLite trade cache. WAL mode provides per-commit durability — at most one in-flight wallet's transaction is lost on crash. Set via `PE_BOOTSTRAP_CACHE_PATH`. |
 | `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to a legacy enumerated wallet address list. Consumed once by `migrate::auto_migrate_legacy` (ingested into the pile, then deleted). Not produced by any current path; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
-| `bootstrap_fetch_resolutions` | `false` | When `true`, `pe-bootstrap` fetches resolution data from the Polymarket Gamma API after the trade-fetch phase and stores it in `market_resolutions`. Set `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1` to enable. |
+| `bootstrap_fetch_resolutions` | `false` | When `true`, `pe-bootstrap` runs the Polymarket CLOB closed-market payout walk after trade fetch and stores validated resolution data in `market_resolutions`. Gamma schedule enrichment is separate. Set `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1` to enable. |
 | `bootstrap_rebuild_resolutions` | `false` | One-shot retroactive correction (issue #149 follow-up): when `true`, stage 6 deletes every `market_resolutions` row tagged with an imprecise source (`'gamma'`, `'clob'`) before any fetcher runs; the CLOB stage then re-populates the `'clob'` rows via `INSERT OR IGNORE`. Retained `'polygon'` rows are **not** deleted — they keep their exact block-timestamp `resolved_at_unix`. **#369:** with the on-chain scan removed, CLOB is the only source that re-derives `'clob'` rows (with `end_date_iso`-approximate timestamps); there is no precise on-chain backfill. Idempotent — safe to set on every run. Set `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` to enable. |
 | `bootstrap_skip_trade_fetch` | `false` | When `true`, `pe-bootstrap` skips the Polymarket trade-fetch step entirely. Safe when the trade cache is already fully populated and only subsequent steps (resolutions, filters) need to run. Emits a warn-level log. Set `PE_BOOTSTRAP_SKIP_TRADE_FETCH=1` to enable. |
 | `infra_probe_span_secs` | `3600` | Maximum span (newest − oldest, seconds) across the first 500 trades of a cold-start wallet for it to be classified as infrastructure (issue #197). 500 trades in < 1 h ⇒ > 8 trades/min ⇒ market-maker / treasury / arbitrage bot. Below threshold: wallet is flagged `is_infra = 1`, the probe page is discarded, and downstream consumers skip via the `active_tradeable_wallets` view. The same threshold drives the `pe-bootstrap classify-infra` retroactive sweep over already-cached trades. Override via `PE_BOOTSTRAP_INFRA_SPAN_SECS`; canonical const lives in `pe_bootstrap::infra_probe::DEFAULT_INFRA_SPAN_SECS`. |
@@ -803,8 +825,6 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_event_orphan_warn_pct` | 99 | `pe-bootstrap events` coverage gate (issue #206): warn if more than 99% of distinct traded markets are orphans (self-mapped). Gamma's /events covers only a curated subset of all condition IDs; a 90–99% orphan rate on a large historical cache is expected and correct. The format-break hard-fail (abort if `events_seen > 0` but `conditions_mapped == 0`) replaces the old percentage-based abort. Const `ORPHAN_WARN_PCT` in `pe_bootstrap::events`. |
 | `bootstrap_events_page_max_retries` | 5 | Walk-level retries on a transient / rate-limited Gamma `/events` page after `ReqwestFetcher` exhausts its fast internal attempts. The sequential sweep never skips the failed offset. Exhaustion preserves a typed temporary error and exits with `rank_and_push_tempfail_exit`; fatal HTTP, malformed payload/schema, cache, and invariant errors remain permanent. Const `EVENTS_PAGE_MAX_RETRIES` in `pe_bootstrap::events`. |
 | `bootstrap_events_page_retry_base_ms` | 1_000 | Base delay for Gamma `/events` page retry. Exponential delays are capped at 30s; `RateLimited` uses the server's `Retry-After` with a one-second floor. Const `EVENTS_PAGE_RETRY_BASE_MS` in `pe_bootstrap::events`. |
-| `market_fee_missing_default_bps` | 0 | Default fee in bps when Gamma sets `feesEnabled = false`, omits `feeSchedule`, or omits `feeSchedule.rate`. Zero is the safe sentinel: it never over-discounts PnL and treats pre-fee-era markets correctly. Used by `fees_for_market` / `rate_to_bps` in `pe_bootstrap::events`. |
-| `market_fee_max_bps` | 10_000 | Upper clamp for `market_fees.taker_base_fee_bps` / `maker_base_fee_bps`. Polymarket's live `feeSchedule.rate` is `0.04` (= 400 bps); the 10 000 bps ceiling (100%) is a hard guard against malformed API responses, not a normal value. |
 | `bootstrap_clob_base_url` | `https://clob.polymarket.com` | Base URL for the Polymarket CLOB API (`/markets?closed=true` paginated listing) — the **sole** market-resolution source (#369). Override via `PE_CLOB_BASE_URL` for testing against a stub. |
 | `bootstrap_clob_concurrency` | 8 | Number of in-flight CLOB requests issued concurrently per fetch loop, mirroring the Gamma `buffer_unordered` pattern. Set via `PE_BOOTSTRAP_CLOB_CONCURRENCY`. Reused as the concurrency for the `prices-history` CLOB backfill. |
 | `clob_prices_history_min_interval_ms` | 10 | Minimum milliseconds between CLOB `/prices-history` requests (≈100 req/s, under the documented 1000 req/10s limit), enforced on a **dedicated** `ReqwestFetcher` so it does not loosen the 50 ms Data-API (`/trades`,`/activity`) gate (issue #421 PR4). Canonical constant `CLOB_PRICES_HISTORY_MIN_INTERVAL_MS` in `pe-source-polymarket-public`; override via `PE_BOOTSTRAP_PRICES_HISTORY_MIN_INTERVAL_MS`. |
@@ -916,6 +936,7 @@ CREATE TABLE leaderboard_snapshots (
 | Key | Default | Meaning |
 |---|---:|---|
 | `backtest_slippage_bps` | 100 | Conservative fill-cost assumption per trade; converted to a rate (`bps / 10_000`) and applied proportionally: BUY fill = `price × (1 + rate)`, SELL fill = `price × (1 − rate)`. The same rate feeds `WinnerFollowConfig.slippage_rate` so Kelly sizing and fill accounting are consistent. |
+| `modeled_polymarket_fee_rate` | 0.04 | Backtest-only, non-promotional exponent-one CLOB fee model. Every BUY calls the venue fee owner once for the final aggregate quantity and signed price, stores the exact modeled fee and aggregate all-in debit, and closes from that aggregate cost. Runtime and qualification never read this setting. Set via `PE_BACKTEST_MODELED_POLYMARKET_FEE_RATE`. |
 | `backtest_step_days` | 1 | Walk-forward simulation step in days; set via `PE_BACKTEST_STEP_DAYS` |
 | `backtest_bankroll_usd` | 10000 | Starting bankroll in USD; set via `PE_BANKROLL_USD` |
 | `backtest_audit_window_days` | 90 | Trade lookback window for ledger reconstruction during simulation; set via `PE_BACKTEST_AUDIT_WINDOW_DAYS` |
@@ -933,9 +954,9 @@ CREATE TABLE leaderboard_snapshots (
 | `liquidity_take_fraction_default` | `0.05` | Fraction of cached Gamma `liquidity` USD the sizer may take per BUY. Applied as `max_contracts = floor(take_fraction × liquidity_usd / fill_price)` in `simulation.rs` after `evaluate()` returns. `0` disables the gate (silent passthrough). Worked example: at `liquidity_usd = $5,000`, `take_fraction = 0.05`, `fill_price = $0.50` → max contracts = `floor(5000 × 0.05 / 0.50) = 500`. Set via `PE_BACKTEST_LIQUIDITY_TAKE_FRACTION`. **Backtest staleness caveat:** stored value is depth-at-last-bootstrap-refresh (≈ now), applied uniformly across the entire historical sim window — markets that *grew* in depth get over-clamped, markets that *shrank* get under-clamped. |
 | `liquidity_min_required_usd_default` | 200 | Minimum Gamma `liquidity` USD required to apply the clamp. Below this floor, depth data is too noisy to act on — clamp is bypassed (passthrough with `tracing::warn!`). Tracked via report counter `liquidity_below_floor_bypasses`. Set via `PE_BACKTEST_LIQUIDITY_MIN_REQUIRED_USD`. |
 | `per_trade_cap_default` | `mode_default` | Default `PerTradeCap` variant for `WinnerFollowConfig` and backtest: resolves to 25 bps for LiveTiny, 100 bps for Promoted. Override with `PE_BACKTEST_PER_TRADE_CAP=bps:N` or `PE_BACKTEST_PER_TRADE_CAP=unlimited` in backtest. Ordinary service production requires the complete initial hot snapshot before producers; its reviewed `service_config.per_trade_cap` value is `unlimited`. |
-| `per_trade_cap_unlimited_resolved_bps` | 10 000 | Effective cap in basis points when `PerTradeCap::Unlimited` is selected. Full bankroll — Kelly fraction is the only size constraint. |
-| `sizing_mode_default` | `kelly` | Default for `WinnerFollowConfig.sizing_mode` (#398 WS2; replaced `flat_usd_per_trade`). `kelly` = fractional-Kelly sizing. `dollar` (`sizing_dollar_usd`) sizes each BUY as `max(1, floor(usd / resolved_fill_basis))` contracts; `contract` (`sizing_contracts`) sizes exactly N contracts. The per-trade cap, risk gate, and mandatory price-impact book cap remain active in all modes. The deployed service's reviewed hot snapshot uses `dollar` / `sizing_dollar_usd = 25`; an ordinary-live account with NULL `accounts.live_sizing_mode` falls back to this shared mode, otherwise `accounts.live_sizing_*` overrides it (#516). |
-| `price_impact_cap_bps_default` | `100` | Mandatory hot `RuntimeConfig.price_impact_cap_bps` and new-install seed (#544): **the sole policy order-size limit** below the always-applying available-bankroll bound. One CLOB `/book` fetch per admitted BUY feeds the shared band gate, budget-based executable-ladder planner, and — in paper `clob_best_ask` mode — exact ladder-VWAP fill basis. Missing, unusable, corrupt, empty, stale, or timed-out evidence fails closed before any destination stages. A successful read with no paper-affordable whole share anchors the shared band at best ask, permits any otherwise-admissible live staging, and then records a paper-only skip. Boot requires the row; edits accept only `1..=10_000`. Zero and out-of-range values reject the whole snapshot and retain the last-good one; there is no gate-off construction path. |
+| `per_trade_cap_unlimited_resolved_bps` | 10 000 | Effective cap in basis points when `PerTradeCap::Unlimited` is selected (the reviewed #544 activation value). Full bankroll — Kelly fraction is the only size constraint. After activation any valid row (`unlimited`, `mode_default`, `bps:1..=10000`) is accepted; live risk snapshots record the resolved cap and strict replay reuses the recorded value. |
+| `sizing_mode_default` | `kelly` | Default for `WinnerFollowConfig.sizing_mode`. `kelly` uses the venue planner's aggregate-fee convergence chain; `dollar` derives conservative principal from `sizing_dollar_usd`; `contract` passes exactly `sizing_contracts` shares and declines rather than shrinking when any cap is exceeded. No mode has a one-contract fallback. The deployed service's reviewed hot snapshot uses `dollar` / `sizing_dollar_usd = 25`; an ordinary-live account with NULL `accounts.live_sizing_mode` falls back to this shared mode, otherwise `accounts.live_sizing_*` overrides it (#516). |
+| `price_impact_cap_bps_default` | `100` | Mandatory hot `RuntimeConfig.price_impact_cap_bps` and new-install seed (#544). One recorded CLOB `/book` read feeds the sole tick-aware sized-buy planner. Every monetary cap bounds signed principal plus the conservative fee reserve, whose quantity is derived from that principal and signed limit price rather than accepted independently; unusable evidence, insufficient depth, venue dust, or a cap excess is a typed decline. Boot requires the row; edits accept only `1..=10_000`. |
 | `clob_book_hot_path_timeout_secs` | `2` | Timeout for the orchestrator's single mandatory hot-path CLOB `/book` fetch. A timeout fails closed; no cap bypass or haircut fallback remains. |
 | `backtest_suppression_warn_threshold_pct` | 30 | Single warn threshold shared by every per-quarter BUY-signal suppression diagnostic (`expiry_filter_suppression_pct`, `high_price_suppression_pct`, …). Logged as a warning when any quarter exceeds it. Hardcoded as `SUPPRESSION_WARN_THRESHOLD` in `crates/backtest/src/simulation.rs`. |
 | `backtest_require_known_expiry_default` | `true` | Strict-mode flag for the `max_hours_to_expiry` filter. `true` (default after #137 Sub-PR 3, gated on PR #154 stage 6f raising trade-set schedule coverage to 99.64%) — when both schedule and resolution are absent for a market, the BUY signal fails closed (suppressed). `false` (rollback / legacy) — both-absent allows the trade through. The fallback chain (schedule → resolution → flag) was unified in PR #139; pre-#139 the NULL-schedule path short-circuited to allow regardless of resolution. Set via `PE_BACKTEST_REQUIRE_KNOWN_EXPIRY`. |

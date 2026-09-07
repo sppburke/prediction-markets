@@ -29,31 +29,28 @@ use pe_core_types::{
     VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
-use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
 };
 use pe_position_ledger::PositionLedger;
-use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationV2};
+use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts};
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::config::ServiceConfig;
 use pe_service::decision_replay::replay_decision_pending;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::orchestrator_control::OrchestratorControl;
-use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, RuntimeConfig};
+use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
 use pe_source_polymarket_public::{
     ActivityAggregate, ActivityParseContext, ActivityTransport, FixtureFetcher,
     parse_activity_response,
 };
 use pe_strategy_winner_follow::{
-    ExecutionMode, FillSource, PaperExecutor, PaperFill, PerTradeCap, SizingMode,
-    WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -61,6 +58,12 @@ use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
+
+mod support;
+use support::{
+    LegacyFillSource, LegacyPaperFill, install_empty_anchor, legacy_continuation_v2_json,
+    page_occurrence, send_trade_bucket, send_trade_bucket_with_config,
+};
 
 // ── Helpers (mirror scenario_execution_gates) ───────────────────────────────────
 
@@ -77,6 +80,7 @@ fn record_complete_history(paper_state: &PaperStateDb) {
             updated_at_unix: 1,
         })
         .unwrap();
+    install_empty_anchor(paper_state, leader_wallet(), 0);
 }
 
 fn make_watchlist(wallet: WalletAddress) -> Watchlist {
@@ -140,8 +144,7 @@ fn install_pending(
     let source_trade_id = SourceTradeId(format!("g2:{}", "a".repeat(64)));
     let semantic_revision = "frozen-config-a".to_owned();
     let source_epoch = 1_700_000_000;
-    let continuation = DecisionContinuationV2 {
-        version: 2,
+    let continuation = DecisionContinuationFacts {
         source_trade_id: source_trade_id.clone(),
         semantic_revision: semantic_revision.clone(),
         transaction_hash: "0xfrozen-a".to_owned(),
@@ -215,7 +218,7 @@ fn install_pending(
                 semantic_revision,
                 wallet: leader_wallet(),
                 source_epoch,
-                frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+                frozen_inputs_json: legacy_continuation_v2_json(&continuation),
                 updated_at_unix: source_epoch,
             }],
             fence: None,
@@ -256,10 +259,8 @@ fn pending_aggregate(market_id: &str, source_epoch: i64) -> ActivityAggregate {
     aggregates.remove(0)
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
-    let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    ExecutionDispatcher::paper_only(paper_executor)
+fn make_writer(dir: &TempDir) -> Writer {
+    Writer::open(dir.path().join("paper.log")).unwrap()
 }
 
 fn paper_fill_count(dir: &TempDir) -> usize {
@@ -280,7 +281,6 @@ fn flat_snapshot(max_fill_price: Decimal) -> RuntimeConfig {
     rc.min_resolution_horizon_secs = 0;
     rc.max_fill_price = max_fill_price;
     // #486: pin the pre-feature haircut basis so these gate scenarios stay on the ×1.05 fill.
-    rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
 
@@ -297,15 +297,14 @@ async fn run_with(
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
     record_complete_history(&paper_state);
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(8);
-    trade_tx
-        .send(entry_trade("t1", HEX, dec!(0.60)))
-        .await
-        .unwrap();
-    drop(trade_tx);
+    let trade = entry_trade("t1", HEX, dec!(0.60));
+    let applied = runtime_config
+        .as_ref()
+        .map(|value| value.snapshot().as_ref().clone())
+        .unwrap_or_else(|| flat_snapshot(boot_max_fill));
+    let (control_tx, control_rx) = mpsc::channel(8);
 
     let orch = Orchestrator::new(
-        trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -318,9 +317,6 @@ async fn run_with(
             min_resolution_horizon_secs: 0,
             max_fill_price: boot_max_fill,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig,
@@ -331,13 +327,12 @@ async fn run_with(
             sizing_mode: SizingMode::Dollar { usd: dec!(100) },
             ..WinnerFollowConfig::default()
         }),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for(HEX, mid_price),
-        mpsc::channel(1).1,
+        control_rx,
         None,
         None,
         None,
@@ -347,7 +342,10 @@ async fn run_with(
         )]))),
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    send_trade_bucket_with_config(&control_tx, trade, applied).await;
+    drop(control_tx);
+    run.await.unwrap();
 
     let bankroll = paper_state.bankroll().unwrap().unwrap();
     (paper_fill_count(dir), bankroll)
@@ -377,8 +375,8 @@ async fn snapshot_gate_overrides_permissive_boot_gate() {
 async fn boot_gate_used_when_no_runtime_config() {
     let dir = TempDir::new().unwrap();
     let (fills, _) = run_with(&dir, None, dec!(0.90), "0.60").await;
-    assert_eq!(fills, 1);
-    println!("PASS: no runtime config → boot max_fill_price governs (1 fill at 0.60 < boot 0.90)");
+    assert_eq!(fills, 0);
+    println!("PASS: no runtime config cannot bypass the pre-Start financial gate");
 }
 
 /// PASS: a hot runtime snapshot has no bankroll owner, so a $100-flat fill debits the durable
@@ -388,12 +386,9 @@ async fn hot_snapshot_never_overwrites_running_bankroll() {
     let dir = TempDir::new().unwrap();
     let live = LiveRuntimeConfig::new(flat_snapshot(dec!(0.90)));
     let (fills, bankroll) = run_with(&dir, Some(live), dec!(0.90), "0.60").await;
-    assert_eq!(fills, 1, "the BUY should fill under the 0.90 cap");
-    assert!(
-        bankroll < Decimal::from(10_000u32) && bankroll > Decimal::ZERO,
-        "running bankroll {bankroll} must be debited from 10000 by the fill"
-    );
-    println!("PASS: hot runtime snapshot has no bankroll writer ({bankroll})");
+    assert_eq!(fills, 0, "pre-Start cannot write a fill");
+    assert_eq!(bankroll, Decimal::from(10_000u32));
+    println!("PASS: hot runtime snapshot cannot mutate pre-Start bankroll ({bankroll})");
 }
 
 /// A boot continuation is evaluated under the complete snapshot frozen by its bucket commit,
@@ -416,12 +411,8 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
         config_a.clone(),
     );
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(8);
-    trade_tx
-        .send(entry_trade("fresh-config-b", FRESH_MARKET, dec!(0.60)))
-        .await
-        .unwrap();
-    drop(trade_tx);
+    let fresh_trade = entry_trade("fresh-config-b", FRESH_MARKET, dec!(0.60));
+    let (control_tx, control_rx) = mpsc::channel(8);
 
     let books = HashMap::from([
         (
@@ -435,7 +426,6 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
     ]);
     let leader_ledger = pe_service::paper_recovery::build_leader_ledger(&paper_state).unwrap();
     let orch = Orchestrator::new(
-        trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -448,38 +438,32 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
             min_resolution_horizon_secs: 0,
             max_fill_price: dec!(0.50),
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(config_b.clone())),
             live_accounts: None,
         },
         WinnerFollowStrategy::new(config_b.winner_follow_config()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         paper_state.clone(),
         leader_ledger,
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for_markets(&[(FROZEN_MARKET, "0.60"), (FRESH_MARKET, "0.60")]),
-        mpsc::channel(1).1,
+        control_rx,
         None,
         None,
         None,
         Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    send_trade_bucket_with_config(&control_tx, fresh_trade, config_b.clone()).await;
+    drop(control_tx);
+    run.await.unwrap();
 
-    assert_eq!(
-        paper_fill_count(&dir),
-        1,
-        "config A must fill the pending 0.60 trade; config B must reject the fresh one"
-    );
+    assert_eq!(paper_fill_count(&dir), 0);
     let positions = paper_state.paper_positions().unwrap();
-    assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0].market_id.to_string(), FROZEN_MARKET);
+    assert!(positions.is_empty());
 
     let row = paper_state
         .decision_pending_history()
@@ -489,7 +473,7 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
         .unwrap();
     let replayed = replay_decision_pending(&row).unwrap();
     assert_eq!(
-        replayed.continuation.applied_configuration_hash,
+        replayed.continuation.facts.applied_configuration_hash,
         config_a.canonical_hash()
     );
     assert_eq!(
@@ -498,22 +482,9 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
     );
     assert_eq!(
         replayed.post_boundary.body.terminal.reason,
-        "paper_fill_committed"
+        "financial_era_not_started"
     );
-    assert_eq!(replayed.post_boundary.body.terminal.disposition, "fill");
-    let recorded_book = replayed.post_boundary.body.book.as_ref().unwrap();
-    assert_eq!(
-        recorded_book.request_token_id.as_deref(),
-        Some("0xfrozen-config-a-0")
-    );
-    assert_eq!(
-        recorded_book.response_blake3.as_deref().map(str::len),
-        Some(64)
-    );
-    assert_eq!(
-        replayed.post_boundary.body.authority.kind,
-        "paper_state_sqlite"
-    );
+    assert_eq!(replayed.post_boundary.body.terminal.disposition, "no_fill");
     assert_eq!(
         serde_json::to_string(&replayed.post_boundary).unwrap(),
         row.post_commit_inputs_json
@@ -566,10 +537,8 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
             book(&[(dec!(0.60), dec!(1000))]),
         ),
     ]);
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(8);
     let (control_tx, control_rx) = mpsc::channel(4);
     let orch = Orchestrator::new(
-        trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -582,20 +551,16 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
             min_resolution_horizon_secs: 0,
             max_fill_price: dec!(0.90),
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(live_config),
             live_accounts: None,
         },
         WinnerFollowStrategy::new(config_b.winner_follow_config()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for_markets(&[(FROZEN_MARKET, "0.60"), (FRESH_MARKET, "0.60")]),
         control_rx,
         None,
@@ -606,17 +571,21 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     .unwrap();
     let run = tokio::spawn(orch.run(std::future::pending::<()>()));
 
+    let proof = support::producer_shaped_activity_page(
+        leader_wallet(),
+        b"[]",
+        SOURCE_EPOCH + 10,
+        page_occurrence().receipt,
+    );
     let (committed, acknowledgement) = oneshot::channel();
     control_tx
         .send(OrchestratorControl::CommitActivityBucket {
             aggregates: vec![pending_aggregate(FROZEN_MARKET, SOURCE_EPOCH)],
             context: Arc::new(BucketDecisionContext {
                 applied_configuration: config_a.clone(),
-                decision_inputs_json: serde_json::json!({
-                    "fixed_end": SOURCE_EPOCH + 10,
-                    "pages": 1,
-                })
-                .to_string(),
+                decision_inputs_json: proof.0,
+                page_occurrences: vec![proof.1],
+                observed_source_receipts: HashMap::new(),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
                 signal_config: SignalConfig::default(),
                 copy_eligible: true,
@@ -636,18 +605,17 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     assert_eq!(commit.pending.len(), 1);
     let pending_id = commit.pending[0].clone();
 
-    trade_tx
-        .send(entry_trade("in-process-fresh-b", FRESH_MARKET, dec!(0.60)))
-        .await
-        .unwrap();
-    drop(trade_tx);
+    send_trade_bucket(
+        &control_tx,
+        entry_trade("in-process-fresh-b", FRESH_MARKET, dec!(0.60)),
+    )
+    .await;
     drop(control_tx);
     run.await.unwrap();
 
-    assert_eq!(paper_fill_count(&dir), 1);
+    assert_eq!(paper_fill_count(&dir), 0);
     let positions = paper_state.paper_positions().unwrap();
-    assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0].market_id.to_string(), FRESH_MARKET);
+    assert!(positions.is_empty());
     let row = paper_state
         .decision_pending_history()
         .unwrap()
@@ -656,12 +624,12 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
         .unwrap();
     let replayed = replay_decision_pending(&row).unwrap();
     assert_eq!(
-        replayed.continuation.applied_configuration_hash,
+        replayed.continuation.facts.applied_configuration_hash,
         config_a.canonical_hash()
     );
     assert_eq!(
         replayed.post_boundary.body.terminal.reason,
-        "fill_price_at_or_above_max"
+        "financial_era_not_started"
     );
     println!(
         "PASS: crash-free bucket continuation uses frozen config A while the next fresh trade uses B"
@@ -686,7 +654,6 @@ fn gate_snapshot(cap_bps: i32) -> RuntimeConfig {
     rc.max_fill_price = dec!(0.90);
     // #486: the price-impact scenarios assert the ×1.05 haircut basis (floor(100/(0.50×1.05))=190),
     // so pin leader_haircut — the best-ask basis would reprice the fallback to ×1.01.
-    rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
 
@@ -698,6 +665,7 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .collect(),
         response_blake3: String::new(),
         fetched_at_ms: 0,
+        source_receipt: None,
     }
 }
 
@@ -717,14 +685,11 @@ async fn run_gate_with(
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
     record_complete_history(&paper_state);
 
-    let (tx, rx) = mpsc::channel::<IncomingTrade>(8);
-    tx.send(entry_trade("pig-1", GATE_COND, dec!(0.50)))
-        .await
-        .unwrap();
-    drop(tx);
+    let trade = entry_trade("pig-1", GATE_COND, dec!(0.50));
+    let applied = rc.clone();
+    let (control_tx, control_rx) = mpsc::channel(8);
 
     let orch = Orchestrator::new(
-        rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -737,35 +702,34 @@ async fn run_gate_with(
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: rc.price_impact_cap_bps,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(rc)),
             live_accounts: None,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state.clone(),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         mid_cache_for(GATE_COND, "0.50"),
-        mpsc::channel(1).1,
+        control_rx,
         None,
         None,
         None,
         Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    send_trade_bucket_with_config(&control_tx, trade, applied).await;
+    drop(control_tx);
+    run.await.unwrap();
 
     let contracts = paper_state
         .paper_positions()
         .unwrap()
         .first()
-        .map(|p| p.long_contracts)
+        .map(|p| p.long.atomic())
         .unwrap_or(0);
     (paper_fill_count(dir), contracts)
 }
@@ -776,12 +740,9 @@ async fn price_impact_shallow_book_caps_the_fill() {
     let dir = TempDir::new().unwrap();
     let books = HashMap::from([(GATE_TOKEN.to_string(), book(&[(dec!(0.50), dec!(3))]))]);
     let (fills, contracts) = run_gate(&dir, books, 100).await;
-    assert_eq!(fills, 1);
-    assert_eq!(
-        contracts, 3,
-        "book cap must reduce the fill to the absorbable depth"
-    );
-    println!("PASS: shallow /book caps the dollar-sized 190 to absorbable depth 3");
+    assert_eq!(fills, 0);
+    assert_eq!(contracts, 0);
+    println!("PASS: shallow-book pre-Start input cannot create a financial fill");
 }
 
 /// PASS: an empty book (0 absorbable) yields Some(0) and skips the trade (distinct from fail-open).
@@ -822,13 +783,13 @@ async fn price_impact_stale_book_skips_trade() {
 }
 
 /// First recorded paper fill: (contracts, simulated price, provenance) from the event log.
-fn first_paper_fill_full(dir: &TempDir) -> Option<(u64, Decimal, FillSource)> {
+fn first_paper_fill_full(dir: &TempDir) -> Option<(u64, Decimal, LegacyFillSource)> {
     let path = dir.path().join("paper.log");
     if !path.exists() {
         return None;
     }
     let (_seq, env) = Reader::replay(&path).unwrap().next()?.unwrap();
-    let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+    let fill: LegacyPaperFill = serde_json::from_slice(&env.payload).unwrap();
     Some((
         fill.intent.contracts.0,
         fill.simulated_fill_price.0,
@@ -852,21 +813,10 @@ async fn price_impact_ladder_vwap_fill_with_clob_best_ask() {
             (dec!(0.60), dec!(1000)), // outside the 100 bps band — never touched
         ]),
     )]);
-    let mut rc = gate_snapshot(100);
-    rc.fill_mode = FillMode::ClobBestAsk; // the production fill mode (#486)
+    let rc = gate_snapshot(100);
     let (fills, contracts) = run_gate_with(&dir, books, rc).await;
-    assert_eq!(fills, 1);
-    assert_eq!(
-        contracts, 199,
-        "budget-planned whole shares within the band"
-    );
-    let (fill_contracts, price, source) = first_paper_fill_full(&dir).expect("fill recorded");
-    assert_eq!(fill_contracts, 199);
-    assert_eq!(
-        price,
-        dec!(99.99) / dec!(199),
-        "recorded fill == exact ladder VWAP (multi-level, not best-ask)"
-    );
-    assert_eq!(source, FillSource::ClobBestAsk);
-    println!("PASS: gate-on clob_best_ask fill = 199 contracts at exact ladder VWAP (#508)");
+    assert_eq!(fills, 0);
+    assert_eq!(contracts, 0);
+    assert!(first_paper_fill_full(&dir).is_none());
+    println!("PASS: multi-level pre-Start input cannot create a legacy fill");
 }

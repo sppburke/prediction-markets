@@ -886,6 +886,8 @@ fn bracket_context(
             "pages": activity.pages,
             "source_log_generation": source_log_generation,
         }))?,
+        page_occurrences: Vec::new(),
+        observed_source_receipts: HashMap::new(),
         reconstruction_quality,
         signal_config: SignalConfig::default(),
         copy_eligible: false,

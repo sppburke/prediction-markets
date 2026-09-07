@@ -8,11 +8,12 @@
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
 deploying it to the VPS with one restart and no stop-before-swap window.
 
-## Issue #557 generation activation
+## Historical issue #557 generation activation
 
-The procedure in this section replaces the ordinary binary swap when a deployment creates a new
-paper-state generation. The AC10 rehearsal is a **mandatory pre-deploy gate**. Do not enter the
-activation driver's `guarded` state without its recorded PASS evidence.
+The procedure in this section applies only when a deployment creates a new paper-state generation;
+issue #545 keeps the verified generation and uses the separate route below. The AC10 rehearsal is a
+**mandatory pre-deploy gate**. Do not enter the generation activation driver's `guarded` state
+without its recorded PASS evidence.
 
 ### Mandatory isolated rehearsal
 
@@ -51,7 +52,9 @@ write production Supabase.
 3. Run `scripts/deploy/rehearsal_preflight.sh <rehearsal-env>`. Its database matrix must prove:
 
    - `anon` cannot execute any of the six service write RPCs while `service_role` can;
-   - `anon` has no DML grants on the three live tables; and
+   - `anon` has no DML grants on the three live tables;
+   - the privileged database connection observes one canonical C-ordered `accounts` census in which
+     account IDs are unique and every requested/effective mode is `off`; and
    - each other reachable sink has RLS enabled, is not anon-owned, anon cannot bypass RLS, and no
      anon/PUBLIC/authenticated write policy exists.
 
@@ -142,16 +145,21 @@ hashes are bound in the manifest. The driver never parses `ExecStart`, `Environm
 text. Instead it proves ownership from the running `MainPID`: `/proc/<pid>/exe` matches the installed
 binary; `/proc/<pid>/cwd` equals the service root and owns normalization of the relative config argv; argv
 is exactly `<installed-binary> <installed-config>`; and every variable the installed environment file
-defines (evaluated with the unit's own `set -a; source` semantics) is present with an equal value. Any
+defines under the shared strict data parser is present with an equal value. Any
 process variable not defined by that file must be one of exactly `CREDENTIALS_DIRECTORY`, `HOME`,
 `INVOCATION_ID`, `JOURNAL_STREAM`, `LANG`, `LOGNAME`, `MEMORY_PRESSURE_WATCH`,
 `MEMORY_PRESSURE_WRITE`, `PATH`, `SHELL`, `SYSTEMD_EXEC_PID`, `USER`, or the wrapper-owned
 `PWD`, `SHLVL`, `OLDPWD`, or `_`. `CREDENTIALS_DIRECTORY` must equal
 `/run/credentials/pe-service.service`; every other extra is refused. `LD_PRELOAD` and
-`LD_LIBRARY_PATH` are refused even when the installed environment file defines the same value.
-The clean-shell comparison uses `set -a; source "$1"; set +a`, rejects either loader variable by
-set/unset presence, then `exec env -0`. This matches real exec behavior: exported scalars and
-`BASH_FUNC_*` functions cross the boundary, while arrays do not. The wrapper-owned `PWD`, `SHLVL`,
+`LD_LIBRARY_PATH`, and `LD_AUDIT` are refused even when the installed environment file defines the
+same value.
+Environment files are data, never shell. Write settings as plain `NAME=value` physical lines. Blank
+lines and lines whose first non-whitespace character is `#` or `;` are ignored, but a backslash
+anywhere in a physical line is refused. Assignment names have no leading whitespace, `=` has no
+adjacent whitespace, and `export` is not accepted. Values are either unquoted with no leading or
+trailing whitespace and no quote, or wholly single/double quoted with no backslash or matching quote
+inside. There is no expansion or continuation; every rejected physical line reports its line number.
+The wrapper-owned `PWD`, `SHLVL`,
 `OLDPWD`, and `_` names are stripped from the expected set because they do not affect the binary;
 `/proc/<pid>/cwd` proves the working directory separately.
 One systemd snapshot supplies `ActiveState`, `MainPID`, `InvocationID`, and `ActiveEnterTimestamp` before
@@ -245,15 +253,283 @@ old generation, and proves the unit active and enabled with the running executab
 binary before recording `rolled_back`. A forward rerun of that id is thereafter refused. Retain the
 manifest, generation, and pre-T0 archive for audit.
 
+## Issue #545 schema-two financial-era activation
+
+This route changes financial semantics inside the already-verified #557 generation. It does not
+create a generation, stage new state paths, invoke `seed_v1_empty.sh`, or replace
+`/home/sean/pe-activation.json`. The latter is read-only generation/activation identity;
+`/home/sean/pe-financial-era.json` (`kind: financial-era-v1`) is the sole financial-transition
+manifest.
+
+### Bounded final-head rehearsal
+
+Run the final-head harness before financial activation. Pass the same reviewed `service.toml` and
+complete environment paths that will be supplied to the financial-era driver's `--target-config`
+and `--target-environment`; the required positional argument is the reviewed full Git object
+identity:
+
+```bash
+scripts/deploy/rehearsal545.sh --dry-run \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  <reviewed-40-hex>
+SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/rehearsal545.sh \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  <reviewed-40-hex>
+```
+
+The no-target `--dry-run <reviewed-40-hex>` form used by CI is intentionally a path-independent
+parser/syntax check. The reviewed target pair remains accepted in dry-run and is mandatory for an
+actual rehearsal; if either target flag is present, both must be present.
+
+The harness requires `/home/sean/pe-activation.json` to be `verified`, reads the active generation
+from it, and checkpoints its SQLite database, all three framed logs, and the captured legacy-history
+input. A new or reused checkpoint must have the exact six-entry `copied.sha256` inventory and pass
+`sha256sum --strict -c` before use. `PE_REHEARSAL_BIND` is mandatory and must be a numeric loopback
+address with a nonzero port different from the installed service's port; the harness passes it to
+the child as `PE_BIND`, derives the readiness URL from it, and runs against real first-party venue
+endpoints.
+The #557 activation manifest is inherited-generation and installed-old authority only. The harness
+requires its full production schema and exact six-artifact inventory, verifies the installed old
+binary/config/environment against those #557 hashes and destinations, and reads the active generation
+from it. The explicit #545 config and production environment are independent reviewed targets: their
+paths need not equal any #557 staged path, and the harness hashes their bytes directly. If legacy
+`PE_REHEARSAL_CONFIG` or `PE_REHEARSAL_ENV` is present, it must resolve to the corresponding explicit
+target path; an arbitrary override is refused.
+
+The reviewed binary and config are copied first into a private rehearsal artifact directory, with
+the copied files installed mode `0500` and `0400`, respectively. Their copied bytes are hashed,
+self-validated, evidenced, and executed; later replacement of either supplied target path cannot
+change the rehearsal invocation. Immediately before execution, the harness re-hashes the private
+binary, config, and sanitized environment against their recorded identities. Its hash-bound watch
+log also records that the resolved `/proc/<service_pid>/exe` path equals the private binary path.
+The reviewed production environment must carry a publishable/anon-class value in
+`PE_SUPABASE_ANON_KEY` and a distinct secret/service-role-class value in
+`PE_SUPABASE_SECRET_KEY`. Write the reviewed file using the strict plain `NAME=value` grammar above;
+syntax whose systemd interpretation could differ, including any backslash or `export` prefix, is
+refused with its physical line number. The harness deterministically creates its own mode-`0600`
+sanitized derivative by replacing only those two assignments with the publishable value; each
+assignment must occur exactly once. The shared strict data parser validates both the target and
+derivative without executing either. Preflight requests only the URL and two Supabase service variables, so target-file
+`SUPABASE_DB_URL` and `PG*` assignments never enter its shell. It passes only that derivative to
+`rehearsal_preflight.sh` and to the service child. The preflight accepts a modern
+`sb_publishable_*` key or a legacy JWT with `role=anon` and
+rejects a modern secret key, service-role JWT, malformed key, or mismatched slots before any HTTP
+request. It receives the database-admin URL through an fd-backed environment handoff in a separate
+sanitized process, passes it only to sanitized `psql` children, and removes its marker rows on every
+exit. The service then starts under `env -i`
+with only the explicit `ServiceConfig` environment allowlist and fixed rehearsal overrides;
+the production service-role credential, `SUPABASE_DB_URL`, `PGDATABASE`, `CREDENTIALS_DIRECTORY`,
+and unrelated inherited variables cannot reach it.
+
+Path and cadence overrides are environment variables, not flags:
+`PE_REHEARSAL_ROOT`, `PE_ACTIVATION_MANIFEST`, `PE_REHEARSAL_RELEASE_ROOT`,
+`PE_REHEARSAL_BINARY`, `PE_REHEARSAL_COPY_DIR`, `PE_REHEARSAL_BIND`, `PE_REHEARSAL_TIMEOUT_SECS`,
+`PE_REHEARSAL_POLL_SECS`, and `PE_REHEARSAL_EVIDENCE_HASH_FILE`.
+
+The four concurrent observers are the status-file poller, reader-drop classifier, fence/anchor
+census, and write-refusal counter. A fifth, privileged account observer runs synchronously before
+the child starts and again after it has exited. Each decision pass also queries the staged process's
+real `/health/ready` endpoint at the dedicated loopback bind and requires HTTP success plus
+`ready: true` with no reported issues (the empty `issues` field may be omitted); status freshness
+and critical-task assertions remain independent requirements. Before the publishable-only child is
+started, the descriptor-fed privileged preflight queries `accounts` once and emits its canonical
+C-ordered count and SHA-256 receipt after proving unique account IDs and requested/effective modes
+of `off` on every row. The child still receives no service-role credential. Consequently, its fresh
+status must contain the authorization-denied `live` shape: `stale: true` and an empty `accounts`
+list. Any other child shape fails the rehearsal because it is evidence that a privileged credential
+reached the child; the child snapshot is not compared with the privileged census. After the child
+has quiesced and written final status, the descriptor-fed privileged observer takes a second
+canonical account census. PASS requires both censuses to be safe and identical in count and digest.
+The run stops at the first complete same-invocation proof, the first unsafe observation, process
+exit, or its bound. PASS requires the reviewed revision, a complete ordinary poll after start,
+successful re-anchor, real readiness, healthy critical owners, identical safe
+before/after privileged account censuses, the expected authorization-denied child snapshot, and no
+credit loss, unexpected fence/error, or successful database write. Immediately before PASS, the
+harness quiesces the child, synchronously rescans one exact complete service-log prefix, queries the
+current anchor/reanchor/fence database observation, and takes the final privileged account census.
+The result binds that prefix's byte length and SHA-256 plus the database and census values; unsafe
+evidence arriving while readiness is in flight therefore fails the same invocation. The harness
+prints `REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
+file records PASS/FAIL, the SHA-256 of the result manifest, its absolute path, and the rehearsed
+binary's revision, embedded BLAKE3 identity, file SHA-256, activation ID, canonical generation
+directory, copied-state manifest SHA-256, exact passing readiness-body SHA-256, config SHA-256, and
+both environment identities. `environment_sha256` is the reviewed production target;
+`rehearsal_environment_sha256` is the generated publishable-only derivative. Preserve and review the
+JSON file and its result manifest. The result manifest records each privileged census's count,
+SHA-256, and safety result plus `account_census_before_after_identical`; the outer JSON's
+`evidence_sha256` binds those fields as part of the exact result-manifest bytes. The financial driver
+compares the production identity to `--target-environment`, binds both before entering `prepared`,
+and revalidates them from disk before entering `guarded`. The copy manifest, result manifest, and
+outer JSON are installed with the shared durable atomic-write primitive (file sync, rename, then
+parent-directory sync).
+
+The mandatory production rehearsal is the PostgREST-level authorization proof: it runs the real
+service through the target project's PostgREST endpoint with the publishable key in both credential
+slots and requires the child's denied account read to surface as `live.stale: true` with an empty
+`live.accounts` list. CI does not install a PostgREST daemon solely for this proof because that would
+add a new infrastructure dependency outside this service/schema change; instead, the PostgreSQL
+scenario proves the real candidate-schema grants under `anon` and `service_role`, and the service
+unit test proves that PostgREST 401/403 responses select the stale, empty boot snapshot. These CI
+checks do not replace or waive the production rehearsal.
+
+Before `QualificationStarted`, installed artifacts and `ConfigEra::Legacy17` stay active. Its two
+superseded values are compatibility data and never enter corrected economics. The old 17-name
+contract is verified before the guarded mutation. Only after the physical Start does the driver
+install the financial authority and multi-account live schemas, seed the Start identity, migrate to
+`ConfigEra::Financial15`, refresh `wallet_live_stats_mv`, adopt the reviewed files, and start the
+service. The live-schema boundary converts both `live_positions` quantity columns from the deployed
+`bigint` shape to `numeric` without changing existing whole-contract values. An optional
+`risk_halt_release_hash` remains separate incident control. Do not apply the 17→15 boundary early.
+
+Run the exact reviewed driver command on the production host:
+
+```bash
+SUPABASE_DB_URL=<session-pooler-url> \
+  scripts/paper_reset/activate_financial_era.sh \
+  --target-binary <reviewed-pe-service> \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  --paper-log <active-generation-paper.log> \
+  --source-log <active-generation-source_events.log> \
+  --live-journal <active-generation-live_journal.log> \
+  --paper-state <active-generation-paper_state.db> \
+  --fresh-bankroll <amount> \
+  --rehearsal-evidence <rehearsal-evidence-json> \
+  --ranking-batch-id <id> \
+  --membership-json <canonical-membership-array.json>
+```
+
+The driver requires the real #557 activation manifest to be `state: verified`. That manifest owns
+only the inherited generation identity: `activation_id`, canonical `generation_dir`, `merge_commit`,
+bankroll, source-v1-main evidence, legacy-history evidence, and the #557 artifact inventory. Before
+creating the financial manifest, the driver proves the installed old binary, config, and environment
+match the #557 artifact hashes and installed destinations. The reviewed #545 target is independent:
+its binary self-reports its revision and BLAKE3 under `--verify-staged-identity`, and the driver binds
+the binary/config/environment SHA-256 values to the rehearsal evidence. A #545 target is neither
+path-equal nor revision-equal to the inherited #557 artifacts. Before it creates the financial
+manifest or can approach Start, the driver also requires the reviewed production
+`PE_SUPABASE_SECRET_KEY` to be a modern `sb_secret_*` key or a legacy JWT with `role=service_role`;
+the validator reads that value through the data parser rather than argv. The publishable-only
+rehearsal derivative is never adopted as production. Before the financial manifest is created, the
+same parser refuses `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `LD_AUDIT`. Every offline rollback-check,
+prepare, and Start invocation receives target-file assignments only through the shared service
+configuration allowlist; unrelated target assignments are not exported. After Start, each artifact
+adoption hashes the copied temporary file and compares it with the manifest's reviewed digest before
+the destination rename; drift refuses without replacing the installed file. The Start hot-config
+identity is not an operator assertion:
+while the service is inert, the driver exports the database rows that the 17→15 migration retains to
+a mode-private temporary file. The database helper reads the credential-bearing URL from its named
+environment variable and exports `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, and optional
+`PGSSLMODE` from it for `psql`; the URL is never in argv. The Rust prepare owner parses the rows as
+`ConfigEra::Financial15` and calls
+`RuntimeConfig::canonical_hash`. The membership-proofs identity is likewise a Rust-owned BLAKE3 of
+the exact manifest membership array plus each member's current complete-history, coverage, latest
+position-anchor, and position-validation records. Missing or inconsistent evidence fails prepare.
+
+There is no durable activation policy artifact in the current repository, so Start carries no
+separate policy identity. `QualificationStarted` binds the reviewed artifact, effective static
+configuration, Rust-derived hot configuration, generation and activation, ranking batch, fresh
+bankroll, membership and its proofs, and schema, parser, and financial-semantic model versions.
+
+The exact resumable forward order is `rehearsal PASS → prepared → guarded → started → verified`.
+Creating `prepared` records the verified #557 identity and source/history evidence; the independently
+reviewed target identities; durable paths; ranking/membership inputs; fresh bankroll; and every
+rehearsal binding named above without changing service or financial state.
+Before any stop intent, the `prepared → guarded` transition rereads the bound evidence JSON and result
+manifest, verifies the recorded hash, requires PASS, and requires the activation/generation,
+copied-state/readiness, reviewed config/environment, revision, embedded BLAKE3 identity, and binary
+SHA-256 to remain exact, including both the reviewed production-environment hash and the sanitized
+rehearsal-environment hash. A missing, changed, failed, or mismatched rehearsal is a typed
+`REHEARSAL_REFUSAL` and leaves the service and financial state untouched. Identical reruns preserve
+the original binding. After that gate, the driver records stop intent, stops the service once, proves
+it inert, verifies the old 17-name contract, takes and verifies a complete SQLite online backup,
+records the remote census and all three log identities, and invokes the staged network-free
+`prepare` command. That command scans the logs and returns the exact Start payload and expected
+synchronized receipt; it does not mutate them.
+
+From `guarded`, the driver archives/resets the remote paper state, invokes the network-free local
+reset/Start, and then records the post-Start database boundaries in this order:
+`authority-schema-intent → authority-schema-installed → live-schema-intent →
+live-schema-installed → authority-start-seeded → financial-config-migration-intent →
+financial-config-migrated → wallet-live-stats-refresh-intent →
+wallet-live-stats-refreshed`. It then adopts the reviewed files, starts the service once, records
+`started`, and exits. A rerun from `started` performs the first invocation-fresh verification and
+records `verified`.
+
+`started → verified` checks the installed identities; guarded log-prefix continuity; exact local and
+remote Start/fresh-financial state; applied hot hash; ranking and membership; public projection;
+required producers and critical owners; and accounts off, unarmed, fresh, and free of dispatch work.
+It also queries the proven installed invocation's numeric-loopback `/health/ready` endpoint exactly
+once and requires HTTP success, `ready: true`, and no issues. Readiness has no wait loop: if either the
+invocation-fresh status proof or that one endpoint response is not already complete, the command fails
+immediately and the operator reruns the same command. There is no soak, dwell, repeated sample, or
+site approval. The public materialized-view evidence at this stage is its durable pre-start refresh
+receipt, not a row comparison against the live `wallet_live_stats` base view: after service start,
+new financial writes may legitimately make that base view newer than the scheduled snapshot.
+
+`--rollback-before-start` is the only rollback route. Rollback-check scans and validates an exact
+manifest-bound complete Start before consulting mutable status or live posture. A complete Start
+forces roll-forward even when the shell manifest or status is missing or stale. Only the no-Start path
+requires the pre-Start posture and may repair a partial final frame; it restores only from the durable
+activation archive and complete SQLite backup. After the remote archive restoration it records
+`rollback-wallet-live-stats-refresh-intent → rollback-wallet-live-stats-refreshed` while the service
+is inert, then starts the old service and records `rolled_back`. A no-mutation rollback skips the
+remote restore and refresh. At or after Start, rollback is forbidden: preserve the append-only era and
+recover with a compatible reader.
+
+The driver invokes these early-dispatch service commands; they accept either `--name=value` or
+`--name value` spellings:
+
+```bash
+pe-service <service.toml> --financial-era=prepare \
+  --activation-manifest=/home/sean/pe-financial-era.json \
+  --financial-config-rows=<driver-exported-financial15-rows.json>
+pe-service <service.toml> --financial-era=start \
+  --activation-manifest=/home/sean/pe-financial-era.json \
+  --financial-config-rows=<driver-exported-financial15-rows.json>
+pe-service <service.toml> --financial-era=rollback-check \
+  --activation-manifest=/home/sean/pe-financial-era.json
+```
+
+`prepare` is read-only, `start` performs the idempotent local financial reset and synchronized Start,
+and `rollback-check` reports whether a complete Start is already present. They dispatch before normal
+client construction.
+
+CI proves this cross-store boundary against PostgreSQL 16 with
+[`test_legacy_to_financial_pg.sh`](../scripts/deploy/test_legacy_to_financial_pg.sh). The scenario
+installs checked-in pre-545 schema fixtures pinned to commit `8ea29a9`, creates fresh local logs and
+paper state, runs the production `pe-service --financial-era=prepare` and `start` owners via
+`cargo run -p pe-service --all-features --bin pe-service --`, and passes the returned synchronized
+Start receipt to `seed_financial_start` before applying the configuration migration. It retries every
+transition boundary once, applies the live schema twice to the legacy `bigint` position shape, proves
+whole quantities survive and fractional quantities round-trip, and requires the materialized and base
+view counts to agree after forward refresh and rollback restoration. Both pull-request and post-merge
+`main` CI therefore exercise the same legacy input.
+
+The offline qualification command is separate from activation and constructs no network client:
+
+```bash
+pe-service --qualify \
+  --paper-log <paper.log> --source-log <source_events.log> \
+  --live-journal <live_journal.log> \
+  --paper-state <paper_state.db> --seal-hash <qualification-seal-hash> \
+  --output <qualification-report.json>
+```
+
+It emits canonical compact JSON plus one trailing newline and reports its BLAKE3 hash. Only a sealed
+`Pass` under `_GLOSSARY.md` permits the one subsequent manual paper-to-live-tiny review.
+
 ## Facts
 
 | item | value |
 |---|---|
 | VPS | `82.22.32.225`, user `sean` (`ssh -i ~/.ssh/id_personal sean@82.22.32.225` — never root) |
 | unit | systemd **system** unit `pe-service` (`/etc/systemd/system/pe-service.service` + drop-in `pe-service.service.d/age-identity.conf`); `WantedBy=multi-user.target`, `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2` (SIGINT — the binary's shutdown signal, so a restart drains buffered trades). Start/stop/restart need root: run [`scripts/vps_grant_pe_service_sudo.sh`](../scripts/vps_grant_pe_service_sudo.sh) once as root to grant the deploy user passwordless, command-scoped `systemctl` control of the pe-service units (verified with `sudo -n -l`); until then use `ssh -t … 'sudo systemctl restart pe-service'` |
-| binary path | `ExecStart` runs `/bin/bash -c 'set -a; source /home/sean/prediction-markets/.env; set +a; exec /home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml'` with `WorkingDirectory=/home/sean/prediction-markets` (verified 2026-08-31) |
+| binary path | `ExecStart` runs `/home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml` with `EnvironmentFile=/home/sean/prediction-markets/.env` and `WorkingDirectory=/home/sean/prediction-markets`; environment contents use data-file semantics and are never shell-sourced |
 | backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
-| env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
+| env | `.env` on the VPS (REST URL plus both credential identities: publishable/anon-class `PE_SUPABASE_ANON_KEY` and secret/service-role-class `PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). The #545 rehearsal derives its publishable-only file from this reviewed production target and never installs the derivative. `PE_SUPABASE_AUTHORITATIVE` defaults to `false` but must be `true` in the #545 production target. `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
 | build box | the VPS has no cargo — build on the dev box and `scp`. Release-like builds derive the full revision directly from the checked-out Git object and reject a dirty, unknown, or invalid checkout; no environment override is accepted. Dev/test builds use the explicit `dev-dirty` sentinel when needed. |
 | logs | `journalctl -u pe-service -f` (Tier-1 prod check); JSONL sinks per `jsonl_log_path`; `status.json` in the working directory |
 
@@ -451,18 +727,16 @@ pe-service applied that batch, and only then disable the flag or roll the binary
 back. Disabling first would copy Δ=2-selected wallets at poll latency — the
 padded-watchlist loss class.
 
-## #510 restart semantics (authoritative mode)
+## Historical #510 pre-Start restart semantics
 
-Since #510 the authoritative catch-up watermark advances at runtime (successor-gated in
-`commit_fill_authoritative`), so a healthy restart's boot catch-up is a **zero-RPC no-op** —
-the boot log prints one summary line: `supabase authoritative boot: catch-up summary`
-(`old_watermark` / `head` / `replayed`). Expect `replayed=0` on a healthy restart; a non-zero
-count is the bounded gap-heal (an earlier RPC failure or halted boot froze the watermark) and
-completes idempotently. Diagnose with
-`sqlite3 paper_state.db "select key,value from meta where key like '%event_seq'"` —
-`last_supabase_applied_event_seq` tracks `last_applied_event_seq` in steady state.
-`--backfill-supabase` (one-time cutover tool) now performs a strict full fill sweep and
-aborts before seeding any cursor if the sweep halts (rerun to resume; fully idempotent).
+This section applies only to the legacy era before `QualificationStarted`. Its successor-gated
+Supabase catch-up cursor makes a healthy legacy restart's boot catch-up a zero-RPC no-op; a non-zero
+replay count is the bounded, idempotent gap heal for an earlier legacy authority failure. The
+one-time `--backfill-supabase` cutover tool is also legacy-only and is refused after Start.
+
+In the financial era this cursor is neither steady-state authority nor a financial progress marker.
+The Start-bound `paper_bankroll.last_prepared_seq`, together with synchronized
+`FinancialPrepared`/`FinancialFinal` receipts, owns financial sequencing and restart recovery.
 
 ## #508 Phase A config cutover (A0–A4)
 

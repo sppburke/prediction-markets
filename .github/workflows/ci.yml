@@ -30,6 +30,8 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -91,6 +93,8 @@ jobs:
       - name: Python drift-guard tests
         run: |
           bash -n scripts/deploy/*.sh scripts/paper_reset/*.sh
+          bash scripts/deploy/rehearsal545.sh --dry-run \
+            0000000000000000000000000000000000000000 >/dev/null
           python3 scripts/check_sql_unfiltered_dml.py
           python3 scripts/test_push_ranking_filter.py
           python3 scripts/test_ranker_decay.py
@@ -115,6 +119,15 @@ jobs:
           python3 scripts/test_ranker_clv_source_comparison.py
           python3 scripts/verify_bakeoff_components.py
           bash scripts/deploy/test_activate_generation.sh
+          bash scripts/paper_reset/test_activate_financial_era.sh
+
+      - name: Legacy-to-financial PostgreSQL archive/restore scenario (issue #545)
+        env:
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          PG_LEGACY_URL: postgres://postgres:postgres@localhost:5432/pe_legacy_545
+        # Keep this in the workspace gate after the Rust build/test commands: the scenario's
+        # `cargo run -p pe-service --all-features --bin pe-service -- ...` invocations are incremental.
+        run: bash scripts/deploy/test_legacy_to_financial_pg.sh
 
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
       # Load both Supabase schema files into the Postgres service (creating the Supabase
@@ -125,7 +138,6 @@ jobs:
         env:
           PGURL: postgres://postgres:postgres@localhost:5432/postgres
         run: |
-          psql "$PGURL" -v ON_ERROR_STOP=1 -c "create role anon nologin; create role authenticated nologin; create role service_role nologin;"
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_paper_state_schema.sql
           # Matview SQL must load on vanilla Postgres too (its pg_cron block self-skips when the
@@ -143,7 +155,7 @@ jobs:
       - name: Postgres RPC parity + concurrency test (issue #397)
         env:
           PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: cargo nextest run -p pe-service --features scenario pg_parity
+        run: cargo nextest run -p pe-service --features scenario --test pg_parity
 
       - name: Ranking publication RPC idempotency + rollback test
         env:

@@ -37,6 +37,7 @@ pe-risk-engine                = { path = "../risk-engine",             version =
 pe-source-core                = { path = "../source-core",             version = "0.1.0" }
 pe-strategy-winner-follow     = { path = "../strategy-winner-follow",  version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",            version = "0.1.0" }
+pe-venue-polymarket           = { path = "../venue-polymarket",        version = "0.1.0" }
 
 figment         = { workspace = true }
 rayon           = { workspace = true }

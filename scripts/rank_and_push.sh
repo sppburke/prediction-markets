@@ -65,6 +65,10 @@
 #   --engine E            ranker engine: auto (default) | duck | sqlite. auto uses the DuckDB
 #                         read-layer over a fresh Parquet snapshot (faster scan), else SQLite.
 #   --skip-export         reuse an existing Parquet snapshot (skip the Step-0a rewrite).
+#   --cache-stage-record P enable schema-two cutover: rank finalized side --db,
+#                         prepare publication, activate onto --fixed-db, then resume it.
+#   --fixed-db P          installed Forge cache path for schema-two cutover.
+#   --prior-cache-backup P one generic hash-bound prior-main backup path.
 #   --skip-purge          accepted as a backward-compatible no-op; automatic purge is retired (#544).
 #   --keep-intermediates  retain qualifying_positions_72hr.csv (the >5 GB pass-1 intermediate) instead
 #                         of auto-pruning it after pass-2; useful for debugging the raw position set.
@@ -137,6 +141,9 @@ RESUME_PENDING="0"                # internal supervisor recovery path; never sta
 PENDING_FILE="data/eval-results/rank_and_push.pending"
 CYCLE_FILE="data/eval-results/rank_and_push.cycle"
 PRODUCTION_CYCLE="0"
+CACHE_STAGE_RECORD=""
+FIXED_DB=""
+PRIOR_CACHE_BACKUP=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -171,6 +178,9 @@ while [[ $# -gt 0 ]]; do
     --parquet-dir) PARQUET_DIR="$2"; shift 2;;
     --parquet-max-age-hours) PARQUET_MAX_AGE_HOURS="$2"; shift 2;;
     --skip-export) SKIP_EXPORT="1"; shift;;
+    --cache-stage-record) CACHE_STAGE_RECORD="$2"; shift 2;;
+    --fixed-db) FIXED_DB="$2"; shift 2;;
+    --prior-cache-backup) PRIOR_CACHE_BACKUP="$2"; shift 2;;
     --resume-pending) RESUME_PENDING="1"; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -457,6 +467,35 @@ fi
 mkdir -p "$OUT_DIR"
 echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
 
+CUTOVER_MODE="0"
+BEFORE_RANKING_JSON=""
+if [[ -n "$CACHE_STAGE_RECORD" ]]; then
+  CUTOVER_MODE="1"
+  [[ -f "$CACHE_STAGE_RECORD" && ! -L "$CACHE_STAGE_RECORD" ]] || {
+    echo "FATAL: --cache-stage-record must be a regular file" >&2; exit 2;
+  }
+  [[ -n "$FIXED_DB" && -f "$FIXED_DB" ]] || {
+    echo "FATAL: schema-two cutover requires an existing --fixed-db" >&2; exit 2;
+  }
+  [[ -n "$PRIOR_CACHE_BACKUP" ]] || {
+    echo "FATAL: schema-two cutover requires --prior-cache-backup" >&2; exit 2;
+  }
+  [[ "$ENGINE" != "sqlite" ]] || {
+    echo "FATAL: schema-two cutover refuses --engine sqlite" >&2; exit 2;
+  }
+  "$PYTHON_BIN" - "$DB" <<'PY'
+import sqlite3
+import sys
+with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 2:
+        raise SystemExit("schema-two cutover --db is not PRAGMA user_version=2")
+PY
+  "$PYTHON_BIN" -c 'import duckdb'
+  BEFORE_RANKING_JSON="$OUT_DIR/before_ranking.json"
+  "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
+    --snapshot-current "$BEFORE_RANKING_JSON"
+fi
+
 ACTIVATION_RUN_HASH="$("$PYTHON_BIN" -c \
   'import hashlib, os, sys; print(hashlib.sha256(os.path.realpath(os.path.abspath(sys.argv[1])).encode()).hexdigest()[:16])' \
   "$OUT_DIR")"
@@ -475,6 +514,27 @@ GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PIPELINE_VERSIONS_FILE="$OUT_DIR/pipeline_versions.json"
 if [[ "$SKIP_RANK" == "0" && ! -f "$PIPELINE_VERSIONS_FILE" ]]; then
   "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_FILE"
+fi
+if [[ "$CUTOVER_MODE" == "1" && ! -f "$OUT_DIR/cycle_manifest.json" ]]; then
+  "$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" \
+    "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" \
+    "$FLOOR_TSTAT" "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" \
+    "$LATENCY_SHIFT_SECS" "$FILL_WINDOW_SECS" "$TOP_N" <<'PY'
+import json
+import sys
+keys = [
+    "half_life_days", "ttr_hours", "price_min", "price_max", "floor_tstat",
+    "min_trl", "min_avg_per_month", "min_active_months", "latency_shift_secs",
+    "fill_window_secs", "top_n",
+]
+with open(sys.argv[1], "w", encoding="utf-8") as destination:
+    json.dump(dict(zip(keys, sys.argv[2:], strict=True)), destination, sort_keys=True)
+    destination.write("\n")
+PY
+  "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture --db "$DB" \
+    --day-utc "$(date -u +%Y-%m-%d)" --versions-file "$PIPELINE_VERSIONS_FILE" \
+    --configuration-file "$OUT_DIR/cycle_configuration.json" \
+    --output "$OUT_DIR/cycle_manifest.json"
 fi
 
 # Universe source: explicit --universe <file>, else the production default --universe-from-trades
@@ -577,7 +637,11 @@ refresh_data() {
   fi
 }
 
-refresh_data
+if [[ "$CUTOVER_MODE" == "1" ]]; then
+  echo "── Step 0: finalized schema-two side cache; legacy refresh skipped ──"
+else
+  refresh_data
+fi
 
 # ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
 # Full atomic rewrite from the just-refreshed cache (so the snapshot is fresh for this run).
@@ -597,7 +661,17 @@ else
   echo "── Step 0a: Parquet export skipped (engine=$ENGINE skip_rank=$SKIP_RANK skip_export=$SKIP_EXPORT) ──"
 fi
 
+TTR_MAX_SECS="$("$PYTHON_BIN" -c "print(int(float('$TTR_HOURS')*3600))")"
+
 if [[ "$SKIP_RANK" == "0" ]]; then
+  RERANK_CACHE_ARGS=()
+  if [[ "$CUTOVER_MODE" == "1" ]]; then
+    RERANK_CACHE_ARGS+=(
+      --before-ranking-json "$BEFORE_RANKING_JSON"
+      --cycle-manifest-file "$OUT_DIR/cycle_manifest.json"
+      --cache-stage-record "$CACHE_STAGE_RECORD"
+    )
+  fi
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
   "$PYTHON_BIN" scripts/rank_72hr_buyandhold.py \
     --db "$DB" "${UNIVERSE_ARGS[@]}" --out-dir "$OUT_DIR" \
@@ -623,6 +697,16 @@ if [[ "$SKIP_RANK" == "0" ]]; then
   export PE_BOOTSTRAP_CACHE_PATH="$DB"
   run_refresh_stage "reference-fetch" "$PE_BOOTSTRAP_BIN" prices-history \
     --targets-csv "$TARGETS_CSV" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  if [[ "$CUTOVER_MODE" == "1" ]]; then
+    # The price store lives in the same SQLite file. Re-finalize after its
+    # targeted writes so activation is bound to the exact ranked cache bytes.
+    "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$DB" \
+      --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture --db "$DB" \
+      --day-utc "$(date -u +%Y-%m-%d)" --versions-file "$PIPELINE_VERSIONS_FILE" \
+      --configuration-file "$OUT_DIR/cycle_configuration.json" \
+      --output "$OUT_DIR/cycle_manifest.json"
+  fi
 
   echo "── Stage 2c/3: pass-2 reference-oracle rerank (adds hit_rate) ─────────────────"
   "$PYTHON_BIN" scripts/latency_shift_rerank.py \
@@ -632,8 +716,11 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
     --min-active-months "$MIN_ACTIVE_MONTHS" \
+    --min-ttr-secs 60 --ttr-max-secs "$TTR_MAX_SECS" \
+    --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
     --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA" \
-    --pipeline-versions-file "$PIPELINE_VERSIONS_FILE"
+    --pipeline-versions-file "$PIPELINE_VERSIONS_FILE" \
+    "${RERANK_CACHE_ARGS[@]}"
 else
   echo "── Stages 1-2 skipped (--skip-rank); reusing $LATENCY_CSV ──"
 fi
@@ -667,7 +754,6 @@ else
 
   # TTR provenance: pass the actual ranking TTR ceiling so the durable request reflects
   # the shape these entries were ranked at.
-  TTR_MAX_SECS="$("$PYTHON_BIN" -c "print(int(float('$TTR_HOURS')*3600))")"
   PUSH_ARGS+=(
     --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N"
     --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX"
@@ -692,13 +778,67 @@ else
 
   # Parameterized research/re-push invocations never own the singleton production
   # recovery pointer. The complete zero-argument cycle is its sole normal writer.
-  if [[ "$INVOCATION_ARGC" -eq 0 ]]; then
+  if [[ "$INVOCATION_ARGC" -eq 0 || "$CUTOVER_MODE" == "1" ]]; then
     PUSH_ARGS+=(--pending-file "$PENDING_FILE")
+  fi
+  if [[ "$CUTOVER_MODE" == "1" ]]; then
+    PUSH_ARGS+=(
+      --cache-stage-record "$CACHE_STAGE_RECORD"
+      --cache-side-db "$DB"
+      --cache-fixed-db "$FIXED_DB"
+      --prior-cache-backup "$PRIOR_CACHE_BACKUP"
+    )
   fi
 fi
 
+activate_bound_cache() {
+  local request_path="$1"
+  local -a binding=()
+  local validation_output
+  validation_output="$("$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
+    --validate-request "$request_path")" || return $?
+  if [[ -z "$validation_output" ]]; then
+    return 0
+  fi
+  mapfile -t binding <<< "$validation_output"
+  [[ "${#binding[@]}" -eq 4 ]] || {
+    echo "FATAL: publication request has malformed cache activation evidence" >&2
+    return 2
+  }
+  local -a lock_handoff=(
+    --held-run-lock-fd 8
+    --held-run-lock-pid "$$"
+  )
+  local loop_lock_file="data/eval-results/.rank_and_push_loop.lock"
+  if [[ -e /proc/self/fd/9 && /proc/self/fd/9 -ef "$loop_lock_file" ]]; then
+    local loop_pid
+    loop_pid="$(tr -cd '0-9' < "$loop_lock_file" 2>/dev/null || true)"
+    [[ -n "$loop_pid" ]] || {
+      echo "FATAL: inherited ranking-loop lock has no holder PID" >&2
+      return 2
+    }
+    lock_handoff+=(--held-loop-lock-fd 9 --held-loop-lock-pid "$loop_pid")
+  fi
+  "$PE_BOOTSTRAP_BIN" cache-activate --db "${binding[0]}" \
+    --fixed-db "${binding[1]}" --backup "${binding[2]}" \
+    --expected-sha256 "${binding[3]}" "${lock_handoff[@]}"
+}
+
 push_rc=0
-"$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
+if [[ "$CUTOVER_MODE" == "1" && "$RESUME_PENDING" != "1" ]]; then
+  "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
+    "${PUSH_ARGS[@]}" --prepare-only || push_rc=$?
+  if [[ "$push_rc" -eq 0 ]]; then
+    activate_bound_cache "$PUBLISH_REQUEST_FILE"
+    "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
+      --resume-request "$PUBLISH_REQUEST_FILE" || push_rc=$?
+  fi
+elif [[ "$RESUME_PENDING" == "1" ]]; then
+  activate_bound_cache "$PUBLISH_REQUEST_FILE"
+  "$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
+else
+  "$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
+fi
 if [[ "$push_rc" -ne 0 ]]; then
   echo "   [push] exit $push_rc — pending request retained for recovery" >&2
   exit "$push_rc"

@@ -4,16 +4,19 @@
 //! deterministic output given the same ordered input stream.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, PositionState};
+use pe_copy_signal_engine::{
+    IncomingTrade, PositionSnapshot, PositionState, SignalConfig, TradeProvenance,
+    classify_leader_action,
+};
 use pe_core_types::{
-    MarketId, MarketOutcomeId, OutcomeId, Price, ShareAmount, Side, SourceTimestamp, SourceTradeId,
-    VenueMarketId, WalletAddress,
+    LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality, ShareAmount,
+    Side, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_source_polymarket_public::{ActivityAggregate, ActivityType};
 
@@ -1083,6 +1086,305 @@ impl Default for PositionLedger {
     }
 }
 
+/// Pure first-entry classification for one trade in a complete wallet-second (#545).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryClassification {
+    Admitted,
+    NotFirstEntry,
+    NotBuy,
+    NotAnEntry,
+    AmbiguousFirstEntrySameSecond,
+    WalletHistoryIncomplete,
+}
+
+impl EntryClassification {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::NotFirstEntry => "not_first_entry",
+            Self::NotBuy => "not_buy",
+            Self::NotAnEntry => "not_an_entry",
+            Self::AmbiguousFirstEntrySameSecond => "ambiguous_first_entry_same_second",
+            Self::WalletHistoryIncomplete => "wallet_history_incomplete",
+        }
+    }
+}
+
+/// One ordinary trade classified against the immutable pre-second position snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeDecision {
+    pub source_trade_id: SourceTradeId,
+    pub market_id: MarketId,
+    pub outcome_id: OutcomeId,
+    pub side: Side,
+    pub amount: ShareAmount,
+    pub price: Price,
+    pub action: LeaderAction,
+    pub action_order_dependent: bool,
+    pub entry: EntryClassification,
+}
+
+/// Result of proving and classifying a complete wallet-second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecondVerdict {
+    OrderIndependent {
+        applied: Vec<AppliedEffect>,
+        decisions: Vec<TradeDecision>,
+        first_entries: Vec<(MarketId, SourceTradeId)>,
+    },
+    /// `trigger` is the first input mutation in the first failing connected component.
+    /// Persistence owners may map this proof identity to their existing fence-trigger policy.
+    OrderDependent { trigger: SourceTradeId },
+}
+
+/// Prove mutation-order independence, apply the bucket to a disposable ledger clone,
+/// classify ordinary trades from the immutable pre-bucket snapshot, and classify first entries.
+pub fn classify_complete_second(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    mutations: &[LedgerMutation],
+    reconstruction_quality: ReconstructionQuality,
+    signal_config: &SignalConfig,
+    history_complete: bool,
+    has_market: &dyn Fn(&MarketId) -> bool,
+) -> Result<SecondVerdict, LedgerError> {
+    if let Some(trigger) = order_independent_validity(ledger, wallet, mutations)? {
+        return Ok(SecondVerdict::OrderDependent { trigger });
+    }
+
+    let (_, applied) = ledger.simulate_all_or_none(mutations)?;
+    let pre_snapshot = ledger.position(&wallet);
+    let mut touched_count: HashMap<MarketOutcomeId, usize> = HashMap::new();
+    for mutation in mutations {
+        for key in mutation.touched_keys() {
+            let count = touched_count.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    let mut decisions = Vec::new();
+    for mutation in mutations {
+        let LedgerEffect::Trade {
+            market_id,
+            outcome_id,
+            side,
+            amount,
+            price,
+        } = mutation.effect.effective()
+        else {
+            continue;
+        };
+        let trade = IncomingTrade {
+            wallet,
+            market_id: market_id.clone(),
+            outcome_id: *outcome_id,
+            side: *side,
+            price: *price,
+            contracts: *amount,
+            observed_at: mutation.source_time.0,
+            received_at: mutation.source_time.0,
+            source_trade_id: mutation.source_trade_id.clone(),
+            transaction_hash: Some(mutation.transaction_hash.clone()),
+            // Provenance is not read by `classify_leader_action`; it is supplied only
+            // because `IncomingTrade` retains transport evidence for its other consumers.
+            provenance: TradeProvenance::RestPoll,
+        };
+        let key = MarketOutcomeId::new(market_id.clone(), *outcome_id);
+        decisions.push(TradeDecision {
+            source_trade_id: mutation.source_trade_id.clone(),
+            market_id: market_id.clone(),
+            outcome_id: *outcome_id,
+            side: *side,
+            amount: *amount,
+            price: *price,
+            action: classify_leader_action(
+                &trade,
+                pre_snapshot,
+                reconstruction_quality,
+                signal_config,
+            ),
+            action_order_dependent: touched_count.get(&key).copied().unwrap_or_default() > 1,
+            entry: EntryClassification::NotAnEntry,
+        });
+    }
+
+    let mut candidates: BTreeMap<String, (MarketId, Vec<usize>)> = BTreeMap::new();
+    for (index, decision) in decisions.iter_mut().enumerate() {
+        if decision.side != Side::Buy {
+            decision.entry = EntryClassification::NotBuy;
+        } else if decision.action != LeaderAction::Entry {
+            decision.entry = EntryClassification::NotAnEntry;
+        } else {
+            candidates
+                .entry(decision.market_id.to_string())
+                .or_insert_with(|| (decision.market_id.clone(), Vec::new()))
+                .1
+                .push(index);
+        }
+    }
+
+    let mut first_entries = Vec::new();
+    for (market_id, candidate_indices) in candidates.into_values() {
+        if has_market(&market_id) {
+            for index in candidate_indices {
+                decisions[index].entry = EntryClassification::NotFirstEntry;
+            }
+            continue;
+        }
+
+        if let Some(first_id) = candidate_indices
+            .iter()
+            .map(|index| decisions[*index].source_trade_id.clone())
+            .min_by(|left, right| left.0.cmp(&right.0))
+        {
+            first_entries.push((market_id, first_id));
+        }
+        let entry = if !history_complete {
+            EntryClassification::WalletHistoryIncomplete
+        } else if candidate_indices.len() >= 2 {
+            EntryClassification::AmbiguousFirstEntrySameSecond
+        } else {
+            EntryClassification::Admitted
+        };
+        for index in candidate_indices {
+            decisions[index].entry = entry;
+        }
+    }
+
+    Ok(SecondVerdict::OrderIndependent {
+        applied,
+        decisions,
+        first_entries,
+    })
+}
+
+/// Classify one complete historical second with the canonical signal defaults.
+///
+/// Bootstrap supplies the reconstruction quality explicitly because it owns the
+/// proof that the fixed-end wallet history is complete. Keeping the signal
+/// configuration here prevents the cache builder from acquiring a second direct
+/// dependency on the copy-signal classifier.
+pub fn classify_complete_historical_second(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    mutations: &[LedgerMutation],
+    reconstruction_quality: ReconstructionQuality,
+    has_market: &dyn Fn(&MarketId) -> bool,
+) -> Result<SecondVerdict, LedgerError> {
+    classify_complete_second(
+        ledger,
+        wallet,
+        mutations,
+        reconstruction_quality,
+        &SignalConfig::default(),
+        true,
+        has_market,
+    )
+}
+
+fn order_independent_validity(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    mutations: &[LedgerMutation],
+) -> Result<Option<SourceTradeId>, LedgerError> {
+    for component in mutation_components(mutations) {
+        let Some(first) = component.first() else {
+            continue;
+        };
+        if component.len() > 4 || !all_component_orders_match(ledger, wallet, &component)? {
+            return Ok(Some(first.source_trade_id.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn mutation_components(mutations: &[LedgerMutation]) -> Vec<Vec<&LedgerMutation>> {
+    let mut assigned = vec![false; mutations.len()];
+    let mut components = Vec::new();
+    for seed in 0..mutations.len() {
+        if assigned[seed] {
+            continue;
+        }
+        assigned[seed] = true;
+        let mut component = vec![&mutations[seed]];
+        let mut keys = mutations[seed]
+            .touched_keys()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        loop {
+            let mut changed = false;
+            for (index, mutation) in mutations.iter().enumerate() {
+                if assigned[index] {
+                    continue;
+                }
+                let touched = mutation.touched_keys();
+                if touched.iter().any(|key| keys.contains(key)) {
+                    assigned[index] = true;
+                    keys.extend(touched);
+                    component.push(mutation);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        components.push(component);
+    }
+    components
+}
+
+fn all_component_orders_match(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    component: &[&LedgerMutation],
+) -> Result<bool, LedgerError> {
+    let mut sequences = Vec::new();
+    let mut remaining = component.to_vec();
+    enumerate_mutation_orders(&mut remaining, &mut Vec::new(), &mut sequences);
+    let mut expected = None;
+    for sequence in sequences {
+        let (candidate, applied) = match ledger.simulate_all_or_none(&sequence) {
+            Ok(result) => result,
+            Err(error) if component.len() == 1 => return Err(error),
+            Err(_) => return Ok(false),
+        };
+        let residuals = applied
+            .into_iter()
+            .map(|outcome| outcome.clamped_residual)
+            .collect::<Vec<_>>();
+        let result = (candidate.position(&wallet).cloned(), residuals);
+        if expected
+            .as_ref()
+            .is_some_and(|expected| expected != &result)
+        {
+            return Ok(false);
+        }
+        expected = Some(result);
+    }
+    Ok(true)
+}
+
+fn enumerate_mutation_orders(
+    remaining: &mut Vec<&LedgerMutation>,
+    current: &mut Vec<LedgerMutation>,
+    sequences: &mut Vec<Vec<LedgerMutation>>,
+) {
+    if remaining.is_empty() {
+        sequences.push(current.clone());
+        return;
+    }
+    for index in 0..remaining.len() {
+        let mutation = remaining.remove(index);
+        current.push(mutation.clone());
+        enumerate_mutation_orders(remaining, current, sequences);
+        current.pop();
+        remaining.insert(index, mutation);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1892,6 +2194,76 @@ mod tests {
                 Err(LedgerEffectDocumentError::Malformed { .. })
             ));
         }
+    }
+
+    /// PASS: every classification maps to its frozen durable disposition string.
+    #[test]
+    fn entry_classification_strings_match_service_dispositions() {
+        let cases = [
+            (EntryClassification::Admitted, "admitted"),
+            (EntryClassification::NotFirstEntry, "not_first_entry"),
+            (EntryClassification::NotBuy, "not_buy"),
+            (EntryClassification::NotAnEntry, "not_an_entry"),
+            (
+                EntryClassification::AmbiguousFirstEntrySameSecond,
+                "ambiguous_first_entry_same_second",
+            ),
+            (
+                EntryClassification::WalletHistoryIncomplete,
+                "wallet_history_incomplete",
+            ),
+        ];
+        for (classification, expected) in cases {
+            assert_eq!(classification.as_str(), expected);
+        }
+    }
+
+    /// PASS: a same-outcome SELL and SPLIT whose final balances depend on order returns
+    /// `OrderDependent` with the first mutation of that failing component as its trigger.
+    #[test]
+    fn complete_second_rejects_order_dependent_component() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let sell = LedgerMutation {
+            source_trade_id: SourceTradeId("g2:sell".to_owned()),
+            transaction_hash: "0xsell".to_owned(),
+            wallet: w,
+            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            effect: LedgerEffect::Trade {
+                market_id: market(),
+                outcome_id: OutcomeId(0),
+                side: Side::Sell,
+                amount: ShareAmount::from_whole(2).unwrap(),
+                price: Price(dec!(0.5)),
+            },
+        };
+        let split = LedgerMutation {
+            source_trade_id: SourceTradeId("g2:split".to_owned()),
+            transaction_hash: "0xsplit".to_owned(),
+            wallet: w,
+            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            effect: LedgerEffect::Split {
+                market_id: market(),
+                amount: ShareAmount::from_whole(1).unwrap(),
+            },
+        };
+
+        let verdict = classify_complete_second(
+            &PositionLedger::new(),
+            w,
+            &[sell, split],
+            ReconstructionQuality::new(100).unwrap(),
+            &SignalConfig::default(),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verdict,
+            SecondVerdict::OrderDependent {
+                trigger: SourceTradeId("g2:sell".to_owned())
+            }
+        );
     }
 }
 #[cfg(test)]

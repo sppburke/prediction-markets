@@ -8,7 +8,7 @@
 //! [`value_portfolio`] call, cannot drift.
 //!
 //! Accounting identities (`T = current_bankroll − initial_bankroll`):
-//! - `open_cost`           = Σ over open fills of `fill_price × contracts` (buy +, sell −)
+//! - `open_cost`           = Σ over open fills of exact principal and fee (buy +, sell −)
 //! - `open_market_value`   = Σ over open positions of `(long − short) × mid[outcome_id]`
 //! - `realized_pnl`        = `T + open_cost`
 //! - `unrealized_pnl`      = `open_market_value − open_cost`
@@ -56,8 +56,8 @@ pub struct ValuationOutput {
     pub unrealized_pnl: Decimal,
     /// `Σ (long − short) × mid` over priced live open positions.
     pub open_market_value: Decimal,
-    /// `Σ fill_price × contracts` (buy +, sell −) over fills backing a live open
-    /// position.
+    /// `Σ (principal + fee)` for buys and `−Σ (principal − fee)` for sells over
+    /// fills backing a live open position.
     pub open_cost: Decimal,
     /// Live open positions with no live mid; valued at 0 in the aggregate, marked
     /// `None` per row.
@@ -104,7 +104,9 @@ pub fn value_portfolio(
     let mut open_position_count = 0usize;
     let mut live: HashSet<(MarketId, u16)> = HashSet::new();
     for p in positions {
-        if (p.long_contracts == 0 && p.short_contracts == 0) || resolutions.is_settled(&p.market_id)
+        if (p.long == pe_core_types::ShareAmount::ZERO
+            && p.short == pe_core_types::ShareAmount::ZERO)
+            || resolutions.is_settled(&p.market_id)
         {
             continue;
         }
@@ -112,7 +114,7 @@ pub fn value_portfolio(
         live.insert((p.market_id.clone(), p.outcome_id.0));
         match mid_for(open_mids, &p.market_id, p.outcome_id.0) {
             Some(mid) => {
-                let net = Decimal::from(p.long_contracts) - Decimal::from(p.short_contracts);
+                let net = p.long.to_decimal() - p.short.to_decimal();
                 let v = net.checked_mul(mid).unwrap_or(Decimal::ZERO);
                 open_market_value = open_market_value
                     .checked_add(v)
@@ -166,14 +168,11 @@ pub fn value_portfolio(
 
 /// Signed cash flow of a fill: buys debit (`+`), sells credit (`−`).
 fn signed_cost(f: &FillRow) -> Decimal {
-    let notional = f
-        .fill_price
-        .0
-        .checked_mul(Decimal::from(f.contracts))
-        .unwrap_or(Decimal::ZERO);
+    let principal = f.principal.to_decimal();
+    let fee = f.fee.to_decimal();
     match f.side {
-        Side::Buy => notional,
-        Side::Sell => -notional,
+        Side::Buy => principal.checked_add(fee).unwrap_or(Decimal::ZERO),
+        Side::Sell => -principal.checked_sub(fee).unwrap_or(Decimal::ZERO),
     }
 }
 
@@ -188,8 +187,8 @@ fn mid_for(
         .and_then(|prices| prices.get(usize::from(outcome_id)).copied())
 }
 
-/// Realized P&L of a single **settled** fill — `side_sign × (resolved − fill_price)
-/// × contracts`, where `resolved` is the settled price of the fill's outcome (`0` if
+/// Realized P&L of a single **settled** fill from its exact payout, principal, and fee,
+/// where `resolved` is the settled price of the fill's outcome (`0` if
 /// the outcome index is out of range, matching the prior inline behaviour).
 ///
 /// This is the settled branch of [`value_fill`]; `value_fill` calls it so the
@@ -198,24 +197,28 @@ fn mid_for(
 /// Returns `0` on any decimal-overflow step (the same saturating behaviour
 /// `value_fill` had).
 ///
-/// The per-share edge — `realized_edge / contracts = side_sign × (resolved −
-/// fill_price)` — is bounded in `[-1, 1]` for binary settlement (`resolved ∈ {0,1}`,
-/// `fill_price ∈ [0,1]`); the demotion statistic relies on that bound.
+/// Principal and fee are the recorded authority values; neither is reconstructed from
+/// quantity and fill price.
 pub fn realized_edge(f: &FillRow, info: &SettlementInfo) -> Decimal {
     let resolved = info
         .outcome_prices
         .get(usize::from(f.outcome_id.0))
         .copied()
         .unwrap_or(Decimal::ZERO);
-    let diff = resolved
-        .checked_sub(f.fill_price.0)
+    let payout = resolved
+        .checked_mul(f.quantity.to_decimal())
         .unwrap_or(Decimal::ZERO);
-    let magnitude = diff
-        .checked_mul(Decimal::from(f.contracts))
-        .unwrap_or(Decimal::ZERO);
+    let principal = f.principal.to_decimal();
+    let fee = f.fee.to_decimal();
     match f.side {
-        Side::Buy => magnitude,
-        Side::Sell => -magnitude,
+        Side::Buy => payout
+            .checked_sub(principal)
+            .and_then(|value| value.checked_sub(fee))
+            .unwrap_or(Decimal::ZERO),
+        Side::Sell => principal
+            .checked_sub(payout)
+            .and_then(|value| value.checked_sub(fee))
+            .unwrap_or(Decimal::ZERO),
     }
 }
 
@@ -256,7 +259,9 @@ fn value_fill(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use pe_core_types::{MarketId, OutcomeId, Price, VenueMarketId};
+    use pe_core_types::{
+        CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, VenueMarketId,
+    };
     use rust_decimal_macros::dec;
 
     fn mid(s: &str) -> MarketId {
@@ -264,14 +269,22 @@ mod tests {
     }
 
     fn fill(market: &str, outcome: u16, side: Side, contracts: u64, price: Decimal) -> FillRow {
+        let quantity = ShareAmount::from_whole(contracts).unwrap();
+        let principal =
+            CollateralAmount::from_decimal_exact(price.checked_mul(quantity.to_decimal()).unwrap())
+                .unwrap();
         FillRow {
             idempotency_key: format!("wf|0xL|0xS|{market}|{outcome}|buy|1700000000"),
             market_id: mid(market),
             outcome_id: OutcomeId(outcome),
             side,
-            contracts,
+            quantity,
             fill_price: Price(price),
-            event_seq: 1,
+            principal,
+            fee: CollateralAmount::ZERO,
+            event_seq: EventSeq(1),
+            prepared_seq: EventSeq(1),
+            source_receipt_seq: None,
         }
     }
 
@@ -279,8 +292,8 @@ mod tests {
         PaperPositionRow {
             market_id: mid(market),
             outcome_id: OutcomeId(outcome),
-            long_contracts: long,
-            short_contracts: short,
+            long: ShareAmount::from_whole(long).unwrap(),
+            short: ShareAmount::from_whole(short).unwrap(),
         }
     }
 
@@ -500,5 +513,27 @@ mod tests {
         // Out-of-range outcome index resolves to price 0 (no panic, matches inline).
         let oob = fill("0xm", 9, Side::Buy, 100, dec!(0.40));
         assert_eq!(realized_edge(&oob, &info), dec!(-40)); // (0 − 0.40) × 100
+    }
+
+    #[test]
+    fn fractional_quantity_uses_recorded_principal_and_fee_exactly() {
+        let (_dir, store) = store_with(&[("m", vec![dec!(1), dec!(0)], dec!(1.333333))]);
+        let quantity = ShareAmount::from_decimal_exact(dec!(1.333333)).unwrap();
+        let fill = FillRow {
+            idempotency_key: "wf|0xL|0xS|m|0|buy|1700000000".to_owned(),
+            market_id: mid("m"),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity,
+            fill_price: Price::new(dec!(0.49)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(0.666667)).unwrap(),
+            fee: CollateralAmount::from_decimal_exact(dec!(0.000010)).unwrap(),
+            event_seq: EventSeq(7),
+            prepared_seq: EventSeq(7),
+            source_receipt_seq: Some(EventSeq(6)),
+        };
+        let info = store.settlement_info(&mid("m")).unwrap();
+
+        assert_eq!(realized_edge(&fill, &info), dec!(0.666656));
     }
 }

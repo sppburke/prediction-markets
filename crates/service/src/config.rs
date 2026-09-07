@@ -116,30 +116,13 @@ pub struct ServiceConfig {
     #[serde(default = "default_legacy_wallet_history_path")]
     pub legacy_wallet_history_path: PathBuf,
 
-    /// BUY-side paper fill haircut (fee + slippage) in basis points.
-    /// See `docs/_GLOSSARY.md`: `paper_fill_haircut_bps`.
-    #[serde(default = "default_paper_fill_haircut_bps")]
-    pub paper_fill_haircut_bps: u32,
-
-    /// SELL-side paper fill slippage (no taker fee) in basis points.
-    /// See `docs/_GLOSSARY.md`: `paper_fill_slippage_bps`.
-    #[serde(default = "default_paper_fill_slippage_bps")]
-    pub paper_fill_slippage_bps: u32,
-
-    /// Paper fill-price mode (#486): `clob_best_ask` (default — a paper BUY fills at the fresh
-    /// CLOB best-ask, and sizing/band-gates key off it) or `leader_haircut` (the pre-#486
-    /// boot-frozen leader-price haircut). Runtime-mutable via `service_config`; an unknown value
-    /// warns and keeps the last-known-good. See `docs/_GLOSSARY.md`: `fill_mode`.
-    #[serde(default = "default_fill_mode")]
-    pub fill_mode: String,
-
     // ── Gamma / resolution polling ───────────────────────────────────────────
     /// Gamma API base URL (no trailing slash). See `docs/_GLOSSARY.md`.
     #[serde(default = "default_gamma_base_url")]
     pub gamma_base_url: String,
 
-    /// Seconds between Gamma resolution poll rounds.
-    /// See `docs/_GLOSSARY.md`: `gamma_resolution_poll_interval_secs`.
+    /// CLOB resolution-discovery cadence in seconds. The public field and `PE_*` environment
+    /// key retain their deployed legacy name; Gamma is not a payout source.
     #[serde(default = "default_gamma_resolution_poll_interval_secs")]
     pub gamma_resolution_poll_interval_secs: u64,
 
@@ -232,13 +215,11 @@ pub struct ServiceConfig {
     pub supabase_sink_reconcile_interval_secs: u64,
 
     // ── Supabase authoritative paper-state (issue #397) ───────────────────────
-    /// Make Supabase the authoritative system of record for paper-state (issue #397).
-    /// When `true`: a paper fill writes the `commit_fill` RPC first (fail-closed — on error
-    /// the fill is parked and the frozen record retries via v2 — #511), then
-    /// mirrors to SQLite; resolutions go through the `apply_resolution` RPC; boot does a
-    /// catch-up-then-pull against Supabase; and the best-effort `run_sink` is NOT spawned
-    /// (the RPCs are the sole writer of `paper_fills`/`settled_markets`). When `false`
-    /// (default) SQLite stays authoritative and the existing best-effort sink runs.
+    /// Make Supabase the active financial-era authority (issue #545). After a verified Start,
+    /// every fill/resolution uses the Prepared → authority → exact local projection → Final
+    /// protocol and an unmatched Prepared is reconciled before successor financial work.
+    /// Before Start, financial entry and resolution fail closed. The best-effort analytics sink
+    /// is never an active-era financial writer.
     /// Requires the service-role `supabase_secret_key`. Off by default; set explicitly in
     /// `.env`. `PE_SUPABASE_AUTHORITATIVE`. See `docs/_GLOSSARY.md`: `supabase_authoritative`.
     #[serde(default)]
@@ -318,6 +299,11 @@ pub struct ServiceConfig {
     /// Polymarket CLOB REST API base URL. Set via `PE_POLYMARKET_CLOB_BASE_URL`.
     #[serde(default = "default_clob_base_url")]
     pub polymarket_clob_base_url: String,
+
+    /// Key-free Polygon JSON-RPC endpoint used only for ordinary-live receipt finality.
+    /// Set via `PE_POLYGON_RECEIPT_RPC_URL`.
+    #[serde(default = "default_polygon_receipt_rpc_url")]
+    pub polygon_receipt_rpc_url: String,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -438,18 +424,6 @@ fn default_legacy_wallet_history_path() -> PathBuf {
     PathBuf::from("./wallet_market_history.json")
 }
 
-const fn default_paper_fill_haircut_bps() -> u32 {
-    500
-}
-
-const fn default_paper_fill_slippage_bps() -> u32 {
-    100
-}
-
-fn default_fill_mode() -> String {
-    "clob_best_ask".to_string() // #486: paper BUY fills at the fresh CLOB best-ask
-}
-
 fn default_bankroll_usd() -> String {
     "10000".to_string()
 }
@@ -460,6 +434,10 @@ fn default_mode() -> String {
 
 fn default_clob_base_url() -> String {
     "https://clob.polymarket.com".to_string()
+}
+
+fn default_polygon_receipt_rpc_url() -> String {
+    "https://polygon.publicnode.com".to_string()
 }
 
 fn default_gamma_base_url() -> String {
@@ -494,9 +472,6 @@ impl Default for ServiceConfig {
             log_retention_days: default_log_retention_days(),
             paper_state_db_path: default_paper_state_db_path(),
             legacy_wallet_history_path: default_legacy_wallet_history_path(),
-            paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
-            paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
-            fill_mode: default_fill_mode(),
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
@@ -524,6 +499,7 @@ impl Default for ServiceConfig {
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),
             polymarket_clob_base_url: default_clob_base_url(),
+            polygon_receipt_rpc_url: default_polygon_receipt_rpc_url(),
         }
     }
 }
@@ -574,9 +550,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "log_retention_days",
         "paper_state_db_path",
         "legacy_wallet_history_path",
-        "paper_fill_haircut_bps",
-        "paper_fill_slippage_bps",
-        "fill_mode",
         "gamma_base_url",
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
@@ -596,6 +569,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "mode",
         "strategy",
         "polymarket_clob_base_url",
+        "polygon_receipt_rpc_url",
     ]);
     let cfg: ServiceConfig = fig.merge(env).extract()?;
     // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
@@ -638,12 +612,13 @@ mod tests {
         assert_eq!(cfg.status_interval_secs, 30);
         assert_eq!(cfg.log_retention_days, 7);
         assert_eq!(cfg.polymarket_channel_capacity, 256);
+        assert_eq!(
+            cfg.polygon_receipt_rpc_url,
+            "https://polygon.publicnode.com"
+        );
         assert_eq!(cfg.trade_poll_interval_secs, 30);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");
-        assert_eq!(cfg.paper_fill_haircut_bps, 500);
-        assert_eq!(cfg.paper_fill_slippage_bps, 100);
-        assert_eq!(cfg.fill_mode, "clob_best_ask");
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
         assert_eq!(
             cfg.legacy_wallet_history_path,

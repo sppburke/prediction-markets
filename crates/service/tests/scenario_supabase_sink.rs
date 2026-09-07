@@ -29,7 +29,10 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId};
+use pe_core_types::{
+    CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
+    VenueMarketId,
+};
 use pe_paper_state::{
     FillMarketSnapshot, FillRecord, FillRow, LeaderPositionRow, PaperStateDb, SettledMarketRow,
 };
@@ -57,10 +60,13 @@ struct FakeWriter {
 
 impl SinkWriter for FakeWriter {
     async fn upsert_fill(&self, row: &SupabaseFillRow) -> Result<(), SinkError> {
-        if Some(row.fill.event_seq) == self.fail_on_seq {
+        if Some(i64::try_from(row.fill.event_seq.0).unwrap()) == self.fail_on_seq {
             return Err(SinkError::Status(503));
         }
-        self.fills.lock().unwrap().push(row.fill.event_seq);
+        self.fills
+            .lock()
+            .unwrap()
+            .push(i64::try_from(row.fill.event_seq.0).unwrap());
         Ok(())
     }
     async fn upsert_settled(&self, row: &SettledMarketRow) -> Result<(), SinkError> {
@@ -94,8 +100,10 @@ fn seed_fills(specs: &[(u64, &str)]) -> (TempDir, PaperStateDb) {
             market_id: market("0xmkt"),
             outcome_id: OutcomeId(0),
             side: Side::Buy,
-            contracts: 10,
+            quantity: ShareAmount::from_whole(10).unwrap(),
             fill_price: Price(dec!(0.40)),
+            principal: CollateralAmount::from_decimal_exact(dec!(4)).unwrap(),
+            fee: CollateralAmount::ZERO,
         };
         let leader = LeaderPositionRow {
             wallet: pe_core_types::WalletAddress::from_hex(wallet_hex()).unwrap(),
@@ -160,9 +168,13 @@ async fn ac_skip_non_wf_fill_and_advance() {
         market_id: market("0xmkt"),
         outcome_id: OutcomeId(0),
         side: Side::Buy,
-        contracts: 10,
+        quantity: ShareAmount::from_whole(10).unwrap(),
         fill_price: Price(dec!(0.40)),
-        event_seq: 9,
+        principal: CollateralAmount::from_decimal_exact(dec!(4)).unwrap(),
+        fee: CollateralAmount::ZERO,
+        event_seq: EventSeq(9),
+        prepared_seq: EventSeq(9),
+        source_receipt_seq: None,
     };
     assert!(supabase_fill_from(&non_wf).is_none());
 
@@ -188,9 +200,13 @@ async fn ac_send_fill_never_blocks_on_full_channel() {
         market_id: market("0xmkt"),
         outcome_id: OutcomeId(0),
         side: Side::Buy,
-        contracts: 10,
+        quantity: ShareAmount::from_whole(10).unwrap(),
         fill_price: Price(dec!(0.40)),
-        event_seq: 1,
+        principal: CollateralAmount::from_decimal_exact(dec!(4)).unwrap(),
+        fee: CollateralAmount::ZERO,
+        event_seq: EventSeq(1),
+        prepared_seq: EventSeq(1),
+        source_receipt_seq: None,
     };
 
     handle.send_fill(row()); // buffers into the single slot

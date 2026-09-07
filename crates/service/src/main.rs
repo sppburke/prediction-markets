@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr as _;
@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
-use pe_core_types::{SourceId, WalletAddress};
-use pe_event_log::{Scanner, Writer};
-use pe_execution_core::{ExecutionDispatcher, LiveJournal};
+use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
+use pe_execution_core::LiveJournal;
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
 use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::BucketCommitEngine;
@@ -21,20 +21,27 @@ use pe_service::paper_migration::{
     record_activation_facts, rollback_version_one, validate_initial_configuration,
     validate_migration_authority,
 };
-use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
+use pe_service::paper_recovery::{
+    active_risk_halts, build_leader_ledger, paper_era, reconcile_paper_state, replay_membership,
+    scan_paper_log,
+};
 use pe_service::position_seeder::CausalPositionValidator;
-use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, ReconciliationFetcher, ReqwestFetcher};
-use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
+use pe_source_polymarket_public::{
+    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
+    GAMMA_BATCH_SIZE, PageFetcher, ReconciliationFetcher, ReqwestFetcher, parse_clob_market,
+};
+use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
+use pe_paper_pnl::{PnlLedger, ResolutionStore};
 use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::config_poller::{
-    CONFIG_POLL_INTERVAL_SECS, SupabaseConfigFetcher, capacity_request_channel,
-    fetch_service_config, run_capacity_worker, run_config_poll_loop,
+    CONFIG_POLL_INTERVAL_SECS, QualificationSealHandle, RiskHaltReleaseHandle,
+    SupabaseConfigFetcher, capacity_request_channel, fetch_service_config,
+    partition_risk_halt_release_hash, run_capacity_worker, run_config_poll_loop,
 };
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
@@ -44,7 +51,8 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::runtime_config::{
-    AppliedWatchlistCapacity, LiveRuntimeConfig, RuntimeConfigStatus, load_initial_runtime_config,
+    AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, MAX_ACTIVE_WATCHLIST_SIZE,
+    RuntimeConfigStatus, load_initial_runtime_config,
 };
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
@@ -52,7 +60,7 @@ use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
-    SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
+    SupabaseStateClient, reconcile_active_financial_frames, supabase_authoritative_boot,
     supabase_authoritative_boot_observed,
 };
 use pe_service::supervisor::{
@@ -60,7 +68,7 @@ use pe_service::supervisor::{
     TaskName, TaskResult, TaskSupervisor, cancel_at, cancel_result_at,
 };
 use pe_service::trade_poller::{
-    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
+    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations, recover_daily_boundary,
 };
 use pe_service::watchlist_admission::{AdmissionPreparer, anchor_refresh_due};
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
@@ -140,12 +148,23 @@ async fn main() -> Result<()> {
         .iter()
         .position(|argument| argument == "--verify-staged-identity")
     {
-        let expected_revision = args.get(position + 1).context(
-            "--verify-staged-identity requires a full Git object identity and BLAKE3 digest",
-        )?;
-        let expected_hash = args.get(position + 2).context(
-            "--verify-staged-identity requires a full Git object identity and BLAKE3 digest",
-        )?;
+        let derived_revision = pe_service::build_info::embedded().source_revision;
+        let derived_hash = {
+            let executable = std::env::current_exe().context("resolve staged executable")?;
+            let bytes = std::fs::read(&executable)
+                .with_context(|| format!("read staged executable {}", executable.display()))?;
+            blake3::hash(&bytes).to_hex().to_string()
+        };
+        let (expected_revision, expected_hash) = match (
+            args.get(position + 1),
+            args.get(position + 2),
+        ) {
+            (None, None) => (derived_revision, derived_hash.as_str()),
+            (Some(revision), Some(hash)) => (revision.as_str(), hash.as_str()),
+            _ => anyhow::bail!(
+                "--verify-staged-identity accepts either no values or a full Git object identity and BLAKE3 digest"
+            ),
+        };
         let actual_hash =
             pe_service::build_info::verify_staged_identity(expected_revision, expected_hash)
                 .context("verify staged binary identity and bytes")?;
@@ -171,17 +190,115 @@ async fn main() -> Result<()> {
     if env::args().any(|a| a == "--rollback-paper-v1") {
         return run_rollback_paper_v1();
     }
+    if args.iter().any(|argument| argument == "--qualify") {
+        let options = pe_service::qualification::QualifyOptions {
+            paper_log: PathBuf::from(required_arg_value(&args, "--paper-log")?),
+            source_log: PathBuf::from(required_arg_value(&args, "--source-log")?),
+            live_journal: Some(PathBuf::from(required_arg_value(&args, "--live-journal")?)),
+            paper_state: PathBuf::from(required_arg_value(&args, "--paper-state")?),
+            seal_hash: required_arg_value(&args, "--seal-hash")?,
+            output: PathBuf::from(required_arg_value(&args, "--output")?),
+        };
+        let (verdict, report_hash) = pe_service::qualification::run_qualify(&options)
+            .await
+            .context("run network-free sealed qualification")?;
+        println!("verdict={verdict:?} report_blake3={report_hash}");
+        return Ok(());
+    }
+    if let Some(raw_command) = optional_arg_value(&args, "--financial-era") {
+        let command = match raw_command.as_str() {
+            "prepare" => pe_service::qualification::FinancialEraCommand::Prepare,
+            "start" => pe_service::qualification::FinancialEraCommand::Start,
+            "rollback-check" => pe_service::qualification::FinancialEraCommand::RollbackCheck,
+            value => anyhow::bail!(
+                "--financial-era must be prepare, start, or rollback-check; got {value}"
+            ),
+        };
+        let manifest = PathBuf::from(required_arg_value(&args, "--activation-manifest")?);
+        let financial_config_rows = match command {
+            pe_service::qualification::FinancialEraCommand::Prepare
+            | pe_service::qualification::FinancialEraCommand::Start => Some(PathBuf::from(
+                required_arg_value(&args, "--financial-config-rows")?,
+            )),
+            pe_service::qualification::FinancialEraCommand::RollbackCheck => None,
+        };
+        let config_path = args
+            .first()
+            .filter(|argument| !argument.starts_with("--"))
+            .map(PathBuf::from);
+        let offline_config = service_config::load(config_path.as_deref()).with_context(|| {
+            config_path.as_ref().map_or_else(
+                || "load financial-era config from environment".to_owned(),
+                |path| format!("load financial-era config from {}", path.display()),
+            )
+        })?;
+        let result = pe_service::qualification::run_financial_era(
+            command,
+            &manifest,
+            &offline_config,
+            financial_config_rows.as_deref(),
+        )
+        .context("run network-free financial-era command")?;
+        println!("{result}");
+        return Ok(());
+    }
 
     let cfg = load_config()?;
+
+    // Derive the financial era exactly once, from the verified paper log, before constructing
+    // any HTTP client. A Start has no local-authority interpretation: credentials and the
+    // Start-bound Supabase protocol are mandatory for every subsequent boot.
+    let financial_era = if cfg.event_log_path.exists() {
+        Some(paper_era(
+            scan_paper_log(&cfg.event_log_path)
+                .context("verify paper log and derive financial era")?,
+        ))
+    } else {
+        None
+    };
+    let financial_start_record = financial_era.as_ref().and_then(|era| era.start.clone());
+    let active_risk_halt_count = financial_era
+        .as_ref()
+        .map_or(0, |era| active_risk_halts(era).len());
+    let financial_start = financial_start_record.as_ref().map(|(receipt, _)| *receipt);
+    if financial_start.is_some() {
+        anyhow::ensure!(
+            cfg.supabase_authoritative,
+            "QualificationStarted requires PE_SUPABASE_AUTHORITATIVE=1; blind local replay is forbidden"
+        );
+        anyhow::ensure!(
+            !cfg.supabase_url.is_empty(),
+            "QualificationStarted requires PE_SUPABASE_URL"
+        );
+        anyhow::ensure!(
+            !cfg.supabase_secret_key.is_empty(),
+            "QualificationStarted requires the service-role PE_SUPABASE_SECRET_KEY"
+        );
+    }
 
     // Hold the rolling-log worker guards for the whole process; dropping them flushes the
     // non-blocking writers (losing buffered lines), so keep `log_guards` alive until exit.
     let log_guards =
         pe_service::logging::setup(&cfg.jsonl_log_path, "info", cfg.log_retention_days)?;
     info!("pe-service starting");
+    info!(
+        active_risk_halt_count,
+        "active paper risk causes rebuilt from the verified prefix"
+    );
 
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
+    let starting_bankroll = financial_start_record
+        .as_ref()
+        .map_or(configured_bankroll, |(_, start)| {
+            start.starting_bankroll.to_decimal()
+        });
+    if financial_start.is_some() {
+        anyhow::ensure!(
+            configured_bankroll == starting_bankroll,
+            "configured bankroll {configured_bankroll} differs from QualificationStarted baseline {starting_bankroll}"
+        );
+    }
     // (#398 step 8) The boot-time Kelly approval guard was removed: its invariant now lives in
     // `runtime_config::parse_config` and is re-enforced on every poll (and at boot via
     // `load_initial_runtime_config`), so a runtime override change is governed too — not just the
@@ -205,6 +322,13 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(20))
         .build()
         .context("build bounded initial service-config HTTP client")?;
+    // The one injected CLOB-resolution transport shares the boot-owned HTTP client, uses the
+    // canonical 200 ms CLOB gate, and performs no private retry/backoff.
+    let clob_resolution_fetcher = Arc::new(
+        ReqwestFetcher::new(config_http_client.clone())
+            .with_min_interval_ms(200)
+            .with_max_retries(0),
+    );
     let initial_config_rows = fetch_service_config(
         &config_http_client,
         &cfg.supabase_url,
@@ -213,61 +337,107 @@ async fn main() -> Result<()> {
     )
     .await
     .context("required initial service_config fetch")?;
-    let initial_runtime_config =
-        load_initial_runtime_config(&initial_config_rows, &cfg, clob_creds_present)
-            .context("validate required initial service_config snapshot")?;
+    let config_era = if financial_start.is_some() {
+        ConfigEra::Financial15
+    } else {
+        ConfigEra::Legacy17
+    };
+    let initial_partitioned = partition_risk_halt_release_hash(&initial_config_rows);
+    if let Some(warning) = initial_partitioned.warning {
+        warn!(?warning, "boot risk halt release row ignored");
+    }
+    let initial_release_hash = initial_partitioned.risk_halt_release_hash.clone();
+    let initial_runtime_config = load_initial_runtime_config(
+        &initial_partitioned.economic_rows,
+        &cfg,
+        clob_creds_present,
+        config_era,
+    )
+    .context("validate required initial service_config snapshot")?;
     let mode = parse_mode(&initial_runtime_config.mode)?;
     let max_fill_price = initial_runtime_config.max_fill_price;
     let min_fill_price = initial_runtime_config.min_fill_price;
     let runtime_config_status = RuntimeConfigStatus::new(&initial_runtime_config);
     let live_runtime_config = LiveRuntimeConfig::new(initial_runtime_config.clone());
 
-    // Bootstrap the initial wallet set from Supabase `latest_ranking` — the sole wallet
-    // source (#339, #370). The fetch also returns the last-trade side-map (#357): each
-    // wallet's real last on-chain trade time, used below to seed the poll cursor (the
-    // inactivity clock). There is no leaderboard/seed fallback — the service hard-fails fast
-    // if Supabase is empty or unreachable at boot, chosen over running an unvalidated set.
-    // Deploy precondition: the authoritative `rank_and_push` cron must already be populating
-    // `latest_ranking`.
-    // Record the ranking batch observed at boot BEFORE fetching the watchlist, so a batch
-    // landing in between reads as a transition on the first maintenance tick (full_rerank
-    // then swaps immediately) rather than being pinned as already-seen. Best-effort: `None`
-    // makes the first full-rerank tick apply whatever batch it observes (#542).
-    let boot_batch_marker = supabase_reader::fetch_latest_batch_id(
-        &reqwest::Client::new(),
-        &cfg.supabase_url,
-        &cfg.supabase_anon_key,
-        &cfg.supabase_secret_key,
-    )
-    .await
-    .unwrap_or_default();
-
+    // A financial Start makes the synchronized paper prefix the structural membership owner.
+    // Its initial entries come from the exact ranking batch named by Start; subsequent replacement
+    // vectors are verified and reconstructed from the source-log artifacts named by each durable
+    // MembershipChanged record. Therefore a newer published batch with no synchronized membership
+    // record remains a transition for the first maintenance tick instead of changing (or
+    // invalidating) the boot generation.
     let initial_watchlist_size = live_runtime_config.snapshot().active_watchlist_size;
-    let (initial_watchlist, bootstrap_last_trade): (Watchlist, HashMap<_, _>) =
-        supabase_reader::fetch(
-            &reqwest::Client::new(),
+    let ranking_client = reqwest::Client::new();
+    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker): (
+        Watchlist,
+        HashMap<_, _>,
+        Option<i64>,
+    ) = if let Some((_, start)) = &financial_start_record {
+        let (start_batch, mut start_last_trade) = supabase_reader::fetch_batch(
+            &ranking_client,
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+            start.ranking_batch_id,
+            MAX_ACTIVE_WATCHLIST_SIZE,
+        )
+        .await
+        .context("fetch QualificationStarted ranking batch")?;
+        let era = financial_era
+            .as_ref()
+            .context("QualificationStarted is missing its financial era")?;
+        let replayed = replay_membership(era, start_batch, &cfg.source_event_log_path)
+            .context("replay Start-bound structural membership")?
+            .context("QualificationStarted is missing from its financial era")?;
+        let restored = replayed
+            .watchlist
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>();
+        start_last_trade.retain(|wallet, _| restored.contains(wallet));
+        (
+            replayed.watchlist,
+            start_last_trade,
+            Some(replayed.last_ranking_batch_id),
+        )
+    } else {
+        // Before a financial Start, `latest_ranking` remains the boot owner. Read its marker first
+        // so a batch landing between the two reads is applied on the first maintenance tick. A
+        // failed marker read becomes `None`, which also forces the first full-rerank tick (#542).
+        let marker = supabase_reader::fetch_latest_batch_id(
+            &ranking_client,
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        )
+        .await
+        .unwrap_or_default();
+        let (watchlist, last_trade) = supabase_reader::fetch(
+            &ranking_client,
             &cfg.supabase_url,
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
             initial_watchlist_size,
         )
         .await
-        .context("bootstrap watchlist from Supabase (the sole wallet source)")?;
+        .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;
+        (watchlist, last_trade, marker)
+    };
     info!(
         active = initial_watchlist.active_count,
         total = initial_watchlist.entries.len(),
-        "watchlist bootstrapped from supabase"
+        batch_id = ?boot_batch_marker,
+        durable = financial_start.is_some(),
+        "watchlist membership rebuilt"
     );
 
-    // Fail fast if Supabase returned no wallets — there is no fallback source (#370). The read is
-    // survivor-filtered (#518), so "empty" now has two causes: `latest_ranking` itself is empty
-    // (the authoritative `rank_and_push` cron has not populated it), or the newest batch carries
-    // no surviving rows (no verdict recorded, or the ranker endorsed nobody). Both fail closed:
-    // refuse to boot rather than run with an empty watchlist.
+    // Fail fast if the selected Supabase batch returned no durable members — there is no fallback
+    // source (#370). Both the pre-Start moving read and the Start-pinned read are survivor-filtered
+    // (#518), so a batch with no surviving rows fails closed rather than running an empty set.
     anyhow::ensure!(
         !initial_watchlist.entries.is_empty(),
-        "no wallets to copy: Supabase `latest_ranking` returned no SURVIVING rows \
-         (is rank_and_push populating it, and does the newest batch carry `survives` verdicts?)"
+        "no wallets to copy: the boot membership generation contains no SURVIVING rows"
     );
 
     let (projection_dirty, projection_dirty_rx) = projection_dirty_channel();
@@ -314,13 +484,22 @@ async fn main() -> Result<()> {
         })?,
     );
     paper_state
-        .init_bankroll(configured_bankroll)
+        .init_bankroll(starting_bankroll)
         .context("initialise paper-state bankroll")?;
+    if financial_start.is_some() {
+        anyhow::ensure!(
+            paper_state
+                .bankroll()
+                .context("read Start-bound local bankroll")?
+                == Some(starting_bankroll),
+            "local bankroll differs from QualificationStarted before authority mutation"
+        );
+    }
     // #511: LEGACY-ONLY blind frame replay. In authoritative mode the boot frame-walk
     // below owns local application — every unresolved frame is decided by the authority
     // (`commit_fill_v2`), so a refused frame can never resurrect locally. The blind
     // replay would apply such frames unconditionally.
-    if !cfg.supabase_authoritative {
+    if !cfg.supabase_authoritative && financial_start.is_none() {
         let reconciled = reconcile_paper_state(&cfg.event_log_path, &paper_state)
             .context("reconcile paper-state from event log")?;
         if reconciled > 0 {
@@ -352,7 +531,25 @@ async fn main() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
-        if migration_boot.session.is_some() {
+        if let Some(start) = financial_start {
+            let authoritative_bankroll = client
+                .fetch_bankroll()
+                .await
+                .context("read Start-bound authoritative bankroll")?;
+            anyhow::ensure!(
+                authoritative_bankroll == Some(starting_bankroll),
+                "authoritative bankroll {:?} differs from QualificationStarted baseline {}",
+                authoritative_bankroll,
+                starting_bankroll
+            );
+            paper_state
+                .seed_financial_start(start)
+                .context("seed local financial Start")?;
+            client
+                .seed_financial_start(start)
+                .await
+                .context("seed authoritative financial Start")?;
+        } else if migration_boot.session.is_some() {
             supabase_authoritative_boot_observed(
                 &client,
                 &paper_state,
@@ -380,16 +577,47 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Open the sole paper writer and converge the active financial prefix before reading any
+    // bankroll used for sizing or API state.
+    let mut paper_writer = Writer::open(&cfg.event_log_path)
+        .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
+    if financial_start.is_some() {
+        let authority = supabase_state.as_ref().context(
+            "active financial era requires the authoritative client before paper writer boot",
+        )?;
+        let recovered = reconcile_active_financial_frames(
+            authority,
+            &paper_state,
+            &cfg.event_log_path,
+            &cfg.source_event_log_path,
+            &mut paper_writer,
+        )
+        .await
+        .context("recover active paper financial protocol")?;
+        if recovered > 0 {
+            info!(recovered, "completed unmatched paper Prepared records");
+        }
+    }
+
     // #508 Decision 10 (#511: AFTER frame dispositions exist in either mode): resume staged
     // dispatch aggregates — flip seeds whose fill frame reached a disposition, finalize
     // stuck seeds, leave redeliverable seeds pending. Never reconstructs targets.
-    pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
-        .context("resume dispatch seeds")?;
+    if financial_start.is_none() {
+        pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
+            .context("resume dispatch seeds")?;
+    }
 
-    let bankroll = paper_state
-        .bankroll()
-        .context("read paper-state bankroll")?
-        .unwrap_or(configured_bankroll);
+    let bankroll = if financial_start.is_some() {
+        paper_state
+            .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
+            .context("read recovered active financial snapshot")?
+            .cash
+    } else {
+        paper_state
+            .bankroll()
+            .context("read paper-state bankroll")?
+            .unwrap_or(configured_bankroll)
+    };
     let leader_ledger =
         build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
 
@@ -484,6 +712,8 @@ async fn main() -> Result<()> {
     drop(boot_position_validator);
     let (source_log, source_rx) =
         pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
+    let resolution_source_log = source_log.clone();
+    let orchestrator_source_log = source_log.clone();
     asset_identity.activate_runtime(source_log.clone()).await;
     drop(boot_source_log);
 
@@ -583,18 +813,10 @@ async fn main() -> Result<()> {
     projection_dirty.mark();
     info!(bankroll = %bankroll, "paper-state opened");
 
-    // Paper event-log writer (opened after reconciliation reads the existing log).
-    let paper_writer = Writer::open(&cfg.event_log_path)
-        .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
-    let paper_executor = PaperExecutor::new(
-        paper_writer,
-        SourceId("pe-service.paper".into()),
-        cfg.paper_fill_haircut_bps,
-        cfg.paper_fill_slippage_bps,
-    );
-
-    let dispatcher = ExecutionDispatcher::paper_only(paper_executor);
-
+    if financial_start.is_some() {
+        pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
+            .context("resume active-era dispatch seeds after financial recovery")?;
+    }
     let health = new_shared_health_with_ws(
         false,
         cfg.polymarket_activity_ws_enabled,
@@ -613,9 +835,6 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.bind))?;
 
-    // Bounded channel per _GLOSSARY.md defaults.
-    let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
-
     // Seed the delivery cursor without mutating the ordered activity ledger. The positions API
     // is no longer an overwrite authority (#544).
     let mut cursor_seeded = 0usize;
@@ -630,6 +849,19 @@ async fn main() -> Result<()> {
 
     // Bounded service-side activity-bucket/admission control channel (#544).
     let (control_tx, control_rx) = mpsc::channel(2);
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
+            .context("build verified source receipt index")?;
+    let risk_halt_release = financial_start.is_some().then(|| {
+        RiskHaltReleaseHandle::new(
+            cfg.event_log_path.clone(),
+            source_receipts.clone(),
+            control_tx.clone(),
+        )
+    });
+    let qualification_seal = financial_start
+        .is_some()
+        .then(|| QualificationSealHandle::new(control_tx.clone()));
     let (producer_start_tx, producer_start_rx) = watch::channel(false);
 
     // Runtime admissions prove durable history and recheck the fence under the shared
@@ -638,13 +870,23 @@ async fn main() -> Result<()> {
         control_tx.clone(),
         paper_state.clone(),
         position_validator,
-    );
+    )
+    .with_source_log(orchestrator_source_log.clone());
 
     // Rebuild durable reader obligations before either source producer starts.
     // The existing source log plus aggregate records are sufficient, so #544
     // adds no second database or obligation table.
-    let obligations = rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
-        .context("rebuild durable activity reconciliation obligations")?;
+    let mut obligations =
+        rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
+            .context("rebuild durable activity reconciliation obligations")?;
+    if financial_start.is_some() {
+        recover_daily_boundary(
+            &cfg.source_event_log_path,
+            &cfg.event_log_path,
+            &mut obligations,
+        )
+        .context("recover causal daily boundary")?;
+    }
     info!(
         obligations = obligations.len(),
         "activity obligations rebuilt"
@@ -673,6 +915,7 @@ async fn main() -> Result<()> {
             trigger_tx,
             activity_health,
         )
+        .with_source_receipt_index(source_receipts.clone())
     } else {
         pe_service::activity_ingest::ActivityIngest::poll_only(
             sink,
@@ -680,6 +923,7 @@ async fn main() -> Result<()> {
             trigger_tx,
             activity_health,
         )
+        .with_source_receipt_index(source_receipts.clone())
     };
     let reconciliation_obligations_dropped =
         activity_ingest.reconciliation_triggers_dropped_counter();
@@ -738,17 +982,20 @@ async fn main() -> Result<()> {
     });
 
     // Orchestrator.
+    // Dashboard-only end-time projection; active economics uses admission evidence directly.
     let market_end_cache = MarketEndCache::new(cfg.gamma_base_url.clone());
     // Mid-price cache for marking open dashboard positions to market (own rate gate).
-    let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone());
+    let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone())
+        .with_source_log(orchestrator_source_log.clone());
 
     // Supabase analytics sink (issue #343): best-effort dual-write of fills + settlements.
     // Spawned only when enabled and a Supabase URL is configured; otherwise `None` (no-op).
-    // NOT spawned in authoritative mode (issue #397): the `commit_fill`/`apply_resolution`
-    // RPCs are the sole writer of `paper_fills`/`settled_markets`, so a best-effort
-    // `merge-duplicates` upsert from `run_sink` must not race them. With `sink_handle = None`
-    // the orchestrator's `send_fill` and `tick_resolution`'s `send_resolution` are suppressed
-    // automatically; the liquidity-snapshot worker (#350) keeps its own gate and stays alive.
+    // Not spawned in authoritative mode (issue #397): the Prepared-sequenced
+    // `commit_fill_v2`/`apply_resolution_v2` paths own `paper_fills`/`settled_markets`, so a
+    // best-effort `merge-duplicates` upsert from `run_sink` must not race them. With
+    // `sink_handle = None`
+    // the active financial protocol remains the only paper-state writer; the liquidity-snapshot
+    // worker (#350) keeps its own gate and stays alive.
     let sink_handle =
         if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() && !cfg.supabase_authoritative
         {
@@ -795,7 +1042,23 @@ async fn main() -> Result<()> {
         .context("build bounded CLOB book HTTP client")?;
     let book_fetcher = Arc::new(
         ReqwestClobBookFetcher::new(book_http_client)
+            .with_source_log(orchestrator_source_log.clone())
             .with_base_url(cfg.polymarket_clob_base_url.clone()),
+    );
+    let admission_http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("build bounded market-admission HTTP client")?;
+    let boundary_mark_fetcher = Arc::new(pe_service::mark_prices::HistoricalMarkAdapter::new(
+        admission_http_client.clone(),
+        cfg.polymarket_clob_base_url.clone(),
+        orchestrator_source_log.clone(),
+    ));
+    let admission_builder = pe_service::live_venue_adapter::LiveAdmissionBuilder::new(
+        admission_http_client,
+        cfg.gamma_base_url.clone(),
+        cfg.polymarket_clob_base_url.clone(),
+        orchestrator_source_log,
     );
 
     let snapshot_handle = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
@@ -877,6 +1140,25 @@ async fn main() -> Result<()> {
     // passed as `None`; the mode machine then cannot arm, while the paper orchestrator remains
     // fully operational. The account-tagged journal is a mode-0600 sibling of the paper log.
     if let Some(live_accounts) = live_accounts.clone() {
+        let qualification = match optional_arg_value(&args, "--qualification-report") {
+            Some(path) => {
+                match pe_service::live_mode::load_qualification_facts(&PathBuf::from(&path)) {
+                    Ok(report) => Some(report),
+                    Err(error) => {
+                        tracing::warn!(
+                            path,
+                            error = %error,
+                            "qualification report unavailable; live arming disabled"
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("--qualification-report was not supplied; live arming disabled");
+                None
+            }
+        };
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
             Err(error) => {
@@ -885,6 +1167,29 @@ async fn main() -> Result<()> {
             }
         };
         let journal_path = live_journal_path(&cfg.event_log_path);
+        let era_live_prefix = if cfg.event_log_path.exists() {
+            paper_era(
+                scan_paper_log(&cfg.event_log_path)
+                    .context("verify paper era for the live-journal prefix")?,
+            )
+            .start
+            .map(|(_, start)| {
+                Ok::<_, anyhow::Error>(pe_event_log::LogTailBinding {
+                    path: journal_path.clone(),
+                    physical_tail: start.live_prefix.physical_tail,
+                    last_sequence: start.live_prefix.last_sequence,
+                    last_hash: blake3::Hash::from_hex(&start.live_prefix.last_hash)
+                        .context("decode QualificationStarted live-prefix hash")?,
+                })
+            })
+            .transpose()?
+        } else {
+            None
+        };
+        if let Some(prefix) = &era_live_prefix {
+            pe_event_log::Scanner::verify_prefix(prefix)
+                .context("verify QualificationStarted live-journal prefix")?;
+        }
         let journal = LiveJournal::open(&journal_path).with_context(|| {
             format!("open and validate live journal {}", journal_path.display())
         })?;
@@ -898,17 +1203,32 @@ async fn main() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
+        let live_book_fetcher = Arc::new(
+            ReqwestClobBookFetcher::new(live_http_client.clone())
+                .with_base_url(cfg.polymarket_clob_base_url.clone())
+                .with_source_log(resolution_source_log.clone()),
+        );
         let fanout_config = pe_service::live_fanout::LiveFanoutConfig {
             paper_state: paper_state.clone(),
             live_accounts,
             live_watchlist: live_watchlist.clone(),
             runtime_config: live_runtime_config.clone(),
+            qualification,
             identity,
             journal: Arc::new(journal),
             journal_path,
+            era_live_prefix,
             projection,
-            book_fetcher: book_fetcher.clone(),
+            book_fetcher: live_book_fetcher,
+            mid_price_cache: mid_price_cache
+                .clone()
+                .with_source_log(resolution_source_log.clone()),
+            source_log: resolution_source_log.clone(),
+            source_receipts: source_receipts.clone(),
+            paper_log_path: cfg.event_log_path.clone(),
+            orchestrator_control: control_tx.clone(),
             http: live_http_client,
+            polygon_receipt_rpc_url: cfg.polygon_receipt_rpc_url.clone(),
             supabase_url: cfg.supabase_url.clone(),
             supabase_anon_key: cfg.supabase_anon_key.clone(),
             supabase_secret_key: cfg.supabase_secret_key.clone(),
@@ -916,6 +1236,7 @@ async fn main() -> Result<()> {
             clob_base_url: cfg.polymarket_clob_base_url.clone(),
             data_base_url: cfg.polymarket_base_url.clone(),
             projection_reconcile_interval_secs: cfg.supabase_sink_reconcile_interval_secs,
+            shutdown: shutdown.clone(),
         };
         let fanout_health = health.clone();
         let fanout_shutdown = shutdown.subscribe();
@@ -939,7 +1260,6 @@ async fn main() -> Result<()> {
     }
 
     let mut orch = Orchestrator::new(
-        trade_rx,
         live_watchlist.clone(),
         OrchestratorConfig {
             bankroll,
@@ -952,20 +1272,16 @@ async fn main() -> Result<()> {
             watchlist_writer_lock: Some(watchlist_writer_lock.clone()),
             max_fill_price,
             min_fill_price,
-            paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
-            paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
-            fill_mode: initial_runtime_config.fill_mode,
             price_impact_cap_bps: initial_runtime_config.price_impact_cap_bps,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
             live_accounts: live_accounts.clone(),
         },
         WinnerFollowStrategy::new(initial_runtime_config.winner_follow_config()),
-        dispatcher,
+        paper_writer,
         paper_state.clone(),
         leader_ledger,
         health.clone(),
-        market_end_cache.clone(),
         mid_price_cache.clone(),
         control_rx,
         sink_handle.clone(),
@@ -974,6 +1290,16 @@ async fn main() -> Result<()> {
         book_fetcher,
     )
     .context("build orchestrator")?;
+    if financial_start.is_some() {
+        orch.configure_financial_log_paths(
+            cfg.event_log_path.clone(),
+            cfg.source_event_log_path.clone(),
+            admission_builder,
+            boundary_mark_fetcher,
+            source_receipts,
+        )
+        .context("configure active financial protocol")?;
+    }
     orch.resume_pending_before_producers()
         .await
         .context("resume decision_pending before source producers")?;
@@ -984,6 +1310,26 @@ async fn main() -> Result<()> {
             .map(|()| TaskExit::CleanShutdown)
             .map_err(TaskFailure::typed)
     });
+    if let Some(handle) = qualification_seal.as_ref() {
+        handle
+            .apply(
+                initial_runtime_config.canonical_hash(),
+                pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("synchronize boot qualification seal check: {error}")
+            })?;
+    }
+    if let (Some(handle), Some(release_hash)) =
+        (risk_halt_release.as_ref(), initial_release_hash.as_deref())
+    {
+        handle
+            .apply(release_hash)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("synchronize boot risk halt release")?;
+    }
     producer_start_tx
         .send(true)
         .map_err(|_| anyhow::anyhow!("source producer start gate closed"))?;
@@ -992,18 +1338,18 @@ async fn main() -> Result<()> {
     // is moved into the resolution task below; `None` when not in authoritative mode.
     let supabase_rpc_calls = supabase_state.as_ref().map(|c| c.call_counter());
 
-    // Resolution polling task: periodically fetch Gamma for closed markets. In authoritative
-    // mode (issue #397) it credits via the `apply_resolution` RPC; `sink_handle` is `None`,
-    // so the best-effort `send_resolution` nudge is suppressed.
-    let resolution_poller = run_resolution_poller(
-        paper_state.clone(),
-        cfg.gamma_base_url.clone(),
-        cfg.gamma_resolution_poll_interval_secs,
-        sink_handle.clone(),
-        supabase_state,
-        shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
-    );
-    supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
+    if financial_start.is_some() {
+        let resolution_poller = run_financial_resolution_poller(
+            paper_state.clone(),
+            cfg.polymarket_clob_base_url.clone(),
+            cfg.gamma_resolution_poll_interval_secs,
+            clob_resolution_fetcher.clone(),
+            resolution_source_log,
+            control_tx.clone(),
+            shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
+        );
+        supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
+    }
 
     // Live-watchlist refresh task (#339): poll Supabase on the configured interval and refresh
     // the scores of the live set (score-update-only, #350 WS1). Spawned only when configured.
@@ -1122,7 +1468,10 @@ async fn main() -> Result<()> {
             capacity_result_rx,
             CONFIG_POLL_INTERVAL_SECS,
             clob_creds_present,
+            config_era,
             Some(health.clone()),
+            risk_halt_release.clone(),
+            qualification_seal.clone(),
         );
         supervisor.spawn(
             TaskName::RuntimeConfigPoller,
@@ -1163,7 +1512,7 @@ async fn main() -> Result<()> {
     // Shared state for paper API handlers.
     let paper_api_state = Arc::new(PaperApiState {
         paper_state: paper_state.clone(),
-        initial_bankroll: configured_bankroll,
+        initial_bankroll: starting_bankroll,
         market_end_cache,
         mid_price_cache,
     });
@@ -1225,7 +1574,6 @@ async fn main() -> Result<()> {
     drop(producer_start_tx);
     drop(admission_preparer);
     drop(control_tx);
-    drop(trade_tx);
 
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
     shutdown_timed_out |=
@@ -1355,6 +1703,7 @@ fn build_identity() -> &'static str {
 /// The idempotency-key PK backstop and organic cursor re-warm cover the gaps on restart.
 fn run_rebuild_state() -> Result<()> {
     let cfg = load_config()?;
+    ensure_pre_start_paper_log(&cfg.event_log_path, "--rebuild-state")?;
     // #511: frame-only reconstruction cannot know authority dispositions (a refused or
     // ambiguously-failed frame would resurrect locally and diverge from Supabase).
     // Rebuild is a LEGACY-mode tool.
@@ -1444,6 +1793,7 @@ fn run_rollback_paper_v1() -> Result<()> {
 /// schema is applied and before flipping `PE_SUPABASE_AUTHORITATIVE`.
 async fn run_backfill_supabase() -> Result<()> {
     let cfg = load_config()?;
+    ensure_pre_start_paper_log(&cfg.event_log_path, "--backfill-supabase")?;
     anyhow::ensure!(
         !cfg.supabase_url.is_empty(),
         "--backfill-supabase requires PE_SUPABASE_URL"
@@ -1479,6 +1829,20 @@ async fn run_backfill_supabase() -> Result<()> {
     println!("  paper_fills HWM:            {}", counts.fills_hwm);
     println!("  supabase watermark (head):  {}", counts.watermark);
     std::process::exit(0);
+}
+
+fn ensure_pre_start_paper_log(path: &std::path::Path, operation: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let era = paper_era(
+        scan_paper_log(path).with_context(|| format!("verify paper log before {operation}"))?,
+    );
+    anyhow::ensure!(
+        era.start.is_none(),
+        "{operation} is refused after QualificationStarted; preserve the era and roll forward"
+    );
+    Ok(())
 }
 
 /// Print P&L report from the existing paper-state DB and exit.
@@ -1529,140 +1893,142 @@ fn load_config() -> Result<ServiceConfig> {
     })
 }
 
-/// Periodically fetch Gamma resolutions for all open positions and credit the bankroll.
-async fn run_resolution_poller(
+fn optional_arg_value(args: &[String], name: &str) -> Option<String> {
+    let with_equals = format!("{name}=");
+    args.iter().enumerate().find_map(|(index, argument)| {
+        argument
+            .strip_prefix(&with_equals)
+            .map(str::to_owned)
+            .or_else(|| {
+                (argument == name)
+                    .then(|| args.get(index.saturating_add(1)).cloned())
+                    .flatten()
+            })
+    })
+}
+
+fn required_arg_value(args: &[String], name: &str) -> Result<String> {
+    optional_arg_value(args, name).with_context(|| format!("{name} requires a value"))
+}
+
+/// Poll the same CLOB per-condition evidence used by live resolution, append each successful
+/// response exactly once, and hand only resolved canonical vectors to the paper serializer.
+async fn run_financial_resolution_poller(
     paper_state: Arc<PaperStateDb>,
-    gamma_base_url: String,
+    clob_base_url: String,
     poll_interval_secs: u64,
-    sink: Option<SinkHandle>,
-    supabase_state: Option<SupabaseStateClient>,
+    fetcher: Arc<ReqwestFetcher>,
+    source_log: pe_service::activity_ingest::SourceLogHandle,
+    control: mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> TaskResult {
-    let fetcher = GammaResolutionFetcher::new(
-        gamma_base_url,
-        ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50),
-    );
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             () = &mut shutdown => return Ok(TaskExit::CleanShutdown),
             () = tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(1))) => {}
         }
-        if let Err(error) = tick_resolution(
+        if let Err(error) = tick_financial_resolution(
             &paper_state,
-            &fetcher,
-            sink.as_ref(),
-            supabase_state.as_ref(),
+            &clob_base_url,
+            fetcher.as_ref(),
+            &source_log,
+            &control,
         )
         .await
         {
-            warn!(error = %error, "resolution poll error");
+            warn!(error = %error, "financial resolution poll error");
         }
     }
 }
 
-async fn tick_resolution(
-    paper_state: &Arc<PaperStateDb>,
-    fetcher: &GammaResolutionFetcher<ReqwestFetcher>,
-    sink: Option<&SinkHandle>,
-    supabase_state: Option<&SupabaseStateClient>,
+async fn tick_financial_resolution(
+    paper_state: &PaperStateDb,
+    clob_base_url: &str,
+    fetcher: &ReqwestFetcher,
+    source_log: &pe_service::activity_ingest::SourceLogHandle,
+    control: &mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
 ) -> Result<()> {
-    let mut store =
-        ResolutionStore::load(Arc::clone(paper_state)).context("load resolution store")?;
-
-    let positions = paper_state.paper_positions().context("read positions")?;
-
-    // Collect market IDs with open positions that have not been settled yet.
-    let pending: Vec<pe_core_types::MarketId> = positions
-        .iter()
-        .map(|p| p.market_id.clone())
-        .collect::<std::collections::HashSet<_>>()
+    let now = OffsetDateTime::now_utc();
+    let snapshot = paper_state
+        .financial_snapshot(now.unix_timestamp())
+        .context("read financial resolution snapshot")?;
+    let conditions = snapshot
+        .positions
         .into_iter()
-        .filter(|mid| !store.is_settled(mid))
-        .collect();
+        .map(|position| position.market_id.0.0)
+        .collect::<std::collections::BTreeSet<_>>();
 
-    if pending.is_empty() {
-        return Ok(());
-    }
-
-    let resolved = fetcher
-        .fetch_closed(&pending)
+    for condition in conditions.into_iter().map(PolymarketConditionId) {
+        if let Err(error) = resolve_financial_condition(
+            clob_base_url,
+            fetcher,
+            source_log,
+            control,
+            condition.clone(),
+        )
         .await
-        .context("fetch resolutions")?;
-
-    let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-    let any_settled = !resolved.is_empty();
-    for res in resolved {
-        let market_positions: Vec<_> = positions
-            .iter()
-            .filter(|p| p.market_id == res.market_id)
-            .cloned()
-            .collect();
-        let credit;
-        if let Some(sup) = supabase_state {
-            // Authoritative (#397/#511): `apply_resolution_v2` FIRST — the credit is
-            // computed INSIDE the RPC from `paper_positions` under the bankroll lock
-            // (closing the read-then-resolve TOCTOU with fills), then mirrored to SQLite
-            // with the RETURNED canonical values. On RPC error, leave the market
-            // unsettled locally so the next tick retries (fail-closed).
-            let _ = &market_positions; // authoritative credit is server-computed (#511)
-            match apply_resolution_authoritative(
-                sup,
-                &mut store,
-                &res.market_id,
-                &res.outcome_prices,
-                now_unix,
-            )
-            .await
-            {
-                Ok(_bankroll) => {
-                    credit = store
-                        .settled_credit(&res.market_id)
-                        .unwrap_or(rust_decimal::Decimal::ZERO);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        market = %res.market_id,
-                        "authoritative apply_resolution failed; leaving unsettled for next-tick retry"
-                    );
-                    continue;
-                }
-            }
-        } else {
-            // Legacy (#511): settle + credit in ONE SQLite transaction, the credit
-            // computed inside it from freshly-read positions — a fill committing between
-            // an outside read and the settle can no longer be silently uncredited.
-            let (applied_credit, _bankroll) = paper_state
-                .settle_and_credit_from_positions(
-                    &res.market_id,
-                    &serde_json::to_string(
-                        &res.outcome_prices
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    )
-                    .context("encode outcome prices")?,
-                    now_unix,
-                    |positions| PnlLedger::resolution_credit(positions, &res.outcome_prices),
-                )
-                .context("settle and credit")?;
-            credit = applied_credit;
-            store
-                .note_settled(
-                    res.market_id.clone(),
-                    res.outcome_prices.clone(),
-                    applied_credit,
-                    now_unix,
-                )
-                .context("note settled")?;
+        {
+            warn!(condition = %condition.0, error = %error, "financial resolution condition failed; continuing");
         }
-        tracing::info!(market = %res.market_id, %credit, "resolution applied");
     }
-    // Nudge the Supabase sink once per tick to re-upsert the settled set (canonical JSON).
-    if any_settled && let Some(sink) = sink {
-        sink.send_resolution();
-    }
+    Ok(())
+}
+
+async fn resolve_financial_condition(
+    clob_base_url: &str,
+    fetcher: &ReqwestFetcher,
+    source_log: &pe_service::activity_ingest::SourceLogHandle,
+    control: &mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
+    condition: PolymarketConditionId,
+) -> Result<()> {
+    let observed_at = OffsetDateTime::now_utc();
+    let url = format!(
+        "{}/markets/{}",
+        clob_base_url.trim_end_matches('/'),
+        condition.0
+    );
+    let body = fetcher
+        .fetch_page(&url)
+        .await
+        .with_context(|| format!("fetch CLOB resolution {}", condition.0))?;
+    let received_at = OffsetDateTime::now_utc();
+    let receipt = source_log
+        .append(EnvelopeIn {
+            source_id: SourceId("polymarket.clob.market".to_owned()),
+            schema_version: CLOB_RESOLUTION_SCHEMA_VERSION,
+            parser_version: CLOB_RESOLUTION_PARSER_VERSION,
+            observed_at: SourceTimestamp(observed_at),
+            received_at: ReceivedAt(received_at),
+            content_type: ContentType::Json,
+            payload: body.clone(),
+        })
+        .await
+        .context("append CLOB resolution response")?;
+    let parsed = parse_clob_market(&body).context("parse CLOB resolution response")?;
+    anyhow::ensure!(
+        parsed.condition_id.as_deref() == Some(condition.0.as_str()),
+        "CLOB resolution condition differs from request"
+    );
+    let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
+        return Ok(());
+    };
+    let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
+    control
+        .send(
+            pe_service::orchestrator_control::OrchestratorControl::ResolutionCandidate {
+                condition,
+                payout_by_outcome_index_json: payout.canonical_json(),
+                receipt,
+                acknowledged,
+            },
+        )
+        .await
+        .context("send paper resolution candidate")?;
+    acknowledgement
+        .await
+        .context("paper resolution acknowledgement dropped")?
+        .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 

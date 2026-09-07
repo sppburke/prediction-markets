@@ -23,9 +23,9 @@ float_arithmetic = "deny"
 
 [dependencies]
 pe-core-types = { path = "../core-types", version = "0.1.0" }
-pe-source-core = { path = "../source-core", version = "0.1.0" }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

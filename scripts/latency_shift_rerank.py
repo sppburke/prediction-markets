@@ -54,7 +54,7 @@ from ranker_decay import (
 # the lookup rule or repricing semantics; the fetch side's parser identity is
 # `pe_bootstrap::prices_history::RANKER_PRICE_PARSER_VERSION` (mirrored here).
 ORACLE_NAME = "clob-minute-reference"
-ORACLE_VERSION = 1
+ORACLE_VERSION = 2
 ORACLE_FIDELITY_MINUTES = 1
 ORACLE_PARSER_VERSION = 1
 
@@ -100,6 +100,20 @@ def parse_args():
                    help="minimum track-record length: survival requires >= this many REPRICED "
                         "positions (docs/_GLOSSARY ranker_prod_min_trl). 0 = off. Mirrors pass-1; "
                         "the run28 production shape uses 20 with the per-month gates zeroed.")
+    p.add_argument("--min-ttr-secs", type=int, default=60,
+                   help="schema-two minimum scheduled horizon at entry+shift")
+    p.add_argument("--ttr-max-secs", type=int, default=259200,
+                   help="schema-two exclusive maximum scheduled horizon at entry+shift")
+    p.add_argument("--price-min", type=float, default=0.15,
+                   help="schema-two repriced band lower bound (inclusive)")
+    p.add_argument("--price-max", type=float, default=0.85,
+                   help="schema-two repriced band upper bound (exclusive)")
+    p.add_argument("--before-ranking-json",
+                   help="cycle-start snapshot of the active published batch; required for schema two")
+    p.add_argument("--cycle-manifest-file",
+                   help="frozen source/cache manifest; required for schema two")
+    p.add_argument("--cache-stage-record",
+                   help="finalized side-cache record whose digest binds publication")
     p.add_argument("--target-n", type=int, default=25)
     p.add_argument("--git-sha", default="unknown",
                    help="code revision recorded in the run manifest (the wrapper passes it)")
@@ -121,6 +135,74 @@ def load_candidates(ranked_csv: str, floor_tstat: float) -> set[str]:
             except (ValueError, KeyError):
                 continue
     return out
+
+
+def load_all_position_wallets(positions_csv: str) -> set[str]:
+    """Schema two bypasses every pass-one statistical/leader-price gate."""
+    with open(positions_csv, newline="", encoding="utf-8") as source:
+        return {row["wallet"] for row in csv.DictReader(source) if row.get("wallet")}
+
+
+def write_before_after_diff(path: str, before_path: str, rows: list[dict],
+                            target_n: int) -> None:
+    """Write a deterministic exact field-level cycle comparison."""
+    with open(before_path, encoding="utf-8") as source:
+        before_value = json.load(source)
+    if not isinstance(before_value, list):
+        raise ValueError("before-ranking snapshot must be a JSON array")
+
+    def normalized(row: dict, *, after: bool) -> dict:
+        wallet = str(row.get("wallet", row.get("wallet_hex", ""))).lower()
+        if not wallet:
+            raise ValueError("before/after ranking row omitted wallet")
+        score_key = "tstat_net_ls" if after else "score"
+        score = row.get(score_key)
+        survives = bool(row.get("survives", False))
+        rank = int(row["rank"]) if row.get("rank") not in (None, "") else None
+        eligible = bool(row.get("eligible", survives))
+        membership = bool(row.get("membership", survives and rank is not None
+                                  and rank <= target_n))
+        return {
+            "wallet": wallet,
+            "eligibility": eligible,
+            "score": None if score in (None, "") else float(score),
+            "survival": survives,
+            "rank": rank,
+            "membership": membership,
+        }
+
+    before = {item["wallet"]: item for item in (
+        normalized(row, after=False) for row in before_value
+    )}
+    after_rows = []
+    for index, row in enumerate(rows, start=1):
+        enriched = dict(row)
+        enriched["rank"] = index
+        enriched["membership"] = bool(row["survives"] and index <= target_n)
+        after_rows.append(normalized(enriched, after=True))
+    after = {item["wallet"]: item for item in after_rows}
+    diff = []
+    for wallet in sorted(set(before) | set(after)):
+        left = before.get(wallet, {
+            "wallet": wallet, "eligibility": False, "score": None,
+            "survival": False, "rank": None, "membership": False,
+        })
+        right = after.get(wallet, {
+            "wallet": wallet, "eligibility": False, "score": None,
+            "survival": False, "rank": None, "membership": False,
+        })
+        diff.append({
+            "wallet": wallet,
+            "before": {key: left[key] for key in (
+                "eligibility", "score", "survival", "rank", "membership"
+            )},
+            "after": {key: right[key] for key in (
+                "eligibility", "score", "survival", "rank", "membership"
+            )},
+        })
+    with open(path, "w", encoding="utf-8") as destination:
+        json.dump(diff, destination, sort_keys=True, separators=(",", ":"))
+        destination.write("\n")
 
 
 def sha256_file(path: str) -> str:
@@ -205,8 +287,22 @@ def main() -> int:
             "anchors the backward fetch windows (#536 review)")
         return 1
     os.makedirs(a.out_dir, exist_ok=True)
+    probe = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
+    try:
+        schema_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        probe.close()
+    if (schema_version >= 2 and not a.emit_targets
+            and (not a.before_ranking_json or not a.cycle_manifest_file
+                 or not a.cache_stage_record)):
+        log("FATAL: schema two requires cycle-start ranking and cache manifests")
+        return 1
     slip = a.slip_cents / 100.0
-    cand = load_candidates(a.ranked_csv, a.floor_tstat)
+    cand = (
+        load_all_position_wallets(a.positions_csv)
+        if schema_version >= 2
+        else load_candidates(a.ranked_csv, a.floor_tstat)
+    )
     log(f"pass-1 edge-floor candidates: {len(cand)} wallets")
     if not cand:
         log("no candidates; nothing to re-rank")
@@ -231,6 +327,7 @@ def main() -> int:
             by_mo.setdefault(key, []).append({
                 "wallet": w,
                 "entry_ts": int(r["entry_ts"]),
+                "ttr_secs": int(r["ttr_secs"]),
                 "resolved_at": int(r["resolved_at"]),
                 "payoff": float(r["payoff"]),
             })
@@ -347,17 +444,27 @@ def main() -> int:
                     if fill_price is None or not (0.0 < fill_price < 1.0):
                         reason = "invalid_price"
                     else:
+                        shifted_ttr = pos["ttr_secs"] - shift
                         eff = min(fill_price + slip, 0.999)
-                        net = (pos["payoff"] - eff) / eff
-                        net_ls.setdefault(w, []).append(net)
-                        entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
-                        g = time.gmtime(pos["entry_ts"])
-                        months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
-                        n_filled[w] = n_filled.get(w, 0) + 1
-                        payoffs.setdefault(w, []).append(pos["payoff"])
-                        staleness.append(target - t_smp)
-                        reason = "repriced"
-                        sample_t, sample_px = t_smp, px_arr[idx]
+                        if schema_version >= 2 and not (
+                            a.min_ttr_secs <= shifted_ttr < a.ttr_max_secs
+                        ):
+                            reason = "scheduled_horizon"
+                        elif schema_version >= 2 and not (
+                            a.price_min <= eff < a.price_max
+                        ):
+                            reason = "price_band"
+                        else:
+                            net = (pos["payoff"] - eff) / eff
+                            net_ls.setdefault(w, []).append(net)
+                            entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
+                            g = time.gmtime(pos["entry_ts"])
+                            months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
+                            n_filled[w] = n_filled.get(w, 0) + 1
+                            payoffs.setdefault(w, []).append(pos["payoff"])
+                            staleness.append(target - t_smp)
+                            reason = "repriced"
+                            sample_t, sample_px = t_smp, px_arr[idx]
             # token_id + sample_t uniquely locate the covering validated page in
             # ranker_price_pages — the per-position provenance chain (#536 review).
             outcomes.writerow([w, mid, oid, tok or "", pos["entry_ts"], pos["payoff"],
@@ -394,8 +501,8 @@ def main() -> int:
             and (nf / am if am else 0) >= a.min_avg_per_month
             and nf >= a.min_trl
             and fr >= a.min_fill_rate
-            and not math.isnan(t) and t >= a.floor_tstat and mean > 0
         )
+        survives = eligible and not math.isnan(t) and t >= a.floor_tstat and mean > 0
         rows.append({
             "wallet": w, "n_total": n_total[w], "n_filled": nf,
             "fill_rate": round(fr, 4), "active_months": am,
@@ -403,7 +510,8 @@ def main() -> int:
             "tstat_net_ls": round(t, 4) if not math.isnan(t) else "",
             "n_eff": round(n_eff, 4),
             "hit_rate": round(hr, 4) if not math.isnan(hr) else "",
-            "survives": eligible,
+            "eligible": eligible,
+            "survives": survives,
         })
     rows.sort(key=lambda r: (r["survives"], r["tstat_net_ls"] if r["tstat_net_ls"] != "" else -9),
               reverse=True)
@@ -412,11 +520,15 @@ def main() -> int:
     # Static fieldnames: never index rows[0] (empty when candidates had no positions
     # overlapping the positions CSV — still write a header-only file, don't crash).
     fields = ["wallet", "n_total", "n_filled", "fill_rate", "active_months",
-              "mean_net_ls", "tstat_net_ls", "n_eff", "hit_rate", "survives"]
+              "mean_net_ls", "tstat_net_ls", "n_eff", "hit_rate", "eligible", "survives"]
     with open(ranked_path, "w", newline="") as f:
         wcsv = csv.DictWriter(f, fieldnames=fields)
         wcsv.writeheader()
         wcsv.writerows(rows)
+
+    diff_path = os.path.join(a.out_dir, "before_after_diff.json")
+    if a.before_ranking_json:
+        write_before_after_diff(diff_path, a.before_ranking_json, rows, a.target_n)
 
     # Versioned run manifest: canonical JSON whose sha256 the publisher stores in
     # `ranking_batches.config_hash` (#536 replay binding). The publish request is
@@ -448,6 +560,11 @@ def main() -> int:
         "min_trl": a.min_trl,
         "min_active_months": a.min_active_months,
         "min_avg_per_month": a.min_avg_per_month,
+        "schema_version": schema_version,
+        "price_band": {"minimum_inclusive": a.price_min,
+                       "maximum_exclusive": a.price_max},
+        "scheduled_horizon": {"minimum_secs": a.min_ttr_secs,
+                              "maximum_secs_exclusive": a.ttr_max_secs},
         "git_sha": a.git_sha,
         "versions": {
             **{key: pipeline_versions[key] for key in sorted(required_versions)},
@@ -457,6 +574,15 @@ def main() -> int:
         "inputs": {
             "ranked_csv_sha256": sha256_file(a.ranked_csv),
             "positions_csv_sha256": sha256_file(a.positions_csv),
+            "before_ranking_sha256": (
+                sha256_file(a.before_ranking_json) if a.before_ranking_json else None
+            ),
+            "cycle_manifest_sha256": (
+                sha256_file(a.cycle_manifest_file) if a.cycle_manifest_file else None
+            ),
+            "cache_stage_record_sha256": (
+                sha256_file(a.cache_stage_record) if a.cache_stage_record else None
+            ),
             # The cycle's target file (stage 2a) when present — binds which windows
             # the reference store was asked to cover (#536 review).
             "oracle_targets_sha256": (
@@ -468,6 +594,9 @@ def main() -> int:
         "outputs": {
             "latency_shift_ranked_sha256": sha256_file(ranked_path),
             "oracle_outcomes_sha256": sha256_file(outcomes_path),
+            "before_after_diff_sha256": (
+                sha256_file(diff_path) if a.before_ranking_json else None
+            ),
         },
     }
     manifest_path = os.path.join(a.out_dir, "oracle_manifest.json")

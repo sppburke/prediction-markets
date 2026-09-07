@@ -196,12 +196,38 @@ class RankAndPushScenario(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             "from pathlib import Path\n"
+            "import hashlib, json\n"
             "a = sys.argv[1:]\n"
             'open("push.log", "a").write(" ".join(a) + "\\n")\n'
+            'if "--validate-request" in a:\n'
+            '    payload = json.load(open(a[a.index("--validate-request") + 1]))\n'
+            '    identity = {"batch": payload["batch"], "entries": payload["entries"]}\n'
+            '    activation = payload.get("cache_activation")\n'
+            '    if activation is not None: identity["cache_activation"] = activation\n'
+            '    expected = hashlib.sha256(json.dumps(identity, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()\n'
+            '    if payload.get("publish_key") != expected: raise SystemExit(1)\n'
+            '    if activation is not None:\n'
+            '        for key in ("side_path", "fixed_path", "prior_cache_backup_path", "expected_sha256"): print(activation[key])\n'
+            '    raise SystemExit(0)\n'
+            'if "--snapshot-current" in a:\n'
+            '    Path(a[a.index("--snapshot-current") + 1]).write_text("[]\\n")\n'
+            '    raise SystemExit(0)\n'
             'if "--request-file" in a:\n'
             '    request = Path(a[a.index("--request-file") + 1])\n'
             '    request.parent.mkdir(parents=True, exist_ok=True)\n'
-            '    request.write_text("{}\\n")\n'
+            '    payload = {"version": 1, "batch": {}, "entries": [{"rank": 1, "wallet_hex": "0xabc"}], "keep_batches": 1080}\n'
+            '    if "--cache-side-db" in a:\n'
+            '        stage = json.load(open(a[a.index("--cache-stage-record") + 1]))\n'
+            '        payload["cache_activation"] = {\n'
+            '            "side_path": a[a.index("--cache-side-db") + 1],\n'
+            '            "fixed_path": a[a.index("--cache-fixed-db") + 1],\n'
+            '            "prior_cache_backup_path": a[a.index("--prior-cache-backup") + 1],\n'
+            '            "expected_sha256": stage["cache_sha256"],\n'
+            '        }\n'
+            '    identity = {"batch": payload["batch"], "entries": payload["entries"]}\n'
+            '    if "cache_activation" in payload: identity["cache_activation"] = payload["cache_activation"]\n'
+            '    payload["publish_key"] = hashlib.sha256(json.dumps(identity, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()\n'
+            '    request.write_text(json.dumps(payload) + "\\n")\n'
             'if "--pending-file" in a:\n'
             '    pending = Path(a[a.index("--pending-file") + 1])\n'
             '    pending.parent.mkdir(parents=True, exist_ok=True)\n'
@@ -821,7 +847,9 @@ class RankAndPushScenario(unittest.TestCase):
                     SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
                 CREATE TABLE activity_coverage_manifests_v2 (
                     generation INTEGER PRIMARY KEY, cursors_json TEXT,
-                    completed_at_unix INTEGER
+                    completed_at_unix INTEGER, reference_sha256 TEXT,
+                    wallet_count INTEGER, receipt_set_digest TEXT,
+                    aggregate_digest TEXT, source_row_count INTEGER
                 );
                 CREATE TABLE activity_groups_v2 (
                     wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
@@ -829,19 +857,27 @@ class RankAndPushScenario(unittest.TestCase):
                 );
                 CREATE TABLE clob_payout_coverage_manifests_v2 (
                     generation INTEGER PRIMARY KEY, terminal_kind TEXT,
-                    completed_at_unix INTEGER
+                    completed_at_unix INTEGER, manifest_json TEXT,
+                    terminal_page_sha256 TEXT
                 );
                 CREATE TABLE clob_payout_evidence_v2 (
                     coverage_generation INTEGER, fetched_at_unix INTEGER
                 );
+                CREATE TABLE cache_v2_migration_state (
+                    singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
+                    ranker_projection_digest TEXT, ranker_classifier_version INTEGER
+                );
                 INSERT INTO wallets VALUES ('0xabc', 1, 0);
-                INSERT INTO activity_coverage_manifests_v2 VALUES (1, '{"0xabc":10}', 20);
+                INSERT INTO activity_coverage_manifests_v2 VALUES
+                    (1, '{"0xabc":10}', 20, 'aa', 1, 'bb', 'cc', 2);
                 INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
                 INSERT INTO activity_groups_v2 VALUES ('0xignored', 99, 'TRADE', 2);
                 INSERT INTO activity_groups_v2 VALUES ('0xabc', 98, 'REDEEM', 1);
-                INSERT INTO clob_payout_coverage_manifests_v2 VALUES (3, 'end_cursor', 30);
+                INSERT INTO clob_payout_coverage_manifests_v2 VALUES
+                    (3, 'end_cursor', 30, '{}', 'dd');
                 INSERT INTO clob_payout_evidence_v2 VALUES (3, 29);
                 INSERT INTO clob_payout_evidence_v2 VALUES (2, 97);
+                INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 1);
                 """
             )
 
@@ -853,12 +889,82 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(manifest["source_watermark"]["activity"]["generation"], 1)
         self.assertEqual(manifest["source_watermark"]["activity"]["count"], 2)
         self.assertEqual(manifest["source_watermark"]["activity"]["newest_source_unix"], 10)
+        self.assertEqual(manifest["source_watermark"]["activity"]["receipt_set_digest"], "bb")
+        self.assertEqual(
+            manifest["source_watermark"]["activity"]["ranker_projection"]["digest"], "ee"
+        )
         self.assertEqual(manifest["source_watermark"]["resolution"]["generation"], 3)
         self.assertEqual(manifest["source_watermark"]["resolution"]["count"], 1)
         self.assertEqual(manifest["source_watermark"]["resolution"]["newest_fetch_unix"], 29)
+        self.assertEqual(
+            manifest["source_watermark"]["resolution"]["terminal_page_sha256"], "dd"
+        )
         self.assertEqual(manifest["versions"]["activity_parser"], 2)
         self.assertEqual(manifest["versions"]["clob_resolution_schema"], 2)
         self.assertEqual(manifest["versions"]["ranker"], 1)
+
+    def test_schema_two_prepares_then_activates_then_resumes_exact_request(self):
+        """The corrected batch request is durable before cache activation and the
+        same request is resumed only after the idempotent activation command."""
+        side = self.root / "data" / "wallet_cache.side.db"
+        with sqlite3.connect(side) as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 2;
+                CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, is_active INTEGER, is_infra INTEGER);
+                CREATE VIEW active_tradeable_wallets AS
+                    SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+                CREATE TABLE activity_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, cursors_json TEXT, completed_at_unix INTEGER,
+                    reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT,
+                    aggregate_digest TEXT, source_row_count INTEGER);
+                CREATE TABLE activity_groups_v2 (
+                    wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
+                    coverage_generation INTEGER);
+                CREATE TABLE clob_payout_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, terminal_kind TEXT, completed_at_unix INTEGER,
+                    manifest_json TEXT, terminal_page_sha256 TEXT);
+                CREATE TABLE clob_payout_evidence_v2 (
+                    coverage_generation INTEGER, fetched_at_unix INTEGER);
+                CREATE TABLE cache_v2_migration_state (
+                    singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
+                    ranker_projection_digest TEXT, ranker_classifier_version INTEGER);
+                INSERT INTO wallets VALUES ('0xabc', 1, 0);
+                INSERT INTO activity_coverage_manifests_v2 VALUES
+                    (1, '[]', 20, 'aa', 1, 'bb', 'cc', 1);
+                INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
+                INSERT INTO clob_payout_coverage_manifests_v2 VALUES
+                    (1, 'end_cursor', 30, '{}', 'dd');
+                INSERT INTO clob_payout_evidence_v2 VALUES (1, 29);
+                INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 1);
+                """
+            )
+        stage = self.root / "data" / "cache-stage.json"
+        stage.write_text(json.dumps({
+            "cache_path": str(side.resolve()), "cache_sha256": "a" * 64,
+        }))
+        out = "data/eval-results/cron-20260905T000000Z"
+        result = self._run(
+            "--db", str(side), "--out-dir", out,
+            "--cache-stage-record", str(stage),
+            "--fixed-db", "data/wallet_cache.db",
+            "--prior-cache-backup", "data/wallet_cache.prior.db",
+            "--skip-discovery", "--skip-backfill", "--keep-intermediates",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        push_lines = (self._log("push.log") or "").splitlines()
+        self.assertIn("--snapshot-current", push_lines[0])
+        self.assertIn("--prepare-only", push_lines[1])
+        self.assertIn("--cache-stage-record", push_lines[1])
+        self.assertIn("--validate-request", push_lines[2])
+        self.assertIn("--resume-request", push_lines[3])
+        bootstrap = (self._log("pe_bootstrap.log") or "").splitlines()
+        operations = [line.split()[0] for line in bootstrap]
+        self.assertEqual(
+            operations,
+            ["prices-history", "cache-finalize-v2", "cache-activate"],
+        )
+        print("PASS: schema-two request preparation precedes activation and exact resume")
 
     def test_parameterized_research_run_never_owns_production_pending_pointer(self):
         result = self._run("--skip-purge")
@@ -947,6 +1053,46 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse(
             (self.root / "data" / "eval-results" / ".rank_and_push.lock").exists()
         )
+
+    def test_resume_rejects_tampered_request_before_cache_activation(self):
+        """PASS: the publisher validates publish_key before the wrapper invokes activation.
+        FAIL: a modified activation tuple reaches pe-bootstrap."""
+        request_dir = self.root / "data" / "eval-results" / "cron-tampered"
+        request_dir.mkdir()
+        request = request_dir / "ranking_publish_request.json"
+        activation = {
+            "side_path": "data/side.db",
+            "fixed_path": "data/wallet_cache.db",
+            "prior_cache_backup_path": "data/prior.db",
+            "expected_sha256": "a" * 64,
+        }
+        identity = {
+            "batch": {},
+            "entries": [{"rank": 1, "wallet_hex": "0xabc"}],
+            "cache_activation": activation,
+        }
+        payload = {
+            "version": 1,
+            "batch": identity["batch"],
+            "entries": identity["entries"],
+            "keep_batches": 1080,
+            "cache_activation": activation,
+            "publish_key": __import__("hashlib").sha256(
+                json.dumps(identity, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest(),
+        }
+        payload["cache_activation"]["side_path"] = "data/tampered.db"
+        request.write_text(json.dumps(payload) + "\n")
+        pending = self.root / "data" / "eval-results" / "rank_and_push.pending"
+        pending.write_text(
+            "data/eval-results/cron-tampered/ranking_publish_request.json\n"
+        )
+
+        result = self._run("--resume-pending")
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIsNone(self._log("pe_bootstrap.log"))
+        self.assertTrue(pending.is_file())
+        print("PASS: tampered pending request is rejected before activation")
 
     def test_default_half_life_threaded_to_both_passes(self):
         r = self._run()

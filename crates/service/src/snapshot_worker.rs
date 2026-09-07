@@ -133,7 +133,7 @@ pub fn absorbable_usd_within_bps(book: &OrderBook, bps: u64) -> Option<Decimal> 
 
 // NOTE (#508 Phase A): the former `absorbable_contracts_within_bps` — the #398 WS2 gate's
 // contract-count sum — was removed with the gate's move to the budget-based ladder planner
-// (`pe_venue_polymarket::plan_budget_buy`), which owns the within-band quantity, VWAP, and
+// (`pe_venue_polymarket::plan_sized_buy`), which owns the within-band quantity, VWAP, and
 // worst-case debit. `absorbable_usd_within_bps` stays: it feeds the analytics column
 // `absorbable_usd_100bps`, not the gate.
 
@@ -183,10 +183,11 @@ where
     let liquidity = gamma.and_then(|s| s.liquidity);
     let volume = gamma.and_then(|s| s.volume);
     let token = gamma.and_then(|s| s.clob_token_ids.get(usize::from(req.outcome_id.0)).cloned());
+    let condition_id = req.market_id.to_string();
 
     // CLOB /book → absorbable depth + raw asks. Best-effort: failure/absent token ⇒ partial.
     let (absorbable_usd_100bps, ask_levels_json) = match token.as_deref() {
-        Some(token_id) => match book_fetcher.fetch_book(token_id).await {
+        Some(token_id) => match book_fetcher.fetch_book(&condition_id, token_id).await {
             Ok(book) => (
                 absorbable_usd_within_bps(&book, ABSORBABLE_DEPTH_BPS),
                 ask_levels_json(&book),
@@ -286,6 +287,7 @@ mod tests {
                 .collect(),
             response_blake3: String::new(),
             fetched_at_ms: 0,
+            source_receipt: None,
         }
     }
 

@@ -89,18 +89,23 @@ pub(crate) fn compute_stats(
     })
 }
 
-/// LCB_5pct = mean − 1.645 × stderr, expressed in basis points.
+/// Exact Decimal core of LCB_5pct = mean − 1.645 × stderr.
 ///
 /// `stderr = sqrt(variance / n)` using `Decimal::sqrt()` (maths feature).
-/// Returns `BasisPoints(i32::MIN)` when `n < 2` (score undefined — caller treats as ineligible).
-fn lcb_5pct(returns: &[Decimal], n: u32) -> BasisPoints {
-    if n < 2 {
-        return BasisPoints(i32::MIN);
+/// Returns `None` below two samples because the score is undefined.
+pub fn lcb_5pct_decimal(samples: &[Decimal]) -> Option<Decimal> {
+    if samples.len() < 2 {
+        return None;
     }
-    let n_dec = Decimal::from(n);
-    let mean = returns.iter().copied().fold(Decimal::ZERO, |a, r| a + r) / n_dec;
-    let variance = returns.iter().copied().fold(Decimal::ZERO, |acc, r| {
-        let diff = r - mean;
+    let sample_count = u64::try_from(samples.len()).ok()?;
+    let n_dec = Decimal::from(sample_count);
+    let mean = samples
+        .iter()
+        .copied()
+        .fold(Decimal::ZERO, |acc, sample| acc + sample)
+        / n_dec;
+    let variance = samples.iter().copied().fold(Decimal::ZERO, |acc, sample| {
+        let diff = sample - mean;
         acc + diff * diff
     }) / n_dec;
 
@@ -108,7 +113,16 @@ fn lcb_5pct(returns: &[Decimal], n: u32) -> BasisPoints {
     let stderr = (variance / n_dec).sqrt().unwrap_or(Decimal::ZERO);
 
     // z_{0.05} ≈ 1.645 (one-tailed 5th percentile of standard normal).
-    let lcb = mean - dec!(1.645) * stderr;
+    Some(mean - dec!(1.645) * stderr)
+}
+
+/// Basis-point adapter retained by the ranking path.
+///
+/// Undefined scores keep the existing `i32::MIN` ineligibility sentinel.
+fn lcb_5pct(returns: &[Decimal], _n: u32) -> BasisPoints {
+    let Some(lcb) = lcb_5pct_decimal(returns) else {
+        return BasisPoints(i32::MIN);
+    };
     // Pass the return ratio directly; BasisPoints::from_decimal scales by ×10_000 internally.
     BasisPoints::from_decimal(lcb)
 }
@@ -155,5 +169,7 @@ mod tests {
     fn lcb_5pct_below_two_returns_sentinel() {
         assert_eq!(lcb_5pct(&[dec!(0.05)], 1).0, i32::MIN);
         assert_eq!(lcb_5pct(&[], 0).0, i32::MIN);
+        assert_eq!(lcb_5pct_decimal(&[dec!(0.05)]), None);
+        assert_eq!(lcb_5pct_decimal(&[]), None);
     }
 }

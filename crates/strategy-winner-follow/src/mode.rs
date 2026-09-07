@@ -13,11 +13,12 @@ pub enum ExecutionMode {
     Shadow,
     /// Paper-copy; Kelly fraction = 0.10. Execution handled by `execution-core` (#18).
     Paper,
-    /// First live stage; Kelly fraction = 0.25. The 25 bps `ModeDefault` per-trade cap is
-    /// retired in production (#508 — the price-impact cap is the sole policy size limit).
+    /// First live stage; Kelly fraction = 0.25. `ModeDefault` resolves to 25 bps here; the
+    /// production per-trade cap policy (reviewed `unlimited`, valid post-activation rows) is
+    /// canonical in `docs/19-WINNER-FOLLOW-STRATEGY.md`.
     LiveTiny,
-    /// Post-promotion live stage; Kelly fraction = 0.25. The 100 bps `ModeDefault` per-trade
-    /// cap is likewise retired in production (#508).
+    /// Post-promotion live stage; Kelly fraction = 0.25. `ModeDefault` resolves to 100 bps
+    /// here; the production cap policy is canonical in `docs/19-WINNER-FOLLOW-STRATEGY.md`.
     Promoted,
 }
 

@@ -8,11 +8,16 @@
 
 use std::sync::Arc;
 
+use pe_core_types::PolymarketConditionId;
 use pe_core_types::WalletAddress;
+use pe_event_log::AppendReceipt;
+use pe_risk_engine::RiskHaltCause;
 use pe_source_polymarket_public::ActivityAggregate;
+use pe_trader_index::WatchlistEntry;
 use tokio::sync::oneshot;
 
 use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
+use crate::paper_recovery::{HaltState, MembershipChange, RiskHaltOwner};
 use crate::position_seeder::AnchorInstall;
 
 /// Exact single-owner ledger capture used by the causal bracket.
@@ -50,5 +55,39 @@ pub enum OrchestratorControl {
         aggregates: Vec<ActivityAggregate>,
         context: Arc<BucketDecisionContext>,
         committed: oneshot::Sender<Result<BucketCommitResult, String>>,
+    },
+    /// CLOB resolution evidence was durably appended by the caller. The orchestrator
+    /// serializes its Prepared/authority/local/Final financial transition.
+    ResolutionCandidate {
+        condition: PolymarketConditionId,
+        payout_by_outcome_index_json: String,
+        receipt: AppendReceipt,
+        acknowledged: oneshot::Sender<Result<(), String>>,
+    },
+    /// Publish one structural membership transition after its paper record synchronizes.
+    PublishMembership {
+        change: MembershipChange,
+        replacements: Vec<WatchlistEntry>,
+        acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
+    },
+    /// Append one risk-cause edge before acknowledging it to the producer.
+    RiskHaltChange {
+        owner: RiskHaltOwner,
+        cause: RiskHaltCause,
+        state: HaltState,
+        evidence: serde_json::Value,
+        acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
+    },
+    /// Daily mark producer handoff. Lane D owns mark construction semantics.
+    DailyBoundary {
+        cutoff_unix: i64,
+        boundary_receipt: AppendReceipt,
+        acknowledged: oneshot::Sender<Result<(), String>>,
+    },
+    /// Qualification seal producer handoff. Lane F owns the verifier semantics.
+    SealCheck {
+        proposed_economic_hash: String,
+        proposed_financial_semantic_version: u32,
+        acknowledged: oneshot::Sender<Result<(), String>>,
     },
 }

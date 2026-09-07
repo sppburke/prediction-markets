@@ -164,7 +164,8 @@ fn stable_bracket_responses(wallets: &[WalletAddress]) -> HashMap<String, Vec<Ve
             "asset": format!("asset-{index}"),
             "conditionId": format!("condition-{index}"),
             "size": "1",
-            "outcomeIndex": 0
+            "outcomeIndex": 0,
+            "negativeRisk": false
         })])
         .unwrap();
         responses.insert(
@@ -342,6 +343,7 @@ fn poller_harness(
                     }
                     let _ = acknowledged.send(result);
                 }
+                _ => {}
             }
         }
     });
@@ -436,6 +438,7 @@ async fn refresh_outcome_for_install_rejection(
                 OrchestratorControl::InstallAnchors { acknowledged, .. } => {
                     let _ = acknowledged.send(Err(rejection.take().unwrap()));
                 }
+                _ => {}
             }
         }
     });
@@ -450,6 +453,8 @@ async fn refresh_outcome_for_install_rejection(
     outcome
 }
 
+/// PASS: one due wallet is refreshed per poll round and fairness advances in watchlist order.
+/// FAIL: a round refreshes multiple wallets, skips a due wallet, or terminates the poller.
 #[tokio::test]
 async fn refreshes_at_most_one_due_wallet_per_round_in_round_robin_order() {
     let wallets = [wallet(0x11), wallet(0x22)];
@@ -622,6 +627,8 @@ async fn deferred_refresh_continues_the_poller() {
     finish_harness(ingest, actor, preparer).await;
 }
 
+/// PASS: every typed anchor-install rejection is deferred without publishing a partial anchor.
+/// FAIL: a rejection escapes as a fatal refresh error or installs any rejected anchor.
 #[tokio::test]
 async fn every_install_rejection_defers_refresh() {
     let wallet = wallet(0x5a);

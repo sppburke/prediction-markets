@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use pe_core_types::{
-    EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, VenueMarketId,
-    WalletAddress,
+    CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
+    VenueMarketId, WalletAddress,
 };
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
@@ -32,6 +32,7 @@ fn wallet() -> WalletAddress {
 /// Commit a BUY of `contracts` YES @ `price` in `mkt` (debits the bankroll, keeps the
 /// position row), mirroring a real entry fill.
 fn enter(db: &Arc<PaperStateDb>, mkt: &MarketId, key: &str, contracts: u64, price: Decimal) {
+    let quantity = ShareAmount::from_whole(contracts).unwrap();
     db.commit_fill(
         &SourceTradeId(format!("src-{key}")),
         &LeaderPositionRow {
@@ -46,8 +47,10 @@ fn enter(db: &Arc<PaperStateDb>, mkt: &MarketId, key: &str, contracts: u64, pric
             market_id: mkt.clone(),
             outcome_id: OutcomeId(0),
             side: Side::Buy,
-            contracts,
+            quantity,
             fill_price: Price(price),
+            principal: CollateralAmount::from_decimal_exact(price * quantity.to_decimal()).unwrap(),
+            fee: CollateralAmount::ZERO,
         },
         EventSeq(1),
     )

@@ -105,8 +105,8 @@ impl WalletEdgeStats {
 /// `now_unix − pnl_window_secs`.
 ///
 /// Only **settled** fills (market present in `resolutions`) carrying a parseable
-/// Winner-Follow leader (`ParsedKey::from_key`) and non-zero `contracts` contribute.
-/// Open fills, legacy/foreign idempotency keys, and zero-contract fills (which carry
+/// Winner-Follow leader (`ParsedKey::from_key`) and non-zero quantity contribute.
+/// Open fills, legacy/foreign idempotency keys, and zero-quantity fills (which carry
 /// no edge) are skipped. The returned map is keyed by the leader hex parsed from the
 /// idempotency key.
 pub fn wallet_edge_stats(
@@ -129,8 +129,8 @@ pub fn wallet_edge_stats(
         let Some(leader) = ParsedKey::from_key(&f.idempotency_key).leader else {
             continue;
         };
-        // A zero-contract fill carries no edge; skip it rather than dilute the sample.
-        if f.contracts == 0 {
+        // A zero-quantity fill carries no edge; skip it rather than dilute the sample.
+        if f.quantity == pe_core_types::ShareAmount::ZERO {
             continue;
         }
         series.entry(leader).or_default().push(SettledEdge {
@@ -252,7 +252,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use pe_core_types::{MarketId, OutcomeId, Price, Side, VenueMarketId};
+    use pe_core_types::{
+        CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, VenueMarketId,
+    };
     use pe_paper_state::PaperStateDb;
     use rust_decimal_macros::dec;
 
@@ -278,14 +280,19 @@ mod tests {
             Side::Buy => "buy",
             Side::Sell => "sell",
         };
+        let quantity = ShareAmount::from_whole(contracts).unwrap();
         FillRow {
             idempotency_key: format!("wf|{leader}|0xsrc|{market}|{outcome}|{side_str}|1700000000"),
             market_id: mid(market),
             outcome_id: OutcomeId(outcome),
             side,
-            contracts,
+            quantity,
             fill_price: Price(price),
-            event_seq: 1,
+            principal: CollateralAmount::from_decimal_exact(price * quantity.to_decimal()).unwrap(),
+            fee: CollateralAmount::ZERO,
+            event_seq: EventSeq(1),
+            prepared_seq: EventSeq(1),
+            source_receipt_seq: None,
         }
     }
 
@@ -439,7 +446,7 @@ mod tests {
 
     /// Reverse direction of the window divergence (intentional): a lifetime LOSER
     /// whose trailing window is flat-or-positive is NOT demoted this tick — the
-    /// windowed conjunct is the sole P&L gate, and it fails open toward keeping.
+    /// windowed conjunct is the sole P&L gate, so the wallet remains when that conjunct is false.
     /// (It stays demotable the moment its window turns red again; inactivity
     /// eviction still applies independently.)
     #[test]
@@ -520,15 +527,10 @@ mod tests {
             fill("0xA", "0xopen", 0, Side::Buy, 100, dec!(0.50)),
             // Foreign/legacy key (not "wf|...") → skipped.
             FillRow {
-                idempotency_key: "legacy-key".to_string(),
-                market_id: mid("0xm"),
-                outcome_id: OutcomeId(0),
-                side: Side::Buy,
-                contracts: 100,
-                fill_price: Price(dec!(0.50)),
-                event_seq: 1,
+                idempotency_key: "legacy-key".to_owned(),
+                ..fill("ignored", "0xm", 0, Side::Buy, 100, dec!(0.50))
             },
-            // Zero-contract fill → skipped (carries no edge).
+            // Zero-quantity fill → skipped (carries no edge).
             fill("0xA", "0xm", 0, Side::Buy, 0, dec!(0.50)),
         ];
 
@@ -536,7 +538,7 @@ mod tests {
         assert_eq!(stats.len(), 2, "only 0xA and 0xB have settled wf fills");
 
         let a = stats.get("0xA").unwrap();
-        assert_eq!(a.settled_count, 2, "open/foreign/zero-contract excluded");
+        assert_eq!(a.settled_count, 2, "open/foreign/zero-quantity excluded");
         assert_eq!(a.realized_pnl, dec!(-70)); // −50 + −20
         assert_eq!(a.windowed_pnl, dec!(-70)); // both settled in-window
 

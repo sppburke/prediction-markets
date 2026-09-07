@@ -84,6 +84,7 @@ fn defaults_apply_without_toml() {
     let cfg = load(None).expect("load(None) must succeed with output_dir set");
 
     assert_eq!(cfg.bankroll_usd, Decimal::from(10_000u32));
+    assert_eq!(cfg.modeled_polymarket_fee_rate, dec!(0.04));
     assert_eq!(cfg.step_days, 1);
     assert_eq!(cfg.audit_window_days, 90);
     assert_eq!(cfg.ranker_min_quality, 0);

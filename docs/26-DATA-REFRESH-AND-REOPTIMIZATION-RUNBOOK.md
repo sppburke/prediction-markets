@@ -40,9 +40,9 @@ cargo build --release -p pe-bootstrap
   rebuild.
   Symptom to recognize: `sqlite: unable to open database file` from a stage whose cache
   path is demonstrably writable.
-- **Market resolutions (no RPC).** The resolution pipeline is CLOB → Gamma:
-  the Polymarket CLOB `/markets?closed=true` listing is the sole resolution
-  source (#369; key-free), with Gamma supplying open-market schedules/liquidity.
+- **Market resolutions (no RPC).** The Polymarket CLOB `/markets?closed=true`
+  listing is the sole payout-resolution source (#369; key-free). Gamma supplies
+  schedules, event mappings, liquidity, and mark-price inputs, never payouts.
   No Polygon RPC / Alchemy provider is required.
 - **Supabase + Python.** `.env` must carry `SUPABASE_URL` + `SUPABASE_SECRET_KEY`
   (the push reads them). `rank_and_push.sh` selects its own interpreter so the documented
@@ -51,8 +51,8 @@ cargo build --release -p pe-bootstrap
   not silently use the system `python3`. Install `scripts/requirements.txt` into one of those
   repository environments. Before taking the PID lock, creating a run directory, or refreshing
   the cache, the wrapper imports its required modules and exits with remediation instructions if
-  the environment is incomplete. DuckDB remains optional under `engine=auto` (SQLite fallback)
-  and is mandatory under `engine=duck`.
+  the environment is incomplete. Schema one retains `engine=auto` with its SQLite fallback;
+  schema two requires the verified Parquet/DuckDB path and rejects SQLite.
 
 ---
 
@@ -85,12 +85,12 @@ not new discovery.)
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap backfill
 
-# 2. Refresh condition→event + fee mappings (needed by the ranker's
+# 2. Refresh condition→event mappings (needed by the ranker's
 #    distinct-events eligibility gate; backfill does not cover this).
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap events
 
-# 3. (Optional) Run the full CLOB resolution re-walk + Gamma auxiliaries explicitly.
+# 3. (Optional) Run the full CLOB resolution re-walk explicitly.
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 \
   ./target/release/pe-bootstrap resolutions
@@ -122,7 +122,7 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 > - **The 403 gate is the literal `Python-urllib/*` default User-Agent, not "missing browser UA".**
 >   `&closed=true` returned 200 for a *headerless* request (a bare `reqwest::Client`, = the shipped
 >   Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and 403
->   **only** for `Python-urllib/3.11`. So `pe-bootstrap`'s CLOB closed walk and the paper-pnl
+>   **only** for `Python-urllib/3.11`. So `pe-bootstrap`'s CLOB closed walk and the service CLOB
 >   resolution poller (both UA-less) do **not** 403; transport was healthy during the 2026-06-24
 >   through 2026-08-21 cursor-wedge incident, while repeat resolution ingestion was not. The proven
 >   scripts' "browser UA required (else 403)" note is correct only because `urllib` auto-injects the
@@ -133,7 +133,7 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 >   no longer lists, not truncation). Comma-separated joining returns 0 — repeat-key is mandatory.
 >   Observed cap ≥ 100; default `gamma_batch_size` stays 50 (`_GLOSSARY.md`).
 > - This unblocks a shared batched Gamma client (~60× the per-ID ~20 req/s) across `pe-bootstrap`,
->   `pe-service`, and `pe-paper-pnl` — including the *open* passes, which the stale
+>   `pe-service` and bootstrap metadata paths — including the *open* passes, which the stale
 >   `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" comment wrongly excludes.
 
 **Exit codes** (a vocabulary — each `pe-bootstrap` subcommand emits a subset):
@@ -155,8 +155,8 @@ sqlite3 data/wallet_cache.db "
 ```
 
 `newest_trade` should be within the last day or two. If `resolved_mkts` is low
-relative to the markets your wallets traded, re-run step 3 (the CLOB → Gamma
-resolution pipeline — no RPC required, #369/#372).
+relative to the markets your wallets traded, re-run step 3 (the CLOB resolution
+walk — no RPC required, #369/#372).
 
 > **Backfill before pushing (issue #350 WS3).** The Supabase upload
 > (`scripts/push_ranking_to_supabase.py`, invoked by `scripts/rank_and_push.sh`)
@@ -323,45 +323,77 @@ activity and CLOB-payout generations, and no API unions the generations.
 pe-bootstrap cache-migrate-v2 \
   --db "$CACHE_V2_SIDE" --manifest "$CACHE_BUILD_MANIFEST"
 
-pe-bootstrap cache-populate-activity-v2 \
-  --db "$CACHE_V2_SIDE" --fixed-end "$FIXED_END_UNIX" --generation 1
-
-pe-bootstrap cache-populate-payout-v2 --db "$CACHE_V2_SIDE"
-
 pe-bootstrap cache-verify-frozen-v1 \
   --db "$CACHE_V2_SIDE" --frozen-payload "$FROZEN_PAYLOAD_REFERENCE"
 
+pe-bootstrap cache-populate-activity-v2 \
+  --db "$CACHE_V2_SIDE" --frozen-payload "$FROZEN_PAYLOAD_REFERENCE" \
+  --fixed-end "$FIXED_END_UNIX" --generation 1
+
+pe-bootstrap cache-populate-payout-v2 --db "$CACHE_V2_SIDE"
+
 pe-bootstrap cache-finalize-v2 \
   --db "$CACHE_V2_SIDE" --stage-record "$CACHE_STAGE_RECORD"
-
-pe-bootstrap cache-activate \
-  --db "$CACHE_V2_SIDE" \
-  --fixed-db data/wallet_cache.db \
-  --backup "$CACHE_V1_BACKUP" \
-  --expected-sha256 "$CACHE_V2_SHA256"
 ```
 
-Each command is idempotent only for the same recorded evidence. Activity coverage is published
-only after every fixed-end wallet walk completes; payout coverage requires a complete terminal
-CLOB walk; the frozen-payload verification must reproduce the last accepted active-wallet and
-freshness/cursor facts with zero cross-generation identity matches. Finalization verifies both
-coverage generations, integrity, checkpoint/truncate, the exact main-file hash, and parent sync.
-Activation itself acquires all three Forge locks in canonical order and rechecks reclamation
-evidence before the atomic fixed-path rename.
+Frozen verification precedes all activity I/O. Each completed wallet commits its aggregates and
+receipt together; restart schedules only missing exact receipts, and finalization requires the
+receipt set to equal the frozen universe before atomically installing the activity manifest and
+deleting staging. Finalization also verifies payout coverage, builds the Rust ledger/classifier
+projection, and records its count and digest.
 
-Pre-activation rollback preserves the failed v2 main for audit and restores the immutable v1
-main only:
+Rank and cut over through the one publication path. This snapshots the current published batch,
+exports and verifies the schema-two Parquet projection, computes the minute-price rerank and exact
+diff, durably prepares the publication request, activates the side cache, then resumes that exact
+request. The targeted price-store write is re-finalized before request preparation so the stage
+hash covers the installed bytes:
 
 ```bash
-pe-bootstrap cache-rollback-v1 \
+PE_PYTHON="$PE_PYTHON" bash scripts/rank_and_push.sh \
+  --db "$CACHE_V2_SIDE" --engine duck \
+  --cache-stage-record "$CACHE_STAGE_RECORD" \
   --fixed-db data/wallet_cache.db \
-  --backup "$CACHE_V1_BACKUP" \
-  --failed-backup "$FAILED_CACHE_V2_BACKUP"
+  --prior-cache-backup "$CACHE_PRIOR_BACKUP" \
+  --skip-discovery --skip-backfill
 ```
 
-After activation, normal ranking/export still names the legacy `trades` table and is not a v2
-ranking consumer. Keep the production loop stopped. The only verified v2 publication path in
-this cycle is a unique-notes pure re-push of the last accepted payload; it must remain purge-free.
+The exact publication request carries the side path, fixed path, generic prior-backup path, and
+stage hash inside its `publish_key`. If the process stops after preparation, the existing pending
+pointer resumes idempotent activation before publication; no additional pointer is used. Before
+either first activation or resumed activation, the publisher validates the complete request and
+returns the sole activation tuple consumed by the wrapper. A content-hash mismatch therefore fails
+before any cache mutation. Request and pointer replacement fsync both the new file and containing
+directory. Activation accepts a verified schema-one or schema-two fixed cache and retains one
+generic prior-main backup.
+
+The wrapper remains the one-shot run-lock owner. For activation it passes the inherited run-lock
+descriptor and, under the supervisor, the inherited loop-lock descriptor. `pe-bootstrap` verifies
+each descriptor's inode, PID stamp, and live kernel contention before skipping only that lock; Rust
+always acquires the cache lock. A direct `pe-bootstrap cache-activate` call without that verified
+handoff continues to acquire loop → run → cache itself.
+
+Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
+hash and schema. Preserve the displaced cache for audit:
+
+```bash
+pe-bootstrap cache-restore-prior \
+  --fixed-db data/wallet_cache.db \
+  --backup "$CACHE_PRIOR_BACKUP" \
+  --displaced-backup "$DISPLACED_CACHE_BACKUP" \
+  --prior-sha256 "$PRIOR_CACHE_SHA256" \
+  --prior-schema "$PRIOR_CACHE_SCHEMA" \
+  --publication-request "$PUBLISH_REQUEST_FILE" \
+  --pending-pointer data/eval-results/rank_and_push.pending
+```
+
+Run this only with `SUPABASE_URL` and `SUPABASE_SECRET_KEY` in the environment after stopping the
+rank supervisor. Restore validates the pending pointer, the complete request `publish_key`, the
+fixed/prior activation paths, and the installed corrected-cache hash while holding the Forge lock
+stack. It then asks authoritative `ranking_batches.publish_key` whether that exact publication was
+ever consumed. A consumed publication, a missing/malformed pointer or request, or unavailable
+authority refuses restoration; recover by rolling forward through the existing pending-publication
+path. There is no operator assertion flag. Schema one retains `auto | duck | sqlite`; schema two
+requires the verified DuckDB snapshot and refuses SQLite.
 
 ### Continuous Forge supervisor
 

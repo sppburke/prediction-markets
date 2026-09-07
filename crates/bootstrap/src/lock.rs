@@ -1,4 +1,4 @@
-//! Cross-process mutex for `pe-bootstrap` cache mutations (#544).
+//! Cross-process mutex and verified activation handoff for Forge cache mutations (#544/#545).
 //!
 //! [`CacheMutationLock`] uses a persistent inode beside the cache
 //! (`<cache_path>.lock`) and an exclusive nonblocking kernel lock. The inode is
@@ -27,18 +27,45 @@ pub struct CacheMutationLock {
 }
 
 /// Cutover guard holding the three persistent Forge locks in the only allowed
-/// order: loop → one-shot run → cache (#544).
+/// order: loop → one-shot run → cache (#544/#545).
 #[derive(Debug)]
 #[must_use = "all Forge activation locks release when the guard is dropped"]
 pub struct ForgeActivationLocks {
-    _loop_file: File,
-    _run_file: File,
+    _loop_file: Option<File>,
+    _run_file: Option<File>,
     _cache: CacheMutationLock,
+}
+
+/// One inherited shell lock proven to refer to the expected persistent inode.
+///
+/// The descriptor stays owned by the invoking shell (and inherited across
+/// `exec`).  Rust validates it before skipping only that already-held lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InheritedForgeLock {
+    pub fd: u32,
+    pub holder_pid: u32,
+}
+
+/// Explicit handoff from `rank_and_push.sh` to cache activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeLockHandoff {
+    pub loop_lock: Option<InheritedForgeLock>,
+    pub run_lock: InheritedForgeLock,
 }
 
 impl ForgeActivationLocks {
     /// Acquire every Forge mutation owner needed for fixed-path activation.
     pub fn acquire(cache_path: &Path) -> Result<Self, BootstrapError> {
+        Self::acquire_with_handoff(cache_path, None)
+    }
+
+    /// Acquire the Forge lock stack, accepting only verified inherited shell
+    /// ownership for the named loop/run locks. The cache lock is never handed
+    /// off and is always acquired by this process.
+    pub fn acquire_with_handoff(
+        cache_path: &Path,
+        handoff: Option<&ForgeLockHandoff>,
+    ) -> Result<Self, BootstrapError> {
         let parent = cache_path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -46,8 +73,20 @@ impl ForgeActivationLocks {
         let eval_results = parent.join("eval-results");
         let loop_path = eval_results.join(".rank_and_push_loop.lock");
         let run_path = eval_results.join(".rank_and_push.lock");
-        let loop_file = acquire_named_lock(&loop_path, "ranking loop")?;
-        let run_file = acquire_named_lock(&run_path, "one-shot ranking run")?;
+        let loop_file = match handoff.and_then(|value| value.loop_lock.as_ref()) {
+            Some(inherited) => {
+                verify_inherited_lock(&loop_path, "ranking loop", inherited, false)?;
+                None
+            }
+            None => Some(acquire_named_lock(&loop_path, "ranking loop")?),
+        };
+        let run_file = match handoff.map(|value| &value.run_lock) {
+            Some(inherited) => {
+                verify_inherited_lock(&run_path, "one-shot ranking run", inherited, true)?;
+                None
+            }
+            None => Some(acquire_named_lock(&run_path, "one-shot ranking run")?),
+        };
         let cache = CacheMutationLock::acquire(cache_path)?;
         Ok(Self {
             _loop_file: loop_file,
@@ -55,6 +94,86 @@ impl ForgeActivationLocks {
             _cache: cache,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_inherited_lock(
+    path: &Path,
+    owner: &str,
+    inherited: &InheritedForgeLock,
+    require_parent: bool,
+) -> Result<(), BootstrapError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if inherited.holder_pid == 0 {
+        return Err(BootstrapError::Invalid {
+            message: format!("{owner} lock handoff has an invalid holder PID"),
+        });
+    }
+    if require_parent && process_parent_pid()? != inherited.holder_pid {
+        return Err(BootstrapError::Invalid {
+            message: format!("{owner} lock handoff holder is not the invoking wrapper"),
+        });
+    }
+
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", inherited.fd));
+    let descriptor =
+        std::fs::metadata(&descriptor_path).map_err(|error| BootstrapError::Invalid {
+            message: format!(
+                "{owner} lock handoff descriptor {} is unavailable: {error}",
+                inherited.fd
+            ),
+        })?;
+    let expected = std::fs::metadata(path)?;
+    if descriptor.dev() != expected.dev() || descriptor.ino() != expected.ino() {
+        return Err(BootstrapError::Invalid {
+            message: format!(
+                "{owner} lock handoff descriptor {} does not name {}",
+                inherited.fd,
+                path.display()
+            ),
+        });
+    }
+
+    let mut holder_file = OpenOptions::new().read(true).write(true).open(path)?;
+    if read_holder_pid(&mut holder_file).as_deref()
+        != Some(inherited.holder_pid.to_string().as_str())
+    {
+        return Err(BootstrapError::Invalid {
+            message: format!("{owner} lock handoff PID stamp does not match its holder"),
+        });
+    }
+    match holder_file.try_lock_exclusive() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(BootstrapError::Io(error)),
+        Ok(()) => Err(BootstrapError::Invalid {
+            message: format!("{owner} lock handoff inode is not kernel-locked"),
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pid() -> Result<u32, BootstrapError> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:\t"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .ok_or_else(|| BootstrapError::Invalid {
+            message: "cannot verify the invoking wrapper PID".to_owned(),
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_inherited_lock(
+    _path: &Path,
+    owner: &str,
+    _inherited: &InheritedForgeLock,
+    _require_parent: bool,
+) -> Result<(), BootstrapError> {
+    Err(BootstrapError::Invalid {
+        message: format!("{owner} lock handoff is supported only on Linux Forge hosts"),
+    })
 }
 
 impl CacheMutationLock {

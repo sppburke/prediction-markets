@@ -173,15 +173,18 @@ verify_staged_artifacts() {
 }
 
 env_value() {
-  local file=$1 name=$2
-  (
-    set +u
-    set -a
-    # shellcheck disable=SC1090
-    source "$file"
-    set +a
-    printf '%s' "${!name-}"
+  local file=$1 name=$2 assignment
+  local -a parsed
+  mapfile -d '' -t parsed < <(
+    env_file_values "$file" "$name" && printf '__PE_ENV_FILE_PARSED__\0'
   )
+  ((${#parsed[@]} >= 1)) || return 1
+  [[ ${parsed[-1]} == __PE_ENV_FILE_PARSED__ ]] || return 1
+  unset 'parsed[-1]'
+  for assignment in "${parsed[@]}"; do
+    [[ $assignment == "$name="* ]] || return 1
+    printf '%s' "${assignment#*=}"
+  done
 }
 
 toml_value() {
@@ -203,127 +206,6 @@ effective_path() {
   [[ -n "$value" ]] || value=$(toml_value "$config_file" "$toml_name")
   [[ -n "$value" ]] || value=$fallback
   absolute_from_root "$value"
-}
-
-process_runs_service() {
-  # Ownership of what runs NOW, from the process itself (lossless, no unit-file interpretation):
-  #   argv  == exactly `<binary> <config>` (NUL-split; empty elements kept)
-  #   environ: every variable the installed environment file defines (evaluated with the unit's own
-  #   `set -a; source; exec env -0` semantics) is present with an equal value, and every extra name is
-  #   one of the exact systemd-injected names observed for the production unit or one of the unit's
-  #   `bash -c` wrapper's own variables. PWD, SHLVL, OLDPWD, and _ are stripped from the expected set
-  #   because they do not affect the binary; cwd is proved independently from /proc/<pid>/cwd.
-  local expected_binary=$1 expected_config=$2 expected_env=$3 working=$4 pid=$5
-  python3 -c 'import os,subprocess,sys
-expected_binary,expected_config,expected_env,working,pid,proc_root=sys.argv[1:]
-def norm(path):
-    return os.path.normpath(path if os.path.isabs(path) else os.path.join(working, path))
-with open("%s/%s/cmdline" % (proc_root, pid), "rb") as handle:
-    raw=handle.read()
-if raw.endswith(b"\0"):
-    raw=raw[:-1]
-argv=[part.decode() for part in raw.split(b"\0")]
-if not (len(argv) == 2 and argv[0] == expected_binary and norm(argv[1]) == os.path.normpath(expected_config)):
-    raise SystemExit(1)
-def parse_environment(raw):
-    entries={}
-    for part in raw.rstrip(b"\0").split(b"\0"):
-        if not part:
-            continue
-        if b"=" not in part:
-            raise SystemExit(1)
-        name,value=part.split(b"=",1)
-        if name in entries:
-            raise SystemExit(1)
-        entries[name]=value
-    return entries
-with open("%s/%s/environ" % (proc_root, pid), "rb") as handle:
-    running=parse_environment(handle.read())
-evaluated=subprocess.run(
-    ["env","-i","/bin/bash","-c","""set -a
-source "$1"
-set +a
-if [[ ${LD_PRELOAD+x} == x || ${LD_LIBRARY_PATH+x} == x ]]; then
-    exit 97
-fi
-exec env -0""","bash",expected_env],
-    check=False,cwd=working,stdout=subprocess.PIPE,
-)
-if evaluated.returncode == 97:
-    raise SystemExit(1)
-if evaluated.returncode != 0:
-    raise SystemExit(1)
-shell_own={b"_",b"PWD",b"SHLVL",b"OLDPWD"}
-evaluated_environment=parse_environment(evaluated.stdout)
-loader_overrides={b"LD_PRELOAD",b"LD_LIBRARY_PATH"}
-if loader_overrides & (running.keys() | evaluated_environment.keys()):
-    raise SystemExit(1)
-expected={name:value for name,value in evaluated_environment.items() if name not in shell_own}
-missing=[name for name,value in expected.items() if running.get(name) != value]
-injected={
-    b"CREDENTIALS_DIRECTORY",b"HOME",b"INVOCATION_ID",b"JOURNAL_STREAM",b"LANG",b"LOGNAME",
-    b"MEMORY_PRESSURE_WATCH",b"MEMORY_PRESSURE_WRITE",b"PATH",b"SHELL",b"SYSTEMD_EXEC_PID",b"USER",
-    b"PWD",b"SHLVL",b"OLDPWD",b"_",
-}
-unknown=[name for name in running if name not in expected and name not in injected]
-credential_ok=running.get(b"CREDENTIALS_DIRECTORY") == b"/run/credentials/pe-service.service"
-raise SystemExit(0 if not missing and not unknown and credential_ok else 1)' \
-    "$expected_binary" "$expected_config" "$expected_env" "$working" "$pid" "$PROC_ROOT"
-}
-
-read_service_process_snapshot() {
-  local output key value
-  local active= pid= invocation= active_enter=
-  output=$(systemctl show -p ActiveState -p MainPID -p InvocationID -p ActiveEnterTimestamp pe-service) ||
-    return 1
-  while IFS='=' read -r key value; do
-    case "$key" in
-      ActiveState) active=$value ;;
-      MainPID) pid=$value ;;
-      InvocationID) invocation=$value ;;
-      ActiveEnterTimestamp) active_enter=$value ;;
-    esac
-  done <<< "$output"
-  [[ -n "$active" && -n "$pid" && -n "$invocation" && -n "$active_enter" ]] || return 1
-  SERVICE_SNAPSHOT_ACTIVE=$active
-  SERVICE_SNAPSHOT_PID=$pid
-  SERVICE_SNAPSHOT_INVOCATION=$invocation
-  SERVICE_SNAPSHOT_ACTIVE_ENTER=$active_enter
-}
-
-verify_installed_unit_owner() {
-  # Ownership is proved from one stable manager snapshot plus the running process, never from unit-file
-  # syntax. The same checks run on the NEW process in `verified`, so what the unit starts after the switch
-  # is proved, not parsed.
-  local active enabled pid invocation active_enter working running
-  [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
-    die "one or more installed service artifacts are absent"
-  active=$(systemctl_active_state pe-service)
-  enabled=$(systemctl_enabled_state pe-service)
-  [[ "$active" == true ]] || die "installed pe-service is not active"
-  [[ "$enabled" == true ]] || die "installed pe-service is not enabled"
-  read_service_process_snapshot || die "could not read the pe-service process snapshot"
-  active=$SERVICE_SNAPSHOT_ACTIVE
-  pid=$SERVICE_SNAPSHOT_PID
-  invocation=$SERVICE_SNAPSHOT_INVOCATION
-  active_enter=$SERVICE_SNAPSHOT_ACTIVE_ENTER
-  [[ "$active" == active ]] || die "installed pe-service is not active"
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "pe-service has no MainPID"
-  [[ "$(systemctl show pe-service -p NeedDaemonReload --value)" == no ]] ||
-    die "pe-service unit files differ from the loaded configuration (daemon-reload pending)"
-  working=$(readlink "$PROC_ROOT/$pid/cwd") || die "could not read pe-service process cwd"
-  [[ "$(realpath -m "$working")" == "$SERVICE_ROOT" ]] ||
-    die "pe-service process cwd is $working, expected $SERVICE_ROOT"
-  running=$(sha256_file "$PROC_ROOT/$pid/exe")
-  [[ "$running" == "$(sha256_file "$SERVICE_BINARY")" ]] ||
-    die "running pe-service is not the installed binary"
-  process_runs_service "$SERVICE_BINARY" "$SERVICE_CONFIG" "$SERVICE_ENV" "$working" "$pid" ||
-    die "running pe-service does not run the installed binary, service config and environment"
-  read_service_process_snapshot || die "could not re-read the pe-service process snapshot"
-  [[ "$SERVICE_SNAPSHOT_ACTIVE" == "$active" && "$SERVICE_SNAPSHOT_PID" == "$pid" &&
-     "$SERVICE_SNAPSHOT_INVOCATION" == "$invocation" &&
-     "$SERVICE_SNAPSHOT_ACTIVE_ENTER" == "$active_enter" ]] ||
-    die "pe-service process snapshot changed during ownership proof"
 }
 
 render_config() {
@@ -639,13 +521,28 @@ if (( $(state_rank "$state") < $(state_rank prepared) )); then
   verify_staged_artifacts rehearsal_environment "rehearsal environment" \
     rehearsal_config "rehearsal config" binary "rehearsal binary"
   prepare_started_unix=$(date -u +%s)
+  rehearsal_test_environment=()
+  if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]]; then
+    rehearsal_test_environment=(
+      "PE_ACTIVATION_TESTING=1" "PE_ACTIVATION_TEST_ROOT=$PE_ACTIVATION_TEST_ROOT"
+    )
+  fi
   (
-    set -a
-    # shellcheck disable=SC1090
-    source "$rehearsal_env"
-    set +a
     cd "$SERVICE_ROOT"
-    "$staged_binary" "$rehearsal_config" --exit-after-anchors
+    env -i "${rehearsal_test_environment[@]}" python3 -c '
+import os,sys
+environment=dict(os.environ)
+raw=b"".join(iter(lambda: os.read(3,65536),b""))
+parts=raw.split(b"\0")
+if len(parts) < 2 or parts[-2:] != [b"__PE_ENV_FILE_PARSED__",b""]:
+    raise SystemExit("could not parse the rehearsal environment")
+for part in parts[:-2]:
+    name,separator,value=part.partition(b"=")
+    if not separator: raise SystemExit("invalid parsed rehearsal environment")
+    environment[name.decode("ascii")]=value.decode("utf-8")
+os.execve(sys.argv[1],sys.argv[1:],environment)' \
+      "$staged_binary" "$rehearsal_config" --exit-after-anchors \
+      3< <(env_file_values "$rehearsal_env" && printf '__PE_ENV_FILE_PARSED__\0')
   )
   # A version-two main is never adopted from table counts alone. Re-entering the
   # binary completes or verifies the machine-owned migration through installed.

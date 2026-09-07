@@ -33,6 +33,13 @@ pub async fn backfill_supabase(
     anon_key: &str,
     secret_key: &str,
 ) -> Result<BackfillCounts> {
+    anyhow::ensure!(
+        paper_state
+            .financial_start()
+            .context("read local financial Start")?
+            .is_none(),
+        "--backfill-supabase is refused after QualificationStarted; the Start-bound authority is the only financial protocol"
+    );
     let client =
         SupabaseStateClient::new(reqwest::Client::new(), supabase_url, anon_key, secret_key);
 

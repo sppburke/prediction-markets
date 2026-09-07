@@ -104,7 +104,11 @@ pub struct WinnerFollowStrategy {
 
 ### Promotion path
 
-The full per-mode ladder, with quantified gates (KS p-value, mean-PnL z-score, observation length, fill-rate match, latency match, demotion-resets-clock rule), is in `19-WINNER-FOLLOW-STRATEGY.md` ("Promotion ladder", "Promotion and demotion criteria") and `_GLOSSARY.md` ("Promotion criteria — quantified", "Demotion criteria"). All "matches simulation" / "close to" / "stable" qualifiers in this file resolve through those tables.
+The paper-to-live-tiny gate is the one-system sealed qualification defined in
+`19-WINNER-FOLLOW-STRATEGY.md` and `_GLOSSARY.md` ("Paper-to-live-tiny qualification — quantified").
+It requires exact replay, positive lower-bound complete-day growth, bounded drawdown, the canonical
+observation minima and delay, followed by one manual review. Historical simulator-comparison
+language is not a promotion contract.
 
 ## Strategy trait
 

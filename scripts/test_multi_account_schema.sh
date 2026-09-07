@@ -14,6 +14,7 @@
 # CI runs it after loading the schema twice (idempotency); safe to re-run.
 set -u
 URL="$1"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fails=0
 expect_ok()  { if psql "$URL" -v ON_ERROR_STOP=1 -c "$2" >/dev/null 2>&1; then echo "PASS: $1"; else echo "FAIL(expected ok): $1"; fails=$((fails+1)); fi; }
 expect_err() { if psql "$URL" -v ON_ERROR_STOP=1 -c "$2" >/dev/null 2>&1; then echo "FAIL(expected err): $1"; fails=$((fails+1)); else echo "PASS: $1"; fi; }
@@ -98,6 +99,22 @@ expect_err "ledgered account DELETE restricted"  "delete from accounts where acc
 # 13. live_fills idempotent insert (PK) + service_role UPDATE denied (insert-only ledger)
 expect_err "duplicate live fill rejected by PK"  "insert into live_fills(account_id,idempotency_key,leader_wallet,market_id,outcome_id,side,contracts,fill_price,event_seq) values('ledgered','k1','0xw','0xm',0,'buy',10,0.5,1)"
 expect_err "service_role UPDATE live_fills denied" "set role service_role; update live_fills set contracts=99 where true"
+
+# 14. An old bigint position survives the idempotent numeric migration, then fractional values
+# round trip through the migrated columns.
+expect_ok  "restore legacy bigint position shape" "alter table live_positions alter column long_contracts type bigint using long_contracts::bigint, alter column short_contracts type bigint using short_contracts::bigint"
+expect_ok  "insert legacy bigint position" "insert into live_positions(account_id,market_id,outcome_id,long_contracts,short_contracts,cost_basis) values('ledgered','0xlegacy',0,7,2,3.5)"
+if psql "$URL" -v ON_ERROR_STOP=1 -f "$SCRIPT_DIR/supabase_multi_account_live_schema.sql" >/dev/null 2>&1; then
+  echo "PASS: legacy bigint live-position migration reapplies"
+else
+  echo "FAIL(expected ok): legacy bigint live-position migration reapplies"
+  fails=$((fails+1))
+fi
+legacy=$(psql "$URL" -Atc "select long_contracts::text || ',' || short_contracts::text || ',' || pg_typeof(long_contracts)::text from live_positions where account_id='ledgered' and market_id='0xlegacy' and outcome_id=0")
+if [ "$legacy" = "7,2,numeric" ]; then echo "PASS: legacy bigint row preserved as numeric"; else echo "FAIL: legacy bigint row migration changed ($legacy)"; fails=$((fails+1)); fi
+expect_ok  "fractional live position inserts" "insert into live_positions(account_id,market_id,outcome_id,long_contracts,short_contracts,cost_basis) values('ledgered','0xfractional',1,3.125001,0.000001,2.5)"
+fractional=$(psql "$URL" -Atc "select long_contracts::text || ',' || short_contracts::text from live_positions where account_id='ledgered' and market_id='0xfractional' and outcome_id=1")
+if [ "$fractional" = "3.125001,0.000001" ]; then echo "PASS: fractional live position round trip"; else echo "FAIL: fractional live position changed ($fractional)"; fails=$((fails+1)); fi
 
 echo "---"
 if [ "$fails" = "0" ]; then echo "ALL PHASE-B SQL ACCEPTANCE CHECKS PASSED"; else echo "$fails CHECK(S) FAILED"; exit 1; fi

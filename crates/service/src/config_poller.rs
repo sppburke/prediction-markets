@@ -6,6 +6,7 @@
 //! polling while that worker performs potentially slow history/position preparation. Only a
 //! successfully applied membership generation becomes the runtime snapshot's active capacity.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,15 +15,75 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::health::SharedHealth;
+use crate::orchestrator_control::OrchestratorControl;
+use crate::paper_recovery::{HaltState, active_risk_halts, paper_era, scan_paper_log};
+use crate::risk_inputs::{
+    LiveLatencyJournalTailEvidence, SourceReceiptIndex, audited_halt_release, live_latency_samples,
+    paper_latency_samples,
+};
 use crate::runtime_config::{
-    AppliedWatchlistCapacity, ConfigRow, LiveRuntimeConfig, RuntimeConfigStatus,
-    WatchlistCapacityEpoch, parse_config,
+    AppliedWatchlistCapacity, ConfigEra, ConfigRow, LiveRuntimeConfig, RISK_HALT_RELEASE_HASH_KEY,
+    RuntimeConfigStatus, WatchlistCapacityEpoch, parse_config,
 };
 use crate::supabase_reader::{SupabaseError, auth_token};
 
 /// Seconds between `service_config` polls. Boot-frozen (the poll cadence cannot govern itself).
 /// Canonical default lives in `docs/_GLOSSARY.md`: `config_poll_interval_secs`.
 pub const CONFIG_POLL_INTERVAL_SECS: u64 = 30;
+
+/// Non-economic incident control separated from one fetched config proposal (#545).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedConfigRows {
+    pub economic_rows: Vec<ConfigRow>,
+    pub risk_halt_release_hash: Option<String>,
+    pub warning: Option<RiskHaltReleaseRowWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskHaltReleaseRowWarning {
+    Duplicate,
+    WrongValueType,
+    Malformed,
+}
+
+/// Remove the optional audited incident-control row before economic parsing and hashing.
+#[must_use]
+pub fn partition_risk_halt_release_hash(rows: &[ConfigRow]) -> PartitionedConfigRows {
+    let mut economic_rows = Vec::with_capacity(rows.len());
+    let release_rows = rows
+        .iter()
+        .filter(|row| row.key == RISK_HALT_RELEASE_HASH_KEY)
+        .collect::<Vec<_>>();
+    economic_rows.extend(
+        rows.iter()
+            .filter(|row| row.key != RISK_HALT_RELEASE_HASH_KEY)
+            .cloned(),
+    );
+
+    let (risk_halt_release_hash, warning) = match release_rows.as_slice() {
+        [] => (None, None),
+        [row] if row.value_type != "text" => {
+            (None, Some(RiskHaltReleaseRowWarning::WrongValueType))
+        }
+        [row] if row.value.is_empty() => (None, None),
+        [row]
+            if row.value.len() == 64
+                && row
+                    .value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            (Some(row.value.clone()), None)
+        }
+        [_] => (None, Some(RiskHaltReleaseRowWarning::Malformed)),
+        _ => (None, Some(RiskHaltReleaseRowWarning::Duplicate)),
+    };
+    PartitionedConfigRows {
+        economic_rows,
+        risk_halt_release_hash,
+        warning,
+    }
+}
 
 /// A config read may consume only part of a poll period. This prevents a stalled socket from
 /// stopping later 30-second reloads indefinitely.
@@ -101,6 +162,153 @@ pub enum CapacityWorkerError {
 pub enum ConfigPollError {
     #[error("capacity result channel closed")]
     CapacityResultChannelClosed,
+}
+
+/// Applies the optional incident release through the paper serializer. Re-reading the paper log
+/// makes the row naturally consume-once: after the synchronized release edge the named cause is no
+/// longer active and the same hash cannot match again.
+#[derive(Clone)]
+pub struct RiskHaltReleaseHandle {
+    paper_log_path: PathBuf,
+    source_receipts: SourceReceiptIndex,
+    live_journal_path: PathBuf,
+    control: mpsc::Sender<OrchestratorControl>,
+}
+
+/// Orders the active qualification seal check before an economic proposal is published.
+#[derive(Clone)]
+pub struct QualificationSealHandle {
+    control: mpsc::Sender<OrchestratorControl>,
+}
+
+impl QualificationSealHandle {
+    pub fn new(control: mpsc::Sender<OrchestratorControl>) -> Self {
+        Self { control }
+    }
+
+    pub async fn apply(
+        &self,
+        proposed_economic_hash: String,
+        proposed_financial_semantic_version: u32,
+    ) -> Result<(), String> {
+        let (acknowledged, response) = tokio::sync::oneshot::channel();
+        self.control
+            .send(OrchestratorControl::SealCheck {
+                proposed_economic_hash,
+                proposed_financial_semantic_version,
+                acknowledged,
+            })
+            .await
+            .map_err(|_| "orchestrator control channel closed during seal check".to_owned())?;
+        response
+            .await
+            .map_err(|_| "orchestrator dropped seal-check acknowledgement".to_owned())?
+    }
+}
+
+impl RiskHaltReleaseHandle {
+    pub fn new(
+        paper_log_path: PathBuf,
+        source_receipts: SourceReceiptIndex,
+        control: mpsc::Sender<OrchestratorControl>,
+    ) -> Self {
+        let live_journal_path = paper_log_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("live_journal.log");
+        Self {
+            paper_log_path,
+            source_receipts,
+            live_journal_path,
+            control,
+        }
+    }
+
+    pub async fn apply(&self, release_hash: &str) -> Result<(), String> {
+        let era =
+            paper_era(scan_paper_log(&self.paper_log_path).map_err(|error| error.to_string())?);
+        let active = active_risk_halts(&era);
+        let Some(release) = audited_halt_release(&era, &active, release_hash) else {
+            return Ok(());
+        };
+        let mut live_journal_tail = None;
+        let latest_latency_p95_ms = if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency {
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            owner_latest_latency_p95(
+                &release.owner,
+                || {
+                    paper_latency_samples(&era, &self.source_receipts, now_unix)
+                        .map(|samples| samples.latest.p95_ms)
+                        .map_err(|error| format!("derive paper release latency evidence: {error}"))
+                },
+                |account_id| {
+                    let (mut events, tail) =
+                        pe_execution_core::live_journal::replay_account_with_tail(
+                            &self.live_journal_path,
+                            account_id,
+                        )
+                        .map_err(|error| {
+                            format!("derive live release latency evidence: {error}")
+                        })?;
+                    live_journal_tail = Some(LiveLatencyJournalTailEvidence::from(tail));
+                    if let Some((_, start)) = &era.start {
+                        events.retain(|event| {
+                            start
+                                .live_prefix
+                                .last_sequence
+                                .is_none_or(|last| event.seq > last.0)
+                        });
+                    }
+                    live_latency_samples(&events, now_unix)
+                        .map(|samples| samples.latest.p95_ms)
+                        .map_err(|error| format!("derive live release latency evidence: {error}"))
+                },
+            )?
+        } else {
+            None
+        };
+        if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency
+            && latest_latency_p95_ms.is_some()
+        {
+            return Ok(());
+        }
+        let (acknowledged, response) = tokio::sync::oneshot::channel();
+        self.control
+            .send(OrchestratorControl::RiskHaltChange {
+                owner: release.owner,
+                cause: release.cause,
+                state: HaltState::Released,
+                evidence: serde_json::json!({
+                    "engaged_receipt": release.engaged_receipt,
+                    "release_hash": release_hash,
+                    "latest_latency_p95_ms": latest_latency_p95_ms,
+                    "live_journal_tail": live_journal_tail,
+                }),
+                acknowledged,
+            })
+            .await
+            .map_err(|_| "orchestrator control channel closed during risk release".to_owned())?;
+        response
+            .await
+            .map_err(|_| "orchestrator dropped risk release acknowledgement".to_owned())?
+            .map(|_| ())
+    }
+}
+
+fn owner_latest_latency_p95<Paper, Live>(
+    owner: &crate::paper_recovery::RiskHaltOwner,
+    paper: Paper,
+    live: Live,
+) -> Result<Option<u64>, String>
+where
+    Paper: FnOnce() -> Result<Option<u64>, String>,
+    Live: FnOnce(&pe_core_types::AccountId) -> Result<Option<u64>, String>,
+{
+    match owner {
+        crate::paper_recovery::RiskHaltOwner::Paper => paper(),
+        crate::paper_recovery::RiskHaltOwner::LiveAccount(account_id) => live(account_id),
+    }
 }
 
 fn publish_generation_health(
@@ -219,12 +427,16 @@ async fn fetch_with_timeout<F: ConfigFetcher>(
 
 /// One bounded poll cycle: fetch, parse, publish ordinary edits, and coalesce a capacity request.
 /// A potentially long capacity transition is never awaited here.
+#[allow(clippy::too_many_arguments)]
 pub async fn poll_once<F: ConfigFetcher>(
     live: &LiveRuntimeConfig,
     status: &RuntimeConfigStatus,
     fetcher: &F,
     capacity_requests: &CapacityRequestHandle,
     clob_creds_present: bool,
+    era: ConfigEra,
+    risk_release: Option<&RiskHaltReleaseHandle>,
+    qualification_seal: Option<&QualificationSealHandle>,
 ) {
     let rows =
         match fetch_with_timeout(fetcher, Duration::from_secs(CONFIG_FETCH_TIMEOUT_SECS)).await {
@@ -242,16 +454,45 @@ pub async fn poll_once<F: ConfigFetcher>(
             }
         };
 
+    let partitioned = partition_risk_halt_release_hash(&rows);
+    if let Some(warning) = partitioned.warning {
+        warn!(?warning, "risk halt release row ignored");
+    }
     let applied = live.snapshot();
-    let parsed = match parse_config(&rows, &applied, clob_creds_present) {
+    let parsed = match parse_config(
+        &partitioned.economic_rows,
+        &applied,
+        clob_creds_present,
+        era,
+    ) {
         Ok(parsed) => parsed,
         Err(error) => {
             warn!(%error, "service_config snapshot rejected; keeping whole last-good config");
-            status.record_rejected(&rows, error);
+            status.record_rejected(&partitioned.economic_rows, error);
             return;
         }
     };
     let requested_target = parsed.active_watchlist_size;
+
+    if let Some(handle) = qualification_seal
+        && let Err(error) = handle
+            .apply(
+                parsed.canonical_hash(),
+                crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+            )
+            .await
+    {
+        warn!(%error, "qualification seal check was not synchronized; keeping last-known-good config");
+        return;
+    }
+
+    if let (Some(handle), Some(release_hash)) =
+        (risk_release, partitioned.risk_halt_release_hash.as_deref())
+        && let Err(error) = handle.apply(release_hash).await
+    {
+        warn!(%error, "risk halt release was not synchronized; keeping last-known-good config");
+        return;
+    }
 
     // This task is the sole RuntimeConfig writer. Other valid edits take effect immediately;
     // active_watchlist_size continues to describe the last successfully applied membership cap.
@@ -353,7 +594,10 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     mut capacity_results: mpsc::Receiver<CapacityApplyResult>,
     interval_secs: u64,
     clob_creds_present: bool,
+    era: ConfigEra,
     health: Option<SharedHealth>,
+    risk_release: Option<RiskHaltReleaseHandle>,
+    qualification_seal: Option<QualificationSealHandle>,
 ) -> Result<(), ConfigPollError> {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -363,7 +607,16 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                poll_once(&live, &status, &fetcher, &capacity_requests, clob_creds_present).await;
+                poll_once(
+                    &live,
+                    &status,
+                    &fetcher,
+                    &capacity_requests,
+                    clob_creds_present,
+                    era,
+                    risk_release.as_ref(),
+                    qualification_seal.as_ref(),
+                ).await;
                 publish_generation_health(health.as_ref(), &capacity_requests, &applied_capacity);
             }
             result = capacity_results.recv() => {
@@ -430,7 +683,6 @@ mod tests {
             ("min_fill_price", "0.15", "decimal"),
             ("min_resolution_horizon_secs", "60", "integer"),
             ("max_resolution_horizon_secs", "172800", "integer"),
-            ("fill_mode", "clob_best_ask", "text"),
             ("price_impact_cap_bps", "100", "integer"),
             ("flip_human_approved", "false", "bool"),
             (
@@ -438,7 +690,6 @@ mod tests {
                 "false",
                 "bool",
             ),
-            ("polymarket_fee_rate", "0.04", "decimal"),
             ("per_trade_cap", "unlimited", "text"),
             ("slippage_rate", "0.01", "decimal"),
             ("sizing_mode", "dollar", "text"),
@@ -496,6 +747,204 @@ mod tests {
         );
     }
 
+    /// PASS: a valid incident hash is excluded from economic rows and round-trips exactly.
+    #[test]
+    fn partitions_valid_risk_halt_release_hash() {
+        let mut rows = rows_with("max_fill_price", "0.50");
+        rows.push(cfg_row(
+            RISK_HALT_RELEASE_HASH_KEY,
+            &"ab".repeat(32),
+            "text",
+        ));
+        let partitioned = partition_risk_halt_release_hash(&rows);
+        assert_eq!(partitioned.risk_halt_release_hash, Some("ab".repeat(32)));
+        assert_eq!(partitioned.warning, None);
+        assert!(
+            partitioned
+                .economic_rows
+                .iter()
+                .all(|row| row.key != RISK_HALT_RELEASE_HASH_KEY)
+        );
+        let without = parse_config(
+            &rows[..rows.len() - 1],
+            &boot(),
+            false,
+            ConfigEra::Financial15,
+        )
+        .unwrap();
+        let partitioned_config = parse_config(
+            &partitioned.economic_rows,
+            &boot(),
+            false,
+            ConfigEra::Financial15,
+        )
+        .unwrap();
+        assert_eq!(
+            without.canonical_hash(),
+            partitioned_config.canonical_hash()
+        );
+    }
+
+    /// PASS: empty is unseeded, while malformed, uppercase, wrong-type, and duplicate rows are
+    /// excluded with typed warnings and never reach the economic parser.
+    #[test]
+    fn invalid_release_rows_warn_without_poisoning_economics() {
+        let cases = [
+            (vec![cfg_row(RISK_HALT_RELEASE_HASH_KEY, "", "text")], None),
+            (
+                vec![cfg_row(RISK_HALT_RELEASE_HASH_KEY, "a", "text")],
+                Some(RiskHaltReleaseRowWarning::Malformed),
+            ),
+            (
+                vec![cfg_row(
+                    RISK_HALT_RELEASE_HASH_KEY,
+                    &"AB".repeat(32),
+                    "text",
+                )],
+                Some(RiskHaltReleaseRowWarning::Malformed),
+            ),
+            (
+                vec![cfg_row(
+                    RISK_HALT_RELEASE_HASH_KEY,
+                    &"ab".repeat(32),
+                    "decimal",
+                )],
+                Some(RiskHaltReleaseRowWarning::WrongValueType),
+            ),
+            (
+                vec![
+                    cfg_row(RISK_HALT_RELEASE_HASH_KEY, &"ab".repeat(32), "text"),
+                    cfg_row(RISK_HALT_RELEASE_HASH_KEY, &"cd".repeat(32), "text"),
+                ],
+                Some(RiskHaltReleaseRowWarning::Duplicate),
+            ),
+        ];
+        for (release_rows, expected_warning) in cases {
+            let mut rows = rows_with("max_fill_price", "0.50");
+            rows.extend(release_rows);
+            let partitioned = partition_risk_halt_release_hash(&rows);
+            assert_eq!(partitioned.warning, expected_warning);
+            assert!(partitioned.risk_halt_release_hash.is_none());
+            assert!(
+                parse_config(
+                    &partitioned.economic_rows,
+                    &boot(),
+                    false,
+                    ConfigEra::Financial15,
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    /// PASS: paper and live latency evidence are selected only after the matched owner is known;
+    /// a sampled live owner cannot borrow paper starvation, and a starved live owner ignores a
+    /// populated paper hour.
+    #[test]
+    fn latency_release_evidence_is_owner_local_including_starved_live() {
+        let live_owner = crate::paper_recovery::RiskHaltOwner::LiveAccount(
+            pe_core_types::AccountId::new("live-a").unwrap(),
+        );
+        assert_eq!(
+            owner_latest_latency_p95(&live_owner, || Ok(None), |_| Ok(Some(3_001))),
+            Ok(Some(3_001)),
+            "live evidence wins when paper is starved"
+        );
+        assert_eq!(
+            owner_latest_latency_p95(&live_owner, || Ok(Some(3_001)), |_| Ok(None)),
+            Ok(None),
+            "starved live release ignores populated paper evidence"
+        );
+        assert_eq!(
+            owner_latest_latency_p95(
+                &crate::paper_recovery::RiskHaltOwner::Paper,
+                || Ok(Some(1_000)),
+                |_| Ok(Some(3_001)),
+            ),
+            Ok(Some(1_000)),
+            "paper evidence is independent of live disagreement"
+        );
+    }
+
+    /// PASS: a starved live latency release carries the exact empty account-journal tail in the
+    /// synchronized `RiskHaltChanged` evidence handed to the paper-log owner.
+    #[tokio::test]
+    async fn live_latency_release_audits_account_journal_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper_log_path = dir.path().join("paper.log");
+        let live_journal_path = dir.path().join("live_journal.log");
+        drop(pe_execution_core::LiveJournal::open(&live_journal_path).unwrap());
+        let account_id = pe_core_types::AccountId::new("live-a").unwrap();
+        let at = time::macros::datetime!(2026-09-06 00:00 UTC);
+        let mut writer = pe_event_log::Writer::open(&paper_log_path).unwrap();
+        let engaged = writer
+            .append_synced(pe_event_log::EnvelopeIn {
+                source_id: pe_core_types::SourceId("pe-service.paper".to_owned()),
+                schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: pe_core_types::SourceTimestamp(at),
+                received_at: pe_core_types::ReceivedAt(at),
+                content_type: pe_event_log::ContentType::Json,
+                payload: serde_json::to_vec(
+                    &crate::paper_recovery::PaperLogRecord::RiskHaltChanged {
+                        owner: crate::paper_recovery::RiskHaltOwner::LiveAccount(
+                            account_id.clone(),
+                        ),
+                        cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                        state: HaltState::Engaged,
+                        evidence: serde_json::json!({}),
+                    },
+                )
+                .unwrap(),
+            })
+            .unwrap();
+        drop(writer);
+
+        let (control, mut controls) = mpsc::channel(1);
+        let handle =
+            RiskHaltReleaseHandle::new(paper_log_path, SourceReceiptIndex::default(), control);
+        let release_hash = engaged.this_hash.to_hex().to_string();
+        let apply = handle.apply(&release_hash);
+        let acknowledge = async {
+            let message = controls
+                .recv()
+                .await
+                .ok_or("release control channel closed")?;
+            let OrchestratorControl::RiskHaltChange {
+                owner,
+                cause,
+                state,
+                evidence,
+                acknowledged,
+            } = message
+            else {
+                return Err("release emitted the wrong control message");
+            };
+            assert_eq!(
+                owner,
+                crate::paper_recovery::RiskHaltOwner::LiveAccount(account_id)
+            );
+            assert_eq!(cause, pe_risk_engine::RiskHaltCause::CopyLatency);
+            assert_eq!(state, HaltState::Released);
+            assert_eq!(
+                evidence.get("live_journal_tail"),
+                Some(&serde_json::json!({
+                    "last_sequence": null,
+                    "last_hash": "00".repeat(32),
+                    "scanned_prefix_last_sequence": null,
+                    "scanned_prefix_last_hash": "00".repeat(32),
+                }))
+            );
+            acknowledged
+                .send(Ok(engaged))
+                .map_err(|_| "release acknowledgement receiver dropped")?;
+            Ok::<(), &'static str>(())
+        };
+        let (result, acknowledgement) = tokio::join!(apply, acknowledge);
+        assert_eq!(result, Ok(()));
+        assert_eq!(acknowledgement, Ok(()));
+    }
+
     #[tokio::test]
     async fn bounded_fetch_drops_a_stalled_request() {
         let result = fetch_with_timeout(&PendingFetcher, Duration::from_millis(1)).await;
@@ -513,10 +962,72 @@ mod tests {
             &OkFetcher(rows_with("max_fill_price", "0.50")),
             &requests,
             false,
+            ConfigEra::Financial15,
+            None,
+            None,
         )
         .await;
         assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
         assert_eq!(requests.current().target, 100);
+    }
+
+    /// PASS: a financial-era proposal is not published until the orchestrator acknowledges the
+    /// exact economic hash and financial-semantic version carried by `SealCheck`.
+    #[tokio::test]
+    async fn poll_once_seal_check_precedes_config_publication() {
+        let live = LiveRuntimeConfig::new(boot());
+        let status = RuntimeConfigStatus::new(&live.snapshot());
+        let (requests, _rx) = request_channel(100);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let seal = QualificationSealHandle::new(control);
+        let observed = live.clone();
+        let responder = tokio::spawn(async move {
+            let Some(message) = control_rx.recv().await else {
+                return Err("control channel closed before SealCheck");
+            };
+            let OrchestratorControl::SealCheck {
+                proposed_economic_hash,
+                proposed_financial_semantic_version,
+                acknowledged,
+            } = message
+            else {
+                return Err("received another control before SealCheck");
+            };
+            assert_eq!(observed.snapshot().max_fill_price, Decimal::new(85, 2));
+            assert_eq!(
+                proposed_financial_semantic_version,
+                crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION
+            );
+            assert_eq!(
+                proposed_economic_hash,
+                parse_config(
+                    &rows_with("max_fill_price", "0.50"),
+                    &boot(),
+                    false,
+                    ConfigEra::Financial15,
+                )
+                .unwrap()
+                .canonical_hash()
+            );
+            acknowledged
+                .send(Ok(()))
+                .map_err(|_| "seal acknowledgement receiver dropped")?;
+            Ok(())
+        });
+
+        poll_once(
+            &live,
+            &status,
+            &OkFetcher(rows_with("max_fill_price", "0.50")),
+            &requests,
+            false,
+            ConfigEra::Financial15,
+            None,
+            Some(&seal),
+        )
+        .await;
+        assert_eq!(responder.await.unwrap(), Ok(()));
+        assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
     }
 
     #[tokio::test]
@@ -525,7 +1036,17 @@ mod tests {
         let status = RuntimeConfigStatus::new(&live.snapshot());
         let (requests, _rx) = request_channel(100);
         let before = live.snapshot().max_fill_price;
-        poll_once(&live, &status, &ErrFetcher, &requests, false).await;
+        poll_once(
+            &live,
+            &status,
+            &ErrFetcher,
+            &requests,
+            false,
+            ConfigEra::Financial15,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(live.snapshot().max_fill_price, before);
         assert_eq!(requests.current().target, 100);
     }
@@ -548,6 +1069,9 @@ mod tests {
             }),
             &requests,
             false,
+            ConfigEra::Financial15,
+            None,
+            None,
         )
         .await;
         let snapshot = live.snapshot();
@@ -568,6 +1092,9 @@ mod tests {
             &OkFetcher(rows_with("active_watchlist_size", "150")),
             &requests,
             false,
+            ConfigEra::Financial15,
+            None,
+            None,
         )
         .await;
         poll_once(
@@ -576,6 +1103,9 @@ mod tests {
             &OkFetcher(rows_with("active_watchlist_size", "invalid")),
             &requests,
             false,
+            ConfigEra::Financial15,
+            None,
+            None,
         )
         .await;
         assert_eq!(requests.current().target, 150);
@@ -630,6 +1160,9 @@ mod tests {
                 result_rx,
                 3_600,
                 false,
+                ConfigEra::Financial15,
+                None,
+                None,
                 None,
             )
             .await,
@@ -747,6 +1280,9 @@ mod tests {
             results_rx,
             3_600,
             false,
+            ConfigEra::Financial15,
+            None,
+            None,
             None,
         ));
 

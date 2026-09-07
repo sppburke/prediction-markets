@@ -6,18 +6,33 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pe_core_types::WalletAddress;
+use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_paper_state::{PaperStateDb, WalletCoverage};
+use pe_trader_index::WatchlistEntry;
+use serde::Serialize;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
+use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::bucket_commit::AnchorInstallError;
 use crate::orchestrator_control::OrchestratorControl;
+use crate::paper_recovery::{
+    CapacityMembershipArtifact, KnockoutCausalArtifact, MembershipAdmissionArtifact,
+    MembershipAdmissionReceipt, MembershipChange, MembershipProofManifest, MembershipReason,
+    RankingMembershipArtifact, SealedKnockoutEvidence,
+};
 use crate::position_seeder::{
     AnchorInstall, CausalPositionError, CausalPositionValidator, is_deferred_causal_position_error,
 };
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
+pub(crate) const RANKING_MEMBERSHIP_SOURCE_ID: &str = "pe-service.watchlist-ranking";
+pub(crate) const MEMBERSHIP_ADMISSION_SOURCE_ID: &str = "pe-service.watchlist-admission";
+pub(crate) const KNOCKOUT_CAUSAL_SOURCE_ID: &str = "pe-service.watchlist-knockout";
+pub(crate) const MEMBERSHIP_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MEMBERSHIP_ARTIFACT_PARSER_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
@@ -31,6 +46,8 @@ pub enum AdmissionError {
     AcknowledgementClosed,
     #[error("orchestrator admission preparation exceeded {0} seconds")]
     AcknowledgementTimeout(u64),
+    #[error("orchestrator rejected structural membership publication: {0}")]
+    PublicationRejected(String),
     #[error("causal current-position validation unavailable: {0}")]
     PositionValidation(#[source] CausalPositionError),
     #[error("orchestrator rejected the accepted position brackets: {0}")]
@@ -41,6 +58,16 @@ pub enum AdmissionError {
     PaperState(#[from] pe_paper_state::PaperStateError),
     #[error("anchor refresh requires a causal position validator")]
     PositionValidatorUnavailable,
+    #[error("membership publication requires the synchronized source-log handle")]
+    MembershipSourceLogUnavailable,
+    #[error("encode immutable membership artifact: {0}")]
+    MembershipArtifactEncoding(#[source] serde_json::Error),
+    #[error("accepted capacity target {target} cannot be represented durably")]
+    CapacityTargetOverflow { target: usize },
+    #[error("record immutable membership artifact: {0}")]
+    MembershipSourceLog(#[from] SourceLogHandleError),
+    #[error("capture immutable membership proof: {0}")]
+    MembershipProof(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +92,7 @@ pub fn anchor_refresh_due(coverage: &WalletCoverage, now_unix: i64, refresh_secs
 #[derive(Clone)]
 pub struct AdmissionPreparer {
     inner: Arc<Preparer>,
+    source_log: Option<SourceLogHandle>,
 }
 
 struct Preparer {
@@ -86,6 +114,7 @@ impl AdmissionPreparer {
                 attempt: Mutex::new(()),
                 validator: None,
             }),
+            source_log: None,
         }
     }
 
@@ -102,7 +131,16 @@ impl AdmissionPreparer {
                 attempt: Mutex::new(()),
                 validator: Some(validator),
             }),
+            source_log: None,
         }
+    }
+
+    /// Install the process-wide synchronized source-log handle used to retain accepted
+    /// capacity-change inputs before their structural membership publication.
+    #[must_use]
+    pub fn with_source_log(mut self, source_log: SourceLogHandle) -> Self {
+        self.source_log = Some(source_log);
+        self
     }
 
     /// Prove Lane C's durable prerequisites, then hand ownership to the
@@ -117,6 +155,135 @@ impl AdmissionPreparer {
 
         self.check_prerequisites(additions)?;
         self.prepare_locked(additions).await
+    }
+
+    /// Synchronize one structural membership record, then publish its exact replacement entries.
+    pub async fn publish_membership(
+        &self,
+        change: MembershipChange,
+        replacements: Vec<WatchlistEntry>,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        let (acknowledged, received) = oneshot::channel();
+        self.inner
+            .control_tx
+            .send(OrchestratorControl::PublishMembership {
+                change,
+                replacements,
+                acknowledged,
+            })
+            .await
+            .map_err(|_| AdmissionError::ControlClosed)?;
+        received
+            .await
+            .map_err(|_| AdmissionError::AcknowledgementClosed)?
+            .map_err(AdmissionError::PublicationRejected)
+    }
+
+    /// Durably retain the exact accepted capacity request before its membership record can
+    /// reference the returned immutable source-log receipt.
+    pub(crate) async fn record_capacity_config(
+        &self,
+        generation: u64,
+        target: usize,
+        published_entries: Vec<WatchlistEntry>,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        let durable_target =
+            u64::try_from(target).map_err(|_| AdmissionError::CapacityTargetOverflow { target })?;
+        self.record_artifact(
+            CAPACITY_CONFIG_SOURCE_ID,
+            &CapacityMembershipArtifact {
+                generation,
+                target: durable_target,
+                published_entries,
+            },
+        )
+        .await
+    }
+
+    /// Retain the exact batch-pinned ranking rows used by a full-rerank, or the exact
+    /// candidate rows used by a knockout backfill.
+    pub(crate) async fn record_ranking_membership(
+        &self,
+        batch_id: Option<i64>,
+        entries: Vec<WatchlistEntry>,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        self.record_artifact(
+            RANKING_MEMBERSHIP_SOURCE_ID,
+            &RankingMembershipArtifact { batch_id, entries },
+        )
+        .await
+    }
+
+    /// Snapshot each admitted wallet's installed immutable proof preimages into the source log.
+    pub(crate) async fn record_admission_proofs(
+        &self,
+        additions: &[WalletAddress],
+    ) -> Result<Vec<MembershipAdmissionReceipt>, AdmissionError> {
+        let mut receipts = Vec::with_capacity(additions.len());
+        for wallet in additions {
+            let proof = MembershipProofManifest::capture(&self.inner.paper_state, &[*wallet])
+                .map_err(|error| AdmissionError::MembershipProof(error.to_string()))?;
+            let receipt = self
+                .record_artifact(
+                    MEMBERSHIP_ADMISSION_SOURCE_ID,
+                    &MembershipAdmissionArtifact {
+                        wallet: *wallet,
+                        proof,
+                    },
+                )
+                .await?;
+            receipts.push(MembershipAdmissionReceipt {
+                wallet: *wallet,
+                receipt,
+            });
+        }
+        Ok(receipts)
+    }
+
+    /// Retain each knockout's policy and cursor inputs and return the receipt-bound evidence.
+    pub(crate) async fn record_knockout_inputs(
+        &self,
+        inputs: Vec<(MembershipReason, KnockoutCausalArtifact)>,
+    ) -> Result<Vec<SealedKnockoutEvidence>, AdmissionError> {
+        let mut evidence = Vec::with_capacity(inputs.len());
+        for (reason, input) in inputs {
+            let wallet = input.wallet;
+            let causal_receipt = self
+                .record_artifact(KNOCKOUT_CAUSAL_SOURCE_ID, &input)
+                .await?;
+            evidence.push(SealedKnockoutEvidence {
+                wallet,
+                reason,
+                causal_receipt,
+            });
+        }
+        Ok(evidence)
+    }
+
+    async fn record_artifact<T: Serialize>(
+        &self,
+        source_id: &str,
+        artifact: &T,
+    ) -> Result<AppendReceipt, AdmissionError> {
+        let source_log = self
+            .source_log
+            .as_ref()
+            .ok_or(AdmissionError::MembershipSourceLogUnavailable)?;
+        let payload =
+            serde_json::to_vec(artifact).map_err(AdmissionError::MembershipArtifactEncoding)?;
+        let now = time::OffsetDateTime::now_utc();
+        source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(source_id.to_owned()),
+                schema_version: MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+                parser_version: MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                content_type: ContentType::Json,
+                payload,
+            })
+            .await
+            .map_err(AdmissionError::from)
     }
 
     /// Re-anchor one due wallet under the shared bracket mutex.

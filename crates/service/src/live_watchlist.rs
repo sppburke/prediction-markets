@@ -41,6 +41,37 @@ pub fn projection_dirty_channel() -> (ProjectionDirty, watch::Receiver<u64>) {
     (ProjectionDirty { tx }, rx)
 }
 
+/// Apply one structural eviction/backfill operation without publishing it.
+pub(crate) fn replace_entries(
+    current: &[WatchlistEntry],
+    removed: &HashSet<WalletAddress>,
+    replacements: &[WatchlistEntry],
+    cap: usize,
+) -> Vec<WatchlistEntry> {
+    let mut entries = current
+        .iter()
+        .filter(|entry| !removed.contains(&entry.wallet))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut present = entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+
+    for replacement in replacements {
+        if entries.len() >= cap {
+            break;
+        }
+        if !removed.contains(&replacement.wallet) && present.insert(replacement.wallet) {
+            entries.push(replacement.clone());
+        }
+    }
+
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.leader_score_bps.0));
+    entries.truncate(cap);
+    entries
+}
+
 /// Hot-swappable handle to the current [`Watchlist`].
 ///
 /// Clones share one underlying cell. Reads ([`Self::snapshot`]) are wait-free; the
@@ -157,39 +188,7 @@ impl LiveWatchlist {
         cap: usize,
     ) -> usize {
         let current = self.inner.load_full();
-
-        // Survivors: current entries minus the evicted set.
-        let mut entries: Vec<WatchlistEntry> = current
-            .entries
-            .iter()
-            .filter(|e| !removed.contains(&e.wallet))
-            .cloned()
-            .collect();
-
-        // Membership of the working set, used to dedup backfills against survivors and
-        // against each other.
-        let mut present: HashSet<WalletAddress> = entries.iter().map(|e| e.wallet).collect();
-
-        for re in replacements {
-            if entries.len() >= cap {
-                break; // working set full — drop remaining candidates
-            }
-            if removed.contains(&re.wallet) {
-                continue; // never re-admit a just-evicted wallet
-            }
-            if present.insert(re.wallet) {
-                entries.push(re.clone());
-            }
-            // else: already present — leave the existing entry unchanged
-        }
-
-        // Maintain the `Watchlist` invariant: entries sorted descending by score.
-        entries.sort_by_key(|e| std::cmp::Reverse(e.leader_score_bps.0));
-        // Enforce the working-set cap. The backfill loop above only blocks *new*
-        // admissions; if the survivor set itself already exceeds `cap` (e.g. a live set
-        // that accumulated past the working-set size before this primitive was wired),
-        // keep the highest-scored `cap` and drop the rest.
-        entries.truncate(cap);
+        let entries = replace_entries(&current.entries, removed, replacements, cap);
         let active_count = entries
             .iter()
             .filter(|e| e.tier == WatchlistTier::Active)

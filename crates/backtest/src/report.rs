@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use pe_core_types::KellyFraction;
+use pe_risk_engine::max_drawdown_fraction;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -181,6 +182,10 @@ pub struct TradeFill {
     pub contracts: u64,
     pub signal_price: Decimal,
     pub fill_price: Decimal,
+    /// Modeled, non-promotional exponent-one platform fee. Zero for non-BUY records.
+    pub modeled_fee: Decimal,
+    /// Principal plus modeled fee debited for a BUY. Zero for non-BUY records.
+    pub all_in_debit: Decimal,
 }
 
 /// Per-operator PnL accumulator.
@@ -244,23 +249,10 @@ pub fn sharpe_ratio(daily_pnl: &[Decimal]) -> Decimal {
 
 /// Compute max peak-to-trough drawdown percentage from daily bankroll series.
 pub fn max_drawdown_pct(daily_bankroll: &[Decimal]) -> Decimal {
-    if daily_bankroll.len() < 2 {
-        return Decimal::ZERO;
-    }
-    let mut peak = daily_bankroll[0];
-    let mut max_dd = Decimal::ZERO;
-    for &b in daily_bankroll {
-        if b > peak {
-            peak = b;
-        }
-        if peak > Decimal::ZERO {
-            let dd = (peak - b) / peak * Decimal::from(100u32);
-            if dd > max_dd {
-                max_dd = dd;
-            }
-        }
-    }
-    max_dd
+    max_drawdown_fraction(daily_bankroll)
+        .ok()
+        .and_then(|fraction| fraction.checked_mul(Decimal::from(100u32)))
+        .unwrap_or(Decimal::ZERO)
 }
 
 /// Integer Newton's method sqrt for Decimal.

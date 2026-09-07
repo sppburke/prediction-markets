@@ -15,7 +15,7 @@ use polymarket_client_sdk_v2::clob::types::request::{
     BalanceAllowanceRequest, OrdersRequest, TradesRequest,
 };
 use polymarket_client_sdk_v2::clob::types::{
-    OrderPayload, OrderStatusType, OrderType, Side, SignatureType, TickSize,
+    Amount, OrderPayload, OrderStatusType, OrderType, Side, SignatureType, TickSize,
 };
 use polymarket_client_sdk_v2::clob::{Client, Config, standard_v2_order_hash};
 use polymarket_client_sdk_v2::types::{Address, B256, U256};
@@ -26,6 +26,8 @@ use polymarket_client_sdk_v2::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+
+use crate::fee::signed_price;
 
 pub const CLOB_V2_HOST: &str = "https://clob.polymarket.com";
 pub const SDK_VERSION: &str = "0.7.0";
@@ -118,7 +120,7 @@ pub enum CanaryV2Error {
     Client(String),
     #[error("system clock is before the Unix epoch")]
     Clock,
-    #[error("request is not an exact whole-share, fee-free BUY")]
+    #[error("request is not a positive collateral-path BUY")]
     Request,
     #[error("SDK produced a non-V2 or mismatched order")]
     PreparedMismatch,
@@ -216,15 +218,15 @@ impl CanaryV2Client {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| CanaryV2Error::Clock)?;
-        if request.shares.atomic() == 0
-            || !request.shares.atomic().is_multiple_of(1_000_000)
+        if request.shares == ShareAmount::ZERO
             || request.limit_price == Price::ZERO
-            || request.maximum_collateral
-                != CollateralAmount::from_decimal_exact(
-                    request.shares.to_decimal() * request.limit_price.0,
-                )
-                .map_err(|_| CanaryV2Error::Amount)?
+            || request.maximum_collateral == CollateralAmount::ZERO
         {
+            return Err(CanaryV2Error::Request);
+        }
+        let requested_signed_price = signed_price(request.maximum_collateral, request.shares)
+            .map_err(|_| CanaryV2Error::Request)?;
+        if requested_signed_price < request.limit_price {
             return Err(CanaryV2Error::Request);
         }
         let token_id = U256::from_str(&request.token_id.0)
@@ -234,14 +236,15 @@ impl CanaryV2Client {
         self.client.set_tick_size(token_id, tick_size);
         self.client.set_neg_risk(token_id, neg_risk);
 
-        let whole_shares = request.shares.atomic() / 1_000_000;
+        let amount = Amount::usdc(request.maximum_collateral.to_decimal())
+            .map_err(|error| CanaryV2Error::Client(error.to_string()))?;
         let signable = self
             .client
-            .limit_order()
+            .market_order()
             .token_id(token_id)
             .side(Side::Buy)
             .price(request.limit_price.0)
-            .size(polymarket_client_sdk_v2::types::Decimal::from(whole_shares))
+            .amount(amount)
             .order_type(OrderType::FOK)
             .post_only(false)
             .defer_exec(false)
@@ -266,6 +269,8 @@ impl CanaryV2Client {
         let wallet = self.deposit_wallet.to_string();
         let maker_collateral = amount_from_u256(&order.makerAmount)?;
         let taker_shares = share_from_u256(&order.takerAmount)?;
+        let actual_signed_price = signed_price(maker_collateral, taker_shares)
+            .map_err(|_| CanaryV2Error::PreparedMismatch)?;
         if maker != wallet
             || signer != wallet
             || order.tokenId != token_id
@@ -273,11 +278,13 @@ impl CanaryV2Client {
             || order.signatureType != SignatureType::Poly1271 as u8
             || maker_collateral != request.maximum_collateral
             || taker_shares != request.shares
+            || actual_signed_price != requested_signed_price
+            || actual_signed_price < request.limit_price
             || payload.expiration != U256::ZERO
             || order.metadata != B256::ZERO
-            || order.builder != B256::ZERO
+            || !supported_builder_code(order.builder)
             || signed.order_type != OrderType::FOK
-            || signed.post_only != Some(false)
+            || signed.post_only.is_some_and(|post_only| post_only)
             || signed.defer_exec != Some(false)
         {
             return Err(CanaryV2Error::PreparedMismatch);
@@ -629,6 +636,10 @@ impl CanaryV2Client {
     }
 }
 
+fn supported_builder_code(builder: B256) -> bool {
+    builder == B256::ZERO
+}
+
 fn raw_response(endpoint_kind: &str, observation: ResponseObservation) -> RawHttpResponse {
     let source_at = source_at(&observation.headers);
     RawHttpResponse {
@@ -768,7 +779,9 @@ fn validate_wire(bytes: &[u8]) -> Result<(), CanaryV2Error> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| CanaryV2Error::Wire(e.to_string()))?;
     if value.get("orderType").and_then(serde_json::Value::as_str) != Some("FOK")
-        || value.get("postOnly").and_then(serde_json::Value::as_bool) != Some(false)
+        // The vendored SDK never serializes `postOnly` for a market order (its market build fixes
+        // `post_only: None`); the collateral path must therefore carry no such field at all.
+        || value.get("postOnly").is_some()
         || value.get("deferExec").and_then(serde_json::Value::as_bool) != Some(false)
         || value
             .pointer("/order/expiration")
@@ -1045,6 +1058,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_zero_builder_code_is_reachable() {
+        assert!(supported_builder_code(B256::ZERO));
+        assert!(!supported_builder_code(B256::repeat_byte(1)));
+    }
+
     async fn prepared(client: &CanaryV2Client) -> Result<PreparedSubmission, CanaryV2Error> {
         client.prepare_buy(buy_request()).await
     }
@@ -1139,6 +1158,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collateral_path_signs_fractional_minimum_shares_and_zero_builder() {
+        let (client, _) = client().await;
+        let mut request = buy_request();
+        request.maximum_collateral = CollateralAmount::from_atomic(512_345);
+        // Tick 0.01 gives the SDK's signed taker quantity four decimal places.
+        request.shares = ShareAmount::from_atomic(5_123_400);
+        let submission = client.prepare_buy_for_market(request, false).await.unwrap();
+        let order = order_from_submission(&submission);
+
+        assert_eq!(submission.prepared().maker_collateral.atomic(), 512_345);
+        assert_eq!(submission.prepared().taker_shares.atomic(), 5_123_400);
+        assert!(
+            signed_price(
+                submission.prepared().maker_collateral,
+                submission.prepared().taker_shares,
+            )
+            .unwrap()
+                > submission.prepared().limit_price
+        );
+        assert_eq!(order.makerAmount, U256::from(512_345u64));
+        assert_eq!(order.takerAmount, U256::from(5_123_400u64));
+        assert_eq!(order.builder, B256::ZERO);
+    }
+
+    #[tokio::test]
     async fn prepares_v2_fok_and_posts_exact_bytes_once() {
         let (client, state) = client().await;
         let submission = prepared(&client).await.unwrap();
@@ -1164,7 +1208,10 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_slice(&state.body.lock().unwrap()).unwrap();
         assert_eq!(body["orderType"], "FOK");
-        assert_eq!(body["postOnly"], false);
+        assert!(
+            body.get("postOnly").is_none(),
+            "market orders carry no postOnly field"
+        );
         assert_eq!(body["deferExec"], false);
         assert_eq!(body["order"]["makerAmount"], "500000");
         assert_eq!(body["order"]["takerAmount"], "5000000");

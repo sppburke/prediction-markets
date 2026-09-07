@@ -118,6 +118,8 @@ fn context(epoch: i64) -> BucketDecisionContext {
             &pe_service::config::ServiceConfig::default(),
         ),
         decision_inputs_json: "{}".to_owned(),
+        page_occurrences: Vec::new(),
+        observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),
         copy_eligible: false,

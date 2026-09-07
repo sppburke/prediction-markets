@@ -3,48 +3,253 @@
 //! The V2 client intentionally exposes raw, observed reconciliation rather than separate
 //! authenticated account/order methods. This adapter consumes that one composite seam for both
 //! account admission and order-hash recovery, preserving every raw observation in the
-//! execution-core audit types. Market admission uses a fresh Gamma long-market response and the
-//! corresponding CLOB long-market response. Both halves use a 60-second freshness window; the
-//! independently fetched executable ladder keeps its stricter two-second venue-owned bound.
+//! execution-core audit types. Market admission records fresh Gamma-long, CLOB-long, and compact
+//! CLOB responses before composing the shared artifact. The long observations use a 60-second
+//! freshness window; the independently fetched executable ladder keeps its stricter two-second
+//! venue-owned bound.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use pe_core_types::{
-    CollateralAmount, Price, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
-    TransportErrorClass,
+    AccountId, Price, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
+    ReceivedAt, SourceId, SourceTimestamp, TransportErrorClass, WalletAddress,
 };
+use pe_event_log::{ContentType, EnvelopeIn};
+use pe_execution_core::live_executor::{
+    LiveAccountResponseClassification, classify_live_account_responses,
+};
+use pe_execution_core::live_journal::{LiveAccountBindingAudit, request_descriptor_hash};
 use pe_execution_core::{
-    LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutedAmounts,
-    LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification, LivePostFuture,
-    LivePostParseError, LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
-    LiveVenuePreparationError, LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared,
-    LiveVenueReconciledOutcome, LiveVenueReconciliation, LiveVenueReconciliationError,
-    RedemptionStatusObservation, RedemptionStatusReadError, RedemptionStatusReader,
+    AdmissionReceipts, LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact,
+    LiveExecutedAmounts, LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification,
+    LivePostFuture, LivePostParseError, LiveReconciliationFuture, LiveVenueAccountReadError,
+    LiveVenueAccountState, LiveVenuePreparationError, LiveVenuePrepareFuture,
+    LiveVenuePrepareRequest, LiveVenuePrepared, LiveVenueReconciledOutcome,
+    LiveVenueReconciliation, LiveVenueReconciliationError, RedemptionStatusObservation,
+    RedemptionStatusReadError, RedemptionStatusReader,
 };
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
-use pe_source_polymarket_public::validate_live_market;
+use pe_source_polymarket_public::{
+    GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
+    validate_live_market,
+};
 use pe_venue_polymarket::{
     CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
     REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION, REDEMPTION_SCHEMA_VERSION,
     RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX,
     RELAYER_LEGACY_TRANSACTION_PATH, RedemptionTransport, RedemptionTransportError,
     RelayerCredentials, RelayerPollPolicy, RelayerTransportClient, SignedRedemptionRequest,
-    V2BuyRequest,
+    V2BuyRequest, parse_compact_market,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::live_credentials::LiveAccountCredentials;
 
-const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
+pub(crate) const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
 const MARKET_REQUEST_TIMEOUT_SECS: u64 = 10;
 const RECONCILIATION_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CLOB_LONG_MARKET_SOURCE_ID: &str = "polymarket.clob.markets";
+pub(crate) const CLOB_COMPACT_MARKET_SOURCE_ID: &str = "polymarket.clob.compact-market";
+const POLYGON_RECEIPT_RPC_SCHEMA_VERSION: u16 = 1;
+const POLYGON_RECEIPT_RPC_PARSER_VERSION: u16 = 1;
+
+/// Single-attempt, key-free Polygon JSON-RPC transport using the service's bounded HTTP client.
+#[derive(Clone)]
+pub struct PolygonReceiptRpc {
+    http: reqwest::Client,
+    url: String,
+}
+
+/// Narrow read-only seam used by the existing recovery pass and deterministic receipt fixtures.
+pub trait PolygonReceiptReader: Send + Sync {
+    fn chain_id(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>>;
+    fn transaction_receipt<'a>(
+        &'a self,
+        transaction_hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + 'a>>;
+    fn finalized_block(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>>;
+    fn block_by_number(
+        &self,
+        number: u64,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>>;
+}
+
+impl PolygonReceiptRpc {
+    #[must_use]
+    pub fn new(http: reqwest::Client, url: impl Into<String>) -> Self {
+        Self {
+            http,
+            url: url.into(),
+        }
+    }
+
+    pub async fn chain_id(&self) -> RawHttpAttempt {
+        self.call("polygon-chain-id", "eth_chainId", serde_json::json!([]))
+            .await
+    }
+
+    pub async fn transaction_receipt(&self, transaction_hash: &str) -> RawHttpAttempt {
+        self.call(
+            "polygon-transaction-receipt",
+            "eth_getTransactionReceipt",
+            serde_json::json!([transaction_hash]),
+        )
+        .await
+    }
+
+    pub async fn finalized_block(&self) -> RawHttpAttempt {
+        self.call(
+            "polygon-finalized-block",
+            "eth_getBlockByNumber",
+            serde_json::json!(["finalized", false]),
+        )
+        .await
+    }
+
+    pub async fn block_by_number(&self, number: u64) -> RawHttpAttempt {
+        self.call(
+            "polygon-canonical-block",
+            "eth_getBlockByNumber",
+            serde_json::json!([format!("0x{number:x}"), false]),
+        )
+        .await
+    }
+
+    async fn call(&self, endpoint_kind: &str, method: &str, params: Value) -> RawHttpAttempt {
+        let observed_at = OffsetDateTime::now_utc();
+        let ordered_query = vec![
+            ("rpc_method".to_owned(), method.to_owned()),
+            ("rpc_params".to_owned(), params.to_string()),
+        ];
+        let response = match self
+            .http
+            .post(&self.url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return RawHttpAttempt::TransportFailure(RawTransportFailure {
+                    source_id: "polygon-receipt-rpc".to_owned(),
+                    endpoint_kind: endpoint_kind.to_owned(),
+                    method: "POST".to_owned(),
+                    path: self.url.clone(),
+                    ordered_query,
+                    attempt_ordinal: 1,
+                    observed_at,
+                    received_at: OffsetDateTime::now_utc(),
+                    error_class: classify_reqwest_error(&error),
+                    schema_version: POLYGON_RECEIPT_RPC_SCHEMA_VERSION,
+                    parser_version: POLYGON_RECEIPT_RPC_PARSER_VERSION,
+                    adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                });
+            }
+        };
+        let status = response.status().as_u16();
+        let mut headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        headers.sort();
+        let body = match response.bytes().await {
+            Ok(body) => body.to_vec(),
+            Err(_) => {
+                return RawHttpAttempt::TransportFailure(RawTransportFailure {
+                    source_id: "polygon-receipt-rpc".to_owned(),
+                    endpoint_kind: endpoint_kind.to_owned(),
+                    method: "POST".to_owned(),
+                    path: self.url.clone(),
+                    ordered_query,
+                    attempt_ordinal: 1,
+                    observed_at,
+                    received_at: OffsetDateTime::now_utc(),
+                    error_class: TransportErrorClass::BodyRead,
+                    schema_version: POLYGON_RECEIPT_RPC_SCHEMA_VERSION,
+                    parser_version: POLYGON_RECEIPT_RPC_PARSER_VERSION,
+                    adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                });
+            }
+        };
+        RawHttpAttempt::Response(RawHttpResponse {
+            source_id: "polygon-receipt-rpc".to_owned(),
+            endpoint_kind: endpoint_kind.to_owned(),
+            method: "POST".to_owned(),
+            path: self.url.clone(),
+            ordered_query,
+            status,
+            headers,
+            body,
+            attempt_ordinal: 1,
+            source_at: None,
+            observed_at,
+            received_at: OffsetDateTime::now_utc(),
+            schema_version: POLYGON_RECEIPT_RPC_SCHEMA_VERSION,
+            parser_version: POLYGON_RECEIPT_RPC_PARSER_VERSION,
+            adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+        })
+    }
+}
+
+impl PolygonReceiptReader for PolygonReceiptRpc {
+    fn chain_id(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+        Box::pin(PolygonReceiptRpc::chain_id(self))
+    }
+
+    fn transaction_receipt<'a>(
+        &'a self,
+        transaction_hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + 'a>> {
+        Box::pin(PolygonReceiptRpc::transaction_receipt(
+            self,
+            transaction_hash,
+        ))
+    }
+
+    fn finalized_block(&self) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+        Box::pin(PolygonReceiptRpc::finalized_block(self))
+    }
+
+    fn block_by_number(
+        &self,
+        number: u64,
+    ) -> Pin<Box<dyn Future<Output = RawHttpAttempt> + Send + '_>> {
+        Box::pin(PolygonReceiptRpc::block_by_number(self, number))
+    }
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> TransportErrorClass {
+    if error.is_timeout() {
+        TransportErrorClass::Timeout
+    } else if error.is_connect() {
+        TransportErrorClass::Connect
+    } else if error.is_builder() {
+        TransportErrorClass::RequestBuild
+    } else {
+        TransportErrorClass::Other
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveVenueAdapterError {
@@ -56,6 +261,8 @@ pub enum LiveVenueAdapterError {
     MarketStatus(u16),
     #[error("live market validation failed: {0}")]
     MarketValidation(String),
+    #[error("source-log coordinator closed while recording live admission")]
+    SourceLogClosed,
     #[error("requested outcome is not binary")]
     Outcome,
     #[error("redemption transport configuration failed: {0}")]
@@ -65,6 +272,12 @@ pub enum LiveVenueAdapterError {
 /// Concrete per-account V2 order venue. Constructed only after the account bundle decrypts.
 pub struct PolymarketLiveVenue {
     client: CanaryV2Client,
+    account_binding: LiveAccountBindingAudit,
+}
+
+pub(crate) struct BoundLiveVenueAccountState {
+    pub state: LiveVenueAccountState,
+    pub binding: LiveAccountBindingAudit,
 }
 
 impl PolymarketLiveVenue {
@@ -86,7 +299,23 @@ impl PolymarketLiveVenue {
         // Authentication/version observations belong to the first real read, not to a later
         // unrelated operation. The composite reconciliation call captures its own responses.
         let _ = client.take_observations();
-        Ok(Self { client })
+        let account_id = AccountId::new(&credentials.account_id)
+            .map_err(|error| LiveVenueAdapterError::Client(error.to_string()))?;
+        let custody_wallet = WalletAddress::from_hex(&credentials.deposit_wallet)
+            .map_err(|error| LiveVenueAdapterError::Client(error.to_string()))?;
+        let account_binding = LiveAccountBindingAudit::new(
+            account_id,
+            pe_execution_core::CredentialBindingIdentity {
+                version: credentials.bundle_version,
+                key_id: credentials.key_id.clone(),
+            },
+            custody_wallet,
+            live_account_credential_fingerprint(credentials),
+        );
+        Ok(Self {
+            client,
+            account_binding,
+        })
     }
 
     #[must_use]
@@ -99,38 +328,106 @@ impl PolymarketLiveVenue {
         self.client.owner_signer()
     }
 
+    #[must_use]
+    pub(crate) fn account_binding(&self) -> &LiveAccountBindingAudit {
+        &self.account_binding
+    }
+
     async fn account_state(
         &self,
         neg_risk: bool,
     ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
-        if protocol_failure.is_some() {
-            return Err(account_read_error(
-                LiveAccountReadFailure::Protocol,
-                evidence,
-            ));
-        }
-        parse_account_state(evidence, neg_risk)
+        let (evidence, _) = self.client.account_probe_raw(deadline).await;
+        let request_descriptor_hashes =
+            bind_account_read_attempts(&evidence, &self.account_binding).map_err(|()| {
+                account_read_error(
+                    LiveAccountReadFailure::Protocol,
+                    evidence.clone(),
+                    Vec::new(),
+                )
+            })?;
+        parse_account_state(
+            evidence,
+            neg_risk,
+            request_descriptor_hashes,
+            &self.account_binding,
+        )
     }
 
     pub(crate) async fn account_states(
         &self,
-    ) -> Result<(LiveVenueAccountState, LiveVenueAccountState), LiveVenueAccountReadError> {
+    ) -> Result<(BoundLiveVenueAccountState, BoundLiveVenueAccountState), LiveVenueAccountReadError>
+    {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
-        if protocol_failure.is_some() {
-            return Err(account_read_error(
-                LiveAccountReadFailure::Protocol,
-                evidence,
-            ));
-        }
-        let standard = parse_account_state(evidence.clone(), false)?;
-        let neg_risk = parse_account_state(evidence, true)?;
-        Ok((standard, neg_risk))
+        let (evidence, _) = self.client.account_probe_raw(deadline).await;
+        let request_descriptor_hashes =
+            bind_account_read_attempts(&evidence, &self.account_binding).map_err(|()| {
+                account_read_error(
+                    LiveAccountReadFailure::Protocol,
+                    evidence.clone(),
+                    Vec::new(),
+                )
+            })?;
+        let standard = parse_account_state(
+            evidence.clone(),
+            false,
+            request_descriptor_hashes.clone(),
+            &self.account_binding,
+        )?;
+        let neg_risk = parse_account_state(
+            evidence,
+            true,
+            request_descriptor_hashes,
+            &self.account_binding,
+        )?;
+        Ok((
+            BoundLiveVenueAccountState {
+                state: standard,
+                binding: self.account_binding.clone(),
+            },
+            BoundLiveVenueAccountState {
+                state: neg_risk,
+                binding: self.account_binding.clone(),
+            },
+        ))
     }
+}
+
+fn bind_account_read_attempts(
+    evidence: &[RawEvidence],
+    binding: &LiveAccountBindingAudit,
+) -> Result<Vec<String>, ()> {
+    evidence
+        .iter()
+        .filter_map(|item| match item {
+            RawEvidence::HttpResponse(response) => Some(RawHttpAttempt::Response(response.clone())),
+            RawEvidence::HttpTransportFailure(failure) => {
+                Some(RawHttpAttempt::TransportFailure(failure.clone()))
+            }
+            RawEvidence::Artifact(_) => None,
+        })
+        .map(|attempt| {
+            let descriptor = binding.request_descriptor_for_attempt(&attempt);
+            request_descriptor_hash(&descriptor).map_err(|_| ())
+        })
+        .collect()
+}
+
+fn live_account_credential_fingerprint(credentials: &LiveAccountCredentials) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for component in [
+        b"ordinary-live-account-read-credential-v1".as_slice(),
+        credentials.private_key.as_bytes(),
+        credentials.api_key.as_bytes(),
+        credentials.api_secret.as_bytes(),
+        credentials.api_passphrase.as_bytes(),
+    ] {
+        hasher.update(blake3::hash(component).as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 impl LiveOrderVenue for PolymarketLiveVenue {
@@ -249,7 +546,6 @@ fn classify_order_post_response(
         if parsed.order_id.trim().is_empty()
             || parsed.making_amount <= Decimal::ZERO
             || parsed.taking_amount <= Decimal::ZERO
-            || parsed.taking_amount.fract() != Decimal::ZERO
             || parsed
                 .making_amount
                 .checked_div(parsed.taking_amount)
@@ -264,6 +560,7 @@ fn classify_order_post_response(
                 making_amount: parsed.making_amount,
                 taking_amount: parsed.taking_amount,
             },
+            transaction_hashes: post_transaction_hashes(response)?,
         });
     }
     if parsed.definitive && parsed.order_id.trim().is_empty() {
@@ -278,18 +575,57 @@ fn classify_order_post_response(
     })
 }
 
+fn post_transaction_hashes(response: &RawHttpResponse) -> Result<Vec<String>, LivePostParseError> {
+    let value: Value =
+        serde_json::from_slice(&response.body).map_err(|_| LivePostParseError::InvalidResponse)?;
+    let hashes = value.get("transactionHashes");
+    let Some(hashes) = hashes else {
+        return Ok(Vec::new());
+    };
+    let hashes = hashes
+        .as_array()
+        .ok_or(LivePostParseError::InvalidResponse)?;
+    let mut canonical = BTreeSet::new();
+    for value in hashes {
+        let raw = value.as_str().ok_or(LivePostParseError::InvalidResponse)?;
+        if raw.trim().is_empty()
+            || raw
+                .trim_start_matches("0x")
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            continue;
+        }
+        let hash =
+            canonical_nonzero_transaction_hash(raw).ok_or(LivePostParseError::InvalidResponse)?;
+        canonical.insert(hash);
+    }
+    Ok(canonical.into_iter().collect())
+}
+
 enum ReconciliationClassification {
-    Matched(String),
+    Matched {
+        venue_order_id: String,
+        transaction_hashes: Vec<String>,
+    },
     Killed(Option<String>),
     Rejected(Option<String>),
-    Cancel { order_id: String },
+    Cancel {
+        order_id: String,
+    },
     Ambiguous,
 }
 
 impl ReconciliationClassification {
     fn into_venue_outcome(self) -> LiveVenueReconciledOutcome {
         match self {
-            Self::Matched(venue_order_id) => LiveVenueReconciledOutcome::Matched { venue_order_id },
+            Self::Matched {
+                venue_order_id,
+                transaction_hashes,
+            } => LiveVenueReconciledOutcome::Matched {
+                venue_order_id,
+                transaction_hashes,
+            },
             Self::Killed(venue_order_id) => LiveVenueReconciledOutcome::Killed { venue_order_id },
             Self::Rejected(venue_order_id) => {
                 LiveVenueReconciledOutcome::Rejected { venue_order_id }
@@ -305,28 +641,54 @@ fn classify_reconciliation(
     evidence: &[RawEvidence],
     order_hash: &str,
 ) -> Result<ReconciliationClassification, ()> {
-    let matching_trade = evidence.iter().find_map(|item| match item {
-        RawEvidence::HttpResponse(response) if response.endpoint_kind == "trades-page" => {
-            response_json(response)
-                .ok()
-                .and_then(|value| page_rows(&value).ok().map(|rows| rows.to_vec()))
-                .and_then(|rows| {
-                    rows.into_iter()
-                        .find(|trade| trade_matches_order(trade, order_hash))
-                })
-        }
-        RawEvidence::HttpResponse(_)
-        | RawEvidence::HttpTransportFailure(_)
-        | RawEvidence::Artifact(_) => None,
-    });
-    if let Some(trade) = matching_trade {
-        let venue_order_id = trade
-            .get("taker_order_id")
-            .or_else(|| trade.get("takerOrderId"))
-            .and_then(Value::as_str)
+    let matching_trades = evidence
+        .iter()
+        .flat_map(|item| match item {
+            RawEvidence::HttpResponse(response) if response.endpoint_kind == "trades-page" => {
+                response_json(response)
+                    .ok()
+                    .and_then(|value| page_rows(&value).ok().map(|rows| rows.to_vec()))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|trade| trade_matches_order(trade, order_hash))
+                    .collect::<Vec<_>>()
+            }
+            RawEvidence::HttpResponse(_)
+            | RawEvidence::HttpTransportFailure(_)
+            | RawEvidence::Artifact(_) => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if !matching_trades.is_empty() {
+        let venue_order_id = matching_trades
+            .iter()
+            .find_map(|trade| {
+                trade
+                    .get("taker_order_id")
+                    .or_else(|| trade.get("takerOrderId"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            })
             .unwrap_or(order_hash)
             .to_owned();
-        return Ok(ReconciliationClassification::Matched(venue_order_id));
+        let mut transaction_hashes = BTreeSet::new();
+        for trade in &matching_trades {
+            let Some(raw) = trade.get("transaction_hash").and_then(Value::as_str) else {
+                continue;
+            };
+            if raw.trim().is_empty()
+                || raw
+                    .trim_start_matches("0x")
+                    .bytes()
+                    .all(|byte| byte == b'0')
+            {
+                continue;
+            }
+            transaction_hashes.insert(canonical_nonzero_transaction_hash(raw).ok_or(())?);
+        }
+        return Ok(ReconciliationClassification::Matched {
+            venue_order_id,
+            transaction_hashes: transaction_hashes.into_iter().collect(),
+        });
     }
 
     let exact = evidence.iter().find_map(|item| match item {
@@ -356,7 +718,10 @@ fn classify_reconciliation(
         .unwrap_or_default()
         .to_ascii_uppercase();
     if matches!(status.as_str(), "MATCHED" | "FILLED") {
-        return Ok(ReconciliationClassification::Matched(order_id));
+        return Ok(ReconciliationClassification::Matched {
+            venue_order_id: order_id,
+            transaction_hashes: Vec::new(),
+        });
     }
     if matches!(
         status.as_str(),
@@ -373,106 +738,66 @@ fn classify_reconciliation(
     Ok(ReconciliationClassification::Ambiguous)
 }
 
+fn canonical_nonzero_transaction_hash(value: &str) -> Option<String> {
+    let digits = value.strip_prefix("0x")?;
+    if digits.len() != 64
+        || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || digits.bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some(format!("0x{}", digits.to_ascii_lowercase()))
+}
+
 fn parse_account_state(
     evidence: Vec<RawEvidence>,
     neg_risk: bool,
+    request_descriptor_hashes: Vec<String>,
+    binding: &LiveAccountBindingAudit,
 ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
-    if evidence
-        .iter()
-        .any(|item| matches!(item, RawEvidence::HttpTransportFailure(_)))
-    {
-        return Err(account_read_error(
-            LiveAccountReadFailure::Transport,
-            evidence,
-        ));
-    }
-    let response = |kind: &str| {
-        evidence.iter().find_map(|item| match item {
-            RawEvidence::HttpResponse(response) if response.endpoint_kind == kind => Some(response),
-            RawEvidence::HttpResponse(_)
-            | RawEvidence::HttpTransportFailure(_)
-            | RawEvidence::Artifact(_) => None,
-        })
-    };
-    let geoblock = response("geoblock")
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let closed_only_response = response("closed-only")
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let balance = response("balance-allowance")
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    if [geoblock, closed_only_response, balance]
-        .iter()
-        .any(|response| response.status == 401 || response.status == 403)
-    {
-        return Err(account_read_error(
-            LiveAccountReadFailure::Authentication,
-            evidence,
-        ));
-    }
-    let geoblock_json = response_json(geoblock)
-        .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let closed_json = response_json(closed_only_response)
-        .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let balance_json = response_json(balance)
-        .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let blocked = geoblock_json
-        .get("blocked")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let country = geoblock_json
-        .get("country")
-        .and_then(Value::as_str)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let geoblocked = blocked && !matches!(country, "IE" | "JP" | "MT" | "NL");
-    let closed_only = closed_json
-        .get("closed_only")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let collateral_balance = atomic_amount(balance_json.get("balance"))
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
     let selected_spender = if neg_risk {
         CanaryV2Client::negrisk_spender()
     } else {
         CanaryV2Client::standard_spender()
     }
-    .map_err(|_| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let allowances = balance_json
-        .get("allowances")
-        .and_then(Value::as_object)
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    let allowance = allowances
+    .map_err(|_| {
+        account_read_error(
+            LiveAccountReadFailure::Protocol,
+            evidence.clone(),
+            request_descriptor_hashes.clone(),
+        )
+    })?;
+    let attempts = evidence
         .iter()
-        .find(|(spender, _)| spender.eq_ignore_ascii_case(&selected_spender))
-        .and_then(|(_, value)| atomic_amount(Some(value)))
-        .unwrap_or(CollateralAmount::ZERO);
-    let observed_at = [geoblock, closed_only_response, balance]
-        .iter()
-        .map(|response| response.observed_at)
-        .min()
-        .ok_or_else(|| account_read_error(LiveAccountReadFailure::Protocol, evidence.clone()))?;
-    Ok(LiveVenueAccountState {
-        observed_at,
-        closed_only,
-        geoblocked,
-        selected_spender,
-        collateral_balance,
-        allowance,
-        // The ordinary service has no separate local reservation owner yet; the durable
-        // dispatch reservation prevents another account/order from overtaking this read.
-        reconciled_free_collateral: collateral_balance,
-        schema_version: 1,
-        parser_version: 1,
-        evidence: evidence.into_iter().filter_map(raw_attempt).collect(),
-    })
+        .cloned()
+        .filter_map(raw_attempt)
+        .collect::<Vec<_>>();
+    match classify_live_account_responses(
+        &attempts,
+        &selected_spender,
+        &request_descriptor_hashes,
+        None,
+        binding,
+    ) {
+        Ok(LiveAccountResponseClassification::State(state)) => Ok(state),
+        Ok(LiveAccountResponseClassification::ReadFailure(error)) => Err(error),
+        Err(_) => Err(LiveVenueAccountReadError {
+            kind: LiveAccountReadFailure::Protocol,
+            evidence: attempts,
+            request_descriptor_hashes,
+        }),
+    }
 }
 
 fn account_read_error(
     kind: LiveAccountReadFailure,
     evidence: Vec<RawEvidence>,
+    request_descriptor_hashes: Vec<String>,
 ) -> LiveVenueAccountReadError {
     LiveVenueAccountReadError {
         kind,
         evidence: evidence.into_iter().filter_map(raw_attempt).collect(),
+        request_descriptor_hashes,
     }
 }
 
@@ -522,24 +847,13 @@ fn trade_matches_order(trade: &Value, order_id: &str) -> bool {
             })
 }
 
-fn atomic_amount(value: Option<&Value>) -> Option<CollateralAmount> {
-    let value = value?;
-    let encoded = value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string());
-    encoded
-        .parse::<u64>()
-        .ok()
-        .map(CollateralAmount::from_atomic)
-}
-
 /// Fresh two-source market-admission builder for one condition.
 #[derive(Clone)]
 pub struct LiveAdmissionBuilder {
     client: reqwest::Client,
     gamma_base_url: String,
     clob_base_url: String,
+    source_log: SourceLogHandle,
 }
 
 impl LiveAdmissionBuilder {
@@ -547,11 +861,13 @@ impl LiveAdmissionBuilder {
         client: reqwest::Client,
         gamma_base_url: impl Into<String>,
         clob_base_url: impl Into<String>,
+        source_log: SourceLogHandle,
     ) -> Self {
         Self {
             client,
             gamma_base_url: gamma_base_url.into().trim_end_matches('/').to_owned(),
             clob_base_url: clob_base_url.into().trim_end_matches('/').to_owned(),
+            source_log,
         }
     }
 
@@ -561,13 +877,28 @@ impl LiveAdmissionBuilder {
         now: OffsetDateTime,
     ) -> Result<LiveAdmissionArtifact, LiveVenueAdapterError> {
         let gamma_url = format!(
-            "{}/markets?condition_ids={}&limit=500&include_tag=true",
+            "{}/markets?condition_ids={}&limit={GAMMA_BATCH_LIMIT_PARAM}&include_tag=true",
             self.gamma_base_url, condition_id.0
         );
         let clob_url = format!("{}/markets/{}", self.clob_base_url, condition_id.0);
-        let gamma_raw = self.fetch(&gamma_url).await?;
-        let clob_raw = self.fetch(&clob_url).await?;
-        let market = validate_live_market(
+        let compact_url = format!("{}/clob-markets/{}", self.clob_base_url, condition_id.0);
+        let (gamma_raw, gamma_receipt, gamma_received_at) = self
+            .fetch_and_record(
+                &gamma_url,
+                GAMMA_MARKETS_SOURCE_ID,
+                GAMMA_MARKETS_SCHEMA_VERSION,
+                GAMMA_MARKETS_PARSER_VERSION,
+            )
+            .await?;
+        let (clob_raw, clob_long_receipt, clob_long_received_at) = self
+            .fetch_and_record(
+                &clob_url,
+                CLOB_LONG_MARKET_SOURCE_ID,
+                LIVE_MARKET_SCHEMA_VERSION,
+                LIVE_MARKET_PARSER_VERSION,
+            )
+            .await?;
+        let mut market = validate_live_market(
             &gamma_raw,
             &clob_raw,
             condition_id,
@@ -575,6 +906,31 @@ impl LiveAdmissionBuilder {
             LIVE_MARKET_FRESHNESS_SECS,
         )
         .map_err(|error| LiveVenueAdapterError::MarketValidation(error.to_string()))?;
+        market.observed_at_unix = gamma_received_at
+            .max(clob_long_received_at)
+            .unix_timestamp();
+        let (compact_raw, clob_compact_receipt, _compact_received_at) = self
+            .fetch_and_record(
+                &compact_url,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+                LIVE_MARKET_SCHEMA_VERSION,
+                LIVE_MARKET_PARSER_VERSION,
+            )
+            .await?;
+        let compact = parse_compact_market(
+            &compact_raw,
+            condition_id,
+            &market.ordered_outcome_token_ids,
+        )
+        .map_err(|error| LiveVenueAdapterError::MarketValidation(error.to_string()))?;
+        if compact.minimum_order_size != market.minimum_order_size
+            || compact.minimum_tick_size != market.minimum_tick_size
+            || compact.neg_risk != market.neg_risk
+        {
+            return Err(LiveVenueAdapterError::MarketValidation(
+                "compact and long CLOB market rules disagree".to_owned(),
+            ));
+        }
         // validate_live_market admits only active=true, closed=false evidence from BOTH
         // payloads. Therefore the same observed payloads prove the entry settlement status is
         // unresolved; any resolved/ambiguous shape was already rejected above.
@@ -584,14 +940,29 @@ impl LiveAdmissionBuilder {
             status: VenueResolutionStatus::Unresolved,
             raw_evidence_hash: blake3::hash(&clob_raw).to_hex().to_string(),
             source_timestamp_unix: None,
-            observed_at_unix: now.unix_timestamp(),
+            observed_at_unix: clob_long_received_at.unix_timestamp(),
             parser_version: 1,
             freshness_window_secs: LIVE_MARKET_FRESHNESS_SECS,
         };
-        Ok(LiveAdmissionArtifact { market, settlement })
+        Ok(LiveAdmissionArtifact {
+            market,
+            settlement,
+            fee_schedule: compact.fee_schedule,
+            receipts: AdmissionReceipts {
+                gamma: gamma_receipt,
+                clob_long: clob_long_receipt,
+                clob_compact: clob_compact_receipt,
+            },
+        })
     }
 
-    async fn fetch(&self, url: &str) -> Result<Vec<u8>, LiveVenueAdapterError> {
+    async fn fetch_and_record(
+        &self,
+        url: &str,
+        source_id: &str,
+        schema_version: u32,
+        parser_version: u32,
+    ) -> Result<(Vec<u8>, pe_event_log::AppendReceipt, OffsetDateTime), LiveVenueAdapterError> {
         let response = self
             .client
             .get(url)
@@ -600,14 +971,29 @@ impl LiveAdmissionBuilder {
             .await
             .map_err(|error| LiveVenueAdapterError::MarketTransport(error.to_string()))?;
         let status = response.status();
-        if !status.is_success() {
-            return Err(LiveVenueAdapterError::MarketStatus(status.as_u16()));
-        }
-        response
+        let body = response
             .bytes()
             .await
             .map(|bytes| bytes.to_vec())
-            .map_err(|error| LiveVenueAdapterError::MarketTransport(error.to_string()))
+            .map_err(|error| LiveVenueAdapterError::MarketTransport(error.to_string()))?;
+        let received_at = OffsetDateTime::now_utc();
+        let receipt = self
+            .source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(source_id.to_owned()),
+                schema_version,
+                parser_version,
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                content_type: ContentType::Json,
+                payload: body.clone(),
+            })
+            .await
+            .map_err(|SourceLogHandleError::Closed| LiveVenueAdapterError::SourceLogClosed)?;
+        if !status.is_success() {
+            return Err(LiveVenueAdapterError::MarketStatus(status.as_u16()));
+        }
+        Ok((body, receipt, received_at))
     }
 }
 
@@ -866,10 +1252,156 @@ impl RedemptionStatusReader for LiveRedemptionAdapter {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use axum::Router;
+    use axum::http::{StatusCode, Uri};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use pe_core_types::CollateralAmount;
+    use pe_event_log::Reader;
     use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
+    use crate::clob_book::ClobBookFetcher as _;
+
+    const ADMISSION_CONDITION: &str =
+        "0x4c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ee";
+
+    async fn admission_and_book_fixture(uri: Uri) -> Response {
+        let path = uri.path();
+        let body = if path == "/markets" {
+            json!([{
+                "conditionId": ADMISSION_CONDITION,
+                "active": true,
+                "closed": false,
+                "acceptingOrders": true,
+                "enableOrderBook": true,
+                "negRisk": false,
+                "outcomes": "[\"Yes\",\"No\"]",
+                "clobTokenIds": "[\"11\",\"22\"]",
+                "orderPriceMinTickSize": "0.01",
+                "orderMinSize": "5",
+                "secondsDelay": 0
+            }])
+        } else if path.strip_prefix("/markets/") == Some(ADMISSION_CONDITION) {
+            json!({
+                "condition_id": ADMISSION_CONDITION,
+                "end_date_iso": "2026-09-06T12:00:00Z",
+                "active": true,
+                "closed": false,
+                "accepting_orders": true,
+                "enable_order_book": true,
+                "minimum_order_size": "5",
+                "minimum_tick_size": "0.01",
+                "neg_risk": false,
+                "seconds_delay": 0,
+                "tokens": [
+                    {"token_id": "11", "outcome": "Yes"},
+                    {"token_id": "22", "outcome": "No"}
+                ],
+                "maker_base_fee": 0,
+                "taker_base_fee": 0
+            })
+        } else if path.strip_prefix("/clob-markets/") == Some(ADMISSION_CONDITION) {
+            json!({
+                "c": ADMISSION_CONDITION,
+                "t": [{"t":"11","o":"Yes"},{"t":"22","o":"No"}],
+                "mts": 0.01,
+                "mos": 5,
+                "nr": false,
+                "mbf": 0,
+                "tbf": 0
+            })
+        } else if path == "/book" {
+            json!({
+                "market": ADMISSION_CONDITION,
+                "asset_id": "11",
+                "asks": [{"price":"0.50","size":"5"}],
+                "bids": []
+            })
+        } else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        (StatusCode::OK, axum::Json(body)).into_response()
+    }
+
+    /// PASS: Gamma-long, CLOB-long, compact, and the consumed book each append exactly once and
+    /// return the receipt of the exact synchronized source frame.
+    #[tokio::test]
+    async fn admission_and_book_append_each_response_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(get(admission_and_book_fixture)),
+            )
+            .await
+            .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let source_sink = crate::source_event_sink::SourceEventSink::open(&source_path).unwrap();
+        let (source_log, source_rx) = crate::activity_ingest::SourceLogHandle::channel(8);
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(1);
+        let coordinator = tokio::spawn(
+            crate::activity_ingest::ActivityIngest::poll_only(
+                source_sink,
+                source_rx,
+                trigger_tx,
+                crate::health::new_shared_health_with_ws(false, true, 90),
+            )
+            .run(),
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let admission = LiveAdmissionBuilder::new(
+            client.clone(),
+            base.clone(),
+            base.clone(),
+            source_log.clone(),
+        )
+        .build(
+            &pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned()),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        let book = crate::clob_book::ReqwestClobBookFetcher::new(client)
+            .with_base_url(base)
+            .with_source_log(source_log.clone())
+            .fetch_book(ADMISSION_CONDITION, "11")
+            .await
+            .unwrap();
+
+        let frames = Reader::replay(&source_path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|(_, frame)| frame.source_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "polymarket.gamma.markets",
+                "polymarket.clob.markets",
+                "polymarket.clob.compact-market",
+                "polymarket.clob.book"
+            ]
+        );
+        assert_eq!(admission.receipts.gamma.sequence, frames[0].0);
+        assert_eq!(admission.receipts.clob_long.sequence, frames[1].0);
+        assert_eq!(admission.receipts.clob_compact.sequence, frames[2].0);
+        assert_eq!(book.source_receipt.unwrap().sequence, frames[3].0);
+
+        drop(source_log);
+        coordinator.abort();
+        server.abort();
+    }
 
     fn post_response(body: serde_json::Value) -> RawHttpResponse {
         RawHttpResponse {
@@ -891,12 +1423,164 @@ mod tests {
         }
     }
 
+    /// PASS: an external account response carrying the former internal sentinel name remains
+    /// literal response evidence and is classified with its separate request descriptor hash.
     #[test]
-    fn matched_post_classification_retains_executed_price_improvement_amounts() {
+    fn account_response_accepts_literal_request_descriptor_named_header() {
+        let account_id = AccountId::new("account").unwrap();
+        let custody_wallet =
+            WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap();
+        let binding = LiveAccountBindingAudit::new(
+            account_id,
+            pe_execution_core::CredentialBindingIdentity {
+                version: 1,
+                key_id: "key".to_owned(),
+            },
+            custody_wallet,
+            blake3::hash(b"credential").to_hex().to_string(),
+        );
+        let spender = CanaryV2Client::standard_spender().unwrap();
+        let response = |endpoint_kind: &str,
+                        path: &str,
+                        ordered_query: Vec<(String, String)>,
+                        headers: Vec<(String, String)>,
+                        body: Vec<u8>| {
+            RawEvidence::HttpResponse(RawHttpResponse {
+                source_id: "polymarket-clob-v2".to_owned(),
+                endpoint_kind: endpoint_kind.to_owned(),
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                ordered_query,
+                status: 200,
+                headers,
+                body,
+                attempt_ordinal: 1,
+                source_at: None,
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+                received_at: OffsetDateTime::UNIX_EPOCH,
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+            })
+        };
+        let literal_header = (
+            "x-pe-request-descriptor-blake3".to_owned(),
+            "venue-value".to_owned(),
+        );
+        let evidence = vec![
+            response(
+                "geoblock",
+                "/api/geoblock",
+                Vec::new(),
+                vec![literal_header.clone()],
+                br#"{"blocked":false,"country":"US"}"#.to_vec(),
+            ),
+            response(
+                "closed-only",
+                "/auth/ban-status/closed-only",
+                Vec::new(),
+                Vec::new(),
+                br#"{"closed_only":false}"#.to_vec(),
+            ),
+            response(
+                "balance-allowance",
+                "/balance-allowance",
+                vec![
+                    ("asset_type".to_owned(), "COLLATERAL".to_owned()),
+                    ("signature_type".to_owned(), "3".to_owned()),
+                ],
+                Vec::new(),
+                serde_json::to_vec(&json!({
+                    "balance": "1000000",
+                    "allowances": { spender.clone(): "1000000" },
+                }))
+                .unwrap(),
+            ),
+        ];
+
+        let descriptor_hashes = bind_account_read_attempts(&evidence, &binding).unwrap();
+        let headers = evidence
+            .iter()
+            .find_map(|item| match item {
+                RawEvidence::HttpResponse(response) if response.endpoint_kind == "geoblock" => {
+                    Some(&response.headers)
+                }
+                RawEvidence::HttpResponse(_)
+                | RawEvidence::HttpTransportFailure(_)
+                | RawEvidence::Artifact(_) => None,
+            })
+            .unwrap();
+        assert_eq!(headers.as_slice(), &[literal_header]);
+        let attempts = evidence
+            .into_iter()
+            .filter_map(raw_attempt)
+            .collect::<Vec<_>>();
+        let classified = classify_live_account_responses(
+            &attempts,
+            &spender,
+            &descriptor_hashes,
+            None,
+            &binding,
+        )
+        .unwrap();
+        assert!(matches!(
+            classified,
+            LiveAccountResponseClassification::State(_)
+        ));
+        let LiveAccountResponseClassification::State(state) = classified else {
+            return;
+        };
+        assert_eq!(
+            state.collateral_balance,
+            CollateralAmount::from_atomic(1_000_000)
+        );
+    }
+
+    /// PASS: descriptor generation binds every account attempt one-for-one, including a
+    /// transport failure that has no HTTP response bytes.
+    #[test]
+    fn account_transport_failure_gets_account_bound_request_descriptor() {
+        let account_id = AccountId::new("account").unwrap();
+        let binding = LiveAccountBindingAudit::new(
+            account_id,
+            pe_execution_core::CredentialBindingIdentity {
+                version: 1,
+                key_id: "key".to_owned(),
+            },
+            WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap(),
+            blake3::hash(b"credential").to_hex().to_string(),
+        );
+        let failure = RawTransportFailure {
+            source_id: "polymarket-clob-v2".to_owned(),
+            endpoint_kind: "closed-only".to_owned(),
+            method: "GET".to_owned(),
+            path: "/auth/ban-status/closed-only".to_owned(),
+            ordered_query: Vec::new(),
+            attempt_ordinal: 1,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            error_class: TransportErrorClass::Connect,
+            schema_version: 1,
+            parser_version: 1,
+            adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+        };
+        let evidence = vec![RawEvidence::HttpTransportFailure(failure.clone())];
+        let hashes = bind_account_read_attempts(&evidence, &binding).unwrap();
+        let expected = request_descriptor_hash(
+            &binding.request_descriptor_for_attempt(&RawHttpAttempt::TransportFailure(failure)),
+        )
+        .unwrap();
+
+        assert_eq!(hashes, vec![expected]);
+    }
+
+    /// PASS: post evidence retains exact fractional improved quantity for audit-only use.
+    #[test]
+    fn matched_post_classification_retains_fractional_price_improvement_amounts() {
         let response = post_response(json!({
             "errorMsg": null,
-            "makingAmount": "4.00",
-            "takingAmount": "10",
+            "makingAmount": "4.05",
+            "takingAmount": "10.125",
             "orderID": "venue-order",
             "status": "MATCHED",
             "success": true,
@@ -908,9 +1592,10 @@ mod tests {
             LivePostClassification::Matched {
                 venue_order_id: "venue-order".to_owned(),
                 executed: LiveExecutedAmounts {
-                    making_amount: dec!(4.00),
-                    taking_amount: dec!(10),
+                    making_amount: dec!(4.05),
+                    taking_amount: dec!(10.125),
                 },
+                transaction_hashes: Vec::new(),
             }
         );
     }
@@ -930,6 +1615,47 @@ mod tests {
         assert_eq!(
             classify_order_post_response(&response),
             Err(LivePostParseError::InvalidResponse)
+        );
+    }
+
+    /// PASS: authenticated reconciliation preserves every distinct matching nonzero hash.
+    #[test]
+    fn reconciliation_retains_every_matching_transaction_hash() {
+        let order_hash = format!("0x{}", "aa".repeat(32));
+        let first = format!("0x{}", "11".repeat(32));
+        let second = format!("0x{}", "22".repeat(32));
+        let response = RawHttpResponse {
+            endpoint_kind: "trades-page".to_owned(),
+            body: serde_json::to_vec(&json!({"data":[
+                {"taker_order_id": order_hash, "transaction_hash": second},
+                {"taker_order_id": order_hash, "transaction_hash": first},
+                {"taker_order_id": order_hash, "transaction_hash": second},
+                {"taker_order_id": order_hash, "transaction_hash": format!("0x{}", "00".repeat(32))},
+                {"taker_order_id": "other", "transaction_hash": format!("0x{}", "33".repeat(32))}
+            ]}))
+            .unwrap(),
+            ..post_response(json!({}))
+        };
+        let result = classify_reconciliation(
+            &[RawEvidence::HttpResponse(response)],
+            &format!("0x{}", "aa".repeat(32)),
+        )
+        .unwrap();
+        let transaction_hashes = match result {
+            ReconciliationClassification::Matched {
+                transaction_hashes, ..
+            } => Some(transaction_hashes),
+            ReconciliationClassification::Killed(_)
+            | ReconciliationClassification::Rejected(_)
+            | ReconciliationClassification::Cancel { .. }
+            | ReconciliationClassification::Ambiguous => None,
+        };
+        assert_eq!(
+            transaction_hashes,
+            Some(vec![
+                format!("0x{}", "11".repeat(32)),
+                format!("0x{}", "22".repeat(32))
+            ])
         );
     }
 }

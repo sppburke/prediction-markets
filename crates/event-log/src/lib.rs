@@ -42,4 +42,4 @@ pub use envelope::{ContentType, EnvelopeIn, EventEnvelope};
 pub use error::{LogError, PoisonReason};
 pub use reader::Reader;
 pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
-pub use writer::Writer;
+pub use writer::{AppendReceipt, Writer};

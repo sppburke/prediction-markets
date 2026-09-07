@@ -9,16 +9,29 @@
 #![forbid(unsafe_code)]
 
 pub mod canary_market;
+pub mod fee;
 pub mod ladder;
+pub mod receipt;
 pub mod redemption;
 pub mod v2;
 
 pub use canary_market::{
-    AskLevel, CanaryBookSnapshot, CanaryMarketError, ClobMarketEvidence, ExecutableLadder,
-    executable_ladder, parse_book, parse_market_evidence,
+    AskLevel, CanaryBookSnapshot, CanaryMarketError, ClobMarketEvidence, CompactMarketEvidence,
+    ExecutableLadder, executable_ladder, parse_book, parse_compact_market, parse_market_evidence,
+};
+pub use fee::{
+    CompactFeeSchedule, FeeError, FeeScheduleError, fee_reserve, fee_within_reserve,
+    parse_compact_fee_schedule, principal_for_budget, taker_fee,
 };
 pub use ladder::{
-    LADDER_MAX_AGE_MS, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy, plan_exact_shares,
+    BuySizing, KellyAllocator, LADDER_MAX_AGE_MS, LadderError, LadderPlan, SizedBuyPlan,
+    ladder_is_stale, plan_sized_buy,
+};
+pub use receipt::{
+    CTF_EXCHANGE_V2, DecodedOrderFill, FINALIZED_CHAIN_ID, FinalizedBlock, MatchedReceipt,
+    NEG_RISK_CTF_EXCHANGE_V2, ReceiptError, TOPIC_ORDER_FILLED_V2, canonical_block_matches,
+    decode_order_fills, parse_chain_id_response, parse_finalized_block_response,
+    parse_receipt_response,
 };
 pub use redemption::{
     ApprovalCheckRequest, ApprovalEvidence, ApprovalReadError, ApprovalReader,

@@ -4,6 +4,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -16,7 +18,7 @@ use pe_paper_state::{
 };
 use pe_position_ledger::{AppliedEffect, LedgerEffect, PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
-    BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2, IdentityOverride,
+    BucketCommitEngine, BucketDecisionContext, DecisionContinuationV3, IdentityOverride,
 };
 use pe_service::decision_replay::{
     AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
@@ -170,11 +172,22 @@ fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
     }
 }
 fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
+    let proof = support::producer_shaped_activity_page(
+        wallet(),
+        b"[]",
+        epoch,
+        pe_event_log::AppendReceipt {
+            sequence: pe_core_types::EventSeq(u64::try_from(epoch).unwrap()),
+            this_hash: blake3::hash(format!("receipt-{epoch}").as_bytes()),
+        },
+    );
     BucketDecisionContext {
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
         ),
-        decision_inputs_json: "{\"source_window\":\"complete\"}".to_owned(),
+        decision_inputs_json: proof.0,
+        page_occurrences: vec![proof.1],
+        observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),
         copy_eligible: true,
@@ -1125,12 +1138,12 @@ fn trade_aggregate_uses_exact_size_weighted_price_and_not_usdc_audit() {
         .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     let row = paper.open_decision_pending().unwrap().remove(0);
-    let frozen = DecisionContinuationV2::from_durable(&row).unwrap();
-    assert_eq!(frozen.share_amount.atomic(), 4_000_000);
-    assert_eq!(frozen.price.0, rust_decimal::Decimal::new(5, 1));
+    let frozen = DecisionContinuationV3::from_durable(&row).unwrap();
+    assert_eq!(frozen.facts.share_amount.atomic(), 4_000_000);
+    assert_eq!(frozen.facts.price.0, rust_decimal::Decimal::new(5, 1));
     assert_eq!(
-        frozen.applied_configuration_hash,
-        frozen.applied_configuration.canonical_hash(),
+        frozen.facts.applied_configuration_hash,
+        frozen.facts.applied_configuration.canonical_hash(),
         "the pending boundary stores the real canonical hash of its full hot snapshot"
     );
 }
@@ -1294,21 +1307,23 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
     let _restarted_engine = BucketCommitEngine::load(Arc::clone(&restarted), ledger).unwrap();
     assert_eq!(restarted.leader_positions().unwrap(), before);
     for pending in restarted.open_decision_pending().unwrap() {
-        let frozen = DecisionContinuationV2::from_durable(&pending).unwrap();
+        let frozen = DecisionContinuationV3::from_durable(&pending).unwrap();
         let trade = frozen.incoming_trade().unwrap();
         assert_eq!(trade.source_trade_id, pending.source_trade_id);
-        assert_eq!(trade.contracts, frozen.share_amount);
+        assert_eq!(trade.contracts, frozen.facts.share_amount);
         let terminal = TerminalDispositionEvidence {
             disposition: "no_copy:test_terminal".to_owned(),
             reason: "test_terminal".to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         };
         let evidence = DecisionPostBoundaryEvidence::from_body(DecisionPostBoundaryEvidenceBody {
             version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,
             owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
             source_trade_id: pending.source_trade_id.clone(),
-            applied_configuration_hash: frozen.applied_configuration_hash.clone(),
+            applied_configuration_hash: frozen.facts.applied_configuration_hash.clone(),
             market_end: None,
             market_price: None,
             book: None,
@@ -1343,6 +1358,76 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             && replay_decision_pending(row).is_ok()
     }));
     assert_eq!(restarted.leader_positions().unwrap(), before);
+}
+
+/// RC14-DECISION-FINAL-RECEIPT
+///
+/// Preconditions: one admitted first-entry bucket has an open `decision_pending` continuation and
+/// the paper serializer has synchronized its FinancialFinal receipt.
+/// PASS: terminalization removes legacy copied fill evidence, retains the exact Final receipt, and
+/// replay returns the same receipt after reopening SQLite.
+/// FAIL: the receipt is absent/changed, legacy fill evidence survives, or replay rejects the row.
+#[test]
+fn terminal_decision_pending_retains_financial_final_receipt() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let result = engine
+        .commit(
+            vec![position_row(
+                "TRADE", "0x43", MARKET_A, 0, "BUY", "1.25", "0.4", 302,
+            )],
+            &context(302, true),
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(result.pending.len(), 1);
+    let pending = paper.open_decision_pending().unwrap().remove(0);
+    let frozen = DecisionContinuationV3::from_durable(&pending).unwrap();
+    let final_receipt = pe_event_log::AppendReceipt {
+        sequence: pe_core_types::EventSeq(77),
+        this_hash: blake3::hash(b"financial-final"),
+    };
+    let terminal = TerminalDispositionEvidence::final_fill(final_receipt);
+    assert!(terminal.fill.is_none());
+    let evidence = DecisionPostBoundaryEvidence::from_body(DecisionPostBoundaryEvidenceBody {
+        version: pe_service::decision_replay::TERMINAL_EVIDENCE_VERSION,
+        owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
+        source_trade_id: pending.source_trade_id.clone(),
+        applied_configuration_hash: frozen.facts.applied_configuration_hash,
+        market_end: None,
+        market_price: None,
+        book: None,
+        clocks: vec![DecisionClockEvidence {
+            purpose: "financial_final".to_owned(),
+            unix_millis: 302_001,
+        }],
+        authority: AuthorityEvidence {
+            kind: "commit_fill_v2".to_owned(),
+            outcome: "applied".to_owned(),
+            bankroll: Some("9".to_owned()),
+        },
+        terminal,
+    })
+    .unwrap();
+    paper
+        .close_decision_pending(
+            &pending.source_trade_id,
+            &serde_json::to_string(&evidence).unwrap(),
+            "fill",
+            303,
+        )
+        .unwrap();
+    drop(engine);
+    drop(paper);
+
+    let reopened = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    let row = reopened.decision_pending_history().unwrap().remove(0);
+    assert_eq!(row.state, DecisionPendingState::Terminal);
+    let replayed = replay_decision_pending(&row).unwrap();
+    assert_eq!(
+        replayed.post_boundary.body.terminal.final_receipt,
+        Some(final_receipt)
+    );
+    assert!(replayed.post_boundary.body.terminal.fill.is_none());
 }
 
 #[test]

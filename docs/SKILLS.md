@@ -32,7 +32,7 @@ Quality bar:
 - robust sample-size shrinkage (Bayesian prior, see `19-` § p estimation);
 - latency/edge decay measured against the production budget in `_GLOSSARY.md`;
 - Kalshi identity restrictions respected (`07-`);
-- live-tiny only after paper-copy validation per `_GLOSSARY.md` "Promotion criteria — quantified".
+- live-tiny only after the sealed observed-paper gate in `_GLOSSARY.md` and one post-`Pass` review.
 
 ## Skill: Venue adapter implementation
 
@@ -52,10 +52,12 @@ Quality bar:
 ## Skill: Backtesting and anti-overfitting
 
 - Walk-forward only for strategy selection.
-- Use bootstrap confidence intervals.
+- Use predeclared uncertainty calculations appropriate to the research question; qualification
+  reuses the existing pure lower-five-percent daily-growth bound.
 - Penalize profit concentration.
 - Include costs, slippage, missed fills, and copy delay.
-- Compare live paper-copy against backtest distributions using the "close to simulation" definition in `_GLOSSARY.md` (KS p-value ≥ 0.10, abs(z) ≤ 2.0).
+- Keep backtests as research/regression evidence. Paper qualification replays one sealed observed
+  system exactly and does not compare it with a simulator distribution.
 
 ## Skill: AWS and Git operations
 

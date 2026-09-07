@@ -1,29 +1,32 @@
 //! Authoritative Supabase paper-state client (issue #397).
 //!
-//! When `PE_SUPABASE_AUTHORITATIVE=1`, Supabase is the system of record for "the money and
-//! the book": the new `paper_bankroll` + `paper_positions` tables and the reused
-//! `paper_fills` + `settled_markets`. Mutations go through two Postgres RPCs —
-//! [`SupabaseStateClient::commit_fill`] and [`SupabaseStateClient::apply_resolution`] — that
-//! are atomic and idempotent (the SQL gates each money write on the dedup row newly
-//! inserting and mutates `paper_bankroll` via a single self-referencing UPDATE, so the
-//! concurrent fill and resolution tasks cannot lose an update). Local SQLite is mirrored
-//! write-through and is the read cache; `seen_trades`/`leader_positions`/`poll_cursors`/
-//! `meta` stay local-only.
-//!
-//! The two write-through paths are exposed as the free functions
-//! [`commit_fill_authoritative`] and [`apply_resolution_authoritative`] (RPC first, SQLite
-//! mirror second), generic over [`SupabaseStateTrait`] so scenario tests drive them with an
-//! in-memory fake and inject RPC failures with no live network — mirroring the
+//! When `PE_SUPABASE_AUTHORITATIVE=1`, Supabase is the system of record for the paper money
+//! and book. Financial-era mutations flow through the Prepared-sequenced write-through paths
+//! ([`commit_prepared_fill`](SupabaseStateTrait::commit_prepared_fill) and
+//! [`apply_prepared_resolution`](SupabaseStateTrait::apply_prepared_resolution)), which call
+//! `commit_fill_v2` and `apply_resolution_v2` with the Start identity, completed predecessor,
+//! and current Prepared sequence. Local SQLite receives the canonical result before Final.
+//! The legacy `commit_fill_v2` request shape survives only for the pre-Start frame walk.
+//! Everything is generic over [`SupabaseStateTrait`] so scenario tests drive it with an in-memory
+//! fake and inject RPC failures with no live network — mirroring the
 //! [`crate::supabase_sink`] `SinkWriter` seam.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId};
-use pe_paper_pnl::ResolutionStore;
-use pe_paper_state::{
-    FillRecord, FillRow, LeaderPositionRow, PaperPositionRow, PaperStateDb, PaperStateError,
+use pe_core_types::{
+    CollateralAmount, EventSeq, MarketId, OutcomeId, PolymarketConditionId, Price, ReceivedAt,
+    ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Writer};
+use pe_execution_core::EconomicPrepared;
+use pe_paper_state::{FillRecord, FillRow, PaperPositionRow, PaperStateDb, PaperStateError};
+use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
+use pe_source_polymarket_public::{
+    BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
+    ClobPayoutResolution, parse_clob_market,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -33,6 +36,11 @@ use crate::decision_replay::{
     AuthorityEvidence, DecisionEvidenceAccumulator, TerminalDispositionEvidence,
 };
 use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pending_evidence};
+use crate::paper_recovery::{
+    CanonicalFillResult, CanonicalResolutionResult, ExpectedAuthority, FinancialPayload,
+    FinancialResult, PAPER_LOG_SCHEMA_VERSION, PaperFillOperationIdentity, PaperLogFrame,
+    PaperLogRecord, paper_era, scan_paper_log,
+};
 use crate::supabase_reader::auth_token;
 use crate::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 
@@ -68,6 +76,9 @@ pub enum SupabaseStateError {
     Serialize(#[from] serde_json::Error),
     #[error("migration evidence: {0}")]
     MigrationEvidence(String),
+    /// Authority compared an existing/predecessor operation and rejected changed identity.
+    #[error("authoritative paper protocol conflict: {reason}")]
+    Conflict { reason: String },
     /// Boot frame reconciliation stopped below the verified log head.
     #[error("authoritative boot frame walk incomplete at watermark {last_watermark}")]
     IncompleteFrameWalk { last_watermark: i64 },
@@ -81,6 +92,10 @@ const PAPER_POSITIONS_PAGE_LIMIT: usize = 1_000;
 /// ignored/repeating offset into a loud failure instead of an unbounded loop.
 /// Canonical: `docs/_GLOSSARY.md` `supabase_paper_positions_max_rows`.
 const PAPER_POSITIONS_MAX_ROWS: usize = 500_000;
+
+/// Upper bound for one authoritative financial mutation. An elapsed request is deliberately
+/// ambiguous and is recovered from the synchronized Prepared record.
+const AUTHORITATIVE_MUTATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 const fn side_str(side: Side) -> &'static str {
     match side {
@@ -129,8 +144,85 @@ pub struct ResolutionV2Outcome {
     pub bankroll: Decimal,
 }
 
-/// Idempotent authoritative writes. Abstracted as a trait so scenario tests drive
-/// [`commit_fill_authoritative`] / [`apply_resolution_authoritative`] with an in-memory fake.
+/// Frozen fill request reconstructed solely from a FinancialPrepared payload and receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedFillRequest {
+    pub expected_authority: ExpectedAuthority,
+    pub prepared_receipt: AppendReceipt,
+    pub idempotency_key: String,
+    pub leader_wallet: WalletAddress,
+    pub source_trade_id: SourceTradeId,
+    pub condition_id: PolymarketConditionId,
+    pub market_id: String,
+    pub outcome_id: u16,
+    pub side: Side,
+    pub quantity: ShareAmount,
+    pub fill_price: Price,
+    pub principal: CollateralAmount,
+    pub fee: CollateralAmount,
+    pub entry_unix: i64,
+}
+
+impl PreparedFillRequest {
+    pub fn from_prepared(
+        expected_authority: ExpectedAuthority,
+        prepared_receipt: AppendReceipt,
+        operation: &PaperFillOperationIdentity,
+        economic: &EconomicPrepared,
+    ) -> Self {
+        let outcome_id = u16::from(economic.market.outcome_index);
+        let idempotency_key = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+            &operation.leader_wallet.to_string(),
+            &operation.source_trade_id.0,
+            &economic.market.market_id,
+            outcome_id,
+            economic.market.side,
+            operation.observed_at_bucket,
+        );
+        Self {
+            expected_authority,
+            prepared_receipt,
+            idempotency_key,
+            leader_wallet: operation.leader_wallet,
+            source_trade_id: operation.source_trade_id.clone(),
+            condition_id: economic.market.condition_id.clone(),
+            market_id: economic.market.market_id.clone(),
+            outcome_id,
+            side: economic.market.side,
+            quantity: economic.sizing.expected_shares,
+            fill_price: economic.sizing.expected_vwap,
+            principal: economic.sizing.principal,
+            fee: economic.fee.expected_fee,
+            entry_unix: operation.observed_at_bucket,
+        }
+    }
+}
+
+fn validate_authority_market_identity(
+    condition_id: &PolymarketConditionId,
+    market_id: &str,
+) -> Result<(), SupabaseStateError> {
+    if market_id == condition_id.0 {
+        Ok(())
+    } else {
+        Err(SupabaseStateError::Corrupt(
+            "paper authority market ID disagrees with admitted condition ID".to_owned(),
+        ))
+    }
+}
+
+/// Frozen resolution request reconstructed from its Prepared payload and source envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedResolutionRequest {
+    pub expected_authority: ExpectedAuthority,
+    pub prepared_receipt: AppendReceipt,
+    pub condition: PolymarketConditionId,
+    pub payout_by_outcome_index_json: String,
+    pub settled_at_unix: i64,
+}
+
+/// Idempotent authoritative writes. Abstracted as a trait so scenario tests drive the legacy
+/// frame-walk and Prepared-sequenced methods with an in-memory fake.
 pub trait SupabaseStateTrait: Send + Sync {
     /// Commit a fill via the authoritative `commit_fill_v2` RPC (#511): typed outcome,
     /// canonical row, lock-first settled refusal.
@@ -138,14 +230,17 @@ pub trait SupabaseStateTrait: Send + Sync {
         &self,
         row: &SupabaseFillRow,
     ) -> impl Future<Output = Result<FillV2Outcome, SupabaseStateError>> + Send;
-    /// Apply a resolution via the authoritative `apply_resolution_v2` RPC (#511): the
-    /// credit is computed server-side under the bankroll lock.
-    fn apply_resolution_v2(
+    /// #545 Start-bound, Prepared-sequenced exact fill mutation.
+    fn commit_prepared_fill(
         &self,
-        market_id: &MarketId,
-        outcome_prices: &[Decimal],
-        settled_at_unix: i64,
-    ) -> impl Future<Output = Result<ResolutionV2Outcome, SupabaseStateError>> + Send;
+        request: &PreparedFillRequest,
+    ) -> impl Future<Output = Result<CanonicalFillResult, SupabaseStateError>> + Send;
+
+    /// #545 Start-bound, Prepared-sequenced exact resolution mutation.
+    fn apply_prepared_resolution(
+        &self,
+        request: &PreparedResolutionRequest,
+    ) -> impl Future<Output = Result<CanonicalResolutionResult, SupabaseStateError>> + Send;
 }
 
 /// Complete authoritative boot reads, split from runtime RPCs for deterministic failure injection.
@@ -167,7 +262,7 @@ pub struct SupabaseStateClient {
     client: reqwest::Client,
     base_url: String,
     token: String,
-    /// Cumulative count of authoritative RPC calls (`commit_fill` + `apply_resolution`),
+    /// Cumulative count of authoritative RPC calls (`commit_fill_v2` + `apply_resolution_v2`),
     /// surfaced in `status.json` so an agent can see the steady-state Supabase write rate.
     /// `Arc` so every clone (one per fill, in the orchestrator) shares the same counter.
     calls: Arc<AtomicU64>,
@@ -189,6 +284,51 @@ impl SupabaseStateClient {
         Arc::clone(&self.calls)
     }
 
+    /// Seed the synchronized QualificationStarted receipt in the authority singleton.
+    /// Equal retries are idempotent; a distinct Start is surfaced as a typed conflict.
+    pub async fn seed_financial_start(
+        &self,
+        start: AppendReceipt,
+    ) -> Result<(), SupabaseStateError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Response {
+            outcome: String,
+            #[serde(default)]
+            conflict_reason: Option<String>,
+            start_seq: i64,
+            start_hash: String,
+        }
+
+        let body = serde_json::json!({
+            "p_start_seq": start.sequence.0,
+            "p_start_hash": start.this_hash.to_hex().to_string(),
+        });
+        let value = self.post_rpc_json("seed_financial_start", &body).await?;
+        let response: Response = serde_json::from_value(value).map_err(|error| {
+            SupabaseStateError::Corrupt(format!("seed_financial_start shape: {error}"))
+        })?;
+        if response.outcome == "conflict" {
+            return Err(SupabaseStateError::Conflict {
+                reason: response
+                    .conflict_reason
+                    .unwrap_or_else(|| "authority omitted conflict_reason".to_owned()),
+            });
+        }
+        let sequence = u64::try_from(response.start_seq).map_err(|_| {
+            SupabaseStateError::Corrupt(format!("financial Start sequence {}", response.start_seq))
+        })?;
+        if !matches!(response.outcome.as_str(), "applied" | "existing")
+            || sequence != start.sequence.0
+            || response.start_hash != start.this_hash.to_hex().to_string()
+        {
+            return Err(SupabaseStateError::Corrupt(
+                "seed_financial_start canonical identity differs".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// `POST {base}/rest/v1/rpc/{func}` with a JSON args object; decode the scalar return.
     async fn post_rpc_json(
         &self,
@@ -202,6 +342,7 @@ impl SupabaseStateClient {
         let resp = self
             .client
             .post(&url)
+            .timeout(AUTHORITATIVE_MUTATION_TIMEOUT)
             .header("apikey", &self.token)
             .header(
                 reqwest::header::AUTHORIZATION,
@@ -347,11 +488,11 @@ impl SupabaseStateClient {
                     outcome_id: OutcomeId(u16::try_from(r.outcome_id).map_err(|_| {
                         SupabaseStateError::Corrupt(format!("outcome_id {}", r.outcome_id))
                     })?),
-                    long_contracts: u64::try_from(r.long_contracts).map_err(|_| {
-                        SupabaseStateError::Corrupt(format!("long {}", r.long_contracts))
+                    long: ShareAmount::from_decimal_exact(r.long_contracts).map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("paper position long: {error}"))
                     })?,
-                    short_contracts: u64::try_from(r.short_contracts).map_err(|_| {
-                        SupabaseStateError::Corrupt(format!("short {}", r.short_contracts))
+                    short: ShareAmount::from_decimal_exact(r.short_contracts).map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("paper position short: {error}"))
                     })?,
                 })
             })
@@ -361,7 +502,7 @@ impl SupabaseStateClient {
     // ── One-time backfill upserts (SQLite → Supabase, service stopped) ──────────
 
     /// Upsert the bankroll singleton to an exact value (backfill — distinct from the
-    /// delta-based `commit_fill`/`apply_resolution` RPCs; this is the only way to seed the
+    /// Prepared-sequenced financial RPCs; this is the only way to seed the
     /// authoritative balance from the complete local SQLite scalar).
     pub async fn upsert_bankroll(&self, value: Decimal) -> Result<(), SupabaseStateError> {
         let body = serde_json::json!([{ "id": 0, "bankroll_str": value.to_string() }]);
@@ -373,8 +514,8 @@ impl SupabaseStateClient {
         let body = serde_json::json!([{
             "market_id": row.market_id.0.0,
             "outcome_id": row.outcome_id.0,
-            "long_contracts": row.long_contracts,
-            "short_contracts": row.short_contracts,
+            "long_contracts": row.long.to_decimal().to_string(),
+            "short_contracts": row.short.to_decimal().to_string(),
         }]);
         self.post_upsert("paper_positions", "market_id,outcome_id", &body)
             .await
@@ -412,11 +553,39 @@ struct FillV2RowJson {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResolutionV2Resp {
+#[serde(deny_unknown_fields)]
+struct PreparedFillResp {
     outcome: String,
-    credit: String,
-    outcome_prices: Vec<String>,
-    settled_at_unix: i64,
+    conflict_reason: Option<String>,
+    bankroll: String,
+    applied_prepared_seq: Option<i64>,
+    row: Option<PreparedFillRow>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedFillRow {
+    idempotency_key: String,
+    leader_wallet: String,
+    source_trade_id: String,
+    market_id: String,
+    outcome_id: i64,
+    side: String,
+    quantity: String,
+    fill_price: String,
+    principal: String,
+    fee: String,
+    entry_unix: i64,
+    prepared_seq: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedResolutionResp {
+    outcome: String,
+    conflict_reason: Option<String>,
+    credit: Option<String>,
+    applied_prepared_seq: Option<i64>,
     bankroll: String,
 }
 
@@ -495,19 +664,31 @@ fn canonical_fill(row: FillV2RowJson) -> Result<CanonicalFill, SupabaseStateErro
     };
     let contracts = u64::try_from(row.contracts)
         .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row contracts {}", row.contracts)))?;
+    let quantity = ShareAmount::from_whole(contracts)
+        .map_err(|error| SupabaseStateError::Corrupt(format!("v2 row quantity: {error}")))?;
     let event_seq = u64::try_from(row.event_seq)
         .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row event_seq {}", row.event_seq)))?;
     let outcome_id = u16::try_from(row.outcome_id).map_err(|_| {
         SupabaseStateError::Corrupt(format!("v2 row outcome_id {}", row.outcome_id))
     })?;
+    let fill_price = Price::new(money(&row.fill_price, "v2 row fill_price")?)
+        .map_err(|error| SupabaseStateError::Corrupt(format!("v2 row fill_price: {error}")))?;
+    let principal = fill_price
+        .0
+        .checked_mul(quantity.to_decimal())
+        .ok_or_else(|| SupabaseStateError::Corrupt("v2 row principal overflow".to_owned()))?;
     Ok(CanonicalFill {
         record: FillRecord {
             idempotency_key: row.idempotency_key,
             market_id: MarketId(pe_core_types::VenueMarketId(row.market_id)),
             outcome_id: OutcomeId(outcome_id),
             side,
-            contracts,
-            fill_price: Price(money(&row.fill_price, "v2 row fill_price")?),
+            quantity,
+            fill_price,
+            principal: CollateralAmount::from_decimal_exact(principal).map_err(|error| {
+                SupabaseStateError::Corrupt(format!("v2 row principal: {error}"))
+            })?,
+            fee: CollateralAmount::ZERO,
         },
         event_seq: EventSeq(event_seq),
         source_trade_id: row.source_trade_id,
@@ -519,7 +700,14 @@ impl SupabaseStateTrait for SupabaseStateClient {
         &self,
         row: &SupabaseFillRow,
     ) -> Result<FillV2Outcome, SupabaseStateError> {
-        // Decimals as strings (no f64); the RPC casts text → numeric.
+        const ATOMIC_SCALE: u64 = 1_000_000;
+        if !row.fill.quantity.atomic().is_multiple_of(ATOMIC_SCALE) {
+            return Err(SupabaseStateError::Corrupt(
+                "legacy commit_fill_v2 cannot encode fractional shares".to_owned(),
+            ));
+        }
+        let contracts = row.fill.quantity.atomic() / ATOMIC_SCALE;
+        // Decimals as strings (no f64); the legacy RPC accepts whole contracts only.
         let body = serde_json::json!({
             "p_idempotency_key": row.fill.idempotency_key,
             "p_leader_wallet": row.leader_wallet,
@@ -527,10 +715,10 @@ impl SupabaseStateTrait for SupabaseStateClient {
             "p_market_id": row.fill.market_id.0.0,
             "p_outcome_id": row.fill.outcome_id.0,
             "p_side": side_str(row.fill.side),
-            "p_contracts": row.fill.contracts,
+            "p_contracts": contracts,
             "p_fill_price": row.fill.fill_price.0.to_string(),
             "p_entry_unix": row.entry_unix,
-            "p_event_seq": row.fill.event_seq,
+            "p_event_seq": row.fill.event_seq.0,
         });
         let value = self.post_rpc_json("commit_fill_v2", &body).await?;
         let resp: FillV2Resp = serde_json::from_value(value)
@@ -553,43 +741,184 @@ impl SupabaseStateTrait for SupabaseStateClient {
         }
     }
 
-    async fn apply_resolution_v2(
+    async fn commit_prepared_fill(
         &self,
-        market_id: &MarketId,
-        outcome_prices: &[Decimal],
-        settled_at_unix: i64,
-    ) -> Result<ResolutionV2Outcome, SupabaseStateError> {
-        // `outcome_prices` as a jsonb array of text decimals — matches the sink's
-        // `settled_markets.outcome_prices` shape (so `wallet_live_stats` reads agree).
-        let prices: Vec<String> = outcome_prices.iter().map(|d| d.to_string()).collect();
+        request: &PreparedFillRequest,
+    ) -> Result<CanonicalFillResult, SupabaseStateError> {
+        validate_authority_market_identity(&request.condition_id, &request.market_id)?;
         let body = serde_json::json!({
-            "p_market_id": market_id.0.0,
-            "p_outcome_prices": prices,
-            "p_settled_at_unix": settled_at_unix,
+            "p_start_seq": request.expected_authority.qualification_start_receipt.sequence.0,
+            "p_start_hash": request.expected_authority.qualification_start_receipt.this_hash.to_hex().to_string(),
+            "p_expected_prior_seq": request.expected_authority.prior_completed_prepared_sequence.map(|value| value.0),
+            "p_prepared_seq": request.prepared_receipt.sequence.0,
+            "p_idempotency_key": request.idempotency_key,
+            "p_leader_wallet": request.leader_wallet.to_string(),
+            "p_source_trade_id": request.source_trade_id.0,
+            "p_market_id": request.market_id,
+            "p_outcome_id": request.outcome_id,
+            "p_side": side_str(request.side),
+            "p_quantity": request.quantity.to_decimal().to_string(),
+            "p_fill_price": request.fill_price.0.to_string(),
+            "p_principal": request.principal.to_decimal().to_string(),
+            "p_fee": request.fee.to_decimal().to_string(),
+            "p_entry_unix": request.entry_unix,
+        });
+        let value = self.post_rpc_json("commit_fill_v2", &body).await?;
+        let response: PreparedFillResp = serde_json::from_value(value).map_err(|error| {
+            SupabaseStateError::Corrupt(format!("prepared commit_fill_v2 shape: {error}"))
+        })?;
+        if response.outcome == "conflict" {
+            return Err(SupabaseStateError::Conflict {
+                reason: response
+                    .conflict_reason
+                    .unwrap_or_else(|| "authority omitted conflict_reason".to_owned()),
+            });
+        }
+        if response.outcome != "applied" && response.outcome != "existing" {
+            return Err(SupabaseStateError::Corrupt(format!(
+                "prepared commit_fill_v2 outcome {:?}",
+                response.outcome
+            )));
+        }
+        let applied = parse_event_seq(
+            response.applied_prepared_seq,
+            "prepared commit_fill_v2 applied_prepared_seq",
+        )?;
+        if applied != request.prepared_receipt.sequence {
+            return Err(SupabaseStateError::Corrupt(
+                "authority returned a different fill Prepared sequence".to_owned(),
+            ));
+        }
+        let row = response.row.ok_or_else(|| {
+            SupabaseStateError::Corrupt("prepared commit_fill_v2 omitted row".to_owned())
+        })?;
+        validate_prepared_fill_row(request, &row)?;
+        Ok(CanonicalFillResult {
+            outcome: response.outcome,
+            bankroll: bankroll_money(&response.bankroll, "prepared fill bankroll")?,
+            applied_prepared_seq: applied,
+            quantity: request.quantity,
+            principal: request.principal,
+            fee: request.fee,
+            fill_price: request.fill_price,
+        })
+    }
+
+    async fn apply_prepared_resolution(
+        &self,
+        request: &PreparedResolutionRequest,
+    ) -> Result<CanonicalResolutionResult, SupabaseStateError> {
+        let payout: serde_json::Value = serde_json::from_str(&request.payout_by_outcome_index_json)
+            .map_err(|error| {
+                SupabaseStateError::Corrupt(format!("prepared resolution payout JSON: {error}"))
+            })?;
+        let body = serde_json::json!({
+            "p_start_seq": request.expected_authority.qualification_start_receipt.sequence.0,
+            "p_start_hash": request.expected_authority.qualification_start_receipt.this_hash.to_hex().to_string(),
+            "p_expected_prior_seq": request.expected_authority.prior_completed_prepared_sequence.map(|value| value.0),
+            "p_prepared_seq": request.prepared_receipt.sequence.0,
+            "p_condition_id": request.condition.0,
+            "p_payout_by_outcome_index": payout,
+            "p_settled_at_unix": request.settled_at_unix,
         });
         let value = self.post_rpc_json("apply_resolution_v2", &body).await?;
-        let resp: ResolutionV2Resp = serde_json::from_value(value)
-            .map_err(|e| SupabaseStateError::Corrupt(format!("apply_resolution_v2 shape: {e}")))?;
-        let applied = match resp.outcome.as_str() {
-            "applied" => true,
-            "existing" => false,
-            other => {
-                return Err(SupabaseStateError::Corrupt(format!(
-                    "apply_resolution_v2 outcome {other:?}"
-                )));
-            }
-        };
-        let mut parsed_prices = Vec::with_capacity(resp.outcome_prices.len());
-        for p in &resp.outcome_prices {
-            parsed_prices.push(money(p, "apply_resolution_v2 outcome_price")?);
+        let response: PreparedResolutionResp = serde_json::from_value(value).map_err(|error| {
+            SupabaseStateError::Corrupt(format!("prepared apply_resolution_v2 shape: {error}"))
+        })?;
+        if response.outcome == "conflict" {
+            return Err(SupabaseStateError::Conflict {
+                reason: response
+                    .conflict_reason
+                    .unwrap_or_else(|| "authority omitted conflict_reason".to_owned()),
+            });
         }
-        Ok(ResolutionV2Outcome {
-            applied,
-            credit: money(&resp.credit, "apply_resolution_v2 credit")?,
-            outcome_prices: parsed_prices,
-            settled_at_unix: resp.settled_at_unix,
-            bankroll: bankroll_money(&resp.bankroll, "apply_resolution_v2 bankroll")?,
+        if response.outcome != "applied" && response.outcome != "existing" {
+            return Err(SupabaseStateError::Corrupt(format!(
+                "prepared apply_resolution_v2 outcome {:?}",
+                response.outcome
+            )));
+        }
+        let applied = parse_event_seq(
+            response.applied_prepared_seq,
+            "prepared apply_resolution_v2 applied_prepared_seq",
+        )?;
+        if applied != request.prepared_receipt.sequence {
+            return Err(SupabaseStateError::Corrupt(
+                "authority returned a different resolution Prepared sequence".to_owned(),
+            ));
+        }
+        let credit = response.credit.ok_or_else(|| {
+            SupabaseStateError::Corrupt("prepared apply_resolution_v2 omitted credit".to_owned())
+        })?;
+        Ok(CanonicalResolutionResult {
+            outcome: response.outcome,
+            bankroll: bankroll_money(&response.bankroll, "prepared resolution bankroll")?,
+            applied_prepared_seq: applied,
+            credit: parse_collateral(&credit, "prepared resolution credit")?,
+            settled_at_unix: request.settled_at_unix,
         })
+    }
+}
+
+fn parse_event_seq(value: Option<i64>, what: &'static str) -> Result<EventSeq, SupabaseStateError> {
+    let value = value.ok_or(SupabaseStateError::Null(what))?;
+    u64::try_from(value)
+        .map(EventSeq)
+        .map_err(|_| SupabaseStateError::Corrupt(format!("{what}: {value}")))
+}
+
+fn parse_collateral(
+    value: &str,
+    what: &'static str,
+) -> Result<CollateralAmount, SupabaseStateError> {
+    CollateralAmount::from_decimal_exact(money(value, what)?)
+        .map_err(|error| SupabaseStateError::Corrupt(format!("{what}: {error}")))
+}
+
+fn parse_shares(value: &str, what: &'static str) -> Result<ShareAmount, SupabaseStateError> {
+    ShareAmount::from_decimal_exact(money(value, what)?)
+        .map_err(|error| SupabaseStateError::Corrupt(format!("{what}: {error}")))
+}
+
+fn validate_prepared_fill_row(
+    request: &PreparedFillRequest,
+    row: &PreparedFillRow,
+) -> Result<(), SupabaseStateError> {
+    let outcome_id = u16::try_from(row.outcome_id).map_err(|_| {
+        SupabaseStateError::Corrupt(format!("prepared fill outcome_id {}", row.outcome_id))
+    })?;
+    let side = match row.side.as_str() {
+        "buy" => Side::Buy,
+        "sell" => Side::Sell,
+        other => {
+            return Err(SupabaseStateError::Corrupt(format!(
+                "prepared fill side {other:?}"
+            )));
+        }
+    };
+    let prepared_seq = u64::try_from(row.prepared_seq).map(EventSeq).map_err(|_| {
+        SupabaseStateError::Corrupt(format!("prepared fill sequence {}", row.prepared_seq))
+    })?;
+    let exact = row.idempotency_key == request.idempotency_key
+        && row.leader_wallet == request.leader_wallet.to_string()
+        && row.source_trade_id == request.source_trade_id.0
+        && row.market_id == request.market_id
+        && outcome_id == request.outcome_id
+        && side == request.side
+        && parse_shares(&row.quantity, "prepared fill quantity")? == request.quantity
+        && Price::new(money(&row.fill_price, "prepared fill price")?)
+            .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?
+            == request.fill_price
+        && parse_collateral(&row.principal, "prepared fill principal")? == request.principal
+        && parse_collateral(&row.fee, "prepared fill fee")? == request.fee
+        && row.entry_unix == request.entry_unix
+        && prepared_seq == request.prepared_receipt.sequence;
+    if exact {
+        Ok(())
+    } else {
+        Err(SupabaseStateError::Corrupt(
+            "authority canonical fill row differs from Prepared".to_owned(),
+        ))
     }
 }
 
@@ -602,192 +931,485 @@ struct BankrollRow {
 struct PositionRow {
     market_id: String,
     outcome_id: i64,
-    long_contracts: i64,
-    short_contracts: i64,
+    long_contracts: Decimal,
+    short_contracts: Decimal,
 }
 
 // ── Write-through paths (RPC first, SQLite mirror second) ───────────────────────
 
-/// Outcome of an authoritative fill commit (#511): the orchestrator marks the contract
-/// filled only on `Filled`; `RefusedSettled` is terminal (seen + typed flip written).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthoritativeFillOutcome {
-    Filled(Decimal),
-    RefusedSettled(Decimal),
-    /// The authority committed but the local mirror could not converge after
-    /// in-process retries (#544 review): the caller must treat paper durability
-    /// as uncertain — fail readiness and stop producers; the boot frame-walk
-    /// converges from the durable frame on restart. Carries the authority
-    /// bankroll for the final status snapshot only.
-    LocalDurabilityUncertain(Decimal),
-}
-
-/// Authoritative fill commit (#397, reshaped by #511): `commit_fill_v2` FIRST (fail-closed
-/// — an RPC error propagates and the caller runs the frozen-retry protocol; the frame is
-/// durable), then ONE local convergence transaction mirroring the CANONICAL row and the
-/// authority bankroll, then — only after the local transaction commits (#511 R3) — the
-/// successor-gated #510 watermark advance. A settled refusal writes the terminal refused
-/// disposition instead. The RPC `.await` completes before the SQLite mutex is taken.
-#[allow(clippy::too_many_arguments)]
-pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
+/// Reconcile the active Start-bound paper protocol before any producer starts.
+///
+/// Completed Prepared/Final pairs are projected locally in order when SQLite is behind. The sole
+/// unmatched Prepared, if present, is retried against its frozen authority request, projected, and
+/// completed with one synchronized Final. Scanner validation rejects a second Prepared from
+/// overtaking it, so an unknown authority result always blocks the remaining financial prefix.
+pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
-    source_trade_id: &SourceTradeId,
-    leader: &LeaderPositionRow,
-    _record: &FillRecord,
-    seq: EventSeq,
-    sup_row: &SupabaseFillRow,
-    flip: Option<pe_paper_state::DispatchFlip<'_>>,
-    pending_decision: Option<&DecisionEvidenceAccumulator>,
-) -> Result<AuthoritativeFillOutcome, SupabaseStateError> {
-    // #510: snapshot the watermark BEFORE the external mutation — a getter failure fails
-    // the fill closed here, never after the RPC has already debited Supabase.
-    let wm_before = paper_state.last_supabase_applied_event_seq()?;
-    let outcome = supabase.commit_fill_v2(sup_row).await?;
-    let pending = match &outcome {
-        FillV2Outcome::Applied { bankroll, row } => render_pending_evidence(
-            pending_decision,
-            AuthorityEvidence::commit_fill_v2("applied", *bankroll),
-            recorded_fill_terminal(&row.record, row.event_seq),
-        ),
-        FillV2Outcome::Existing { bankroll, row } => render_pending_evidence(
-            pending_decision,
-            AuthorityEvidence::commit_fill_v2("existing", *bankroll),
-            recorded_fill_terminal(&row.record, row.event_seq),
-        ),
-        FillV2Outcome::Settled { bankroll } => render_pending_evidence(
-            pending_decision,
-            AuthorityEvidence::commit_fill_v2("settled_refusal", *bankroll),
-            TerminalDispositionEvidence::settled_refusal(),
-        ),
-    }
-    .map_err(|error| {
-        SupabaseStateError::Corrupt(format!(
-            "encode decision_pending authority evidence: {error}"
-        ))
+    paper_log_path: &std::path::Path,
+    source_log_path: &std::path::Path,
+    writer: &mut Writer,
+) -> Result<usize, SupabaseStateError> {
+    let era =
+        paper_era(scan_paper_log(paper_log_path).map_err(|error| {
+            SupabaseStateError::Corrupt(format!("scan active paper log: {error}"))
+        })?);
+    let (start_receipt, _) = era.start.as_ref().ok_or_else(|| {
+        SupabaseStateError::Corrupt(
+            "active financial reconciliation requires QualificationStarted".to_owned(),
+        )
     })?;
-    // #508 round-4: the local disposition surfaces and retries IN-PROCESS (bounded); the
-    // durable backstop is the boot frame-walk (the frozen watermark marks the frame pending).
-    let mut local = Ok(());
-    for attempt in 1u32..=3 {
-        local = match &outcome {
-            FillV2Outcome::Applied { bankroll, row }
-            | FillV2Outcome::Existing { bankroll, row } => paper_state
-                .commit_fill_canonical_pending(
-                    Some(source_trade_id),
-                    Some(leader),
-                    &row.record,
-                    row.event_seq,
-                    seq,
-                    *bankroll,
-                    flip,
-                    pending.as_ref().map(pending_terminal),
-                ),
-            FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill_pending(
-                source_trade_id,
-                Some(leader),
-                seq,
-                flip.map(|f| pe_paper_state::DispatchFlip {
-                    dispatch_id: f.dispatch_id,
-                    paper_outcome: "no_fill:market_settled",
-                }),
-                pending.as_ref().map(pending_terminal),
-            ),
+    paper_state.seed_financial_start(*start_receipt)?;
+
+    let local_last = paper_state.financial_last_prepared_seq()?;
+    let prepared_sequences = era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { .. }) => {
+                Some(frame.receipt.sequence)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(local_last) = local_last
+        && !prepared_sequences.contains(&local_last)
+    {
+        return Err(SupabaseStateError::Corrupt(format!(
+            "local financial sequence {} is absent from the active paper prefix",
+            local_last.0
+        )));
+    }
+
+    let mut appended_finals = 0usize;
+    for frame in &era.frames {
+        let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+            expected_authority,
+            payload,
+        }) = &frame.frame
+        else {
+            continue;
         };
-        match &local {
-            Ok(()) => break,
-            Err(e) if attempt < 3 => {
-                tracing::error!(
-                    error = %e,
-                    attempt,
-                    "authoritative fill: local disposition failed; retrying in-process"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Err(_) => {}
-        }
-    }
-    match local {
-        Ok(()) => {
-            // #510 successor-gated runtime advance, AFTER the local disposition (#511 R3:
-            // advancing first would hide an unmirrored frame from the boot frame-walk).
-            // Frames are dense from seq 0; any gap freezes the watermark and the boot
-            // frame-walk — which resolves every frame above it through v2 — heals it.
-            let is_successor = match wm_before {
-                None => seq.0 == 0,
-                Some(wm) => wm.0.checked_add(1) == Some(seq.0),
+        let existing_final = era
+            .frames
+            .iter()
+            .find_map(|candidate| match &candidate.frame {
+                PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                    prepared_receipt,
+                    result,
+                }) if prepared_receipt == &frame.receipt => {
+                    Some((result.clone(), candidate.receipt))
+                }
+                _ => None,
+            });
+        if local_last.is_some_and(|last| frame.receipt.sequence < last) {
+            let Some((result, final_receipt)) = &existing_final else {
+                return Err(SupabaseStateError::Corrupt(
+                    "local projection advanced beyond an unmatched Prepared".to_owned(),
+                ));
             };
-            if is_successor && let Err(e) = paper_state.set_supabase_applied_event_seq(seq) {
-                warn!(
-                    error = %e,
-                    seq = seq.0,
-                    "authoritative fill: watermark advance failed (boot frame-walk re-confirms)"
-                );
+            terminalize_final_fill_decision(paper_state, payload, result, *final_receipt)?;
+            continue;
+        }
+        if local_last == Some(frame.receipt.sequence)
+            && let Some((result, final_receipt)) = &existing_final
+        {
+            terminalize_final_fill_decision(paper_state, payload, result, *final_receipt)?;
+            continue;
+        }
+
+        let persisted_result = existing_final.as_ref().map(|(result, _)| result.clone());
+        let result = match (payload, persisted_result) {
+            (FinancialPayload::Fill { .. }, Some(result @ FinancialResult::Fill { .. })) => {
+                apply_financial_result(
+                    paper_state,
+                    *start_receipt,
+                    expected_authority,
+                    frame.receipt,
+                    payload,
+                    &result,
+                    source_log_path,
+                )?;
+                result
             }
+            (
+                FinancialPayload::Fill {
+                    operation,
+                    economic,
+                },
+                None,
+            ) => {
+                let request = PreparedFillRequest::from_prepared(
+                    expected_authority.clone(),
+                    frame.receipt,
+                    operation,
+                    economic,
+                );
+                let canonical = supabase.commit_prepared_fill(&request).await?;
+                let result = FinancialResult::Fill { canonical };
+                apply_financial_result(
+                    paper_state,
+                    *start_receipt,
+                    expected_authority,
+                    frame.receipt,
+                    payload,
+                    &result,
+                    source_log_path,
+                )?;
+                result
+            }
+            (
+                FinancialPayload::Resolution { .. },
+                Some(result @ FinancialResult::Resolution { .. }),
+            ) => {
+                apply_financial_result(
+                    paper_state,
+                    *start_receipt,
+                    expected_authority,
+                    frame.receipt,
+                    payload,
+                    &result,
+                    source_log_path,
+                )?;
+                result
+            }
+            (
+                FinancialPayload::Resolution {
+                    condition_id,
+                    payout_by_outcome_index_json,
+                    resolution_source_receipt,
+                },
+                None,
+            ) => {
+                let settled_at_unix = resolution_source_received_at(
+                    source_log_path,
+                    *resolution_source_receipt,
+                    condition_id,
+                    payout_by_outcome_index_json,
+                )?;
+                let request = PreparedResolutionRequest {
+                    expected_authority: expected_authority.clone(),
+                    prepared_receipt: frame.receipt,
+                    condition: condition_id.clone(),
+                    payout_by_outcome_index_json: payout_by_outcome_index_json.clone(),
+                    settled_at_unix,
+                };
+                let canonical = supabase.apply_prepared_resolution(&request).await?;
+                let result = FinancialResult::Resolution { canonical };
+                apply_financial_result(
+                    paper_state,
+                    *start_receipt,
+                    expected_authority,
+                    frame.receipt,
+                    payload,
+                    &result,
+                    source_log_path,
+                )?;
+                result
+            }
+            _ => {
+                return Err(SupabaseStateError::Corrupt(
+                    "financial Final kind differs from its Prepared".to_owned(),
+                ));
+            }
+        };
+
+        if let Some((_, final_receipt)) = existing_final {
+            terminalize_final_fill_decision(paper_state, payload, &result, final_receipt)?;
+            continue;
         }
-        Err(e) => {
-            warn!(
-                error = %e,
-                seq = seq.0,
-                "authoritative fill: authority committed but local disposition failed after \
-                 in-process retries; watermark left frozen (boot frame-walk converges)"
-            );
-            // Remote truth advanced without local convergence: surface typed
-            // uncertainty instead of success (#544 review). In-memory financial
-            // state must not advance past durable local state.
-            let bankroll = match outcome {
-                FillV2Outcome::Applied { bankroll, .. }
-                | FillV2Outcome::Existing { bankroll, .. }
-                | FillV2Outcome::Settled { bankroll } => bankroll,
-            };
-            return Ok(AuthoritativeFillOutcome::LocalDurabilityUncertain(bankroll));
-        }
+        let now = time::OffsetDateTime::now_utc();
+        let final_payload = serde_json::to_vec(&PaperLogRecord::FinancialFinal {
+            prepared_receipt: frame.receipt,
+            result: result.clone(),
+        })?;
+        let final_receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                content_type: ContentType::Json,
+                payload: final_payload,
+            })
+            .map_err(|error| {
+                SupabaseStateError::Corrupt(format!("append recovered FinancialFinal: {error}"))
+            })?;
+        terminalize_final_fill_decision(paper_state, payload, &result, final_receipt)?;
+        appended_finals = appended_finals.saturating_add(1);
     }
-    Ok(match outcome {
-        FillV2Outcome::Applied { bankroll, .. } | FillV2Outcome::Existing { bankroll, .. } => {
-            AuthoritativeFillOutcome::Filled(bankroll)
-        }
-        FillV2Outcome::Settled { bankroll } => AuthoritativeFillOutcome::RefusedSettled(bankroll),
-    })
+    Ok(appended_finals)
 }
 
-/// Authoritative resolution (#397, reshaped by #511): `apply_resolution_v2` FIRST — the
-/// credit is computed INSIDE the RPC from `paper_positions` under the bankroll lock,
-/// closing the read-then-resolve TOCTOU — then the SQLite mirror applies the RETURNED
-/// canonical values (on `existing`, the originally recorded ones), so a crash-then-retry
-/// converges with no double credit. Fail-closed: an RPC error leaves the market unsettled
-/// for the next tick.
-pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
-    supabase: &S,
-    store: &mut ResolutionStore,
-    market_id: &MarketId,
-    outcome_prices: &[Decimal],
-    settled_at_unix: i64,
-) -> Result<Decimal, SupabaseStateError> {
-    let res = supabase
-        .apply_resolution_v2(market_id, outcome_prices, settled_at_unix)
-        .await?;
-    if let Err(e) = store.settle_and_credit(
-        market_id.clone(),
-        res.outcome_prices.clone(),
-        res.credit,
-        res.settled_at_unix,
-    ) {
-        warn!(
-            error = %e,
-            market = %market_id,
-            "authoritative resolution committed to Supabase but local SQLite mirror failed"
-        );
-        // Typed error instead of silent success (#544 review): the market stays
-        // locally unsettled, the next tick re-drives the idempotent RPC (returns
-        // `existing`), and the mirror converges — the caller retries, it does
-        // not report a settled market it has not durably recorded.
-        return Err(SupabaseStateError::LocalMirrorUncertain {
-            market: market_id.0.0.clone(),
-            error: e.to_string(),
-        });
+pub(crate) fn terminalize_final_fill_decision(
+    paper_state: &PaperStateDb,
+    payload: &FinancialPayload,
+    result: &FinancialResult,
+    final_receipt: AppendReceipt,
+) -> Result<(), SupabaseStateError> {
+    let (FinancialPayload::Fill { operation, .. }, FinancialResult::Fill { canonical }) =
+        (payload, result)
+    else {
+        return Ok(());
+    };
+    let row = paper_state
+        .open_decision_pending()?
+        .into_iter()
+        .find(|row| row.source_trade_id == operation.source_trade_id);
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let evidence = DecisionEvidenceAccumulator::from_pending_checkpoint(&row).map_err(|error| {
+        SupabaseStateError::Corrupt(format!(
+            "rebuild pending fill evidence {}: {error}",
+            operation.source_trade_id
+        ))
+    })?;
+    let terminal = render_pending_evidence(
+        Some(&evidence),
+        AuthorityEvidence::commit_fill_v2(&canonical.outcome, canonical.bankroll),
+        TerminalDispositionEvidence::final_fill(final_receipt),
+    )?
+    .ok_or_else(|| {
+        SupabaseStateError::Corrupt("fill terminal evidence unexpectedly absent".to_owned())
+    })?;
+    paper_state.close_decision_pending(
+        &operation.source_trade_id,
+        &terminal.0,
+        "fill",
+        terminal.1,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_financial_result(
+    paper_state: &PaperStateDb,
+    start: AppendReceipt,
+    expected: &ExpectedAuthority,
+    prepared_receipt: AppendReceipt,
+    payload: &FinancialPayload,
+    result: &FinancialResult,
+    source_log_path: &std::path::Path,
+) -> Result<(), SupabaseStateError> {
+    match (payload, result) {
+        (
+            FinancialPayload::Fill {
+                operation,
+                economic,
+            },
+            FinancialResult::Fill { canonical },
+        ) => {
+            let request = PreparedFillRequest::from_prepared(
+                expected.clone(),
+                prepared_receipt,
+                operation,
+                economic,
+            );
+            if !matches!(canonical.outcome.as_str(), "applied" | "existing")
+                || canonical.applied_prepared_seq != prepared_receipt.sequence
+                || canonical.quantity != request.quantity
+                || canonical.principal != request.principal
+                || canonical.fee != request.fee
+                || canonical.fill_price != request.fill_price
+            {
+                return Err(SupabaseStateError::Corrupt(
+                    "fill Final canonical values differ from Prepared".to_owned(),
+                ));
+            }
+            let record = FillRecord {
+                idempotency_key: request.idempotency_key,
+                market_id: MarketId(VenueMarketId(request.market_id)),
+                outcome_id: OutcomeId(request.outcome_id),
+                side: request.side,
+                quantity: request.quantity,
+                fill_price: request.fill_price,
+                principal: request.principal,
+                fee: request.fee,
+            };
+            let observation = economic.observation.as_ref().ok_or_else(|| {
+                SupabaseStateError::Corrupt(
+                    "fill Prepared has no causal source observation".to_owned(),
+                )
+            })?;
+            let causal_received_at_unix =
+                source_receipt_received_at(source_log_path, observation.source_receipt)?;
+            paper_state.apply_financial_fill(
+                start,
+                expected.prior_completed_prepared_sequence,
+                prepared_receipt.sequence,
+                observation.source_receipt,
+                causal_received_at_unix,
+                &record,
+                canonical.bankroll,
+            )?;
+        }
+        (
+            FinancialPayload::Resolution {
+                condition_id,
+                payout_by_outcome_index_json,
+                resolution_source_receipt,
+            },
+            FinancialResult::Resolution { canonical },
+        ) => {
+            if !matches!(canonical.outcome.as_str(), "applied" | "existing")
+                || canonical.applied_prepared_seq != prepared_receipt.sequence
+                || canonical.settled_at_unix
+                    != resolution_source_received_at(
+                        source_log_path,
+                        *resolution_source_receipt,
+                        condition_id,
+                        payout_by_outcome_index_json,
+                    )?
+            {
+                return Err(SupabaseStateError::Corrupt(
+                    "resolution Final sequence or settlement time differs from evidence".to_owned(),
+                ));
+            }
+            let condition = MarketId(VenueMarketId(condition_id.0.clone()));
+            if paper_state.financial_last_prepared_seq()? != Some(prepared_receipt.sequence) {
+                let payout = BinaryPayoutVector::from_canonical_json(payout_by_outcome_index_json)
+                    .map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("resolution payout vector: {error}"))
+                    })?;
+                let snapshot = paper_state.financial_snapshot(canonical.settled_at_unix)?;
+                let decimals = payout.decimals();
+                let binary_payout =
+                    BinaryPayout::new(decimals[0], decimals[1]).map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("resolution payout vector: {error}"))
+                    })?;
+                let positions = snapshot
+                    .positions
+                    .into_iter()
+                    .filter(|position| position.market_id == condition)
+                    .map(|position| {
+                        let net_shares =
+                            position.long.checked_sub(position.short).map_err(|_| {
+                                SupabaseStateError::Corrupt(format!(
+                                    "resolution position {}:{} is net short",
+                                    position.market_id, position.outcome_id.0
+                                ))
+                            })?;
+                        Ok((position.outcome_id.0, net_shares))
+                    })
+                    .collect::<Result<Vec<_>, SupabaseStateError>>()?;
+                let derived =
+                    aggregate_resolution_credit(&positions, &binary_payout).map_err(|error| {
+                        SupabaseStateError::Corrupt(format!("resolution arithmetic: {error}"))
+                    })?;
+                if derived != canonical.credit {
+                    return Err(SupabaseStateError::Corrupt(
+                        "resolution authority credit differs from shared aggregate arithmetic"
+                            .to_owned(),
+                    ));
+                }
+            }
+            paper_state.apply_financial_resolution(
+                start,
+                expected.prior_completed_prepared_sequence,
+                prepared_receipt.sequence,
+                &condition,
+                payout_by_outcome_index_json,
+                *resolution_source_receipt,
+                canonical.settled_at_unix,
+                canonical.credit,
+                canonical.bankroll,
+            )?;
+        }
+        _ => {
+            return Err(SupabaseStateError::Corrupt(
+                "financial result kind mismatch".to_owned(),
+            ));
+        }
     }
-    Ok(res.bankroll)
+    Ok(())
+}
+
+pub(crate) fn resolution_source_received_at(
+    source_log_path: &std::path::Path,
+    receipt: AppendReceipt,
+    condition: &PolymarketConditionId,
+    payout_json: &str,
+) -> Result<i64, SupabaseStateError> {
+    let replay = Reader::replay(source_log_path).map_err(|error| {
+        SupabaseStateError::Corrupt(format!("open source log for resolution evidence: {error}"))
+    })?;
+    for frame in replay {
+        let (sequence, envelope) = frame.map_err(|error| {
+            SupabaseStateError::Corrupt(format!("read source resolution evidence: {error}"))
+        })?;
+        if sequence == receipt.sequence {
+            if envelope.this_hash != receipt.this_hash {
+                return Err(SupabaseStateError::Corrupt(
+                    "resolution source receipt hash differs from verified envelope".to_owned(),
+                ));
+            }
+            if envelope.source_id.0 != "polymarket.clob.market" {
+                return Err(SupabaseStateError::Corrupt(
+                    "resolution receipt does not reference CLOB market evidence".to_owned(),
+                ));
+            }
+            if envelope.schema_version != CLOB_RESOLUTION_SCHEMA_VERSION
+                || envelope.parser_version != CLOB_RESOLUTION_PARSER_VERSION
+            {
+                return Err(SupabaseStateError::Corrupt(
+                    "resolution receipt uses an unsupported CLOB schema or parser version"
+                        .to_owned(),
+                ));
+            }
+            let market = parse_clob_market(&envelope.payload).map_err(|error| {
+                SupabaseStateError::Corrupt(format!(
+                    "parse referenced CLOB resolution evidence: {error}"
+                ))
+            })?;
+            if market.condition_id.as_deref() != Some(condition.0.as_str()) {
+                return Err(SupabaseStateError::Corrupt(
+                    "referenced CLOB resolution condition differs from Prepared".to_owned(),
+                ));
+            }
+            let ClobPayoutResolution::Resolved(payout) = market.resolution_evidence().payout else {
+                return Err(SupabaseStateError::Corrupt(
+                    "referenced CLOB market is not resolved".to_owned(),
+                ));
+            };
+            if payout.canonical_json() != payout_json {
+                return Err(SupabaseStateError::Corrupt(
+                    "referenced CLOB payout differs from Prepared".to_owned(),
+                ));
+            }
+            return Ok(envelope.received_at.0.unix_timestamp());
+        }
+    }
+    Err(SupabaseStateError::Corrupt(format!(
+        "resolution source receipt {} is absent",
+        receipt.sequence.0
+    )))
+}
+
+fn source_receipt_received_at(
+    source_log_path: &std::path::Path,
+    receipt: AppendReceipt,
+) -> Result<i64, SupabaseStateError> {
+    let replay = Reader::replay(source_log_path).map_err(|error| {
+        SupabaseStateError::Corrupt(format!("open source log for fill evidence: {error}"))
+    })?;
+    for frame in replay {
+        let (sequence, envelope) = frame.map_err(|error| {
+            SupabaseStateError::Corrupt(format!("read source fill evidence: {error}"))
+        })?;
+        if sequence != receipt.sequence {
+            continue;
+        }
+        if envelope.this_hash != receipt.this_hash {
+            return Err(SupabaseStateError::Corrupt(
+                "fill source receipt hash differs from its envelope".to_owned(),
+            ));
+        }
+        return Ok(envelope.received_at.0.unix_timestamp());
+    }
+    Err(SupabaseStateError::Corrupt(
+        "fill source receipt is absent from the source log".to_owned(),
+    ))
 }
 
 // ── Boot: frame-walk then pull ──────────────────────────────────────────────────
@@ -820,28 +1442,52 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
     if !event_log_path.exists() {
         return Ok((new_wm, true, 0));
     }
-    let replay = pe_event_log::Reader::replay(event_log_path).map_err(|e| {
-        SupabaseStateError::Corrupt(format!("open event log {}: {e}", event_log_path.display()))
-    })?;
-    for frame in replay {
-        let (seq, envelope) =
-            frame.map_err(|e| SupabaseStateError::Corrupt(format!("read event-log frame: {e}")))?;
+    let era = paper_era(scan_paper_log(event_log_path).map_err(|error| {
+        SupabaseStateError::Corrupt(format!(
+            "scan paper log {}: {error}",
+            event_log_path.display()
+        ))
+    })?);
+    if era.start.is_some() {
+        return Err(SupabaseStateError::Corrupt(
+            "legacy Supabase frame walk is forbidden after QualificationStarted".to_owned(),
+        ));
+    }
+    for frame in era.frames {
+        let seq = frame.receipt.sequence;
         let seq_i = i64::try_from(seq.0).unwrap_or(i64::MAX);
         if seq_i <= new_wm {
             continue;
         }
-        let fill: pe_strategy_winner_follow::PaperFill = serde_json::from_slice(&envelope.payload)
-            .map_err(|e| {
-                SupabaseStateError::Corrupt(format!("decode PaperFill at seq {}: {e}", seq.0))
-            })?;
+        let Some(fill) = frame.legacy_fill() else {
+            paper_state.set_supabase_applied_event_seq(seq)?;
+            new_wm = seq_i;
+            continue;
+        };
         let fill_row = FillRow {
             idempotency_key: fill.intent.idempotency_key.clone(),
             market_id: fill.intent.market_id.clone(),
             outcome_id: fill.intent.outcome_id,
             side: fill.intent.side,
-            contracts: fill.intent.contracts.0,
+            quantity: ShareAmount::from_whole(fill.intent.contracts.0).map_err(|error| {
+                SupabaseStateError::Corrupt(format!("legacy fill quantity: {error}"))
+            })?,
             fill_price: fill.simulated_fill_price,
-            event_seq: seq_i,
+            principal: CollateralAmount::from_decimal_exact(
+                fill.simulated_fill_price
+                    .0
+                    .checked_mul(Decimal::from(fill.intent.contracts.0))
+                    .ok_or_else(|| {
+                        SupabaseStateError::Corrupt("legacy fill principal overflow".to_owned())
+                    })?,
+            )
+            .map_err(|error| {
+                SupabaseStateError::Corrupt(format!("legacy fill principal: {error}"))
+            })?,
+            fee: CollateralAmount::ZERO,
+            event_seq: seq,
+            prepared_seq: seq,
+            source_receipt_seq: None,
         };
         let disposition = match supabase_fill_from(&fill_row) {
             // Non-`wf|` fill (no leader): cannot write `paper_fills.leader_wallet` (NOT
@@ -983,11 +1629,8 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
 /// the advanced watermark, then pull the authoritative bankroll + positions back into SQLite
 /// so values read after this reflect the Supabase source of truth.
 ///
-/// The settled set is **not** pulled: it self-heals via the gated `apply_resolution` on the
-/// next resolution tick (a market settled in Supabase but missing from SQLite is re-driven —
-/// the RPC gate credits zero, the SQLite `settle_and_credit` mirror inserts+credits once),
-/// which also avoids a fragile jsonb→text round-trip. Fail-closed: a pull error aborts boot
-/// (refuse to run authoritative without the authority).
+/// The settled set is not pulled during this pre-Start compatibility boot. A pull error aborts
+/// boot rather than running without the authority.
 pub async fn supabase_authoritative_boot<S: SupabaseBootTrait + ?Sized>(
     client: &S,
     paper_state: &PaperStateDb,
@@ -1065,8 +1708,19 @@ mod tests {
     use axum::extract::{Query, State};
     use axum::routing::get;
     use axum::{Json, Router};
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    #[test]
+    fn economic_authority_request_rejects_split_market_identity() {
+        let condition = PolymarketConditionId("condition".to_owned());
+        assert!(validate_authority_market_identity(&condition, "condition").is_ok());
+        assert!(matches!(
+            validate_authority_market_identity(&condition, "other-condition"),
+            Err(SupabaseStateError::Corrupt(_))
+        ));
+    }
 
     /// Fixture "table": `rows` total rows, returning at most `server_cap` per response
     /// regardless of the requested limit (models PostgREST `db-max-rows`), failing with
@@ -1140,6 +1794,187 @@ mod tests {
 
     fn client(base: &str) -> SupabaseStateClient {
         SupabaseStateClient::new(reqwest::Client::new(), base, "anon", "")
+    }
+
+    #[derive(Clone, Default)]
+    struct PreparedResolutionAuthority {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SupabaseStateTrait for PreparedResolutionAuthority {
+        async fn commit_fill_v2(
+            &self,
+            _row: &SupabaseFillRow,
+        ) -> Result<FillV2Outcome, SupabaseStateError> {
+            Err(SupabaseStateError::Corrupt(
+                "legacy fill RPC is outside this fixture".to_owned(),
+            ))
+        }
+
+        async fn commit_prepared_fill(
+            &self,
+            _request: &PreparedFillRequest,
+        ) -> Result<CanonicalFillResult, SupabaseStateError> {
+            Err(SupabaseStateError::Corrupt(
+                "prepared fill RPC is outside this fixture".to_owned(),
+            ))
+        }
+
+        fn apply_prepared_resolution(
+            &self,
+            request: &PreparedResolutionRequest,
+        ) -> impl Future<Output = Result<CanonicalResolutionResult, SupabaseStateError>> + Send
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let prepared = request.prepared_receipt.sequence;
+            let settled_at_unix = request.settled_at_unix;
+            async move {
+                Ok(CanonicalResolutionResult {
+                    outcome: "applied".to_owned(),
+                    bankroll: Decimal::from(100u32),
+                    applied_prepared_seq: prepared,
+                    credit: CollateralAmount::ZERO,
+                    settled_at_unix,
+                })
+            }
+        }
+    }
+
+    fn append_test_record<T: serde::Serialize>(
+        writer: &mut Writer,
+        schema_version: u32,
+        value: &T,
+    ) -> AppendReceipt {
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("test".to_owned()),
+                schema_version,
+                parser_version: 1,
+                observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(value).unwrap(),
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unmatched_resolution_recovery_mutates_and_finalizes_once() {
+        use crate::paper_recovery::{FinancialPayload, QualificationStarted, TailBinding};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let source_path = dir.path().join("source.log");
+        let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        db.init_bankroll(Decimal::from(100u32)).unwrap();
+
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let source_receipt = source_writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("polymarket.clob.market".to_owned()),
+                schema_version: pe_source_polymarket_public::CLOB_RESOLUTION_SCHEMA_VERSION,
+                parser_version: pe_source_polymarket_public::CLOB_RESOLUTION_PARSER_VERSION,
+                observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: br#"{"condition_id":"condition","closed":true,
+                    "is_50_50_outcome":false,
+                    "tokens":[{"token_id":"yes","outcome":"Yes","price":1,"winner":true},
+                              {"token_id":"no","outcome":"No","price":0,"winner":false}]}"#
+                    .to_vec(),
+            })
+            .unwrap();
+        drop(source_writer);
+
+        let mut writer = Writer::open(&paper_path).unwrap();
+        let tail = TailBinding {
+            physical_tail: 8,
+            last_sequence: None,
+            last_hash: "00".repeat(32),
+        };
+        let start = append_test_record(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+                starting_bankroll: CollateralAmount::from_decimal_exact(Decimal::from(100u32))
+                    .unwrap(),
+                paper_prefix: tail.clone(),
+                source_prefix: tail.clone(),
+                live_prefix: tail,
+                artifact_blake3: "artifact".to_owned(),
+                static_config_hash: "static".to_owned(),
+                hot_config_hash: "hot".to_owned(),
+                generation: "generation".to_owned(),
+                activation_id: "activation".to_owned(),
+                ranking_batch_id: 1,
+                membership: Vec::new(),
+                membership_proofs_hash: "proofs".to_owned(),
+                schema_version: 1,
+                parser_version: 1,
+                financial_semantic_version: 1,
+            })),
+        );
+        let prepared = append_test_record(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::FinancialPrepared {
+                expected_authority: ExpectedAuthority {
+                    qualification_start_receipt: start,
+                    prior_completed_prepared_sequence: None,
+                },
+                payload: FinancialPayload::Resolution {
+                    condition_id: PolymarketConditionId("condition".to_owned()),
+                    payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
+                    resolution_source_receipt: source_receipt,
+                },
+            },
+        );
+
+        let authority = PreparedResolutionAuthority::default();
+        assert_eq!(
+            reconcile_active_financial_frames(
+                &authority,
+                &db,
+                &paper_path,
+                &source_path,
+                &mut writer,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        drop(writer);
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.financial_last_prepared_seq().unwrap(),
+            Some(prepared.sequence)
+        );
+
+        let mut writer = Writer::open(&paper_path).unwrap();
+        assert_eq!(
+            reconcile_active_financial_frames(
+                &authority,
+                &db,
+                &paper_path,
+                &source_path,
+                &mut writer,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        let finals = scan_paper_log(&paper_path)
+            .unwrap()
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialFinal { .. })
+                )
+            })
+            .count();
+        assert_eq!(finals, 1);
     }
 
     #[test]
@@ -1302,8 +2137,8 @@ mod tests {
         db.upsert_position(
             &MarketId(VenueMarketId("0xstale".to_owned())),
             OutcomeId(0),
-            9,
-            0,
+            ShareAmount::from_whole(9).unwrap(),
+            ShareAmount::ZERO,
         )
         .unwrap();
 
@@ -1330,7 +2165,13 @@ mod tests {
         let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
         let stale = MarketId(VenueMarketId("0xstale".to_owned()));
         db.set_bankroll(Decimal::ONE).unwrap();
-        db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+        db.upsert_position(
+            &stale,
+            OutcomeId(0),
+            ShareAmount::from_whole(9).unwrap(),
+            ShareAmount::ZERO,
+        )
+        .unwrap();
 
         let result =
             supabase_authoritative_boot(&client(&base), &db, &dir.path().join("absent-paper.log"))

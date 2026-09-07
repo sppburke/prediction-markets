@@ -3,8 +3,7 @@
 //! Exercises the short-circuit in `simulation.rs` that bypasses Kelly, the
 //! per-trade cap, mode clamping, `risk-engine`, and the liquidity clamp when
 //! `BacktestConfig::flat_usd` is `Some(_)`. The bypass branch must produce
-//! fills with notional `≤ flat_usd` (modulo the degenerate `fill_price >
-//! flat` case where one contract is opened best-effort), update bankroll /
+//! fills whose principal plus fee is `≤ flat_usd`, update bankroll /
 //! exposure / open_positions identically to the Kelly path, and leave every
 //! Kelly-path counter (`total_signals_evaluated`, `snapshot_prior_*`,
 //! `liquidity_*`) at zero.
@@ -22,10 +21,8 @@
 //!    and `bankroll_final ≥ 0`.
 //! 5. `flat_mode_sell_path_unchanged` — opens close on the leader's sells;
 //!    `total_copies` reflects the closed positions.
-//! 6. `flat_mode_min_one_contract_when_flat_below_fill_price` — `flat = $0.10`,
-//!    `fill_price ≈ $0.355` (with 1% slippage from $0.35); `floor(0.10 /
-//!    0.355) = 0`, but `.max(1)` produces 1 contract → fills still occur
-//!    (best-effort, notional > flat).
+//! 6. `flat_mode_below_fill_price_is_rejected` — `flat = $0.10`, `fill_price ≈
+//!    $0.355`; a zero contract result produces no BUY fill.
 //!
 //! Note: the sweep-collapse branch in `main.rs:150` (suppress
 //! `kelly_sweep_fractions` when `flat_usd.is_some()`) is exercised by an
@@ -118,6 +115,7 @@ fn base_config(dir: &TempDir, flat_usd: Option<Decimal>, bankroll: Decimal) -> B
         bootstrap_cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
         bankroll_usd: bankroll,
+        modeled_polymarket_fee_rate: dec!(0.04),
         step_days: 1,
         max_hours_to_expiry: None,
         audit_window_days: 365,
@@ -200,31 +198,33 @@ struct TradeFillJson {
     side: String,
     contracts: u64,
     fill_price: Decimal,
+    modeled_fee: Decimal,
+    all_in_debit: Decimal,
 }
 
 // ── Scenario 1 ────────────────────────────────────────────────────────────────
 
-/// PASS: with `flat_usd = $1` and BUY `fill_price = 0.35 × 1.01 ≈ 0.3535`,
-///       `contracts = floor(1 / 0.3535) = 2`, `notional = 2 × 0.3535 ≈ 0.707`,
-///       which is ≤ $1 for every BUY fill.
-/// FAIL: any BUY fill produces `notional > $1`.
+/// PASS: each BUY at 0.3535 has 2 contracts, aggregate modeled fee 0.01828, all-in debit
+///       0.72528, and each completed SELL realizes exactly 0.75972 after retaining that fee.
+/// FAIL: any per-fill fee/debit or aggregate realized P&L differs.
 #[tokio::test]
 async fn flat_mode_caps_notional_at_one_dollar() {
-    let (_report, fills) = run(Some(dec!(1)), dec!(1000));
+    let (report, fills) = run(Some(dec!(1)), dec!(1000));
 
     let buys: Vec<&TradeFillJson> = fills.iter().filter(|f| f.side == "buy").collect();
     assert!(!buys.is_empty(), "expected ≥1 buy fill");
 
     for f in &buys {
-        let notional = Decimal::from(f.contracts) * f.fill_price;
-        assert!(
-            notional <= dec!(1),
-            "flat-mode buy notional must be ≤ $1; got {notional} (contracts={}, \
-             fill_price={})",
-            f.contracts,
-            f.fill_price
-        );
+        assert_eq!(f.contracts, 2);
+        assert_eq!(f.fill_price, dec!(0.3535));
+        assert_eq!(f.modeled_fee, dec!(0.01828));
+        assert_eq!(f.all_in_debit, dec!(0.72528));
+        assert!(f.all_in_debit <= dec!(1));
     }
+    assert_eq!(
+        report.total_pnl_usd,
+        Decimal::from(report.total_copies) * dec!(0.75972)
+    );
 }
 
 // ── Scenario 2 ────────────────────────────────────────────────────────────────
@@ -309,25 +309,13 @@ async fn flat_mode_sell_path_unchanged() {
 
 // ── Scenario 6 ────────────────────────────────────────────────────────────────
 
-/// PASS: `flat = $0.10`, `fill_price ≈ $0.3535` → `floor(0.10 / 0.3535) = 0`,
-///       but `.max(1)` opens 1 contract (best-effort). Each fill has
-///       `notional ≈ $0.3535 > flat` — the degenerate case explicitly
-///       documented in the issue.
-/// FAIL: no fills produced (would mean `.max(1)` was dropped).
+/// PASS: `flat = $0.10`, `fill_price ≈ $0.3535` has no executable contract and produces no
+///       BUY fill; the simulator never spends above the configured budget.
+/// FAIL: any BUY fill is emitted through the retired one-contract fallback.
 #[tokio::test]
-async fn flat_mode_min_one_contract_when_flat_below_fill_price() {
+async fn flat_mode_below_fill_price_is_rejected() {
     let (_report, fills) = run(Some(dec!(0.10)), dec!(1000));
 
     let buys: Vec<&TradeFillJson> = fills.iter().filter(|f| f.side == "buy").collect();
-    assert!(
-        !buys.is_empty(),
-        "expected ≥1 buy fill (1 contract, best-effort)"
-    );
-
-    for f in &buys {
-        assert_eq!(
-            f.contracts, 1,
-            "best-effort 1-contract fill when flat < fill_price"
-        );
-    }
+    assert!(buys.is_empty(), "budget below one contract must not fill");
 }

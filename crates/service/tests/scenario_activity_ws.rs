@@ -48,41 +48,57 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    routing::get,
+};
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
-    BasisPoints, LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, ReceivedAt,
-    ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
-    VenueMarketId, WalletAddress,
+    BasisPoints, CollateralAmount, LeaderAction, MarketId, OutcomeId, PolymarketConditionId,
+    PolymarketTokenId, Price, ProbabilityPpm, ReceivedAt, ReconstructionQuality, ShareAmount, Side,
+    SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
-use pe_execution_core::ExecutionDispatcher;
+use pe_event_log::{ContentType, EnvelopeIn, Reader, Scanner, Writer};
+use pe_execution_core::{AdmissionReceipts, LiveAdmissionArtifact};
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
 };
+use pe_resolver_card::{
+    VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+};
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
-use pe_service::bucket_commit::DecisionContinuationV2;
-use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
+use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts};
+use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook, ReqwestClobBookFetcher};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
 use pe_service::live_accounts::{
     AccountRow, CredentialMetaRow, LiveAccounts, LiveAccountsSnapshot,
 };
+use pe_service::live_venue_adapter::LiveAdmissionBuilder;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
-use pe_service::paper_recovery::build_leader_ledger;
+use pe_service::paper_recovery::{
+    PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, QualificationStarted, TailBinding,
+    build_leader_ledger,
+};
+use pe_service::risk_inputs::SourceReceiptIndex;
+use pe_service::runtime_config::RuntimeConfig;
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::trade_parser;
+use pe_service::{config::ServiceConfig, mark_prices::HistoricalMarkAdapter};
 use pe_source_polymarket_public::{
     ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, ACTIVITY_WS_SUBSCRIBE, ActivityWsError,
-    ActivityWsPeer, FixtureFetcher, parse_activity_frame, parse_activity_trade_observation,
+    ActivityWsPeer, FixtureFetcher, LiveMarketEvidence, parse_activity_frame,
+    parse_activity_response, parse_activity_trade_observation,
 };
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+use pe_venue_polymarket::CompactFeeSchedule;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -90,6 +106,8 @@ use time::OffsetDateTime;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+
+mod support;
 
 // ── Helpers (mirrors scenario_paper_state.rs; scenario files are self-contained) ──
 
@@ -118,10 +136,6 @@ fn market_c() -> MarketId {
 
 fn market_d() -> MarketId {
     market_with('5')
-}
-
-fn id(s: &str) -> SourceTradeId {
-    SourceTradeId(s.to_string())
 }
 
 fn now_unix() -> i64 {
@@ -168,6 +182,15 @@ fn trade_at(
     }
 }
 
+fn bucket_id(transaction_hash: &str, market_id: MarketId) -> SourceTradeId {
+    support::bucket_source_trade_id(&trade_at(
+        transaction_hash,
+        market_id,
+        OffsetDateTime::UNIX_EPOCH,
+        TradeProvenance::ActivityWs,
+    ))
+}
+
 /// One real-shape websocket activity payload (string numerics, as the feed sends them).
 fn payload(tx: &str, wallet: &str, market: &MarketId, observed_unix: i64) -> String {
     format!(
@@ -191,14 +214,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-fn make_dispatcher(dir: &Path) -> ExecutionDispatcher {
-    let paper_writer = Writer::open(dir.join("paper.log")).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    ExecutionDispatcher::paper_only(paper_executor)
-}
-
-fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
-    mpsc::channel(1).1
+fn make_writer(dir: &Path) -> Writer {
+    Writer::open(dir.join("paper.log")).unwrap()
 }
 
 fn disabled_entry_gate() -> CopyEntryGateConfig {
@@ -245,47 +262,6 @@ fn whole_shares(value: u64) -> u64 {
         .atomic()
 }
 
-// ── Armed live accounts (mirrors scenario_dispatch.rs) ────────────────────────
-
-fn account_row(
-    id: &str,
-    primary: bool,
-    enabled: bool,
-    execution_order: i64,
-    mode: &str,
-) -> AccountRow {
-    AccountRow {
-        account_id: id.to_string(),
-        is_primary: primary,
-        enabled,
-        execution_order,
-        requested_live_mode: mode.to_string(),
-        effective_live_mode: mode.to_string(),
-        live_price_impact_cap_bps: 100,
-        custody_wallet_address: None,
-        custody_wallet_kind: None,
-    }
-}
-
-fn standard_armed_accounts() -> LiveAccounts {
-    let rows = vec![
-        account_row("partner", false, true, 1, "live_tiny"),
-        account_row("primary-acct", true, true, 9, "live_tiny"),
-        account_row("bench", false, false, 0, "live_tiny"),
-    ];
-    let credentials: Vec<CredentialMetaRow> = rows
-        .iter()
-        .map(|row| CredentialMetaRow {
-            account_id: row.account_id.clone(),
-            bundle_version: 1,
-            key_id: "key-1".to_string(),
-        })
-        .collect();
-    let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &credentials);
-    snapshot.fetched_at_unix = Some(now_unix());
-    LiveAccounts::new(snapshot)
-}
-
 // ── Orchestrator fixture ─────────────────────────────────────────────────────
 
 struct OrchOpts {
@@ -309,10 +285,12 @@ impl OrchOpts {
 fn build_orchestrator(
     dir: &Path,
     paper_state: Arc<PaperStateDb>,
-    trade_rx: mpsc::Receiver<IncomingTrade>,
     health: SharedHealth,
     opts: OrchOpts,
-) -> Orchestrator<FixtureFetcher, FixtureClobBookFetcher> {
+) -> (
+    Orchestrator<FixtureFetcher, FixtureClobBookFetcher>,
+    mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
+) {
     paper_state
         .record_reconciled_history_status(&WalletHistoryStatusRecord {
             wallet: leader_wallet(),
@@ -321,6 +299,7 @@ fn build_orchestrator(
             updated_at_unix: 1,
         })
         .unwrap();
+    support::install_empty_anchor(&paper_state, leader_wallet(), 0);
     let mid_price_cache = mid_cache_for(&opts.markets, "0.50");
     let books = opts
         .markets
@@ -336,14 +315,15 @@ fn build_orchestrator(
                         }],
                         response_blake3: String::new(),
                         fetched_at_ms: 0,
+                        source_receipt: None,
                     },
                 )
             })
         })
         .collect();
     let leader_ledger = build_leader_ledger(&paper_state).unwrap();
+    let (control_tx, control_rx) = mpsc::channel(64);
     let mut orch = Orchestrator::new(
-        trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: opts.ws_enabled,
@@ -356,22 +336,18 @@ fn build_orchestrator(
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
-            fill_mode: pe_service::runtime_config::FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: opts.live_accounts,
         },
         WinnerFollowStrategy::new(flat_fill_config()),
-        make_dispatcher(dir),
+        make_writer(dir),
         paper_state,
         leader_ledger,
         health,
-        MarketEndCache::new(String::new()),
         mid_price_cache,
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
@@ -381,7 +357,7 @@ fn build_orchestrator(
     if let Some(hooks) = opts.hooks {
         orch.set_scenario_hooks(hooks);
     }
-    orch
+    (orch, control_tx)
 }
 
 /// Run `trades` (in order) through a fresh orchestrator to completion.
@@ -392,14 +368,13 @@ async fn run_trades(
     opts: OrchOpts,
     trades: Vec<IncomingTrade>,
 ) {
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
-    for t in trades {
-        trade_tx.send(t).await.unwrap();
+    let (orch, control_tx) = build_orchestrator(dir, paper_state, health, opts);
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    for trade in trades {
+        support::send_trade_bucket(&control_tx, trade).await;
     }
-    drop(trade_tx);
-    build_orchestrator(dir, paper_state, trade_rx, health, opts)
-        .run(std::future::pending::<()>())
-        .await;
+    drop(control_tx);
+    run.await.unwrap();
 }
 
 fn spawn_orchestrator(
@@ -410,6 +385,17 @@ fn spawn_orchestrator(
         rx.await.ok();
     }));
     (task, tx)
+}
+
+fn forward_trade_buckets(
+    mut trades: mpsc::Receiver<IncomingTrade>,
+    control: mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(trade) = trades.recv().await {
+            support::send_trade_bucket(&control, trade).await;
+        }
+    })
 }
 
 // ── Reader-pool fixture: three real readers over in-process pipes ─────────────
@@ -548,7 +534,7 @@ async fn start_pool_with_gate(
         ingest = ingest.with_reader_append_gate(gate);
     }
     let replay_path = source_log.clone();
-    // Compatibility projection for the retained #546 reader-pool scenarios:
+    // Projection for the retained #546 reader-pool scenarios:
     // production emits only reconciliation triggers, while these tests still
     // exercise the old orchestrator seam. Reparse the row only after the source
     // log proves it durable; no production path uses this projection.
@@ -908,36 +894,32 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
     let (pool, trade_rx) = start_pool(64).await;
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
-    // Fixed admission clock: 0xsame copy 1 samples early+final (fills), copy 2 is
-    // seen (no sample), 0xother samples early+final. Rows are observed 1 s before.
+    // Fixed admission clock: the two unique acknowledged decisions each sample once.
     let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
     let hooks = Arc::new(ScenarioHooks::default());
-    hooks.age_clock.lock().unwrap().extend([t, t, t, t]);
-    let orch = build_orchestrator(
+    hooks.age_clock.lock().unwrap().extend([t, t]);
+    let (orch, control_tx) = build_orchestrator(
         dir.path(),
         paper_state.clone(),
-        trade_rx,
         pool.health.clone(),
         OrchOpts {
             hooks: Some(Arc::clone(&hooks)),
             ..OrchOpts::ws(vec![market(), market_b()])
         },
     );
+    let forward = forward_trade_buckets(trade_rx, control_tx);
     let (orch_task, shutdown) = spawn_orchestrator(orch);
     let mut s0 = pool.net.take_server(0);
     let mut s1 = pool.net.take_server(1); // silent forever
     let mut s2 = pool.net.take_server(2);
 
     advance(Duration::from_secs(1)).await;
-    let observed_unix = t.unix_timestamp() - 1;
+    let observed_unix = t.unix_timestamp() - 2;
     let frame = activity_frame(&[payload("0xsame", LEADER, &market(), observed_unix)]);
     s0.send_text(&frame).await.unwrap();
     s2.send_text(&frame).await.unwrap();
     assert!(
-        settle_until(
-            || paper_fill_count(dir.path()) == 1 && paper_state.is_seen(&id("0xsame")).unwrap()
-        )
-        .await,
+        settle_until(|| { paper_state.is_seen(&bucket_id("0xsame", market())).unwrap() }).await,
         "two reader copies reach one decision with no polling input"
     );
     // A distinct identifier delivered by one reader only is also copied.
@@ -945,22 +927,26 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
         "0xother",
         LEADER,
         &market_b(),
-        observed_unix,
+        observed_unix + 1,
     )]))
     .await
     .unwrap();
-    assert!(settle_until(|| paper_state.is_seen(&id("0xother")).unwrap()).await);
+    assert!(
+        settle_until(|| {
+            paper_state
+                .is_seen(&bucket_id("0xother", market_b()))
+                .unwrap()
+        })
+        .await
+    );
     assert!(
         paper_state
-            .no_copy_disposition(&id("0xother"))
+            .no_copy_disposition(&bucket_id("0xother", market_b()))
             .unwrap()
             .is_none(),
-        "delivered fresh: admitted without a stale disposition"
+        "fresh pre-Start refusal is not a stale no-copy"
     );
-    // The same leader's second entry reaches the strategy, which sizes it to zero
-    // under the existing per-leader Kelly rule ("no edge") — delivery is proven by
-    // admission, not by a second fill.
-    assert_eq!(paper_fill_count(dir.path()), 1);
+    assert_eq!(paper_fill_count(dir.path()), 0);
     assert_eq!(
         leader_long(&paper_state, &market()),
         Some(whole_shares(100)),
@@ -972,7 +958,7 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
     );
     assert!(
         hooks.age_clock.lock().unwrap().is_empty(),
-        "four budget samples"
+        "two unique acknowledged decisions sample once"
     );
 
     // Keep 0 and 2 alive past slot 1's deadline with parser-accepted unwatched rows.
@@ -1024,6 +1010,7 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
     shutdown.send(()).unwrap();
     orch_task.await.unwrap();
     pool.task.abort();
+    forward.abort();
 }
 
 // ── R5: independent per-slot backoff ─────────────────────────────────────────
@@ -1090,28 +1077,23 @@ async fn r5_each_reader_has_independent_reconnect_backoff() {
 
 #[tokio::test(start_paused = true)]
 async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to_the_same() {
-    // Fixed admission clock for both runs: copy 1 samples early+final (fault),
-    // copy 2 samples early+final (fills), copy 3 is seen (no sample).
+    // Fixed admission clock for both runs: the one deduplicated decision samples once.
     let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
     let hooks = Arc::new(ScenarioHooks::default());
-    hooks
-        .fail_next_stage_seed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    hooks.age_clock.lock().unwrap().extend([t, t, t, t]);
+    hooks.age_clock.lock().unwrap().push_back(t);
     let (pool, trade_rx) = start_pool(64).await;
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
-    let orch = build_orchestrator(
+    let (orch, control_tx) = build_orchestrator(
         dir.path(),
         paper_state.clone(),
-        trade_rx,
         pool.health.clone(),
         OrchOpts {
             hooks: Some(Arc::clone(&hooks)),
-            live_accounts: Some(standard_armed_accounts()),
             ..OrchOpts::ws(vec![market()])
         },
     );
+    let forward = forward_trade_buckets(trade_rx, control_tx);
     let (orch_task, shutdown) = spawn_orchestrator(orch);
 
     let row = payload("0xthree", LEADER, &market(), t.unix_timestamp() - 1);
@@ -1120,7 +1102,9 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
         pool.net.take_server(slot).send_text(&frame).await.unwrap();
     }
     assert!(
-        settle_until(|| paper_state.fills_count().unwrap() == 1
+        settle_until(|| paper_state
+            .is_seen(&bucket_id("0xthree", market()))
+            .unwrap()
             && pool.source_log_ids().len() == 3)
         .await
     );
@@ -1130,7 +1114,7 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
 
     let assert_one_decision = |state: &PaperStateDb, paper_dir: &Path| {
         assert!(
-            state.is_seen(&id("0xthree")).unwrap(),
+            state.is_seen(&bucket_id("0xthree", market())).unwrap(),
             "one committed seen row"
         );
         assert_eq!(
@@ -1140,37 +1124,34 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
         );
         assert_eq!(
             state.fills_count().unwrap(),
-            1,
-            "exactly one eligible paper fill"
+            0,
+            "pre-Start classification cannot create a financial fill"
         );
-        assert_eq!(paper_fill_count(paper_dir), 1);
+        assert_eq!(paper_fill_count(paper_dir), 0);
         let mut seeds = state.pending_dispatch_seeds().unwrap();
         seeds.extend(state.unfinalized_ready_dispatch_seeds().unwrap());
-        assert_eq!(seeds.len(), 1, "one dispatch seed");
-        assert_eq!(seeds[0].source_trade_id, "0xthree");
-        let targets = state.dispatch_targets(&seeds[0].dispatch_id).unwrap();
-        let mut accounts: Vec<&str> = targets.iter().map(|t| t.account_id.as_str()).collect();
-        accounts.sort_unstable();
         assert_eq!(
-            accounts,
-            vec!["partner", "primary-acct"],
-            "one target per eligible armed account with a credential binding"
+            seeds.len(),
+            0,
+            "pre-Start classification cannot stage live dispatch"
+        );
+        assert!(
+            state
+                .no_copy_disposition(&bucket_id("0xthree", market()))
+                .unwrap()
+                .is_none(),
+            "fresh pre-Start refusal is not a stale no-copy"
         );
     };
-    assert!(
-        !hooks
-            .fail_next_stage_seed
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "the one-shot staging fault was consumed by the first copy"
-    );
     assert_one_decision(&paper_state, dir.path());
     assert!(
         hooks.age_clock.lock().unwrap().is_empty(),
-        "four budget samples"
+        "one deduplicated decision sample"
     );
     shutdown.send(()).unwrap();
     orch_task.await.unwrap();
     pool.task.abort();
+    forward.abort();
     settle().await;
 
     // Replay: three ordered envelopes, each byte-identical raw row with its own receipt.
@@ -1224,35 +1205,25 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
         replayed.push(t);
     }
 
-    // Fresh state, same fault: replay reproduces the single decision.
+    // Fresh state: replay reproduces the single acknowledged decision.
     let dir2 = tempfile::tempdir().unwrap();
     let paper2 = Arc::new(PaperStateDb::open(&dir2.path().join("p.db")).unwrap());
     assert_eq!(paper2.fills_count().unwrap(), 0);
-    assert!(!paper2.is_seen(&id("0xthree")).unwrap());
+    assert!(!paper2.is_seen(&bucket_id("0xthree", market())).unwrap());
     assert!(paper2.pending_dispatch_seeds().unwrap().is_empty());
     let hooks2 = Arc::new(ScenarioHooks::default());
-    hooks2
-        .fail_next_stage_seed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    hooks2.age_clock.lock().unwrap().extend([t, t, t, t]);
+    hooks2.age_clock.lock().unwrap().push_back(t);
     run_trades(
         dir2.path(),
         paper2.clone(),
         healthy_ws_health(),
         OrchOpts {
             hooks: Some(Arc::clone(&hooks2)),
-            live_accounts: Some(standard_armed_accounts()),
             ..OrchOpts::ws(vec![market()])
         },
         replayed,
     )
     .await;
-    assert!(
-        !hooks2
-            .fail_next_stage_seed
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "replay consumed the fault exactly once"
-    );
     assert_one_decision(&paper2, dir2.path());
     assert!(hooks2.age_clock.lock().unwrap().is_empty());
 }
@@ -1322,9 +1293,13 @@ async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
     let hooks = Arc::new(ScenarioHooks::default());
-    // Stale rows consume one instant (early gate); eligible rows consume two
-    // (early gate + the pre-staging re-check).
-    hooks.age_clock.lock().unwrap().extend([t, t, t, t, t, t]);
+    // Each acknowledged pending decision consumes one final staleness sample.
+    hooks.age_clock.lock().unwrap().extend([
+        t - time::Duration::seconds(1),
+        t,
+        t - time::Duration::seconds(1),
+        t,
+    ]);
     run_trades(
         dir.path(),
         paper_state.clone(),
@@ -1335,29 +1310,29 @@ async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
         },
         vec![
             trade_at(
+                "0xrest60",
+                market_b(),
+                t - time::Duration::seconds(61),
+                TradeProvenance::RestPoll,
+            ),
+            trade_at(
                 "0xws60",
                 market(),
                 t - time::Duration::seconds(60),
                 TradeProvenance::ActivityWs,
             ),
+            // Exact boundary (age == budget) stays eligible for both provenances.
             trade_at(
-                "0xrest60",
-                market_b(),
-                t - time::Duration::seconds(60),
+                "0xrestedge",
+                market_d(),
+                t - time::Duration::seconds(3),
                 TradeProvenance::RestPoll,
             ),
-            // Exact boundary (age == budget) stays eligible for both provenances.
             trade_at(
                 "0xwsedge",
                 market_c(),
                 t - time::Duration::seconds(2),
                 TradeProvenance::ActivityWs,
-            ),
-            trade_at(
-                "0xrestedge",
-                market_d(),
-                t - time::Duration::seconds(2),
-                TradeProvenance::RestPoll,
             ),
         ],
     )
@@ -1366,17 +1341,15 @@ async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
         hooks.age_clock.lock().unwrap().is_empty(),
         "every check sampled once"
     );
-    // Both boundary rows are admitted as eligible (seen, no disposition, both sampled
-    // twice). The first fills; the second reaches the strategy and is sized to zero by
-    // the existing per-leader Kelly rule — stale rows never get that far.
+    // Both boundary rows are fresh but fail closed at the pre-Start financial boundary.
     assert_eq!(
         paper_fill_count(dir.path()),
-        1,
-        "a boundary row fills; stale rows never do"
+        0,
+        "pre-Start classification never writes a financial fill"
     );
     assert_eq!(
         paper_state
-            .no_copy_disposition(&id("0xws60"))
+            .no_copy_disposition(&bucket_id("0xws60", market()))
             .unwrap()
             .unwrap(),
         (
@@ -1387,7 +1360,7 @@ async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
     );
     assert_eq!(
         paper_state
-            .no_copy_disposition(&id("0xrest60"))
+            .no_copy_disposition(&bucket_id("0xrest60", market_b()))
             .unwrap()
             .unwrap(),
         (
@@ -1396,21 +1369,28 @@ async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
             "stale_fallback_past_copy_budget".to_string()
         )
     );
-    for t in ["0xws60", "0xrest60", "0xwsedge", "0xrestedge"] {
-        assert!(paper_state.is_seen(&id(t)).unwrap(), "{t} seen");
+    for (transaction_hash, market_id) in [
+        ("0xws60", market()),
+        ("0xrest60", market_b()),
+        ("0xwsedge", market_c()),
+        ("0xrestedge", market_d()),
+    ] {
+        assert!(
+            paper_state
+                .is_seen(&bucket_id(transaction_hash, market_id))
+                .unwrap(),
+            "{transaction_hash} seen"
+        );
     }
-    assert!(
-        paper_state
-            .no_copy_disposition(&id("0xwsedge"))
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        paper_state
-            .no_copy_disposition(&id("0xrestedge"))
-            .unwrap()
-            .is_none()
-    );
+    for (transaction_hash, market_id) in [("0xwsedge", market_c()), ("0xrestedge", market_d())] {
+        assert!(
+            paper_state
+                .no_copy_disposition(&bucket_id(transaction_hash, market_id))
+                .unwrap()
+                .is_none(),
+            "fresh pre-Start refusal is not a stale no-copy"
+        );
+    }
     assert_eq!(
         leader_long(&paper_state, &market()),
         Some(whole_shares(100)),
@@ -1421,18 +1401,18 @@ async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
 // ── R9: fresh early, stale before staging; commit fault rolls back cleanly ───
 
 #[tokio::test]
-async fn r9_stale_before_staging_commits_no_copy_and_a_commit_fault_rolls_back() {
+async fn r9_stale_acknowledged_bucket_commits_no_copy() {
     let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
 
-    // Part 1: fresh at the early gate, stale at the pre-staging re-check.
+    // A committed continuation that is stale at its final admission check records no-copy.
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let hooks = Arc::new(ScenarioHooks::default());
-    hooks.age_clock.lock().unwrap().extend([
-        t,                              // 0xlate early: age 1s, fresh
-        t + time::Duration::seconds(5), // 0xlate final: age 6s, stale
-        t,                              // 0xsecond early: fresh; then NotFirstEntry
-    ]);
+    hooks
+        .age_clock
+        .lock()
+        .unwrap()
+        .push_back(t + time::Duration::seconds(5));
     run_trades(
         dir.path(),
         paper_state.clone(),
@@ -1448,20 +1428,15 @@ async fn r9_stale_before_staging_commits_no_copy_and_a_commit_fault_rolls_back()
                 t - time::Duration::seconds(1),
                 TradeProvenance::ActivityWs,
             ),
-            trade_at(
-                "0xsecond",
-                market(),
-                t - time::Duration::seconds(1),
-                TradeProvenance::ActivityWs,
-            ),
+            trade_at("0xsecond", market(), t, TradeProvenance::ActivityWs),
         ],
     )
     .await;
     assert!(hooks.age_clock.lock().unwrap().is_empty());
-    assert!(paper_state.is_seen(&id("0xlate")).unwrap());
+    assert!(paper_state.is_seen(&bucket_id("0xlate", market())).unwrap());
     assert_eq!(
         paper_state
-            .no_copy_disposition(&id("0xlate"))
+            .no_copy_disposition(&bucket_id("0xlate", market()))
             .unwrap()
             .unwrap(),
         (
@@ -1483,82 +1458,674 @@ async fn r9_stale_before_staging_commits_no_copy_and_a_commit_fault_rolls_back()
     assert!(paper_state.pending_dispatch_seeds().unwrap().is_empty());
     // The same-session entry was retained: the second entry into this market is
     // NotFirstEntry (seen, no disposition, no fill).
-    assert!(paper_state.is_seen(&id("0xsecond")).unwrap());
     assert!(
         paper_state
-            .no_copy_disposition(&id("0xsecond"))
+            .is_seen(&bucket_id("0xsecond", market()))
             .unwrap()
-            .is_none()
+    );
+    assert!(
+        paper_state
+            .is_seen(&bucket_id("0xsecond", market()))
+            .unwrap()
+    );
+}
+
+/// PASS: receipt-scoped V3 observation resolution advances the deterministic clock from an age of
+/// 1,999 ms to 2,001 ms before the final sample, so no live dispatch target is staged.
+/// FAIL: the final age sample precedes observation resolution and the armed account receives a
+/// dispatch seed.
+#[tokio::test]
+async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let paper_path = dir.path().join("paper.log");
+    let state_path = dir.path().join("paper.db");
+    let observed_at = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+    let condition = market();
+    let token_id = format!("{condition}-0");
+    let activity = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": leader_wallet().to_string(),
+        "timestamp": observed_at.unix_timestamp(),
+        "conditionId": condition.to_string(),
+        "type": "TRADE",
+        "size": "100",
+        "usdcSize": "50",
+        "transactionHash": "0xresolution-delay",
+        "price": "0.50",
+        "asset": token_id,
+        "side": "BUY",
+        "outcomeIndex": 0,
+        "outcome": "Yes",
+        "isCombo": false
+    }]))
+    .unwrap();
+    let mut source_writer = Writer::open(&source_path).unwrap();
+    let page_receipt = source_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(observed_at),
+            received_at: ReceivedAt(observed_at),
+            content_type: ContentType::Json,
+            payload: activity.clone(),
+        })
+        .unwrap();
+    drop(source_writer);
+    let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+
+    let paper_state = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: observed_at.unix_timestamp(),
+        })
+        .unwrap();
+    support::install_empty_anchor(&paper_state, leader_wallet(), 0);
+
+    let mut runtime = RuntimeConfig::from_service_config(&ServiceConfig::default());
+    runtime.mode = "paper".to_owned();
+    runtime.max_resolution_horizon_secs = 0;
+    runtime.min_resolution_horizon_secs = 0;
+    runtime.price_impact_cap_bps = 100;
+    runtime.sizing_mode = SizingMode::Dollar { usd: dec!(10) };
+    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let start_at = observed_at - time::Duration::seconds(1);
+    let paper_prefix = TailBinding::from(&Scanner::verify(&paper_path).unwrap());
+    let source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+    let start = paper_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: PAPER_LOG_SCHEMA_VERSION,
+            parser_version: 1,
+            observed_at: SourceTimestamp(start_at),
+            received_at: ReceivedAt(start_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+                QualificationStarted {
+                    starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+                    paper_prefix,
+                    source_prefix,
+                    live_prefix: TailBinding {
+                        physical_tail: 0,
+                        last_sequence: None,
+                        last_hash: "00".repeat(32),
+                    },
+                    artifact_blake3: "scenario".to_owned(),
+                    static_config_hash: "scenario".to_owned(),
+                    hot_config_hash: runtime.canonical_hash(),
+                    generation: "scenario".to_owned(),
+                    activation_id: "scenario".to_owned(),
+                    ranking_batch_id: 545,
+                    membership: vec![leader_wallet()],
+                    membership_proofs_hash: "scenario".to_owned(),
+                    schema_version: 3,
+                    parser_version: 1,
+                    financial_semantic_version: 1,
+                },
+            )))
+            .unwrap(),
+        })
+        .unwrap();
+    paper_state
+        .reset_financial_era(
+            start,
+            CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+        )
+        .unwrap();
+
+    let mut accounts = LiveAccountsSnapshot::from_rows(
+        vec![AccountRow {
+            account_id: "latency-test".to_owned(),
+            is_primary: true,
+            enabled: true,
+            execution_order: 0,
+            requested_live_mode: "live_tiny".to_owned(),
+            effective_live_mode: "live_tiny".to_owned(),
+            live_price_impact_cap_bps: 100,
+            custody_wallet_address: None,
+            custody_wallet_kind: None,
+        }],
+        &[CredentialMetaRow {
+            account_id: "latency-test".to_owned(),
+            bundle_version: 1,
+            key_id: "latency-key".to_owned(),
+        }],
+    );
+    accounts.fetched_at_unix = Some(OffsetDateTime::now_utc().unix_timestamp());
+
+    let admission = LiveAdmissionArtifact {
+        market: LiveMarketEvidence {
+            condition_id: PolymarketConditionId(condition.to_string()),
+            ordered_outcome_token_ids: [
+                PolymarketTokenId(token_id.clone()),
+                PolymarketTokenId(format!("{condition}-1")),
+            ],
+            neg_risk: false,
+            minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+            minimum_order_size: ShareAmount::from_whole(1).unwrap(),
+            scheduled_end_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            schema_version: pe_source_polymarket_public::LIVE_MARKET_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::LIVE_MARKET_PARSER_VERSION,
+            freshness_window_secs: 60,
+        },
+        settlement: VenueSettlementRecord {
+            schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+            condition_id: PolymarketConditionId(condition.to_string()),
+            status: VenueResolutionStatus::Unresolved,
+            raw_evidence_hash: "scenario".to_owned(),
+            source_timestamp_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            parser_version: 1,
+            freshness_window_secs: 60,
+        },
+        fee_schedule: CompactFeeSchedule::Zero,
+        receipts: AdmissionReceipts {
+            gamma: page_receipt,
+            clob_long: page_receipt,
+            clob_compact: page_receipt,
+        },
+    };
+    let hooks = Arc::new(ScenarioHooks::default());
+    hooks.age_clock.lock().unwrap().extend([
+        observed_at + time::Duration::milliseconds(1_999),
+        observed_at + time::Duration::milliseconds(1_999),
+    ]);
+    hooks
+        .observation_resolution_advance_millis
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .admission_artifacts
+        .lock()
+        .unwrap()
+        .push_back(admission);
+
+    let book = OrderBook {
+        asks: vec![BookLevel {
+            price: dec!(0.50),
+            size: dec!(10_000),
+        }],
+        response_blake3: "scenario-book".to_owned(),
+        fetched_at_ms: 0,
+        source_receipt: Some(page_receipt),
+    };
+    let (control_tx, control_rx) = mpsc::channel(4);
+    let (source_log, _source_rx) = SourceLogHandle::channel(4);
+    let http = reqwest::Client::new();
+    let mut orchestrator = Orchestrator::new(
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        OrchestratorConfig {
+            bankroll: dec!(10_000),
+            mode: ExecutionMode::Paper,
+            signal_config: SignalConfig::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
+            min_fill_price: Decimal::ZERO,
+            price_impact_cap_bps: 100,
+            entry_gate_config: disabled_entry_gate(),
+            runtime_config: None,
+            live_accounts: Some(LiveAccounts::new(accounts)),
+            activity_ws_enabled: true,
+            copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
+        },
+        WinnerFollowStrategy::new(runtime.winner_follow_config()),
+        paper_writer,
+        Arc::clone(&paper_state),
+        build_leader_ledger(&paper_state).unwrap(),
+        healthy_ws_health(),
+        mid_cache_for(std::slice::from_ref(&condition), "0.50"),
+        control_rx,
+        None,
+        None,
+        None,
+        Arc::new(FixtureClobBookFetcher::new(HashMap::from([(
+            token_id, book,
+        )]))),
+    )
+    .unwrap();
+    orchestrator.set_scenario_hooks(Arc::clone(&hooks));
+    orchestrator
+        .configure_financial_log_paths(
+            paper_path,
+            source_path,
+            LiveAdmissionBuilder::new(
+                http.clone(),
+                "http://unused.invalid",
+                "http://unused.invalid",
+                source_log.clone(),
+            ),
+            Arc::new(HistoricalMarkAdapter::new(
+                http,
+                "http://unused.invalid",
+                source_log,
+            )),
+            source_receipts,
+        )
+        .unwrap();
+    let run = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+
+    let parse_context = pe_source_polymarket_public::ActivityParseContext {
+        source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+        observed_at: SourceTimestamp(observed_at),
+        received_at: ReceivedAt(observed_at),
+        transport: pe_source_polymarket_public::ActivityTransport::Rest,
+    };
+    let aggregates = parse_activity_response(&activity, leader_wallet(), &parse_context)
+        .unwrap()
+        .aggregates()
+        .unwrap();
+    let source_trade_id = aggregates[0].group_id.key().clone();
+    let (decision_inputs_json, occurrence) = support::producer_shaped_activity_page(
+        leader_wallet(),
+        &activity,
+        observed_at.unix_timestamp(),
+        page_receipt,
+    );
+    let (committed, acknowledgement) = oneshot::channel();
+    control_tx
+        .send(
+            pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context: Arc::new(BucketDecisionContext {
+                    applied_configuration: runtime,
+                    decision_inputs_json,
+                    page_occurrences: vec![occurrence],
+                    observed_source_receipts: HashMap::new(),
+                    reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    signal_config: SignalConfig::default(),
+                    copy_eligible: true,
+                    bracket_commit: false,
+                    recorded_at_unix: observed_at.unix_timestamp(),
+                    observation_provenance: HashMap::from([(
+                        source_trade_id.clone(),
+                        TradeProvenance::RestPoll,
+                    )]),
+                    no_copy_dispositions: HashMap::new(),
+                    identity_overrides: HashMap::new(),
+                    identity_unresolved: HashSet::new(),
+                    history_status: None,
+                }),
+                committed,
+            },
+        )
+        .await
+        .unwrap();
+    acknowledgement.await.unwrap().unwrap();
+    drop(control_tx);
+    run.await.unwrap();
+
+    assert!(hooks.age_clock.lock().unwrap().is_empty());
+    assert_eq!(
+        hooks
+            .observation_resolution_advance_millis
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(paper_state.pending_dispatch_seeds().unwrap().is_empty());
+    assert!(
+        paper_state
+            .unfinalized_ready_dispatch_seeds()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        paper_state
+            .no_copy_disposition(&source_trade_id)
+            .unwrap()
+            .map(|(_, _, reason)| reason),
+        Some("stale_fallback_past_copy_budget".to_owned())
+    );
+}
+
+#[derive(Clone)]
+struct WrongMarketBookLoopback {
+    expected_token: String,
+    wrong_condition: String,
+    book_requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn wrong_market_book_response(
+    State(state): State<WrongMarketBookLoopback>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    assert_eq!(
+        query.get("token_id"),
+        Some(&state.expected_token),
+        "runtime fetch requests the admitted outcome token"
+    );
+    state
+        .book_requests
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Json(serde_json::json!({
+        "market": state.wrong_condition,
+        "asset_id": state.expected_token,
+        "asks": [{"price": "0.50", "size": "10000"}]
+    }))
+}
+
+/// PASS: the production `/book` fetch receives the admitted token with a usable ask ladder under
+/// a different market identity, fails closed, and creates no dispatch seed or paper preparation.
+/// FAIL: token-only validation admits the substituted condition or any downstream dispatch work.
+#[tokio::test]
+async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_preparation() {
+    let condition = market();
+    let token_id = format!("{condition}-0");
+    let book_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let loopback_state = WrongMarketBookLoopback {
+        expected_token: token_id.clone(),
+        wrong_condition: market_b().to_string(),
+        book_requests: Arc::clone(&book_requests),
+    };
+    let app = Router::new()
+        .route("/book", get(wrong_market_book_response))
+        .with_state(loopback_state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let paper_path = dir.path().join("paper.log");
+    let state_path = dir.path().join("paper.db");
+    let observed_at = OffsetDateTime::now_utc();
+    let activity = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": leader_wallet().to_string(),
+        "timestamp": observed_at.unix_timestamp(),
+        "conditionId": condition.to_string(),
+        "type": "TRADE",
+        "size": "100",
+        "usdcSize": "50",
+        "transactionHash": "0xwrong-market-book",
+        "price": "0.50",
+        "asset": token_id,
+        "side": "BUY",
+        "outcomeIndex": 0,
+        "outcome": "Yes",
+        "isCombo": false
+    }]))
+    .unwrap();
+    let mut source_writer = Writer::open(&source_path).unwrap();
+    let page_receipt = source_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(observed_at),
+            received_at: ReceivedAt(observed_at),
+            content_type: ContentType::Json,
+            payload: activity.clone(),
+        })
+        .unwrap();
+    drop(source_writer);
+    let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+    let source_sink = SourceEventSink::open(&source_path).unwrap();
+    let (source_log, source_rx) = SourceLogHandle::channel(8);
+    let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+    let source_coordinator = tokio::spawn(
+        ActivityIngest::poll_only(
+            source_sink,
+            source_rx,
+            trigger_tx,
+            new_shared_health_with_ws(false, true, 90),
+        )
+        .with_source_receipt_index(source_receipts.clone())
+        .run(),
     );
 
-    // Part 2: the one-shot no-copy commit fault leaves the trade unseen and restores
-    // both the leader ledger and the tentative entry, so a distinct new trade for the
-    // same leader and market stages exactly once.
-    let dir = tempfile::tempdir().unwrap();
-    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let paper_state = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: observed_at.unix_timestamp(),
+        })
+        .unwrap();
+    support::install_empty_anchor(&paper_state, leader_wallet(), 0);
+    let mut runtime = RuntimeConfig::from_service_config(&ServiceConfig::default());
+    runtime.mode = "paper".to_owned();
+    runtime.max_resolution_horizon_secs = 0;
+    runtime.min_resolution_horizon_secs = 0;
+    runtime.price_impact_cap_bps = 100;
+    runtime.sizing_mode = SizingMode::Dollar { usd: dec!(10) };
+
+    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let start_at = observed_at - time::Duration::seconds(1);
+    let start = paper_writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: PAPER_LOG_SCHEMA_VERSION,
+            parser_version: 1,
+            observed_at: SourceTimestamp(start_at),
+            received_at: ReceivedAt(start_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+                QualificationStarted {
+                    starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+                    paper_prefix: TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
+                    source_prefix: TailBinding::from(&Scanner::verify(&source_path).unwrap()),
+                    live_prefix: TailBinding {
+                        physical_tail: 0,
+                        last_sequence: None,
+                        last_hash: "00".repeat(32),
+                    },
+                    artifact_blake3: "scenario".to_owned(),
+                    static_config_hash: "scenario".to_owned(),
+                    hot_config_hash: runtime.canonical_hash(),
+                    generation: "scenario".to_owned(),
+                    activation_id: "scenario".to_owned(),
+                    ranking_batch_id: 545,
+                    membership: vec![leader_wallet()],
+                    membership_proofs_hash: "scenario".to_owned(),
+                    schema_version: 3,
+                    parser_version: 1,
+                    financial_semantic_version: 1,
+                },
+            )))
+            .unwrap(),
+        })
+        .unwrap();
+    paper_state
+        .reset_financial_era(
+            start,
+            CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+        )
+        .unwrap();
+
+    let mut accounts = LiveAccountsSnapshot::from_rows(
+        vec![AccountRow {
+            account_id: "identity-test".to_owned(),
+            is_primary: true,
+            enabled: true,
+            execution_order: 0,
+            requested_live_mode: "live_tiny".to_owned(),
+            effective_live_mode: "live_tiny".to_owned(),
+            live_price_impact_cap_bps: 100,
+            custody_wallet_address: None,
+            custody_wallet_kind: None,
+        }],
+        &[CredentialMetaRow {
+            account_id: "identity-test".to_owned(),
+            bundle_version: 1,
+            key_id: "identity-key".to_owned(),
+        }],
+    );
+    accounts.fetched_at_unix = Some(observed_at.unix_timestamp());
+    let admission = LiveAdmissionArtifact {
+        market: LiveMarketEvidence {
+            condition_id: PolymarketConditionId(condition.to_string()),
+            ordered_outcome_token_ids: [
+                PolymarketTokenId(token_id),
+                PolymarketTokenId(format!("{condition}-1")),
+            ],
+            neg_risk: false,
+            minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+            minimum_order_size: ShareAmount::from_whole(1).unwrap(),
+            scheduled_end_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            schema_version: pe_source_polymarket_public::LIVE_MARKET_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::LIVE_MARKET_PARSER_VERSION,
+            freshness_window_secs: 60,
+        },
+        settlement: VenueSettlementRecord {
+            schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+            condition_id: PolymarketConditionId(condition.to_string()),
+            status: VenueResolutionStatus::Unresolved,
+            raw_evidence_hash: "scenario".to_owned(),
+            source_timestamp_unix: None,
+            observed_at_unix: observed_at.unix_timestamp(),
+            parser_version: 1,
+            freshness_window_secs: 60,
+        },
+        fee_schedule: CompactFeeSchedule::Zero,
+        receipts: AdmissionReceipts {
+            gamma: page_receipt,
+            clob_long: page_receipt,
+            clob_compact: page_receipt,
+        },
+    };
     let hooks = Arc::new(ScenarioHooks::default());
     hooks
-        .fail_next_no_copy_commit
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let t2 = t + time::Duration::seconds(100);
-    hooks.age_clock.lock().unwrap().extend([
-        t,                              // 0xrb early: fresh
-        t + time::Duration::seconds(5), // 0xrb final: stale → commit fault → rollback
-        t2,                             // 0xnew early: fresh
-        t2,                             // 0xnew final: fresh → stages
-    ]);
-    run_trades(
-        dir.path(),
-        paper_state.clone(),
-        healthy_ws_health(),
-        OrchOpts {
-            hooks: Some(Arc::clone(&hooks)),
-            ..OrchOpts::ws(vec![market()])
+        .admission_artifacts
+        .lock()
+        .unwrap()
+        .push_back(admission);
+
+    let (control_tx, control_rx) = mpsc::channel(4);
+    let http = reqwest::Client::new();
+    let book_fetcher = ReqwestClobBookFetcher::new(http.clone())
+        .with_base_url(format!("http://{address}"))
+        .with_source_log(source_log.clone());
+    let mut orchestrator = Orchestrator::new(
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        OrchestratorConfig {
+            bankroll: dec!(10_000),
+            mode: ExecutionMode::Paper,
+            signal_config: SignalConfig::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
+            min_fill_price: Decimal::ZERO,
+            price_impact_cap_bps: 100,
+            entry_gate_config: disabled_entry_gate(),
+            runtime_config: None,
+            live_accounts: Some(LiveAccounts::new(accounts)),
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
         },
-        vec![
-            trade_at(
-                "0xrb",
-                market(),
-                t - time::Duration::seconds(1),
-                TradeProvenance::ActivityWs,
-            ),
-            trade_at(
-                "0xnew",
-                market(),
-                t2 - time::Duration::seconds(1),
-                TradeProvenance::ActivityWs,
-            ),
-        ],
+        WinnerFollowStrategy::new(runtime.winner_follow_config()),
+        paper_writer,
+        Arc::clone(&paper_state),
+        build_leader_ledger(&paper_state).unwrap(),
+        healthy_ws_health(),
+        mid_cache_for(std::slice::from_ref(&condition), "0.50"),
+        control_rx,
+        None,
+        None,
+        None,
+        Arc::new(book_fetcher),
     )
-    .await;
-    assert!(
-        !hooks
-            .fail_next_no_copy_commit
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "fault consumed exactly once"
+    .unwrap();
+    orchestrator.set_scenario_hooks(Arc::clone(&hooks));
+    orchestrator
+        .configure_financial_log_paths(
+            paper_path.clone(),
+            source_path,
+            LiveAdmissionBuilder::new(
+                http.clone(),
+                "http://unused.invalid",
+                "http://unused.invalid",
+                source_log.clone(),
+            ),
+            Arc::new(HistoricalMarkAdapter::new(
+                http,
+                "http://unused.invalid",
+                source_log,
+            )),
+            source_receipts,
+        )
+        .unwrap();
+    let run = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+    let parse_context = pe_source_polymarket_public::ActivityParseContext {
+        source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+        observed_at: SourceTimestamp(observed_at),
+        received_at: ReceivedAt(observed_at),
+        transport: pe_source_polymarket_public::ActivityTransport::Rest,
+    };
+    let aggregates = parse_activity_response(&activity, leader_wallet(), &parse_context)
+        .unwrap()
+        .aggregates()
+        .unwrap();
+    let source_trade_id = aggregates[0].group_id.key().clone();
+    let (decision_inputs_json, occurrence) = support::producer_shaped_activity_page(
+        leader_wallet(),
+        &activity,
+        observed_at.unix_timestamp(),
+        page_receipt,
     );
-    assert!(hooks.age_clock.lock().unwrap().is_empty());
-    assert!(
-        !paper_state.is_seen(&id("0xrb")).unwrap(),
-        "rolled back unseen"
-    );
+    let (committed, acknowledgement) = oneshot::channel();
+    control_tx
+        .send(
+            pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context: Arc::new(BucketDecisionContext {
+                    applied_configuration: runtime,
+                    decision_inputs_json,
+                    page_occurrences: vec![occurrence],
+                    observed_source_receipts: HashMap::new(),
+                    reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    signal_config: SignalConfig::default(),
+                    copy_eligible: true,
+                    bracket_commit: false,
+                    recorded_at_unix: observed_at.unix_timestamp(),
+                    observation_provenance: HashMap::from([(
+                        source_trade_id,
+                        TradeProvenance::RestPoll,
+                    )]),
+                    no_copy_dispositions: HashMap::new(),
+                    identity_overrides: HashMap::new(),
+                    identity_unresolved: HashSet::new(),
+                    history_status: None,
+                }),
+                committed,
+            },
+        )
+        .await
+        .unwrap();
+    acknowledgement.await.unwrap().unwrap();
+    drop(control_tx);
+    run.await.unwrap();
+
+    assert_eq!(book_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(paper_state.pending_dispatch_seeds().unwrap().is_empty());
     assert!(
         paper_state
-            .no_copy_disposition(&id("0xrb"))
+            .unfinalized_ready_dispatch_seeds()
             .unwrap()
-            .is_none()
+            .is_empty()
     );
-    assert!(paper_state.is_seen(&id("0xnew")).unwrap());
-    assert_eq!(
-        paper_fill_count(dir.path()),
-        1,
-        "the new trade stages exactly once"
-    );
-    assert_eq!(
-        leader_long(&paper_state, &market()),
-        Some(whole_shares(100)),
-        "the rolled-back ingest was restored: only the new trade advanced the ledger"
-    );
+    let financial_prepared = pe_service::paper_recovery::scan_paper_log(&paper_path)
+        .unwrap()
+        .into_iter()
+        .filter(|frame| {
+            matches!(
+                frame.frame,
+                pe_service::paper_recovery::PaperLogFrame::Record(
+                    PaperLogRecord::FinancialPrepared { .. }
+                )
+            )
+        })
+        .count();
+    assert_eq!(financial_prepared, 0);
+
+    source_coordinator.abort();
+    server.abort();
 }
 
 // ── R10: shutdown paths ───────────────────────────────────────────────────────
@@ -1624,8 +2191,8 @@ async fn ws1_duplicate_ws_then_rest_yields_one_decision() {
     .await;
     assert_eq!(
         paper_fill_count(dir.path()),
-        1,
-        "duplicate must not double-fill"
+        0,
+        "pre-Start duplicate cannot write a financial fill"
     );
     assert_eq!(
         leader_long(&paper_state, &market()),
@@ -1634,14 +2201,14 @@ async fn ws1_duplicate_ws_then_rest_yields_one_decision() {
     );
 }
 
-// ── WS2: stale REST fallback ⇒ disposition, no fill; fresh websocket fills ───
+// ── WS2: stale REST fallback and fresh websocket dispositions stay distinct ─
 
 #[tokio::test]
-async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
+async fn ws2_stale_rest_fallback_and_fresh_ws_dispositions() {
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let now = OffsetDateTime::now_utc();
-    let stale_id = SourceTradeId("0xstale".to_string());
+    let stale_id = bucket_id("0xstale", market());
     run_trades(
         dir.path(),
         paper_state.clone(),
@@ -1655,8 +2222,6 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
                 now - time::Duration::seconds(60),
                 TradeProvenance::RestPoll,
             ),
-            // Fresh websocket observation in another market: must still fill.
-            trade_at("0xfresh", market_b(), now, TradeProvenance::ActivityWs),
             // Fractional boundary (review F6): 2.5s old with a 2s budget IS stale —
             // whole-second truncation would have admitted it (2 > 2 false).
             trade_at(
@@ -1665,13 +2230,15 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
                 now - time::Duration::milliseconds(2_500),
                 TradeProvenance::RestPoll,
             ),
+            // Fresh websocket observation in another market reaches the financial-era guard.
+            trade_at("0xfresh", market_b(), now, TradeProvenance::ActivityWs),
         ],
     )
     .await;
     assert_eq!(
         paper_fill_count(dir.path()),
-        1,
-        "only the fresh websocket trade may fill"
+        0,
+        "pre-Start observations cannot write financial fills"
     );
     assert!(
         paper_state.is_seen(&stale_id).unwrap(),
@@ -1687,7 +2254,14 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
         "recorded age must reflect the observation age (got {age})"
     );
     assert_eq!(reason, "stale_fallback_past_copy_budget");
-    let boundary_id = SourceTradeId("0xboundary".to_string());
+    assert!(
+        paper_state
+            .no_copy_disposition(&bucket_id("0xfresh", market_b()))
+            .unwrap()
+            .is_none(),
+        "fresh pre-Start refusal is not a stale no-copy"
+    );
+    let boundary_id = bucket_id("0xboundary", market_c());
     assert!(
         paper_state
             .no_copy_disposition(&boundary_id)
@@ -1703,14 +2277,14 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
     );
 }
 
-// ── WS3: disabled flag ⇒ byte-identical legacy admission (rollback posture) ──
+// ── WS3: disabled websocket mode retains REST classification pre-Start ───────
 
 #[tokio::test]
-async fn ws3_disabled_mode_processes_old_rest_trades_unchanged() {
+async fn ws3_disabled_mode_processes_rest_trade_without_financial_write() {
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let now = OffsetDateTime::now_utc();
-    let id = SourceTradeId("0xlegacy".to_string());
+    let id = bucket_id("0xlegacy", market());
     run_trades(
         dir.path(),
         paper_state.clone(),
@@ -1729,19 +2303,19 @@ async fn ws3_disabled_mode_processes_old_rest_trades_unchanged() {
     .await;
     assert_eq!(
         paper_fill_count(dir.path()),
-        1,
-        "legacy path must fill as before #530"
+        0,
+        "pre-Start REST input cannot write a schema-one fill"
     );
     assert!(
         paper_state.no_copy_disposition(&id).unwrap().is_none(),
-        "disabled mode must write no disposition"
+        "disabled websocket mode adds no staleness disposition"
     );
 }
 
-// ── WS4: dual-unhealthy ⇒ the trade is HELD, then admits exactly once ────────
+// ── WS4: acknowledged pre-Start bucket remains financially closed ──────────
 
 #[tokio::test]
-async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
+async fn ws4_acknowledged_bucket_stays_financially_closed() {
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let health = healthy_ws_health();
@@ -1752,11 +2326,8 @@ async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
         h.poll_error_streak = 3;
     }
     let now = OffsetDateTime::now_utc();
-    let id = SourceTradeId("0xblocked".to_string());
+    let id = bucket_id("0xblocked", market());
 
-    // Run the orchestrator concurrently: the blocked trade must be HELD (review
-    // F1 — dropping it would orphan a websocket trade behind the poll cursor),
-    // with no state write while both sources are unhealthy.
     let dir_path = dir.path().to_path_buf();
     let run_state = paper_state.clone();
     let run_health = health.clone();
@@ -1775,31 +2346,28 @@ async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
         )
         .await;
     });
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
         !run.is_finished(),
-        "orchestrator must hold the blocked trade, not drop it"
+        "the acknowledged continuation remains held while both sources are unhealthy"
     );
-    assert_eq!(paper_fill_count(dir.path()), 0, "no fill while blocked");
     assert!(
-        !paper_state.is_seen(&id).unwrap(),
-        "no state write while blocked"
+        paper_state.is_seen(&id).unwrap(),
+        "the bucket commit is durable before its continuation runs"
     );
-
-    // Recovery: one source healthy again -> the HELD trade admits exactly once.
     {
-        let mut h = health.lock().unwrap();
-        h.poll_error_streak = 0;
-        h.poll_last_round_at = Some(OffsetDateTime::now_utc());
+        let mut current = health.lock().unwrap();
+        current.poll_error_streak = 0;
+        current.poll_last_round_at = Some(OffsetDateTime::now_utc());
     }
     tokio::time::timeout(std::time::Duration::from_secs(10), run)
         .await
-        .expect("orchestrator must finish after recovery")
+        .expect("the continuation completes after source recovery")
         .unwrap();
     assert_eq!(
         paper_fill_count(dir.path()),
-        1,
-        "held trade fills exactly once after recovery"
+        0,
+        "acknowledged pre-Start bucket remains financially fail-closed"
     );
     assert!(paper_state.is_seen(&id).unwrap());
 }
@@ -1816,8 +2384,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
     let applied_configuration = pe_service::runtime_config::RuntimeConfig::from_service_config(
         &pe_service::config::ServiceConfig::default(),
     );
-    let frozen = DecisionContinuationV2 {
-        version: 2,
+    let frozen = DecisionContinuationFacts {
         source_trade_id: source_trade_id.clone(),
         semantic_revision: semantic_revision.clone(),
         transaction_hash: "0xpending".to_owned(),
@@ -1888,7 +2455,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
                 semantic_revision,
                 wallet: leader_wallet(),
                 source_epoch,
-                frozen_inputs_json: serde_json::to_string(&frozen).unwrap(),
+                frozen_inputs_json: support::legacy_continuation_v2_json(&frozen),
                 updated_at_unix: 2,
             }],
             fence: None,
@@ -1897,14 +2464,13 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         })
         .unwrap();
 
-    let (_trade_tx, trade_rx) = mpsc::channel(1);
-    let mut first = build_orchestrator(
+    let (mut first, first_control) = build_orchestrator(
         dir.path(),
         paper_state.clone(),
-        trade_rx,
         healthy_ws_health(),
         OrchOpts::ws(vec![market()]),
     );
+    drop(first_control);
     first.resume_pending_before_producers().await.unwrap();
     drop(first);
 
@@ -1923,14 +2489,13 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         Some("stale_activity_ws_past_copy_budget".to_owned())
     );
 
-    let (_trade_tx, trade_rx) = mpsc::channel(1);
-    let mut restarted = build_orchestrator(
+    let (mut restarted, restarted_control) = build_orchestrator(
         dir.path(),
         paper_state.clone(),
-        trade_rx,
         healthy_ws_health(),
         OrchOpts::ws(vec![market()]),
     );
+    drop(restarted_control);
     restarted.resume_pending_before_producers().await.unwrap();
     assert_eq!(leader_long(&paper_state, &market()), Some(1_000_000));
     assert_eq!(paper_state.decision_pending_history().unwrap().len(), 1);

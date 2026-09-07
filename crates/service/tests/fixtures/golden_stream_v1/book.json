@@ -1,0 +1,1 @@
+{"market":"0x4c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ee","asset_id":"11","timestamp":"1800000000100","min_order_size":"5","tick_size":"0.01","neg_risk":false,"bids":[{"price":"0.48","size":"10"}],"asks":[{"price":"0.50","size":"10"},{"price":"0.49","size":"2"}]}

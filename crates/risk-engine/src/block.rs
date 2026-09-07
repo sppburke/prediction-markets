@@ -16,19 +16,17 @@ pub enum RiskBlock {
     FamilyConcentrationExceeded,
     /// Proposed trade + total copy exposure would exceed 2500 bps.
     TotalCopyExposureExceeded,
-    /// On-chain source is not healthy (Degraded or Dead).
-    OnchainSourceUnhealthy,
     /// Intraday PnL has hit or breached the -200 bps drawdown stop.
     IntradayDrawdownStop,
     /// Rolling 7-day PnL has hit or breached the -600 bps drawdown stop.
     Rolling7dDrawdownStop,
-    /// Intraday PnL has hit or breached the -1000 bps absolute kill switch.
+    /// Absolute PnL has hit or breached the -1000 bps kill switch.
     KillSwitchDrawdown,
-    /// Copy latency p95 has exceeded the kill switch threshold (>3000 ms).
+    /// The service-owned copy-latency kill switch is active.
     CopyLatencyKillSwitch,
     /// Proposed trade size exceeds `RiskSnapshot.per_trade_cap_bps` (the resolved
-    /// `PerTradeCap`; production runs `unlimited` = 10 000 bps since #508 — the price-impact
-    /// cap is the sole policy size limit there).
+    /// `PerTradeCap` recorded in the snapshot; the production cap policy is canonical in
+    /// `docs/19-WINNER-FOLLOW-STRATEGY.md`).
     PerTradeSizeExceeded,
     /// Resolver evidence is absent, stale, ambiguous, deferred, or mismatched.
     ResolverNotTradable,

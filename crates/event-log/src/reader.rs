@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use pe_core_types::EventSeq;
 
+use blake3::Hash;
+
 use crate::frame::verify_file_header;
 use crate::scanner::{LogTailBinding, ScanState, ScanStep, Scanner, read_verified_frame};
 use crate::{EventEnvelope, LogError};
@@ -21,10 +23,50 @@ impl Reader {
     pub fn replay(
         path: impl AsRef<Path>,
     ) -> Result<impl Iterator<Item = Result<(EventSeq, EventEnvelope), LogError>>, LogError> {
+        Ok(Self::replay_with_offsets(path)?
+            .map(|item| item.map(|(_byte_offset, sequence, envelope)| (sequence, envelope))))
+    }
+
+    /// Open `path` and return scanner-verified frames with each frame's starting byte offset.
+    #[tracing::instrument(skip_all, fields(path = %path.as_ref().display()))]
+    pub fn replay_with_offsets(
+        path: impl AsRef<Path>,
+    ) -> Result<impl Iterator<Item = Result<(u64, EventSeq, EventEnvelope), LogError>>, LogError>
+    {
         // Verify through physical EOF before exposing frame 0. This prevents a consumer from
         // mutating replay state from a valid prefix before discovering corrupt interior bytes.
         Scanner::verify(path.as_ref())?;
         ReplayIter::open(path.as_ref(), None)
+    }
+
+    /// Read and verify the frame at an already scanner-proven byte offset, returning the byte
+    /// immediately after that frame.
+    ///
+    /// The expected sequence and preceding chain hash bind this isolated read to the verified
+    /// metadata retained by the caller, without rescanning or retaining the rest of a large log.
+    pub fn read_at(
+        path: impl AsRef<Path>,
+        byte_offset: u64,
+        expected_sequence: EventSeq,
+        expected_previous_hash: Hash,
+    ) -> Result<(EventEnvelope, u64), LogError> {
+        let path = path.as_ref();
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        verify_file_header(path, &mut reader)?;
+        reader.seek(SeekFrom::Start(byte_offset))?;
+        let mut state = ScanState::at_frame(expected_sequence, expected_previous_hash, byte_offset);
+        match read_verified_frame(&mut reader, &mut state)? {
+            ScanStep::Frame(envelope) => Ok((envelope, state.physical_tail())),
+            ScanStep::Eof => Err(LogError::Truncated {
+                at: expected_sequence,
+                byte_offset,
+            }),
+            ScanStep::Incomplete(incomplete) => Err(LogError::Truncated {
+                at: incomplete.next_sequence,
+                byte_offset: incomplete.byte_offset,
+            }),
+        }
     }
 
     /// Verify the complete file and report its exact resolved-path/physical-tail binding.
@@ -38,7 +80,8 @@ impl Reader {
         path: impl AsRef<Path>,
         poll_interval: Duration,
     ) -> Result<impl Iterator<Item = Result<(EventSeq, EventEnvelope), LogError>>, LogError> {
-        ReplayIter::open(path.as_ref(), Some(poll_interval))
+        Ok(ReplayIter::open(path.as_ref(), Some(poll_interval))?
+            .map(|item| item.map(|(_byte_offset, sequence, envelope)| (sequence, envelope))))
     }
 }
 
@@ -66,7 +109,7 @@ impl ReplayIter {
 }
 
 impl Iterator for ReplayIter {
-    type Item = Result<(EventSeq, EventEnvelope), LogError>;
+    type Item = Result<(u64, EventSeq, EventEnvelope), LogError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.poisoned {
@@ -78,7 +121,7 @@ impl Iterator for ReplayIter {
             match read_verified_frame(&mut self.reader, &mut self.state) {
                 Ok(ScanStep::Frame(envelope)) => {
                     self.truncation_deadline = None;
-                    return Some(Ok((envelope.seq, envelope)));
+                    return Some(Ok((frame_start, envelope.seq, envelope)));
                 }
                 Ok(ScanStep::Eof) => match self.poll_interval {
                     None => return None,
@@ -109,5 +152,55 @@ impl Iterator for ReplayIter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
+    use time::OffsetDateTime;
+
+    use super::*;
+    use crate::{ContentType, EnvelopeIn, Writer};
+
+    fn envelope(payload: &[u8]) -> EnvelopeIn {
+        EnvelopeIn {
+            source_id: SourceId("reader-offset-test".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// PASS: offset replay identifies each frame start and an isolated read reproduces the exact
+    /// payload while checking its sequence and preceding chain hash.
+    #[test]
+    fn replay_offsets_support_verified_isolated_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("offsets.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let first = writer.append_synced(envelope(b"first")).unwrap();
+        let second = writer.append_synced(envelope(b"second")).unwrap();
+        drop(writer);
+
+        let replayed = Reader::replay_with_offsets(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert!(replayed[0].0 < replayed[1].0);
+        assert_eq!(replayed[0].1, first.sequence);
+        assert_eq!(replayed[1].1, second.sequence);
+
+        let (isolated, frame_end) =
+            Reader::read_at(&path, replayed[1].0, second.sequence, first.this_hash).unwrap();
+        assert_eq!(isolated.payload, b"second");
+        assert_eq!(isolated.this_hash, second.this_hash);
+        assert_eq!(frame_end, std::fs::metadata(&path).unwrap().len());
     }
 }

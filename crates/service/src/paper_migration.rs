@@ -165,8 +165,8 @@ pub fn append_remote_authority_snapshot(
         "positions": positions.iter().map(|position| serde_json::json!({
             "market_id": position.market_id.0,
             "outcome_id": position.outcome_id.0,
-            "long_contracts": position.long_contracts,
-            "short_contracts": position.short_contracts,
+            "long_contracts": position.long.to_decimal().to_string(),
+            "short_contracts": position.short.to_decimal().to_string(),
         })).collect::<Vec<_>>(),
     }))?;
     let mut sink = SourceEventSink::open(source_log_path).map_err(|error| {
@@ -586,7 +586,7 @@ fn append_legacy_input_and_select_roll_forward(
             })
             .context("append and synchronize captured legacy history")?;
         ensure!(
-            appended == sequence,
+            appended.sequence == sequence,
             "legacy-history migration append used an unexpected sequence"
         );
         drop(sink);

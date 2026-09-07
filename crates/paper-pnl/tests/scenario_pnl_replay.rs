@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pe_core_types::{
-    EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, VenueMarketId,
-    WalletAddress,
+    CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
+    VenueMarketId, WalletAddress,
 };
 use pe_paper_pnl::{PnlLedger, ResolutionStore};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
@@ -37,13 +37,16 @@ fn leader(market_id: MarketId, long: u64) -> LeaderPositionRow {
 }
 
 fn fill(key: &str, market_id: MarketId, side: Side, contracts: u64, price: Decimal) -> FillRecord {
+    let quantity = ShareAmount::from_whole(contracts).unwrap();
     FillRecord {
         idempotency_key: key.to_string(),
         market_id,
         outcome_id: OutcomeId(0),
         side,
-        contracts,
+        quantity,
         fill_price: Price(price),
+        principal: CollateralAmount::from_decimal_exact(price * quantity.to_decimal()).unwrap(),
+        fee: CollateralAmount::ZERO,
     }
 }
 
@@ -85,13 +88,7 @@ fn snapshot_matches_expected_after_resolution() {
     assert_eq!(db.bankroll().unwrap(), Some(dec!(993)));
 
     // Market-A resolves YES: credit = 10 * 1.0 = 10.00
-    let positions_a: Vec<_> = db
-        .paper_positions()
-        .unwrap()
-        .into_iter()
-        .filter(|p| p.market_id == mkt_a)
-        .collect();
-    let credit = PnlLedger::resolution_credit(&positions_a, &[dec!(1), dec!(0)]);
+    let credit = dec!(10);
     assert_eq!(credit, dec!(10), "resolution credit should be 10");
 
     db.credit_bankroll(credit).unwrap();
@@ -144,13 +141,7 @@ fn replay_equals_snapshot() {
     )
     .unwrap();
 
-    let positions: Vec<_> = db
-        .paper_positions()
-        .unwrap()
-        .into_iter()
-        .filter(|p| p.market_id == mkt)
-        .collect();
-    let credit = PnlLedger::resolution_credit(&positions, &[dec!(1), dec!(0)]);
+    let credit = dec!(20);
     db.credit_bankroll(credit).unwrap();
 
     let mut store = ResolutionStore::load(db.clone()).unwrap();

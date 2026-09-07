@@ -30,26 +30,22 @@ use std::sync::Arc;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, classify_trade};
 use pe_core_types::{
     BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
-    ReconstructionQuality, Side, SourceId, SourceTimestamp, SourceTradeId, VenueId, VenueMarketId,
+    ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, VenueId, VenueMarketId,
     WalletAddress,
 };
 use pe_event_log::Writer;
-use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
-use pe_risk_engine::{ConcentrationCaps, RiskSnapshot, snapshot::TradingMode};
+use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
 use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::runtime_config::FillMode;
-use pe_source_core::SourceStatus;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -57,6 +53,9 @@ use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
+
+mod support;
+use support::send_trade_bucket;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -102,12 +101,9 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
     }
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
+fn make_writer(dir: &TempDir) -> Writer {
     let paper_path = dir.path().join("paper.log");
-    let paper_writer = Writer::open(&paper_path).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-
-    ExecutionDispatcher::paper_only(paper_executor)
+    Writer::open(&paper_path).unwrap()
 }
 
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
@@ -123,10 +119,6 @@ fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
     state
 }
 
-fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
-    mpsc::channel(1).1
-}
-
 /// Copy-entry gate disabled for lifecycle tests: fail-open (no band since #339).
 /// Paired with an empty history map so every first Entry is admitted.
 fn disabled_entry_gate() -> CopyEntryGateConfig {
@@ -140,8 +132,8 @@ fn empty_mid_cache() -> MidPriceCache<FixtureFetcher> {
 }
 
 /// A risk snapshot with no exposure, healthy source, and headroom under every cap,
-/// so the risk gate approves. `proposed_trade_bps`/`per_trade_cap_bps`/`trading_mode`
-/// are overwritten by `evaluate()` before the gate runs.
+/// so the risk gate approves. `proposed_trade_bps`/`per_trade_cap_bps` are overwritten
+/// by `evaluate()` before the gate runs.
 fn clean_snapshot() -> RiskSnapshot {
     RiskSnapshot {
         leader_exposure_bps: BasisPoints(0),
@@ -150,9 +142,8 @@ fn clean_snapshot() -> RiskSnapshot {
         total_copy_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        onchain_source_status: SourceStatus::Healthy,
-        copy_latency_p95_ms: 500,
-        trading_mode: TradingMode::LiveTiny,
+        absolute_pnl_bps: BasisPoints(0),
+        copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
@@ -171,14 +162,9 @@ async fn scenario_e2e_clean_exit() {
     let dir = TempDir::new().unwrap();
     let wallet = wallet_a();
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(16);
-
-    // Send one trade then close the channel so the orchestrator exits cleanly.
-    trade_tx.send(make_trade(wallet)).await.unwrap();
-    drop(trade_tx);
+    let (control_tx, control_rx) = mpsc::channel(16);
 
     let orch = Orchestrator::new(
-        trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -191,23 +177,19 @@ async fn scenario_e2e_clean_exit() {
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
             // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         empty_mid_cache(),
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
@@ -215,8 +197,10 @@ async fn scenario_e2e_clean_exit() {
     )
     .unwrap();
 
-    // Runs until both channels are closed (shutdown future never resolves).
-    orch.run(std::future::pending::<()>()).await;
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+    send_trade_bucket(&control_tx, make_trade(wallet)).await;
+    drop(control_tx);
+    run.await.unwrap();
 
     // Assert paper.log was created (executor initialised) and orchestrator exited cleanly.
     let log_path = dir.path().join("paper.log");
@@ -239,19 +223,10 @@ async fn scenario_graceful_shutdown() {
     let dir = TempDir::new().unwrap();
     let wallet = wallet_a();
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(16);
-
-    // Pre-fill channel with 2 trades before the orchestrator starts.
-    trade_tx.send(make_trade(wallet)).await.unwrap();
-    trade_tx.send(make_trade(wallet)).await.unwrap();
-    // Senders deliberately kept alive — simulates producers still running at shutdown.
-
-    // Shutdown resolves immediately.
+    let (control_tx, control_rx) = mpsc::channel(16);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    shutdown_tx.send(()).unwrap();
 
     let orch = Orchestrator::new(
-        trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
             activity_ws_enabled: false,
@@ -264,23 +239,19 @@ async fn scenario_graceful_shutdown() {
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
-            paper_fill_haircut_bps: 500,
-            paper_fill_slippage_bps: 100,
             // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
-            fill_mode: FillMode::LeaderHaircut,
             price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_dispatcher(&dir),
+        make_writer(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
         new_shared_health(false),
-        MarketEndCache::new(String::new()),
         empty_mid_cache(),
-        dead_reseed_rx(),
+        control_rx,
         None,
         None,
         None,
@@ -288,10 +259,14 @@ async fn scenario_graceful_shutdown() {
     )
     .unwrap();
 
-    orch.run(async {
+    let run = tokio::spawn(orch.run_coordinated(async {
         shutdown_rx.await.ok();
-    })
-    .await;
+    }));
+    send_trade_bucket(&control_tx, make_trade(wallet)).await;
+    send_trade_bucket(&control_tx, make_trade(wallet)).await;
+    shutdown_tx.send(()).unwrap();
+    drop(control_tx);
+    run.await.unwrap().unwrap();
 
     // Executor was initialised; orchestrator exited cleanly without hanging.
     let log_path = dir.path().join("paper.log");
@@ -300,8 +275,6 @@ async fn scenario_graceful_shutdown() {
         len >= 5,
         "paper.log should have at least the 5-byte header; got {len} bytes"
     );
-
-    drop(trade_tx);
 }
 
 // ── Scenario 3: normal_leader_follow_order_intent_equivalence ─────────────────

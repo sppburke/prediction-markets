@@ -404,6 +404,7 @@ pub struct ActivityAssetMapping {
     by_asset: HashMap<PolymarketTokenId, ActivityAssetIdentity>,
     unresolved: BTreeMap<PolymarketTokenId, Vec<ActivityAssetIdentity>>,
     classification_by_asset: HashMap<PolymarketTokenId, Option<PositionClassification>>,
+    journal_verified_assets: HashSet<PolymarketTokenId>,
 }
 
 impl ActivityAssetMapping {
@@ -501,12 +502,67 @@ impl ActivityAssetMapping {
             by_asset,
             unresolved,
             classification_by_asset,
+            journal_verified_assets: HashSet::new(),
         }
     }
 
     #[must_use]
     pub fn identity(&self, asset: &PolymarketTokenId) -> Option<&ActivityAssetIdentity> {
         self.by_asset.get(asset)
+    }
+
+    /// Insert one ordinary identity already verified by a journaled live-admission response.
+    ///
+    /// This is deliberately narrower than [`Self::from_rows`]: it cannot manufacture combo
+    /// classification and rejects both token reuse and condition/outcome reuse with different
+    /// identities. Repeating the identical durable identity is idempotent.
+    pub fn insert_verified_ordinary(
+        &mut self,
+        asset: PolymarketTokenId,
+        condition_id: PolymarketConditionId,
+        outcome: OutcomeId,
+    ) -> Result<(), PositionReadError> {
+        if let Some(existing) = self.by_asset.get(&asset) {
+            let identical = existing.condition_id == condition_id
+                && existing.outcome == outcome
+                && existing.classification == PositionClassification::Ordinary
+                && existing.verified;
+            if identical {
+                self.journal_verified_assets.insert(asset);
+                return Ok(());
+            }
+            return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
+        }
+        let outcome_is_reused = self.by_asset.iter().any(|(existing_asset, identity)| {
+            existing_asset != &asset
+                && identity.condition_id == condition_id
+                && identity.outcome == outcome
+        }) || self.unresolved.iter().any(|(existing_asset, identities)| {
+            existing_asset != &asset
+                && identities.iter().any(|identity| {
+                    identity.condition_id == condition_id && identity.outcome == outcome
+                })
+        });
+        if outcome_is_reused {
+            return Err(PositionReadError::ConflictingOutcomeMapping {
+                condition_id: condition_id.0,
+                outcome: outcome.0,
+            });
+        }
+        self.classification_by_asset
+            .insert(asset.clone(), Some(PositionClassification::Ordinary));
+        self.unresolved.remove(&asset);
+        self.journal_verified_assets.insert(asset.clone());
+        self.by_asset.insert(
+            asset,
+            ActivityAssetIdentity {
+                condition_id,
+                outcome,
+                classification: PositionClassification::Ordinary,
+                verified: true,
+            },
+        );
+        Ok(())
     }
 
     /// Every activity-backed token, whether its stamped identity is consistent or unresolved.
@@ -539,6 +595,19 @@ impl ActivityAssetMapping {
         asset: &PolymarketTokenId,
         verified: &VerifiedTokenIdentity,
     ) -> Result<(), PositionReadError> {
+        if self.journal_verified_assets.contains(asset) {
+            return match self.by_asset.get(asset) {
+                Some(existing)
+                    if existing.condition_id == verified.condition_id
+                        && existing.outcome == verified.outcome =>
+                {
+                    Ok(())
+                }
+                Some(_) | None => Err(PositionReadError::ConflictingActivityMapping {
+                    asset: asset.0.clone(),
+                }),
+            };
+        }
         let classification = match self.classification_by_asset.get(asset) {
             Some(Some(classification)) => *classification,
             Some(None) => {
@@ -575,6 +644,10 @@ pub struct CanonicalPosition {
     pub outcome: OutcomeId,
     pub classification: PositionClassification,
     pub size: ShareAmount,
+    /// Partition returned by the complete two-part read.
+    pub redeemable: bool,
+    /// Venue redemption adapter selector retained from the same position row.
+    pub neg_risk: bool,
 }
 
 /// One independently complete union of the two explicit position partitions.
@@ -663,6 +736,8 @@ struct RawPosition<'a> {
     condition_id: Option<&'a RawValue>,
     outcome_index: Option<u16>,
     size: ExactDecimal,
+    #[serde(rename = "negativeRisk")]
+    neg_risk: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,9 +757,13 @@ impl<'de> Deserialize<'de> for ExactDecimal {
     }
 }
 
-/// Fetch and union independently complete `redeemable=false` and `true`
-/// partitions. Partition layout and page provenance are excluded from semantic
-/// equality; duplicate assets across either walk reject the read.
+/// Fetch and union independently complete `redeemable=false` and `true` partitions.
+///
+/// Every accepted row must carry a boolean `negativeRisk`; omission returns
+/// [`PositionReadError::MissingField`] and produces no proof. Partition membership and
+/// `negativeRisk` are semantic because redemption selection and submission consume them.
+/// Page layout, response presentation, and page provenance are non-semantic; duplicate assets
+/// across either walk reject the read.
 pub async fn fetch_complete_positions(
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
@@ -743,11 +822,11 @@ pub async fn fetch_complete_positions(
                 }
                 let asset =
                     PolymarketTokenId(required_raw_string(decoded.asset, row_index, "asset")?);
-                let _position_condition_id = PolymarketConditionId(
+                let position_condition_id = PolymarketConditionId(
                     required_raw_string(decoded.condition_id, row_index, "conditionId")?
                         .to_ascii_lowercase(),
                 );
-                let _position_outcome = OutcomeId(decoded.outcome_index.ok_or(
+                let position_outcome = OutcomeId(decoded.outcome_index.ok_or(
                     PositionReadError::MissingField {
                         row_index,
                         field: "outcomeIndex",
@@ -771,6 +850,12 @@ pub async fn fetch_complete_positions(
                         reason: "position asset unverified by venue metadata".to_owned(),
                     });
                 }
+                if mapping.journal_verified_assets.contains(&asset)
+                    && (position_condition_id != identity.condition_id
+                        || position_outcome != identity.outcome)
+                {
+                    return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
+                }
                 let condition_id = identity.condition_id.clone();
                 let outcome = identity.outcome;
                 let size = ShareAmount::from_decimal_exact(decoded.size.0).map_err(|error| {
@@ -788,6 +873,11 @@ pub async fn fetch_complete_positions(
                     outcome,
                     classification: identity.classification,
                     size,
+                    redeemable: partition == PositionPartition::Redeemable,
+                    neg_risk: decoded.neg_risk.ok_or(PositionReadError::MissingField {
+                        row_index,
+                        field: "negativeRisk",
+                    })?,
                 };
                 if positions.insert(asset_key.clone(), position).is_some() {
                     return Err(PositionReadError::DuplicateAsset { asset: asset_key });
@@ -869,6 +959,8 @@ fn position_semantic_hash(positions: &[CanonicalPosition]) -> Result<String, Pos
             },
         )?;
         proof_component(&mut hasher, &position.size.atomic().to_be_bytes())?;
+        proof_component(&mut hasher, &[u8::from(position.redeemable)])?;
+        proof_component(&mut hasher, &[u8::from(position.neg_risk)])?;
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -895,18 +987,140 @@ fn page_evidence(
     raw: &[u8],
     context: PageEvidenceContext<'_>,
 ) -> Result<ReconciliationPageEvidence, serde_json::Error> {
-    let value: serde_json::Value = serde_json::from_slice(raw)?;
-    let canonical = serde_json::to_vec(&value)?;
     Ok(ReconciliationPageEvidence {
         request_url: context.request_url.to_owned(),
         bounds: context.bounds,
         partition: context.partition,
         offset: context.offset,
         row_count: context.row_count,
-        canonical_page_hash: blake3::hash(&canonical).to_hex().to_string(),
+        canonical_page_hash: canonical_page_hash(raw)?,
         raw_page_hash: blake3::hash(raw).to_hex().to_string(),
         received_at: context.received_at,
         schema_version: context.schema_version,
         parser_version: context.parser_version,
     })
+}
+
+/// Hash one JSON page using the reconciliation producer's canonical representation.
+pub fn canonical_page_hash(raw: &[u8]) -> Result<String, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(raw)?;
+    let canonical = serde_json::to_vec(&value)?;
+    Ok(blake3::hash(&canonical).to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    struct PositionFixture;
+
+    impl ReconciliationFetcher for PositionFixture {
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(serde_json::to_vec(&serde_json::json!([{
+                    "proxyWallet": "0x1111111111111111111111111111111111111111",
+                    "asset": "asset-1",
+                    "conditionId": format!("0x{}", "88".repeat(32)),
+                    "outcomeIndex": 0,
+                    "size": "1.25",
+                    "negativeRisk": false
+                }]))
+                .unwrap())
+            })
+        }
+    }
+
+    /// PASS: exact verified ordinary identities converge and every conflicting reuse is rejected.
+    #[test]
+    fn verified_ordinary_inserter_is_narrow_and_conflict_checked() {
+        let asset = PolymarketTokenId("asset-1".to_owned());
+        let condition = PolymarketConditionId("condition-1".to_owned());
+        let mut mapping = ActivityAssetMapping::from_rows(&[]);
+        mapping
+            .insert_verified_ordinary(asset.clone(), condition.clone(), OutcomeId(0))
+            .unwrap();
+        mapping
+            .insert_verified_ordinary(asset.clone(), condition.clone(), OutcomeId(0))
+            .unwrap();
+        assert!(mapping.identity(&asset).is_some_and(|identity| {
+            identity.verified && identity.classification == PositionClassification::Ordinary
+        }));
+        assert!(matches!(
+            mapping.insert_verified_ordinary(asset.clone(), condition.clone(), OutcomeId(1)),
+            Err(PositionReadError::ConflictingActivityMapping { .. })
+        ));
+        assert!(matches!(
+            mapping.insert_verified_ordinary(
+                PolymarketTokenId("asset-2".to_owned()),
+                condition,
+                OutcomeId(0)
+            ),
+            Err(PositionReadError::ConflictingOutcomeMapping { .. })
+        ));
+        assert!(matches!(
+            mapping.apply_verified(
+                &asset,
+                &VerifiedTokenIdentity {
+                    condition_id: PolymarketConditionId("condition-other".to_owned()),
+                    outcome: OutcomeId(0),
+                    evidence_hash: "gamma".to_owned(),
+                }
+            ),
+            Err(PositionReadError::ConflictingActivityMapping { .. })
+        ));
+    }
+
+    /// PASS: verified insertion rejects condition/outcome reuse still held by unresolved assets.
+    #[test]
+    fn verified_ordinary_inserter_checks_unresolved_reverse_identity() {
+        let condition = PolymarketConditionId("condition-1".to_owned());
+        let unresolved_asset = PolymarketTokenId("asset-unresolved".to_owned());
+        let mut mapping = ActivityAssetMapping {
+            by_asset: HashMap::new(),
+            unresolved: BTreeMap::from([(
+                unresolved_asset,
+                vec![ActivityAssetIdentity {
+                    condition_id: condition.clone(),
+                    outcome: OutcomeId(0),
+                    classification: PositionClassification::Ordinary,
+                    verified: false,
+                }],
+            )]),
+            classification_by_asset: HashMap::new(),
+            journal_verified_assets: HashSet::new(),
+        };
+
+        assert!(matches!(
+            mapping.insert_verified_ordinary(
+                PolymarketTokenId("asset-new".to_owned()),
+                condition,
+                OutcomeId(0),
+            ),
+            Err(PositionReadError::ConflictingOutcomeMapping { .. })
+        ));
+    }
+
+    /// PASS: a complete-position row cannot override a journal-verified condition/token mapping.
+    #[tokio::test]
+    async fn journal_verified_position_stamp_must_match_exactly() {
+        let wallet = WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap();
+        let mut mapping = ActivityAssetMapping::from_rows(&[]);
+        mapping
+            .insert_verified_ordinary(
+                PolymarketTokenId("asset-1".to_owned()),
+                PolymarketConditionId(format!("0x{}", "77".repeat(32))),
+                OutcomeId(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            fetch_complete_positions(&PositionFixture, "https://example.test", wallet, &mapping)
+                .await,
+            Err(PositionReadError::ConflictingActivityMapping { .. })
+        ));
+    }
 }

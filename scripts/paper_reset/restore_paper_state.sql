@@ -21,54 +21,66 @@ delete from paper_positions;
 delete from paper_bankroll;
 delete from fill_market_snapshots;
 
-insert into paper_fills (
-  idempotency_key, leader_wallet, source_trade_id, market_id, outcome_id,
-  side, contracts, fill_price, entry_unix, event_seq, inserted_at
-)
-select idempotency_key, leader_wallet, source_trade_id, market_id, outcome_id,
-       side, contracts, fill_price, entry_unix, event_seq, inserted_at
-  from paper_fills_archive where activation_id = :'activation_id';
-
-insert into settled_markets (
-  market_id, outcome_prices, credit_applied, settled_at_unix, inserted_at
-)
-select market_id, outcome_prices, credit_applied, settled_at_unix, inserted_at
-  from settled_markets_archive where activation_id = :'activation_id';
-
-insert into paper_positions (
-  market_id, outcome_id, long_contracts, short_contracts, updated_at
-)
-select market_id, outcome_id, long_contracts, short_contracts, updated_at
-  from paper_positions_archive where activation_id = :'activation_id';
-
-insert into paper_bankroll (id, bankroll_str, updated_at)
-select id, bankroll_str, updated_at
-  from paper_bankroll_archive where activation_id = :'activation_id';
-
-insert into fill_market_snapshots (
-  idempotency_key, liquidity, volume, absorbable_usd_100bps,
-  ask_levels_json, captured_at_unix, inserted_at
-)
-select idempotency_key, liquidity, volume, absorbable_usd_100bps,
-       ask_levels_json, captured_at_unix, inserted_at
-  from fill_market_snapshots_archive where activation_id = :'activation_id';
-
 select set_config('pe.activation_id', :'activation_id', true);
 do $$
-declare activation text := current_setting('pe.activation_id');
+declare
+  activation text := current_setting('pe.activation_id');
+  t text;
+  arch text;
+  collist text;
+  missing_column text;
+  live_n bigint;
+  archived_n bigint;
+  differs boolean;
+  tables constant text[] := array[
+    'paper_fills', 'settled_markets', 'paper_positions',
+    'paper_bankroll', 'fill_market_snapshots'
+  ];
 begin
-  if (select count(*) from paper_fills) <>
-       (select count(*) from paper_fills_archive where activation_id = activation)
-     or (select count(*) from settled_markets) <>
-       (select count(*) from settled_markets_archive where activation_id = activation)
-     or (select count(*) from paper_positions) <>
-       (select count(*) from paper_positions_archive where activation_id = activation)
-     or (select count(*) from paper_bankroll) <>
-       (select count(*) from paper_bankroll_archive where activation_id = activation)
-     or (select count(*) from fill_market_snapshots) <>
-       (select count(*) from fill_market_snapshots_archive where activation_id = activation) then
-    raise exception 'restored live counts do not match activation % archive counts', activation;
-  end if;
+  foreach t in array tables loop
+    arch := t || '_archive';
+    select a.attname
+      into missing_column
+      from pg_attribute a
+     where a.attrelid = t::regclass and a.attnum > 0 and not a.attisdropped
+       and not exists (
+         select 1
+           from pg_attribute archived
+          where archived.attrelid = arch::regclass
+            and archived.attnum > 0 and not archived.attisdropped
+            and archived.attname = a.attname
+       )
+     order by a.attnum
+     limit 1;
+    if missing_column is not null then
+      raise exception 'archive % lacks live column %', arch, missing_column;
+    end if;
+    select string_agg(format('%I', a.attname), ', ' order by a.attnum)
+      into collist
+      from pg_attribute a
+     where a.attrelid = t::regclass and a.attnum > 0 and not a.attisdropped;
+    execute format(
+      'insert into %I (%s) select %s from %I where activation_id = $1',
+      t, collist, collist, arch
+    ) using activation;
+    execute format('select count(*) from %I', t) into live_n;
+    execute format('select count(*) from %I where activation_id = $1', arch)
+      into archived_n using activation;
+    if live_n <> archived_n then
+      raise exception 'restored % count % does not match activation % archive count %',
+        t, live_n, activation, archived_n;
+    end if;
+    execute format(
+      'select exists ((select %1$s from %2$I) except all '
+      '(select %1$s from %3$I where activation_id = $1)) or exists '
+      '((select %1$s from %3$I where activation_id = $1) except all '
+      '(select %1$s from %2$I))',
+      collist, t, arch
+    ) into differs using activation;
+    if differs then
+      raise exception 'restored % differs from activation % archive', t, activation;
+    end if;
+  end loop;
   if (select count(*) from paper_bankroll) <> 1 then
     raise exception 'restored activation % must contain exactly one bankroll row', activation;
   end if;

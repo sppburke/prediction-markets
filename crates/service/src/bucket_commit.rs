@@ -4,16 +4,18 @@
 //! reaches paper-state in one transaction. Lexical `g2:` order is used only to
 //! make storage/replay output canonical; it never selects a causal winner.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Display;
 use std::sync::Arc;
 
-use pe_copy_signal_engine::{
-    IncomingTrade, PositionState, SignalConfig, TradeProvenance, classify_leader_action,
-};
+use pe_copy_signal_engine::{IncomingTrade, PositionState, SignalConfig, TradeProvenance};
 use pe_core_types::{
     LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, Probability, ProbabilityPpm,
-    ReconstructionQuality, ShareAmount, Side, SourceTradeId, WalletAddress,
+    ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
+    WalletAddress,
 };
+use pe_event_log::{AppendReceipt, ContentType};
+use pe_execution_core::ObservationEvidence;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, ActivityGroupState, AnchorInstallRecord,
     DecisionPendingRecord, DecisionPendingRow, EntryGateResultRecord, LeaderPositionRow,
@@ -22,15 +24,21 @@ use pe_paper_state::{
 };
 use pe_position_ledger::{
     AppliedEffect, LedgerEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation,
-    PositionLedger, WalletFenceCause,
+    PositionLedger, SecondVerdict, TradeDecision, WalletFenceCause, classify_complete_second,
 };
-use pe_source_polymarket_public::ActivityAggregate;
+use pe_source_polymarket_public::{
+    ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
+    ActivityParseContext, ActivityTransport, PolymarketEndpoint, RECONCILIATION_PAGE_LIMIT,
+    ReconciliationPageEvidence, aggregate_activity_rows, canonical_page_hash,
+    parse_activity_response, parse_activity_trade_observation,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::position_seeder::{AnchorInstall, ledger_capture};
+use crate::risk_inputs::SourceReceiptIndex;
 use crate::runtime_config::RuntimeConfig;
 
 /// Decision inputs already read before the atomic bucket commit.
@@ -38,6 +46,11 @@ use crate::runtime_config::RuntimeConfig;
 pub struct BucketDecisionContext {
     pub applied_configuration: RuntimeConfig,
     pub decision_inputs_json: String,
+    /// Receipt-bearing page occurrences are frozen only in continuation V3. They stay out of
+    /// `decision_inputs`, which owns the logical read proof rather than source-log identities.
+    pub page_occurrences: Vec<PageOccurrence>,
+    /// Lowest websocket receipt per admitted group; frozen only in continuation V3.
+    pub observed_source_receipts: HashMap<SourceTradeId, AppendReceipt>,
     pub reconstruction_quality: ReconstructionQuality,
     pub signal_config: SignalConfig,
     pub copy_eligible: bool,
@@ -83,12 +96,11 @@ pub struct FrozenDecisionBasis {
     pub bankroll: Decimal,
 }
 
-/// Versioned, self-contained continuation frozen by the bucket transaction.
+/// Receipt-free continuation facts frozen by the bucket transaction.
 /// Inputs read after this boundary are appended to paper/source logs and the
 /// terminal `decision_pending` transition; offline replay never executes it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DecisionContinuationV2 {
-    pub version: u16,
+pub struct DecisionContinuationFacts {
     pub source_trade_id: SourceTradeId,
     pub semantic_revision: String,
     pub transaction_hash: String,
@@ -110,6 +122,542 @@ pub struct DecisionContinuationV2 {
     pub decision_inputs: Value,
 }
 
+/// Private compatibility decoder for durable version-two continuation rows.
+#[derive(Debug, Deserialize)]
+struct DecisionContinuationV2Wire {
+    version: u16,
+    #[serde(flatten)]
+    facts: DecisionContinuationFacts,
+}
+
+/// One occurrence of a fixed-end activity page and the receipt assigned by the source log.
+/// Repeated request URLs and payload hashes remain distinct entries (#545).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageOccurrence {
+    pub request_url: String,
+    pub raw_hash: String,
+    pub receipt: AppendReceipt,
+}
+
+/// Durable receipt-bearing successor and runtime owner of a frozen continuation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionContinuationV3 {
+    version: u16,
+    #[serde(flatten)]
+    pub facts: DecisionContinuationFacts,
+    pub observed_source_receipt: Option<AppendReceipt>,
+    pub page_occurrences: Vec<PageOccurrence>,
+}
+
+/// One source-log activity page resolved by its frozen V3 receipt.
+pub(crate) struct CompleteActivityPage {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) observed_at: SourceTimestamp,
+    pub(crate) received_at: ReceivedAt,
+    pub(crate) source_id: String,
+    pub(crate) schema_version: u32,
+    pub(crate) parser_version: u32,
+    pub(crate) content_type: ContentType,
+}
+
+/// Fail-closed error from the shared complete-read reconstruction owner.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CompleteActivityReadError(String);
+
+fn complete_activity_read_error(message: impl Into<String>) -> CompleteActivityReadError {
+    CompleteActivityReadError(message.into())
+}
+
+#[derive(Deserialize)]
+struct CompleteActivityReadWire {
+    fixed_end: Option<i64>,
+    pages: Option<Vec<ReconciliationPageEvidence>>,
+}
+
+struct CompleteActivitySegment {
+    rows: Vec<pe_source_polymarket_public::NormalizedActivity>,
+    children: Vec<(Option<i64>, i64)>,
+}
+
+impl DecisionContinuationV3 {
+    pub(crate) fn new(
+        facts: DecisionContinuationFacts,
+        observed_source_receipt: Option<AppendReceipt>,
+        page_occurrences: Vec<PageOccurrence>,
+    ) -> Self {
+        Self {
+            version: 3,
+            facts,
+            observed_source_receipt,
+            page_occurrences,
+        }
+    }
+
+    /// Greatest synchronized activity-page receipt in this complete read.
+    #[must_use]
+    pub fn complete_bound(&self) -> Option<AppendReceipt> {
+        self.page_occurrences
+            .iter()
+            .map(|page| page.receipt)
+            .max_by_key(|receipt| receipt.sequence)
+    }
+
+    /// Earliest complete observation and its envelope receive time. Legacy V2 rows have no
+    /// receipt evidence and return `None`.
+    #[must_use]
+    fn observation_at(&self, observed_unix_ms: i64) -> Option<ObservationEvidence> {
+        let complete_bound_receipt = self.complete_bound()?;
+        let (source_receipt, provenance) = match self.observed_source_receipt {
+            Some(websocket) if websocket.sequence < complete_bound_receipt.sequence => {
+                (websocket, "activity_ws")
+            }
+            Some(websocket) if websocket.sequence == complete_bound_receipt.sequence => {
+                if websocket.this_hash != complete_bound_receipt.this_hash {
+                    return None;
+                }
+                (websocket, "activity_ws")
+            }
+            _ => (complete_bound_receipt, "rest_poll"),
+        };
+        Some(ObservationEvidence {
+            source_receipt,
+            complete_bound_receipt,
+            observed_unix_ms,
+            provenance: provenance.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn observation_receipt(&self) -> Option<AppendReceipt> {
+        let complete_bound = self.complete_bound()?;
+        match self.observed_source_receipt {
+            Some(websocket) if websocket.sequence < complete_bound.sequence => Some(websocket),
+            Some(websocket) if websocket.sequence == complete_bound.sequence => {
+                (websocket.this_hash == complete_bound.this_hash).then_some(websocket)
+            }
+            _ => Some(complete_bound),
+        }
+    }
+
+    #[must_use]
+    pub fn page_occurrences(&self) -> &[PageOccurrence] {
+        &self.page_occurrences
+    }
+
+    /// Reconstruct one frozen fixed-end activity read from its exact receipt occurrences.
+    ///
+    /// Page evidence is joined with multiplicity, every retained payload is parsed and checked,
+    /// and saturated parent segments contribute no production aggregates. Only complete leaves of
+    /// the validated split graph are aggregated, matching the production reconciliation reader.
+    pub(crate) fn reconstruct_complete_activity_read<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<Vec<ActivityAggregate>, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let wire: CompleteActivityReadWire =
+            serde_json::from_value(self.facts.decision_inputs.clone()).map_err(|error| {
+                complete_activity_read_error(format!(
+                    "decision complete activity read is invalid: {error}"
+                ))
+            })?;
+        if wire.fixed_end.is_some() != wire.pages.is_some() {
+            return Err(complete_activity_read_error(
+                "decision complete activity read proof is partial",
+            ));
+        }
+        let rows = match (wire.fixed_end, wire.pages.as_deref()) {
+            (Some(fixed_end), Some(pages)) => {
+                self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?
+            }
+            (None, None) => {
+                return Err(complete_activity_read_error(
+                    "decision continuation is missing its complete activity read proof",
+                ));
+            }
+            _ => {
+                return Err(complete_activity_read_error(
+                    "decision complete activity read proof is partial",
+                ));
+            }
+        };
+        aggregate_activity_rows(&rows).map_err(|error| {
+            complete_activity_read_error(format!(
+                "complete activity read aggregate failed: {error}"
+            ))
+        })
+    }
+
+    fn reconstruct_rich_activity_read<L, E>(
+        &self,
+        fixed_end: i64,
+        pages: &[ReconciliationPageEvidence],
+        lookup: &mut L,
+    ) -> Result<Vec<pe_source_polymarket_public::NormalizedActivity>, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let joined = joined_read_pages(&self.page_occurrences, pages)?;
+        let mut grouped_pages = BTreeMap::<
+            (Option<i64>, i64),
+            Vec<(&PageOccurrence, &ReconciliationPageEvidence)>,
+        >::new();
+        for (occurrence, page) in joined {
+            let bounds = page.bounds.ok_or_else(|| {
+                complete_activity_read_error("complete activity read page has no activity bounds")
+            })?;
+            if page.partition.is_some()
+                || page.schema_version != ACTIVITY_SCHEMA_VERSION
+                || page.parser_version != ACTIVITY_PARSER_VERSION
+                || page.row_count > RECONCILIATION_PAGE_LIMIT
+                || page.offset > ACTIVITY_MAX_OFFSET
+                || bounds.end > fixed_end
+            {
+                return Err(complete_activity_read_error(
+                    "complete activity read page evidence is invalid",
+                ));
+            }
+            let base_url = occurrence
+                .request_url
+                .split_once("/activity?")
+                .map(|(base_url, _)| base_url)
+                .filter(|base_url| !base_url.is_empty())
+                .ok_or_else(|| {
+                    complete_activity_read_error(
+                        "complete activity read page request URL is invalid",
+                    )
+                })?;
+            let expected_url = PolymarketEndpoint::UserPositionActivityPage {
+                user: self.facts.wallet.to_string(),
+                end: bounds.end,
+                start: bounds.start.map(|start| start.saturating_add(1)),
+                offset: page.offset,
+            }
+            .url(base_url);
+            if occurrence.request_url != expected_url {
+                return Err(complete_activity_read_error(
+                    "complete activity read page request URL differs from its source contract",
+                ));
+            }
+            grouped_pages
+                .entry((bounds.start, bounds.end))
+                .or_default()
+                .push((occurrence, page));
+        }
+        if grouped_pages.keys().map(|(_, end)| *end).max() != Some(fixed_end) {
+            return Err(complete_activity_read_error(
+                "complete activity read does not reach its fixed end",
+            ));
+        }
+
+        let mut segments = BTreeMap::new();
+        for ((start, end), mut pages) in grouped_pages {
+            pages.sort_by_key(|(_, page)| page.offset);
+            let page_count = u32::try_from(pages.len()).map_err(|_| {
+                complete_activity_read_error("complete activity read page count overflow")
+            })?;
+            for (index, (_, page)) in pages.iter().enumerate() {
+                let index = u32::try_from(index).map_err(|_| {
+                    complete_activity_read_error("complete activity read page count overflow")
+                })?;
+                if page.offset != index.saturating_mul(RECONCILIATION_PAGE_LIMIT)
+                    || (index + 1 < page_count && page.row_count != RECONCILIATION_PAGE_LIMIT)
+                {
+                    return Err(complete_activity_read_error(
+                        "complete activity read page offsets are incomplete",
+                    ));
+                }
+            }
+            let Some((_, terminal)) = pages.last() else {
+                return Err(complete_activity_read_error(
+                    "complete activity read contains an empty segment",
+                ));
+            };
+            let saturated = terminal.offset == ACTIVITY_MAX_OFFSET
+                && terminal.row_count == RECONCILIATION_PAGE_LIMIT;
+            if terminal.row_count == RECONCILIATION_PAGE_LIMIT && !saturated {
+                return Err(complete_activity_read_error(
+                    "complete activity read segment has no terminal page",
+                ));
+            }
+            let mut segment_rows = Vec::new();
+            for (occurrence, page) in pages {
+                let source = complete_activity_page(occurrence, lookup)?;
+                let actual_canonical_hash =
+                    canonical_page_hash(&source.payload).map_err(|error| {
+                        complete_activity_read_error(format!(
+                            "complete activity read canonical page hash failed: {error}"
+                        ))
+                    })?;
+                if actual_canonical_hash != page.canonical_page_hash {
+                    return Err(complete_activity_read_error(
+                        "complete activity read canonical page hash differs",
+                    ));
+                }
+                let window = parse_complete_activity_page(
+                    &source,
+                    self.facts.wallet,
+                    "complete activity read page parse failed",
+                )?;
+                if u32::try_from(window.rows.len()).ok() != Some(page.row_count)
+                    || window.rows.iter().any(|row| {
+                        let timestamp = row.source_time.0.unix_timestamp();
+                        timestamp > end || start.is_some_and(|start| timestamp <= start)
+                    })
+                {
+                    return Err(complete_activity_read_error(
+                        "complete activity read page differs from its bounds/count",
+                    ));
+                }
+                segment_rows.extend(window.rows);
+            }
+
+            let children = if saturated {
+                let boundary = segment_rows
+                    .iter()
+                    .map(|row| row.source_time.0.unix_timestamp())
+                    .min()
+                    .ok_or_else(|| {
+                        complete_activity_read_error(
+                            "saturated complete activity read segment has no rows",
+                        )
+                    })?;
+                let terminal_start = boundary.checked_sub(1).ok_or_else(|| {
+                    complete_activity_read_error("complete activity read split boundary underflow")
+                })?;
+                if (start.is_some_and(|value| value >= terminal_start) && end <= boundary)
+                    || boundary > end
+                    || start.is_some_and(|value| boundary <= value)
+                {
+                    return Err(complete_activity_read_error(
+                        "complete activity read has an invalid saturated split",
+                    ));
+                }
+                let mut children = Vec::with_capacity(3);
+                if boundary < end {
+                    children.push((Some(boundary), end));
+                }
+                children.push((Some(terminal_start), boundary));
+                if start.is_none_or(|value| value < terminal_start) {
+                    children.push((start, terminal_start));
+                }
+                children
+            } else {
+                Vec::new()
+            };
+            segments.insert(
+                (start, end),
+                CompleteActivitySegment {
+                    rows: segment_rows,
+                    children,
+                },
+            );
+        }
+
+        validate_complete_activity_segment_graph(fixed_end, &segments)?;
+        Ok(segments
+            .into_values()
+            .filter(|segment| segment.children.is_empty())
+            .flat_map(|segment| segment.rows)
+            .collect())
+    }
+
+    /// Resolve every V3 receipt through the boot-owned verified source-receipt index and derive
+    /// observation time from the selected receipt. No timestamp copied into continuation JSON is
+    /// trusted, and the growing source log is never replayed on this hot path (#545).
+    pub fn observation_from_receipt_index(
+        &self,
+        source_receipts: &SourceReceiptIndex,
+    ) -> Result<Option<ObservationEvidence>, DecisionContinuationError> {
+        let Some(selected) = self.observation_receipt() else {
+            return Ok(None);
+        };
+        for page in &self.page_occurrences {
+            let envelope = source_receipts.source_envelope(page.receipt)?;
+            if envelope.source_id.0 != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+                || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
+                || envelope.parser_version != ACTIVITY_PARSER_VERSION
+                || envelope.raw_payload_hash.to_hex().as_str() != page.raw_hash
+            {
+                return Err(DecisionContinuationError::SourceReceiptMismatch {
+                    sequence: page.receipt.sequence.0,
+                });
+            }
+        }
+        if let Some(websocket) = self.observed_source_receipt {
+            let envelope = source_receipts.source_envelope(websocket)?;
+            let activity = parse_activity_trade_observation(&envelope.payload).map_err(|_| {
+                DecisionContinuationError::SourceReceiptMismatch {
+                    sequence: websocket.sequence.0,
+                }
+            })?;
+            if envelope.source_id.0 != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+                || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
+                || envelope.parser_version != ACTIVITY_PARSER_VERSION
+                || activity.wallet != self.facts.wallet
+                || activity.group_id.key() != &self.facts.source_trade_id
+            {
+                return Err(DecisionContinuationError::SourceReceiptMismatch {
+                    sequence: websocket.sequence.0,
+                });
+            }
+        }
+        let observed_unix_ms = source_receipts.received_millis(selected)?;
+        self.observation_at(observed_unix_ms)
+            .ok_or(DecisionContinuationError::SourceReceiptMismatch {
+                sequence: selected.sequence.0,
+            })
+            .map(Some)
+    }
+}
+
+fn joined_read_pages<'a>(
+    occurrences: &'a [PageOccurrence],
+    pages: &'a [ReconciliationPageEvidence],
+) -> Result<Vec<(&'a PageOccurrence, &'a ReconciliationPageEvidence)>, CompleteActivityReadError> {
+    if occurrences.len() != pages.len() {
+        return Err(complete_activity_read_error(
+            "complete activity read page multiplicity is inconsistent",
+        ));
+    }
+    let mut evidence = BTreeMap::<(String, String), VecDeque<&ReconciliationPageEvidence>>::new();
+    for page in pages {
+        evidence
+            .entry((page.request_url.clone(), page.raw_page_hash.clone()))
+            .or_default()
+            .push_back(page);
+    }
+    let mut joined = Vec::with_capacity(occurrences.len());
+    for occurrence in occurrences {
+        let key = (occurrence.request_url.clone(), occurrence.raw_hash.clone());
+        let page = evidence
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .ok_or_else(|| {
+                complete_activity_read_error(
+                    "complete activity read page occurrence has no page evidence",
+                )
+            })?;
+        joined.push((occurrence, page));
+    }
+    if evidence.values().any(|pages| !pages.is_empty()) {
+        return Err(complete_activity_read_error(
+            "complete activity read has unbound page evidence",
+        ));
+    }
+    Ok(joined)
+}
+
+fn complete_activity_page<L, E>(
+    occurrence: &PageOccurrence,
+    lookup: &mut L,
+) -> Result<CompleteActivityPage, CompleteActivityReadError>
+where
+    L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+    E: Display,
+{
+    let source = lookup(occurrence.receipt).map_err(|error| {
+        complete_activity_read_error(format!(
+            "complete activity read page receipt lookup failed: {error}"
+        ))
+    })?;
+    if source.source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+        || source.schema_version != ACTIVITY_SCHEMA_VERSION
+        || source.parser_version != ACTIVITY_PARSER_VERSION
+        || source.content_type != ContentType::Json
+    {
+        return Err(complete_activity_read_error(
+            "complete activity read page has the wrong source contract",
+        ));
+    }
+    if blake3::hash(&source.payload).to_hex().as_str() != occurrence.raw_hash {
+        return Err(complete_activity_read_error(
+            "complete activity read page payload hash differs",
+        ));
+    }
+    Ok(source)
+}
+
+fn parse_complete_activity_page(
+    source: &CompleteActivityPage,
+    wallet: WalletAddress,
+    error_context: &str,
+) -> Result<pe_source_polymarket_public::NormalizedActivityWindow, CompleteActivityReadError> {
+    parse_activity_response(
+        &source.payload,
+        wallet,
+        &ActivityParseContext {
+            source_id: SourceId(source.source_id.clone()),
+            observed_at: source.observed_at.clone(),
+            received_at: source.received_at.clone(),
+            transport: ActivityTransport::Replay,
+        },
+    )
+    .map_err(|error| complete_activity_read_error(format!("{error_context}: {error}")))
+}
+
+fn validate_complete_activity_segment_graph(
+    fixed_end: i64,
+    segments: &BTreeMap<(Option<i64>, i64), CompleteActivitySegment>,
+) -> Result<(), CompleteActivityReadError> {
+    let mut parent_counts = BTreeMap::<(Option<i64>, i64), usize>::new();
+    for segment in segments.values() {
+        for child in &segment.children {
+            if !segments.contains_key(child) {
+                return Err(complete_activity_read_error(
+                    "complete activity read is missing a split child segment",
+                ));
+            }
+            let count = parent_counts.entry(*child).or_default();
+            *count = count.saturating_add(1);
+            if *count > 1 {
+                return Err(complete_activity_read_error(
+                    "complete activity read split child has multiple parents",
+                ));
+            }
+        }
+    }
+    let roots = segments
+        .keys()
+        .filter(|bounds| !parent_counts.contains_key(bounds))
+        .copied()
+        .collect::<Vec<_>>();
+    let [root] = roots.as_slice() else {
+        return Err(complete_activity_read_error(
+            "complete activity read does not have one root segment",
+        ));
+    };
+    if root.1 != fixed_end {
+        return Err(complete_activity_read_error(
+            "complete activity read root differs from its fixed end",
+        ));
+    }
+    let mut pending = vec![*root];
+    let mut visited = HashSet::new();
+    while let Some(bounds) = pending.pop() {
+        if !visited.insert(bounds) {
+            return Err(complete_activity_read_error(
+                "complete activity read split graph repeats a segment",
+            ));
+        }
+        let segment = segments.get(&bounds).ok_or_else(|| {
+            complete_activity_read_error("complete activity read split segment is absent")
+        })?;
+        pending.extend(segment.children.iter().copied());
+    }
+    if visited.len() != segments.len() {
+        return Err(complete_activity_read_error(
+            "complete activity read contains an unrelated segment",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionContinuationError {
     #[error("invalid frozen continuation json: {0}")]
@@ -120,15 +668,35 @@ pub enum DecisionContinuationError {
     DurableMismatch,
     #[error("frozen continuation has invalid source epoch {0}")]
     SourceEpoch(i64),
+    #[error("source receipt lookup failed: {0}")]
+    SourceReceiptLookup(#[from] crate::risk_inputs::RiskInputsUnavailable),
+    #[error("source receipt sequence {sequence} does not match its frozen evidence")]
+    SourceReceiptMismatch { sequence: u64 },
 }
 
-impl DecisionContinuationV2 {
+impl DecisionContinuationV3 {
     /// Decode and bind a frozen continuation to its durable outer row.
     pub fn from_durable(row: &DecisionPendingRow) -> Result<Self, DecisionContinuationError> {
-        let frozen: Self = serde_json::from_str(&row.frozen_inputs_json)?;
-        if frozen.version != 2 {
-            return Err(DecisionContinuationError::Version(frozen.version));
-        }
+        let value: Value = serde_json::from_str(&row.frozen_inputs_json)?;
+        let version = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or(DecisionContinuationError::Version(0))?;
+        let continuation = match version {
+            2 => {
+                let legacy: DecisionContinuationV2Wire = serde_json::from_value(value)?;
+                Self {
+                    version: legacy.version,
+                    facts: legacy.facts,
+                    observed_source_receipt: None,
+                    page_occurrences: Vec::new(),
+                }
+            }
+            3 => serde_json::from_value(value)?,
+            version => return Err(DecisionContinuationError::Version(version)),
+        };
+        let frozen = &continuation.facts;
         if frozen.source_trade_id != row.source_trade_id
             || frozen.semantic_revision != row.semantic_revision
             || frozen.wallet != row.wallet
@@ -139,26 +707,44 @@ impl DecisionContinuationV2 {
         {
             return Err(DecisionContinuationError::DurableMismatch);
         }
-        Ok(frozen)
+        if version == 3 {
+            let page_occurrences = continuation.page_occurrences();
+            if page_occurrences.is_empty() {
+                return Err(DecisionContinuationError::DurableMismatch);
+            }
+            let proof: CompleteActivityReadWire =
+                serde_json::from_value(continuation.facts.decision_inputs.clone())?;
+            if proof.fixed_end.is_none() || proof.pages.as_ref().is_none_or(Vec::is_empty) {
+                return Err(DecisionContinuationError::DurableMismatch);
+            }
+            let mut previous = None;
+            for page in page_occurrences {
+                if previous.is_some_and(|sequence| page.receipt.sequence <= sequence) {
+                    return Err(DecisionContinuationError::DurableMismatch);
+                }
+                previous = Some(page.receipt.sequence);
+            }
+        }
+        Ok(continuation)
     }
 
     /// Reconstruct only the transport-neutral trade facts needed by the existing
     /// idempotent decision continuation. Ledger/classification/gate are not rerun.
     pub fn incoming_trade(&self) -> Result<IncomingTrade, DecisionContinuationError> {
-        let observed_at = time::OffsetDateTime::from_unix_timestamp(self.source_epoch)
-            .map_err(|_| DecisionContinuationError::SourceEpoch(self.source_epoch))?;
+        let observed_at = time::OffsetDateTime::from_unix_timestamp(self.facts.source_epoch)
+            .map_err(|_| DecisionContinuationError::SourceEpoch(self.facts.source_epoch))?;
         Ok(IncomingTrade {
-            wallet: self.wallet,
-            market_id: self.market_id.clone(),
-            outcome_id: self.outcome_id,
-            side: self.side,
-            price: self.price,
-            contracts: self.share_amount,
+            wallet: self.facts.wallet,
+            market_id: self.facts.market_id.clone(),
+            outcome_id: self.facts.outcome_id,
+            side: self.facts.side,
+            price: self.facts.price,
+            contracts: self.facts.share_amount,
             observed_at,
             received_at: observed_at,
-            source_trade_id: self.source_trade_id.clone(),
-            transaction_hash: Some(self.transaction_hash.clone()),
-            provenance: self.provenance,
+            source_trade_id: self.facts.source_trade_id.clone(),
+            transaction_hash: Some(self.facts.transaction_hash.clone()),
+            provenance: self.facts.provenance,
         })
     }
 }
@@ -179,6 +765,8 @@ pub enum BucketCommitError {
     PaperState(#[from] pe_paper_state::PaperStateError),
     #[error("ledger effect document: {0}")]
     EffectDocument(#[from] LedgerEffectDocumentError),
+    #[error("{0}")]
+    Invariant(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -644,9 +1232,29 @@ impl BucketCommitEngine {
                 None
             }
         });
-        match order_independent_validity(&self.ledger, wallet, &mutations) {
-            Ok(true) => {}
-            Ok(false) => {
+        let history_complete = context
+            .history_status
+            .as_ref()
+            .filter(|status| status.wallet == wallet)
+            .map_or_else(
+                || self.complete_history.contains(&wallet),
+                |status| status.complete,
+            );
+        let (applied, trade_decisions, first_entries) = match classify_complete_second(
+            &self.ledger,
+            wallet,
+            &mutations,
+            context.reconstruction_quality,
+            &context.signal_config,
+            history_complete,
+            &|market_id| self.entry_gate.has_market(&wallet, market_id),
+        ) {
+            Ok(SecondVerdict::OrderIndependent {
+                applied,
+                decisions,
+                first_entries,
+            }) => (applied, decisions, first_entries),
+            Ok(SecondVerdict::OrderDependent { .. }) => {
                 let trigger = mutations
                     .iter()
                     .find(|mutation| {
@@ -677,91 +1285,21 @@ impl BucketCommitEngine {
                     context,
                 );
             }
-        }
-
-        let pre_snapshot = self.ledger.position(&wallet).cloned();
-        let mut candidate = self.ledger.clone();
-        let applied = match candidate.apply_all_or_none(&mutations) {
-            Ok(applied) => applied,
-            Err(error) => {
-                return self.commit_fence(
-                    &aggregates,
-                    wallet,
-                    source_epoch,
-                    error.fence_cause(),
-                    mutation_error_id(&error),
-                    context,
-                );
-            }
         };
 
-        let mut trade_decisions = Vec::new();
-        let mut touched_count: BTreeMap<String, usize> = BTreeMap::new();
-        for mutation in &mutations {
-            for key in mutation.touched_keys() {
-                let encoded = encode_key(&key);
-                let count = touched_count.entry(encoded).or_default();
-                *count = count.saturating_add(1);
-            }
-        }
-        for mutation in &mutations {
-            let LedgerEffect::Trade {
-                market_id,
-                outcome_id,
-                side,
-                amount,
-                price,
-            } = mutation.effect.effective()
-            else {
-                continue;
-            };
-            let trade = IncomingTrade {
+        let mut candidate = self.ledger.clone();
+        if let Err(error) = candidate.apply_all_or_none(&mutations) {
+            return self.commit_fence(
+                &aggregates,
                 wallet,
-                market_id: market_id.clone(),
-                outcome_id: *outcome_id,
-                side: *side,
-                price: *price,
-                contracts: *amount,
-                observed_at: mutation.source_time.0,
-                received_at: mutation.source_time.0,
-                source_trade_id: mutation.source_trade_id.clone(),
-                transaction_hash: Some(mutation.transaction_hash.clone()),
-                provenance: context
-                    .observation_provenance
-                    .get(&mutation.source_trade_id)
-                    .copied()
-                    .unwrap_or(TradeProvenance::RestPoll),
-            };
-            let action = classify_leader_action(
-                &trade,
-                pre_snapshot.as_ref(),
-                context.reconstruction_quality,
-                &context.signal_config,
+                source_epoch,
+                error.fence_cause(),
+                mutation_error_id(&error),
+                context,
             );
-            let key = MarketOutcomeId::new(market_id.clone(), *outcome_id);
-            trade_decisions.push(TradeDecision {
-                source_trade_id: mutation.source_trade_id.clone(),
-                market_id: market_id.clone(),
-                side: *side,
-                action,
-                action_order_dependent: touched_count
-                    .get(&encode_key(&key))
-                    .copied()
-                    .unwrap_or_default()
-                    > 1,
-            });
         }
-
-        let history_complete = context
-            .history_status
-            .as_ref()
-            .filter(|status| status.wallet == wallet)
-            .map_or_else(
-                || self.complete_history.contains(&wallet),
-                |status| status.complete,
-            );
         let (gate_results, history_effects, gate_outcomes) =
-            self.derive_gate_results(wallet, source_epoch, history_complete, &trade_decisions);
+            Self::derive_gate_results(wallet, source_epoch, &trade_decisions, &first_entries);
 
         let mut pending = Vec::new();
         let mut dispositions = BTreeMap::new();
@@ -803,8 +1341,7 @@ impl BucketCommitEngine {
                         else {
                             return Err(BucketCommitError::Empty);
                         };
-                        let frozen = DecisionContinuationV2 {
-                            version: 2,
+                        let facts = DecisionContinuationFacts {
                             source_trade_id: source_trade_id.clone(),
                             semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
                             transaction_hash: aggregate
@@ -837,12 +1374,26 @@ impl BucketCommitEngine {
                             applied_configuration: context.applied_configuration.clone(),
                             decision_inputs: decision_inputs.clone(),
                         };
+                        if context.page_occurrences.is_empty() {
+                            return Err(BucketCommitError::Invariant(
+                                "admitted continuation is missing source page receipts".to_owned(),
+                            ));
+                        }
+                        let frozen_inputs_json =
+                            serde_json::to_string(&DecisionContinuationV3::new(
+                                facts,
+                                context
+                                    .observed_source_receipts
+                                    .get(&source_trade_id)
+                                    .copied(),
+                                context.page_occurrences.clone(),
+                            ))?;
                         pending.push(DecisionPendingRecord {
                             source_trade_id: source_trade_id.clone(),
                             semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
                             wallet,
                             source_epoch,
-                            frozen_inputs_json: serde_json::to_string(&frozen)?,
+                            frozen_inputs_json,
                             updated_at_unix: context.recorded_at_unix,
                         });
                         "decision_pending".to_owned()
@@ -1125,71 +1676,33 @@ impl BucketCommitEngine {
     }
 
     fn derive_gate_results(
-        &self,
         wallet: WalletAddress,
         source_epoch: i64,
-        history_complete: bool,
         decisions: &[TradeDecision],
+        first_entries: &[(MarketId, SourceTradeId)],
     ) -> (
         Vec<EntryGateResultRecord>,
         Vec<MarketHistoryRecord>,
         BTreeMap<String, String>,
     ) {
-        let mut candidates: BTreeMap<String, Vec<&TradeDecision>> = BTreeMap::new();
-        for decision in decisions {
-            if decision.side == Side::Buy && decision.action == LeaderAction::Entry {
-                candidates
-                    .entry(decision.market_id.to_string())
-                    .or_default()
-                    .push(decision);
-            }
-        }
-        let mut outcomes = BTreeMap::new();
-        let mut history = Vec::new();
-        for (market_string, market_candidates) in &candidates {
-            let market_id = MarketId(pe_core_types::VenueMarketId(market_string.clone()));
-            if self.entry_gate.has_market(&wallet, &market_id) {
-                for decision in market_candidates {
-                    outcomes.insert(
-                        decision.source_trade_id.0.clone(),
-                        "not_first_entry".to_owned(),
-                    );
-                }
-                continue;
-            }
-            let first_id = market_candidates
-                .iter()
-                .map(|decision| decision.source_trade_id.clone())
-                .min_by(|left, right| left.0.cmp(&right.0));
-            if let Some(first_id) = first_id {
-                history.push(MarketHistoryRecord {
-                    wallet,
-                    market_id: market_id.clone(),
-                    first_epoch: source_epoch,
-                    source_trade_id: first_id,
-                });
-            }
-            let outcome = if !history_complete {
-                "wallet_history_incomplete"
-            } else if market_candidates.len() >= 2 {
-                "ambiguous_first_entry_same_second"
-            } else {
-                "admitted"
-            };
-            for decision in market_candidates {
-                outcomes.insert(decision.source_trade_id.0.clone(), outcome.to_owned());
-            }
-        }
-
-        for decision in decisions {
-            outcomes
-                .entry(decision.source_trade_id.0.clone())
-                .or_insert_with(|| match (decision.side, decision.action) {
-                    (Side::Sell, _) => "not_buy".to_owned(),
-                    (_, LeaderAction::Entry) => "not_first_entry".to_owned(),
-                    _ => "not_an_entry".to_owned(),
-                });
-        }
+        let outcomes = decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision.source_trade_id.0.clone(),
+                    decision.entry.as_str().to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let history = first_entries
+            .iter()
+            .map(|(market_id, source_trade_id)| MarketHistoryRecord {
+                wallet,
+                market_id: market_id.clone(),
+                first_epoch: source_epoch,
+                source_trade_id: source_trade_id.clone(),
+            })
+            .collect::<Vec<_>>();
         let gate_results = decisions
             .iter()
             .map(|decision| EntryGateResultRecord {
@@ -1197,10 +1710,7 @@ impl BucketCommitEngine {
                 wallet,
                 market_id: decision.market_id.clone(),
                 source_epoch,
-                result: outcomes
-                    .get(&decision.source_trade_id.0)
-                    .cloned()
-                    .unwrap_or_else(|| "not_an_entry".to_owned()),
+                result: decision.entry.as_str().to_owned(),
                 history_consumed: history
                     .iter()
                     .any(|effect| effect.source_trade_id == decision.source_trade_id),
@@ -1400,9 +1910,27 @@ impl BucketCommitEngine {
             .cloned()
             .collect();
         let mut candidate = self.ledger.clone();
-        let applied_outcomes = match order_independent_validity(&self.ledger, wallet, &known) {
-            Ok(true) => candidate.apply_all_or_none(&known).ok(),
-            Ok(false) | Err(_) => None,
+        let history_complete = context
+            .history_status
+            .as_ref()
+            .filter(|status| status.wallet == wallet)
+            .map_or_else(
+                || self.complete_history.contains(&wallet),
+                |status| status.complete,
+            );
+        let applied_outcomes = match classify_complete_second(
+            &self.ledger,
+            wallet,
+            &known,
+            context.reconstruction_quality,
+            &context.signal_config,
+            history_complete,
+            &|market_id| self.entry_gate.has_market(&wallet, market_id),
+        ) {
+            Ok(SecondVerdict::OrderIndependent { applied, .. }) => {
+                candidate.apply_all_or_none(&known).ok().map(|_| applied)
+            }
+            Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => None,
         };
         let applied = applied_outcomes.is_some();
         let applied_by_id = known
@@ -1487,15 +2015,6 @@ impl BucketCommitEngine {
             already_committed: false,
         })
     }
-}
-
-#[derive(Debug)]
-struct TradeDecision {
-    source_trade_id: SourceTradeId,
-    market_id: MarketId,
-    side: Side,
-    action: LeaderAction,
-    action_order_dependent: bool,
 }
 
 fn activity_record(
@@ -1598,100 +2117,548 @@ fn touched_leader_rows(
         .collect()
 }
 
-fn order_independent_validity(
-    ledger: &PositionLedger,
-    wallet: WalletAddress,
-    mutations: &[LedgerMutation],
-) -> Result<bool, LedgerError> {
-    for component in mutation_components(mutations) {
-        if component.len() > 4 || !all_component_orders_match(ledger, wallet, &component)? {
-            return Ok(false);
+#[cfg(test)]
+mod continuation_v3_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::fs::OpenOptions;
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+    use pe_core_types::{EventSeq, Probability, ReceivedAt, SourceId, SourceTimestamp};
+    use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
+    use pe_paper_state::DecisionPendingState;
+    use rust_decimal_macros::dec;
+    use serde_json::json;
+
+    use super::*;
+
+    fn receipt(sequence: u64) -> AppendReceipt {
+        AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap_or(u8::MAX); 32]),
         }
     }
-    Ok(true)
-}
 
-fn mutation_components(mutations: &[LedgerMutation]) -> Vec<Vec<&LedgerMutation>> {
-    let mut assigned = vec![false; mutations.len()];
-    let mut components = Vec::new();
-    for seed in 0..mutations.len() {
-        if assigned[seed] {
-            continue;
+    fn activity_page(payload: &[u8]) -> CompleteActivityPage {
+        CompleteActivityPage {
+            payload: payload.to_vec(),
+            observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+            received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+            source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+            content_type: ContentType::Json,
         }
-        assigned[seed] = true;
-        let mut component = vec![&mutations[seed]];
-        let mut keys = mutations[seed]
-            .touched_keys()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        loop {
-            let mut changed = false;
-            for (index, mutation) in mutations.iter().enumerate() {
-                if assigned[index] {
-                    continue;
-                }
-                let touched = mutation.touched_keys();
-                if touched.iter().any(|key| keys.contains(key)) {
-                    assigned[index] = true;
-                    keys.extend(touched);
-                    component.push(mutation);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        components.push(component);
     }
-    components
-}
 
-fn all_component_orders_match(
-    ledger: &PositionLedger,
-    wallet: WalletAddress,
-    component: &[&LedgerMutation],
-) -> Result<bool, LedgerError> {
-    let mut sequences = Vec::new();
-    let mut remaining = component.to_vec();
-    enumerate_mutation_orders(&mut remaining, &mut Vec::new(), &mut sequences);
-    let mut expected = None;
-    for sequence in sequences {
-        let (candidate, applied) = match ledger.simulate_all_or_none(&sequence) {
-            Ok(result) => result,
-            Err(error) if component.len() == 1 => return Err(error),
-            Err(_) => return Ok(false),
+    fn activity_request_url(start: Option<i64>, end: i64, offset: u32) -> String {
+        PolymarketEndpoint::UserPositionActivityPage {
+            user: "0x1111111111111111111111111111111111111111".to_owned(),
+            end,
+            start: start.map(|start| start.saturating_add(1)),
+            offset,
+        }
+        .url("https://data-api.polymarket.com")
+    }
+
+    fn activity_page_fixture(
+        payload: &[u8],
+        start: Option<i64>,
+        end: i64,
+        offset: u32,
+        receipt: AppendReceipt,
+    ) -> (PageOccurrence, ReconciliationPageEvidence) {
+        let request_url = activity_request_url(start, end, offset);
+        let raw_hash = blake3::hash(payload).to_hex().to_string();
+        let row_count = serde_json::from_slice::<Vec<Value>>(payload).unwrap().len();
+        (
+            PageOccurrence {
+                request_url: request_url.clone(),
+                raw_hash: raw_hash.clone(),
+                receipt,
+            },
+            ReconciliationPageEvidence {
+                request_url,
+                bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
+                partition: None,
+                offset,
+                row_count: u32::try_from(row_count).unwrap(),
+                canonical_page_hash: canonical_page_hash(payload).unwrap(),
+                raw_page_hash: raw_hash,
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+            },
+        )
+    }
+
+    fn complete_read_inputs(fixed_end: i64, pages: &[ReconciliationPageEvidence]) -> Value {
+        json!({"fixed_end": fixed_end, "pages": pages})
+    }
+
+    fn proof_for_occurrences(
+        fixed_end: i64,
+        occurrences: &[PageOccurrence],
+    ) -> Vec<ReconciliationPageEvidence> {
+        let last = occurrences.len().saturating_sub(1);
+        occurrences
+            .iter()
+            .enumerate()
+            .map(|(index, occurrence)| ReconciliationPageEvidence {
+                request_url: occurrence.request_url.clone(),
+                bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                    start: Some(fixed_end.saturating_sub(1)),
+                    end: fixed_end,
+                }),
+                partition: None,
+                offset: u32::try_from(index).unwrap() * RECONCILIATION_PAGE_LIMIT,
+                row_count: if index == last {
+                    0
+                } else {
+                    RECONCILIATION_PAGE_LIMIT
+                },
+                canonical_page_hash: "00".repeat(32),
+                raw_page_hash: occurrence.raw_hash.clone(),
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+            })
+            .collect()
+    }
+
+    fn facts(decision_inputs: Value) -> DecisionContinuationFacts {
+        let configuration =
+            RuntimeConfig::from_service_config(&crate::config::ServiceConfig::default());
+        DecisionContinuationFacts {
+            source_trade_id: SourceTradeId("g2:continuation".to_owned()),
+            semantic_revision: "semantic".to_owned(),
+            transaction_hash: "0xtransaction".to_owned(),
+            wallet: WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap(),
+            source_epoch: 1_700_000_000,
+            market_id: MarketId(pe_core_types::VenueMarketId("market".to_owned())),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            price: Price::new(dec!(0.5)).unwrap(),
+            share_amount: ShareAmount::from_whole(1).unwrap(),
+            provenance: TradeProvenance::ActivityWs,
+            pre_bucket_action: LeaderAction::Entry,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+            gate_result: "admitted".to_owned(),
+            applied_configuration_hash: configuration.canonical_hash(),
+            applied_configuration: configuration,
+            frozen_basis: FrozenDecisionBasis {
+                win_rate_p: Probability::new(dec!(0.6)).unwrap(),
+                bankroll: dec!(100),
+            },
+            decision_inputs,
+        }
+    }
+
+    fn legacy_v2_json(facts: &DecisionContinuationFacts) -> String {
+        let facts = serde_json::to_string(facts).unwrap();
+        format!(r#"{{"version":2,{}"#, facts.strip_prefix('{').unwrap())
+    }
+
+    fn durable(value: &impl Serialize) -> DecisionPendingRow {
+        let frozen_inputs_json = serde_json::to_string(value).unwrap();
+        let continuation: DecisionContinuationV3 =
+            serde_json::from_str(&frozen_inputs_json).unwrap();
+        DecisionPendingRow {
+            source_trade_id: continuation.facts.source_trade_id.clone(),
+            semantic_revision: continuation.facts.semantic_revision.clone(),
+            wallet: continuation.facts.wallet,
+            source_epoch: continuation.facts.source_epoch,
+            frozen_inputs_json,
+            post_commit_inputs_json: String::new(),
+            state: DecisionPendingState::Open,
+            terminal_disposition: None,
+            updated_at_unix: 1_700_000_001,
+        }
+    }
+
+    /// PASS: V3 keeps repeated payload occurrences, derives the greatest complete bound, and picks
+    /// the lower websocket receipt; the caller-supplied time is not persisted in continuation JSON.
+    #[test]
+    fn v3_observation_uses_lower_receipt_and_preserves_multiplicity() {
+        let fixed_end = 1_700_000_010_i64;
+        let pages = vec![
+            PageOccurrence {
+                request_url: activity_request_url(Some(fixed_end.saturating_sub(1)), fixed_end, 0),
+                raw_hash: "same".to_owned(),
+                receipt: receipt(9),
+            },
+            PageOccurrence {
+                request_url: activity_request_url(
+                    Some(fixed_end.saturating_sub(1)),
+                    fixed_end,
+                    RECONCILIATION_PAGE_LIMIT,
+                ),
+                raw_hash: "same".to_owned(),
+                receipt: receipt(11),
+            },
+        ];
+        let proof = proof_for_occurrences(fixed_end, &pages);
+        let value = DecisionContinuationV3::new(
+            facts(complete_read_inputs(fixed_end, &proof)),
+            Some(receipt(7)),
+            pages,
+        );
+        let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.page_occurrences().len(), 2);
+        assert_eq!(decoded.complete_bound(), Some(receipt(11)));
+        assert_eq!(
+            decoded.observation_at(1_700_000_000_007),
+            Some(ObservationEvidence {
+                source_receipt: receipt(7),
+                complete_bound_receipt: receipt(11),
+                observed_unix_ms: 1_700_000_000_007,
+                provenance: "activity_ws".to_owned(),
+            })
+        );
+    }
+
+    /// PASS: polling-only V3 uses the complete page bound, while a legacy V2 row has no fabricated
+    /// observation evidence.
+    #[test]
+    fn poll_only_v3_and_legacy_v2_have_distinct_observation_semantics() {
+        let fixed_end = 1_700_000_010_i64;
+        let pages = vec![PageOccurrence {
+            request_url: activity_request_url(Some(fixed_end.saturating_sub(1)), fixed_end, 0),
+            raw_hash: "hash".to_owned(),
+            receipt: receipt(4),
+        }];
+        let proof = proof_for_occurrences(fixed_end, &pages);
+        let value = DecisionContinuationV3::new(
+            facts(complete_read_inputs(fixed_end, &proof)),
+            None,
+            pages,
+        );
+        let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
+        assert_eq!(
+            decoded.observation_at(1_700_000_000_004),
+            Some(ObservationEvidence {
+                source_receipt: receipt(4),
+                complete_bound_receipt: receipt(4),
+                observed_unix_ms: 1_700_000_000_004,
+                provenance: "rest_poll".to_owned(),
+            })
+        );
+
+        let legacy = facts(json!({"fixed_end": fixed_end}));
+        let mut row = durable(&value);
+        row.frozen_inputs_json = legacy_v2_json(&legacy);
+        let decoded = DecisionContinuationV3::from_durable(&row).unwrap();
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.observation_at(1_700_000_000_004), None);
+    }
+
+    /// PASS: polling observation time and hashes are recovered through exact receipt-index reads
+    /// even when an unrelated interior frame is unreadable; tampering a frozen raw-page hash
+    /// still fails closed.
+    /// FAIL: a corrupted or missing retained page is accepted, or a valid retained page is
+    /// rejected or resolved against the wrong receipt.
+    #[test]
+    fn receipt_index_is_the_scoped_observation_time_and_hash_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let append = |writer: &mut Writer, payload: &[u8], received_unix: i64| {
+            let time = time::OffsetDateTime::from_unix_timestamp(received_unix).unwrap();
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                    schema_version: ACTIVITY_SCHEMA_VERSION,
+                    parser_version: ACTIVITY_PARSER_VERSION,
+                    observed_at: SourceTimestamp(time),
+                    received_at: ReceivedAt(time),
+                    content_type: ContentType::Json,
+                    payload: payload.to_vec(),
+                })
+                .unwrap()
         };
-        let residuals = applied
-            .into_iter()
-            .map(|outcome| outcome.clamped_residual)
-            .collect::<Vec<_>>();
-        let result = (candidate.position(&wallet).cloned(), residuals);
-        if expected
-            .as_ref()
-            .is_some_and(|expected| expected != &result)
-        {
-            return Ok(false);
-        }
-        expected = Some(result);
-    }
-    Ok(true)
-}
+        let first_payload = br#"[{"page":1}]"#;
+        let unrelated_payload = br#"[{"unrelated":true}]"#;
+        let second_payload = br#"[{"page":2}]"#;
+        let first = append(&mut writer, first_payload, 1_700_000_001);
+        let _unrelated = append(&mut writer, unrelated_payload, 1_700_000_001);
+        let second = append(&mut writer, second_payload, 1_700_000_002);
+        drop(writer);
+        let offsets = Reader::replay_with_offsets(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let source_receipts = SourceReceiptIndex::replay(&path).unwrap();
 
-fn enumerate_mutation_orders(
-    remaining: &mut Vec<&LedgerMutation>,
-    current: &mut Vec<LedgerMutation>,
-    sequences: &mut Vec<Vec<LedgerMutation>>,
-) {
-    if remaining.is_empty() {
-        sequences.push(current.clone());
-        return;
+        // Corrupt only the unrelated frame after boot built the verified index. A complete-log
+        // replay now fails, while direct reads of the two receipt-bound page frames remain valid.
+        let corrupt_at = offsets[1].0.checked_add(4).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&[byte[0] ^ 0xff]).unwrap();
+        file.sync_all().unwrap();
+        assert!(
+            Reader::replay(&path).is_err(),
+            "complete replay sees the corrupt neighbor"
+        );
+
+        let fixed_end = 1_700_000_010_i64;
+        let occurrences = vec![
+            PageOccurrence {
+                request_url: activity_request_url(Some(fixed_end.saturating_sub(1)), fixed_end, 0),
+                raw_hash: blake3::hash(first_payload).to_hex().to_string(),
+                receipt: first,
+            },
+            PageOccurrence {
+                request_url: activity_request_url(
+                    Some(fixed_end.saturating_sub(1)),
+                    fixed_end,
+                    RECONCILIATION_PAGE_LIMIT,
+                ),
+                raw_hash: blake3::hash(second_payload).to_hex().to_string(),
+                receipt: second,
+            },
+        ];
+        let proof = proof_for_occurrences(fixed_end, &occurrences);
+        let value = DecisionContinuationV3::new(
+            facts(complete_read_inputs(fixed_end, &proof)),
+            None,
+            occurrences,
+        );
+        let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
+        assert_eq!(
+            decoded
+                .observation_from_receipt_index(&source_receipts)
+                .unwrap(),
+            Some(ObservationEvidence {
+                source_receipt: second,
+                complete_bound_receipt: second,
+                observed_unix_ms: 1_700_000_002_000,
+                provenance: "rest_poll".to_owned(),
+            })
+        );
+
+        let mut tampered = decoded;
+        tampered.page_occurrences[1].raw_hash = "00".repeat(32);
+        assert!(matches!(
+            tampered.observation_from_receipt_index(&source_receipts),
+            Err(DecisionContinuationError::SourceReceiptMismatch { .. })
+        ));
     }
-    for index in 0..remaining.len() {
-        let mutation = remaining.remove(index);
-        current.push(mutation.clone());
-        enumerate_mutation_orders(remaining, current, sequences);
-        current.pop();
-        remaining.insert(index, mutation);
+
+    /// PASS: the shared owner rejects a continuation whose logical complete-read proof is dropped
+    /// or unrelated, whatever version it records — no producer emits page occurrences without
+    /// the proof, so there is no one-page compatibility path.
+    /// FAIL: a proof-free continuation (current or version two) reconstructs an aggregate.
+    #[test]
+    fn strict_live_shared_owner_rejects_proof_free_continuations_of_any_version() {
+        let payload = br#"[{"proxyWallet":"0x1111111111111111111111111111111111111111","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"1","usdcSize":"0.5","price":"0.5","timestamp":"1700000000","transactionHash":"0xtransaction","outcomeIndex":"0"}]"#;
+        let occurrence = PageOccurrence {
+            request_url: "https://source/page".to_owned(),
+            raw_hash: blake3::hash(payload).to_hex().to_string(),
+            receipt: receipt(1),
+        };
+        for missing_proof in [json!({}), json!({"unrelated": true})] {
+            let current =
+                DecisionContinuationV3::new(facts(missing_proof), None, vec![occurrence.clone()]);
+            let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+            let error = current
+                .reconstruct_complete_activity_read(&mut lookup)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("decision continuation is missing its complete activity read proof")
+            );
+        }
+
+        let version_two = DecisionContinuationV3 {
+            version: 2,
+            facts: facts(json!({"legacy": true})),
+            observed_source_receipt: None,
+            page_occurrences: vec![occurrence],
+        };
+        let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+        let error = version_two
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decision continuation is missing its complete activity read proof")
+        );
+    }
+
+    /// PASS: V3 decode requires the producer's fixed end and at least one page-evidence record.
+    /// FAIL: increasing page receipts alone make a proof-free V3 durable row executable.
+    #[test]
+    fn v3_decode_requires_rich_complete_read_proof() {
+        let payload = b"[]";
+        let (occurrence, evidence) =
+            activity_page_fixture(payload, Some(1_699_999_999), 1_700_000_000, 0, receipt(1));
+        let valid = DecisionContinuationV3::new(
+            facts(complete_read_inputs(
+                1_700_000_000,
+                std::slice::from_ref(&evidence),
+            )),
+            None,
+            vec![occurrence.clone()],
+        );
+        DecisionContinuationV3::from_durable(&durable(&valid)).unwrap();
+
+        let pages_without_fixed_end = json!({"pages": [evidence]});
+        for decision_inputs in [
+            json!({}),
+            json!({"fixed_end": 1_700_000_000}),
+            json!({"fixed_end": 1_700_000_000, "pages": []}),
+            pages_without_fixed_end,
+        ] {
+            let invalid =
+                DecisionContinuationV3::new(facts(decision_inputs), None, vec![occurrence.clone()]);
+            assert!(matches!(
+                DecisionContinuationV3::from_durable(&durable(&invalid)),
+                Err(DecisionContinuationError::DurableMismatch)
+            ));
+        }
+    }
+
+    /// PASS: the shared owner accepts a source-shaped short terminal page and rejects the same
+    /// retained payload when both continuation URL copies are changed together.
+    /// FAIL: a URL survives by acting only as an equality key inside the continuation.
+    #[test]
+    fn complete_read_validates_source_owned_request_url() {
+        let payload = br#"[
+            {"proxyWallet":"0x1111111111111111111111111111111111111111","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"1","usdcSize":"0.5","price":"0.5","timestamp":"1700000000","transactionHash":"0xtransaction","outcomeIndex":"0"}
+        ]"#;
+        let (occurrence, evidence) =
+            activity_page_fixture(payload, Some(1_699_999_999), 1_700_000_000, 0, receipt(1));
+        let valid = DecisionContinuationV3::new(
+            facts(complete_read_inputs(
+                1_700_000_000,
+                std::slice::from_ref(&evidence),
+            )),
+            None,
+            vec![occurrence.clone()],
+        );
+        let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+        assert_eq!(
+            valid
+                .reconstruct_complete_activity_read(&mut lookup)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let tampered_url = format!("{}&tampered=true", occurrence.request_url);
+        let mut tampered_evidence = evidence;
+        tampered_evidence.request_url.clone_from(&tampered_url);
+        let mut tampered_occurrence = occurrence;
+        tampered_occurrence.request_url = tampered_url;
+        let tampered = DecisionContinuationV3::new(
+            facts(complete_read_inputs(1_700_000_000, &[tampered_evidence])),
+            None,
+            vec![tampered_occurrence],
+        );
+        let error = tampered
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(error.to_string().contains("source contract"));
+    }
+
+    /// PASS: canonical page evidence is recomputed by the producer-owned hash helper, independently
+    /// of the raw-byte hash, and a changed canonical digest fails closed.
+    /// FAIL: valid raw bytes make a forged canonical page hash irrelevant.
+    #[test]
+    fn complete_read_verifies_canonical_page_hash() {
+        let payload = br#"[ {"proxyWallet":"0x1111111111111111111111111111111111111111","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"1","usdcSize":"0.5","price":"0.5","timestamp":"1700000000","transactionHash":"0xtransaction","outcomeIndex":"0"} ]"#;
+        let (occurrence, mut evidence) =
+            activity_page_fixture(payload, Some(1_699_999_999), 1_700_000_000, 0, receipt(1));
+        assert_ne!(evidence.canonical_page_hash, evidence.raw_page_hash);
+        evidence
+            .canonical_page_hash
+            .clone_from(&evidence.raw_page_hash);
+        let continuation = DecisionContinuationV3::new(
+            facts(complete_read_inputs(1_700_000_000, &[evidence])),
+            None,
+            vec![occurrence],
+        );
+        let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+        let error = continuation
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(error.to_string().contains("canonical page hash differs"));
+    }
+
+    /// PASS: no segment may continue to a short page beyond the producer's maximum offset.
+    /// FAIL: consecutive full pages through the maximum make an extra short page replayable.
+    #[test]
+    fn complete_read_rejects_short_page_beyond_maximum_offset() {
+        let row = json!({
+            "proxyWallet": "0x1111111111111111111111111111111111111111",
+            "type": "TRADE",
+            "conditionId": "0xcondition",
+            "asset": "123",
+            "side": "BUY",
+            "size": "1",
+            "usdcSize": "0.5",
+            "price": "0.5",
+            "timestamp": "1700000000",
+            "transactionHash": "0xtransaction",
+            "outcomeIndex": "0"
+        });
+        let full_payload = serde_json::to_vec(
+            &(0..RECONCILIATION_PAGE_LIMIT)
+                .map(|_| row.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let terminal_payload = b"[]";
+        let terminal_offset = ACTIVITY_MAX_OFFSET + RECONCILIATION_PAGE_LIMIT;
+        let mut occurrences = Vec::new();
+        let mut evidence = Vec::new();
+        let mut offset = 0;
+        while offset <= terminal_offset {
+            let payload = if offset == terminal_offset {
+                terminal_payload.as_slice()
+            } else {
+                full_payload.as_slice()
+            };
+            let (occurrence, page) = activity_page_fixture(
+                payload,
+                Some(1_699_999_999),
+                1_700_000_000,
+                offset,
+                receipt(u64::from(offset / RECONCILIATION_PAGE_LIMIT) + 1),
+            );
+            occurrences.push(occurrence);
+            evidence.push(page);
+            offset += RECONCILIATION_PAGE_LIMIT;
+        }
+        let continuation = DecisionContinuationV3::new(
+            facts(complete_read_inputs(1_700_000_000, &evidence)),
+            None,
+            occurrences,
+        );
+        let terminal_sequence = u64::from(terminal_offset / RECONCILIATION_PAGE_LIMIT) + 1;
+        let mut lookup = |page: AppendReceipt| -> Result<_, &str> {
+            let payload = if page.sequence.0 == terminal_sequence {
+                terminal_payload.as_slice()
+            } else {
+                full_payload.as_slice()
+            };
+            Ok(activity_page(payload))
+        };
+        let error = continuation
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(error.to_string().contains("page evidence is invalid"));
     }
 }

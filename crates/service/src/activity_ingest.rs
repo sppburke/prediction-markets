@@ -48,10 +48,8 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pe_copy_signal_engine::TradeProvenance;
-use pe_core_types::{
-    EventSeq, ReceivedAt, SourceId, SourceTimestamp, SourceTradeId, WalletAddress,
-};
-use pe_event_log::{ContentType, EnvelopeIn};
+use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, SourceTradeId, WalletAddress};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS,
     ACTIVITY_WS_READER_COUNT, ActivityWsError, ActivityWsStream, ReconnectBackoff, WireFrame,
@@ -68,6 +66,7 @@ use tracing::{debug, info, warn};
 
 use crate::health::{HealthState, ReaderHealth, SharedHealth};
 use crate::live_watchlist::LiveWatchlist;
+use crate::risk_inputs::SourceReceiptIndex;
 use crate::source_event_sink::SourceEventSink;
 
 /// Source id stamped on every websocket envelope in the source event log.
@@ -81,6 +80,7 @@ pub struct ReconciliationTrigger {
     pub source_trade_id: SourceTradeId,
     pub provenance: TradeProvenance,
     pub received_at: OffsetDateTime,
+    pub receipt: AppendReceipt,
 }
 
 /// Bounded producer handle for non-websocket source pages. The coordinator
@@ -92,7 +92,7 @@ pub struct SourceLogHandle {
 
 struct SourceLogRequest {
     envelope: EnvelopeIn,
-    appended: oneshot::Sender<EventSeq>,
+    appended: oneshot::Sender<AppendReceipt>,
 }
 
 pub struct SourceLogReceiver {
@@ -113,7 +113,10 @@ impl SourceLogHandle {
     }
 
     /// Record one source page and wait for its durable append acknowledgement.
-    pub async fn append(&self, envelope: EnvelopeIn) -> Result<EventSeq, SourceLogHandleError> {
+    pub async fn append(
+        &self,
+        envelope: EnvelopeIn,
+    ) -> Result<AppendReceipt, SourceLogHandleError> {
         let (appended, acknowledgement) = oneshot::channel();
         self.tx
             .send(SourceLogRequest { envelope, appended })
@@ -139,7 +142,16 @@ fn activity_timeout() -> Duration {
 struct Observation {
     slot: usize,
     payload: Vec<u8>,
-    trigger: ReconciliationTrigger,
+    trigger: PendingReconciliationTrigger,
+}
+
+/// Normalized websocket identity before the coordinator assigns its durable receipt.
+struct PendingReconciliationTrigger {
+    wallet: WalletAddress,
+    source_time: OffsetDateTime,
+    source_trade_id: SourceTradeId,
+    provenance: TradeProvenance,
+    received_at: OffsetDateTime,
 }
 
 /// A downstream receiver closed: the service is shutting down.
@@ -152,6 +164,7 @@ pub struct ActivityIngest {
     trigger_tx: mpsc::Sender<ReconciliationTrigger>,
     health: SharedHealth,
     reconciliation_triggers_dropped: Arc<AtomicU64>,
+    source_receipts: SourceReceiptIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
 }
@@ -195,6 +208,7 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -214,6 +228,7 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -240,8 +255,16 @@ impl ActivityIngest {
             trigger_tx,
             health,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipts: SourceReceiptIndex::default(),
             reader_append_gate: None,
         }
+    }
+
+    /// Install the verified boot projection extended by this ingest's synchronized appends.
+    #[must_use]
+    pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
+        self.source_receipts = source_receipts;
+        self
     }
 
     /// Counter projected into `source_health` by the status writer.
@@ -314,6 +337,7 @@ impl ActivityIngest {
                 fan_in: fan_in_rx,
                 source_rx: self.source_rx.rx,
                 reconciliation_triggers_dropped: self.reconciliation_triggers_dropped,
+                source_receipts: self.source_receipts,
                 #[cfg(feature = "scenario")]
                 reader_append_gate: self.reader_append_gate,
             }
@@ -528,7 +552,7 @@ impl Reader {
             self.deliver(Observation {
                 slot: self.slot,
                 payload: payload.to_vec(),
-                trigger: ReconciliationTrigger {
+                trigger: PendingReconciliationTrigger {
                     wallet: activity.wallet,
                     source_time: activity.source_time.0,
                     source_trade_id: activity.group_id.key().clone(),
@@ -601,6 +625,7 @@ struct Coordinator {
     fan_in: mpsc::Receiver<Observation>,
     source_rx: mpsc::Receiver<SourceLogRequest>,
     reconciliation_triggers_dropped: Arc<AtomicU64>,
+    source_receipts: SourceReceiptIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
 }
@@ -647,16 +672,21 @@ impl Coordinator {
                     };
                     let label = observation.trigger.source_trade_id.clone();
                     let slot = Some(observation.slot);
-                    if self
-                        .append_with_recovery(envelope, &label, slot)
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                    let receipt = match self.append_with_recovery(envelope, &label, slot).await {
+                        Ok(receipt) => receipt,
+                        Err(Shutdown) => return,
+                    };
+                    let trigger = ReconciliationTrigger {
+                        wallet: observation.trigger.wallet,
+                        source_time: observation.trigger.source_time,
+                        source_trade_id: observation.trigger.source_trade_id,
+                        provenance: observation.trigger.provenance,
+                        received_at: observation.trigger.received_at,
+                        receipt,
+                    };
                     // Trigger delivery follows sync. A full queue drops only this
                     // durable obligation; polling and restart replay recover it.
-                    match self.trigger_tx.try_send(observation.trigger) {
+                    match self.trigger_tx.try_send(trigger) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
                             self.reconciliation_triggers_dropped
@@ -689,9 +719,9 @@ impl Coordinator {
         envelope: EnvelopeIn,
         label: &SourceTradeId,
         slot: Option<usize>,
-    ) -> Result<EventSeq, Shutdown> {
+    ) -> Result<AppendReceipt, Shutdown> {
         match self.sink.append_durable(duplicate_envelope(&envelope)) {
-            Ok(seq) => return Ok(seq),
+            Ok(receipt) => return self.index_synced_append(receipt, &envelope),
             Err(error) => {
                 self.set_health(|h| {
                     h.ws_sink_poisoned = true;
@@ -712,8 +742,14 @@ impl Coordinator {
             if !self.sink.try_reopen() {
                 continue;
             }
+            if let Err(error) = self.source_receipts.catch_up_verified_tail() {
+                warn!(%error,
+                    "reopened source log could not catch the source receipt index up to its verified tail");
+                return Err(Shutdown);
+            }
             match self.sink.append_durable(duplicate_envelope(&envelope)) {
-                Ok(seq) => {
+                Ok(receipt) => {
+                    let receipt = self.index_synced_append(receipt, &envelope)?;
                     self.set_health(|h| {
                         h.ws_sink_poisoned = false;
                         h.source_durability_uncertain = false;
@@ -721,13 +757,28 @@ impl Coordinator {
                     });
                     info!(trade = %label,
                         "source log recovered; held payload appended durably");
-                    return Ok(seq);
+                    return Ok(receipt);
                 }
                 Err(error) => {
                     warn!(error = %error, "source log re-poisoned immediately after reopen");
                 }
             }
         }
+    }
+
+    fn index_synced_append(
+        &self,
+        receipt: AppendReceipt,
+        envelope: &EnvelopeIn,
+    ) -> Result<AppendReceipt, Shutdown> {
+        self.source_receipts
+            .record_synced_append(receipt, envelope)
+            .map(|()| receipt)
+            .map_err(|error| {
+                warn!(%error, sequence = receipt.sequence.0,
+                    "synchronized source append could not extend source receipt index");
+                Shutdown
+            })
     }
 
     fn set_health(&self, f: impl FnOnce(&mut HealthState)) {
@@ -777,7 +828,7 @@ mod tests {
         Observation {
             slot: 0,
             payload,
-            trigger: ReconciliationTrigger {
+            trigger: PendingReconciliationTrigger {
                 wallet: activity.wallet,
                 source_time: activity.source_time.0,
                 source_trade_id: activity.group_id.key().clone(),
@@ -829,6 +880,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -899,6 +951,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -948,6 +1001,82 @@ mod tests {
         assert_eq!(ids, vec!["0xa".to_string(), "0xb".to_string()]);
     }
 
+    /// PASS: synchronization uncertainty leaves a complete frame N for reopen, the receipt index
+    /// catches N up before the held payload retries as N+1, and later appends remain acknowledged
+    /// and addressable without an index gap.
+    /// FAIL: a permanent receipt-index gap after the fault, or a later append that cannot be
+    /// acknowledged or addressed.
+    #[tokio::test(start_paused = true)]
+    async fn coordinator_catches_index_up_after_complete_sync_fault_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        drop(SourceEventSink::open(&path).unwrap());
+        let source_receipts = SourceReceiptIndex::replay(&path).unwrap();
+        let mut sink = SourceEventSink::open(&path).unwrap();
+        sink.fail_next_sync();
+        let (fan_in_tx, fan_in_rx) = mpsc::channel(8);
+        let (trigger_tx, mut trigger_rx) = mpsc::channel(8);
+        let (_source_log, source_rx) = SourceLogHandle::channel(8);
+        let health = new_shared_health_with_ws(false, true, 90);
+        let task = tokio::spawn(
+            Coordinator {
+                sink,
+                trigger_tx,
+                health: health.clone(),
+                fan_in: fan_in_rx,
+                source_rx: source_rx.rx,
+                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipts: source_receipts.clone(),
+                #[cfg(feature = "scenario")]
+                reader_append_gate: None,
+            }
+            .run(),
+        );
+
+        fan_in_tx.send(observation("0xa")).await.unwrap();
+        settle().await;
+        assert!(health.lock().unwrap().ws_sink_poisoned);
+        assert!(trigger_rx.try_recv().is_err());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        let retried = trigger_rx.recv().await.unwrap();
+        assert_eq!(retried.receipt.sequence, pe_core_types::EventSeq(1));
+        assert!(!health.lock().unwrap().ws_sink_poisoned);
+
+        let replayed_after_recovery = LogReader::replay(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(replayed_after_recovery.len(), 2);
+        for (sequence, envelope) in &replayed_after_recovery {
+            let receipt = AppendReceipt {
+                sequence: *sequence,
+                this_hash: envelope.this_hash,
+            };
+            let indexed = source_receipts.source_envelope(receipt).unwrap();
+            assert_eq!(indexed.payload, observation("0xa").payload);
+        }
+
+        fan_in_tx.send(observation("0xb")).await.unwrap();
+        let continued = trigger_rx.recv().await.unwrap();
+        assert_eq!(continued.receipt.sequence, pe_core_types::EventSeq(2));
+        assert_eq!(
+            source_receipts
+                .source_envelope(continued.receipt)
+                .unwrap()
+                .payload,
+            observation("0xb").payload
+        );
+
+        drop(fan_in_tx);
+        task.await.unwrap();
+        assert_eq!(
+            source_receipts.snapshot(),
+            SourceReceiptIndex::replay(&path).unwrap().snapshot()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn full_trigger_queue_drops_obligation_and_releases_poll_page_append() {
         let dir = tempfile::tempdir().unwrap();
@@ -958,8 +1087,19 @@ mod tests {
         let (source_log, source_rx) = SourceLogHandle::channel(1);
         let health = new_shared_health_with_ws(false, true, 90);
         let dropped = Arc::new(AtomicU64::new(0));
+        let queued = observation("0xqueued").trigger;
         trigger_tx
-            .try_send(observation("0xqueued").trigger)
+            .try_send(ReconciliationTrigger {
+                wallet: queued.wallet,
+                source_time: queued.source_time,
+                source_trade_id: queued.source_trade_id,
+                provenance: queued.provenance,
+                received_at: queued.received_at,
+                receipt: AppendReceipt {
+                    sequence: pe_core_types::EventSeq(0),
+                    this_hash: blake3::Hash::from_bytes([0; 32]),
+                },
+            })
             .unwrap();
         let task = tokio::spawn(
             Coordinator {
@@ -969,6 +1109,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::clone(&dropped),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -1000,7 +1141,10 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
-        assert_eq!(appending.await.unwrap().unwrap(), EventSeq(1));
+        assert_eq!(
+            appending.await.unwrap().unwrap().sequence,
+            pe_core_types::EventSeq(1)
+        );
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(
             trigger_rx.try_recv().unwrap().source_trade_id,
@@ -1031,6 +1175,7 @@ mod tests {
             fan_in: fan_in_rx,
             source_rx: source_rx.rx,
             reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
         }
@@ -1057,6 +1202,7 @@ mod tests {
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
                 reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
             }
@@ -1070,5 +1216,70 @@ mod tests {
             .await
             .expect("coordinator must exit once downstream closes")
             .unwrap();
+    }
+
+    /// PASS: the boot source receipt index equals a fresh verified replay, and the same equality
+    /// holds after the coordinator synchronizes and indexes a later source append.
+    #[tokio::test]
+    async fn source_receipt_index_matches_fresh_replay_at_boot_and_after_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let boot_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let runtime_at = OffsetDateTime::from_unix_timestamp(1_800_000_002).unwrap();
+        let envelope = |received_at: OffsetDateTime, payload: &[u8]| EnvelopeIn {
+            source_id: SourceId("receipt-index-test".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(received_at),
+            received_at: ReceivedAt(received_at),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        };
+
+        let mut boot_sink = SourceEventSink::open(&path).unwrap();
+        let boot_receipt = boot_sink
+            .append_durable(envelope(boot_at, br#"{"boot":true}"#))
+            .unwrap();
+        drop(boot_sink);
+
+        let source_receipts = SourceReceiptIndex::replay(&path).unwrap();
+        assert_eq!(
+            source_receipts.snapshot(),
+            SourceReceiptIndex::replay(&path).unwrap().snapshot()
+        );
+        assert_eq!(
+            source_receipts.received_millis(boot_receipt).unwrap(),
+            1_800_000_000_000
+        );
+
+        let sink = SourceEventSink::open(&path).unwrap();
+        let (source_log, source_rx) = SourceLogHandle::channel(1);
+        let (trigger_tx, trigger_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(
+            ActivityIngest::poll_only(
+                sink,
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, true, 90),
+            )
+            .with_source_receipt_index(source_receipts.clone())
+            .run(),
+        );
+        let runtime_receipt = source_log
+            .append(envelope(runtime_at, br#"{"runtime":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(
+            source_receipts.received_millis(runtime_receipt).unwrap(),
+            1_800_000_002_000
+        );
+
+        drop(source_log);
+        drop(trigger_rx);
+        coordinator.await.unwrap();
+        assert_eq!(
+            source_receipts.snapshot(),
+            SourceReceiptIndex::replay(&path).unwrap().snapshot()
+        );
     }
 }

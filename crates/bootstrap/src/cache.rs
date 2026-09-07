@@ -28,7 +28,6 @@ use pe_core_types::{
     WalletAddress,
 };
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest,
     ClobCoveragePage, ClobPayoutResolution, ClobResolutionEvidence,
 };
@@ -242,18 +241,6 @@ CREATE TABLE IF NOT EXISTS token_conditions (
 );
 CREATE INDEX IF NOT EXISTS idx_token_conditions_condition ON token_conditions(condition_id);
 
--- Per-market Polymarket taker/maker fee schedule (issue #23, PR 1).
--- Populated by the `events` subcommand from Gamma takerBaseFee / makerBaseFee.
--- Fees are stored in basis points (0..=10_000) so all comparisons are integer.
--- `fee_active_from_unix` is NULL until PR 4 backfills it from counterparty_edges.
-CREATE TABLE IF NOT EXISTS market_fees (
-    condition_id         TEXT    PRIMARY KEY NOT NULL,
-    taker_base_fee_bps   INTEGER NOT NULL,
-    maker_base_fee_bps   INTEGER NOT NULL,
-    fee_active_from_unix INTEGER,
-    fetched_at_unix      INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS market_liquidity (
     market_id        TEXT    PRIMARY KEY NOT NULL,
     liquidity_usd_str TEXT   NOT NULL,
@@ -287,6 +274,7 @@ CREATE TABLE IF NOT EXISTS clob_payout_coverage_manifests_v2 (
 
 CREATE TABLE IF NOT EXISTS clob_payout_evidence_v2 (
     market_id              TEXT    PRIMARY KEY NOT NULL,
+    end_date_unix          INTEGER NULL,
     is_50_50_outcome       INTEGER NULL CHECK (is_50_50_outcome IN (0,1)),
     payout_status          TEXT    NOT NULL CHECK (payout_status IN (
         'resolved','unresolved_open','unresolved_incomplete',
@@ -339,6 +327,7 @@ CREATE TABLE IF NOT EXISTS clob_payout_walk_pages_v2 (
 CREATE TABLE IF NOT EXISTS clob_payout_evidence_staging_v2 (
     generation             INTEGER NOT NULL,
     market_id              TEXT    NOT NULL,
+    end_date_unix          INTEGER NULL,
     is_50_50_outcome       INTEGER NULL CHECK (is_50_50_outcome IN (0,1)),
     payout_status          TEXT    NOT NULL CHECK (payout_status IN (
         'resolved','unresolved_open','unresolved_incomplete',
@@ -637,13 +626,6 @@ pub struct ActivationBatch {
     pub reused: bool,
 }
 
-/// Per-market fee schedule row loaded from `market_fees` (issue #23).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarketFeeRow {
-    pub taker_base_fee_bps: i32,
-    pub maker_base_fee_bps: i32,
-}
-
 /// Permanent wallet trade-history cache backed by SQLite.
 /// One `(market, token)` work item for the `prices-history` CLOB backfill (issue #421 PR4), with the
 /// per-market close reference the pre-resolution window is anchored on.
@@ -736,6 +718,7 @@ pub struct ClobPayoutWalkStateV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredClobPayoutEvidenceV2 {
     pub market_id: String,
+    pub end_date_unix: Option<i64>,
     pub is_50_50_outcome: Option<bool>,
     pub payout: ClobPayoutResolution,
     pub closed: Option<bool>,
@@ -812,8 +795,8 @@ impl WalletCache {
         // only the deleted operator-graph machinery; dropping reclaims the bulk of
         // the cache (`counterparty_edges` alone was ~275M rows). Idempotent — a
         // no-op once dropped, and the tables are no longer in SCHEMA so fresh DBs
-        // never recreate them. `token_conditions` + `market_fees` are KEPT (still
-        // written by the surviving `events` sweep). #521 adds the orphan
+        // never recreate them. `token_conditions` is kept for the surviving
+        // `events` sweep. #521 adds the orphan
         // `idx_wallets_weekly` drop: its selector went with the `weekly`
         // subcommand, and the `last_funder_fetch_at` column it covered stays in
         // SCHEMA only so a rolled-back binary can recreate the index.
@@ -893,89 +876,6 @@ impl WalletCache {
         self.conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(BootstrapError::from)
-    }
-
-    /// Store one exact reconciled v2 aggregate under its `g2:` identity.
-    ///
-    /// Consumers cannot observe the generation through the typed read until its
-    /// coverage manifest is installed. Legacy transaction-hash rows have no
-    /// path into this method.
-    pub fn insert_activity_aggregate_v2(
-        &mut self,
-        generation: u64,
-        aggregate: &ActivityAggregate,
-    ) -> Result<(), BootstrapError> {
-        self.require_v2_schema()?;
-        let source_trade_id = aggregate.group_id.key();
-        if !source_trade_id.0.starts_with("g2:") {
-            return Err(BootstrapError::Invalid {
-                message: format!(
-                    "version-two activity identity must start with g2:, got {}",
-                    source_trade_id.0
-                ),
-            });
-        }
-        let components = aggregate.group_id.components();
-        let components_json = serde_json::to_string(components)?;
-        let side = components.side.map(|value| match value {
-            Side::Buy => "buy",
-            Side::Sell => "sell",
-        });
-        let changed = self.conn.execute(
-            "INSERT INTO activity_groups_v2 \
-                 (source_trade_id, coverage_generation, semantic_revision, components_json, \
-                  wallet_hex, transaction_hash, activity_type, condition_id, asset, outcome_id, \
-                  side, row_count, share_amount_str, price_weighted_share_amount_str, \
-                  source_usdc_amount_str, source_time_unix, is_combo, schema_version, \
-                  parser_version) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                     ?15, ?16, ?17, ?18, ?19) \
-             ON CONFLICT(source_trade_id) DO UPDATE SET \
-                 coverage_generation = excluded.coverage_generation, \
-                 semantic_revision = excluded.semantic_revision, \
-                 components_json = excluded.components_json, \
-                 wallet_hex = excluded.wallet_hex, \
-                 transaction_hash = excluded.transaction_hash, \
-                 activity_type = excluded.activity_type, \
-                 condition_id = excluded.condition_id, \
-                 asset = excluded.asset, outcome_id = excluded.outcome_id, side = excluded.side, \
-                 row_count = excluded.row_count, share_amount_str = excluded.share_amount_str, \
-                 price_weighted_share_amount_str = excluded.price_weighted_share_amount_str, \
-                 source_usdc_amount_str = excluded.source_usdc_amount_str, \
-                 source_time_unix = excluded.source_time_unix, is_combo = excluded.is_combo, \
-                 schema_version = excluded.schema_version, parser_version = excluded.parser_version \
-             WHERE activity_groups_v2.semantic_revision = excluded.semantic_revision",
-            params![
-                source_trade_id.0,
-                to_i64_u64(generation, "activity coverage generation")?,
-                aggregate.semantic_revision.as_str(),
-                components_json,
-                components.wallet.to_string(),
-                components.transaction_hash,
-                components.activity_type.as_str(),
-                components.condition_id.as_ref().map(ToString::to_string),
-                components.asset.as_ref().map(ToString::to_string),
-                components.outcome.map(|value| i64::from(value.0)),
-                side,
-                to_i64_u64(aggregate.row_count, "activity row count")?,
-                aggregate.share_sum.to_decimal().to_string(),
-                aggregate.price_weighted_share_sum.0.to_string(),
-                aggregate.source_usdc_sum.to_decimal().to_string(),
-                aggregate.source_time.0.unix_timestamp(),
-                i64::from(aggregate.is_combo),
-                i64::from(ACTIVITY_SCHEMA_VERSION),
-                i64::from(ACTIVITY_PARSER_VERSION),
-            ],
-        )?;
-        if changed == 0 {
-            return Err(BootstrapError::Invalid {
-                message: format!(
-                    "activity group {} was replayed with a different semantic revision",
-                    source_trade_id.0
-                ),
-            });
-        }
-        Ok(())
     }
 
     /// Load only version-two activity aggregates. Sealed v1 rows are
@@ -2371,65 +2271,6 @@ impl WalletCache {
             .ok()
     }
 
-    /// Upsert a batch of per-market fee rows into `market_fees` in one transaction.
-    ///
-    /// Rows are `(condition_id, taker_base_fee_bps, maker_base_fee_bps, fetched_at_unix)`.
-    /// `INSERT OR REPLACE` makes re-sweeps idempotent; `fee_active_from_unix` is always
-    /// written as `NULL` in PR 1 (PR 4 backfills it from `counterparty_edges`).
-    ///
-    /// # Precondition
-    /// Returns immediately without writing when `rows` is empty.
-    pub fn upsert_market_fees_batch(
-        &mut self,
-        rows: &[(String, i32, i32, i64)],
-        fetched_at_unix: i64,
-    ) -> Result<(), BootstrapError> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO market_fees \
-                 (condition_id, taker_base_fee_bps, maker_base_fee_bps, \
-                  fee_active_from_unix, fetched_at_unix) \
-                 VALUES (?1, ?2, ?3, NULL, ?4)",
-            )?;
-            for (condition_id, taker_bps, maker_bps, _fetched) in rows {
-                stmt.execute(params![condition_id, taker_bps, maker_bps, fetched_at_unix])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Load all rows from `market_fees` as a `HashMap<condition_id, MarketFeeRow>`.
-    ///
-    /// # Precondition
-    /// Returns an empty map when the table has not been swept yet.
-    pub fn load_market_fees(
-        &self,
-    ) -> Result<std::collections::HashMap<String, MarketFeeRow>, BootstrapError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT condition_id, taker_base_fee_bps, maker_base_fee_bps FROM market_fees",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                MarketFeeRow {
-                    taker_base_fee_bps: row.get::<_, i32>(1)?,
-                    maker_base_fee_bps: row.get::<_, i32>(2)?,
-                },
-            ))
-        })?;
-        let mut map = std::collections::HashMap::new();
-        for result in rows {
-            let (condition_id, fee_row) = result?;
-            map.insert(condition_id, fee_row);
-        }
-        Ok(map)
-    }
-
     /// Stream per-trade `(market_id, price_str, contracts)` from the `trades`
     /// table, skipping rows with empty `market_id` (issue #207 Slice 1c).
     ///
@@ -2968,6 +2809,9 @@ impl WalletCache {
                     })?;
             stored_rows.push((
                 market_id.to_owned(),
+                item.end_date_iso
+                    .as_deref()
+                    .and_then(pe_source_polymarket_public::parse_clob_end_date),
                 bool_to_sql(item.is_50_50_outcome),
                 item.payout.storage_status(),
                 item.payout.payout_vector_json(),
@@ -3033,12 +2877,13 @@ impl WalletCache {
         {
             let mut statement = tx.prepare(
                 "INSERT INTO clob_payout_evidence_staging_v2 \
-                 (generation, market_id, is_50_50_outcome, payout_status, \
+                 (generation, market_id, end_date_unix, is_50_50_outcome, payout_status, \
                   payout_vector_json, closed, tokens_json, raw_page_sha256, \
                   page_ordinal, schema_version, parser_version, fetched_at_unix, origin) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
                          'clob_closed_walk_v2') \
                  ON CONFLICT(generation, market_id) DO UPDATE SET \
+                    end_date_unix = excluded.end_date_unix, \
                     is_50_50_outcome = excluded.is_50_50_outcome, \
                     payout_status = excluded.payout_status, \
                     payout_vector_json = excluded.payout_vector_json, \
@@ -3051,12 +2896,20 @@ impl WalletCache {
                     fetched_at_unix = excluded.fetched_at_unix, \
                     origin = excluded.origin",
             )?;
-            for (market_id, is_fifty_fifty, payout_status, payout_vector, closed, tokens) in
-                stored_rows
+            for (
+                market_id,
+                end_date_unix,
+                is_fifty_fifty,
+                payout_status,
+                payout_vector,
+                closed,
+                tokens,
+            ) in stored_rows
             {
                 statement.execute(params![
                     generation_i64,
                     market_id,
+                    end_date_unix,
                     is_fifty_fifty,
                     payout_status,
                     payout_vector,
@@ -3224,10 +3077,10 @@ impl WalletCache {
         tx.execute("DELETE FROM clob_payout_evidence_v2", [])?;
         tx.execute(
             "INSERT INTO clob_payout_evidence_v2 \
-             (market_id, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+             (market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
               tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
               schema_version, parser_version, fetched_at_unix, origin) \
-             SELECT market_id, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+             SELECT market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
                     tokens_json, raw_page_sha256, generation, page_ordinal, schema_version, \
                     parser_version, fetched_at_unix, origin \
              FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
@@ -3286,7 +3139,7 @@ impl WalletCache {
         let stored = self
             .conn
             .query_row(
-                "SELECT market_id, is_50_50_outcome, payout_status, payout_vector_json, \
+                "SELECT market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, \
                         closed, tokens_json, raw_page_sha256, coverage_generation, \
                         page_ordinal, schema_version, parser_version, fetched_at_unix, origin \
                  FROM clob_payout_evidence_v2 WHERE market_id = ?1",
@@ -3295,17 +3148,18 @@ impl WalletCache {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                         row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(7)?,
                         row.get::<_, i64>(8)?,
                         row.get::<_, i64>(9)?,
                         row.get::<_, i64>(10)?,
                         row.get::<_, i64>(11)?,
-                        row.get::<_, String>(12)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, String>(13)?,
                     ))
                 },
             )
@@ -3313,28 +3167,29 @@ impl WalletCache {
         let Some(stored) = stored else {
             return Ok(None);
         };
-        let payout = ClobPayoutResolution::from_storage(&stored.2, stored.3.as_deref()).map_err(
+        let payout = ClobPayoutResolution::from_storage(&stored.3, stored.4.as_deref()).map_err(
             |error| BootstrapError::Cache {
                 message: error.to_string(),
             },
         )?;
         Ok(Some(StoredClobPayoutEvidenceV2 {
             market_id: stored.0,
-            is_50_50_outcome: sql_to_bool(stored.1, "is_50_50_outcome")?,
+            end_date_unix: stored.1,
+            is_50_50_outcome: sql_to_bool(stored.2, "is_50_50_outcome")?,
             payout,
-            closed: sql_to_bool(stored.4, "closed")?,
-            tokens_json: stored.5,
-            raw_page_sha256: stored.6,
-            coverage_generation: checked_u64(stored.7, "clob payout generation")?,
-            page_ordinal: checked_u64(stored.8, "clob payout page ordinal")?,
-            schema_version: u32::try_from(stored.9).map_err(|_| BootstrapError::Cache {
+            closed: sql_to_bool(stored.5, "closed")?,
+            tokens_json: stored.6,
+            raw_page_sha256: stored.7,
+            coverage_generation: checked_u64(stored.8, "clob payout generation")?,
+            page_ordinal: checked_u64(stored.9, "clob payout page ordinal")?,
+            schema_version: u32::try_from(stored.10).map_err(|_| BootstrapError::Cache {
                 message: "invalid clob payout schema version".to_owned(),
             })?,
-            parser_version: u32::try_from(stored.10).map_err(|_| BootstrapError::Cache {
+            parser_version: u32::try_from(stored.11).map_err(|_| BootstrapError::Cache {
                 message: "invalid clob payout parser version".to_owned(),
             })?,
-            fetched_at_unix: stored.11,
-            origin: stored.12,
+            fetched_at_unix: stored.12,
+            origin: stored.13,
         }))
     }
 
@@ -4543,12 +4398,6 @@ impl WalletCache {
             .expect("test-only direct SQL must succeed");
         n != 0
     }
-}
-
-fn to_i64_u64(value: u64, field: &str) -> Result<i64, BootstrapError> {
-    i64::try_from(value).map_err(|_| BootstrapError::Cache {
-        message: format!("{field} exceeds SQLite integer range"),
-    })
 }
 
 fn to_u64_i64(value: i64, field: &str) -> Result<u64, BootstrapError> {

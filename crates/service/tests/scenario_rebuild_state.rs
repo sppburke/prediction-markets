@@ -10,18 +10,20 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use pe_core_types::{
-    ContractQty, MarketId, OutcomeId, Price, Side, SourceId, SourceTimestamp, SourceTradeId,
-    StrategyId, VenueMarketId, WalletAddress,
+    CollateralAmount, ContractQty, EventSeq, MarketId, OutcomeId, Price, ReceivedAt, ShareAmount,
+    Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::Writer;
+use pe_event_log::{ContentType, EnvelopeIn, Writer};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
 use pe_service::paper_recovery::reconcile_paper_state;
-use pe_strategy_winner_follow::PaperExecutor;
 use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
+
+mod support;
+use support::{LegacyFillSource, LegacyPaperFill};
 
 fn market() -> MarketId {
     MarketId(VenueMarketId("0xmarket".to_string()))
@@ -54,6 +56,49 @@ fn intent(key: &str, side: Side, contracts: u64, price: Decimal) -> OrderIntent 
     }
 }
 
+fn append_legacy_fill(
+    writer: &mut Writer,
+    intent: OrderIntent,
+    fill_price: Price,
+    timestamp: SourceTimestamp,
+) -> (LegacyPaperFill, EventSeq) {
+    let fill = LegacyPaperFill {
+        intent,
+        simulated_fill_price: fill_price,
+        simulated_at: timestamp.clone(),
+        fill_source: LegacyFillSource::LeaderHaircut,
+    };
+    let receipt = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("test.paper".into()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: timestamp.clone(),
+            received_at: ReceivedAt(timestamp.0),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&fill).unwrap(),
+        })
+        .unwrap();
+    (fill, receipt.sequence)
+}
+
+fn exact_record(fill: &LegacyPaperFill) -> FillRecord {
+    let quantity = ShareAmount::from_whole(fill.intent.contracts.0).unwrap();
+    FillRecord {
+        idempotency_key: fill.intent.idempotency_key.clone(),
+        market_id: fill.intent.market_id.clone(),
+        outcome_id: fill.intent.outcome_id,
+        side: fill.intent.side,
+        quantity,
+        fill_price: fill.simulated_fill_price,
+        principal: CollateralAmount::from_decimal_exact(
+            fill.simulated_fill_price.0 * quantity.to_decimal(),
+        )
+        .unwrap(),
+        fee: CollateralAmount::ZERO,
+    }
+}
+
 /// Scenario: rebuild from event log matches original DB state.
 ///
 /// PASS: fresh DB reconciled from event log has identical fills, positions, bankroll.
@@ -74,34 +119,20 @@ fn rebuild_state_matches_original() {
     let orig = PaperStateDb::open(&orig_db_path).unwrap();
     orig.init_bankroll(initial).unwrap();
 
-    let writer = Writer::open(&log_path).unwrap();
-    let mut executor = PaperExecutor::new(writer, SourceId("test".into()), 0, 0);
+    let mut writer = Writer::open(&log_path).unwrap();
 
     // BUY 10 @ 0.40
     let i1 = intent("k1", Side::Buy, 10, dec!(0.40));
-    let (f1, seq1) = executor.execute(&i1, ts.clone(), None).unwrap();
-    let r1 = FillRecord {
-        idempotency_key: f1.intent.idempotency_key.clone(),
-        market_id: f1.intent.market_id.clone(),
-        outcome_id: f1.intent.outcome_id,
-        side: f1.intent.side,
-        contracts: f1.intent.contracts.0,
-        fill_price: f1.simulated_fill_price,
-    };
+    let (f1, seq1) =
+        append_legacy_fill(&mut writer, i1, Price::new(dec!(0.40)).unwrap(), ts.clone());
+    let r1 = exact_record(&f1);
     orig.commit_fill(&SourceTradeId("tx1".to_string()), &leader(10), &r1, seq1)
         .unwrap();
 
     // BUY 5 @ 0.60
     let i2 = intent("k2", Side::Buy, 5, dec!(0.60));
-    let (f2, seq2) = executor.execute(&i2, ts, None).unwrap();
-    let r2 = FillRecord {
-        idempotency_key: f2.intent.idempotency_key.clone(),
-        market_id: f2.intent.market_id.clone(),
-        outcome_id: f2.intent.outcome_id,
-        side: f2.intent.side,
-        contracts: f2.intent.contracts.0,
-        fill_price: f2.simulated_fill_price,
-    };
+    let (f2, seq2) = append_legacy_fill(&mut writer, i2, Price::new(dec!(0.60)).unwrap(), ts);
+    let r2 = exact_record(&f2);
     orig.commit_fill(&SourceTradeId("tx2".to_string()), &leader(15), &r2, seq2)
         .unwrap();
 
@@ -126,10 +157,7 @@ fn rebuild_state_matches_original() {
     assert_eq!(rebuilt_seq, orig_seq, "last_applied_event_seq mismatch");
     assert_eq!(rebuilt_pos.len(), orig_pos.len(), "position count mismatch");
     if let (Some(rp), Some(op)) = (rebuilt_pos.first(), orig_pos.first()) {
-        assert_eq!(
-            rp.long_contracts, op.long_contracts,
-            "long_contracts mismatch"
-        );
+        assert_eq!(rp.long, op.long, "long_contracts mismatch");
     }
 
     println!(
@@ -183,12 +211,14 @@ fn rebuild_never_synthesizes_dispatch_targets() {
     // Original run: one fill through the executor + a staged, flipped dispatch seed.
     let db = PaperStateDb::open(&db_path).unwrap();
     db.init_bankroll(dec!(1000)).unwrap();
-    let writer = Writer::open(&log_path).unwrap();
-    let mut executor = PaperExecutor::new(writer, SourceId("test.paper".into()), 500, 100);
+    let mut writer = Writer::open(&log_path).unwrap();
     let one = intent("wf|k508", Side::Buy, 10, dec!(0.40));
-    let (fill, seq) = executor
-        .execute(&one, SourceTimestamp(OffsetDateTime::UNIX_EPOCH), None)
-        .unwrap();
+    let (fill, seq) = append_legacy_fill(
+        &mut writer,
+        one,
+        Price::new(dec!(0.42)).unwrap(),
+        SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+    );
     db.stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
         dispatch_id: "wf|k508".to_string(),
         signal_json: "{\"schema_version\":1}".to_string(),
@@ -204,14 +234,7 @@ fn rebuild_never_synthesizes_dispatch_targets() {
     db.commit_fill_with_flip(
         &SourceTradeId("src-508".to_string()),
         &leader(10),
-        &FillRecord {
-            idempotency_key: fill.intent.idempotency_key.clone(),
-            market_id: fill.intent.market_id.clone(),
-            outcome_id: fill.intent.outcome_id,
-            side: fill.intent.side,
-            contracts: fill.intent.contracts.0,
-            fill_price: fill.simulated_fill_price,
-        },
+        &exact_record(&fill),
         seq,
         Some(pe_paper_state::DispatchFlip {
             dispatch_id: "wf|k508",

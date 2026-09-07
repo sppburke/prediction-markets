@@ -35,13 +35,17 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
+};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use pe_core_types::{
-    EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
+    CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
     SourceTradeIdentityVersion, VenueMarketId, WalletAddress,
 };
+use pe_event_log::AppendReceipt;
 
 pub use migration::{
     BoundaryField, BoundaryMismatch, DurableLogBindings, DurableLogName, MigrationMetadata,
@@ -50,7 +54,9 @@ pub use migration::{
 };
 pub use schema::SCHEMA_VERSION;
 use schema::{
-    BANKROLL_ROW_ID, META_LAST_APPLIED_EVENT_SEQ, META_LAST_SUPABASE_APPLIED_EVENT_SEQ, SCHEMA,
+    BANKROLL_ROW_ID, LEGACY_EXACT_MIGRATION_VERSION, META_FINANCIAL_LAST_PREPARED_SEQ,
+    META_FINANCIAL_START_HASH, META_FINANCIAL_START_SEQ, META_LAST_APPLIED_EVENT_SEQ,
+    META_LAST_SUPABASE_APPLIED_EVENT_SEQ, SCHEMA,
 };
 
 /// Errors from the paper-state store.
@@ -134,9 +140,44 @@ pub enum PaperStateError {
     /// A terminal continuation was replayed with a different terminal transition.
     #[error("paper-state decision_pending terminal transition conflict for {0}")]
     DecisionPendingConflict(String),
+    /// A seal requested an immutable evidence row that is absent.
+    #[error("qualification seal evidence is missing {table} for {source_trade_id}")]
+    SealEvidenceMissing {
+        table: &'static str,
+        source_trade_id: String,
+    },
+    /// A source-keyed seal row does not bind the requested immutable revision.
+    #[error(
+        "qualification seal evidence revision mismatch for {source_trade_id}: requested {requested}, stored {stored}"
+    )]
+    SealEvidenceRevisionMismatch {
+        source_trade_id: String,
+        requested: String,
+        stored: String,
+    },
+    /// A seal key appeared more than once in the ordered source selection.
+    #[error(
+        "qualification seal evidence contains duplicate key {source_trade_id}/{semantic_revision}"
+    )]
+    DuplicateSealEvidenceKey {
+        source_trade_id: String,
+        semantic_revision: String,
+    },
+    /// SQLite contains a post-Start decision key not present in the independently parsed source
+    /// prefix, or omits one that the source prefix requires.
+    #[error(
+        "qualification seal decision selection differs from the source prefix: requested {requested}, stored {stored}"
+    )]
+    SealEvidenceSelectionMismatch { requested: usize, stored: usize },
     /// The one-time legacy history input was not a valid sidecar.
     #[error("legacy wallet history import is invalid: {0}")]
     InvalidLegacyHistory(String),
+    /// A second distinct QualificationStarted identity attempted to reset an active era.
+    #[error("paper financial Start conflicts with the stored Start identity")]
+    FinancialStartConflict,
+    /// A Prepared retry changed its predecessor, identity, or exact economics.
+    #[error("paper financial protocol conflict: {0}")]
+    FinancialConflict(String),
 }
 
 /// One leader's net position in a `(market, outcome)`, mirroring the in-memory
@@ -303,10 +344,143 @@ pub struct DecisionPendingRow {
     pub updated_at_unix: i64,
 }
 
+type DecisionPendingTuple = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+);
+
+fn decision_pending_row(row: DecisionPendingTuple) -> Result<DecisionPendingRow, PaperStateError> {
+    let (id, revision, wallet, epoch, frozen, post, state, terminal, updated) = row;
+    Ok(DecisionPendingRow {
+        source_trade_id: SourceTradeId(id),
+        semantic_revision: revision,
+        wallet: parse_wallet(&wallet)?,
+        source_epoch: epoch,
+        frozen_inputs_json: frozen,
+        post_commit_inputs_json: post,
+        state: parse_pending_state(&state)?,
+        terminal_disposition: terminal,
+        updated_at_unix: updated,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionPendingState {
     Open,
     Terminal,
+}
+
+const SEAL_DECISION_EVIDENCE_DOMAIN: &str = "prediction-edge/seal-decision-evidence";
+const SEAL_DECISION_EVIDENCE_VERSION: u16 = 1;
+
+#[derive(Serialize)]
+struct SealDecisionEvidenceDocument {
+    domain: &'static str,
+    version: u16,
+    rows: Vec<SealDecisionEvidenceRow>,
+}
+
+#[derive(Serialize)]
+struct SealDecisionEvidenceRow {
+    source_trade_id: String,
+    semantic_revision: String,
+    activity_group: SealActivityGroup,
+    activity_group_revision: SealActivityGroupRevision,
+    entry_gate_result: SealEntryGateResult,
+    no_copy_disposition: Option<SealNoCopyDisposition>,
+    terminal_decision: SealTerminalDecision,
+}
+
+#[derive(Serialize)]
+struct SealActivityGroup {
+    transaction_hash: String,
+    wallet_hex: String,
+    source_epoch: i64,
+    activity_type: String,
+    disposition: String,
+    proof_json: String,
+}
+
+#[derive(Serialize)]
+struct SealActivityGroupRevision {
+    transaction_hash: String,
+    disposition: String,
+    proof_json: String,
+    recorded_at_unix: i64,
+}
+
+#[derive(Serialize)]
+struct SealEntryGateResult {
+    wallet_hex: String,
+    market_id: String,
+    source_epoch: i64,
+    result: String,
+    history_consumed: i64,
+}
+
+#[derive(Serialize)]
+struct SealNoCopyDisposition {
+    provenance: String,
+    age_secs: i64,
+    reason: String,
+    recorded_at_unix: i64,
+}
+
+#[derive(Serialize)]
+struct SealTerminalDecision {
+    wallet_hex: String,
+    source_epoch: i64,
+    frozen_inputs_json: String,
+    post_commit_inputs_json: String,
+    terminal_disposition: String,
+    updated_at_unix: i64,
+}
+
+struct SelectedSealTerminal {
+    semantic_revision: String,
+    wallet_hex: String,
+    source_epoch: i64,
+    frozen_inputs_json: String,
+    post_commit_inputs_json: String,
+    state: String,
+    terminal_disposition: Option<String>,
+    updated_at_unix: i64,
+}
+
+#[derive(Deserialize)]
+struct SealDecisionScope {
+    version: u16,
+    #[serde(default)]
+    observed_source_receipt: Option<AppendReceipt>,
+    #[serde(default)]
+    page_occurrences: Vec<SealPageOccurrence>,
+}
+
+#[derive(Deserialize)]
+struct SealPageOccurrence {
+    receipt: AppendReceipt,
+}
+
+fn validate_seal_decision_keys(
+    keys: &[(SourceTradeId, String)],
+) -> Result<BTreeSet<(String, String)>, PaperStateError> {
+    let mut unique = BTreeSet::new();
+    for (source_trade_id, semantic_revision) in keys {
+        if !unique.insert((source_trade_id.0.clone(), semantic_revision.clone())) {
+            return Err(PaperStateError::DuplicateSealEvidenceKey {
+                source_trade_id: source_trade_id.0.clone(),
+                semantic_revision: semantic_revision.clone(),
+            });
+        }
+    }
+    Ok(unique)
 }
 
 /// Caller-rendered versioned evidence attached to a terminal pending-decision
@@ -361,15 +535,6 @@ pub struct LegacyHistoryImport {
     pub already_imported: bool,
 }
 
-/// One of our own net paper positions in a `(market, outcome)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaperPositionRow {
-    pub market_id: MarketId,
-    pub outcome_id: OutcomeId,
-    pub long_contracts: u64,
-    pub short_contracts: u64,
-}
-
 /// Outcome of a local fill commit (#511). Both arms carry the post-commit bankroll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillCommitOutcome {
@@ -380,42 +545,78 @@ pub enum FillCommitOutcome {
     RefusedSettled(Decimal),
 }
 
-/// A paper fill to record. Built by the service tier from the executed `OrderIntent`
-/// and the `PaperFill` returned by the executor.
+/// One settled market, read back from the `settled_markets` table to hydrate the
+/// resolution double-credit guard (issue #343 step 0). `outcome_prices_json` is the
+/// caller-owned JSON-encoded vector of text decimals, returned verbatim — this crate
+/// does not interpret it. `credit_applied` follows the crate's text-decimal convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledMarketRow {
+    pub market_id: MarketId,
+    pub outcome_prices_json: String,
+    pub credit_applied: Decimal,
+    pub settled_at_unix: i64,
+    pub prepared_seq: Option<EventSeq>,
+    pub source_receipt_seq: Option<EventSeq>,
+}
+
+/// The exact local paper position owner for both legacy recovery and the active era.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperPositionRow {
+    pub market_id: MarketId,
+    pub outcome_id: OutcomeId,
+    pub long: ShareAmount,
+    pub short: ShareAmount,
+}
+
+/// Exact paper fill economics. Schema-one recovery converts its private whole-contract
+/// payload into this public shape before touching the projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillRecord {
     pub idempotency_key: String,
     pub market_id: MarketId,
     pub outcome_id: OutcomeId,
     pub side: Side,
-    pub contracts: u64,
+    pub quantity: ShareAmount,
     pub fill_price: Price,
+    pub principal: CollateralAmount,
+    pub fee: CollateralAmount,
 }
 
-/// A recorded paper fill, read back from the `fills` table for inspection
-/// (dashboard, `/paper/fills`). The `idempotency_key` still encodes the leader,
-/// source trade id and observed-at bucket; callers parse it for those fields.
-#[derive(Debug, Clone)]
+/// Exact persisted fill row returned by [`PaperStateDb::list_fills`] and
+/// [`FinancialSnapshot`]. `event_seq` remains the paper-log frame identity; in the
+/// financial era it equals `prepared_seq`. Legacy migrated rows have no source receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillRow {
     pub idempotency_key: String,
     pub market_id: MarketId,
     pub outcome_id: OutcomeId,
     pub side: Side,
-    pub contracts: u64,
+    pub quantity: ShareAmount,
     pub fill_price: Price,
-    pub event_seq: i64,
+    pub principal: CollateralAmount,
+    pub fee: CollateralAmount,
+    pub event_seq: EventSeq,
+    pub prepared_seq: EventSeq,
+    pub source_receipt_seq: Option<EventSeq>,
 }
 
-/// One settled market, read back from the `settled_markets` table to hydrate the
-/// resolution double-credit guard (issue #343 step 0). `outcome_prices_json` is the
-/// caller-owned JSON-encoded vector of text decimals, returned verbatim — this crate
-/// does not interpret it. `credit_applied` follows the crate's text-decimal convention.
-#[derive(Debug, Clone)]
-pub struct SettledMarketRow {
-    pub market_id: MarketId,
-    pub outcome_prices_json: String,
-    pub credit_applied: Decimal,
-    pub settled_at_unix: i64,
+/// Bounded coherent view of the financial projection. All fields are selected from one
+/// SQLite read transaction, so a Prepared projection cannot be observed partially.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinancialSnapshot {
+    pub cash: Decimal,
+    pub positions: Vec<PaperPositionRow>,
+    pub settlements_7d: Vec<SettledMarketRow>,
+    pub fills_for_open_and_7d: Vec<FillRow>,
+    pub last_prepared_seq: Option<EventSeq>,
+    pub start: Option<(EventSeq, blake3::Hash)>,
+}
+
+/// Local convergence outcome for an exact Prepared transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinancialApplyOutcome {
+    Applied { cash: Decimal },
+    Existing { cash: Decimal },
 }
 
 /// A fill-time market-liquidity snapshot row in the `fill_market_snapshots` table
@@ -507,7 +708,7 @@ impl PaperStateDb {
     /// differs from [`SCHEMA_VERSION`] is rejected with
     /// [`PaperStateError::SchemaVersionMismatch`] rather than silently mis-read.
     pub fn open(path: &Path) -> Result<Self, PaperStateError> {
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
@@ -515,14 +716,17 @@ impl PaperStateDb {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if found != 0 && found != SCHEMA_VERSION {
+        if found != 0 && found != LEGACY_EXACT_MIGRATION_VERSION && found != SCHEMA_VERSION {
             return Err(PaperStateError::SchemaVersionMismatch {
                 found,
                 expected: SCHEMA_VERSION,
             });
         }
         conn.execute_batch(SCHEMA)?;
-        if found == 0 {
+        if found == LEGACY_EXACT_MIGRATION_VERSION {
+            migrate_v2_financial_columns(&mut conn)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if found == 0 {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         // Additive guarded migrations: CREATE IF NOT EXISTS above cannot add columns
@@ -552,7 +756,48 @@ impl PaperStateDb {
                 conn.execute(alter, [])?;
             }
         }
+        for (column, alter) in [
+            (
+                "source_receipt_seq",
+                "ALTER TABLE fills ADD COLUMN source_receipt_seq INTEGER",
+            ),
+            (
+                "source_receipt_hash",
+                "ALTER TABLE fills ADD COLUMN source_receipt_hash TEXT",
+            ),
+            (
+                "causal_received_at_unix",
+                "ALTER TABLE fills ADD COLUMN causal_received_at_unix INTEGER",
+            ),
+        ] {
+            let has_column: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('fills') WHERE name = ?1")?
+                .exists(params![column])?;
+            if !has_column {
+                conn.execute(alter, [])?;
+            }
+        }
 
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Open an existing database without DDL, migration, or write permission.
+    ///
+    /// Qualification verification uses this entry point so merely producing a report cannot
+    /// create a database, advance a projection, or modify a schema (#545).
+    pub fn open_read_only(path: &Path) -> Result<Self, PaperStateError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "query_only", true)?;
+        let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found != SCHEMA_VERSION {
+            return Err(PaperStateError::SchemaVersionMismatch {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1159,6 +1404,40 @@ impl PaperStateDb {
         Ok(complete == Some(1))
     }
 
+    /// Return the exact durable complete-history proof for one wallet.
+    ///
+    /// Callers that publish immutable membership evidence need the proof preimage, not only the
+    /// current boolean projection exposed by [`Self::wallet_history_complete`].
+    pub fn wallet_history_status(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Option<WalletHistoryStatusRecord>, PaperStateError> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT complete, proof_json, updated_at_unix \
+                 FROM wallet_history_status_v2 WHERE wallet_hex = ?1",
+                params![wallet.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(complete, proof_json, updated_at_unix)| {
+            Ok(WalletHistoryStatusRecord {
+                wallet: *wallet,
+                complete: parse_bool_flag(complete, "wallet history complete")?,
+                proof_json,
+                updated_at_unix,
+            })
+        })
+        .transpose()
+    }
+
     /// Persist the result of a complete reconciled-history obligation (#544).
     ///
     /// Source ingestion owns the proof; membership only consumes this durable status.
@@ -1636,20 +1915,308 @@ impl PaperStateDb {
         })?;
         let mut history = Vec::new();
         for row in rows {
-            let (id, revision, wallet, epoch, frozen, post, state, terminal, updated) = row?;
-            history.push(DecisionPendingRow {
-                source_trade_id: SourceTradeId(id),
-                semantic_revision: revision,
-                wallet: parse_wallet(&wallet)?,
-                source_epoch: epoch,
-                frozen_inputs_json: frozen,
-                post_commit_inputs_json: post,
-                state: parse_pending_state(&state)?,
-                terminal_disposition: terminal,
-                updated_at_unix: updated,
-            });
+            history.push(decision_pending_row(row?)?);
         }
         Ok(history)
+    }
+
+    /// Read one durable decision continuation by its source trade id (`None` when absent).
+    pub fn decision_pending_for(
+        &self,
+        source_trade_id: &SourceTradeId,
+    ) -> Result<Option<DecisionPendingRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+                    frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
+                    updated_at_unix \
+             FROM decision_pending WHERE source_trade_id = ?1",
+        )?;
+        let mut rows = statement.query_map([source_trade_id.0.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+        rows.next()
+            .map(|row| decision_pending_row(row?))
+            .transpose()
+    }
+
+    /// Select the immutable decision evidence named by an ordered source-prefix replay.
+    ///
+    /// The complete selection occurs in one read transaction. Source-keyed projections are
+    /// accepted only when both the immutable base group and terminal continuation bind the
+    /// requested semantic revision. The returned version-one document is compact JSON with one
+    /// trailing line feed; callers hash these exact bytes for `QualificationSealed` (#545).
+    pub fn seal_decision_evidence(
+        &self,
+        keys: &[(SourceTradeId, String)],
+    ) -> Result<Vec<u8>, PaperStateError> {
+        validate_seal_decision_keys(keys)?;
+
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let bytes = Self::seal_decision_evidence_in_transaction(&tx, keys)?;
+        tx.commit()?;
+        Ok(bytes)
+    }
+
+    /// Seal the source-derived key set and prove that it is the exact version-three decision set
+    /// for the source receipt interval. The selection and every companion read share one SQLite
+    /// read transaction, so a missing, open, additional, or revision-mismatched row cannot be
+    /// hidden by a self-consistent projection read.
+    pub fn seal_decision_evidence_for_source_prefix(
+        &self,
+        keys: &[(SourceTradeId, String)],
+        start_exclusive: Option<EventSeq>,
+        sealed_inclusive: Option<EventSeq>,
+    ) -> Result<Vec<u8>, PaperStateError> {
+        let requested = validate_seal_decision_keys(keys)?;
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut statement = tx.prepare(
+            "SELECT source_trade_id, semantic_revision, frozen_inputs_json \
+             FROM decision_pending ORDER BY source_trade_id",
+        )?;
+        let candidates = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut stored = BTreeSet::new();
+        for candidate in candidates {
+            let (source_trade_id, semantic_revision, frozen_inputs_json) = candidate?;
+            let scope: SealDecisionScope = serde_json::from_str(&frozen_inputs_json)?;
+            let receipts = scope
+                .page_occurrences
+                .iter()
+                .map(|page| page.receipt)
+                .chain(scope.observed_source_receipt)
+                .collect::<Vec<_>>();
+            let in_scope = scope.version == 3
+                && !receipts.is_empty()
+                && receipts.iter().all(|receipt| {
+                    start_exclusive.is_none_or(|start| receipt.sequence > start)
+                        && sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
+                });
+            if in_scope {
+                stored.insert((source_trade_id, semantic_revision));
+            }
+        }
+        drop(statement);
+        if requested != stored {
+            return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                requested: requested.len(),
+                stored: stored.len(),
+            });
+        }
+        let bytes = Self::seal_decision_evidence_in_transaction(&tx, keys)?;
+        tx.commit()?;
+        Ok(bytes)
+    }
+
+    fn seal_decision_evidence_in_transaction(
+        tx: &Transaction<'_>,
+        keys: &[(SourceTradeId, String)],
+    ) -> Result<Vec<u8>, PaperStateError> {
+        let mut evidence_rows = Vec::with_capacity(keys.len());
+        for (source_trade_id, requested_revision) in keys {
+            let group: Option<(String, String, i64, String, String, String, String)> = tx
+                .query_row(
+                    "SELECT transaction_hash, wallet_hex, source_epoch, semantic_revision, \
+                            activity_type, disposition, proof_json \
+                     FROM activity_groups WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                group_transaction_hash,
+                group_wallet,
+                group_epoch,
+                group_revision,
+                activity_type,
+                group_disposition,
+                group_proof,
+            )) = group
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "activity_groups",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+            if group_revision != *requested_revision {
+                return Err(PaperStateError::SealEvidenceRevisionMismatch {
+                    source_trade_id: source_trade_id.0.clone(),
+                    requested: requested_revision.clone(),
+                    stored: group_revision,
+                });
+            }
+
+            let revision: Option<(String, String, String, i64)> = tx
+                .query_row(
+                    "SELECT transaction_hash, disposition, proof_json, recorded_at_unix \
+                     FROM activity_group_revisions \
+                     WHERE source_trade_id = ?1 AND semantic_revision = ?2",
+                    params![source_trade_id.0, requested_revision],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((revision_transaction_hash, revision_disposition, revision_proof, recorded)) =
+                revision
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "activity_group_revisions",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+
+            let gate: Option<(String, String, i64, String, i64)> = tx
+                .query_row(
+                    "SELECT wallet_hex, market_id, source_epoch, result, history_consumed \
+                     FROM entry_gate_results WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((gate_wallet, market_id, gate_epoch, gate_result, history_consumed)) = gate
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "entry_gate_results",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+
+            let no_copy = tx
+                .query_row(
+                    "SELECT provenance, age_secs, reason, recorded_at_unix \
+                     FROM no_copy_dispositions WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok(SealNoCopyDisposition {
+                            provenance: row.get(0)?,
+                            age_secs: row.get(1)?,
+                            reason: row.get(2)?,
+                            recorded_at_unix: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+
+            let terminal: Option<SelectedSealTerminal> = tx
+                .query_row(
+                    "SELECT semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, \
+                            post_commit_inputs_json, state, terminal_disposition, updated_at_unix \
+                     FROM decision_pending WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| {
+                        Ok(SelectedSealTerminal {
+                            semantic_revision: row.get(0)?,
+                            wallet_hex: row.get(1)?,
+                            source_epoch: row.get(2)?,
+                            frozen_inputs_json: row.get(3)?,
+                            post_commit_inputs_json: row.get(4)?,
+                            state: row.get(5)?,
+                            terminal_disposition: row.get(6)?,
+                            updated_at_unix: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(terminal) = terminal else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "decision_pending",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+            if terminal.semantic_revision != *requested_revision {
+                return Err(PaperStateError::SealEvidenceRevisionMismatch {
+                    source_trade_id: source_trade_id.0.clone(),
+                    requested: requested_revision.clone(),
+                    stored: terminal.semantic_revision,
+                });
+            }
+            let Some(terminal_disposition) = terminal
+                .terminal_disposition
+                .filter(|_| terminal.state == "terminal")
+            else {
+                return Err(PaperStateError::SealEvidenceMissing {
+                    table: "terminal decision_pending",
+                    source_trade_id: source_trade_id.0.clone(),
+                });
+            };
+
+            evidence_rows.push(SealDecisionEvidenceRow {
+                source_trade_id: source_trade_id.0.clone(),
+                semantic_revision: requested_revision.clone(),
+                activity_group: SealActivityGroup {
+                    transaction_hash: group_transaction_hash,
+                    wallet_hex: group_wallet,
+                    source_epoch: group_epoch,
+                    activity_type,
+                    disposition: group_disposition,
+                    proof_json: group_proof,
+                },
+                activity_group_revision: SealActivityGroupRevision {
+                    transaction_hash: revision_transaction_hash,
+                    disposition: revision_disposition,
+                    proof_json: revision_proof,
+                    recorded_at_unix: recorded,
+                },
+                entry_gate_result: SealEntryGateResult {
+                    wallet_hex: gate_wallet,
+                    market_id,
+                    source_epoch: gate_epoch,
+                    result: gate_result,
+                    history_consumed,
+                },
+                no_copy_disposition: no_copy,
+                terminal_decision: SealTerminalDecision {
+                    wallet_hex: terminal.wallet_hex,
+                    source_epoch: terminal.source_epoch,
+                    frozen_inputs_json: terminal.frozen_inputs_json,
+                    post_commit_inputs_json: terminal.post_commit_inputs_json,
+                    terminal_disposition,
+                    updated_at_unix: terminal.updated_at_unix,
+                },
+            });
+        }
+        let document = SealDecisionEvidenceDocument {
+            domain: SEAL_DECISION_EVIDENCE_DOMAIN,
+            version: SEAL_DECISION_EVIDENCE_VERSION,
+            rows: evidence_rows,
+        };
+        let mut bytes = serde_json::to_vec(&document)?;
+        bytes.push(b'\n');
+        Ok(bytes)
     }
 
     /// Whether one bucket-applied delivery still owns an open continuation.
@@ -2490,7 +3057,7 @@ impl PaperStateDb {
         let conn = self.lock();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM positions p \
-             WHERE (p.long_contracts > 0 OR p.short_contracts > 0) \
+             WHERE (CAST(p.long_str AS NUMERIC) > 0 OR CAST(p.short_str AS NUMERIC) > 0) \
                AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id)",
             [],
             |row| row.get(0),
@@ -2498,6 +3065,38 @@ impl PaperStateDb {
         usize::try_from(n).map_err(|_| {
             PaperStateError::Internal(format!("positions_count {n} exceeds usize::MAX"))
         })
+    }
+
+    /// The genuinely OPEN positions — net-nonzero rows whose market has not settled — with the
+    /// same semantic as `positions_count`, portfolio valuation, and the financial snapshot. Risk
+    /// pricing must select markets from this set, never from the cumulative `positions` table.
+    pub fn open_positions(&self) -> Result<Vec<PaperPositionRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT p.market_id, p.outcome_id, p.long_str, p.short_str FROM positions p \
+             WHERE (CAST(p.long_str AS NUMERIC) > 0 OR CAST(p.short_str AS NUMERIC) > 0) \
+               AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id) \
+             ORDER BY p.market_id, p.outcome_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (market, outcome, long, short) = row?;
+            out.push(PaperPositionRow {
+                market_id: MarketId(VenueMarketId(market)),
+                outcome_id: OutcomeId(parse_u16(outcome)?),
+                long: parse_share_amount(&long)?,
+                short: parse_share_amount(&short)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Number of settled-market rows. Cheap `COUNT(*)` for the status snapshot.
@@ -2509,38 +3108,63 @@ impl PaperStateDb {
             .map_err(|_| PaperStateError::Internal(format!("settled_count {n} exceeds usize::MAX")))
     }
 
-    /// All recorded fills in chronological (event-log) order, newest last.
+    /// Exact lifetime fill history in Prepared/event-log order. Risk continues to use the bounded
+    /// transactional [`FinancialSnapshot`]; this reader preserves endpoint and maintenance scope.
     pub fn list_fills(&self) -> Result<Vec<FillRow>, PaperStateError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT idempotency_key, market_id, outcome_id, side, contracts, fill_price_str, \
-             event_seq FROM fills ORDER BY event_seq ASC",
+        let mut statement = conn.prepare(
+            "SELECT idempotency_key, market_id, outcome_id, side, quantity_str, \
+                    fill_price_str, principal_str, fee_str, event_seq, prepared_seq, \
+                    source_receipt_seq \
+             FROM fills ORDER BY prepared_seq, idempotency_key",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
+                row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<i64>>(10)?,
             ))
         })?;
-        let mut out = Vec::new();
+        let mut result = Vec::new();
         for row in rows {
-            let (key, market, outcome, side, contracts, price_str, event_seq) = row?;
-            out.push(FillRow {
+            let (
+                key,
+                market,
+                outcome,
+                side,
+                quantity,
+                price,
+                principal,
+                fee,
+                event,
+                prepared,
+                source_receipt,
+            ) = row?;
+            result.push(FillRow {
                 idempotency_key: key,
                 market_id: MarketId(VenueMarketId(market)),
                 outcome_id: OutcomeId(parse_u16(outcome)?),
                 side: parse_side(&side)?,
-                contracts: parse_u64(contracts)?,
-                fill_price: Price(parse_decimal(&price_str)?),
-                event_seq,
+                quantity: parse_share_amount(&quantity)?,
+                fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
+                    PaperStateError::Corrupt(format!("financial fill price: {error}"))
+                })?,
+                principal: parse_collateral_amount(&principal)?,
+                fee: parse_collateral_amount(&fee)?,
+                event_seq: EventSeq(parse_u64(event)?),
+                prepared_seq: EventSeq(parse_u64(prepared)?),
+                source_receipt_seq: source_receipt.map(parse_u64).transpose()?.map(EventSeq),
             });
         }
-        Ok(out)
+        Ok(result)
     }
 
     // ── Reconciliation cursor ────────────────────────────────────────────────
@@ -2595,6 +3219,460 @@ impl PaperStateDb {
         Ok(())
     }
 
+    // ── #545 exact financial protocol ──────────────────────────────────────
+
+    /// Atomically begin the financial era with an empty exact paper book.
+    ///
+    /// Only the five financial tables and their replay-version metadata are reset. Source
+    /// decisions, leader state, fences, anchors, dispatch evidence, and every append-only log
+    /// remain untouched. An equal retry is idempotent only when the reset is already complete;
+    /// a different Start is always a conflict.
+    pub fn reset_financial_era(
+        &self,
+        start: AppendReceipt,
+        starting_bankroll: CollateralAmount,
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if let Some(stored) = tx_financial_start(&tx)? {
+            if stored != start {
+                return Err(PaperStateError::FinancialStartConflict);
+            }
+            let cash = tx_read_bankroll(&tx)?;
+            let empty = tx.query_row(
+                "SELECT (SELECT COUNT(*) FROM fills) + \
+                        (SELECT COUNT(*) FROM positions) + \
+                        (SELECT COUNT(*) FROM settled_markets) + \
+                        (SELECT COUNT(*) FROM fill_market_snapshots)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? == 0;
+            if empty
+                && cash == starting_bankroll.to_decimal()
+                && tx_financial_last_prepared(&tx)?.is_none()
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(PaperStateError::FinancialConflict(
+                "financial-era reset retry differs from stored state".to_owned(),
+            ));
+        }
+
+        tx.execute("DELETE FROM fill_market_snapshots", [])?;
+        tx.execute("DELETE FROM fills", [])?;
+        tx.execute("DELETE FROM positions", [])?;
+        tx.execute("DELETE FROM settled_markets", [])?;
+        tx.execute("DELETE FROM bankroll", [])?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4, ?5)",
+            params![
+                META_LAST_APPLIED_EVENT_SEQ,
+                META_LAST_SUPABASE_APPLIED_EVENT_SEQ,
+                META_FINANCIAL_START_SEQ,
+                META_FINANCIAL_START_HASH,
+                META_FINANCIAL_LAST_PREPARED_SEQ,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2)",
+            params![BANKROLL_ROW_ID, starting_bankroll.to_decimal().to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            params![META_FINANCIAL_START_SEQ, to_i64(start.sequence.0)?],
+        )?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            params![
+                META_FINANCIAL_START_HASH,
+                start.this_hash.to_hex().to_string()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Install the one QualificationStarted receipt in local metadata. An equal retry is
+    /// idempotent; a later distinct Start is a conflict and can never reset the book.
+    pub fn seed_financial_start(&self, start: AppendReceipt) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        match tx_financial_start(&tx)? {
+            None => {
+                if tx_financial_last_prepared(&tx)?.is_some() {
+                    return Err(PaperStateError::FinancialConflict(
+                        "last Prepared exists without a Start".to_owned(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    params![META_FINANCIAL_START_SEQ, to_i64(start.sequence.0)?],
+                )?;
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    params![
+                        META_FINANCIAL_START_HASH,
+                        start.this_hash.to_hex().to_string()
+                    ],
+                )?;
+            }
+            Some(stored) if stored == start => {}
+            Some(_) => return Err(PaperStateError::FinancialStartConflict),
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The active Start identity, if any. Partial metadata is reported as corruption.
+    pub fn financial_start(&self) -> Result<Option<AppendReceipt>, PaperStateError> {
+        let conn = self.lock();
+        tx_financial_start(&conn)
+    }
+
+    /// Last Prepared sequence projected locally in the active era.
+    pub fn financial_last_prepared_seq(&self) -> Result<Option<EventSeq>, PaperStateError> {
+        let conn = self.lock();
+        tx_financial_last_prepared(&conn)
+    }
+
+    /// Apply one exact fill under the Start/predecessor protocol. `canonical_cash` is the
+    /// authority response; the transaction independently derives principal+fee debit and
+    /// refuses a mismatch before changing the projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_financial_fill(
+        &self,
+        start: AppendReceipt,
+        expected_prior: Option<EventSeq>,
+        prepared_seq: EventSeq,
+        source_receipt: AppendReceipt,
+        causal_received_at_unix: i64,
+        fill: &FillRecord,
+        canonical_cash: Decimal,
+    ) -> Result<FinancialApplyOutcome, PaperStateError> {
+        if fill.outcome_id.0 > 1 {
+            return Err(PaperStateError::FinancialConflict(format!(
+                "paper fill outcome {} is not binary",
+                fill.outcome_id.0
+            )));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        require_financial_start(&tx, start)?;
+        require_financial_sequence(start, expected_prior, prepared_seq)?;
+
+        if let Some(stored) = tx_financial_fill(&tx, &fill.idempotency_key)? {
+            if stored.record != *fill
+                || stored.prepared_seq != prepared_seq
+                || stored.source_receipt != source_receipt
+                || stored.causal_received_at_unix != causal_received_at_unix
+                || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
+                || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
+            {
+                return Err(PaperStateError::FinancialConflict(
+                    "fill retry identity or economics changed".to_owned(),
+                ));
+            }
+            let cash = tx_read_bankroll(&tx)?;
+            if cash != canonical_cash {
+                return Err(PaperStateError::FinancialConflict(
+                    "existing fill bankroll differs from authority".to_owned(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(FinancialApplyOutcome::Existing { cash });
+        }
+
+        require_financial_predecessor(&tx, expected_prior)?;
+        if tx_is_settled(&tx, &fill.market_id)? {
+            return Err(PaperStateError::FinancialConflict(
+                "fill market is already settled".to_owned(),
+            ));
+        }
+        let cash_before = tx_read_bankroll(&tx)?;
+        let debit = fill
+            .principal
+            .checked_add(fill.fee)
+            .map_err(|error| PaperStateError::Internal(error.to_string()))?
+            .to_decimal();
+        if cash_before < debit {
+            return Err(PaperStateError::FinancialConflict(
+                "fill debit exceeds the local bankroll".to_owned(),
+            ));
+        }
+        let derived_cash = cash_before
+            .checked_sub(debit)
+            .ok_or_else(|| PaperStateError::Internal("financial fill debit overflow".to_owned()))?;
+        if derived_cash != canonical_cash {
+            return Err(PaperStateError::FinancialConflict(
+                "fill bankroll arithmetic differs from authority".to_owned(),
+            ));
+        }
+
+        tx_insert_financial_fill(
+            &tx,
+            fill,
+            prepared_seq,
+            source_receipt,
+            causal_received_at_unix,
+        )?;
+        tx_apply_financial_position(&tx, fill)?;
+        tx_set_bankroll(&tx, derived_cash)?;
+        tx_set_financial_last_prepared(&tx, prepared_seq)?;
+        tx.commit()?;
+        Ok(FinancialApplyOutcome::Applied { cash: derived_cash })
+    }
+
+    /// Apply one authority-canonical resolution under the same Start/predecessor lock.
+    /// The caller supplies the shared exact aggregate credit; local cash arithmetic must
+    /// equal the authority's returned bankroll before the transaction commits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_financial_resolution(
+        &self,
+        start: AppendReceipt,
+        expected_prior: Option<EventSeq>,
+        prepared_seq: EventSeq,
+        condition: &MarketId,
+        payout_by_outcome_index_json: &str,
+        source_receipt: AppendReceipt,
+        settled_at_unix: i64,
+        credit: CollateralAmount,
+        canonical_cash: Decimal,
+    ) -> Result<FinancialApplyOutcome, PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        require_financial_start(&tx, start)?;
+        require_financial_sequence(start, expected_prior, prepared_seq)?;
+        let existing = tx
+            .query_row(
+                "SELECT outcome_prices, credit_applied, settled_at_unix, prepared_seq, \
+                        source_receipt_seq FROM settled_markets WHERE market_id = ?1",
+                params![condition.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((payout, stored_credit, settled_at, stored_prepared, stored_source)) = existing
+        {
+            if payout != payout_by_outcome_index_json
+                || parse_decimal(&stored_credit)? != credit.to_decimal()
+                || settled_at != settled_at_unix
+                || stored_prepared.map(parse_u64).transpose()?.map(EventSeq) != Some(prepared_seq)
+                || stored_source.map(parse_u64).transpose()?.map(EventSeq)
+                    != Some(source_receipt.sequence)
+                || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
+                || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
+            {
+                return Err(PaperStateError::FinancialConflict(
+                    "resolution retry identity or economics changed".to_owned(),
+                ));
+            }
+            let cash = tx_read_bankroll(&tx)?;
+            if cash != canonical_cash {
+                return Err(PaperStateError::FinancialConflict(
+                    "existing resolution bankroll differs from authority".to_owned(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(FinancialApplyOutcome::Existing { cash });
+        }
+
+        require_financial_predecessor(&tx, expected_prior)?;
+        let cash = tx_read_bankroll(&tx)?;
+        let derived_cash = cash
+            .checked_add(credit.to_decimal())
+            .ok_or_else(|| PaperStateError::Internal("resolution credit overflow".to_owned()))?;
+        if derived_cash != canonical_cash {
+            return Err(PaperStateError::FinancialConflict(
+                "resolution bankroll arithmetic differs from authority".to_owned(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO settled_markets \
+                (market_id, outcome_prices, credit_applied, settled_at_unix, \
+                 prepared_seq, source_receipt_seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                condition.to_string(),
+                payout_by_outcome_index_json,
+                credit.to_decimal().to_string(),
+                settled_at_unix,
+                to_i64(prepared_seq.0)?,
+                to_i64(source_receipt.sequence.0)?,
+            ],
+        )?;
+        tx_set_bankroll(&tx, derived_cash)?;
+        tx_set_financial_last_prepared(&tx, prepared_seq)?;
+        tx.commit()?;
+        Ok(FinancialApplyOutcome::Applied { cash: derived_cash })
+    }
+
+    /// Reconstruct the coherent financial view at `cutoff_unix` from causal fill and resolution
+    /// facts. Current projection tables are never reused for historical cash or positions.
+    /// Only open positions at the cutoff, settlements in `(cutoff-7d, cutoff]`, and fills
+    /// belonging to either set are returned.
+    pub fn financial_snapshot(
+        &self,
+        cutoff_unix: i64,
+    ) -> Result<FinancialSnapshot, PaperStateError> {
+        self.financial_snapshot_inner(cutoff_unix, None)
+    }
+
+    /// Boundary form of [`Self::financial_snapshot`]. In addition to the cutoff clock, only facts
+    /// whose source receipt is within `source_bound` participate. The cutoff is exclusive because
+    /// a daily-boundary frame owns facts received strictly before midnight.
+    pub fn financial_snapshot_before_source_bound(
+        &self,
+        cutoff_unix: i64,
+        source_bound: EventSeq,
+        completed_prepared: &[EventSeq],
+    ) -> Result<FinancialSnapshot, PaperStateError> {
+        let inclusive = cutoff_unix
+            .checked_sub(1)
+            .ok_or_else(|| PaperStateError::Internal("snapshot cutoff underflow".to_owned()))?;
+        self.financial_snapshot_inner(inclusive, Some((source_bound, completed_prepared)))
+    }
+
+    fn financial_snapshot_inner(
+        &self,
+        cutoff_unix: i64,
+        boundary: Option<(EventSeq, &[EventSeq])>,
+    ) -> Result<FinancialSnapshot, PaperStateError> {
+        const SEVEN_DAYS_SECS: i64 = 7 * 24 * 60 * 60;
+        let lower = cutoff_unix
+            .checked_sub(SEVEN_DAYS_SECS)
+            .ok_or_else(|| PaperStateError::Internal("snapshot window underflow".to_owned()))?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let start = tx_financial_start(&tx)?.map(|value| (value.sequence, value.this_hash));
+        let all_fills = read_causal_financial_fills(&tx, i64::MAX, None)?;
+        let all_settlements = read_causal_settlements(&tx, i64::MAX, None)?;
+        let mut starting_cash = tx_read_bankroll(&tx)?;
+        for fill in &all_fills {
+            starting_cash = starting_cash
+                .checked_add(fill.principal.to_decimal())
+                .and_then(|cash| cash.checked_add(fill.fee.to_decimal()))
+                .ok_or_else(|| PaperStateError::Internal("starting cash overflow".to_owned()))?;
+        }
+        for settlement in &all_settlements {
+            starting_cash = starting_cash
+                .checked_sub(settlement.credit_applied)
+                .ok_or_else(|| PaperStateError::Internal("starting cash overflow".to_owned()))?;
+        }
+
+        let source_bound = boundary.map(|(bound, _)| bound);
+        let completed =
+            boundary.map(|(_, sequences)| sequences.iter().copied().collect::<HashSet<_>>());
+        let fills = read_causal_financial_fills(&tx, cutoff_unix, source_bound)?
+            .into_iter()
+            .filter(|fill| {
+                completed
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&fill.prepared_seq))
+            })
+            .collect::<Vec<_>>();
+        let settlements = read_causal_settlements(&tx, cutoff_unix, source_bound)?
+            .into_iter()
+            .filter(|settlement| {
+                completed.as_ref().is_none_or(|set| {
+                    settlement
+                        .prepared_seq
+                        .is_some_and(|sequence| set.contains(&sequence))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut cash = starting_cash;
+        let mut position_map = HashMap::new();
+        for fill in &fills {
+            cash = cash
+                .checked_sub(fill.principal.to_decimal())
+                .and_then(|value| value.checked_sub(fill.fee.to_decimal()))
+                .ok_or_else(|| {
+                    PaperStateError::Internal("snapshot fill debit overflow".to_owned())
+                })?;
+            let entry = position_map
+                .entry((fill.market_id.clone(), fill.outcome_id))
+                .or_insert((ShareAmount::ZERO, ShareAmount::ZERO));
+            *entry = apply_exact_fill_to_net(entry.0, entry.1, fill.side, fill.quantity)?;
+        }
+        let settled_markets = settlements
+            .iter()
+            .map(|settlement| settlement.market_id.clone())
+            .collect::<HashSet<_>>();
+        for settlement in &settlements {
+            cash = cash.checked_add(settlement.credit_applied).ok_or_else(|| {
+                PaperStateError::Internal("snapshot settlement overflow".to_owned())
+            })?;
+        }
+        let mut positions = position_map
+            .into_iter()
+            .filter(|((market, _), (long, short))| {
+                !settled_markets.contains(market)
+                    && (*long != ShareAmount::ZERO || *short != ShareAmount::ZERO)
+            })
+            .map(
+                |((market_id, outcome_id), (long, short))| PaperPositionRow {
+                    market_id,
+                    outcome_id,
+                    long,
+                    short,
+                },
+            )
+            .collect::<Vec<_>>();
+        positions.sort_by(|left, right| {
+            left.market_id
+                .to_string()
+                .cmp(&right.market_id.to_string())
+                .then(left.outcome_id.0.cmp(&right.outcome_id.0))
+        });
+        let open_markets = positions
+            .iter()
+            .map(|position| position.market_id.clone())
+            .collect::<HashSet<_>>();
+        let settlements_7d = settlements
+            .iter()
+            .filter(|settlement| settlement.settled_at_unix > lower)
+            .cloned()
+            .collect::<Vec<_>>();
+        let recent_settled_markets = settlements_7d
+            .iter()
+            .map(|settlement| settlement.market_id.clone())
+            .collect::<HashSet<_>>();
+        let fills_for_open_and_7d = fills
+            .iter()
+            .filter(|fill| {
+                open_markets.contains(&fill.market_id)
+                    || recent_settled_markets.contains(&fill.market_id)
+            })
+            .map(|fill| fill.row.clone())
+            .collect::<Vec<_>>();
+        let last_prepared_seq = fills
+            .iter()
+            .map(|fill| fill.prepared_seq)
+            .chain(
+                settlements
+                    .iter()
+                    .filter_map(|settlement| settlement.prepared_seq),
+            )
+            .max_by_key(|sequence| sequence.0);
+        tx.commit()?;
+        Ok(FinancialSnapshot {
+            cash,
+            positions,
+            settlements_7d,
+            fills_for_open_and_7d,
+            last_prepared_seq,
+            start,
+        })
+    }
+
     // ── Restore readers ──────────────────────────────────────────────────────
 
     /// All leader position rows, for rehydrating the in-memory `PositionLedger`.
@@ -2630,15 +3708,14 @@ impl PaperStateDb {
     /// All of our own paper position rows, for restoring open positions on restart.
     pub fn paper_positions(&self) -> Result<Vec<PaperPositionRow>, PaperStateError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT market_id, outcome_id, long_contracts, short_contracts FROM positions",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT market_id, outcome_id, long_str, short_str FROM positions")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -2647,8 +3724,8 @@ impl PaperStateDb {
             out.push(PaperPositionRow {
                 market_id: MarketId(VenueMarketId(market)),
                 outcome_id: OutcomeId(parse_u16(outcome)?),
-                long_contracts: parse_u64(long)?,
-                short_contracts: parse_u64(short)?,
+                long: parse_share_amount(&long)?,
+                short: parse_share_amount(&short)?,
             });
         }
         Ok(out)
@@ -2662,21 +3739,22 @@ impl PaperStateDb {
         &self,
         market_id: &MarketId,
         outcome_id: OutcomeId,
-        long_contracts: u64,
-        short_contracts: u64,
+        long: ShareAmount,
+        short: ShareAmount,
     ) -> Result<(), PaperStateError> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO positions (market_id, outcome_id, long_contracts, short_contracts) \
+            "INSERT INTO positions \
+                (market_id, outcome_id, long_str, short_str) \
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
-                long_contracts = excluded.long_contracts, \
-                short_contracts = excluded.short_contracts",
+                long_str = excluded.long_str, \
+                short_str = excluded.short_str",
             params![
                 market_id.to_string(),
                 i64::from(outcome_id.0),
-                to_i64(long_contracts)?,
-                to_i64(short_contracts)?,
+                long.to_decimal().to_string(),
+                short.to_decimal().to_string(),
             ],
         )?;
         Ok(())
@@ -2725,8 +3803,8 @@ impl PaperStateDb {
             encoded.push((
                 key.0,
                 i64::from(position.outcome_id.0),
-                to_i64(position.long_contracts)?,
-                to_i64(position.short_contracts)?,
+                position.long.to_decimal().to_string(),
+                position.short.to_decimal().to_string(),
             ));
         }
 
@@ -2741,10 +3819,10 @@ impl PaperStateDb {
         {
             let mut statement = tx.prepare(
                 "INSERT INTO positions \
-                 (market_id, outcome_id, long_contracts, short_contracts) \
+                 (market_id, outcome_id, long_str, short_str) \
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for (index, (market_id, outcome_id, long_contracts, short_contracts)) in
+            for (index, (market_id, outcome_id, long_str, short_str)) in
                 encoded.into_iter().enumerate()
             {
                 if fail_after == Some(index) {
@@ -2752,12 +3830,7 @@ impl PaperStateDb {
                         "injected authoritative replacement failure".to_owned(),
                     ));
                 }
-                statement.execute(params![
-                    market_id,
-                    outcome_id,
-                    long_contracts,
-                    short_contracts
-                ])?;
+                statement.execute(params![market_id, outcome_id, long_str, short_str,])?;
             }
         }
         tx.commit()?;
@@ -2925,7 +3998,8 @@ impl PaperStateDb {
         let mut rows = Vec::new();
         {
             let mut statement = src.prepare(
-                "SELECT market_id, outcome_prices, credit_applied, settled_at_unix \
+                "SELECT market_id, outcome_prices, credit_applied, settled_at_unix, \
+                        prepared_seq, source_receipt_seq \
                  FROM settled_markets",
             )?;
             let mapped = statement.query_map([], |row| {
@@ -2934,6 +4008,8 @@ impl PaperStateDb {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })?;
             for r in mapped {
@@ -2942,12 +4018,13 @@ impl PaperStateDb {
         }
         let n = rows.len();
         let conn = self.lock();
-        for (market, prices, credit, at) in rows {
+        for (market, prices, credit, at, prepared_seq, source_receipt_seq) in rows {
             conn.execute(
                 "INSERT INTO settled_markets \
-                    (market_id, outcome_prices, credit_applied, settled_at_unix) \
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(market_id) DO NOTHING",
-                params![market, prices, credit, at],
+                    (market_id, outcome_prices, credit_applied, settled_at_unix, \
+                     prepared_seq, source_receipt_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(market_id) DO NOTHING",
+                params![market, prices, credit, at, prepared_seq, source_receipt_seq],
             )?;
         }
         Ok(n)
@@ -2956,8 +4033,8 @@ impl PaperStateDb {
     /// Legacy-mode settle (#511): compute the credit **inside** the settle transaction
     /// from freshly-read positions, closing the read-then-settle TOCTOU (a fill
     /// committing between an outside read and the settle could never be credited).
-    /// `credit_fn` is pure (e.g. `PnlLedger::resolution_credit`); it sees the market's
-    /// positions as of this transaction. Returns `(credit_applied, bankroll)`;
+    /// `credit_fn` is pure; it sees the market's positions as of this transaction.
+    /// Returns `(credit_applied, bankroll)`;
     /// `(0, bankroll)` when the market was already settled.
     pub fn settle_and_credit_from_positions<F>(
         &self,
@@ -2967,7 +4044,7 @@ impl PaperStateDb {
         credit_fn: F,
     ) -> Result<(Decimal, Decimal), PaperStateError>
     where
-        F: FnOnce(&[PaperPositionRow]) -> Decimal,
+        F: FnOnce(&[PaperPositionRow]) -> Result<Decimal, PaperStateError>,
     {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -2977,7 +4054,7 @@ impl PaperStateDb {
             return Ok((Decimal::ZERO, bankroll));
         }
         let positions = tx_positions_for_market(&tx, market_id)?;
-        let credit = credit_fn(&positions);
+        let credit = credit_fn(&positions)?;
         tx.execute(
             "INSERT INTO settled_markets \
                 (market_id, outcome_prices, credit_applied, settled_at_unix) \
@@ -3044,7 +4121,8 @@ impl PaperStateDb {
     pub fn list_settled_markets(&self) -> Result<Vec<SettledMarketRow>, PaperStateError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT market_id, outcome_prices, credit_applied, settled_at_unix \
+            "SELECT market_id, outcome_prices, credit_applied, settled_at_unix, \
+                    prepared_seq, source_receipt_seq \
              FROM settled_markets",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -3053,16 +4131,27 @@ impl PaperStateDb {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (market, prices_json, credit_str, settled_at_unix) = row?;
+            let (
+                market,
+                prices_json,
+                credit_str,
+                settled_at_unix,
+                prepared_seq,
+                source_receipt_seq,
+            ) = row?;
             out.push(SettledMarketRow {
                 market_id: MarketId(VenueMarketId(market)),
                 outcome_prices_json: prices_json,
                 credit_applied: parse_decimal(&credit_str)?,
                 settled_at_unix,
+                prepared_seq: prepared_seq.map(parse_u64).transpose()?.map(EventSeq),
+                source_receipt_seq: source_receipt_seq.map(parse_u64).transpose()?.map(EventSeq),
             });
         }
         Ok(out)
@@ -3400,15 +4489,18 @@ fn tx_record_fill(
 ) -> Result<bool, PaperStateError> {
     let affected = tx.execute(
         "INSERT OR IGNORE INTO fills \
-            (idempotency_key, market_id, outcome_id, side, contracts, fill_price_str, event_seq) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (idempotency_key, market_id, outcome_id, side, quantity_str, \
+             fill_price_str, principal_str, fee_str, event_seq, prepared_seq) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         params![
             fill.idempotency_key,
             fill.market_id.to_string(),
             i64::from(fill.outcome_id.0),
             side_str(fill.side),
-            to_i64(fill.contracts)?,
+            fill.quantity.to_decimal().to_string(),
             fill.fill_price.0.to_string(),
+            fill.principal.to_decimal().to_string(),
+            fill.fee.to_decimal().to_string(),
             to_i64(fill_seq.0)?,
         ],
     )?;
@@ -3417,51 +4509,37 @@ fn tx_record_fill(
 
 /// Apply a fill to our own net position for its `(market, outcome)`.
 fn tx_apply_our_position(tx: &Transaction<'_>, fill: &FillRecord) -> Result<(), PaperStateError> {
-    let market = fill.market_id.to_string();
-    let outcome = i64::from(fill.outcome_id.0);
-    let current: Option<(i64, i64)> = tx
-        .query_row(
-            "SELECT long_contracts, short_contracts FROM positions \
-             WHERE market_id = ?1 AND outcome_id = ?2",
-            params![market, outcome],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (long, short) = match current {
-        Some((l, s)) => (parse_u64(l)?, parse_u64(s)?),
-        None => (0, 0),
-    };
-    let (new_long, new_short) = apply_fill_to_net(long, short, fill.side, fill.contracts);
-    tx.execute(
-        "INSERT INTO positions (market_id, outcome_id, long_contracts, short_contracts) \
-         VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
-            long_contracts = excluded.long_contracts, \
-            short_contracts = excluded.short_contracts",
-        params![market, outcome, to_i64(new_long)?, to_i64(new_short)?],
-    )?;
-    Ok(())
+    tx_apply_financial_position(tx, fill)
 }
 
-/// Apply a fill's cash flow to the bankroll and persist it. BUY debits
-/// `fill_price × contracts` (clamped at zero so the bankroll never goes negative);
-/// SELL credits the same proceeds. Returns the new bankroll.
+/// Apply the fill's recorded exact principal and fee once. BUY debits principal plus fee;
+/// SELL credits principal less fee. The pre-Start path retains its historical zero-floor.
 fn tx_apply_bankroll(tx: &Transaction<'_>, fill: &FillRecord) -> Result<Decimal, PaperStateError> {
     let current = tx_read_bankroll(tx)?;
-    let qty = Decimal::from(fill.contracts);
-    let notional = fill
-        .fill_price
-        .0
-        .checked_mul(qty)
-        .ok_or_else(|| PaperStateError::Internal("fill notional overflow".to_string()))?;
+    let principal = fill.principal.to_decimal();
+    let fee = fill.fee.to_decimal();
     let new = match fill.side {
         Side::Buy => current
-            .checked_sub(notional)
+            .checked_sub(
+                principal
+                    .checked_add(fee)
+                    .ok_or_else(|| PaperStateError::Internal("fill debit overflow".to_owned()))?,
+            )
             .ok_or_else(|| PaperStateError::Internal("bankroll debit overflow".to_string()))?
             .max(Decimal::ZERO),
-        Side::Sell => current
-            .checked_add(notional)
-            .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?,
+        Side::Sell => {
+            let proceeds = principal
+                .checked_sub(fee)
+                .ok_or_else(|| PaperStateError::Internal("fill proceeds overflow".to_owned()))?;
+            if proceeds.is_sign_negative() {
+                return Err(PaperStateError::FinancialConflict(
+                    "fill fee exceeds sell principal".to_owned(),
+                ));
+            }
+            current
+                .checked_add(proceeds)
+                .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?
+        }
     };
     tx.execute(
         "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
@@ -3527,15 +4605,15 @@ fn tx_positions_for_market(
     market_id: &MarketId,
 ) -> Result<Vec<PaperPositionRow>, PaperStateError> {
     let mut statement = tx.prepare(
-        "SELECT market_id, outcome_id, long_contracts, short_contracts \
+        "SELECT market_id, outcome_id, long_str, short_str \
          FROM positions WHERE market_id = ?1",
     )?;
     let rows = statement.query_map(params![market_id.to_string()], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -3547,8 +4625,8 @@ fn tx_positions_for_market(
                 u16::try_from(outcome)
                     .map_err(|_| PaperStateError::Internal(format!("outcome_id {outcome}")))?,
             ),
-            long_contracts: parse_u64(long)?,
-            short_contracts: parse_u64(short)?,
+            long: parse_share_amount(&long)?,
+            short: parse_share_amount(&short)?,
         });
     }
     Ok(out)
@@ -3573,6 +4651,723 @@ fn tx_last_applied(tx: &Transaction<'_>) -> Result<Option<u64>, PaperStateError>
         )
         .optional()?;
     raw.map(parse_u64).transpose()
+}
+
+fn tx_financial_start(conn: &Connection) -> Result<Option<AppendReceipt>, PaperStateError> {
+    let sequence: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![META_FINANCIAL_START_SEQ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![META_FINANCIAL_START_HASH],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match (sequence, hash) {
+        (None, None) => Ok(None),
+        (Some(sequence), Some(hash)) => Ok(Some(AppendReceipt {
+            sequence: EventSeq(parse_u64(sequence)?),
+            this_hash: blake3::Hash::from_hex(&hash).map_err(|error| {
+                PaperStateError::Corrupt(format!("financial Start hash: {error}"))
+            })?,
+        })),
+        _ => Err(PaperStateError::Corrupt(
+            "partial financial Start metadata".to_owned(),
+        )),
+    }
+}
+
+fn tx_financial_last_prepared(conn: &Connection) -> Result<Option<EventSeq>, PaperStateError> {
+    let raw: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![META_FINANCIAL_LAST_PREPARED_SEQ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(parse_u64)
+        .transpose()
+        .map(|value| value.map(EventSeq))
+}
+
+fn require_financial_start(
+    conn: &Connection,
+    expected: AppendReceipt,
+) -> Result<(), PaperStateError> {
+    match tx_financial_start(conn)? {
+        Some(stored) if stored == expected => Ok(()),
+        Some(_) => Err(PaperStateError::FinancialStartConflict),
+        None => Err(PaperStateError::FinancialConflict(
+            "financial Start metadata is missing".to_owned(),
+        )),
+    }
+}
+
+fn require_financial_predecessor(
+    conn: &Connection,
+    expected: Option<EventSeq>,
+) -> Result<(), PaperStateError> {
+    let stored = tx_financial_last_prepared(conn)?;
+    if stored == expected {
+        Ok(())
+    } else {
+        Err(PaperStateError::FinancialConflict(format!(
+            "Prepared predecessor mismatch: stored {stored:?}, expected {expected:?}"
+        )))
+    }
+}
+
+fn require_financial_sequence(
+    start: AppendReceipt,
+    expected_prior: Option<EventSeq>,
+    prepared_seq: EventSeq,
+) -> Result<(), PaperStateError> {
+    if prepared_seq <= start.sequence || expected_prior.is_some_and(|prior| prepared_seq <= prior) {
+        return Err(PaperStateError::FinancialConflict(
+            "Prepared sequence is not monotonic after Start".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn tx_completed_prior_before(
+    conn: &Connection,
+    prepared_seq: EventSeq,
+) -> Result<Option<EventSeq>, PaperStateError> {
+    let prior = conn.query_row(
+        "SELECT MAX(completed_seq) FROM (\
+             SELECT prepared_seq AS completed_seq FROM fills WHERE prepared_seq < ?1 \
+             UNION ALL \
+             SELECT prepared_seq AS completed_seq FROM settled_markets \
+              WHERE prepared_seq IS NOT NULL AND prepared_seq < ?1\
+         )",
+        params![to_i64(prepared_seq.0)?],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    prior
+        .map(parse_u64)
+        .transpose()
+        .map(|value| value.map(EventSeq))
+}
+
+fn tx_set_financial_last_prepared(
+    tx: &Transaction<'_>,
+    prepared_seq: EventSeq,
+) -> Result<(), PaperStateError> {
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_FINANCIAL_LAST_PREPARED_SEQ, to_i64(prepared_seq.0)?],
+    )?;
+    Ok(())
+}
+
+struct StoredFinancialFill {
+    record: FillRecord,
+    prepared_seq: EventSeq,
+    source_receipt: AppendReceipt,
+    causal_received_at_unix: i64,
+}
+
+fn tx_financial_fill(
+    conn: &Connection,
+    idempotency_key: &str,
+) -> Result<Option<StoredFinancialFill>, PaperStateError> {
+    let row = conn
+        .query_row(
+            "SELECT market_id, outcome_id, side, quantity_str, fill_price_str, \
+                    principal_str, fee_str, prepared_seq, source_receipt_seq, \
+                    source_receipt_hash, causal_received_at_unix \
+             FROM fills WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            market,
+            outcome,
+            side,
+            quantity,
+            price,
+            principal,
+            fee,
+            prepared_seq,
+            source_sequence,
+            source_hash,
+            causal_received_at_unix,
+        )| {
+            Ok(StoredFinancialFill {
+                record: FillRecord {
+                    idempotency_key: idempotency_key.to_owned(),
+                    market_id: MarketId(VenueMarketId(market)),
+                    outcome_id: OutcomeId(parse_u16(outcome)?),
+                    side: parse_side(&side)?,
+                    quantity: parse_share_amount(&quantity)?,
+                    fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
+                        PaperStateError::Corrupt(format!("financial fill price: {error}"))
+                    })?,
+                    principal: parse_collateral_amount(&principal)?,
+                    fee: parse_collateral_amount(&fee)?,
+                },
+                prepared_seq: EventSeq(parse_u64(prepared_seq)?),
+                source_receipt: AppendReceipt {
+                    sequence: EventSeq(parse_u64(source_sequence)?),
+                    this_hash: blake3::Hash::from_hex(&source_hash).map_err(|_| {
+                        PaperStateError::Corrupt("bad fill source receipt hash".to_owned())
+                    })?,
+                },
+                causal_received_at_unix,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn tx_insert_financial_fill(
+    tx: &Transaction<'_>,
+    fill: &FillRecord,
+    prepared_seq: EventSeq,
+    source_receipt: AppendReceipt,
+    causal_received_at_unix: i64,
+) -> Result<(), PaperStateError> {
+    tx.execute(
+        "INSERT INTO fills \
+            (idempotency_key, market_id, outcome_id, side, quantity_str, \
+             fill_price_str, principal_str, fee_str, event_seq, prepared_seq, \
+             source_receipt_seq, source_receipt_hash, causal_received_at_unix) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)",
+        params![
+            fill.idempotency_key,
+            fill.market_id.to_string(),
+            i64::from(fill.outcome_id.0),
+            side_str(fill.side),
+            fill.quantity.to_decimal().to_string(),
+            fill.fill_price.0.to_string(),
+            fill.principal.to_decimal().to_string(),
+            fill.fee.to_decimal().to_string(),
+            to_i64(prepared_seq.0)?,
+            to_i64(source_receipt.sequence.0)?,
+            source_receipt.this_hash.to_hex().to_string(),
+            causal_received_at_unix,
+        ],
+    )?;
+    Ok(())
+}
+
+fn tx_apply_financial_position(
+    tx: &Transaction<'_>,
+    fill: &FillRecord,
+) -> Result<(), PaperStateError> {
+    let current = tx
+        .query_row(
+            "SELECT long_str, short_str FROM positions \
+             WHERE market_id = ?1 AND outcome_id = ?2",
+            params![fill.market_id.to_string(), i64::from(fill.outcome_id.0)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (long, short) = match current {
+        Some((long, short)) => (parse_share_amount(&long)?, parse_share_amount(&short)?),
+        None => (ShareAmount::ZERO, ShareAmount::ZERO),
+    };
+    let (new_long, new_short) = match fill.side {
+        Side::Buy => {
+            let covered = short.atomic().min(fill.quantity.atomic());
+            let uncovered = ShareAmount::from_atomic(fill.quantity.atomic() - covered);
+            (
+                long.checked_add(uncovered)
+                    .map_err(|error| PaperStateError::Internal(error.to_string()))?,
+                ShareAmount::from_atomic(short.atomic() - covered),
+            )
+        }
+        Side::Sell => {
+            let trimmed = long.atomic().min(fill.quantity.atomic());
+            let uncovered = ShareAmount::from_atomic(fill.quantity.atomic() - trimmed);
+            (
+                ShareAmount::from_atomic(long.atomic() - trimmed),
+                short
+                    .checked_add(uncovered)
+                    .map_err(|error| PaperStateError::Internal(error.to_string()))?,
+            )
+        }
+    };
+    tx.execute(
+        "INSERT INTO positions \
+            (market_id, outcome_id, long_str, short_str) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
+            long_str = excluded.long_str, short_str = excluded.short_str",
+        params![
+            fill.market_id.to_string(),
+            i64::from(fill.outcome_id.0),
+            new_long.to_decimal().to_string(),
+            new_short.to_decimal().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_financial_positions(
+    conn: &Connection,
+    open_only: bool,
+) -> Result<Vec<PaperPositionRow>, PaperStateError> {
+    let suffix = if open_only {
+        " WHERE (CAST(p.long_str AS NUMERIC) > 0 OR CAST(p.short_str AS NUMERIC) > 0) \
+           AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id)"
+    } else {
+        ""
+    };
+    let mut statement = conn.prepare(&format!(
+        "SELECT p.market_id, p.outcome_id, p.long_str, p.short_str FROM positions p{suffix} \
+         ORDER BY p.market_id, p.outcome_id"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (market, outcome, long, short) = row?;
+        result.push(PaperPositionRow {
+            market_id: MarketId(VenueMarketId(market)),
+            outcome_id: OutcomeId(parse_u16(outcome)?),
+            long: parse_share_amount(&long)?,
+            short: parse_share_amount(&short)?,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+fn read_settlements_window(
+    conn: &Connection,
+    lower: i64,
+    upper: i64,
+) -> Result<Vec<SettledMarketRow>, PaperStateError> {
+    let mut statement = conn.prepare(
+        "SELECT market_id, outcome_prices, credit_applied, settled_at_unix, \
+                prepared_seq, source_receipt_seq \
+         FROM settled_markets WHERE settled_at_unix > ?1 AND settled_at_unix <= ?2 \
+         ORDER BY settled_at_unix, market_id",
+    )?;
+    let rows = statement.query_map(params![lower, upper], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (market, payout, credit, settled_at_unix, prepared, source) = row?;
+        result.push(SettledMarketRow {
+            market_id: MarketId(VenueMarketId(market)),
+            outcome_prices_json: payout,
+            credit_applied: parse_decimal(&credit)?,
+            settled_at_unix,
+            prepared_seq: prepared.map(parse_u64).transpose()?.map(EventSeq),
+            source_receipt_seq: source.map(parse_u64).transpose()?.map(EventSeq),
+        });
+    }
+    Ok(result)
+}
+
+#[derive(Clone)]
+struct CausalFinancialFill {
+    row: FillRow,
+}
+
+impl std::ops::Deref for CausalFinancialFill {
+    type Target = FillRow;
+
+    fn deref(&self) -> &Self::Target {
+        &self.row
+    }
+}
+
+fn read_causal_financial_fills(
+    conn: &Connection,
+    upper_inclusive: i64,
+    source_bound: Option<EventSeq>,
+) -> Result<Vec<CausalFinancialFill>, PaperStateError> {
+    let bound = source_bound
+        .map(|sequence| to_i64(sequence.0))
+        .transpose()?;
+    let mut statement = conn.prepare(
+        "SELECT idempotency_key, market_id, outcome_id, side, quantity_str, fill_price_str, \
+                principal_str, fee_str, prepared_seq, source_receipt_seq, source_receipt_hash, \
+                causal_received_at_unix \
+         FROM fills \
+         WHERE causal_received_at_unix <= ?1 \
+           AND (?2 IS NULL OR source_receipt_seq <= ?2) \
+         ORDER BY prepared_seq, idempotency_key",
+    )?;
+    let rows = statement.query_map(params![upper_inclusive, bound], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (
+            key,
+            market,
+            outcome,
+            side,
+            quantity,
+            price,
+            principal,
+            fee,
+            prepared,
+            source_sequence,
+            source_hash,
+            _causal_received_at_unix,
+        ) = row?;
+        let _source_receipt = AppendReceipt {
+            sequence: EventSeq(parse_u64(source_sequence)?),
+            this_hash: blake3::Hash::from_hex(&source_hash)
+                .map_err(|_| PaperStateError::Corrupt("bad fill source receipt hash".to_owned()))?,
+        };
+        result.push(CausalFinancialFill {
+            row: FillRow {
+                idempotency_key: key,
+                market_id: MarketId(VenueMarketId(market)),
+                outcome_id: OutcomeId(parse_u16(outcome)?),
+                side: parse_side(&side)?,
+                quantity: parse_share_amount(&quantity)?,
+                fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
+                    PaperStateError::Corrupt(format!("financial fill price: {error}"))
+                })?,
+                principal: parse_collateral_amount(&principal)?,
+                fee: parse_collateral_amount(&fee)?,
+                event_seq: EventSeq(parse_u64(prepared)?),
+                prepared_seq: EventSeq(parse_u64(prepared)?),
+                source_receipt_seq: Some(EventSeq(parse_u64(source_sequence)?)),
+            },
+        });
+    }
+    Ok(result)
+}
+
+fn read_causal_settlements(
+    conn: &Connection,
+    upper_inclusive: i64,
+    source_bound: Option<EventSeq>,
+) -> Result<Vec<SettledMarketRow>, PaperStateError> {
+    let bound = source_bound
+        .map(|sequence| to_i64(sequence.0))
+        .transpose()?;
+    let mut statement = conn.prepare(
+        "SELECT market_id, outcome_prices, credit_applied, settled_at_unix, \
+                prepared_seq, source_receipt_seq \
+         FROM settled_markets \
+         WHERE settled_at_unix <= ?1 \
+           AND source_receipt_seq IS NOT NULL \
+           AND (?2 IS NULL OR source_receipt_seq <= ?2) \
+         ORDER BY prepared_seq, market_id",
+    )?;
+    let rows = statement.query_map(params![upper_inclusive, bound], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (market, payout, credit, settled_at_unix, prepared, source) = row?;
+        result.push(SettledMarketRow {
+            market_id: MarketId(VenueMarketId(market)),
+            outcome_prices_json: payout,
+            credit_applied: parse_decimal(&credit)?,
+            settled_at_unix,
+            prepared_seq: prepared.map(parse_u64).transpose()?.map(EventSeq),
+            source_receipt_seq: source.map(parse_u64).transpose()?.map(EventSeq),
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+fn read_financial_fills_window(
+    conn: &Connection,
+    lower: i64,
+    upper: i64,
+) -> Result<Vec<FillRow>, PaperStateError> {
+    let mut statement = conn.prepare(
+        "SELECT f.idempotency_key, f.market_id, f.outcome_id, f.side, f.quantity_str, \
+                f.fill_price_str, f.principal_str, f.fee_str, f.event_seq, f.prepared_seq, \
+                f.source_receipt_seq \
+         FROM fills f \
+         WHERE EXISTS (SELECT 1 FROM positions p WHERE p.market_id = f.market_id \
+                         AND (CAST(p.long_str AS NUMERIC) > 0 \
+                              OR CAST(p.short_str AS NUMERIC) > 0) \
+                         AND NOT EXISTS (SELECT 1 FROM settled_markets sx \
+                                         WHERE sx.market_id = p.market_id)) \
+            OR EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = f.market_id \
+                        AND s.settled_at_unix > ?1 AND s.settled_at_unix <= ?2) \
+         ORDER BY f.prepared_seq, f.idempotency_key",
+    )?;
+    let rows = statement.query_map(params![lower, upper], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (
+            key,
+            market,
+            outcome,
+            side,
+            quantity,
+            price,
+            principal,
+            fee,
+            event,
+            prepared,
+            source_receipt,
+        ) = row?;
+        result.push(FillRow {
+            idempotency_key: key,
+            market_id: MarketId(VenueMarketId(market)),
+            outcome_id: OutcomeId(parse_u16(outcome)?),
+            side: parse_side(&side)?,
+            quantity: parse_share_amount(&quantity)?,
+            fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
+                PaperStateError::Corrupt(format!("financial fill price: {error}"))
+            })?,
+            principal: parse_collateral_amount(&principal)?,
+            fee: parse_collateral_amount(&fee)?,
+            event_seq: EventSeq(parse_u64(event)?),
+            prepared_seq: EventSeq(parse_u64(prepared)?),
+            source_receipt_seq: source_receipt.map(parse_u64).transpose()?.map(EventSeq),
+        });
+    }
+    Ok(result)
+}
+
+/// One-time, lossless v2 whole-contract financial migration (#545). The legacy columns are read
+/// only here and the tables are rebuilt without integer mirrors. SQLite transactional DDL leaves
+/// both the old tables and `user_version = 2` intact on any failure.
+fn migrate_v2_financial_columns(conn: &mut Connection) -> Result<(), PaperStateError> {
+    let tx = conn.transaction()?;
+    let meta_affinity: String = tx.query_row(
+        "SELECT type FROM pragma_table_info('meta') WHERE name = 'value'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !meta_affinity.eq_ignore_ascii_case("blob") {
+        tx.execute_batch(
+            "ALTER TABLE meta RENAME TO meta_v2_financial_migration;
+             CREATE TABLE meta (
+                 key TEXT PRIMARY KEY NOT NULL,
+                 value BLOB NOT NULL
+             );
+             INSERT INTO meta (key, value)
+             SELECT key, value FROM meta_v2_financial_migration;
+             DROP TABLE meta_v2_financial_migration;",
+        )?;
+    }
+    let fills_have_integer_owner = tx
+        .prepare("SELECT 1 FROM pragma_table_info('fills') WHERE name = 'contracts'")?
+        .exists([])?;
+    if fills_have_integer_owner {
+        let mut legacy_fills = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT idempotency_key, market_id, outcome_id, side, contracts, \
+                        fill_price_str, event_seq FROM fills",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (key, market, outcome, side, contracts, price, event_seq) = row?;
+                let whole = parse_u64(contracts)?;
+                let quantity = ShareAmount::from_whole(whole)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+                let price = Price::new(parse_decimal(&price)?).map_err(|error| {
+                    PaperStateError::Corrupt(format!("legacy fill {key} price: {error}"))
+                })?;
+                let principal = price.0.checked_mul(quantity.to_decimal()).ok_or_else(|| {
+                    PaperStateError::Corrupt(format!("legacy fill {key} overflow"))
+                })?;
+                let principal =
+                    CollateralAmount::from_decimal_exact(principal).map_err(|error| {
+                        PaperStateError::Corrupt(format!("legacy fill {key} principal: {error}"))
+                    })?;
+                legacy_fills.push((
+                    key,
+                    market,
+                    outcome,
+                    side,
+                    quantity.to_decimal().to_string(),
+                    price.0.to_string(),
+                    principal.to_decimal().to_string(),
+                    event_seq,
+                ));
+            }
+        }
+        tx.execute_batch(
+            "ALTER TABLE fills RENAME TO fills_v2_financial_migration;
+             CREATE TABLE fills (
+                 idempotency_key TEXT PRIMARY KEY NOT NULL,
+                 market_id TEXT NOT NULL,
+                 outcome_id INTEGER NOT NULL,
+                 side TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+                 quantity_str TEXT NOT NULL,
+                 fill_price_str TEXT NOT NULL,
+                 principal_str TEXT NOT NULL,
+                 fee_str TEXT NOT NULL,
+                 event_seq INTEGER NOT NULL,
+                 prepared_seq INTEGER NOT NULL,
+                 source_receipt_seq INTEGER,
+                 source_receipt_hash TEXT,
+                 causal_received_at_unix INTEGER
+             );",
+        )?;
+        for (key, market, outcome, side, quantity, price, principal, event_seq) in legacy_fills {
+            tx.execute(
+                "INSERT INTO fills \
+                     (idempotency_key, market_id, outcome_id, side, quantity_str, \
+                      fill_price_str, principal_str, fee_str, event_seq, prepared_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '0', ?8, ?8)",
+                params![
+                    key, market, outcome, side, quantity, price, principal, event_seq
+                ],
+            )?;
+        }
+        tx.execute("DROP TABLE fills_v2_financial_migration", [])?;
+    }
+
+    let positions_have_integer_owner = tx
+        .prepare("SELECT 1 FROM pragma_table_info('positions') WHERE name = 'long_contracts'")?
+        .exists([])?;
+    if positions_have_integer_owner {
+        let mut legacy_positions = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT market_id, outcome_id, long_contracts, short_contracts FROM positions",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (market, outcome, long, short) = row?;
+                let long = ShareAmount::from_whole(parse_u64(long)?)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+                let short = ShareAmount::from_whole(parse_u64(short)?)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+                legacy_positions.push((
+                    market,
+                    outcome,
+                    long.to_decimal().to_string(),
+                    short.to_decimal().to_string(),
+                ));
+            }
+        }
+        tx.execute_batch(
+            "ALTER TABLE positions RENAME TO positions_v2_financial_migration;
+             CREATE TABLE positions (
+                 market_id TEXT NOT NULL,
+                 outcome_id INTEGER NOT NULL,
+                 long_str TEXT NOT NULL,
+                 short_str TEXT NOT NULL,
+                 PRIMARY KEY (market_id, outcome_id)
+             );",
+        )?;
+        for (market, outcome, long, short) in legacy_positions {
+            tx.execute(
+                "INSERT INTO positions (market_id, outcome_id, long_str, short_str) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![market, outcome, long, short],
+            )?;
+        }
+        tx.execute("DROP TABLE positions_v2_financial_migration", [])?;
+    }
+
+    for (column, declaration) in [
+        ("prepared_seq", "prepared_seq INTEGER"),
+        ("source_receipt_seq", "source_receipt_seq INTEGER"),
+    ] {
+        let present = tx
+            .prepare("SELECT 1 FROM pragma_table_info('settled_markets') WHERE name = ?1")?
+            .exists(params![column])?;
+        if !present {
+            tx.execute(
+                &format!("ALTER TABLE settled_markets ADD COLUMN {declaration}"),
+                [],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 // ── Connection-scoped read helpers ──────────────────────────────────────────
@@ -3604,17 +5399,31 @@ fn read_last_applied(conn: &Connection) -> Result<Option<u64>, PaperStateError> 
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
 
-/// Net-position update, identical to `PositionLedger::ingest`: a BUY covers shorts
-/// first then adds to long; a SELL trims longs first then adds to short.
-fn apply_fill_to_net(long: u64, short: u64, side: Side, qty: u64) -> (u64, u64) {
+fn apply_exact_fill_to_net(
+    long: ShareAmount,
+    short: ShareAmount,
+    side: Side,
+    quantity: ShareAmount,
+) -> Result<(ShareAmount, ShareAmount), PaperStateError> {
     match side {
         Side::Buy => {
-            let covered = short.min(qty);
-            (long.saturating_add(qty - covered), short - covered)
+            let covered = short.atomic().min(quantity.atomic());
+            let uncovered = ShareAmount::from_atomic(quantity.atomic() - covered);
+            Ok((
+                long.checked_add(uncovered)
+                    .map_err(|error| PaperStateError::Internal(error.to_string()))?,
+                ShareAmount::from_atomic(short.atomic() - covered),
+            ))
         }
         Side::Sell => {
-            let trimmed = long.min(qty);
-            (long - trimmed, short.saturating_add(qty - trimmed))
+            let trimmed = long.atomic().min(quantity.atomic());
+            let uncovered = ShareAmount::from_atomic(quantity.atomic() - trimmed);
+            Ok((
+                ShareAmount::from_atomic(long.atomic() - trimmed),
+                short
+                    .checked_add(uncovered)
+                    .map_err(|error| PaperStateError::Internal(error.to_string()))?,
+            ))
         }
     }
 }
@@ -3664,6 +5473,12 @@ fn parse_share_amount(s: &str) -> Result<ShareAmount, PaperStateError> {
     let decimal = parse_decimal(s)?;
     ShareAmount::from_decimal_exact(decimal)
         .map_err(|error| PaperStateError::Corrupt(format!("bad share amount {s:?}: {error}")))
+}
+
+fn parse_collateral_amount(s: &str) -> Result<CollateralAmount, PaperStateError> {
+    let decimal = parse_decimal(s)?;
+    CollateralAmount::from_decimal_exact(decimal)
+        .map_err(|error| PaperStateError::Corrupt(format!("bad collateral amount {s:?}: {error}")))
 }
 
 fn parse_wallet(s: &str) -> Result<WalletAddress, PaperStateError> {
@@ -3842,14 +5657,21 @@ mod tests {
         }
     }
 
+    fn shares(whole: u64) -> ShareAmount {
+        ShareAmount::from_whole(whole).unwrap()
+    }
+
     fn fill(key: &str, side: Side, contracts: u64, price: Decimal) -> FillRecord {
+        let quantity = shares(contracts);
         FillRecord {
             idempotency_key: key.to_string(),
             market_id: market(),
             outcome_id: OutcomeId(0),
             side,
-            contracts,
+            quantity,
             fill_price: Price(price),
+            principal: CollateralAmount::from_decimal_exact(price * quantity.to_decimal()).unwrap(),
+            fee: CollateralAmount::ZERO,
         }
     }
 
@@ -3861,6 +5683,17 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+        let integer_mirrors: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM pragma_table_info('fills') WHERE name = 'contracts') +
+                    (SELECT COUNT(*) FROM pragma_table_info('positions')
+                        WHERE name IN ('long_contracts', 'short_contracts'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(integer_mirrors, 0);
     }
 
     #[test]
@@ -4487,8 +6320,8 @@ mod tests {
         assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(7));
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos.len(), 1);
-        assert_eq!(pos[0].long_contracts, 10);
-        assert_eq!(pos[0].short_contracts, 0);
+        assert_eq!(pos[0].long, shares(10));
+        assert_eq!(pos[0].short, ShareAmount::ZERO);
     }
 
     #[test]
@@ -4513,7 +6346,7 @@ mod tests {
             .unwrap();
         assert_eq!(new, FillCommitOutcome::Applied(dec!(97.40)));
         let pos = db.paper_positions().unwrap();
-        assert_eq!(pos[0].long_contracts, 6);
+        assert_eq!(pos[0].long, shares(6));
     }
 
     #[test]
@@ -4557,7 +6390,7 @@ mod tests {
         assert_eq!(new, FillCommitOutcome::Applied(dec!(995.0)));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(995.0)));
         let pos = db.paper_positions().unwrap();
-        assert_eq!(pos[0].long_contracts, 10);
+        assert_eq!(pos[0].long, shares(10));
     }
 
     #[test]
@@ -4710,15 +6543,15 @@ mod tests {
         db.upsert_position(
             &MarketId(VenueMarketId("0xopen".to_string())),
             OutcomeId(0),
-            3,
-            0,
+            shares(3),
+            ShareAmount::ZERO,
         )
         .unwrap();
         db.upsert_position(
             &MarketId(VenueMarketId("0xflat".to_string())),
             OutcomeId(0),
-            0,
-            0,
+            ShareAmount::ZERO,
+            ShareAmount::ZERO,
         )
         .unwrap();
         assert_eq!(db.positions_count().unwrap(), 1);
@@ -4799,29 +6632,32 @@ mod tests {
     #[test]
     fn upsert_position_round_trips_and_overwrites() {
         let (_dir, db) = db();
-        db.upsert_position(&market(), OutcomeId(0), 10, 3).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(10), shares(3))
+            .unwrap();
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos.len(), 1);
-        assert_eq!(pos[0].long_contracts, 10);
-        assert_eq!(pos[0].short_contracts, 3);
+        assert_eq!(pos[0].long, shares(10));
+        assert_eq!(pos[0].short, shares(3));
         // Same key overwrites (ON CONFLICT DO UPDATE).
-        db.upsert_position(&market(), OutcomeId(0), 0, 5).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), ShareAmount::ZERO, shares(5))
+            .unwrap();
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos.len(), 1);
-        assert_eq!(pos[0].long_contracts, 0);
-        assert_eq!(pos[0].short_contracts, 5);
+        assert_eq!(pos[0].long, ShareAmount::ZERO);
+        assert_eq!(pos[0].short, shares(5));
     }
 
     #[test]
     fn authoritative_replacement_deletes_stale_rows_atomically() {
         let (_dir, db) = db();
         db.set_bankroll(dec!(10)).unwrap();
-        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(5), ShareAmount::ZERO)
+            .unwrap();
         let replacement = PaperPositionRow {
             market_id: MarketId(VenueMarketId("0xfresh".to_owned())),
             outcome_id: OutcomeId(1),
-            long_contracts: 7,
-            short_contracts: 2,
+            long: shares(7),
+            short: shares(2),
         };
 
         db.replace_authoritative_state(dec!(42.5), std::slice::from_ref(&replacement))
@@ -4835,12 +6671,13 @@ mod tests {
     fn invalid_authoritative_replacement_leaves_prior_state_untouched() {
         let (_dir, db) = db();
         db.set_bankroll(dec!(10)).unwrap();
-        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(5), ShareAmount::ZERO)
+            .unwrap();
         let duplicate = PaperPositionRow {
             market_id: market(),
             outcome_id: OutcomeId(1),
-            long_contracts: 7,
-            short_contracts: 2,
+            long: shares(7),
+            short: shares(2),
         };
         let result = db.replace_authoritative_state(dec!(99), &[duplicate.clone(), duplicate]);
 
@@ -4849,7 +6686,7 @@ mod tests {
             Err(PaperStateError::DuplicateAuthoritativePosition { .. })
         ));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(10)));
-        assert_eq!(db.paper_positions().unwrap()[0].long_contracts, 5);
+        assert_eq!(db.paper_positions().unwrap()[0].long, shares(5));
     }
 
     #[cfg(feature = "scenario")]
@@ -4857,19 +6694,20 @@ mod tests {
     fn mid_transaction_authoritative_replacement_failure_rolls_back_every_write() {
         let (_dir, db) = db();
         db.set_bankroll(dec!(10)).unwrap();
-        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), shares(5), ShareAmount::ZERO)
+            .unwrap();
         let replacements = [
             PaperPositionRow {
                 market_id: MarketId(VenueMarketId("0xfresh-1".to_owned())),
                 outcome_id: OutcomeId(0),
-                long_contracts: 7,
-                short_contracts: 2,
+                long: shares(7),
+                short: shares(2),
             },
             PaperPositionRow {
                 market_id: MarketId(VenueMarketId("0xfresh-2".to_owned())),
                 outcome_id: OutcomeId(1),
-                long_contracts: 8,
-                short_contracts: 3,
+                long: shares(8),
+                short: shares(3),
             },
         ];
 
@@ -4881,7 +6719,7 @@ mod tests {
         let prior = db.paper_positions().unwrap();
         assert_eq!(prior.len(), 1);
         assert_eq!(prior[0].market_id, market());
-        assert_eq!(prior[0].long_contracts, 5);
+        assert_eq!(prior[0].long, shares(5));
     }
 
     #[test]
@@ -5218,5 +7056,828 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    fn insert_seal_fixture(db: &PaperStateDb, pending_revision: &str) {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO activity_groups \
+             (source_trade_id, transaction_hash, wallet_hex, source_epoch, semantic_revision, \
+              activity_type, disposition, proof_json) \
+             VALUES ('g2:seal', '0xtx', '0x1111111111111111111111111111111111111111', \
+                     1700, 'rev-1', 'trade', 'admitted', '{\"proof\":1}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO activity_group_revisions \
+             (source_trade_id, semantic_revision, transaction_hash, disposition, proof_json, \
+              recorded_at_unix) \
+             VALUES ('g2:seal', 'rev-1', '0xtx', 'admitted', '{\"proof\":1}', 1701)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entry_gate_results \
+             (source_trade_id, wallet_hex, market_id, source_epoch, result, history_consumed) \
+             VALUES ('g2:seal', '0x1111111111111111111111111111111111111111', \
+                     'market-1', 1700, 'admitted', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO decision_pending \
+             (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, \
+              post_commit_inputs_json, state, terminal_disposition, updated_at_unix) \
+             VALUES ('g2:seal', ?1, '0x1111111111111111111111111111111111111111', \
+                     1700, '{\"frozen\":1}', '{\"terminal\":1}', 'terminal', 'no_fill', 1702)",
+            params![pending_revision],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn seal_decision_evidence_has_golden_canonical_bytes() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let bytes = db
+            .seal_decision_evidence(&[(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())])
+            .unwrap();
+        let expected = concat!(
+            "{\"domain\":\"prediction-edge/seal-decision-evidence\",\"version\":1,\"rows\":[",
+            "{\"source_trade_id\":\"g2:seal\",\"semantic_revision\":\"rev-1\",",
+            "\"activity_group\":{\"transaction_hash\":\"0xtx\",",
+            "\"wallet_hex\":\"0x1111111111111111111111111111111111111111\",",
+            "\"source_epoch\":1700,\"activity_type\":\"trade\",",
+            "\"disposition\":\"admitted\",\"proof_json\":\"{\\\"proof\\\":1}\"},",
+            "\"activity_group_revision\":{\"transaction_hash\":\"0xtx\",",
+            "\"disposition\":\"admitted\",\"proof_json\":\"{\\\"proof\\\":1}\",",
+            "\"recorded_at_unix\":1701},",
+            "\"entry_gate_result\":{",
+            "\"wallet_hex\":\"0x1111111111111111111111111111111111111111\",",
+            "\"market_id\":\"market-1\",\"source_epoch\":1700,",
+            "\"result\":\"admitted\",\"history_consumed\":1},",
+            "\"no_copy_disposition\":null,",
+            "\"terminal_decision\":{",
+            "\"wallet_hex\":\"0x1111111111111111111111111111111111111111\",",
+            "\"source_epoch\":1700,\"frozen_inputs_json\":\"{\\\"frozen\\\":1}\",",
+            "\"post_commit_inputs_json\":\"{\\\"terminal\\\":1}\",",
+            "\"terminal_disposition\":\"no_fill\",\"updated_at_unix\":1702}}]}\n"
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        assert_eq!(
+            blake3::hash(&bytes).to_hex().to_string(),
+            "38933c59ce4721b57f99aeb2137b2f72a44e61ccf140944c3859894ec193ca47"
+        );
+    }
+
+    #[test]
+    fn seal_decision_evidence_rejects_revision_mismatch_and_duplicate_keys() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "different");
+        let key = (SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned());
+        assert!(matches!(
+            db.seal_decision_evidence(std::slice::from_ref(&key)),
+            Err(PaperStateError::SealEvidenceRevisionMismatch { .. })
+        ));
+        assert!(matches!(
+            db.seal_decision_evidence(&[key.clone(), key]),
+            Err(PaperStateError::DuplicateSealEvidenceKey { .. })
+        ));
+    }
+
+    #[test]
+    fn source_prefix_seal_rejects_an_additional_scoped_decision_in_one_transaction() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let receipt = AppendReceipt {
+            sequence: EventSeq(5),
+            this_hash: blake3::hash(b"source-page"),
+        };
+        let frozen = serde_json::to_string(&serde_json::json!({
+            "version": 3,
+            "observed_source_receipt": null,
+            "page_occurrences": [{"receipt": receipt}],
+        }))
+        .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = 'g2:seal'",
+                params![frozen],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.seal_decision_evidence_for_source_prefix(&[], None, Some(EventSeq(5))),
+            Err(PaperStateError::SealEvidenceSelectionMismatch {
+                requested: 0,
+                stored: 1,
+            })
+        ));
+    }
+
+    fn append_receipt(sequence: u64, byte: u8) -> AppendReceipt {
+        AppendReceipt {
+            sequence: EventSeq(sequence),
+            this_hash: blake3::Hash::from_bytes([byte; 32]),
+        }
+    }
+
+    #[test]
+    fn exact_financial_fill_and_resolution_are_sequenced_and_snapshotted() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(10)).unwrap();
+        let start = append_receipt(10, 1);
+        db.seed_financial_start(start).unwrap();
+        db.seed_financial_start(start).unwrap();
+
+        let fill = FillRecord {
+            idempotency_key: "exact-fill".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: ShareAmount::from_decimal_exact(dec!(1.333333)).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(0.666667)).unwrap(),
+            fee: CollateralAmount::from_decimal_exact(dec!(0.000010)).unwrap(),
+        };
+        let fill_source = append_receipt(20, 3);
+        assert_eq!(
+            db.apply_financial_fill(
+                start,
+                None,
+                EventSeq(11),
+                fill_source,
+                100,
+                &fill,
+                dec!(9.333323),
+            )
+            .unwrap(),
+            FinancialApplyOutcome::Applied {
+                cash: dec!(9.333323)
+            }
+        );
+        assert!(matches!(
+            db.apply_financial_fill(
+                start,
+                None,
+                EventSeq(11),
+                fill_source,
+                100,
+                &fill,
+                dec!(9.333323),
+            )
+            .unwrap(),
+            FinancialApplyOutcome::Existing { .. }
+        ));
+
+        let snapshot = db.financial_snapshot(1_000_000).unwrap();
+        assert_eq!(snapshot.cash, dec!(9.333323));
+        assert_eq!(snapshot.start, Some((start.sequence, start.this_hash)));
+        assert_eq!(snapshot.last_prepared_seq, Some(EventSeq(11)));
+        assert_eq!(snapshot.positions[0].long.to_decimal(), dec!(1.333333));
+        assert_eq!(
+            snapshot.fills_for_open_and_7d[0].principal.to_decimal(),
+            dec!(0.666667)
+        );
+        assert_eq!(
+            snapshot.fills_for_open_and_7d[0].fee.to_decimal(),
+            dec!(0.000010)
+        );
+        assert_eq!(snapshot.fills_for_open_and_7d[0].event_seq, EventSeq(11));
+        assert_eq!(snapshot.fills_for_open_and_7d[0].prepared_seq, EventSeq(11));
+        assert_eq!(
+            snapshot.fills_for_open_and_7d[0].source_receipt_seq,
+            Some(fill_source.sequence)
+        );
+        assert_eq!(db.list_fills().unwrap(), snapshot.fills_for_open_and_7d);
+
+        let source = append_receipt(40, 2);
+        let credit = CollateralAmount::from_decimal_exact(dec!(0.666666)).unwrap();
+        assert!(matches!(
+            db.apply_financial_resolution(
+                start,
+                Some(EventSeq(11)),
+                EventSeq(12),
+                &market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                999_999,
+                credit,
+                dec!(9.999989),
+            )
+            .unwrap(),
+            FinancialApplyOutcome::Applied { .. }
+        ));
+        let settled = db.financial_snapshot(1_000_000).unwrap();
+        assert!(settled.positions.is_empty());
+        assert_eq!(settled.settlements_7d.len(), 1);
+        assert_eq!(settled.settlements_7d[0].prepared_seq, Some(EventSeq(12)));
+        assert_eq!(
+            settled.settlements_7d[0].source_receipt_seq,
+            Some(source.sequence)
+        );
+        assert_eq!(settled.fills_for_open_and_7d.len(), 1);
+    }
+
+    /// PASS: a historical snapshot includes only exact financial facts received before its
+    /// cutoff and inside its source prefix, reconstructing cash and positions from the Start.
+    /// FAIL: current cash/positions or a later fill/resolution leaks into the old boundary.
+    #[test]
+    fn financial_snapshot_reconstructs_the_causal_cutoff() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(10)).unwrap();
+        let start = append_receipt(10, 1);
+        db.seed_financial_start(start).unwrap();
+        let first = FillRecord {
+            idempotency_key: "first".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(2).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        db.apply_financial_fill(
+            start,
+            None,
+            EventSeq(11),
+            append_receipt(20, 2),
+            100,
+            &first,
+            dec!(9),
+        )
+        .unwrap();
+        let later_market = MarketId(VenueMarketId("later-market".to_owned()));
+        let later = FillRecord {
+            idempotency_key: "later".to_owned(),
+            market_id: later_market.clone(),
+            outcome_id: OutcomeId(1),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(4).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(2)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        db.apply_financial_fill(
+            start,
+            Some(EventSeq(11)),
+            EventSeq(12),
+            // Its source observation is before the boundary, but its Final is not in the
+            // boundary-completed Prepared set supplied below.
+            append_receipt(30, 3),
+            150,
+            &later,
+            dec!(7),
+        )
+        .unwrap();
+        db.apply_financial_resolution(
+            start,
+            Some(EventSeq(12)),
+            EventSeq(13),
+            &market(),
+            "[\"1\",\"0\"]",
+            append_receipt(60, 4),
+            400,
+            CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+            dec!(8),
+        )
+        .unwrap();
+
+        let historical = db
+            .financial_snapshot_before_source_bound(250, EventSeq(40), &[EventSeq(11)])
+            .unwrap();
+        assert_eq!(historical.cash, dec!(9));
+        assert_eq!(historical.last_prepared_seq, Some(EventSeq(11)));
+        assert_eq!(historical.positions.len(), 1);
+        assert_eq!(historical.positions[0].market_id, market());
+        assert_eq!(historical.positions[0].long.to_decimal(), dec!(2));
+
+        let current = db.financial_snapshot(500).unwrap();
+        assert_eq!(current.cash, dec!(8));
+        assert_eq!(current.last_prepared_seq, Some(EventSeq(13)));
+        assert_eq!(current.positions.len(), 1);
+        assert_eq!(current.positions[0].market_id, later_market);
+    }
+
+    /// PASS: a resolution committed on a second connection while a snapshot read transaction is
+    /// open cannot expose new cash/version together with old positions (or the inverse).
+    /// FAIL: any field read through the snapshot helpers crosses the transaction boundary.
+    #[test]
+    fn financial_snapshot_transaction_cannot_split_a_concurrent_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-financial-snapshot.db");
+        let reader = PaperStateDb::open(&path).unwrap();
+        reader.init_bankroll(dec!(10)).unwrap();
+        let start = append_receipt(10, 1);
+        reader.seed_financial_start(start).unwrap();
+        let fill = FillRecord {
+            idempotency_key: "concurrent-fill".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(1).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(0.5)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        let fill_source = append_receipt(20, 3);
+        reader
+            .apply_financial_fill(
+                start,
+                None,
+                EventSeq(11),
+                fill_source,
+                100,
+                &fill,
+                dec!(9.5),
+            )
+            .unwrap();
+        let writer = PaperStateDb::open(&path).unwrap();
+
+        let mut connection = reader.lock();
+        let transaction = connection.transaction().unwrap();
+        let cash = tx_read_bankroll(&transaction).unwrap();
+        let snapshot_start = tx_financial_start(&transaction).unwrap();
+        let last_prepared = tx_financial_last_prepared(&transaction).unwrap();
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            let source = append_receipt(40, 2);
+            let result = writer.apply_financial_resolution(
+                start,
+                Some(EventSeq(11)),
+                EventSeq(12),
+                &market(),
+                "[\"1\",\"0\"]",
+                source,
+                999_999,
+                CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                dec!(10.5),
+            );
+            completed_tx.send(result).unwrap();
+        });
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cash, dec!(9.5));
+        assert_eq!(
+            snapshot_start.map(|value| value.sequence),
+            Some(EventSeq(10))
+        );
+        assert_eq!(last_prepared, Some(EventSeq(11)));
+        assert_eq!(
+            read_financial_positions(&transaction, true).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            read_settlements_window(&transaction, 0, 1_000_000)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            read_financial_fills_window(&transaction, 0, 1_000_000)
+                .unwrap()
+                .len(),
+            1
+        );
+        transaction.commit().unwrap();
+        drop(connection);
+        writer_thread.join().unwrap();
+
+        let after = reader.financial_snapshot(1_000_000).unwrap();
+        assert_eq!(after.cash, dec!(10.5));
+        assert_eq!(after.last_prepared_seq, Some(EventSeq(12)));
+        assert!(after.positions.is_empty());
+        assert_eq!(after.settlements_7d.len(), 1);
+    }
+
+    /// I16-C8-CONFLICT-LOCAL
+    ///
+    /// Preconditions: one exact fill and its resolution have committed under one Start and
+    /// monotonically adjacent Prepared sequences.
+    /// PASS: every immutable fill identity/economic field and every resolution
+    /// condition/payout/time/evidence/era/sequence field conflicts on retry, while exact retries
+    /// remain idempotent.
+    /// FAIL: any changed retry mutates SQLite, changes cash, or is accepted as an existing result.
+    #[test]
+    fn financial_protocol_changed_field_conflict_matrix() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(10)).unwrap();
+        let start = append_receipt(1, 1);
+        db.seed_financial_start(start).unwrap();
+        let fill = FillRecord {
+            idempotency_key: "f".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: ShareAmount::from_whole(1).unwrap(),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(0.5)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        assert!(matches!(
+            db.apply_financial_fill(
+                start,
+                Some(EventSeq(99)),
+                EventSeq(2),
+                append_receipt(20, 3),
+                5,
+                &fill,
+                dec!(9.5),
+            ),
+            Err(PaperStateError::FinancialConflict(_))
+        ));
+        db.apply_financial_fill(
+            start,
+            None,
+            EventSeq(2),
+            append_receipt(20, 3),
+            5,
+            &fill,
+            dec!(9.5),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.apply_financial_fill(start, None, EventSeq(2), append_receipt(20, 3), 5, &fill, dec!(9.5)),
+            Ok(FinancialApplyOutcome::Existing { cash }) if cash == dec!(9.5)
+        ));
+
+        let mut changed_fills = Vec::new();
+        let mut changed = fill.clone();
+        changed.idempotency_key = "different-key".to_owned();
+        changed_fills.push(("idempotency_key", changed));
+        let mut changed = fill.clone();
+        changed.market_id = MarketId(VenueMarketId("different-market".to_owned()));
+        changed_fills.push(("market_id", changed));
+        let mut changed = fill.clone();
+        changed.outcome_id = OutcomeId(1);
+        changed_fills.push(("outcome_id", changed));
+        let mut changed = fill.clone();
+        changed.side = Side::Sell;
+        changed_fills.push(("side", changed));
+        let mut changed = fill.clone();
+        changed.quantity = ShareAmount::from_decimal_exact(dec!(1.000001)).unwrap();
+        changed_fills.push(("quantity", changed));
+        let mut changed = fill.clone();
+        changed.fill_price = Price::new(dec!(0.500001)).unwrap();
+        changed_fills.push(("fill_price", changed));
+        let mut changed = fill.clone();
+        changed.principal = CollateralAmount::from_decimal_exact(dec!(0.500001)).unwrap();
+        changed_fills.push(("principal", changed));
+        let mut changed = fill.clone();
+        changed.fee = CollateralAmount::from_decimal_exact(dec!(0.000001)).unwrap();
+        changed_fills.push(("fee", changed));
+
+        for (field, changed) in changed_fills {
+            assert!(
+                matches!(
+                    db.apply_financial_fill(
+                        start,
+                        None,
+                        EventSeq(2),
+                        append_receipt(20, 3),
+                        5,
+                        &changed,
+                        dec!(9.5)
+                    ),
+                    Err(PaperStateError::FinancialConflict(_))
+                ),
+                "changed fill {field} must conflict"
+            );
+        }
+        assert!(matches!(
+            db.apply_financial_fill(
+                start,
+                Some(EventSeq(1)),
+                EventSeq(2),
+                append_receipt(20, 3),
+                5,
+                &fill,
+                dec!(9.5)
+            ),
+            Err(PaperStateError::FinancialConflict(_))
+        ));
+        assert!(matches!(
+            db.apply_financial_fill(
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                append_receipt(20, 3),
+                5,
+                &fill,
+                dec!(9.5)
+            ),
+            Err(PaperStateError::FinancialConflict(_))
+        ));
+        assert!(matches!(
+            db.apply_financial_fill(
+                start,
+                None,
+                EventSeq(2),
+                append_receipt(20, 3),
+                5,
+                &fill,
+                dec!(9.500001)
+            ),
+            Err(PaperStateError::FinancialConflict(_))
+        ));
+        let other_start = append_receipt(3, 3);
+        assert!(matches!(
+            db.apply_financial_fill(
+                other_start,
+                None,
+                EventSeq(2),
+                append_receipt(20, 3),
+                5,
+                &fill,
+                dec!(9.5)
+            ),
+            Err(PaperStateError::FinancialStartConflict)
+        ));
+
+        let source = append_receipt(8, 4);
+        let credit = CollateralAmount::from_decimal_exact(dec!(0.5)).unwrap();
+        db.apply_financial_resolution(
+            start,
+            Some(EventSeq(2)),
+            EventSeq(3),
+            &market(),
+            "[\"0.5\",\"0.5\"]",
+            source,
+            4,
+            credit,
+            dec!(10),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.apply_financial_resolution(
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                &market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            Ok(FinancialApplyOutcome::Existing { cash }) if cash == dec!(10)
+        ));
+
+        let resolution_retries = [
+            (
+                "condition",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                MarketId(VenueMarketId("different-market".to_owned())),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "payout",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"1\",\"0\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "source_receipt",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                append_receipt(9, 5),
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "settled_at_unix",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                5,
+                credit,
+                dec!(10),
+            ),
+            (
+                "credit",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                CollateralAmount::from_decimal_exact(dec!(0.500001)).unwrap(),
+                dec!(10),
+            ),
+            (
+                "canonical_cash",
+                start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10.000001),
+            ),
+            (
+                "era",
+                other_start,
+                Some(EventSeq(2)),
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "prior_sequence",
+                start,
+                None,
+                EventSeq(3),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+            (
+                "prepared_sequence",
+                start,
+                Some(EventSeq(3)),
+                EventSeq(4),
+                market(),
+                "[\"0.5\",\"0.5\"]",
+                source,
+                4,
+                credit,
+                dec!(10),
+            ),
+        ];
+        for (
+            field,
+            retry_start,
+            prior,
+            prepared,
+            condition,
+            payout,
+            retry_source,
+            settled_at,
+            retry_credit,
+            cash,
+        ) in resolution_retries
+        {
+            assert!(
+                matches!(
+                    db.apply_financial_resolution(
+                        retry_start,
+                        prior,
+                        prepared,
+                        &condition,
+                        payout,
+                        retry_source,
+                        settled_at,
+                        retry_credit,
+                        cash,
+                    ),
+                    Err(PaperStateError::FinancialConflict(_)
+                        | PaperStateError::FinancialStartConflict)
+                ),
+                "changed resolution {field} must conflict"
+            );
+        }
+        let snapshot = db.financial_snapshot(100).unwrap();
+        assert_eq!(snapshot.cash, dec!(10));
+        assert_eq!(snapshot.last_prepared_seq, Some(EventSeq(3)));
+        assert_eq!(snapshot.settlements_7d.len(), 1);
+    }
+
+    #[test]
+    fn financial_era_reset_is_atomic_idempotent_and_preserves_nonfinancial_state() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(25)).unwrap();
+        let wallet = wallet();
+        db.set_cursor(&wallet, 77).unwrap();
+        db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet,
+            complete: true,
+            proof_json: "{\"proof\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+        let legacy = FillRecord {
+            idempotency_key: "legacy".to_owned(),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            quantity: shares(2),
+            fill_price: Price::new(dec!(0.5)).unwrap(),
+            principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+            fee: CollateralAmount::ZERO,
+        };
+        db.commit_fill(
+            &SourceTradeId("legacy-source".to_owned()),
+            &leader(2, 0),
+            &legacy,
+            EventSeq(4),
+        )
+        .unwrap();
+
+        let start = append_receipt(10, 7);
+        let bankroll = CollateralAmount::from_decimal_exact(dec!(100)).unwrap();
+        db.reset_financial_era(start, bankroll).unwrap();
+        db.reset_financial_era(start, bankroll).unwrap();
+
+        let snapshot = db.financial_snapshot(1_000).unwrap();
+        assert_eq!(snapshot.cash, dec!(100));
+        assert!(snapshot.positions.is_empty());
+        assert!(snapshot.fills_for_open_and_7d.is_empty());
+        assert!(snapshot.settlements_7d.is_empty());
+        assert_eq!(snapshot.start, Some((start.sequence, start.this_hash)));
+        assert_eq!(snapshot.last_prepared_seq, None);
+        assert_eq!(db.cursor(&wallet).unwrap(), Some(77));
+        assert!(db.wallet_history_complete(&wallet).unwrap());
+
+        assert!(matches!(
+            db.reset_financial_era(append_receipt(11, 8), bankroll),
+            Err(PaperStateError::FinancialStartConflict)
+        ));
+    }
+
+    #[test]
+    fn schema_v2_whole_contract_rows_migrate_to_exact_strings_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE fills (
+                    idempotency_key TEXT PRIMARY KEY, market_id TEXT, outcome_id INTEGER,
+                    side TEXT, contracts INTEGER, fill_price_str TEXT, event_seq INTEGER);
+                 CREATE TABLE positions (
+                    market_id TEXT, outcome_id INTEGER, long_contracts INTEGER,
+                    short_contracts INTEGER, PRIMARY KEY (market_id, outcome_id));
+                 CREATE TABLE settled_markets (
+                    market_id TEXT PRIMARY KEY, outcome_prices TEXT, credit_applied TEXT,
+                    settled_at_unix INTEGER);
+                 INSERT INTO fills VALUES ('legacy','m',0,'buy',3,'0.25',7);
+                 INSERT INTO positions VALUES ('m',0,3,0);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(PaperStateDb::open(&path).unwrap());
+        drop(PaperStateDb::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let row: (String, String, String, i64) = connection
+            .query_row(
+                "SELECT quantity_str, principal_str, fee_str, prepared_seq FROM fills",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("3".to_owned(), "0.75".to_owned(), "0".to_owned(), 7));
+        let position: (String, String) = connection
+            .query_row("SELECT long_str, short_str FROM positions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(position, ("3".to_owned(), "0".to_owned()));
+        let integer_mirrors: i64 = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM pragma_table_info('fills') WHERE name = 'contracts') +
+                    (SELECT COUNT(*) FROM pragma_table_info('positions')
+                        WHERE name IN ('long_contracts', 'short_contracts'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(integer_mirrors, 0);
     }
 }

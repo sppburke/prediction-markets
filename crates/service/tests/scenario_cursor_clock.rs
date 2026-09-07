@@ -174,8 +174,16 @@ async fn run_once(
     ));
     let (trigger_tx, trigger_rx) = mpsc::channel(4);
     let health = new_shared_health_with_ws(false, true, 90);
-    let ingest =
-        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
+    // Production replays the source receipt index from the on-disk log before the ingest starts
+    // (`main.rs`); a restart against a non-empty log must do the same or every synchronized
+    // append is refused as non-contiguous.
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(source_log_path).unwrap();
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
+            .with_source_receipt_index(source_receipts)
+            .run(),
+    );
     let (control_tx, mut control_rx) = mpsc::channel(2);
     let control_paper = paper_state.clone();
     let control_source_log = source_log_path.to_owned();
@@ -502,6 +510,10 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
                 source_trade_id: pe_core_types::SourceTradeId("g2:same".to_owned()),
                 provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
                 received_at: OffsetDateTime::from_unix_timestamp(received_at).unwrap(),
+                receipt: pe_event_log::AppendReceipt {
+                    sequence: pe_core_types::EventSeq(u64::try_from(received_at).unwrap()),
+                    this_hash: blake3::Hash::from_bytes([0; 32]),
+                },
             })
             .await
             .unwrap();

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use blake3::Hash;
 use fs2::FileExt;
 use pe_core_types::EventSeq;
+use serde::{Deserialize, Serialize};
 
 use crate::envelope::{EnvelopeIn, EventEnvelope, HashInput, compute_hashes};
 use crate::frame::{write_file_header, write_frame};
@@ -20,6 +21,14 @@ impl DurableWrite for File {
     fn sync_all(&self) -> std::io::Result<()> {
         File::sync_all(self)
     }
+}
+
+/// Identity of one synchronized frame: its sequence and BLAKE3 chain hash (#545).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendReceipt {
+    pub sequence: EventSeq,
+    #[serde(with = "crate::envelope::hex_hash")]
+    pub this_hash: blake3::Hash,
 }
 
 /// Single-writer handle for an append-only event log file.
@@ -196,6 +205,17 @@ impl Writer {
         Ok(seq)
     }
 
+    /// Append, flush, and fsync one frame; the receipt is returned only after synchronization.
+    pub fn append_synced(&mut self, envelope_in: EnvelopeIn) -> Result<AppendReceipt, LogError> {
+        let sequence = self.append(envelope_in)?;
+        let receipt = AppendReceipt {
+            sequence,
+            this_hash: self.last_hash,
+        };
+        self.sync()?;
+        Ok(receipt)
+    }
+
     /// Flush buffered frame bytes. A failure permanently poisons the writer.
     pub fn flush(&mut self) -> Result<(), LogError> {
         self.ensure_healthy()?;
@@ -244,7 +264,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::ContentType;
+    use crate::{ContentType, Reader};
 
     #[derive(Debug, Clone, Copy)]
     enum Fault {
@@ -347,5 +367,19 @@ mod tests {
             writer.append(envelope()),
             Err(LogError::Poisoned { .. })
         ));
+    }
+
+    /// PASS: a synchronized append returns the sequence and hash replayed from its frame.
+    #[test]
+    fn append_synced_receipt_matches_replayed_frame_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipt.log");
+        let mut writer = Writer::open(&path).unwrap();
+
+        let receipt = writer.append_synced(envelope()).unwrap();
+        let (sequence, replayed) = Reader::replay(&path).unwrap().next().unwrap().unwrap();
+
+        assert_eq!(receipt.sequence, sequence);
+        assert_eq!(receipt.this_hash, replayed.this_hash);
     }
 }

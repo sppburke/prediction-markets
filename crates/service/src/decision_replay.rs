@@ -1,13 +1,21 @@
 //! Pure replay and validation for post-boundary `decision_pending` evidence.
 
-use pe_core_types::{EventSeq, Price, Side, SourceTradeId};
+use pe_core_types::{CollateralAmount, EventSeq, Price, Side, SourceTradeId};
+use pe_event_log::AppendReceipt;
+use pe_execution_core::EconomicPrepared;
 use pe_paper_state::{DecisionPendingRow, DecisionPendingState};
+use pe_strategy_winner_follow::{WinnerFollowDeclineAudit, WinnerFollowError};
 use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
 
-use crate::bucket_commit::{DecisionContinuationError, DecisionContinuationV2};
+use crate::bucket_commit::{
+    DecisionContinuationError, DecisionContinuationFacts, DecisionContinuationV3,
+};
 
-pub const POST_BOUNDARY_EVIDENCE_VERSION: u16 = 2;
+const LEGACY_POST_BOUNDARY_EVIDENCE_VERSION: u16 = 2;
+pub const POST_BOUNDARY_EVIDENCE_VERSION: u16 = 4;
+pub const TERMINAL_EVIDENCE_VERSION: u16 = 5;
+const LEGACY_FINANCIAL_SEMANTIC_VERSION: u32 = 0;
 const EVIDENCE_OWNERS: [&str; 2] = ["source_log", "paper_log"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,12 +95,53 @@ pub struct RecordedFillEvidence {
     pub event_seq: u64,
 }
 
+/// Causal evidence retained when the financial prefix cannot construct a strategy risk snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WinnerFollowRiskInputEvidence {
+    /// Exact paper prefix observed before risk construction. `None` preserves an acquisition
+    /// failure that occurred before a verified financial prefix was available.
+    pub financial_prefix: Option<AppendReceipt>,
+    /// Exact set of source pages consulted by the strict price attempt: value-producing cached or
+    /// fetched pages plus request-bound empty, rejected, or transport-failure observations.
+    pub price_receipts: Vec<AppendReceipt>,
+    /// Clock used for PnL, price freshness, and latency reconstruction.
+    pub evaluated_at_unix_ms: i64,
+    pub proposed_debit: CollateralAmount,
+    pub per_trade_cap_bps: i32,
+}
+
+/// Receipt-bound inputs to the shared Winner-Follow decision, or the typed causal failure that
+/// prevented their construction. Qualification replays both variants from the sealed prefixes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum WinnerFollowDecisionInputs {
+    Evaluated {
+        economic: Box<EconomicPrepared>,
+    },
+    RiskInputsUnavailable {
+        cause: crate::risk_inputs::RiskInputsUnavailable,
+        evidence: WinnerFollowRiskInputEvidence,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WinnerFollowDeclineEvidence {
+    pub outcome: WinnerFollowDeclineAudit,
+    pub inputs: WinnerFollowDecisionInputs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalDispositionEvidence {
     pub disposition: String,
     pub reason: String,
     pub fill: Option<RecordedFillEvidence>,
     pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decline: Option<WinnerFollowDeclineEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_receipt: Option<AppendReceipt>,
 }
 
 impl TerminalDispositionEvidence {
@@ -102,6 +151,8 @@ impl TerminalDispositionEvidence {
             reason: reason.to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -111,6 +162,8 @@ impl TerminalDispositionEvidence {
             reason: reason.to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -120,6 +173,8 @@ impl TerminalDispositionEvidence {
             reason: "market_settled".to_owned(),
             fill: None,
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -129,6 +184,8 @@ impl TerminalDispositionEvidence {
             reason: "live_targets_staged".to_owned(),
             fill: None,
             dispatch_id: Some(dispatch_id),
+            decline: None,
+            final_receipt: None,
         }
     }
 
@@ -154,6 +211,33 @@ impl TerminalDispositionEvidence {
                 event_seq: event_seq.0,
             }),
             dispatch_id: None,
+            decline: None,
+            final_receipt: None,
+        }
+    }
+
+    pub fn declined(error: &WinnerFollowError, inputs: WinnerFollowDecisionInputs) -> Self {
+        Self {
+            disposition: "no_fill".to_owned(),
+            reason: format!("paper_reject:{error}"),
+            fill: None,
+            dispatch_id: None,
+            decline: Some(WinnerFollowDeclineEvidence {
+                outcome: WinnerFollowDeclineAudit::from(error),
+                inputs,
+            }),
+            final_receipt: None,
+        }
+    }
+
+    pub fn final_fill(final_receipt: AppendReceipt) -> Self {
+        Self {
+            disposition: "fill".to_owned(),
+            reason: "paper_fill_committed".to_owned(),
+            fill: None,
+            dispatch_id: None,
+            decline: None,
+            final_receipt: Some(final_receipt),
         }
     }
 }
@@ -176,21 +260,24 @@ pub struct DecisionPostBoundaryEvidenceBody {
 pub struct DecisionPostBoundaryEvidence {
     #[serde(flatten)]
     pub body: DecisionPostBoundaryEvidenceBody,
+    pub financial_semantic_version: u32,
     pub document_blake3: String,
 }
 
 impl DecisionPostBoundaryEvidence {
     /// Seal one post-boundary evidence body with its canonical BLAKE3 identity.
     pub fn from_body(body: DecisionPostBoundaryEvidenceBody) -> Result<Self, serde_json::Error> {
-        let document_blake3 = body_hash(&body)?;
+        let financial_semantic_version = crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION;
+        let document_blake3 = body_hash(&body, financial_semantic_version)?;
         Ok(Self {
             body,
+            financial_semantic_version,
             document_blake3,
         })
     }
 
     fn validate_hash(&self) -> Result<(), ReplayDecisionError> {
-        let actual = body_hash(&self.body)?;
+        let actual = body_hash(&self.body, self.financial_semantic_version)?;
         if actual != self.document_blake3 {
             return Err(ReplayDecisionError::DocumentHash {
                 expected: self.document_blake3.clone(),
@@ -201,7 +288,46 @@ impl DecisionPostBoundaryEvidence {
     }
 }
 
-fn body_hash(body: &DecisionPostBoundaryEvidenceBody) -> Result<String, serde_json::Error> {
+/// Pre-financial wire contract retained only for validating durable v2 documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyDecisionPostBoundaryEvidence {
+    #[serde(flatten)]
+    body: DecisionPostBoundaryEvidenceBody,
+    document_blake3: String,
+}
+
+impl LegacyDecisionPostBoundaryEvidence {
+    fn validate_hash(&self) -> Result<(), ReplayDecisionError> {
+        let actual = legacy_body_hash(&self.body)?;
+        if actual != self.document_blake3 {
+            return Err(ReplayDecisionError::DocumentHash {
+                expected: self.document_blake3.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn into_current(self) -> DecisionPostBoundaryEvidence {
+        DecisionPostBoundaryEvidence {
+            body: self.body,
+            // Zero exists only in this decoded view and preserves the fact that the durable
+            // pre-Start document carried no financial-semantic binding.
+            financial_semantic_version: LEGACY_FINANCIAL_SEMANTIC_VERSION,
+            document_blake3: self.document_blake3,
+        }
+    }
+}
+
+fn body_hash(
+    body: &DecisionPostBoundaryEvidenceBody,
+    financial_semantic_version: u32,
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(&(financial_semantic_version, body))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn legacy_body_hash(body: &DecisionPostBoundaryEvidenceBody) -> Result<String, serde_json::Error> {
     let bytes = serde_json::to_vec(body)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
@@ -222,12 +348,122 @@ struct DecisionEvidenceCheckpointBody {
 struct DecisionEvidenceCheckpoint {
     #[serde(flatten)]
     body: DecisionEvidenceCheckpointBody,
+    financial_semantic_version: u32,
     document_blake3: String,
 }
 
-fn checkpoint_hash(body: &DecisionEvidenceCheckpointBody) -> Result<String, serde_json::Error> {
+/// Pre-financial checkpoint wire contract retained only for compatibility recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyDecisionEvidenceCheckpoint {
+    #[serde(flatten)]
+    body: DecisionEvidenceCheckpointBody,
+    document_blake3: String,
+}
+
+fn checkpoint_hash(
+    body: &DecisionEvidenceCheckpointBody,
+    financial_semantic_version: u32,
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(&(financial_semantic_version, body))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn legacy_checkpoint_hash(
+    body: &DecisionEvidenceCheckpointBody,
+) -> Result<String, serde_json::Error> {
     let bytes = serde_json::to_vec(body)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceWireVersion {
+    version: u16,
+}
+
+fn wire_version_and_financial_field(json: &str) -> Result<(u16, bool), ReplayDecisionError> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let has_financial_semantic_version = value
+        .as_object()
+        .is_some_and(|object| object.contains_key("financial_semantic_version"));
+    let version = serde_json::from_value::<EvidenceWireVersion>(value)?.version;
+    Ok((version, has_financial_semantic_version))
+}
+
+struct DecodedDecisionEvidence {
+    evidence: DecisionPostBoundaryEvidence,
+    legacy: bool,
+}
+
+fn decode_decision_evidence(json: &str) -> Result<DecodedDecisionEvidence, ReplayDecisionError> {
+    let (version, has_financial_semantic_version) = wire_version_and_financial_field(json)?;
+    match (version, has_financial_semantic_version) {
+        (LEGACY_POST_BOUNDARY_EVIDENCE_VERSION, false) => {
+            let legacy: LegacyDecisionPostBoundaryEvidence = serde_json::from_str(json)?;
+            legacy.validate_hash()?;
+            Ok(DecodedDecisionEvidence {
+                evidence: legacy.into_current(),
+                legacy: true,
+            })
+        }
+        (POST_BOUNDARY_EVIDENCE_VERSION | TERMINAL_EVIDENCE_VERSION, true) => {
+            let current: DecisionPostBoundaryEvidence = serde_json::from_str(json)?;
+            current.validate_hash()?;
+            Ok(DecodedDecisionEvidence {
+                evidence: current,
+                legacy: false,
+            })
+        }
+        (
+            LEGACY_POST_BOUNDARY_EVIDENCE_VERSION
+            | POST_BOUNDARY_EVIDENCE_VERSION
+            | TERMINAL_EVIDENCE_VERSION,
+            _,
+        ) => Err(ReplayDecisionError::FinancialSemanticField { version }),
+        _ => Err(ReplayDecisionError::Version(version)),
+    }
+}
+
+struct DecodedCheckpoint {
+    body: DecisionEvidenceCheckpointBody,
+    financial_semantic_version: Option<u32>,
+}
+
+fn decode_checkpoint(json: &str) -> Result<DecodedCheckpoint, ReplayDecisionError> {
+    let (version, has_financial_semantic_version) = wire_version_and_financial_field(json)?;
+    match (version, has_financial_semantic_version) {
+        (LEGACY_POST_BOUNDARY_EVIDENCE_VERSION, false) => {
+            let legacy: LegacyDecisionEvidenceCheckpoint = serde_json::from_str(json)?;
+            let actual = legacy_checkpoint_hash(&legacy.body)?;
+            if actual != legacy.document_blake3 {
+                return Err(ReplayDecisionError::DocumentHash {
+                    expected: legacy.document_blake3,
+                    actual,
+                });
+            }
+            Ok(DecodedCheckpoint {
+                body: legacy.body,
+                financial_semantic_version: None,
+            })
+        }
+        (POST_BOUNDARY_EVIDENCE_VERSION, true) => {
+            let current: DecisionEvidenceCheckpoint = serde_json::from_str(json)?;
+            let actual = checkpoint_hash(&current.body, current.financial_semantic_version)?;
+            if actual != current.document_blake3 {
+                return Err(ReplayDecisionError::DocumentHash {
+                    expected: current.document_blake3,
+                    actual,
+                });
+            }
+            Ok(DecodedCheckpoint {
+                body: current.body,
+                financial_semantic_version: Some(current.financial_semantic_version),
+            })
+        }
+        (LEGACY_POST_BOUNDARY_EVIDENCE_VERSION | POST_BOUNDARY_EVIDENCE_VERSION, _) => {
+            Err(ReplayDecisionError::FinancialSemanticField { version })
+        }
+        _ => Err(ReplayDecisionError::Version(version)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -241,7 +477,7 @@ pub struct DecisionEvidenceAccumulator {
 }
 
 impl DecisionEvidenceAccumulator {
-    pub(crate) fn new(continuation: &DecisionContinuationV2) -> Self {
+    pub(crate) fn new(continuation: &DecisionContinuationFacts) -> Self {
         Self {
             source_trade_id: continuation.source_trade_id.clone(),
             applied_configuration_hash: continuation.applied_configuration_hash.clone(),
@@ -276,9 +512,14 @@ impl DecisionEvidenceAccumulator {
         authority: AuthorityEvidence,
         terminal: TerminalDispositionEvidence,
     ) -> Result<String, serde_json::Error> {
+        let version = if terminal.decline.is_some() || terminal.final_receipt.is_some() {
+            TERMINAL_EVIDENCE_VERSION
+        } else {
+            POST_BOUNDARY_EVIDENCE_VERSION
+        };
         serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(
             DecisionPostBoundaryEvidenceBody {
-                version: POST_BOUNDARY_EVIDENCE_VERSION,
+                version,
                 owners: EVIDENCE_OWNERS.into_iter().map(str::to_owned).collect(),
                 source_trade_id: self.source_trade_id.clone(),
                 applied_configuration_hash: self.applied_configuration_hash.clone(),
@@ -305,9 +546,11 @@ impl DecisionEvidenceAccumulator {
             book: self.book.clone(),
             clocks: self.clocks.clone(),
         };
-        let document_blake3 = checkpoint_hash(&body)?;
+        let financial_semantic_version = crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION;
+        let document_blake3 = checkpoint_hash(&body, financial_semantic_version)?;
         serde_json::to_string(&DecisionEvidenceCheckpoint {
             body,
+            financial_semantic_version,
             document_blake3,
         })
     }
@@ -315,12 +558,9 @@ impl DecisionEvidenceAccumulator {
     pub(crate) fn from_pending_checkpoint(
         row: &DecisionPendingRow,
     ) -> Result<Self, ReplayDecisionError> {
-        let continuation = DecisionContinuationV2::from_durable(row)?;
-        let checkpoint: DecisionEvidenceCheckpoint =
-            serde_json::from_str(&row.post_commit_inputs_json)?;
-        if checkpoint.body.version != POST_BOUNDARY_EVIDENCE_VERSION {
-            return Err(ReplayDecisionError::Version(checkpoint.body.version));
-        }
+        let continuation = DecisionContinuationV3::from_durable(row)?;
+        let frozen = &continuation.facts;
+        let checkpoint = decode_checkpoint(&row.post_commit_inputs_json)?;
         if checkpoint.body.owners
             != EVIDENCE_OWNERS
                 .into_iter()
@@ -329,15 +569,11 @@ impl DecisionEvidenceAccumulator {
         {
             return Err(ReplayDecisionError::Owners);
         }
-        let actual = checkpoint_hash(&checkpoint.body)?;
-        if actual != checkpoint.document_blake3 {
-            return Err(ReplayDecisionError::DocumentHash {
-                expected: checkpoint.document_blake3,
-                actual,
-            });
-        }
-        if checkpoint.body.source_trade_id != continuation.source_trade_id
-            || checkpoint.body.applied_configuration_hash != continuation.applied_configuration_hash
+        if checkpoint
+            .financial_semantic_version
+            .is_some_and(|version| version != crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
+            || checkpoint.body.source_trade_id != frozen.source_trade_id
+            || checkpoint.body.applied_configuration_hash != frozen.applied_configuration_hash
         {
             return Err(ReplayDecisionError::FrozenMismatch);
         }
@@ -361,7 +597,6 @@ pub(crate) fn ladder_plan_blake3(plan: &LadderPlan) -> String {
         "best_ask": plan.best_ask.0.normalize().to_string(),
         "limit_price": plan.limit_price.0.normalize().to_string(),
         "shares_atomic": plan.shares.atomic(),
-        "estimated_ladder_spend_atomic": plan.estimated_ladder_spend.atomic(),
         "worst_case_debit_atomic": plan.worst_case_debit.atomic(),
     });
     blake3::hash(body.to_string().as_bytes())
@@ -371,7 +606,7 @@ pub(crate) fn ladder_plan_blake3(plan: &LadderPlan) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayedDecision {
-    pub continuation: DecisionContinuationV2,
+    pub continuation: DecisionContinuationV3,
     pub post_boundary: DecisionPostBoundaryEvidence,
     /// Exact durable terminal-decision bytes, retained after validation.
     pub recorded_decision_json: String,
@@ -385,6 +620,8 @@ pub enum ReplayDecisionError {
     ContinuationBinding,
     #[error("authority outcome contradicts the terminal disposition")]
     AuthorityBinding,
+    #[error("typed terminal evidence contradicts its disposition")]
+    TerminalEvidenceBinding,
     #[error("decision_pending row is not terminal")]
     OpenRow,
     #[error("frozen decision continuation: {0}")]
@@ -393,6 +630,10 @@ pub enum ReplayDecisionError {
     Json(#[from] serde_json::Error),
     #[error("unsupported post-boundary evidence version {0}")]
     Version(u16),
+    #[error(
+        "post-boundary evidence version {version} has invalid financial_semantic_version field presence"
+    )]
+    FinancialSemanticField { version: u16 },
     #[error("post-boundary evidence owners are invalid")]
     Owners,
     #[error("post-boundary evidence does not match the frozen decision")]
@@ -410,12 +651,10 @@ pub fn replay_decision_pending(
     if row.state != DecisionPendingState::Terminal {
         return Err(ReplayDecisionError::OpenRow);
     }
-    let continuation = DecisionContinuationV2::from_durable(row)?;
-    let post_boundary: DecisionPostBoundaryEvidence =
-        serde_json::from_str(&row.post_commit_inputs_json)?;
-    if post_boundary.body.version != POST_BOUNDARY_EVIDENCE_VERSION {
-        return Err(ReplayDecisionError::Version(post_boundary.body.version));
-    }
+    let continuation = DecisionContinuationV3::from_durable(row)?;
+    let frozen = &continuation.facts;
+    let decoded = decode_decision_evidence(&row.post_commit_inputs_json)?;
+    let post_boundary = decoded.evidence;
     if post_boundary.body.owners
         != EVIDENCE_OWNERS
             .into_iter()
@@ -424,11 +663,12 @@ pub fn replay_decision_pending(
     {
         return Err(ReplayDecisionError::Owners);
     }
-    post_boundary.validate_hash()?;
-    if post_boundary.body.source_trade_id != continuation.source_trade_id
-        || post_boundary.body.applied_configuration_hash != continuation.applied_configuration_hash
-        || continuation.applied_configuration.canonical_hash()
-            != continuation.applied_configuration_hash
+    if (!decoded.legacy
+        && post_boundary.financial_semantic_version
+            != crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
+        || post_boundary.body.source_trade_id != frozen.source_trade_id
+        || post_boundary.body.applied_configuration_hash != frozen.applied_configuration_hash
+        || frozen.applied_configuration.canonical_hash() != frozen.applied_configuration_hash
     {
         return Err(ReplayDecisionError::FrozenMismatch);
     }
@@ -440,35 +680,57 @@ pub fn replay_decision_pending(
     // describes a DIFFERENT market/outcome/side/identity than the frozen
     // continuation — or an authority outcome contradicting the disposition —
     // must fail, or a recomputed-hash forgery replays as valid.
-    let market = continuation.market_id.to_string();
+    let market = frozen.market_id.to_string();
     if let Some(evidence) = post_boundary.body.market_end.as_ref()
         && evidence.market_id != market
     {
         return Err(ReplayDecisionError::ContinuationBinding);
     }
     if let Some(evidence) = post_boundary.body.market_price.as_ref()
-        && (evidence.market_id != market || evidence.outcome_id != continuation.outcome_id.0)
+        && (evidence.market_id != market || evidence.outcome_id != frozen.outcome_id.0)
     {
         return Err(ReplayDecisionError::ContinuationBinding);
     }
     let disposition = post_boundary.body.terminal.disposition.as_str();
-    match post_boundary.body.terminal.fill.as_ref() {
-        Some(fill) => {
+    let terminal = &post_boundary.body.terminal;
+    if post_boundary.body.version == TERMINAL_EVIDENCE_VERSION {
+        let typed_decline = terminal.decline.is_some()
+            && terminal.disposition == "no_fill"
+            && terminal.fill.is_none()
+            && terminal.final_receipt.is_none();
+        let final_fill = terminal.final_receipt.is_some()
+            && terminal.disposition == "fill"
+            && terminal.decline.is_none()
+            && terminal.fill.is_none();
+        if !typed_decline && !final_fill {
+            return Err(ReplayDecisionError::TerminalEvidenceBinding);
+        }
+    }
+    if terminal.decline.is_some()
+        && (terminal.disposition != "no_fill"
+            || terminal.fill.is_some()
+            || terminal.final_receipt.is_some())
+    {
+        return Err(ReplayDecisionError::TerminalEvidenceBinding);
+    }
+    match (terminal.fill.as_ref(), terminal.final_receipt) {
+        (Some(_), Some(_)) => return Err(ReplayDecisionError::TerminalEvidenceBinding),
+        (Some(fill), None) => {
             if disposition != "fill" {
                 // Only a fill disposition may carry recorded fill evidence.
                 return Err(ReplayDecisionError::ContinuationBinding);
             }
             let expected_key = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
-                &pe_core_types::TraderId(continuation.wallet).to_string(),
-                &continuation.source_trade_id.0,
-                &continuation.market_id.0.0,
-                continuation.outcome_id.0,
-                continuation.side,
-                continuation.source_epoch,
+                &pe_core_types::TraderId(frozen.wallet).to_string(),
+                &frozen.source_trade_id.0,
+                &frozen.market_id.0.0,
+                frozen.outcome_id.0,
+                frozen.side,
+                frozen.source_epoch,
             );
-            if fill.market_id != continuation.market_id.0.0
-                || fill.outcome_id != continuation.outcome_id.0
-                || !fill.side.eq_ignore_ascii_case(match continuation.side {
+            if fill.market_id != frozen.market_id.0.0
+                || fill.outcome_id != frozen.outcome_id.0
+                || !fill.side.eq_ignore_ascii_case(match frozen.side {
                     Side::Buy => "buy",
                     Side::Sell => "sell",
                 })
@@ -477,7 +739,12 @@ pub fn replay_decision_pending(
                 return Err(ReplayDecisionError::ContinuationBinding);
             }
         }
-        None => {
+        (None, Some(_)) => {
+            if disposition != "fill" {
+                return Err(ReplayDecisionError::TerminalEvidenceBinding);
+            }
+        }
+        (None, None) => {
             if disposition == "fill" {
                 return Err(ReplayDecisionError::AuthorityBinding);
             }
@@ -531,14 +798,27 @@ mod tests {
     use crate::config::ServiceConfig;
     use crate::runtime_config::RuntimeConfig;
 
+    const ORIGIN_MAIN_TERMINAL: &str =
+        include_str!("../tests/fixtures/decision_replay_origin_main_v2_terminal.json");
+    const ORIGIN_MAIN_CHECKPOINT: &str =
+        include_str!("../tests/fixtures/decision_replay_origin_main_v2_checkpoint.json");
+
     fn wallet() -> WalletAddress {
         serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
     }
 
-    fn continuation(source_trade_id: &SourceTradeId) -> DecisionContinuationV2 {
-        let applied_configuration = RuntimeConfig::from_service_config(&ServiceConfig::default());
-        DecisionContinuationV2 {
-            version: 2,
+    fn continuation(source_trade_id: &SourceTradeId) -> DecisionContinuationFacts {
+        continuation_with_configuration(
+            source_trade_id,
+            RuntimeConfig::from_service_config(&ServiceConfig::default()),
+        )
+    }
+
+    fn continuation_with_configuration(
+        source_trade_id: &SourceTradeId,
+        applied_configuration: RuntimeConfig,
+    ) -> DecisionContinuationFacts {
+        DecisionContinuationFacts {
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v2".to_owned(),
             transaction_hash: "0xtransaction".to_owned(),
@@ -564,7 +844,64 @@ mod tests {
         }
     }
 
-    fn accumulator(continuation: &DecisionContinuationV2) -> DecisionEvidenceAccumulator {
+    fn origin_main_configuration() -> RuntimeConfig {
+        let configuration: RuntimeConfig = serde_json::from_value(json!({
+            "era": "legacy17",
+            "active_watchlist_size": 100,
+            "mode": "paper",
+            "max_fill_price": "0.85",
+            "min_fill_price": "0.15",
+            "min_resolution_horizon_secs": 60,
+            "max_resolution_horizon_secs": 172_800,
+            "price_impact_cap_bps": 100,
+            "flip_human_approved": false,
+            "kelly_fraction_above_default_human_approved": false,
+            "kelly_fraction_override": null,
+            "per_trade_cap": {"kind": "mode_default"},
+            "slippage_rate": "0.01",
+            "sizing_mode": {"kind": "kelly"},
+            "sizing_dollar_usd": "0",
+            "sizing_contracts": 0,
+            "legacy_compatibility": {
+                "fill_mode": "clob_best_ask",
+                "polymarket_fee_rate": "0.04"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            configuration.canonical_hash(),
+            "f602cee694f90f8e48cdd43e70d6d9398879a9991662492af82ec4f7df31b222"
+        );
+        configuration
+    }
+
+    fn origin_main_row(
+        source_trade_id: SourceTradeId,
+        post_commit_inputs_json: &str,
+        state: DecisionPendingState,
+        terminal_disposition: Option<&str>,
+    ) -> DecisionPendingRow {
+        let continuation =
+            continuation_with_configuration(&source_trade_id, origin_main_configuration());
+        DecisionPendingRow {
+            source_trade_id,
+            semantic_revision: continuation.semantic_revision.clone(),
+            wallet: continuation.wallet,
+            source_epoch: continuation.source_epoch,
+            frozen_inputs_json: legacy_v2_json(&continuation),
+            post_commit_inputs_json: post_commit_inputs_json.to_owned(),
+            state,
+            terminal_disposition: terminal_disposition.map(str::to_owned),
+            updated_at_unix: 1_700_000_001,
+        }
+    }
+
+    fn legacy_v2_json(facts: &DecisionContinuationFacts) -> String {
+        let facts = serde_json::to_string(facts).unwrap();
+        format!(r#"{{"version":2,{}"#, facts.strip_prefix('{').unwrap())
+    }
+
+    fn accumulator(continuation: &DecisionContinuationFacts) -> DecisionEvidenceAccumulator {
         let mut evidence = DecisionEvidenceAccumulator::new(continuation);
         evidence.record_market_end(MarketEndEvidence {
             market_id: continuation.market_id.to_string(),
@@ -591,6 +928,19 @@ mod tests {
         evidence
     }
 
+    fn unavailable_inputs() -> WinnerFollowDecisionInputs {
+        WinnerFollowDecisionInputs::RiskInputsUnavailable {
+            cause: crate::risk_inputs::RiskInputsUnavailable::PriceMissing,
+            evidence: WinnerFollowRiskInputEvidence {
+                financial_prefix: None,
+                price_receipts: Vec::new(),
+                evaluated_at_unix_ms: 1_700_000_000_000,
+                proposed_debit: CollateralAmount::ZERO,
+                per_trade_cap_bps: 10_000,
+            },
+        }
+    }
+
     fn terminal_row(
         source_suffix: &str,
         authority: AuthorityEvidence,
@@ -606,7 +956,7 @@ mod tests {
             semantic_revision: continuation.semantic_revision.clone(),
             wallet: continuation.wallet,
             source_epoch: continuation.source_epoch,
-            frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+            frozen_inputs_json: legacy_v2_json(&continuation),
             post_commit_inputs_json: evidence,
             state: DecisionPendingState::Terminal,
             terminal_disposition: Some(terminal.disposition),
@@ -680,6 +1030,196 @@ mod tests {
     }
 
     #[test]
+    fn terminal_v5_keeps_legacy_body_readable_and_records_typed_outcomes() {
+        let legacy: TerminalDispositionEvidence = serde_json::from_value(json!({
+            "disposition": "no_fill",
+            "reason": "legacy",
+            "fill": null,
+            "dispatch_id": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.decline, None);
+        assert_eq!(legacy.final_receipt, None);
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("decline")
+        );
+
+        let declined = TerminalDispositionEvidence::declined(
+            &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+            unavailable_inputs(),
+        );
+        assert_eq!(declined.disposition, "no_fill");
+        assert_eq!(
+            declined.reason,
+            "paper_reject:no edge: Kelly sizing produced zero contracts"
+        );
+        assert_eq!(
+            declined.decline.as_ref().map(|decline| &decline.outcome),
+            Some(&pe_strategy_winner_follow::WinnerFollowDeclineAudit::NoEdge)
+        );
+        let declined_row = terminal_row(
+            "typed-decline",
+            AuthorityEvidence::not_read("strategy_declined"),
+            declined,
+        );
+        let replayed = replay_decision_pending(&declined_row).unwrap();
+        assert_eq!(
+            replayed.post_boundary.body.version,
+            TERMINAL_EVIDENCE_VERSION
+        );
+
+        let receipt = AppendReceipt {
+            sequence: EventSeq(11),
+            this_hash: blake3::Hash::from_bytes([11; 32]),
+        };
+        let final_fill = TerminalDispositionEvidence::final_fill(receipt);
+        assert_eq!(final_fill.final_receipt, Some(receipt));
+        let fill_row = terminal_row(
+            "final-fill",
+            AuthorityEvidence::commit_fill_v2("applied", dec!(996)),
+            final_fill,
+        );
+        let replayed = replay_decision_pending(&fill_row).unwrap();
+        assert_eq!(
+            replayed.post_boundary.body.version,
+            TERMINAL_EVIDENCE_VERSION
+        );
+        assert_eq!(TERMINAL_EVIDENCE_VERSION, 5);
+    }
+
+    /// PASS: the byte-exact origin/main v2 terminal document verifies its body-only hash and
+    /// replays end-to-end without inventing a pre-Start financial-semantic binding.
+    #[test]
+    fn origin_main_terminal_fixture_replays_and_rejects_tampering() {
+        let mut row = origin_main_row(
+            SourceTradeId("g2:fill".to_owned()),
+            ORIGIN_MAIN_TERMINAL,
+            DecisionPendingState::Terminal,
+            Some("fill"),
+        );
+        let replayed = replay_decision_pending(&row).unwrap();
+        assert_eq!(
+            replayed.post_boundary.body.version,
+            LEGACY_POST_BOUNDARY_EVIDENCE_VERSION
+        );
+        assert_eq!(
+            replayed.post_boundary.financial_semantic_version,
+            LEGACY_FINANCIAL_SEMANTIC_VERSION
+        );
+        assert_eq!(replayed.recorded_decision_json, ORIGIN_MAIN_TERMINAL);
+
+        let mut document: serde_json::Value = serde_json::from_str(ORIGIN_MAIN_TERMINAL).unwrap();
+        document["terminal"]["fill"]["contracts"] = json!(11);
+        row.post_commit_inputs_json = serde_json::to_string(&document).unwrap();
+        assert!(matches!(
+            replay_decision_pending(&row),
+            Err(ReplayDecisionError::DocumentHash { .. })
+        ));
+    }
+
+    /// PASS: the byte-exact origin/main open checkpoint verifies its body-only hash before its
+    /// fields are converted into an accumulator and re-rendered under the current wire identity.
+    #[test]
+    fn origin_main_checkpoint_fixture_recovers_and_upgrades() {
+        let row = origin_main_row(
+            SourceTradeId("g2:checkpoint".to_owned()),
+            ORIGIN_MAIN_CHECKPOINT,
+            DecisionPendingState::Open,
+            None,
+        );
+        let recovered = DecisionEvidenceAccumulator::from_pending_checkpoint(&row).unwrap();
+        assert_eq!(
+            recovered
+                .book
+                .as_ref()
+                .and_then(|book| book.best_ask.as_deref()),
+            Some("0.42")
+        );
+        let upgraded: serde_json::Value =
+            serde_json::from_str(&recovered.checkpoint_json().unwrap()).unwrap();
+        assert_eq!(upgraded["version"], json!(POST_BOUNDARY_EVIDENCE_VERSION));
+        assert_eq!(
+            upgraded["financial_semantic_version"],
+            json!(crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
+        );
+    }
+
+    /// PASS: a current typed terminal that lost its financial semantic field is rejected as
+    /// ambiguous instead of being decoded under either generation.
+    #[test]
+    fn current_terminal_without_financial_field_is_ambiguous() {
+        let mut row = terminal_row(
+            "missing-financial-field",
+            AuthorityEvidence::not_read("strategy_declined"),
+            TerminalDispositionEvidence::declined(
+                &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+                unavailable_inputs(),
+            ),
+        );
+        let mut missing_field: serde_json::Value =
+            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+        missing_field
+            .as_object_mut()
+            .unwrap()
+            .remove("financial_semantic_version");
+        row.post_commit_inputs_json = serde_json::to_string(&missing_field).unwrap();
+        assert!(matches!(
+            replay_decision_pending(&row),
+            Err(ReplayDecisionError::FinancialSemanticField {
+                version: TERMINAL_EVIDENCE_VERSION
+            })
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_typed_terminal_decline_or_final_receipt_contradictions() {
+        let mut row = terminal_row(
+            "bad-typed-terminal",
+            AuthorityEvidence::not_read("strategy_declined"),
+            TerminalDispositionEvidence::declined(
+                &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+                unavailable_inputs(),
+            ),
+        );
+        let document: DecisionPostBoundaryEvidence =
+            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+        let mut body = document.body;
+        body.terminal.decline = None;
+        row.post_commit_inputs_json =
+            serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(body).unwrap()).unwrap();
+        assert!(matches!(
+            replay_decision_pending(&row),
+            Err(ReplayDecisionError::TerminalEvidenceBinding)
+        ));
+    }
+
+    /// PASS: structural replay does not interpret display text as Winner-Follow semantics; the
+    /// qualification verifier independently re-executes the retained typed decision inputs.
+    #[test]
+    fn replay_does_not_make_decline_display_text_a_semantic_owner() {
+        let mut row = terminal_row(
+            "display-only",
+            AuthorityEvidence::not_read("strategy_declined"),
+            TerminalDispositionEvidence::declined(
+                &pe_strategy_winner_follow::WinnerFollowError::NoEdge,
+                unavailable_inputs(),
+            ),
+        );
+        let document: DecisionPostBoundaryEvidence =
+            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+        let mut body = document.body;
+        body.terminal.reason = "operator-facing text changed".to_owned();
+        row.post_commit_inputs_json =
+            serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(body).unwrap()).unwrap();
+
+        replay_decision_pending(&row).unwrap();
+    }
+
+    #[test]
     fn replay_rejects_tampered_post_boundary_document() {
         let mut row = terminal_row(
             "tampered",
@@ -708,7 +1248,7 @@ mod tests {
             semantic_revision: continuation.semantic_revision.clone(),
             wallet: continuation.wallet,
             source_epoch: continuation.source_epoch,
-            frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+            frozen_inputs_json: legacy_v2_json(&continuation),
             post_commit_inputs_json: checkpoint,
             state: DecisionPendingState::Open,
             terminal_disposition: None,
@@ -717,6 +1257,40 @@ mod tests {
         let recovered = DecisionEvidenceAccumulator::from_pending_checkpoint(&row).unwrap();
         assert_eq!(recovered.source_trade_id, continuation.source_trade_id);
         assert_eq!(recovered.book, evidence.book);
+
+        let current_json = row.post_commit_inputs_json.clone();
+        let mut missing_field: serde_json::Value = serde_json::from_str(&current_json).unwrap();
+        missing_field
+            .as_object_mut()
+            .unwrap()
+            .remove("financial_semantic_version");
+        row.post_commit_inputs_json = serde_json::to_string(&missing_field).unwrap();
+        assert!(matches!(
+            DecisionEvidenceAccumulator::from_pending_checkpoint(&row),
+            Err(ReplayDecisionError::FinancialSemanticField {
+                version: POST_BOUNDARY_EVIDENCE_VERSION
+            })
+        ));
+
+        row.post_commit_inputs_json = current_json;
+        let current: DecisionEvidenceCheckpoint =
+            serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+        let mut legacy_body = current.body;
+        legacy_body.version = LEGACY_POST_BOUNDARY_EVIDENCE_VERSION;
+        row.post_commit_inputs_json = serde_json::to_string(&LegacyDecisionEvidenceCheckpoint {
+            document_blake3: legacy_checkpoint_hash(&legacy_body).unwrap(),
+            body: legacy_body,
+        })
+        .unwrap();
+        let recovered = DecisionEvidenceAccumulator::from_pending_checkpoint(&row).unwrap();
+        assert_eq!(recovered.source_trade_id, continuation.source_trade_id);
+        let rerendered: serde_json::Value =
+            serde_json::from_str(&recovered.checkpoint_json().unwrap()).unwrap();
+        assert_eq!(rerendered["version"], json!(POST_BOUNDARY_EVIDENCE_VERSION));
+        assert_eq!(
+            rerendered["financial_semantic_version"],
+            json!(crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
+        );
 
         let mut document: serde_json::Value =
             serde_json::from_str(&row.post_commit_inputs_json).unwrap();

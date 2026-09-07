@@ -280,7 +280,7 @@ impl AssetIdentityResolver {
                         message: "source-log coordinator closed".to_owned(),
                     })?,
             };
-        Ok(sequence.0)
+        Ok(sequence.sequence.0)
     }
 }
 
