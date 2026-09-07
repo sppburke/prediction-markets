@@ -530,8 +530,10 @@ installation and later authority boundaries.
 ## Ordinary live execution (#508)
 
 Ordinary `pe-service` has per-account modes `off | live_tiny`. `promoted` is deferred because it
-has no distinct financial contract after retirement of the per-trade cap; the promotion ladder
-below remains canonical for when a distinct promoted contract is introduced. The account grammar,
+has no distinct financial contract under the current cap policy (the reviewed production row is
+`unlimited`; `ModeDefault` resolves 25 bps for LiveTiny and 100 bps for Promoted only when that row
+is selected); the promotion ladder below remains canonical for when a distinct promoted contract is
+introduced. The account grammar,
 armed-account bound, per-account price-impact default, dispatch retention, and redemption surfacing
 threshold live only in `_GLOSSARY.md`.
 
