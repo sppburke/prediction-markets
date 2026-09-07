@@ -273,7 +273,11 @@ impl DecisionContinuationV3 {
             (Some(fixed_end), Some(pages)) => {
                 self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?
             }
-            (None, None) => self.reconstruct_legacy_activity_read(lookup)?,
+            (None, None) => {
+                return Err(complete_activity_read_error(
+                    "decision continuation is missing its complete activity read proof",
+                ));
+            }
             _ => {
                 return Err(complete_activity_read_error(
                     "decision complete activity read proof is partial",
@@ -285,36 +289,6 @@ impl DecisionContinuationV3 {
                 "complete activity read aggregate failed: {error}"
             ))
         })
-    }
-
-    fn reconstruct_legacy_activity_read<L, E>(
-        &self,
-        lookup: &mut L,
-    ) -> Result<Vec<pe_source_polymarket_public::NormalizedActivity>, CompleteActivityReadError>
-    where
-        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
-        E: Display,
-    {
-        let [occurrence] = self.page_occurrences.as_slice() else {
-            return Err(complete_activity_read_error(
-                "legacy complete activity read lacks one terminal page occurrence",
-            ));
-        };
-        let source = complete_activity_page(occurrence, lookup)?;
-        let window = parse_complete_activity_page(
-            &source,
-            self.facts.wallet,
-            "legacy complete activity read page parse failed",
-        )?;
-        if u32::try_from(window.rows.len())
-            .ok()
-            .is_none_or(|row_count| row_count >= RECONCILIATION_PAGE_LIMIT)
-        {
-            return Err(complete_activity_read_error(
-                "legacy complete activity read has no terminal page",
-            ));
-        }
-        Ok(window.rows)
     }
 
     fn reconstruct_rich_activity_read<L, E>(
@@ -2125,6 +2099,18 @@ mod continuation_v3_tests {
         }
     }
 
+    fn activity_page(payload: &[u8]) -> CompleteActivityPage {
+        CompleteActivityPage {
+            payload: payload.to_vec(),
+            observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+            received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+            source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+            content_type: ContentType::Json,
+        }
+    }
+
     fn facts(decision_inputs: Value) -> DecisionContinuationFacts {
         let configuration =
             RuntimeConfig::from_service_config(&crate::config::ServiceConfig::default());
@@ -2335,5 +2321,48 @@ mod continuation_v3_tests {
             tampered.observation_from_receipt_index(&source_receipts),
             Err(DecisionContinuationError::SourceReceiptMismatch { .. })
         ));
+    }
+
+    /// PASS: the shared owner rejects a continuation whose logical complete-read proof is dropped
+    /// or unrelated, whatever version it records — no producer emits page occurrences without
+    /// the proof, so there is no one-page compatibility path.
+    /// FAIL: a proof-free continuation (current or version two) reconstructs an aggregate.
+    #[test]
+    fn strict_live_shared_owner_rejects_proof_free_continuations_of_any_version() {
+        let payload = br#"[{"proxyWallet":"0x1111111111111111111111111111111111111111","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"1","usdcSize":"0.5","price":"0.5","timestamp":"1700000000","transactionHash":"0xtransaction","outcomeIndex":"0"}]"#;
+        let occurrence = PageOccurrence {
+            request_url: "https://source/page".to_owned(),
+            raw_hash: blake3::hash(payload).to_hex().to_string(),
+            receipt: receipt(1),
+        };
+        for missing_proof in [json!({}), json!({"unrelated": true})] {
+            let current =
+                DecisionContinuationV3::new(facts(missing_proof), None, vec![occurrence.clone()]);
+            let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+            let error = current
+                .reconstruct_complete_activity_read(&mut lookup)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("decision continuation is missing its complete activity read proof")
+            );
+        }
+
+        let version_two = DecisionContinuationV3 {
+            version: 2,
+            facts: facts(json!({"legacy": true})),
+            observed_source_receipt: None,
+            page_occurrences: vec![occurrence],
+        };
+        let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
+        let error = version_two
+            .reconstruct_complete_activity_read(&mut lookup)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decision continuation is missing its complete activity read proof")
+        );
     }
 }

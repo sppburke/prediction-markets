@@ -47,13 +47,13 @@ use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION,
     GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION,
     LIVE_MARKET_SCHEMA_VERSION, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
-    validate_live_market,
+    aggregate_activity_rows, parse_activity_response, validate_live_market,
 };
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
-    ClobPricesHistoryClient, FixtureFetcher, aggregate_activity_rows, parse_activity_response,
-    parse_activity_row, parse_activity_trade_observation, parse_clob_market,
+    ClobPricesHistoryClient, FixtureFetcher, parse_activity_row, parse_activity_trade_observation,
+    parse_clob_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
 use rust_decimal::{Decimal, MathematicalOps};
@@ -2731,47 +2731,25 @@ fn verify_decision_source_inputs(
         }
     }
 
-    let mut rows = Vec::new();
-    for page in continuation.page_occurrences() {
-        let source = source
-            .get(&page.receipt.sequence.0)
-            .filter(|source| source.receipt == page.receipt)
-            .ok_or_else(|| {
-                QualificationError::InsufficientEvidence(
-                    "decision activity page is absent from the sealed source prefix".to_owned(),
-                )
-            })?;
-        if source.source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
-            || source.schema_version != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
-            || source.parser_version != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
-            || source.content_type != ContentType::Json
-            || source.receipt.this_hash != page.receipt.this_hash
-            || source.receipt.sequence > observation.complete_bound_receipt.sequence
-        {
-            return insufficient("decision activity page has the wrong source contract");
-        }
-        let window = parse_activity_response(
-            &source.payload,
-            frozen.wallet,
-            &ActivityParseContext {
-                source_id: SourceId(source.source_id.clone()),
-                observed_at: source.observed_at.clone(),
-                received_at: source.received_at.clone(),
-                transport: ActivityTransport::Replay,
-            },
-        )
+    let mut lookup = |receipt| -> Result<_, QualificationError> {
+        let source = decision_source_receipt(source, receipt)?;
+        Ok(CompleteActivityPage {
+            payload: source.payload.clone(),
+            observed_at: source.observed_at.clone(),
+            received_at: source.received_at.clone(),
+            source_id: source.source_id.clone(),
+            schema_version: source.schema_version,
+            parser_version: source.parser_version,
+            content_type: source.content_type.clone(),
+        })
+    };
+    let aggregates = continuation
+        .reconstruct_complete_activity_read(&mut lookup)
         .map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
-                "decision activity page production parse failed: {error}"
+                "decision complete activity read reconstruction failed: {error}"
             ))
         })?;
-        rows.extend(window.rows);
-    }
-    let aggregates = aggregate_activity_rows(&rows).map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "decision activity aggregate replay failed: {error}"
-        ))
-    })?;
     let mut matching = aggregates
         .iter()
         .filter(|aggregate| aggregate.group_id.key() == &frozen.source_trade_id);
@@ -5422,6 +5400,32 @@ mod tests {
         aggregate_activity_rows(&rows).unwrap()
     }
 
+    fn replayed_no_copy_decision(
+        continuation: &DecisionContinuationV3,
+    ) -> crate::decision_replay::ReplayedDecision {
+        let terminal = crate::decision_replay::TerminalDispositionEvidence::no_copy("fixture");
+        let terminal_disposition = terminal.disposition.clone();
+        let post_commit_inputs_json =
+            crate::decision_replay::DecisionEvidenceAccumulator::new(&continuation.facts)
+                .render(
+                    crate::decision_replay::AuthorityEvidence::not_read("fixture"),
+                    terminal,
+                )
+                .unwrap();
+        replay_decision_pending(&DecisionPendingRow {
+            source_trade_id: continuation.facts.source_trade_id.clone(),
+            semantic_revision: continuation.facts.semantic_revision.clone(),
+            wallet: continuation.facts.wallet,
+            source_epoch: continuation.facts.source_epoch,
+            frozen_inputs_json: serde_json::to_string(continuation).unwrap(),
+            post_commit_inputs_json,
+            state: DecisionPendingState::Terminal,
+            terminal_disposition: Some(terminal_disposition),
+            updated_at_unix: continuation.facts.source_epoch,
+        })
+        .unwrap()
+    }
+
     fn append_paper_record_at(
         writer: &mut Writer,
         record: &PaperLogRecord,
@@ -8054,6 +8058,142 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.share_sum.to_decimal(), dec!(3));
+    }
+
+    /// PASS: mandatory decision-source verification parses a saturated root through offset 5,000
+    /// but aggregates only its complete child leaves, reproducing the selected second-51 group as
+    /// 10 shares at 0.52.
+    /// FAIL: qualification concatenates the duplicated root and child rows or cannot reconstruct
+    /// the complete split graph from the sealed source lookup.
+    #[test]
+    fn qualification_source_verifier_excludes_saturated_parent_rows() {
+        let mut first_leg = activity_row("0xtarget", "target", "4", "1.6", "0xtx", 51);
+        first_leg["price"] = serde_json::json!("0.40");
+        let mut second_leg = activity_row("0xtarget", "target", "6", "3.6", "0xtx", 51);
+        second_leg["price"] = serde_json::json!("0.60");
+
+        let mut root_rows = vec![first_leg.clone(), second_leg.clone()];
+        for index in 0..(RECONCILIATION_PAGE_LIMIT - 2) {
+            root_rows.push(activity_row(
+                &format!("0xroot-filler-condition-{index}"),
+                &format!("root-filler-asset-{index}"),
+                "1",
+                "0.5",
+                &format!("0xroot-filler-transaction-{index}"),
+                50,
+            ));
+        }
+        let first_root_payload = activity_payload(root_rows);
+        let other_root_payload = full_page_with_target(
+            activity_row("0xother-root", "other-root", "1", "0.5", "0xother-root", 50),
+            50,
+        );
+        let selected_payload = activity_payload(vec![first_leg, second_leg]);
+        let boundary_payload = activity_payload(vec![activity_row(
+            "0xboundary",
+            "boundary",
+            "1",
+            "0.5",
+            "0xboundary",
+            50,
+        )]);
+        let older_payload = activity_payload(Vec::new());
+
+        let mut observations = BTreeMap::new();
+        let mut pages = Vec::new();
+        for index in 0..=ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT {
+            let sequence = u64::from(index) + 1;
+            let offset = index * RECONCILIATION_PAGE_LIMIT;
+            let url = format!("root-{offset}");
+            let payload = if index == 0 {
+                &first_root_payload
+            } else {
+                &other_root_payload
+            };
+            let observation = activity_observation(sequence, payload);
+            pages.push((
+                page_occurrence(&observation, &url, payload),
+                page_evidence(&url, payload, None, 100, offset),
+            ));
+            observations.insert(sequence, observation);
+        }
+        let first_child_sequence = u64::from(ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT) + 2;
+        for (sequence, (url, payload, start, end)) in (first_child_sequence..).zip([
+            ("selected-child", &selected_payload, Some(50), 100),
+            ("boundary-child", &boundary_payload, Some(49), 50),
+            ("older-child", &older_payload, None, 49),
+        ]) {
+            let observation = activity_observation(sequence, payload);
+            pages.push((
+                page_occurrence(&observation, url, payload),
+                page_evidence(url, payload, start, end, 0),
+            ));
+            observations.insert(sequence, observation);
+        }
+
+        let expected = parsed_aggregates(&[&selected_payload]).remove(0);
+        assert_eq!(expected.share_sum.to_decimal(), dec!(10));
+        assert_eq!(expected.volume_weighted_price().unwrap().0, dec!(0.52));
+        let components = expected.group_id.components();
+        let (mut continuation, _) = classification_fixture();
+        continuation.facts.source_trade_id = expected.group_id.key().clone();
+        continuation.facts.semantic_revision = expected.semantic_revision.as_str().to_owned();
+        continuation.facts.transaction_hash = components.transaction_hash.clone();
+        continuation.facts.wallet = components.wallet;
+        continuation.facts.source_epoch = 51;
+        continuation.facts.market_id = MarketId(VenueMarketId("0xtarget".to_owned()));
+        continuation.facts.outcome_id = OutcomeId(0);
+        continuation.facts.side = Side::Buy;
+        continuation.facts.price = Price::new(dec!(0.52)).unwrap();
+        continuation.facts.share_amount = ShareAmount::from_whole(10).unwrap();
+        continuation.facts.decision_inputs = serde_json::json!({
+            "fixed_end": 100,
+            "pages": pages
+                .iter()
+                .map(|(_, evidence)| evidence)
+                .collect::<Vec<_>>(),
+        });
+        continuation.page_occurrences = pages
+            .into_iter()
+            .map(|(occurrence, _)| occurrence)
+            .collect();
+        let complete_bound_receipt = continuation.complete_bound().unwrap();
+        let decision = replayed_no_copy_decision(&continuation);
+
+        let observation = verify_decision_source_inputs(&decision, &observations).unwrap();
+        assert_eq!(observation.source_receipt, complete_bound_receipt);
+        assert_eq!(observation.complete_bound_receipt, complete_bound_receipt);
+    }
+
+    /// PASS: replacing a current V3 continuation's producer-owned logical page proof with an
+    /// unrelated object makes mandatory qualification source verification fail closed.
+    /// FAIL: a valid one-page payload is accepted solely from its occurrence URL/hash/receipt.
+    #[test]
+    fn qualification_source_verifier_rejects_current_v3_without_logical_read_proof() {
+        let mut target = activity_row("0xtarget", "target", "10", "5.2", "0xtx", 51);
+        target["price"] = serde_json::json!("0.52");
+        let payload = activity_payload(vec![target]);
+        let source = activity_observation(1, &payload);
+        let expected = parsed_aggregates(&[&payload]).remove(0);
+        let components = expected.group_id.components();
+        let (mut continuation, _) = classification_fixture();
+        continuation.facts.source_trade_id = expected.group_id.key().clone();
+        continuation.facts.semantic_revision = expected.semantic_revision.as_str().to_owned();
+        continuation.facts.transaction_hash = components.transaction_hash.clone();
+        continuation.facts.wallet = components.wallet;
+        continuation.facts.source_epoch = 51;
+        continuation.facts.market_id = MarketId(VenueMarketId("0xtarget".to_owned()));
+        continuation.facts.price = Price::new(dec!(0.52)).unwrap();
+        continuation.facts.share_amount = ShareAmount::from_whole(10).unwrap();
+        continuation.facts.decision_inputs = serde_json::json!({"unrelated": true});
+        continuation.page_occurrences = vec![page_occurrence(&source, "page", &payload)];
+        let decision = replayed_no_copy_decision(&continuation);
+
+        assert!(matches!(
+            verify_decision_source_inputs(&decision, &BTreeMap::from([(1, source)])),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("missing its complete activity read proof")
+        ));
     }
 
     /// PASS: cursor overlap may repeat a pre-Start trade in the first post-Start complete read,
