@@ -1810,7 +1810,7 @@ async fn wrong_market_book_response(
 /// a different market identity, fails closed, and creates no dispatch seed or paper preparation.
 /// FAIL: token-only validation admits the substituted condition or any downstream dispatch work.
 #[tokio::test]
-async fn clob_book_wrong_market_with_right_asset_stops_dispatch_before_seed_or_post() {
+async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_preparation() {
     let condition = market();
     let token_id = format!("{condition}-0");
     let book_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
