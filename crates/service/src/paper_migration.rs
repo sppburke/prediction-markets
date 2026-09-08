@@ -441,9 +441,9 @@ impl PaperMigrationSession {
 /// Offline: rebind the installed activation tails of a generation that was moved as a whole (the
 /// rehearsal's private copy) to the configured paths, after proving that every configured log
 /// still carries the recorded activation prefix with the installed branch's own checks (#570).
-/// Returns `false` without writing when the recorded paths already match; never touches the logs.
-/// The paper-state owner refuses a main that is still in its recorded origin directory, so the
-/// production generation cannot be rebound to alternate logs.
+/// Returns `false` without writing when a moved copy's recorded paths already match; never touches
+/// the logs. The paper-state owner refuses a main that is still in its recorded origin directory
+/// (the production generation) whether or not its paths match.
 pub fn update_installed_log_paths(paths: &PaperMigrationPaths) -> Result<bool> {
     let schema = MigrationMetadata::schema_version(&paths.fixed_main)
         .context("inspect fixed paper-state schema before updating migration paths")?;
@@ -479,12 +479,6 @@ pub fn update_installed_log_paths(paths: &PaperMigrationPaths) -> Result<bool> {
             ..recorded.live_journal.clone()
         },
     };
-    if configured.source.path == recorded.source.path
-        && configured.paper.path == recorded.paper.path
-        && configured.live_journal.path == recorded.live_journal.path
-    {
-        return Ok(false);
-    }
     Scanner::verify_prefix(&configured.source)
         .context("verify recorded source-log prefix at the configured path")?;
     Scanner::verify_prefix(&configured.paper)

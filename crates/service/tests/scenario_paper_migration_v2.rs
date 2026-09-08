@@ -404,6 +404,14 @@ fn updating_recorded_log_paths_refuses_the_origin_main_and_every_prefix_mismatch
     let original_bytes = std::fs::read(&paths.fixed_main).unwrap();
     let recorded = original_record.activation_tails.clone().unwrap();
 
+    // The production shape: the original main with its own recorded logs is refused, not a no-op.
+    let own_paths = pe_service::paper_migration::update_installed_log_paths(&paths).unwrap_err();
+    assert!(
+        format!("{own_paths:#}").contains("origin directory"),
+        "{own_paths:#}"
+    );
+    assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), original_bytes);
+
     let (_alternate_dir, alternate) = copied_generation(&paths);
     let rebind_production = PaperMigrationPaths {
         fixed_main: paths.fixed_main.clone(),
@@ -424,7 +432,16 @@ fn updating_recorded_log_paths_refuses_the_origin_main_and_every_prefix_mismatch
     let (_suffix_dir, with_suffix) = copied_generation(&paths);
     append(&with_suffix.source_log, br#"{"source":9}"#);
     assert!(pe_service::paper_migration::update_installed_log_paths(&with_suffix).unwrap());
-    assert!(PaperMigrationBoot::prepare(with_suffix, 1_788_192_007).is_ok());
+    assert!(PaperMigrationBoot::prepare(with_suffix.clone(), 1_788_192_007).is_ok());
+    // A rerun on an already-updated copy still verifies the logs: a truncated source log is
+    // refused instead of reported as unchanged.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&with_suffix.source_log)
+        .unwrap()
+        .set_len(recorded.source.physical_tail - 1)
+        .unwrap();
+    assert!(pe_service::paper_migration::update_installed_log_paths(&with_suffix).is_err());
 
     let (_mutated_dir, mutated) = copied_generation(&paths);
     let mut paper_bytes = std::fs::read(&mutated.paper_log).unwrap();

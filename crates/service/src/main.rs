@@ -1789,8 +1789,9 @@ fn run_rollback_paper_v1() -> Result<()> {
 }
 
 /// Rebind the installed migration record of a generation that was moved as a whole (the
-/// rehearsal's private copy) to the configured paths, then exit (#570). A no-op where the recorded
-/// paths already match; refused for a main still in its recorded origin directory.
+/// rehearsal's private copy) to the configured paths, then exit (#570). A no-op for a moved copy
+/// whose recorded paths already match; refused for a main still in its recorded origin directory
+/// (the production generation), whether or not its paths match.
 fn run_update_paper_migration_paths() -> Result<()> {
     let cfg = load_config()?;
     let updated = update_installed_log_paths(&PaperMigrationPaths {

@@ -363,9 +363,10 @@ impl MigrationMetadata {
     /// Rebind the installed activation tails of a generation that was moved as a whole (a
     /// rehearsal's private copy) to their new canonical paths (#570). Only an installed main is
     /// accepted; the main and all three logs must sit together outside the recorded origin
-    /// directory (the parent of the recorded side main), and every tail, sequence, and hash must
-    /// equal the recorded value, so only the three `activation_tails` paths ever change. Returns
-    /// `false` without writing when the recorded paths already equal `configured`.
+    /// directory (the parent of the recorded side main), so the production generation is refused
+    /// even when its paths already match; and every tail, sequence, and hash must equal the
+    /// recorded value, so only the three `activation_tails` paths ever change. Returns `false`
+    /// without writing when a moved copy's recorded paths already equal `configured`.
     pub fn update_installed_log_paths(
         main: &Path,
         configured: &DurableLogBindings,
@@ -382,12 +383,6 @@ impl MigrationMetadata {
                 });
             }
         };
-        if recorded.source.path == configured.source.path
-            && recorded.paper.path == configured.paper.path
-            && recorded.live_journal.path == configured.live_journal.path
-        {
-            return Ok(false);
-        }
         let main_dir = std::fs::canonicalize(main)?
             .parent()
             .map(Path::to_path_buf)
@@ -431,6 +426,9 @@ impl MigrationMetadata {
         };
         verify_log_bindings(&relocated, configured)
             .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+        if relocated == recorded {
+            return Ok(false);
+        }
         record.activation_tails = Some(relocated);
         write_record(main, connection, &record)?;
         Ok(true)
@@ -1186,6 +1184,11 @@ mod tests {
         );
         assert!(matches!(
             MigrationMetadata::update_installed_log_paths(&origin_main, &alternate),
+            Err(PaperStateError::Corrupt(message)) if message.contains("origin directory")
+        ));
+        let own_paths = origin_record.activation_tails.clone().unwrap();
+        assert!(matches!(
+            MigrationMetadata::update_installed_log_paths(&origin_main, &own_paths),
             Err(PaperStateError::Corrupt(message)) if message.contains("origin directory")
         ));
         assert_eq!(

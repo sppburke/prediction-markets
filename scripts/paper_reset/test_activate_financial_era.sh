@@ -1916,4 +1916,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
 done
 
-echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03, REHEARSAL-PATHS-UPDATE-01A and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
