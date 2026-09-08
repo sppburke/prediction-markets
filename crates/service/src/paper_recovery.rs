@@ -1308,6 +1308,20 @@ mod paper_log_tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    /// Bytes read through system calls by this process (Linux `/proc/self/io`, page-cache hits
+    /// included), so a whole-log pass shows as about the file's length.
+    #[cfg(target_os = "linux")]
+    fn read_chars() -> u64 {
+        std::fs::read_to_string("/proc/self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
     use crate::bucket_commit::{DecisionContinuationFacts, FrozenDecisionBasis};
     use crate::clob_book::FixtureClobBookFetcher;
     use crate::entry_gate::CopyEntryGateConfig;
@@ -1998,7 +2012,26 @@ mod paper_log_tests {
             .into_record(),
         );
         drop(paper_writer);
+        // Filler after the artifacts makes a hidden whole-log pass measurable (#572): exact
+        // indexed reads touch only the artifact frames.
+        for index in 0..20_000_i64 {
+            let at = OffsetDateTime::from_unix_timestamp(1_700_000_000 + index).unwrap();
+            source_writer
+                .append(pe_event_log::EnvelopeIn {
+                    source_id: SourceId("membership-filler".to_owned()),
+                    schema_version: 1,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: pe_event_log::ContentType::Json,
+                    payload: format!(r#"{{"filler":{index},"pad":"{:0>96}"}}"#, index).into_bytes(),
+                })
+                .unwrap();
+        }
+        source_writer.sync().unwrap();
         drop(source_writer);
+        let source_length = std::fs::metadata(&source_path).unwrap().len();
+        assert!(source_length > 1_000_000, "{source_length}");
 
         let era = paper_era(scan_paper_log(&paper_path).unwrap());
         let initial_entries = vec![
@@ -2013,10 +2046,20 @@ mod paper_log_tests {
         let indexed_source = crate::qualification::PublishedMembershipSource::from_index(
             crate::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap(),
         );
+        #[cfg(target_os = "linux")]
+        let before = read_chars();
         let indexed =
             replay_membership_with_source(&era, watchlist(initial_entries), &indexed_source)
                 .unwrap()
                 .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let read = read_chars() - before;
+            assert!(
+                read < source_length / 4,
+                "index-backed membership replay must read only its artifact frames: read {read} of {source_length} bytes"
+            );
+        }
         assert_eq!(
             indexed.last_ranking_batch_id,
             replayed.last_ranking_batch_id

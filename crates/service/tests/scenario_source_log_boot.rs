@@ -645,8 +645,9 @@ fn migration_record_drift_after_the_walk_falls_back_to_the_full_prefix_verificat
 
 /// Acceptance criterion 1: an installed boot reads the source log once (plus the bounded suffix
 /// of its own appends). Measured through the process read counter rather than an internal
-/// counter, so any hidden second pass in migration resume, membership replay, or obligation
-/// rebuild would show up as a second file length.
+/// counter, so a hidden second pass in the walk, migration resume, obligation rebuild, or the
+/// handoff would show up as a second file length. The index-backed membership path is measured
+/// the same way in `paper_recovery`'s membership replay test.
 #[cfg(target_os = "linux")]
 #[test]
 fn installed_boot_reads_the_source_log_once() {

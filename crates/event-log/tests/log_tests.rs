@@ -930,6 +930,22 @@ fn open_verified_refuses_incomplete_or_wrong_prefix_without_repair() {
         Err(error) => panic!("expected a file-identity mismatch, got {error}"),
         Ok(_) => panic!("a binding for another file was accepted"),
     }
+    // The stored-binding entry point applies the same identity rule, also on a torn twin.
+    let own_bytes = std::fs::read(&own_path).unwrap();
+    std::fs::write(&own_path, &own_bytes[..own_bytes.len() - 1]).unwrap();
+    match Writer::open_with_expected_tail(&own_path, &twin_binding) {
+        Err(LogError::Io(error)) => assert_eq!(
+            error.to_string(),
+            "expected tail binding names a different event log"
+        ),
+        Err(error) => panic!("expected a file-identity mismatch, got {error}"),
+        Ok(_) => panic!("a binding for another file was accepted"),
+    }
+    assert_eq!(
+        std::fs::read(&own_path).unwrap(),
+        own_bytes[..own_bytes.len() - 1],
+        "a foreign binding must not authorize repair"
+    );
 }
 
 #[test]

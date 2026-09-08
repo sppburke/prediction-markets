@@ -227,6 +227,14 @@ impl Writer {
         let path = path.as_ref();
         let scan = crate::scanner::Scanner::inspect(path)?;
         let tail = &scan.verified_tail;
+        // A binding names one canonical file (#572): a byte-identical twin must not authorize
+        // this file's repair.
+        if tail.path != expected.path {
+            return Err(LogError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected tail binding names a different event log",
+            )));
+        }
         if tail.physical_tail != expected.physical_tail
             || tail.last_sequence != expected.last_sequence
             || tail.last_hash != expected.last_hash
