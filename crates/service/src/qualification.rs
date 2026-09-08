@@ -4776,7 +4776,7 @@ fn prepare_financial_era(
         &manifest.paths.source_log,
         &config.status_path,
     )?;
-    let state = PaperStateDb::open_read_only(&manifest.paths.paper_state)?;
+    let state = PaperStateDb::open_read_only_allowing_unmigrated(&manifest.paths.paper_state)?;
     if !state.open_decision_pending()?.is_empty() {
         return insufficient("financial-era prepare found an open decision");
     }

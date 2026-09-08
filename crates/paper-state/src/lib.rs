@@ -52,12 +52,12 @@ pub use migration::{
     MigrationPhase, MigrationRecord, PaperMainSeal, PaperSideBuildReport, verify_log_bindings,
     verify_side_main_path,
 };
-pub use schema::SCHEMA_VERSION;
 use schema::{
-    BANKROLL_ROW_ID, LEGACY_EXACT_MIGRATION_VERSION, META_FINANCIAL_LAST_PREPARED_SEQ,
-    META_FINANCIAL_START_HASH, META_FINANCIAL_START_SEQ, META_LAST_APPLIED_EVENT_SEQ,
-    META_LAST_SUPABASE_APPLIED_EVENT_SEQ, SCHEMA,
+    BANKROLL_ROW_ID, META_FINANCIAL_LAST_PREPARED_SEQ, META_FINANCIAL_START_HASH,
+    META_FINANCIAL_START_SEQ, META_LAST_APPLIED_EVENT_SEQ, META_LAST_SUPABASE_APPLIED_EVENT_SEQ,
+    SCHEMA,
 };
+pub use schema::{LEGACY_EXACT_MIGRATION_VERSION, SCHEMA_VERSION};
 
 /// Errors from the paper-state store.
 #[derive(Debug, thiserror::Error)]
@@ -704,8 +704,9 @@ impl PaperStateDb {
     /// Open or create the database at `path`, running idempotent DDL.
     ///
     /// A freshly created database (or one predating versioning, `user_version == 0`)
-    /// is stamped with [`SCHEMA_VERSION`]. An existing database whose `user_version`
-    /// differs from [`SCHEMA_VERSION`] is rejected with
+    /// is stamped with [`SCHEMA_VERSION`]. A database at [`LEGACY_EXACT_MIGRATION_VERSION`]
+    /// has its whole-contract financial columns migrated in place, losslessly, and is then
+    /// stamped with [`SCHEMA_VERSION`]. Any other `user_version` is rejected with
     /// [`PaperStateError::SchemaVersionMismatch`] rather than silently mis-read.
     pub fn open(path: &Path) -> Result<Self, PaperStateError> {
         let mut conn = Connection::open_with_flags(
@@ -786,13 +787,28 @@ impl PaperStateDb {
     /// Open an existing database without DDL, migration, or write permission.
     ///
     /// Qualification verification uses this entry point so merely producing a report cannot
-    /// create a database, advance a projection, or modify a schema (#545).
+    /// create a database, advance a projection, or modify a schema (#545). Only the current
+    /// [`SCHEMA_VERSION`] is admitted.
     pub fn open_read_only(path: &Path) -> Result<Self, PaperStateError> {
+        Self::open_read_only_accepting(path, &[SCHEMA_VERSION])
+    }
+
+    /// Open an existing database read-only, admitting an installed main still at
+    /// [`LEGACY_EXACT_MIGRATION_VERSION`] as well as the current version (#567).
+    ///
+    /// Nothing is migrated: callers must read only tables the exact-financial migration leaves
+    /// unchanged. The financial-era `prepare` command uses this before Start, while the installed
+    /// pre-#545 binary still owns the file.
+    pub fn open_read_only_allowing_unmigrated(path: &Path) -> Result<Self, PaperStateError> {
+        Self::open_read_only_accepting(path, &[SCHEMA_VERSION, LEGACY_EXACT_MIGRATION_VERSION])
+    }
+
+    fn open_read_only_accepting(path: &Path, accepted: &[i64]) -> Result<Self, PaperStateError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "query_only", true)?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if found != SCHEMA_VERSION {
+        if !accepted.contains(&found) {
             return Err(PaperStateError::SchemaVersionMismatch {
                 found,
                 expected: SCHEMA_VERSION,

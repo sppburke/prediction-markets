@@ -552,6 +552,7 @@ atomic=amount*decimal.Decimal(1000000)
 if atomic != atomic.to_integral_value(): raise SystemExit("bankroll is not exact")
 members=json.load(open(members_path,encoding="utf-8"))
 if not isinstance(members,list) or len(members)!=len(set(members)): raise SystemExit("membership must be a unique JSON array")
+if not members: raise SystemExit("membership must not be empty")
 value={
  "kind":"financial-era-v1","state":"prepared","activation_id":activation,"generation":generation,
  "generation_merge_commit":generation_commit,"generation_bankroll":generation_bankroll,
@@ -737,6 +738,15 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
   manifest_advance rolled_back
   echo "activation_id=$activation_id state=rolled_back"
   exit 0
+fi
+
+# A manifest recorded with an empty membership (possible before #567) must never go forward:
+# the first ordinary boot after Start refuses an empty watchlist, and Start is irreversible.
+# Rollback exited above; a complete durable Start must still roll forward.
+if [[ ( "$state" == prepared || "$state" == guarded ) && "$complete_start" == false ]]; then
+  python3 -c 'import json,sys
+if not json.load(open(sys.argv[1],encoding="utf-8"))["membership"]: raise SystemExit("membership must not be empty")' \
+    "$MANIFEST" || die "financial-era manifest membership is empty; refusing to go forward"
 fi
 
 case "$state" in
