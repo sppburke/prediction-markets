@@ -18,8 +18,7 @@ use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
 use pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID;
 use pe_service::paper_migration::{PaperMigrationBoot, PaperMigrationPaths};
 use pe_service::paper_recovery::{
-    PaperLogRecord, QualificationStarted, TailBinding, paper_era, replay_membership,
-    scan_paper_log,
+    PaperLogRecord, QualificationStarted, TailBinding, paper_era, replay_membership, scan_paper_log,
 };
 use pe_service::risk_inputs::SourceReceiptIndex;
 use pe_service::source_log_boot::{SourceLogBoot, SourceLogBootHooks};
@@ -244,11 +243,17 @@ fn installed_boot_walks_once_and_publishes_only_after_the_suffix_walk() {
     let published = boot.obligations(&paper_state, &paths.paper_log).unwrap();
     let rebuilt = rebuild_reconciliation_obligations(&paths.source_log, &paper_state).unwrap();
     assert_eq!(published, rebuilt);
-    assert_eq!(published.len(), 3, "t1, t2, t3 groups coalesced by earliest receipt");
+    assert_eq!(
+        published.len(),
+        3,
+        "t1, t2, t3 groups coalesced by earliest receipt"
+    );
     boot.verify_handoff(&mut sink).unwrap();
 
     // The installed migration resumes through the walked prefix without a second source scan.
-    let resumed = boot.prepare_installed(paths.clone(), NOW_UNIX + 10).unwrap();
+    let resumed = boot
+        .prepare_installed(paths.clone(), NOW_UNIX + 10)
+        .unwrap();
     assert!(resumed.session.is_none());
     assert_eq!(resumed.record.phase, MigrationPhase::Installed);
 }
@@ -296,7 +301,10 @@ fn torn_final_frame_after_the_prefix_is_repaired_once_under_the_lock() {
     assert!(clean.physical_tail > prefix_tail);
 
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
-    assert_eq!(opened.binding, clean, "the torn suffix is repaired to the verified tail");
+    assert_eq!(
+        opened.binding, clean,
+        "the torn suffix is repaired to the verified tail"
+    );
     assert_eq!(file_len(&paths.source_log), clean.physical_tail);
     let mut boot = opened.boot;
     let mut sink = opened.sink;
@@ -471,8 +479,10 @@ fn financial_boot_replays_start_membership_through_the_index_and_recovers_the_bo
             DAILY_BOUNDARY_SOURCE_ID,
             1,
             1,
-            &serde_json::to_vec(&serde_json::json!({"kind": "daily_boundary", "cutoff_unix": cutoff}))
-                .unwrap(),
+            &serde_json::to_vec(
+                &serde_json::json!({"kind": "daily_boundary", "cutoff_unix": cutoff}),
+            )
+            .unwrap(),
             cutoff,
         ),
     );
@@ -483,12 +493,18 @@ fn financial_boot_replays_start_membership_through_the_index_and_recovers_the_bo
     let opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
     let mut boot = opened.boot;
     let mut sink = opened.sink;
-    let replayed = boot.replay_membership(&era, start_batch()).unwrap().unwrap();
+    let replayed = boot
+        .replay_membership(&era, start_batch())
+        .unwrap()
+        .unwrap();
     let expected = replay_membership(&era, start_batch(), &paths.source_log)
         .unwrap()
         .unwrap();
     assert_eq!(replayed.watchlist, expected.watchlist);
-    assert_eq!(replayed.last_ranking_batch_id, expected.last_ranking_batch_id);
+    assert_eq!(
+        replayed.last_ranking_batch_id,
+        expected.last_ranking_batch_id
+    );
 
     boot.extend(&mut sink).unwrap();
     let paper_state = PaperStateDb::open(&paths.fixed_main).unwrap();
@@ -522,8 +538,11 @@ fn generations_that_are_not_exactly_installed_keep_the_existing_flow() {
         "live_journal.log",
         "wallet_market_history.json",
     ] {
-        std::fs::copy(installed.fixed_main.parent().unwrap().join(name), moved.path().join(name))
-            .unwrap();
+        std::fs::copy(
+            installed.fixed_main.parent().unwrap().join(name),
+            moved.path().join(name),
+        )
+        .unwrap();
     }
     let moved_paths = paths_in(moved.path());
     assert!(SourceLogBoot::open(&moved_paths, false).unwrap().is_none());
@@ -547,8 +566,11 @@ fn migration_record_drift_after_the_walk_falls_back_to_the_full_prefix_verificat
         "live_journal.log",
         "wallet_market_history.json",
     ] {
-        std::fs::copy(paths.fixed_main.parent().unwrap().join(name), moved.path().join(name))
-            .unwrap();
+        std::fs::copy(
+            paths.fixed_main.parent().unwrap().join(name),
+            moved.path().join(name),
+        )
+        .unwrap();
     }
     let moved_paths = paths_in(moved.path());
     assert!(pe_service::paper_migration::update_installed_log_paths(&moved_paths).unwrap());

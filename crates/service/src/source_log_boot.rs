@@ -108,7 +108,10 @@ impl SourceLogBoot {
     /// existing flow. The walk fails closed on any frame error, prefix mismatch, lock
     /// contention, or truncation into the recorded prefix; it repairs only a scanner-proven
     /// incomplete final frame after that prefix.
-    pub fn open(paths: &PaperMigrationPaths, financial_era: bool) -> Result<Option<OpenedSourceLog>> {
+    pub fn open(
+        paths: &PaperMigrationPaths,
+        financial_era: bool,
+    ) -> Result<Option<OpenedSourceLog>> {
         let Some(prefix) = installed_source_prefix(paths)
             .context("read the installed migration record before the source-log walk")?
         else {

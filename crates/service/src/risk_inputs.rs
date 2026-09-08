@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
-use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader, Scanner};
+use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader};
 use pe_paper_state::FinancialSnapshot;
 use pe_risk_engine::{
     EquityInputs, PnlWindow, RiskHaltCause, RiskMathError, RiskSnapshot, current_equity,
@@ -79,8 +79,6 @@ pub enum RiskInputsUnavailable {
     PriceFuture,
     #[error("position price evidence conflicts")]
     PriceConflict,
-    #[error("the source log is being re-verified after an append uncertainty")]
-    SourceLogUncertain,
     #[error("the immediately preceding midnight mark is missing")]
     MarkMissing,
     #[error("the immediately preceding midnight mark is duplicated")]
@@ -899,7 +897,6 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
     next_byte_offset: Option<u64>,
-    suspended: bool,
 }
 
 #[derive(Clone)]
@@ -968,14 +965,17 @@ impl SourceReceiptIndexStaging {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        Ok(SourceReceiptIndex {
+        Ok(self.complete_at(binding.physical_tail))
+    }
+
+    fn complete_at(self, physical_tail: u64) -> SourceReceiptIndex {
+        SourceReceiptIndex {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
                 frames: self.frames,
-                next_byte_offset: Some(binding.physical_tail),
-                suspended: false,
+                next_byte_offset: Some(physical_tail),
             })),
             source_log_path: Some(Arc::new(self.canonical_source_log_path)),
-        })
+        }
     }
 }
 
@@ -1002,9 +1002,11 @@ impl SourceReceiptIndex {
                 item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
             staging.observe(byte_offset, &envelope)?;
         }
-        let binding =
-            Scanner::verify(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-        staging.complete(&binding)
+        // The verified reader already proved the file ends at a complete frame boundary.
+        let physical_tail = std::fs::metadata(source_log_path)
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+            .len();
+        Ok(staging.complete_at(physical_tail))
     }
 
     /// Extend the projection with an append that the source-log owner has already synchronized.
@@ -1206,30 +1208,11 @@ impl SourceReceiptIndex {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.suspended {
-            return Err(RiskInputsUnavailable::SourceLogUncertain);
-        }
         let index = usize::try_from(sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
         Ok(state
             .frames
             .get(index)
             .map(|metadata| (metadata.receipt, metadata.received_millis)))
-    }
-
-    /// Suspend source-receipt reads while append uncertainty is being re-verified (#572).
-    pub fn suspend(&self) {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .suspended = true;
-    }
-
-    /// Resume source-receipt reads after append uncertainty has been re-verified (#572).
-    pub fn resume(&self) {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .suspended = false;
     }
 
     pub(crate) fn received_millis(
@@ -1254,9 +1237,6 @@ impl SourceReceiptIndex {
                 .state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.suspended {
-                return Err(RiskInputsUnavailable::SourceLogUncertain);
-            }
             let metadata = state
                 .frames
                 .get(sequence_index)
@@ -1522,7 +1502,7 @@ mod tests {
         PolymarketTokenId, Probability, ReceivedAt, ShareAmount, Side, SourceId, SourceTimestamp,
         WalletAddress,
     };
-    use pe_event_log::{ContentType, EnvelopeIn, Writer};
+    use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
     use pe_execution_core::{
         AdmissionReceipts, BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
         LadderAskAudit, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit,
@@ -1888,10 +1868,6 @@ mod tests {
             (
                 RiskInputsUnavailable::PriceConflict,
                 "position price evidence conflicts",
-            ),
-            (
-                RiskInputsUnavailable::SourceLogUncertain,
-                "the source log is being re-verified after an append uncertainty",
             ),
             (
                 RiskInputsUnavailable::MarkMissing,
@@ -2404,42 +2380,6 @@ mod tests {
             index.receipt_at(EventSeq(0)).unwrap(),
             Some((stored, 10_000))
         );
-    }
-
-    /// PASS: suspension fails all source-receipt lookups closed while leaving recovery available;
-    /// resume restores access to the exact indexed frame.
-    #[test]
-    fn source_receipt_suspend_and_resume_gate_lookups() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("source.log");
-        let mut writer = Writer::open(&source_path).unwrap();
-        let stored = writer.append_synced(source_input(10, b"first")).unwrap();
-        drop(writer);
-        let index = SourceReceiptIndex::replay(&source_path).unwrap();
-
-        index.suspend();
-        assert_eq!(
-            index.receipt_at(stored.sequence),
-            Err(RiskInputsUnavailable::SourceLogUncertain)
-        );
-        assert_eq!(
-            index.received_millis(stored),
-            Err(RiskInputsUnavailable::SourceLogUncertain)
-        );
-        assert_eq!(
-            index.source_envelope(stored),
-            Err(RiskInputsUnavailable::SourceLogUncertain)
-        );
-        let tail = std::fs::metadata(&source_path).unwrap().len();
-        index.catch_up_to(tail, &mut |_, _| {}).unwrap();
-
-        index.resume();
-        assert_eq!(
-            index.receipt_at(stored.sequence).unwrap(),
-            Some((stored, 10_000))
-        );
-        assert_eq!(index.received_millis(stored).unwrap(), 10_000);
-        assert_eq!(index.source_envelope(stored).unwrap().payload, b"first");
     }
 
     /// PASS: the maintained index retains zero payload bytes, and appending metadata while an

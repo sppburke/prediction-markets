@@ -60,9 +60,8 @@ use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
-    SourceEvidence,
-    SupabaseStateClient, reconcile_active_financial_frames, supabase_authoritative_boot,
-    supabase_authoritative_boot_observed,
+    SourceEvidence, SupabaseStateClient, reconcile_active_financial_frames,
+    supabase_authoritative_boot, supabase_authoritative_boot_observed,
 };
 use pe_service::supervisor::{
     SHUTDOWN_DEADLINE, ShutdownController, ShutdownPhase, TaskEvent, TaskExit, TaskFailure,
@@ -417,7 +416,7 @@ async fn main() -> Result<()> {
             None => replay_membership(era, start_batch, &cfg.source_event_log_path),
         }
         .context("replay Start-bound structural membership")?
-            .context("QualificationStarted is missing from its financial era")?;
+        .context("QualificationStarted is missing from its financial era")?;
         let restored = replayed
             .watchlist
             .entries
