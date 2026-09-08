@@ -9,8 +9,9 @@ use pe_event_log::envelope::{HashInput, compute_hashes};
 use pe_event_log::{ContentType, EnvelopeIn, Scanner};
 use pe_execution_core::LiveJournal;
 use pe_paper_state::{
-    DurableLogBindings, MigrationMetadata, MigrationPhase, MigrationRecord, PaperMainSeal,
-    PaperPositionRow, PaperStateDb, SCHEMA_VERSION, verify_log_bindings,
+    DurableLogBindings, LEGACY_EXACT_MIGRATION_VERSION, MigrationMetadata, MigrationPhase,
+    MigrationRecord, PaperMainSeal, PaperPositionRow, PaperStateDb, SCHEMA_VERSION,
+    verify_log_bindings,
 };
 use pe_strategy_winner_follow::PerTradeCap;
 use rust_decimal::Decimal;
@@ -197,7 +198,10 @@ impl PaperMigrationBoot {
         );
         let schema = MigrationMetadata::schema_version(&paths.fixed_main)
             .context("inspect fixed paper-state schema before normal open")?;
-        if schema == SCHEMA_VERSION {
+        // An installed main written by a pre-#545 binary is still at the exact-migration
+        // version; the ordinary writable open that follows this pre-check migrates it in
+        // place (#567).
+        if schema == SCHEMA_VERSION || schema == LEGACY_EXACT_MIGRATION_VERSION {
             let mut record = MigrationMetadata::read(&paths.fixed_main)
                 .context("read installed paper migration record")?
                 .context("v2 paper main omitted migration record")?;

@@ -1,42 +1,3 @@
-//! SQLite schema for the paper-trader crash-safe state mirror.
-//!
-//! `journal_mode = WAL` + `synchronous = NORMAL` gives per-commit durability
-//! without full-fsync cost (matching `bootstrap`'s wallet cache). The schema is
-//! versioned via `PRAGMA user_version`; see [`SCHEMA_VERSION`].
-
-/// Current on-disk schema version, written to `PRAGMA user_version` on create
-/// and checked on open. Bump when the table layout changes incompatibly.
-pub const SCHEMA_VERSION: i64 = 3;
-
-/// Schema version whose whole-contract financial columns are migrated once on open. An installed
-/// main written by a pre-#545 binary is at this version until the first writable open upgrades it.
-pub const LEGACY_EXACT_MIGRATION_VERSION: i64 = 2;
-
-/// `meta` key under which the event-log reconciliation cursor is stored.
-pub(crate) const META_LAST_APPLIED_EVENT_SEQ: &str = "last_applied_event_seq";
-
-/// `meta` key under which the Supabase authoritative catch-up watermark is stored
-/// (issue #397): the highest event-log `seq` whose fill has been applied to the
-/// authoritative Supabase `commit_fill` RPC. Parallel to [`META_LAST_APPLIED_EVENT_SEQ`]
-/// (the local SQLite reconciliation cursor) but kept **separate** so a SQLite-only
-/// reconcile never advances it; on SQLite loss the row is ABSENT (`None`) → a safe full
-/// idempotent replay that includes seq 0 (the RPC gate debits each fill at most once).
-/// `Some(0)` is distinct: seq 0 confirmed (#510). Local-only state — the event log,
-/// whose frames it counts, is itself local. Advanced at runtime by
-/// `commit_fill_authoritative` on each confirmed successor fill (#510).
-pub(crate) const META_LAST_SUPABASE_APPLIED_EVENT_SEQ: &str = "last_supabase_applied_event_seq";
-
-/// Active financial-era metadata (#545). The Start keys are written as one transaction;
-/// `financial_last_prepared_seq` advances only with a local financial projection commit.
-pub(crate) const META_FINANCIAL_START_SEQ: &str = "financial_start_seq";
-pub(crate) const META_FINANCIAL_START_HASH: &str = "financial_start_hash";
-pub(crate) const META_FINANCIAL_LAST_PREPARED_SEQ: &str = "financial_last_prepared_seq";
-
-/// Single-row `bankroll` table primary key.
-pub(crate) const BANKROLL_ROW_ID: i64 = 0;
-
-/// DDL run on every open (idempotent via `IF NOT EXISTS`).
-pub(crate) const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
@@ -83,23 +44,17 @@ CREATE TABLE IF NOT EXISTS fills (
     market_id       TEXT    NOT NULL,
     outcome_id      INTEGER NOT NULL,
     side            TEXT    NOT NULL CHECK(side IN ('buy', 'sell')),
-    quantity_str    TEXT    NOT NULL,
+    contracts       INTEGER NOT NULL,
     fill_price_str  TEXT    NOT NULL,
-    principal_str   TEXT    NOT NULL,
-    fee_str         TEXT    NOT NULL,
-    event_seq       INTEGER NOT NULL,
-    prepared_seq    INTEGER NOT NULL,
-    source_receipt_seq INTEGER,
-    source_receipt_hash TEXT,
-    causal_received_at_unix INTEGER
+    event_seq       INTEGER NOT NULL
 );
 
 -- Our own net paper positions per (market, outcome).
 CREATE TABLE IF NOT EXISTS positions (
     market_id       TEXT    NOT NULL,
     outcome_id      INTEGER NOT NULL,
-    long_str        TEXT    NOT NULL,
-    short_str       TEXT    NOT NULL,
+    long_contracts  INTEGER NOT NULL,
+    short_contracts INTEGER NOT NULL,
     PRIMARY KEY (market_id, outcome_id)
 );
 
@@ -252,7 +207,7 @@ CREATE TABLE IF NOT EXISTS poll_cursors (
 -- canonical JSON text. SQLite's ordinary (non-STRICT) affinity preserves both storage classes.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT    PRIMARY KEY NOT NULL,
-    value BLOB    NOT NULL
+    value INTEGER NOT NULL
 );
 
 -- Hash-bound activation census captured after remote-authority reload and the
@@ -273,9 +228,7 @@ CREATE TABLE IF NOT EXISTS settled_markets (
     market_id       TEXT    PRIMARY KEY NOT NULL,
     outcome_prices  TEXT    NOT NULL,
     credit_applied  TEXT    NOT NULL,
-    settled_at_unix INTEGER NOT NULL,
-    prepared_seq INTEGER,
-    source_receipt_seq INTEGER
+    settled_at_unix INTEGER NOT NULL
 );
 
 -- Fill-time market-liquidity snapshot (WS2 of issue #350): one best-effort row per
@@ -338,4 +291,3 @@ CREATE TABLE IF NOT EXISTS dispatch_targets (
     updated_at_unix           INTEGER NOT NULL,
     PRIMARY KEY (dispatch_id, account_id)
 );
-";
