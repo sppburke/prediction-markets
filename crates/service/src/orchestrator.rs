@@ -55,10 +55,14 @@ use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::SinkHandle;
 use crate::supabase_state::SupabaseStateClient;
 use crate::supabase_state::{
-    PreparedFillRequest, PreparedResolutionRequest, SupabaseStateTrait, apply_financial_result,
-    reconcile_active_financial_frames, resolution_source_received_at,
+    PreparedFillRequest, PreparedResolutionRequest, SourceEvidence, SupabaseStateTrait,
+    apply_financial_result, reconcile_active_financial_frames, resolution_source_received_at,
     terminalize_final_fill_decision,
 };
+
+fn runtime_source_evidence(source_log_path: &std::path::Path) -> SourceEvidence<'_> {
+    SourceEvidence::Log(source_log_path)
+}
 
 /// Hot-path `/book` fetch timeout for the mandatory price-impact gate (#398 WS2). A timeout makes
 /// the book unusable and closes copy admission without stalling the trade.
@@ -598,7 +602,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &authority,
             &self.paper_state,
             &paper_log_path,
-            &source_log_path,
+            runtime_source_evidence(&source_log_path),
             &mut self.paper_writer,
         )
         .await
@@ -661,7 +665,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // Validate and freeze the source-derived settlement time before the irreversible
         // Prepared append. Recovery repeats this check as corruption detection.
         let settled_at_unix = resolution_source_received_at(
-            &source_log_path,
+            runtime_source_evidence(&source_log_path),
             source_receipt,
             &condition,
             &payout_by_outcome_index_json,
@@ -703,7 +707,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             prepared_receipt,
             payload,
             &result,
-            &source_log_path,
+            runtime_source_evidence(&source_log_path),
         )
         .map_err(|error| error.to_string())?;
         self.append_paper_record(&PaperLogRecord::FinancialFinal {
@@ -802,7 +806,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             prepared_receipt,
             &payload,
             &result,
-            &source_log_path,
+            runtime_source_evidence(&source_log_path),
         )
         .map_err(|error| error.to_string())?;
         let final_receipt = self.append_paper_record(&PaperLogRecord::FinancialFinal {
@@ -3445,10 +3449,23 @@ mod tests {
     use crate::paper_recovery::{RiskHaltOwner, SealReason};
     use crate::qualification::QualificationCompletion;
 
-    use super::{Orchestrator, check_resolution_horizon};
+    use super::{Orchestrator, check_resolution_horizon, runtime_source_evidence};
     use crate::risk_inputs::apply_global_risk_halts;
+    use crate::supabase_state::SourceEvidence;
 
     const NOW: i64 = 1_700_000_000;
+
+    /// The active runtime redrive, resolution validation, and result-application call sites all
+    /// use this selector, which must stay on the configured source log rather than the receipt
+    /// index (#572).
+    #[test]
+    fn active_financial_runtime_selects_the_configured_source_log() {
+        let configured = std::path::Path::new("configured/source-events.log");
+        assert!(matches!(
+            runtime_source_evidence(configured),
+            SourceEvidence::Log(path) if path == configured
+        ));
+    }
 
     fn healthy_risk_snapshot() -> RiskSnapshot {
         RiskSnapshot {
