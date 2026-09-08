@@ -145,47 +145,6 @@ fn insert_reconciliation_trigger(
     );
 }
 
-fn take_coalesced_obligation(
-    by_wallet: &mut CoalescedObligations,
-    wallet: &WalletAddress,
-    epoch: i64,
-    group_id: &str,
-) -> Option<Obligation> {
-    let obligation = by_wallet
-        .get_mut(wallet)?
-        .get_mut(&epoch)?
-        .remove(group_id)?;
-    let remove_epoch = by_wallet
-        .get(wallet)
-        .and_then(|epochs| epochs.get(&epoch))
-        .is_some_and(BTreeMap::is_empty);
-    if remove_epoch && let Some(epochs) = by_wallet.get_mut(wallet) {
-        epochs.remove(&epoch);
-    }
-    if by_wallet.get(wallet).is_some_and(BTreeMap::is_empty) {
-        by_wallet.remove(wallet);
-    }
-    Some(obligation)
-}
-
-fn take_earliest_coalesced_obligation(
-    by_wallet: &mut CoalescedObligations,
-) -> Option<(WalletAddress, i64, Obligation)> {
-    let (wallet, epoch, group_id) = by_wallet
-        .iter()
-        .flat_map(|(wallet, epochs)| {
-            epochs.iter().flat_map(move |(epoch, groups)| {
-                groups.iter().map(move |(group_id, obligation)| {
-                    (*wallet, *epoch, group_id, obligation.receipt.sequence)
-                })
-            })
-        })
-        .min_by_key(|(_, _, _, sequence)| *sequence)
-        .map(|(wallet, epoch, group_id, _)| (wallet, epoch, group_id.clone()))?;
-    let obligation = take_coalesced_obligation(by_wallet, &wallet, epoch, &group_id)?;
-    Some((wallet, epoch, obligation))
-}
-
 #[derive(Default)]
 struct BucketIdentities {
     overrides: HashMap<SourceTradeId, IdentityOverride>,
@@ -236,20 +195,43 @@ impl ActivityCandidates {
         Ok(())
     }
 
-    /// Filter the coalesced log candidates against durable paper state (#572).
+    /// Number of coalesced candidates.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_wallet
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(BTreeMap::len)
+            .sum()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_wallet.is_empty()
+    }
+
+    /// Filter the coalesced log candidates against durable paper state (#572). The result is a
+    /// keyed map, so the visiting order does not affect it.
     pub fn into_obligations(
-        mut self,
+        self,
         paper_state: &PaperStateDb,
     ) -> Result<ReconciliationObligations, ObligationRebuildError> {
         let mut obligations = ReconciliationObligations::default();
-        while let Some((wallet, epoch, obligation)) =
-            take_earliest_coalesced_obligation(&mut self.by_wallet)
-        {
-            if paper_state
-                .activity_group_state(&obligation.group_id)?
-                .is_none()
-            {
-                insert_coalesced_obligation(&mut obligations.by_wallet, wallet, epoch, obligation);
+        for (wallet, epochs) in self.by_wallet {
+            for (epoch, groups) in epochs {
+                for obligation in groups.into_values() {
+                    if paper_state
+                        .activity_group_state(&obligation.group_id)?
+                        .is_none()
+                    {
+                        insert_coalesced_obligation(
+                            &mut obligations.by_wallet,
+                            wallet,
+                            epoch,
+                            obligation,
+                        );
+                    }
+                }
             }
         }
         Ok(obligations)

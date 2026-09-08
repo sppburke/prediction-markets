@@ -31,6 +31,7 @@ use crate::risk_inputs::SourceReceiptIndex;
 use crate::source_event_sink::SourceEventSink;
 use crate::trade_poller::{
     ActivityCandidates, DailyBoundaryCandidates, ObligationRebuildError, ReconciliationObligations,
+    recover_daily_boundary_anchor, recover_daily_boundary_from_candidates,
 };
 
 /// Scenario-only fault seams (absent from ordinary builds).
@@ -245,10 +246,11 @@ impl SourceLogBoot {
         let mut obligations = activity
             .into_obligations(paper_state)
             .context("rebuild durable activity reconciliation obligations")?;
-        if let Some(candidates) = self.reducers.daily_boundary.take() {
-            candidates
-                .recover(paper_log_path, &mut obligations)
-                .context("recover causal daily boundary")?;
+        if let Some(candidates) = self.reducers.daily_boundary.take()
+            && let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, &mut obligations)
+                .context("recover causal daily boundary")?
+        {
+            recover_daily_boundary_from_candidates(candidates, anchor, &mut obligations);
         }
         Ok(obligations)
     }
