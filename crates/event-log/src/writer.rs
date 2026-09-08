@@ -9,17 +9,22 @@ use pe_core_types::EventSeq;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{EnvelopeIn, EventEnvelope, HashInput, compute_hashes};
-use crate::frame::{write_file_header, write_frame};
-use crate::scanner::inspect_open;
+use crate::frame::{HEADER_LEN, write_file_header, write_frame};
+use crate::scanner::{LogTailBinding, PrefixVerdict, inspect_open, walk_locked};
 use crate::{LogError, PoisonReason};
 
 trait DurableWrite: Write + Send + Sync {
     fn sync_all(&self) -> std::io::Result<()>;
+    fn len(&self) -> std::io::Result<u64>;
 }
 
 impl DurableWrite for File {
     fn sync_all(&self) -> std::io::Result<()> {
         File::sync_all(self)
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.metadata()?.len())
     }
 }
 
@@ -41,6 +46,7 @@ pub struct Writer {
     inner: BufWriter<Box<dyn DurableWrite>>,
     next_seq: u64,
     last_hash: Hash,
+    cursor: u64,
     poison_reason: Option<PoisonReason>,
 }
 
@@ -51,6 +57,7 @@ impl fmt::Debug for Writer {
             .field("path", &self.path)
             .field("next_seq", &self.next_seq)
             .field("last_hash", &self.last_hash)
+            .field("cursor", &self.cursor)
             .field("poison_reason", &self.poison_reason)
             .finish_non_exhaustive()
     }
@@ -96,6 +103,7 @@ impl Writer {
                 file,
                 0,
                 Hash::from_bytes([0; 32]),
+                HEADER_LEN,
             ));
         }
 
@@ -116,7 +124,95 @@ impl Writer {
             file,
             next_seq,
             scan.verified_tail.last_hash,
+            scan.verified_tail.physical_tail,
         ))
+    }
+
+    /// Open and verify an existing log under its exclusive writer lock (#572).
+    ///
+    /// Every verified frame is reported to `observer`. A scanner-proven incomplete final frame is
+    /// repaired only when it begins outside a matching trusted prefix; missing files are never
+    /// created by this entry point.
+    pub fn open_verified(
+        path: impl AsRef<Path>,
+        expected_prefix: Option<&LogTailBinding>,
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+    ) -> Result<(Self, LogTailBinding), LogError> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                LogError::Locked {
+                    path: path.to_owned(),
+                }
+            } else {
+                LogError::Io(error)
+            }
+        })?;
+
+        if file.metadata()?.len() == 0 {
+            if expected_prefix.is_some() {
+                return Err(LogError::BadHeader {
+                    path: path.to_owned(),
+                });
+            }
+            write_file_header(&mut file)?;
+            file.flush()?;
+            file.sync_all()?;
+            let binding = LogTailBinding {
+                path: std::fs::canonicalize(path)?,
+                physical_tail: HEADER_LEN,
+                last_sequence: None,
+                last_hash: Hash::from_bytes([0; 32]),
+            };
+            return Ok((
+                Self::from_file(
+                    path.to_owned(),
+                    file,
+                    0,
+                    Hash::from_bytes([0; 32]),
+                    HEADER_LEN,
+                ),
+                binding,
+            ));
+        }
+
+        let (scan, verdict) = walk_locked(path, &file, expected_prefix, observer)?;
+        // As `Scanner::verify_prefix`: with an expected prefix, a torn final frame is reported
+        // before any boundary verdict unless the prefix matched (the tear then lies wholly after
+        // it and is repaired below). A tear that cuts into the prefix can never match.
+        if let Some(incomplete) = scan.incomplete_tail
+            && expected_prefix.is_some()
+            && verdict != PrefixVerdict::Matched
+        {
+            return Err(LogError::Truncated {
+                at: incomplete.next_sequence,
+                byte_offset: incomplete.byte_offset,
+            });
+        }
+        verdict.require_match()?;
+
+        if scan.incomplete_tail.is_some() {
+            file.set_len(scan.verified_tail.physical_tail)?;
+        }
+        // As `open`: the verified prefix is synchronized whether or not a repair happened, so a
+        // previous writer's synchronization uncertainty is cleared before the binding is published.
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(scan.verified_tail.physical_tail))?;
+        let next_seq = match scan.verified_tail.last_sequence {
+            None => 0,
+            Some(last) => last.0.checked_add(1).ok_or(LogError::SequenceOverflow)?,
+        };
+        let binding = scan.verified_tail;
+        let writer = Self::from_file(
+            path.to_owned(),
+            file,
+            next_seq,
+            binding.last_hash,
+            binding.physical_tail,
+        );
+        Ok((writer, binding))
     }
 
     /// Open for append with a trusted external tail binding: destructive repair is
@@ -126,11 +222,19 @@ impl Writer {
     /// entry; ordinary startup without a binding uses [`Self::open`] (#544 review).
     pub fn open_with_expected_tail(
         path: impl AsRef<Path>,
-        expected: &crate::scanner::LogTailBinding,
+        expected: &LogTailBinding,
     ) -> Result<Self, LogError> {
         let path = path.as_ref();
         let scan = crate::scanner::Scanner::inspect(path)?;
         let tail = &scan.verified_tail;
+        // A binding names one canonical file (#572): a byte-identical twin must not authorize
+        // this file's repair.
+        if tail.path != expected.path {
+            return Err(LogError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected tail binding names a different event log",
+            )));
+        }
         if tail.physical_tail != expected.physical_tail
             || tail.last_sequence != expected.last_sequence
             || tail.last_hash != expected.last_hash
@@ -144,12 +248,13 @@ impl Writer {
         Self::open(path)
     }
 
-    fn from_file(path: PathBuf, file: File, next_seq: u64, last_hash: Hash) -> Self {
+    fn from_file(path: PathBuf, file: File, next_seq: u64, last_hash: Hash, cursor: u64) -> Self {
         Self {
             path,
             inner: BufWriter::new(Box::new(file)),
             next_seq,
             last_hash,
+            cursor,
             poison_reason: None,
         }
     }
@@ -194,12 +299,25 @@ impl Writer {
             payload: envelope_in.payload,
         };
         let json = serde_json::to_vec(&envelope)?;
-        if let Err(error) = write_frame(&mut self.inner, &json) {
-            if matches!(&error, LogError::Io(_)) {
-                self.poison_reason = Some(PoisonReason::Append);
+        let frame_bytes = match write_frame(&mut self.inner, &json) {
+            Ok(frame_bytes) => frame_bytes,
+            Err(error) => {
+                if matches!(&error, LogError::Io(_)) {
+                    self.poison_reason = Some(PoisonReason::Append);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
+        self.cursor = match self.cursor.checked_add(frame_bytes) {
+            Some(cursor) => cursor,
+            None => {
+                self.poison_reason = Some(PoisonReason::Append);
+                return Err(LogError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "event-log byte cursor overflowed",
+                )));
+            }
+        };
         self.next_seq = next_seq;
         self.last_hash = this_hash;
         Ok(seq)
@@ -234,6 +352,25 @@ impl Writer {
             return Err(LogError::Io(error));
         }
         Ok(())
+    }
+
+    /// Synchronize pending appends and bind the writer's verified byte cursor (#572).
+    pub fn verified_tail(&mut self) -> Result<LogTailBinding, LogError> {
+        self.sync()?;
+        let actual_tail = self.inner.get_ref().len()?;
+        if actual_tail != self.cursor {
+            return Err(LogError::ExpectedTailMismatch {
+                path: self.path.clone(),
+                expected_tail: self.cursor,
+                actual_tail,
+            });
+        }
+        Ok(LogTailBinding {
+            path: std::fs::canonicalize(&self.path)?,
+            physical_tail: self.cursor,
+            last_sequence: self.next_seq.checked_sub(1).map(EventSeq),
+            last_hash: self.last_hash,
+        })
     }
 
     fn ensure_healthy(&self) -> Result<(), LogError> {
@@ -302,6 +439,11 @@ mod tests {
             }
             Ok(())
         }
+
+        fn len(&self) -> io::Result<u64> {
+            u64::try_from(self.bytes.len())
+                .map_err(|_| io::Error::other("injected length overflow"))
+        }
     }
 
     fn writer(fault: Fault) -> Writer {
@@ -316,6 +458,7 @@ mod tests {
             ),
             next_seq: 0,
             last_hash: Hash::from_bytes([0; 32]),
+            cursor: 0,
             poison_reason: None,
         }
     }
@@ -366,6 +509,18 @@ mod tests {
         assert!(matches!(
             writer.append(envelope()),
             Err(LogError::Poisoned { .. })
+        ));
+    }
+
+    #[test]
+    fn verified_tail_refuses_a_poisoned_writer() {
+        let mut writer = writer(Fault::Sync);
+        assert!(writer.sync().is_err());
+        assert!(matches!(
+            writer.verified_tail(),
+            Err(LogError::Poisoned {
+                reason: PoisonReason::Synchronize
+            })
         ));
     }
 

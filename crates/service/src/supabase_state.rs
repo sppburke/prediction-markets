@@ -20,7 +20,7 @@ use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, OutcomeId, PolymarketConditionId, Price, ReceivedAt,
     ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Writer};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader, Writer};
 use pe_execution_core::EconomicPrepared;
 use pe_paper_state::{FillRecord, FillRow, PaperPositionRow, PaperStateDb, PaperStateError};
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
@@ -41,6 +41,7 @@ use crate::paper_recovery::{
     FinancialResult, PAPER_LOG_SCHEMA_VERSION, PaperFillOperationIdentity, PaperLogFrame,
     PaperLogRecord, paper_era, scan_paper_log,
 };
+use crate::risk_inputs::SourceReceiptIndex;
 use crate::supabase_reader::auth_token;
 use crate::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 
@@ -96,6 +97,13 @@ const PAPER_POSITIONS_MAX_ROWS: usize = 500_000;
 /// Upper bound for one authoritative financial mutation. An elapsed request is deliberately
 /// ambiguous and is recovered from the synchronized Prepared record.
 const AUTHORITATIVE_MUTATION_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Verified source evidence used to recover and apply active financial frames (#572).
+#[derive(Clone, Copy)]
+pub enum SourceEvidence<'a> {
+    Log(&'a std::path::Path),
+    Index(&'a SourceReceiptIndex),
+}
 
 const fn side_str(side: Side) -> &'static str {
     match side {
@@ -947,7 +955,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
     paper_log_path: &std::path::Path,
-    source_log_path: &std::path::Path,
+    source_evidence: SourceEvidence<'_>,
     writer: &mut Writer,
 ) -> Result<usize, SupabaseStateError> {
     let era =
@@ -1028,7 +1036,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
                     frame.receipt,
                     payload,
                     &result,
-                    source_log_path,
+                    source_evidence,
                 )?;
                 result
             }
@@ -1054,7 +1062,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
                     frame.receipt,
                     payload,
                     &result,
-                    source_log_path,
+                    source_evidence,
                 )?;
                 result
             }
@@ -1069,7 +1077,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
                     frame.receipt,
                     payload,
                     &result,
-                    source_log_path,
+                    source_evidence,
                 )?;
                 result
             }
@@ -1082,7 +1090,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
                 None,
             ) => {
                 let settled_at_unix = resolution_source_received_at(
-                    source_log_path,
+                    source_evidence,
                     *resolution_source_receipt,
                     condition_id,
                     payout_by_outcome_index_json,
@@ -1103,7 +1111,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
                     frame.receipt,
                     payload,
                     &result,
-                    source_log_path,
+                    source_evidence,
                 )?;
                 result
             }
@@ -1190,7 +1198,7 @@ pub(crate) fn apply_financial_result(
     prepared_receipt: AppendReceipt,
     payload: &FinancialPayload,
     result: &FinancialResult,
-    source_log_path: &std::path::Path,
+    source_evidence: SourceEvidence<'_>,
 ) -> Result<(), SupabaseStateError> {
     match (payload, result) {
         (
@@ -1233,7 +1241,7 @@ pub(crate) fn apply_financial_result(
                 )
             })?;
             let causal_received_at_unix =
-                source_receipt_received_at(source_log_path, observation.source_receipt)?;
+                source_receipt_received_at(source_evidence, observation.source_receipt)?;
             paper_state.apply_financial_fill(
                 start,
                 expected.prior_completed_prepared_sequence,
@@ -1256,7 +1264,7 @@ pub(crate) fn apply_financial_result(
                 || canonical.applied_prepared_seq != prepared_receipt.sequence
                 || canonical.settled_at_unix
                     != resolution_source_received_at(
-                        source_log_path,
+                        source_evidence,
                         *resolution_source_receipt,
                         condition_id,
                         payout_by_outcome_index_json,
@@ -1326,90 +1334,157 @@ pub(crate) fn apply_financial_result(
 }
 
 pub(crate) fn resolution_source_received_at(
-    source_log_path: &std::path::Path,
+    source_evidence: SourceEvidence<'_>,
     receipt: AppendReceipt,
     condition: &PolymarketConditionId,
     payout_json: &str,
 ) -> Result<i64, SupabaseStateError> {
-    let replay = Reader::replay(source_log_path).map_err(|error| {
-        SupabaseStateError::Corrupt(format!("open source log for resolution evidence: {error}"))
-    })?;
-    for frame in replay {
-        let (sequence, envelope) = frame.map_err(|error| {
-            SupabaseStateError::Corrupt(format!("read source resolution evidence: {error}"))
-        })?;
-        if sequence == receipt.sequence {
-            if envelope.this_hash != receipt.this_hash {
+    match source_evidence {
+        SourceEvidence::Log(source_log_path) => {
+            let replay = Reader::replay(source_log_path).map_err(|error| {
+                SupabaseStateError::Corrupt(format!(
+                    "open source log for resolution evidence: {error}"
+                ))
+            })?;
+            for frame in replay {
+                let (sequence, envelope) = frame.map_err(|error| {
+                    SupabaseStateError::Corrupt(format!("read source resolution evidence: {error}"))
+                })?;
+                if sequence == receipt.sequence {
+                    return validate_resolution_source_envelope(
+                        &envelope,
+                        receipt,
+                        condition,
+                        payout_json,
+                    );
+                }
+            }
+            Err(SupabaseStateError::Corrupt(format!(
+                "resolution source receipt {} is absent",
+                receipt.sequence.0
+            )))
+        }
+        SourceEvidence::Index(index) => {
+            let Some((indexed_receipt, _received_millis)) =
+                index.receipt_at(receipt.sequence).map_err(|error| {
+                    SupabaseStateError::Corrupt(format!(
+                        "read indexed source resolution evidence: {error}"
+                    ))
+                })?
+            else {
+                return Err(SupabaseStateError::Corrupt(format!(
+                    "resolution source receipt {} is absent",
+                    receipt.sequence.0
+                )));
+            };
+            if indexed_receipt.this_hash != receipt.this_hash {
                 return Err(SupabaseStateError::Corrupt(
                     "resolution source receipt hash differs from verified envelope".to_owned(),
                 ));
             }
-            if envelope.source_id.0 != "polymarket.clob.market" {
-                return Err(SupabaseStateError::Corrupt(
-                    "resolution receipt does not reference CLOB market evidence".to_owned(),
-                ));
-            }
-            if envelope.schema_version != CLOB_RESOLUTION_SCHEMA_VERSION
-                || envelope.parser_version != CLOB_RESOLUTION_PARSER_VERSION
-            {
-                return Err(SupabaseStateError::Corrupt(
-                    "resolution receipt uses an unsupported CLOB schema or parser version"
-                        .to_owned(),
-                ));
-            }
-            let market = parse_clob_market(&envelope.payload).map_err(|error| {
+            let envelope = index.source_envelope(receipt).map_err(|error| {
                 SupabaseStateError::Corrupt(format!(
-                    "parse referenced CLOB resolution evidence: {error}"
+                    "read indexed source resolution evidence: {error}"
                 ))
             })?;
-            if market.condition_id.as_deref() != Some(condition.0.as_str()) {
-                return Err(SupabaseStateError::Corrupt(
-                    "referenced CLOB resolution condition differs from Prepared".to_owned(),
-                ));
-            }
-            let ClobPayoutResolution::Resolved(payout) = market.resolution_evidence().payout else {
-                return Err(SupabaseStateError::Corrupt(
-                    "referenced CLOB market is not resolved".to_owned(),
-                ));
-            };
-            if payout.canonical_json() != payout_json {
-                return Err(SupabaseStateError::Corrupt(
-                    "referenced CLOB payout differs from Prepared".to_owned(),
-                ));
-            }
-            return Ok(envelope.received_at.0.unix_timestamp());
+            validate_resolution_source_envelope(&envelope, receipt, condition, payout_json)
         }
     }
-    Err(SupabaseStateError::Corrupt(format!(
-        "resolution source receipt {} is absent",
-        receipt.sequence.0
-    )))
+}
+
+fn validate_resolution_source_envelope(
+    envelope: &EventEnvelope,
+    receipt: AppendReceipt,
+    condition: &PolymarketConditionId,
+    payout_json: &str,
+) -> Result<i64, SupabaseStateError> {
+    if envelope.this_hash != receipt.this_hash {
+        return Err(SupabaseStateError::Corrupt(
+            "resolution source receipt hash differs from verified envelope".to_owned(),
+        ));
+    }
+    if envelope.source_id.0 != "polymarket.clob.market" {
+        return Err(SupabaseStateError::Corrupt(
+            "resolution receipt does not reference CLOB market evidence".to_owned(),
+        ));
+    }
+    if envelope.schema_version != CLOB_RESOLUTION_SCHEMA_VERSION
+        || envelope.parser_version != CLOB_RESOLUTION_PARSER_VERSION
+    {
+        return Err(SupabaseStateError::Corrupt(
+            "resolution receipt uses an unsupported CLOB schema or parser version".to_owned(),
+        ));
+    }
+    let market = parse_clob_market(&envelope.payload).map_err(|error| {
+        SupabaseStateError::Corrupt(format!(
+            "parse referenced CLOB resolution evidence: {error}"
+        ))
+    })?;
+    if market.condition_id.as_deref() != Some(condition.0.as_str()) {
+        return Err(SupabaseStateError::Corrupt(
+            "referenced CLOB resolution condition differs from Prepared".to_owned(),
+        ));
+    }
+    let ClobPayoutResolution::Resolved(payout) = market.resolution_evidence().payout else {
+        return Err(SupabaseStateError::Corrupt(
+            "referenced CLOB market is not resolved".to_owned(),
+        ));
+    };
+    if payout.canonical_json() != payout_json {
+        return Err(SupabaseStateError::Corrupt(
+            "referenced CLOB payout differs from Prepared".to_owned(),
+        ));
+    }
+    Ok(envelope.received_at.0.unix_timestamp())
 }
 
 fn source_receipt_received_at(
-    source_log_path: &std::path::Path,
+    source_evidence: SourceEvidence<'_>,
     receipt: AppendReceipt,
 ) -> Result<i64, SupabaseStateError> {
-    let replay = Reader::replay(source_log_path).map_err(|error| {
-        SupabaseStateError::Corrupt(format!("open source log for fill evidence: {error}"))
-    })?;
-    for frame in replay {
-        let (sequence, envelope) = frame.map_err(|error| {
-            SupabaseStateError::Corrupt(format!("read source fill evidence: {error}"))
-        })?;
-        if sequence != receipt.sequence {
-            continue;
+    match source_evidence {
+        SourceEvidence::Log(source_log_path) => {
+            let replay = Reader::replay(source_log_path).map_err(|error| {
+                SupabaseStateError::Corrupt(format!("open source log for fill evidence: {error}"))
+            })?;
+            for frame in replay {
+                let (sequence, envelope) = frame.map_err(|error| {
+                    SupabaseStateError::Corrupt(format!("read source fill evidence: {error}"))
+                })?;
+                if sequence != receipt.sequence {
+                    continue;
+                }
+                if envelope.this_hash != receipt.this_hash {
+                    return Err(SupabaseStateError::Corrupt(
+                        "fill source receipt hash differs from its envelope".to_owned(),
+                    ));
+                }
+                return Ok(envelope.received_at.0.unix_timestamp());
+            }
+            Err(SupabaseStateError::Corrupt(
+                "fill source receipt is absent from the source log".to_owned(),
+            ))
         }
-        if envelope.this_hash != receipt.this_hash {
-            return Err(SupabaseStateError::Corrupt(
-                "fill source receipt hash differs from its envelope".to_owned(),
-            ));
+        SourceEvidence::Index(index) => {
+            let Some((indexed_receipt, received_millis)) =
+                index.receipt_at(receipt.sequence).map_err(|error| {
+                    SupabaseStateError::Corrupt(format!(
+                        "read indexed source fill evidence: {error}"
+                    ))
+                })?
+            else {
+                return Err(SupabaseStateError::Corrupt(
+                    "fill source receipt is absent from the source log".to_owned(),
+                ));
+            };
+            if indexed_receipt.this_hash != receipt.this_hash {
+                return Err(SupabaseStateError::Corrupt(
+                    "fill source receipt hash differs from its envelope".to_owned(),
+                ));
+            }
+            Ok(received_millis.div_euclid(1_000))
         }
-        return Ok(envelope.received_at.0.unix_timestamp());
     }
-    Err(SupabaseStateError::Corrupt(
-        "fill source receipt is absent from the source log".to_owned(),
-    ))
 }
 
 // ── Boot: frame-walk then pull ──────────────────────────────────────────────────
@@ -1858,8 +1933,123 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn fill_source_receipt_lookup_matches_log_and_index_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("fill-source.log");
+        let received_at =
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_789_000_000).unwrap();
+        let mut writer = Writer::open(&source_path).unwrap();
+        let receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("test.fill".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                content_type: ContentType::Json,
+                payload: br#"{"type":"TRADE"}"#.to_vec(),
+            })
+            .unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let wrong_hash = AppendReceipt {
+            sequence: receipt.sequence,
+            this_hash: blake3::Hash::from_bytes([0xA5; 32]),
+        };
+        let absent = AppendReceipt {
+            sequence: EventSeq(999),
+            this_hash: receipt.this_hash,
+        };
+
+        for evidence in [
+            SourceEvidence::Log(&source_path),
+            SourceEvidence::Index(&index),
+        ] {
+            assert_eq!(
+                source_receipt_received_at(evidence, receipt).unwrap(),
+                1_700_000_000
+            );
+            assert_eq!(
+                source_receipt_received_at(evidence, wrong_hash)
+                    .unwrap_err()
+                    .to_string(),
+                "corrupt supabase value: fill source receipt hash differs from its envelope"
+            );
+            assert_eq!(
+                source_receipt_received_at(evidence, absent)
+                    .unwrap_err()
+                    .to_string(),
+                "corrupt supabase value: fill source receipt is absent from the source log"
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_source_receipt_lookup_matches_log_and_index_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("resolution-source.log");
+        let received_at =
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_789_000_000).unwrap();
+        let mut writer = Writer::open(&source_path).unwrap();
+        let receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("polymarket.clob.market".to_owned()),
+                schema_version: CLOB_RESOLUTION_SCHEMA_VERSION,
+                parser_version: CLOB_RESOLUTION_PARSER_VERSION,
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                content_type: ContentType::Json,
+                payload: br#"{"condition_id":"condition","closed":true,
+                    "is_50_50_outcome":false,
+                    "tokens":[{"token_id":"yes","outcome":"Yes","price":1,"winner":true},
+                              {"token_id":"no","outcome":"No","price":0,"winner":false}]}"#
+                    .to_vec(),
+            })
+            .unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let wrong_hash = AppendReceipt {
+            sequence: receipt.sequence,
+            this_hash: blake3::Hash::from_bytes([0xA5; 32]),
+        };
+        let absent = AppendReceipt {
+            sequence: EventSeq(999),
+            this_hash: receipt.this_hash,
+        };
+        let condition = PolymarketConditionId("condition".to_owned());
+
+        for evidence in [
+            SourceEvidence::Log(&source_path),
+            SourceEvidence::Index(&index),
+        ] {
+            assert_eq!(
+                resolution_source_received_at(evidence, receipt, &condition, "[\"1\",\"0\"]")
+                    .unwrap(),
+                1_700_000_000
+            );
+            assert_eq!(
+                resolution_source_received_at(evidence, wrong_hash, &condition, "[\"1\",\"0\"]",)
+                    .unwrap_err()
+                    .to_string(),
+                "corrupt supabase value: resolution source receipt hash differs from verified envelope"
+            );
+            assert_eq!(
+                resolution_source_received_at(evidence, absent, &condition, "[\"1\",\"0\"]",)
+                    .unwrap_err()
+                    .to_string(),
+                "corrupt supabase value: resolution source receipt 999 is absent"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unmatched_resolution_recovery_mutates_and_finalizes_once() {
+        assert_unmatched_resolution_recovery(false).await;
+        assert_unmatched_resolution_recovery(true).await;
+    }
+
+    async fn assert_unmatched_resolution_recovery(use_index: bool) {
         use crate::paper_recovery::{FinancialPayload, QualificationStarted, TailBinding};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1885,6 +2075,12 @@ mod tests {
             })
             .unwrap();
         drop(source_writer);
+        let source_index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let source_evidence = if use_index {
+            SourceEvidence::Index(&source_index)
+        } else {
+            SourceEvidence::Log(&source_path)
+        };
 
         let mut writer = Writer::open(&paper_path).unwrap();
         let tail = TailBinding {
@@ -1936,7 +2132,7 @@ mod tests {
                 &authority,
                 &db,
                 &paper_path,
-                &source_path,
+                source_evidence,
                 &mut writer,
             )
             .await
@@ -1956,7 +2152,7 @@ mod tests {
                 &authority,
                 &db,
                 &paper_path,
-                &source_path,
+                source_evidence,
                 &mut writer,
             )
             .await

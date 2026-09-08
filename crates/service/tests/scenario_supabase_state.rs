@@ -58,9 +58,10 @@ use pe_service::paper_recovery::{
     FinancialResult, PaperFillOperationIdentity, PaperLogFrame, PaperLogRecord,
     QualificationStarted, TailBinding, scan_paper_log,
 };
+use pe_service::risk_inputs::SourceReceiptIndex;
 use pe_service::supabase_sink::SupabaseFillRow;
 use pe_service::supabase_state::{
-    CanonicalFill, FillV2Outcome, PreparedFillRequest, PreparedResolutionRequest,
+    CanonicalFill, FillV2Outcome, PreparedFillRequest, PreparedResolutionRequest, SourceEvidence,
     SupabaseBootTrait, SupabaseStateError, SupabaseStateTrait, reconcile_active_financial_frames,
     resolve_event_frames, supabase_authoritative_boot,
 };
@@ -772,11 +773,15 @@ enum FillCrashSeam {
 /// FAIL: money is applied twice, more than one Final exists, or any seam remains unmatched.
 #[tokio::test]
 async fn active_fill_crash_matrix_converges_once() {
-    for seam in [
-        FillCrashSeam::PreparedAppend,
-        FillCrashSeam::AuthorityResponse,
-        FillCrashSeam::LocalProjection,
-        FillCrashSeam::FinalAppend,
+    for (seam, use_index) in [
+        (FillCrashSeam::PreparedAppend, false),
+        (FillCrashSeam::AuthorityResponse, false),
+        (FillCrashSeam::LocalProjection, false),
+        (FillCrashSeam::FinalAppend, false),
+        (FillCrashSeam::PreparedAppend, true),
+        (FillCrashSeam::AuthorityResponse, true),
+        (FillCrashSeam::LocalProjection, true),
+        (FillCrashSeam::FinalAppend, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let paper_log = dir.path().join("active-paper.log");
@@ -784,6 +789,12 @@ async fn active_fill_crash_matrix_converges_once() {
         let mut source_writer = Writer::open(&source_log).unwrap();
         let source_receipt = append_source_observation(&mut source_writer);
         drop(source_writer);
+        let source_index = SourceReceiptIndex::replay(&source_log).unwrap();
+        let source_evidence = if use_index {
+            SourceEvidence::Index(&source_index)
+        } else {
+            SourceEvidence::Log(&source_log)
+        };
         let mut writer = Writer::open(&paper_log).unwrap();
         let start = append_active_record(&mut writer, &active_start_record());
         let state = PaperStateDb::open(&dir.path().join("active-paper.db")).unwrap();
@@ -876,7 +887,7 @@ async fn active_fill_crash_matrix_converges_once() {
             &authority,
             &state,
             &paper_log,
-            &source_log,
+            source_evidence,
             &mut writer,
         )
         .await
@@ -909,7 +920,7 @@ async fn active_fill_crash_matrix_converges_once() {
                 &authority,
                 &state,
                 &paper_log,
-                &source_log,
+                source_evidence,
                 &mut writer,
             )
             .await

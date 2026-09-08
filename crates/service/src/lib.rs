@@ -41,6 +41,7 @@ pub mod risk_inputs;
 pub mod runtime_config;
 pub mod snapshot_worker;
 pub mod source_event_sink;
+pub mod source_log_boot;
 pub mod status_writer;
 pub mod supabase_backfill;
 pub mod supabase_reader;

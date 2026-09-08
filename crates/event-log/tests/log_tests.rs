@@ -4,7 +4,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use pe_core_types::{EventSeq, ReceivedAt, SourceId, SourceTimestamp};
-use pe_event_log::{ContentType, EnvelopeIn, LogError, Reader, Scanner, Writer};
+use pe_event_log::{ContentType, EnvelopeIn, LogError, LogTailBinding, Reader, Scanner, Writer};
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
@@ -56,6 +56,45 @@ fn write_single_raw_frame(path: &std::path::Path, compressed: &[u8]) {
     bytes.extend_from_slice(compressed);
     bytes.extend_from_slice(&crc32fast::hash(compressed).to_le_bytes());
     std::fs::write(path, bytes).unwrap();
+}
+
+fn rewrite_frame_json(
+    path: &std::path::Path,
+    frame_start: u64,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    let bytes = std::fs::read(path).unwrap();
+    let start = usize::try_from(frame_start).unwrap();
+    let body_start = start + 4;
+    let len = usize::try_from(u32::from_le_bytes(
+        bytes[start..body_start].try_into().unwrap(),
+    ))
+    .unwrap();
+    let body_end = body_start + len;
+    let frame_end = body_end + 4;
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&zstd::decode_all(&bytes[body_start..body_end]).unwrap()).unwrap();
+    edit(&mut json);
+    let encoded = serde_json::to_vec(&json).unwrap();
+    let compressed = zstd::encode_all(encoded.as_slice(), 3).unwrap();
+    let compressed_len = u32::try_from(compressed.len()).unwrap();
+    let mut rewritten = bytes[..start].to_vec();
+    rewritten.extend_from_slice(&compressed_len.to_le_bytes());
+    rewritten.extend_from_slice(&compressed);
+    rewritten.extend_from_slice(&crc32fast::hash(&compressed).to_le_bytes());
+    rewritten.extend_from_slice(&bytes[frame_end..]);
+    std::fs::write(path, rewritten).unwrap();
+}
+
+fn assert_prefix_boundary_error(result: Result<LogTailBinding, LogError>, expected_message: &str) {
+    match result {
+        Err(LogError::Io(error)) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected_message);
+        }
+        Err(error) => panic!("expected prefix boundary error, got {error}"),
+        Ok(binding) => panic!("expected prefix boundary error, got {binding:?}"),
+    }
 }
 
 // ── wire format ──────────────────────────────────────────────────────────────
@@ -504,6 +543,527 @@ fn scanner_reports_exact_physical_tail_sequence_hash_and_resolved_path() {
     );
     assert_eq!(binding.last_sequence, Some(EventSeq(1)));
     assert_eq!(binding.last_hash, envelopes[1].1.this_hash);
+}
+
+// ── Prefix verification and locked writer scan ───────────────────────────────
+
+#[test]
+fn verify_prefix_accepts_exact_boundary_suffix_and_genesis() {
+    let dir = tmp_dir();
+    let path = dir.path().join("prefix-ok.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+
+    let first_tail = Scanner::verify(&path).unwrap();
+    assert_eq!(Scanner::verify_prefix(&first_tail).unwrap(), first_tail);
+
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let whole = Scanner::verify(&path).unwrap();
+    assert_eq!(Scanner::verify_prefix(&first_tail).unwrap(), whole);
+
+    let empty_path = dir.path().join("genesis.log");
+    drop(Writer::open(&empty_path).unwrap());
+    let genesis = Scanner::verify(&empty_path).unwrap();
+    assert_eq!(genesis.physical_tail, 5);
+    assert_eq!(genesis.last_sequence, None);
+    assert_eq!(genesis.last_hash, blake3::Hash::from_bytes([0; 32]));
+    assert_eq!(Scanner::verify_prefix(&genesis).unwrap(), genesis);
+
+    {
+        let mut writer = Writer::open(&empty_path).unwrap();
+        writer
+            .append(make_envelope(b"after genesis".to_vec()))
+            .unwrap();
+        writer.sync().unwrap();
+    }
+    assert_eq!(
+        Scanner::verify_prefix(&genesis).unwrap(),
+        Scanner::verify(&empty_path).unwrap()
+    );
+}
+
+#[test]
+fn verify_prefix_classifies_boundary_mismatches_after_a_clean_end() {
+    const MISMATCH: &str = "event log does not match the recorded migration boundary";
+    const SHORTER: &str = "event log is shorter than the recorded migration boundary";
+
+    let dir = tmp_dir();
+    let path = dir.path().join("prefix-mismatch.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"frame".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let good = Scanner::verify(&path).unwrap();
+
+    let cases = [
+        (
+            "inside frame",
+            LogTailBinding {
+                physical_tail: 6,
+                ..good.clone()
+            },
+            MISMATCH,
+        ),
+        (
+            "below header",
+            LogTailBinding {
+                physical_tail: 3,
+                last_sequence: None,
+                last_hash: blake3::Hash::from_bytes([0; 32]),
+                ..good.clone()
+            },
+            MISMATCH,
+        ),
+        (
+            "beyond end",
+            LogTailBinding {
+                physical_tail: good.physical_tail + 1,
+                ..good.clone()
+            },
+            SHORTER,
+        ),
+        (
+            "wrong hash",
+            LogTailBinding {
+                last_hash: blake3::Hash::from_bytes([0xff; 32]),
+                ..good.clone()
+            },
+            MISMATCH,
+        ),
+        (
+            "wrong sequence",
+            LogTailBinding {
+                last_sequence: Some(EventSeq(99)),
+                ..good.clone()
+            },
+            MISMATCH,
+        ),
+    ];
+
+    for (name, binding, message) in cases {
+        let result = Scanner::verify_prefix(&binding);
+        if let Err(LogError::Io(error)) = &result {
+            assert_eq!(error.to_string(), message, "case {name}");
+        }
+        assert_prefix_boundary_error(result, message);
+    }
+}
+
+#[test]
+fn verify_prefix_reports_incomplete_frames_on_either_side_of_boundary() {
+    let dir = tmp_dir();
+
+    let cuts_prefix_path = dir.path().join("cuts-prefix.log");
+    {
+        let mut writer = Writer::open(&cuts_prefix_path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let whole_binding = Scanner::verify(&cuts_prefix_path).unwrap();
+    let bytes = std::fs::read(&cuts_prefix_path).unwrap();
+    std::fs::write(&cuts_prefix_path, &bytes[..bytes.len() - 1]).unwrap();
+    assert!(matches!(
+        Scanner::verify_prefix(&whole_binding),
+        Err(LogError::Truncated { .. })
+    ));
+
+    let after_prefix_path = dir.path().join("after-prefix.log");
+    {
+        let mut writer = Writer::open(&after_prefix_path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let first_binding = Scanner::verify(&after_prefix_path).unwrap();
+    {
+        let mut writer = Writer::open(&after_prefix_path).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let bytes = std::fs::read(&after_prefix_path).unwrap();
+    std::fs::write(&after_prefix_path, &bytes[..bytes.len() - 1]).unwrap();
+    assert!(matches!(
+        Scanner::verify_prefix(&first_binding),
+        Err(LogError::Truncated { .. })
+    ));
+}
+
+#[test]
+fn verify_prefix_scans_the_suffix_before_applying_boundary_verdict() {
+    let dir = tmp_dir();
+    let path = dir.path().join("suffix-chain-break.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"prefix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let prefix = Scanner::verify(&path).unwrap();
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"suffix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    rewrite_frame_json(&path, prefix.physical_tail, |json| {
+        json["prev_hash"] = serde_json::Value::String("00".repeat(32));
+    });
+
+    assert!(matches!(
+        Scanner::verify_prefix(&prefix),
+        Err(LogError::ChainBroken {
+            at_seq: EventSeq(1),
+            ..
+        })
+    ));
+
+    let mut wrong_prefix = prefix;
+    wrong_prefix.last_hash = blake3::Hash::from_bytes([0xff; 32]);
+    assert!(matches!(
+        Scanner::verify_prefix(&wrong_prefix),
+        Err(LogError::ChainBroken {
+            at_seq: EventSeq(1),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn verify_prefix_never_accepts_corruption_inside_the_prefix() {
+    let dir = tmp_dir();
+    let path = dir.path().join("corrupt-prefix.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"prefix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let binding = Scanner::verify(&path).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[9] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+
+    assert!(matches!(
+        Scanner::verify_prefix(&binding),
+        Err(LogError::CrcMismatch {
+            at_seq: EventSeq(0),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn verify_prefix_returns_a_canonical_path_for_noncanonical_input() {
+    let dir = tmp_dir();
+    let path = dir.path().join("canonical-prefix.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"frame".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let expected = Scanner::verify(&path).unwrap();
+    let mut noncanonical_binding = expected.clone();
+    noncanonical_binding.path = dir.path().join(".").join("canonical-prefix.log");
+
+    let actual = Scanner::verify_prefix(&noncanonical_binding).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.path, std::fs::canonicalize(path).unwrap());
+}
+
+#[test]
+fn open_verified_matches_open_and_reports_verified_frames() {
+    let dir = tmp_dir();
+    let ordinary_path = dir.path().join("ordinary.log");
+    let verified_path = dir.path().join("verified.log");
+    for path in [&ordinary_path, &verified_path] {
+        let mut writer = Writer::open(path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+
+    let expected_binding = Scanner::verify(&verified_path).unwrap();
+    let expected_frames = Reader::replay_with_offsets(&verified_path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut observed = Vec::new();
+    let (mut verified, binding) = Writer::open_verified(
+        &verified_path,
+        Some(&expected_binding),
+        &mut |offset, envelope| observed.push((offset, envelope.seq, envelope.payload.clone())),
+    )
+    .unwrap();
+    assert_eq!(binding, expected_binding);
+    assert_eq!(
+        observed,
+        expected_frames
+            .iter()
+            .map(|(offset, sequence, envelope)| (*offset, *sequence, envelope.payload.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    let mut ordinary = Writer::open(&ordinary_path).unwrap();
+    let ordinary_receipt = ordinary
+        .append_synced(make_envelope(b"third".to_vec()))
+        .unwrap();
+    let verified_receipt = verified
+        .append_synced(make_envelope(b"third".to_vec()))
+        .unwrap();
+    assert_eq!(verified_receipt, ordinary_receipt);
+    drop(ordinary);
+    drop(verified);
+
+    let ordinary_tail = Scanner::verify(&ordinary_path).unwrap();
+    let verified_tail = Scanner::verify(&verified_path).unwrap();
+    assert_eq!(verified_tail.physical_tail, ordinary_tail.physical_tail);
+    assert_eq!(verified_tail.last_sequence, ordinary_tail.last_sequence);
+    assert_eq!(verified_tail.last_hash, ordinary_tail.last_hash);
+}
+
+#[test]
+fn open_verified_repairs_only_an_incomplete_tail_after_a_matching_prefix() {
+    let dir = tmp_dir();
+    let path = dir.path().join("repair-after-prefix.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"prefix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let prefix = Scanner::verify(&path).unwrap();
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"partial".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+
+    let (mut writer, repaired) =
+        Writer::open_verified(&path, Some(&prefix), &mut |_, _| {}).unwrap();
+    assert_eq!(repaired, prefix);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        prefix.physical_tail
+    );
+    let receipt = writer
+        .append_synced(make_envelope(b"replacement".to_vec()))
+        .unwrap();
+    assert_eq!(receipt.sequence, EventSeq(1));
+    drop(writer);
+
+    let final_binding = Scanner::verify(&path).unwrap();
+    assert_eq!(final_binding.last_sequence, Some(receipt.sequence));
+    assert_eq!(final_binding.last_hash, receipt.this_hash);
+}
+
+#[test]
+fn open_verified_refuses_incomplete_or_wrong_prefix_without_repair() {
+    let dir = tmp_dir();
+    let cuts_prefix_path = dir.path().join("open-cuts-prefix.log");
+    {
+        let mut writer = Writer::open(&cuts_prefix_path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let full_binding = Scanner::verify(&cuts_prefix_path).unwrap();
+    let bytes = std::fs::read(&cuts_prefix_path).unwrap();
+    let truncated = bytes[..bytes.len() - 1].to_vec();
+    std::fs::write(&cuts_prefix_path, &truncated).unwrap();
+    assert!(matches!(
+        Writer::open_verified(&cuts_prefix_path, Some(&full_binding), &mut |_, _| {}),
+        Err(LogError::Truncated { .. })
+    ));
+    assert_eq!(std::fs::read(&cuts_prefix_path).unwrap(), truncated);
+
+    let wrong_prefix_path = dir.path().join("open-wrong-prefix.log");
+    {
+        let mut writer = Writer::open(&wrong_prefix_path).unwrap();
+        writer.append(make_envelope(b"prefix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let mut wrong_prefix = Scanner::verify(&wrong_prefix_path).unwrap();
+    {
+        let mut writer = Writer::open(&wrong_prefix_path).unwrap();
+        writer.append(make_envelope(b"partial".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let bytes = std::fs::read(&wrong_prefix_path).unwrap();
+    let incomplete = bytes[..bytes.len() - 1].to_vec();
+    std::fs::write(&wrong_prefix_path, &incomplete).unwrap();
+    wrong_prefix.last_hash = blake3::Hash::from_bytes([0xff; 32]);
+    // A torn tail with an unmatched prefix is reported as `Scanner::verify_prefix` reports it.
+    assert!(matches!(
+        Scanner::verify_prefix(&wrong_prefix),
+        Err(LogError::Truncated { .. })
+    ));
+    assert!(matches!(
+        Writer::open_verified(&wrong_prefix_path, Some(&wrong_prefix), &mut |_, _| {}),
+        Err(LogError::Truncated { .. })
+    ));
+    assert_eq!(std::fs::read(&wrong_prefix_path).unwrap(), incomplete);
+
+    // A binding for a different file never matches, even with byte-identical contents.
+    let own_path = dir.path().join("open-own-file.log");
+    let twin_path = dir.path().join("open-twin-file.log");
+    for path in [&own_path, &twin_path] {
+        let mut writer = Writer::open(path).unwrap();
+        writer.append(make_envelope(b"same".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let twin_binding = Scanner::verify(&twin_path).unwrap();
+    assert_eq!(
+        Scanner::verify(&own_path).unwrap().last_hash,
+        twin_binding.last_hash
+    );
+    match Writer::open_verified(&own_path, Some(&twin_binding), &mut |_, _| {}) {
+        Err(LogError::Io(error)) => assert_eq!(
+            error.to_string(),
+            "event log does not match the recorded migration boundary"
+        ),
+        Err(error) => panic!("expected a file-identity mismatch, got {error}"),
+        Ok(_) => panic!("a binding for another file was accepted"),
+    }
+    // The stored-binding entry point applies the same identity rule: a foreign binding whose
+    // offset, sequence, and hash equal this file's verified tail must not authorize the repair
+    // of a torn frame after that tail.
+    {
+        let mut writer = Writer::open(&own_path).unwrap();
+        writer.append(make_envelope(b"torn".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let own_bytes = std::fs::read(&own_path).unwrap();
+    let torn = own_bytes[..own_bytes.len() - 1].to_vec();
+    std::fs::write(&own_path, &torn).unwrap();
+    let own_tail = Scanner::inspect(&own_path).unwrap().verified_tail;
+    assert_eq!(own_tail.physical_tail, twin_binding.physical_tail);
+    assert_eq!(own_tail.last_sequence, twin_binding.last_sequence);
+    assert_eq!(own_tail.last_hash, twin_binding.last_hash);
+    assert_ne!(own_tail.path, twin_binding.path);
+    match Writer::open_with_expected_tail(&own_path, &twin_binding) {
+        Err(LogError::Io(error)) => assert_eq!(
+            error.to_string(),
+            "expected tail binding names a different event log"
+        ),
+        Err(error) => panic!("expected a file-identity mismatch, got {error}"),
+        Ok(_) => panic!("a binding for another file was accepted"),
+    }
+    assert_eq!(
+        std::fs::read(&own_path).unwrap(),
+        torn,
+        "a foreign binding must not authorize repair"
+    );
+}
+
+#[test]
+fn open_verified_obeys_lock_and_existing_file_contract() {
+    let dir = tmp_dir();
+    let locked_path = dir.path().join("open-verified-locked.log");
+    let held = Writer::open(&locked_path).unwrap();
+    assert!(matches!(
+        Writer::open_verified(&locked_path, None, &mut |_, _| {}),
+        Err(LogError::Locked { .. })
+    ));
+    drop(held);
+
+    let seed_path = dir.path().join("seed.log");
+    drop(Writer::open(&seed_path).unwrap());
+    let expected = Scanner::verify(&seed_path).unwrap();
+
+    let missing_path = dir.path().join("missing.log");
+    assert!(matches!(
+        Writer::open_verified(&missing_path, Some(&expected), &mut |_, _| {}),
+        Err(LogError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(!missing_path.exists());
+
+    let empty_path = dir.path().join("empty.log");
+    std::fs::File::create(&empty_path).unwrap();
+    assert!(matches!(
+        Writer::open_verified(&empty_path, Some(&expected), &mut |_, _| {}),
+        Err(LogError::BadHeader { .. })
+    ));
+    assert_eq!(std::fs::metadata(&empty_path).unwrap().len(), 0);
+
+    let (empty_writer, empty_binding) =
+        Writer::open_verified(&empty_path, None, &mut |_, _| {}).unwrap();
+    assert_eq!(empty_binding, Scanner::verify(&empty_path).unwrap());
+    assert_eq!(empty_binding.physical_tail, 5);
+    drop(empty_writer);
+}
+
+#[test]
+fn writer_verified_tail_matches_scanner_after_appends_and_on_empty_log() {
+    let dir = tmp_dir();
+    let path = dir.path().join("writer-tail.log");
+    let mut writer = Writer::open(&path).unwrap();
+
+    assert_eq!(
+        writer.verified_tail().unwrap(),
+        Scanner::verify(&path).unwrap()
+    );
+    writer.append(make_envelope(b"first".to_vec())).unwrap();
+    writer.append(make_envelope(b"second".to_vec())).unwrap();
+    assert_eq!(
+        writer.verified_tail().unwrap(),
+        Scanner::verify(&path).unwrap()
+    );
+}
+
+#[test]
+fn writer_verified_tail_refuses_external_growth_or_truncation() {
+    let dir = tmp_dir();
+    let growth_path = dir.path().join("external-growth.log");
+    let mut growth_writer = Writer::open(&growth_path).unwrap();
+    growth_writer
+        .append(make_envelope(b"frame".to_vec()))
+        .unwrap();
+    let growth_tail = growth_writer.verified_tail().unwrap();
+    let mut external = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&growth_path)
+        .unwrap();
+    external.write_all(&[0xff]).unwrap();
+    external.sync_all().unwrap();
+    assert!(matches!(
+        growth_writer.verified_tail(),
+        Err(LogError::ExpectedTailMismatch {
+            expected_tail,
+            actual_tail,
+            ..
+        }) if expected_tail == growth_tail.physical_tail
+            && actual_tail == growth_tail.physical_tail + 1
+    ));
+    drop(external);
+    drop(growth_writer);
+
+    let truncation_path = dir.path().join("external-truncation.log");
+    let mut truncation_writer = Writer::open(&truncation_path).unwrap();
+    truncation_writer
+        .append(make_envelope(b"frame".to_vec()))
+        .unwrap();
+    let truncation_tail = truncation_writer.verified_tail().unwrap();
+    let external = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&truncation_path)
+        .unwrap();
+    external.set_len(truncation_tail.physical_tail - 1).unwrap();
+    external.sync_all().unwrap();
+    assert!(matches!(
+        truncation_writer.verified_tail(),
+        Err(LogError::ExpectedTailMismatch {
+            expected_tail,
+            actual_tail,
+            ..
+        }) if expected_tail == truncation_tail.physical_tail
+            && actual_tail == truncation_tail.physical_tail - 1
+    ));
 }
 
 // ── Tail test ─────────────────────────────────────────────────────────────────

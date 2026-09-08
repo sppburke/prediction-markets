@@ -60,8 +60,8 @@ use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
-    SupabaseStateClient, reconcile_active_financial_frames, supabase_authoritative_boot,
-    supabase_authoritative_boot_observed,
+    SourceEvidence, SupabaseStateClient, reconcile_active_financial_frames,
+    supabase_authoritative_boot, supabase_authoritative_boot_observed,
 };
 use pe_service::supervisor::{
     SHUTDOWN_DEADLINE, ShutdownController, ShutdownPhase, TaskEvent, TaskExit, TaskFailure,
@@ -289,6 +289,28 @@ async fn main() -> Result<()> {
         "active paper risk causes rebuilt from the verified prefix"
     );
 
+    // #572: an installed generation's source log is verified once, under the writer lock, and
+    // every boot projection below is built from that walk. Any other migration phase keeps the
+    // established per-owner scans.
+    let migration_paths = PaperMigrationPaths {
+        fixed_main: cfg.paper_state_db_path.clone(),
+        source_log: cfg.source_event_log_path.clone(),
+        paper_log: cfg.event_log_path.clone(),
+        live_journal: live_journal_path(&cfg.event_log_path),
+        legacy_history: cfg.legacy_wallet_history_path.clone(),
+        binary_identity: build_identity().to_owned(),
+    };
+    let (mut source_log_boot, mut boot_sink, walked_source_binding) =
+        match pe_service::source_log_boot::SourceLogBoot::open(
+            &migration_paths,
+            financial_start.is_some(),
+        )
+        .context("walk the installed source event log")?
+        {
+            Some(opened) => (Some(opened.boot), Some(opened.sink), Some(opened.binding)),
+            None => (None, None, None),
+        };
+
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
     let starting_bankroll = financial_start_record
@@ -389,9 +411,12 @@ async fn main() -> Result<()> {
         let era = financial_era
             .as_ref()
             .context("QualificationStarted is missing its financial era")?;
-        let replayed = replay_membership(era, start_batch, &cfg.source_event_log_path)
-            .context("replay Start-bound structural membership")?
-            .context("QualificationStarted is missing from its financial era")?;
+        let replayed = match source_log_boot.as_ref() {
+            Some(boot) => boot.replay_membership(era, start_batch),
+            None => replay_membership(era, start_batch, &cfg.source_event_log_path),
+        }
+        .context("replay Start-bound structural membership")?
+        .context("QualificationStarted is missing from its financial era")?;
         let restored = replayed
             .watchlist
             .entries
@@ -464,17 +489,16 @@ async fn main() -> Result<()> {
         validate_initial_configuration(&live_runtime_config.snapshot())
             .context("validate #544 activation configuration before migration")?;
     }
-    let mut migration_boot = PaperMigrationBoot::prepare(
-        PaperMigrationPaths {
-            fixed_main: cfg.paper_state_db_path.clone(),
-            source_log: cfg.source_event_log_path.clone(),
-            paper_log: cfg.event_log_path.clone(),
-            live_journal: live_journal_path(&cfg.event_log_path),
-            legacy_history: cfg.legacy_wallet_history_path.clone(),
-            binary_identity: build_identity().to_owned(),
-        },
-        OffsetDateTime::now_utc().unix_timestamp(),
-    )
+    let mut migration_boot = match source_log_boot.as_ref() {
+        Some(boot) => boot.prepare_installed(
+            migration_paths.clone(),
+            OffsetDateTime::now_utc().unix_timestamp(),
+        ),
+        None => PaperMigrationBoot::prepare(
+            migration_paths.clone(),
+            OffsetDateTime::now_utc().unix_timestamp(),
+        ),
+    }
     .context("prepare or resume paper-state v2 migration")?;
 
     // Crash-safe paper-state mirror. During the one-time migration every boot
@@ -588,11 +612,16 @@ async fn main() -> Result<()> {
         let authority = supabase_state.as_ref().context(
             "active financial era requires the authoritative client before paper writer boot",
         )?;
+        let boot_receipts = source_log_boot.as_ref().map(|boot| boot.receipt_index());
+        let source_evidence = match boot_receipts.as_ref() {
+            Some(index) => SourceEvidence::Index(index),
+            None => SourceEvidence::Log(&cfg.source_event_log_path),
+        };
         let recovered = reconcile_active_financial_frames(
             authority,
             &paper_state,
             &cfg.event_log_path,
-            &cfg.source_event_log_path,
+            source_evidence,
             &mut paper_writer,
         )
         .await
@@ -641,8 +670,11 @@ async fn main() -> Result<()> {
     // Validate the initial evaluation universe before any producer can observe it.
     // The installed migration record names the immutable version-two source-log
     // generation to which every accepted bracket is bound.
-    let source_binding = Scanner::verify(&cfg.source_event_log_path)
-        .context("verify source-log generation before position bracket")?;
+    let source_binding = match walked_source_binding {
+        Some(binding) => binding,
+        None => Scanner::verify(&cfg.source_event_log_path)
+            .context("verify source-log generation before position bracket")?,
+    };
     let source_log_generation = serde_json::to_string(&serde_json::json!({
         "path": source_binding.path,
         "physical_tail": source_binding.physical_tail,
@@ -656,10 +688,11 @@ async fn main() -> Result<()> {
         ReqwestFetcher::new(reqwest::Client::new())
             .with_rate_limit_retry_max_secs(RECONCILIATION_RATE_LIMIT_RETRY_SECS),
     );
-    let boot_source_log = Arc::new(tokio::sync::Mutex::new(
-        pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+    let boot_source_log = Arc::new(tokio::sync::Mutex::new(match boot_sink.take() {
+        Some(sink) => sink,
+        None => pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
             .context("open boot source-log recorder")?,
-    ));
+    }));
     let asset_identity = Arc::new(AssetIdentityResolver::new(
         position_fetcher.clone(),
         cfg.gamma_base_url.clone(),
@@ -718,7 +751,24 @@ async fn main() -> Result<()> {
     let resolution_source_log = source_log.clone();
     let orchestrator_source_log = source_log.clone();
     asset_identity.activate_runtime(source_log.clone()).await;
-    drop(boot_source_log);
+    // The boot recorder is unique again: walk the frames this boot appended under the same lock.
+    let mut boot_sink = Some(
+        Arc::try_unwrap(boot_source_log)
+            .map_err(|_| {
+                anyhow::anyhow!("boot source-log recorder retained a handle after the anchor walk")
+            })?
+            .into_inner(),
+    );
+    let walked_runtime_binding = match (source_log_boot.as_mut(), boot_sink.as_mut()) {
+        (Some(boot), Some(sink)) => Some(
+            boot.extend(sink)
+                .context("walk the source-log frames appended during boot")?,
+        ),
+        _ => {
+            boot_sink = None;
+            None
+        }
+    };
 
     let complete_history = paper_state
         .complete_history_wallets()
@@ -797,8 +847,11 @@ async fn main() -> Result<()> {
         info!("boot anchors prepared; exiting before runtime writers and listeners");
         return Ok(());
     }
-    let runtime_source_binding = Scanner::verify(&cfg.source_event_log_path)
-        .context("verify current source-log generation after paper activation")?;
+    let runtime_source_binding = match walked_runtime_binding {
+        Some(binding) => binding,
+        None => Scanner::verify(&cfg.source_event_log_path)
+            .context("verify current source-log generation after paper activation")?,
+    };
     let runtime_source_generation = serde_json::to_string(&serde_json::json!({
         "path": runtime_source_binding.path,
         "physical_tail": runtime_source_binding.physical_tail,
@@ -852,9 +905,11 @@ async fn main() -> Result<()> {
 
     // Bounded service-side activity-bucket/admission control channel (#544).
     let (control_tx, control_rx) = mpsc::channel(2);
-    let source_receipts =
-        pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
-            .context("build verified source receipt index")?;
+    let source_receipts = match source_log_boot.as_ref() {
+        Some(boot) => boot.receipt_index(),
+        None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
+            .context("build verified source receipt index")?,
+    };
     let risk_halt_release = financial_start.is_some().then(|| {
         RiskHaltReleaseHandle::new(
             cfg.event_log_path.clone(),
@@ -879,17 +934,25 @@ async fn main() -> Result<()> {
     // Rebuild durable reader obligations before either source producer starts.
     // The existing source log plus aggregate records are sufficient, so #544
     // adds no second database or obligation table.
-    let mut obligations =
-        rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
-            .context("rebuild durable activity reconciliation obligations")?;
-    if financial_start.is_some() {
-        recover_daily_boundary(
-            &cfg.source_event_log_path,
-            &cfg.event_log_path,
-            &mut obligations,
-        )
-        .context("recover causal daily boundary")?;
-    }
+    let obligations = match source_log_boot.as_mut() {
+        Some(boot) => boot
+            .obligations(&paper_state, &cfg.event_log_path)
+            .context("rebuild activity obligations from the boot walk")?,
+        None => {
+            let mut obligations =
+                rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
+                    .context("rebuild durable activity reconciliation obligations")?;
+            if financial_start.is_some() {
+                recover_daily_boundary(
+                    &cfg.source_event_log_path,
+                    &cfg.event_log_path,
+                    &mut obligations,
+                )
+                .context("recover causal daily boundary")?;
+            }
+            obligations
+        }
+    };
     info!(
         obligations = obligations.len(),
         "activity obligations rebuilt"
@@ -897,13 +960,23 @@ async fn main() -> Result<()> {
 
     // One bounded single-writer coordinator owns both websocket rows and every
     // fixed-end public page. Append acknowledgement precedes all triggers/apply.
-    let sink = pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
-        .with_context(|| {
-            format!(
-                "open source event log {}",
-                cfg.source_event_log_path.display()
-            )
-        })?;
+    let sink = match (source_log_boot.as_ref(), boot_sink.take()) {
+        (Some(boot), Some(mut sink)) => {
+            boot.verify_handoff(&mut sink)
+                .context("hand the walked source log to the runtime coordinator")?;
+            sink
+        }
+        (None, None) => {
+            pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+                .with_context(|| {
+                    format!(
+                        "open source event log {}",
+                        cfg.source_event_log_path.display()
+                    )
+                })?
+        }
+        _ => anyhow::bail!("boot source-log recorder and walk state disagree at the handoff"),
+    };
     let (trigger_tx, trigger_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
     let mut start = producer_start_rx.clone();
     let activity_watchlist = live_watchlist.clone();

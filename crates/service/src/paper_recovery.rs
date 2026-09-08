@@ -807,6 +807,33 @@ pub fn replay_membership(
     start_batch: Watchlist,
     source_log: &Path,
 ) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
+    replay_membership_from(
+        era,
+        start_batch,
+        MembershipReplaySource::SourceLog(source_log),
+    )
+}
+
+/// Reconstruct membership from a process-wide source receipt index that boot already verified.
+pub(crate) fn replay_membership_with_source(
+    era: &PaperEra,
+    start_batch: Watchlist,
+    source: &crate::qualification::PublishedMembershipSource,
+) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
+    replay_membership_from(era, start_batch, MembershipReplaySource::Published(source))
+}
+
+#[derive(Clone, Copy)]
+enum MembershipReplaySource<'a> {
+    SourceLog(&'a Path),
+    Published(&'a crate::qualification::PublishedMembershipSource),
+}
+
+fn replay_membership_from(
+    era: &PaperEra,
+    start_batch: Watchlist,
+    source: MembershipReplaySource<'_>,
+) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
     let Some((_, start)) = &era.start else {
         return Ok(None);
     };
@@ -847,11 +874,18 @@ pub fn replay_membership(
             last_ranking_batch_id,
         }));
     };
-    let membership_source = crate::qualification::PublishedMembershipSource::scan(source_log)
-        .map_err(|source| MembershipReplayError::Evidence {
-            sequence: first_membership_sequence,
-            source,
-        })?;
+    let scanned_source;
+    let membership_source = match source {
+        MembershipReplaySource::SourceLog(source_log) => {
+            scanned_source = crate::qualification::PublishedMembershipSource::scan(source_log)
+                .map_err(|source| MembershipReplayError::Evidence {
+                    sequence: first_membership_sequence,
+                    source,
+                })?;
+            &scanned_source
+        }
+        MembershipReplaySource::Published(source) => source,
+    };
 
     for frame in &era.frames {
         let PaperLogFrame::Record(
@@ -886,7 +920,7 @@ pub fn replay_membership(
 
         let replacements = crate::qualification::replay_published_membership_change(
             record,
-            &membership_source,
+            membership_source,
             &present,
         )
         .map_err(|source| MembershipReplayError::Evidence {
@@ -1274,6 +1308,20 @@ mod paper_log_tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    /// Bytes read through system calls by this process (Linux `/proc/self/io`, page-cache hits
+    /// included), so a whole-log pass shows as about the file's length.
+    #[cfg(target_os = "linux")]
+    fn read_chars() -> u64 {
+        std::fs::read_to_string("/proc/self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
     use crate::bucket_commit::{DecisionContinuationFacts, FrozenDecisionBasis};
     use crate::clob_book::FixtureClobBookFetcher;
     use crate::entry_gate::CopyEntryGateConfig;
@@ -1964,21 +2012,62 @@ mod paper_log_tests {
             .into_record(),
         );
         drop(paper_writer);
+        // Filler after the artifacts makes a hidden whole-log pass measurable (#572): exact
+        // indexed reads touch only the artifact frames.
+        for index in 0..20_000_i64 {
+            let at = OffsetDateTime::from_unix_timestamp(1_700_000_000 + index).unwrap();
+            source_writer
+                .append(pe_event_log::EnvelopeIn {
+                    source_id: SourceId("membership-filler".to_owned()),
+                    schema_version: 1,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: pe_event_log::ContentType::Json,
+                    payload: format!(r#"{{"filler":{index},"pad":"{:0>96}"}}"#, index).into_bytes(),
+                })
+                .unwrap();
+        }
+        source_writer.sync().unwrap();
         drop(source_writer);
+        let source_length = std::fs::metadata(&source_path).unwrap().len();
+        assert!(source_length > 1_000_000, "{source_length}");
 
         let era = paper_era(scan_paper_log(&paper_path).unwrap());
-        let replayed = replay_membership(
-            &era,
-            watchlist(vec![
-                watchlist_entry(first, 600),
-                watchlist_entry(second, 500),
-                watchlist_entry(third, 400),
-                watchlist_entry(fourth, 300),
-            ]),
-            &source_path,
-        )
-        .unwrap()
-        .unwrap();
+        let initial_entries = vec![
+            watchlist_entry(first, 600),
+            watchlist_entry(second, 500),
+            watchlist_entry(third, 400),
+            watchlist_entry(fourth, 300),
+        ];
+        let replayed = replay_membership(&era, watchlist(initial_entries.clone()), &source_path)
+            .unwrap()
+            .unwrap();
+        let indexed_source = crate::qualification::PublishedMembershipSource::from_index(
+            crate::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap(),
+        );
+        #[cfg(target_os = "linux")]
+        let before = read_chars();
+        let indexed =
+            replay_membership_with_source(&era, watchlist(initial_entries), &indexed_source)
+                .unwrap()
+                .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let read = read_chars() - before;
+            assert!(
+                read < source_length / 4,
+                "index-backed membership replay must read only its artifact frames: read {read} of {source_length} bytes"
+            );
+        }
+        assert_eq!(
+            indexed.last_ranking_batch_id,
+            replayed.last_ranking_batch_id
+        );
+        assert_eq!(
+            serde_json::to_vec(&indexed.watchlist.entries).unwrap(),
+            serde_json::to_vec(&replayed.watchlist.entries).unwrap()
+        );
         assert_eq!(replayed.last_ranking_batch_id, 8);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, first);

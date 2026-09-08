@@ -89,8 +89,8 @@ use crate::paper_recovery::{
     SealedMembershipEvidence, TailBinding, active_risk_halts, paper_era, scan_paper_log,
 };
 use crate::risk_inputs::{
-    PaperExposureBase, RiskInputsUnavailable, apply_global_risk_halts, build_paper_risk_base,
-    build_paper_risk_snapshot_from_source_receipts, historical_mark_price,
+    PaperExposureBase, RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
+    build_paper_risk_base, build_paper_risk_snapshot_from_source_receipts, historical_mark_price,
     paper_prefix_at_financial_prefix,
 };
 use crate::runtime_config::{
@@ -419,8 +419,8 @@ fn write_report(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct SourceObservation {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceObservation {
     receipt: AppendReceipt,
     observed_at: SourceTimestamp,
     received_at: ReceivedAt,
@@ -652,6 +652,8 @@ async fn verify_qualification(
     }
 
     let source_observations = source_observations(&options.source_log, &seal.source_prefix)?;
+    let membership_source =
+        PublishedMembershipSource::scan_prefix(&options.source_log, &seal.source_prefix)?;
     let state = PaperStateDb::open_read_only(&options.paper_state)?;
     verify_initial_membership(&start)?;
     let decisions = decision_rows_from_source_observations(
@@ -955,7 +957,7 @@ async fn verify_qualification(
                     *ranking_batch_id,
                     evidence,
                     &MembershipEvidenceContext {
-                        source: &source_observations,
+                        source: &membership_source,
                         current_membership: &membership,
                     },
                 )?;
@@ -2257,7 +2259,7 @@ fn verify_decision_configurations(
 }
 
 struct MembershipEvidenceContext<'a> {
-    source: &'a BTreeMap<u64, SourceObservation>,
+    source: &'a PublishedMembershipSource,
     current_membership: &'a HashSet<pe_core_types::WalletAddress>,
 }
 
@@ -2457,12 +2459,12 @@ fn verify_membership_change_evidence(
 }
 
 fn membership_artifact<T: serde::de::DeserializeOwned>(
-    source: &BTreeMap<u64, SourceObservation>,
+    source: &PublishedMembershipSource,
     receipt: AppendReceipt,
     expected_source_id: &str,
 ) -> Result<T, QualificationError> {
     let observation = source
-        .get(&receipt.sequence.0)
+        .get(receipt.sequence.0)?
         .filter(|observation| observation.receipt == receipt)
         .ok_or_else(|| {
             QualificationError::InsufficientEvidence(
@@ -2518,7 +2520,7 @@ fn verify_ranked_change(
 fn verify_admission_receipts(
     added: &[pe_core_types::WalletAddress],
     receipts: &[MembershipAdmissionReceipt],
-    source: &BTreeMap<u64, SourceObservation>,
+    source: &PublishedMembershipSource,
 ) -> Result<(), QualificationError> {
     let mut proved = HashSet::new();
     for proof_receipt in receipts {
@@ -2585,17 +2587,100 @@ fn knockout_record_reason(
         .or_else(|| evidence.first().map(|eviction| eviction.reason))
 }
 
-/// Immutable source-log view shared by every membership record during one boot replay.
+#[derive(Clone, Copy)]
+enum MembershipSourceBoundary {
+    CompleteIndex,
+    SealedPrefix(Option<EventSeq>),
+}
+
+/// Immutable source-log view shared by every membership record during one boot replay (#572).
 pub(crate) struct PublishedMembershipSource {
-    observations: BTreeMap<u64, SourceObservation>,
+    index: SourceReceiptIndex,
+    boundary: MembershipSourceBoundary,
 }
 
 impl PublishedMembershipSource {
+    pub(crate) fn from_index(index: SourceReceiptIndex) -> Self {
+        Self {
+            index,
+            boundary: MembershipSourceBoundary::CompleteIndex,
+        }
+    }
+
+    pub(crate) fn get(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<SourceObservation>, QualificationError> {
+        match self.boundary {
+            MembershipSourceBoundary::SealedPrefix(None) => return Ok(None),
+            MembershipSourceBoundary::SealedPrefix(Some(last_sequence))
+                if sequence > last_sequence.0 =>
+            {
+                return Ok(None);
+            }
+            MembershipSourceBoundary::CompleteIndex
+            | MembershipSourceBoundary::SealedPrefix(Some(_)) => {}
+        }
+        let Some((receipt, received_unix_ms)) =
+            self.index.receipt_at(EventSeq(sequence)).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "MembershipChanged source receipt lookup failed: {error}"
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
+        let envelope = self.index.source_envelope(receipt).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "MembershipChanged source receipt could not be read: {error}"
+            ))
+        })?;
+        Ok(Some(SourceObservation {
+            receipt,
+            observed_at: envelope.observed_at,
+            received_at: envelope.received_at,
+            received_unix_ms,
+            source_id: envelope.source_id.0,
+            schema_version: envelope.schema_version,
+            parser_version: envelope.parser_version,
+            content_type: envelope.content_type,
+            payload: envelope.payload,
+        }))
+    }
+
     pub(crate) fn scan(source_log: &Path) -> Result<Self, QualificationError> {
-        let verified_prefix = TailBinding::from(&Scanner::verify(source_log)?);
-        Ok(Self {
-            observations: source_observations(source_log, &verified_prefix)?,
-        })
+        let index = SourceReceiptIndex::replay(source_log).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "MembershipChanged source index replay failed: {error}"
+            ))
+        })?;
+        Ok(Self::from_index(index))
+    }
+
+    fn scan_prefix(source_log: &Path, prefix: &TailBinding) -> Result<Self, QualificationError> {
+        Self::scan(source_log)?.through_prefix(prefix)
+    }
+
+    fn through_prefix(mut self, prefix: &TailBinding) -> Result<Self, QualificationError> {
+        if let Some(last_sequence) = prefix.last_sequence {
+            let expected_hash = tail_hash(prefix)?;
+            if self
+                .index
+                .receipt_at(last_sequence)
+                .map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "MembershipChanged source receipt lookup failed: {error}"
+                    ))
+                })?
+                .is_none_or(|(receipt, _)| receipt.this_hash != expected_hash)
+            {
+                return insufficient(
+                    "source observations do not reach the sealed sequence/hash prefix",
+                );
+            }
+        }
+        self.boundary = MembershipSourceBoundary::SealedPrefix(prefix.last_sequence);
+        Ok(self)
     }
 }
 
@@ -2626,7 +2711,7 @@ pub(crate) fn replay_published_membership_change(
         *ranking_batch_id,
         evidence,
         &MembershipEvidenceContext {
-            source: &source.observations,
+            source,
             current_membership,
         },
     )
@@ -8529,6 +8614,9 @@ mod tests {
     /// PASS: an arbitrary nonempty object is not typed membership evidence.
     #[test]
     fn arbitrary_membership_evidence_is_insufficient() {
+        let source = PublishedMembershipSource::from_index(
+            crate::risk_inputs::SourceReceiptIndex::default(),
+        );
         assert!(matches!(
             verify_membership_change_evidence(
                 MembershipReason::FullRerank,
@@ -8538,7 +8626,7 @@ mod tests {
                 Some(7),
                 &serde_json::json!({"x": 1}),
                 &MembershipEvidenceContext {
-                    source: &BTreeMap::new(),
+                    source: &source,
                     current_membership: &HashSet::new(),
                 },
             ),
@@ -8598,29 +8686,30 @@ mod tests {
             fills,
             settlements,
         };
-        let observation = |sequence: u64, artifact: &KnockoutCausalArtifact| {
-            let payload = serde_json::to_vec(artifact).unwrap();
-            let receipt = AppendReceipt {
-                sequence: EventSeq(sequence),
-                this_hash: blake3::hash(&payload),
-            };
-            let at = OffsetDateTime::from_unix_timestamp(evaluated_at_unix).unwrap();
-            (
-                receipt,
-                SourceObservation {
-                    receipt,
-                    observed_at: SourceTimestamp(at),
-                    received_at: ReceivedAt(at),
-                    received_unix_ms: evaluated_at_unix * 1_000,
-                    source_id: KNOCKOUT_CAUSAL_SOURCE_ID.to_owned(),
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("membership-source.log");
+        let mut writer = Writer::open(&source_log).unwrap();
+        let at = OffsetDateTime::from_unix_timestamp(evaluated_at_unix).unwrap();
+        let append_artifact = |writer: &mut Writer, artifact: &KnockoutCausalArtifact| {
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(KNOCKOUT_CAUSAL_SOURCE_ID.to_owned()),
                     schema_version: MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
                     parser_version: MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
                     content_type: ContentType::Json,
-                    payload,
-                },
-            )
+                    payload: serde_json::to_vec(artifact).unwrap(),
+                })
+                .unwrap()
         };
-        let (receipt, source_observation) = observation(1, &artifact);
+        let receipt = append_artifact(&mut writer, &artifact);
+        let mut omitted = artifact.clone();
+        omitted.fills.clear();
+        omitted.settlements.clear();
+        let omitted_receipt = append_artifact(&mut writer, &omitted);
+        drop(writer);
+        let source = PublishedMembershipSource::scan(&source_log).unwrap();
         let evidence = SealedMembershipEvidence::knockout_backfill(
             vec![crate::paper_recovery::SealedKnockoutEvidence {
                 wallet,
@@ -8639,21 +8728,17 @@ mod tests {
             None,
             &evidence,
             &MembershipEvidenceContext {
-                source: &BTreeMap::from([(1, source_observation)]),
+                source: &source,
                 current_membership: &HashSet::from([wallet]),
             },
         )
         .unwrap();
 
-        let mut omitted = artifact;
-        omitted.fills.clear();
-        omitted.settlements.clear();
-        let (receipt, source_observation) = observation(2, &omitted);
         let evidence = SealedMembershipEvidence::knockout_backfill(
             vec![crate::paper_recovery::SealedKnockoutEvidence {
                 wallet,
                 reason: MembershipReason::KnockoutUnderperformance,
-                causal_receipt: receipt,
+                causal_receipt: omitted_receipt,
             }],
             None,
             Vec::new(),
@@ -8668,7 +8753,7 @@ mod tests {
                 None,
                 &evidence,
                 &MembershipEvidenceContext {
-                    source: &BTreeMap::from([(2, source_observation)]),
+                    source: &source,
                     current_membership: &HashSet::from([wallet]),
                 },
             ),
@@ -9157,6 +9242,89 @@ mod tests {
     }
 
     #[test]
+    fn published_membership_source_matches_payload_map_and_handles_absent_sequences() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("membership-source.log");
+        let mut writer = Writer::open(&source_log).unwrap();
+        for sequence in 0..3u64 {
+            let observed_at = OffsetDateTime::from_unix_timestamp(
+                1_700_000_000 + i64::try_from(sequence).unwrap(),
+            )
+            .unwrap();
+            let received_at = observed_at + time::Duration::milliseconds(125);
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(format!("membership.source.{sequence}")),
+                    schema_version: u32::try_from(sequence + 1).unwrap(),
+                    parser_version: u32::try_from(sequence + 10).unwrap(),
+                    observed_at: SourceTimestamp(observed_at),
+                    received_at: ReceivedAt(received_at),
+                    content_type: ContentType::Json,
+                    payload: format!("{{\"sequence\":{sequence}}}").into_bytes(),
+                })
+                .unwrap();
+        }
+        drop(writer);
+
+        let prefix = TailBinding::from(&Scanner::verify(&source_log).unwrap());
+        let expected = source_observations(&source_log, &prefix).unwrap();
+        let source = PublishedMembershipSource::scan(&source_log).unwrap();
+        for (sequence, observation) in expected {
+            assert_eq!(source.get(sequence).unwrap(), Some(observation));
+        }
+        assert_eq!(source.get(3).unwrap(), None);
+
+        let absent = AppendReceipt {
+            sequence: EventSeq(3),
+            this_hash: blake3::hash(b"absent"),
+        };
+        assert!(matches!(
+            membership_artifact::<serde_json::Value>(&source, absent, "membership.source.3"),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason == "MembershipChanged artifact receipt is absent from the sealed source prefix"
+        ));
+    }
+
+    #[test]
+    fn published_membership_source_refuses_an_unreached_sealed_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_log = temp.path().join("membership-source.log");
+        let mut writer = Writer::open(&source_log).unwrap();
+        let receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("membership.source".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: br#"{"value":1}"#.to_vec(),
+            })
+            .unwrap();
+        drop(writer);
+
+        for prefix in [
+            TailBinding {
+                physical_tail: 0,
+                last_sequence: Some(EventSeq(1)),
+                last_hash: receipt.this_hash.to_hex().to_string(),
+            },
+            TailBinding {
+                physical_tail: 0,
+                last_sequence: Some(receipt.sequence),
+                last_hash: blake3::hash(b"wrong").to_hex().to_string(),
+            },
+        ] {
+            let index = crate::risk_inputs::SourceReceiptIndex::replay(&source_log).unwrap();
+            assert!(matches!(
+                PublishedMembershipSource::from_index(index).through_prefix(&prefix),
+                Err(QualificationError::InsufficientEvidence(reason))
+                    if reason == "source observations do not reach the sealed sequence/hash prefix"
+            ));
+        }
+    }
+
+    #[test]
     fn empty_source_prefix_exposes_no_later_frames() {
         let temp = tempfile::tempdir().unwrap();
         let source_log = temp.path().join("source.log");
@@ -9183,6 +9351,8 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let source = PublishedMembershipSource::scan_prefix(&source_log, &prefix).unwrap();
+        assert_eq!(source.get(0).unwrap(), None);
     }
 
     /// PASS: runtime and qualification adapters produce byte-for-byte equal base snapshots from

@@ -188,9 +188,93 @@ pub fn append_remote_authority_snapshot(
     Ok(())
 }
 
+/// The installed record's recorded source-log activation binding, read before the boot walk so
+/// the walk can bind it under the writer lock (#572). Only this module turns it into a proof.
+pub(crate) struct InstalledSourcePrefix {
+    binding: LogTailBinding,
+}
+
+impl InstalledSourcePrefix {
+    pub(crate) fn binding(&self) -> &LogTailBinding {
+        &self.binding
+    }
+
+    /// Mint the proof once the locked walk has matched this prefix. The walk refuses every
+    /// mismatch, so a successful walk with this binding as its expected prefix is the match.
+    pub(crate) fn prove(self) -> InstalledSourceProof {
+        InstalledSourceProof {
+            matched: self.binding,
+        }
+    }
+}
+
+/// Crate-private evidence that one locked walk matched the recorded source activation prefix.
+/// [`PaperMigrationBoot::prepare_installed`] skips only the source prefix scan, and only when the
+/// record it re-reads still carries exactly this binding.
+#[derive(Debug, Clone)]
+pub(crate) struct InstalledSourceProof {
+    matched: LogTailBinding,
+}
+
+/// Read the installed migration record before the boot walk. `None` for anything other than an
+/// exact `Installed` record whose recorded source path is the configured canonical path (a
+/// migration boot, a mid-migration phase, or a moved generation keeps today's flow, where the
+/// established owner reports the exact cause).
+pub(crate) fn installed_source_prefix(
+    paths: &PaperMigrationPaths,
+) -> Result<Option<InstalledSourcePrefix>> {
+    if !paths.fixed_main.is_file() {
+        return Ok(None);
+    }
+    let schema = MigrationMetadata::schema_version(&paths.fixed_main)
+        .context("inspect fixed paper-state schema before the source-log walk")?;
+    if schema != SCHEMA_VERSION && schema != LEGACY_EXACT_MIGRATION_VERSION {
+        return Ok(None);
+    }
+    let Some(record) = MigrationMetadata::read(&paths.fixed_main)
+        .context("read installed paper migration record before the source-log walk")?
+    else {
+        return Ok(None);
+    };
+    if record.phase != MigrationPhase::Installed {
+        return Ok(None);
+    }
+    MigrationMetadata::verify_activation_facts(&paths.fixed_main)
+        .context("verify installed paper migration activation census")?;
+    let activation = record
+        .activation_tails
+        .as_ref()
+        .context("installed paper migration omitted activation tails")?;
+    if activation.source.path != std::fs::canonicalize(&paths.source_log)? {
+        return Ok(None);
+    }
+    Ok(Some(InstalledSourcePrefix {
+        binding: activation.source.clone(),
+    }))
+}
+
 impl PaperMigrationBoot {
     /// Prepare or resume the exact machine-owned side main selected in metadata.
     pub fn prepare(paths: PaperMigrationPaths, imported_at_unix: i64) -> Result<Self> {
+        Self::prepare_with(paths, imported_at_unix, None)
+    }
+
+    /// [`Self::prepare`] for an installed generation whose source prefix the boot walk already
+    /// matched (#572): the source prefix scan is skipped only when the re-read record's
+    /// activation source binding equals the proof's; any difference takes the full path.
+    pub(crate) fn prepare_installed(
+        paths: PaperMigrationPaths,
+        imported_at_unix: i64,
+        proof: InstalledSourceProof,
+    ) -> Result<Self> {
+        Self::prepare_with(paths, imported_at_unix, Some(&proof))
+    }
+
+    fn prepare_with(
+        paths: PaperMigrationPaths,
+        imported_at_unix: i64,
+        proof: Option<&InstalledSourceProof>,
+    ) -> Result<Self> {
         ensure!(
             paths.fixed_main.is_file(),
             "paper migration requires the existing fixed main {}",
@@ -231,7 +315,8 @@ impl PaperMigrationBoot {
                 .activation_tails
                 .as_ref()
                 .context("installed paper migration omitted activation tails")?;
-            verify_boundary_prefixes(activation, &paths)
+            let source_verified = proof.is_some_and(|proof| proof.matched == activation.source);
+            verify_boundary_prefixes(activation, &paths, source_verified)
                 .context("verify installed paper migration activation prefixes")?;
             return Ok(Self {
                 active_main: paths.fixed_main,
@@ -324,7 +409,7 @@ impl PaperMigrationBoot {
             "schema-v1 paper main has invalid migration phase {}",
             record.phase
         );
-        verify_boundary_prefixes(&record.version_one_boundary, &paths)?;
+        verify_boundary_prefixes(&record.version_one_boundary, &paths, false)?;
 
         let side = PaperStateDb::open(&side_main).context("open version-two paper side main")?;
         let imported = side
@@ -396,7 +481,7 @@ impl PaperMigrationSession {
                 .context("mirror completed paper side-state build")?;
         }
         if record.phase == MigrationPhase::SideStateBuilt {
-            verify_boundary_prefixes(&record.version_one_boundary, &self.paths)?;
+            verify_boundary_prefixes(&record.version_one_boundary, &self.paths, false)?;
             let activation = capture_log_bindings(&self.paths)?;
             record = MigrationMetadata::record_activation_tails(&self.paths.fixed_main, activation)
                 .context("record final paper activation tails")?;
@@ -523,6 +608,7 @@ fn capture_log_bindings(paths: &PaperMigrationPaths) -> Result<DurableLogBinding
 fn verify_boundary_prefixes(
     boundary: &DurableLogBindings,
     paths: &PaperMigrationPaths,
+    source_verified: bool,
 ) -> Result<()> {
     ensure!(
         boundary.source.path == std::fs::canonicalize(&paths.source_log)?,
@@ -536,7 +622,9 @@ fn verify_boundary_prefixes(
         boundary.live_journal.path == std::fs::canonicalize(&paths.live_journal)?,
         "configured live journal no longer matches the migration record"
     );
-    Scanner::verify_prefix(&boundary.source).context("verify recorded source-log prefix")?;
+    if !source_verified {
+        Scanner::verify_prefix(&boundary.source).context("verify recorded source-log prefix")?;
+    }
     Scanner::verify_prefix(&boundary.paper).context("verify recorded paper-log prefix")?;
     LiveJournal::verified_tail(&paths.live_journal)
         .context("verify current native live-journal payloads")?;

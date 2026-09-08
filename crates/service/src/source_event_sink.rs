@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pe_event_log::{AppendReceipt, EnvelopeIn, LogError, Writer};
+use pe_event_log::{AppendReceipt, EnvelopeIn, EventEnvelope, LogError, LogTailBinding, Writer};
 
 /// Single-owner handle for the source event log. Owned by the ingest task; no
 /// channel or command/ack layer — append-before-deliver is enforced by call
@@ -44,7 +44,25 @@ impl SourceEventSink {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LogError> {
         let path = path.as_ref().to_owned();
         let writer = Writer::open(&path)?;
-        Ok(Self {
+        Ok(Self::from_writer(path, writer))
+    }
+
+    /// Open the source log through the writer's locked verifying walk (#572): every frame is
+    /// handed to `observer` with its start offset, the recorded prefix (when given) must match,
+    /// and only a scanner-proven incomplete final frame after that prefix is repaired. Returns
+    /// the sink and the whole-file binding.
+    pub(crate) fn open_verified(
+        path: impl AsRef<Path>,
+        expected_prefix: Option<&LogTailBinding>,
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+    ) -> Result<(Self, LogTailBinding), LogError> {
+        let path = path.as_ref().to_owned();
+        let (writer, binding) = Writer::open_verified(&path, expected_prefix, observer)?;
+        Ok((Self::from_writer(path, writer), binding))
+    }
+
+    fn from_writer(path: PathBuf, writer: Writer) -> Self {
+        Self {
             path,
             writer: Some(writer),
             #[cfg(test)]
@@ -53,7 +71,24 @@ impl SourceEventSink {
             fail_next_sync: false,
             #[cfg(test)]
             fail_next_reopen: false,
-        })
+        }
+    }
+
+    /// The synchronized tail of the locked writer: one sync, then the file length must equal the
+    /// writer's byte cursor. A poisoned or discarded writer is a typed error, never a binding.
+    pub(crate) fn verified_tail(&mut self) -> Result<LogTailBinding, LogError> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(LogError::Io(std::io::Error::other(
+                "source event sink poisoned",
+            )));
+        };
+        writer.verified_tail()
+    }
+
+    /// Discard the writer as a real durability failure would (scenario builds only).
+    #[cfg(feature = "scenario")]
+    pub fn poison_for_scenario(&mut self) {
+        self.writer = None;
     }
 
     /// Arm one append failure (poisons like a real append/sync error).

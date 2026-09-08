@@ -37,7 +37,7 @@ pub fn verify_file_header(path: &Path, r: &mut impl Read) -> Result<(), LogError
 
 /// Compress `json_bytes` and write one frame: `LEN(u32 LE) | zstd_block | CRC32(u32 LE)`.
 /// CRC32 covers the zstd block bytes only.
-pub fn write_frame(w: &mut impl Write, json_bytes: &[u8]) -> Result<(), LogError> {
+pub fn write_frame(w: &mut impl Write, json_bytes: &[u8]) -> Result<u64, LogError> {
     let compressed =
         zstd::encode_all(json_bytes, ZSTD_LEVEL).map_err(|e| LogError::Compress(e.to_string()))?;
 
@@ -58,7 +58,7 @@ pub fn write_frame(w: &mut impl Write, json_bytes: &[u8]) -> Result<(), LogError
     w.write_all(&len.to_le_bytes())?;
     w.write_all(&compressed)?;
     w.write_all(&crc.to_le_bytes())?;
-    Ok(())
+    Ok(u64::from(len) + 8)
 }
 
 /// Read one frame from `r` starting at `byte_offset`.
