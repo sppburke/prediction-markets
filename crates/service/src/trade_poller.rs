@@ -20,7 +20,7 @@ use pe_core_types::{
     MarketId, MarketOutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
 use pe_paper_state::{NoCopyDisposition, PaperStateDb};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
@@ -104,6 +104,88 @@ struct Obligation {
     receipt: pe_event_log::AppendReceipt,
 }
 
+type CoalescedObligations = HashMap<WalletAddress, BTreeMap<i64, BTreeMap<String, Obligation>>>;
+
+fn insert_coalesced_obligation(
+    by_wallet: &mut CoalescedObligations,
+    wallet: WalletAddress,
+    epoch: i64,
+    obligation: Obligation,
+) {
+    let groups = by_wallet
+        .entry(wallet)
+        .or_default()
+        .entry(epoch)
+        .or_default();
+    groups
+        .entry(obligation.group_id.0.clone())
+        .and_modify(|existing| {
+            if obligation.receipt.sequence < existing.receipt.sequence {
+                existing.received_at = obligation.received_at;
+                existing.receipt = obligation.receipt;
+            }
+        })
+        .or_insert(obligation);
+}
+
+fn insert_reconciliation_trigger(
+    by_wallet: &mut CoalescedObligations,
+    trigger: ReconciliationTrigger,
+) {
+    let epoch = trigger.source_time.unix_timestamp();
+    insert_coalesced_obligation(
+        by_wallet,
+        trigger.wallet,
+        epoch,
+        Obligation {
+            group_id: trigger.source_trade_id,
+            received_at: trigger.received_at,
+            receipt: trigger.receipt,
+        },
+    );
+}
+
+fn take_coalesced_obligation(
+    by_wallet: &mut CoalescedObligations,
+    wallet: &WalletAddress,
+    epoch: i64,
+    group_id: &str,
+) -> Option<Obligation> {
+    let obligation = by_wallet
+        .get_mut(wallet)?
+        .get_mut(&epoch)?
+        .remove(group_id)?;
+    let remove_epoch = by_wallet
+        .get(wallet)
+        .and_then(|epochs| epochs.get(&epoch))
+        .is_some_and(BTreeMap::is_empty);
+    if remove_epoch && let Some(epochs) = by_wallet.get_mut(wallet) {
+        epochs.remove(&epoch);
+    }
+    if by_wallet.get(wallet).is_some_and(BTreeMap::is_empty) {
+        by_wallet.remove(wallet);
+    }
+    Some(obligation)
+}
+
+fn take_earliest_coalesced_obligation(
+    by_wallet: &mut CoalescedObligations,
+) -> Option<(WalletAddress, i64, Obligation)> {
+    let (wallet, epoch, group_id) = by_wallet
+        .iter()
+        .flat_map(|(wallet, epochs)| {
+            epochs.iter().flat_map(move |(epoch, groups)| {
+                groups.iter().map(move |(group_id, obligation)| {
+                    (*wallet, *epoch, group_id, obligation.receipt.sequence)
+                })
+            })
+        })
+        .min_by_key(|(_, _, _, sequence)| *sequence)
+        .map(|(wallet, epoch, group_id, _)| (wallet, epoch, group_id.clone()))?;
+    let obligation = take_coalesced_obligation(by_wallet, &wallet, epoch, &group_id)?;
+    Some((wallet, epoch, obligation))
+}
+
 #[derive(Default)]
 struct BucketIdentities {
     overrides: HashMap<SourceTradeId, IdentityOverride>,
@@ -113,9 +195,65 @@ struct BucketIdentities {
 /// Coalesced durable websocket work rebuilt from source evidence on restart.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationObligations {
-    by_wallet: HashMap<WalletAddress, BTreeMap<i64, BTreeMap<String, Obligation>>>,
+    by_wallet: CoalescedObligations,
     boundary: Option<PendingBoundary>,
     last_boundary_cutoff: Option<i64>,
+}
+
+/// Log-pure websocket candidates awaiting one durable-state filter (#572).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityCandidates {
+    by_wallet: CoalescedObligations,
+}
+
+impl ActivityCandidates {
+    /// Observe one source frame without consulting paper state (#572).
+    pub fn observe_activity(
+        &mut self,
+        envelope: &EventEnvelope,
+    ) -> Result<(), ObligationRebuildError> {
+        if envelope.source_id.0 != ACTIVITY_WS_SOURCE_ID
+            || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
+            || envelope.parser_version != ACTIVITY_PARSER_VERSION
+        {
+            return Ok(());
+        }
+        let activity = parse_activity_trade_observation(&envelope.payload)?;
+        insert_reconciliation_trigger(
+            &mut self.by_wallet,
+            ReconciliationTrigger {
+                wallet: activity.wallet,
+                source_time: activity.source_time.0,
+                source_trade_id: activity.group_id.key().clone(),
+                provenance: TradeProvenance::ActivityWs,
+                received_at: envelope.received_at.0,
+                receipt: AppendReceipt {
+                    sequence: envelope.seq,
+                    this_hash: envelope.this_hash,
+                },
+            },
+        );
+        Ok(())
+    }
+
+    /// Filter the coalesced log candidates against durable paper state (#572).
+    pub fn into_obligations(
+        mut self,
+        paper_state: &PaperStateDb,
+    ) -> Result<ReconciliationObligations, ObligationRebuildError> {
+        let mut obligations = ReconciliationObligations::default();
+        while let Some((wallet, epoch, obligation)) =
+            take_earliest_coalesced_obligation(&mut self.by_wallet)
+        {
+            if paper_state
+                .activity_group_state(&obligation.group_id)?
+                .is_none()
+            {
+                insert_coalesced_obligation(&mut obligations.by_wallet, wallet, epoch, obligation);
+            }
+        }
+        Ok(obligations)
+    }
 }
 
 /// The sole source-ordered daily boundary waiting for qualifying activity acknowledgements.
@@ -129,26 +267,7 @@ impl ReconciliationObligations {
     /// Add one already-durable reader observation. Reader duplicates coalesce
     /// by wallet, source second, and version-two group identity.
     pub fn insert(&mut self, trigger: ReconciliationTrigger) {
-        let epoch = trigger.source_time.unix_timestamp();
-        let groups = self
-            .by_wallet
-            .entry(trigger.wallet)
-            .or_default()
-            .entry(epoch)
-            .or_default();
-        groups
-            .entry(trigger.source_trade_id.0.clone())
-            .and_modify(|obligation| {
-                if trigger.receipt.sequence < obligation.receipt.sequence {
-                    obligation.received_at = trigger.received_at;
-                    obligation.receipt = trigger.receipt;
-                }
-            })
-            .or_insert(Obligation {
-                group_id: trigger.source_trade_id,
-                received_at: trigger.received_at,
-                receipt: trigger.receipt,
-            });
+        insert_reconciliation_trigger(&mut self.by_wallet, trigger);
     }
 
     #[must_use]
@@ -312,17 +431,55 @@ pub enum ObligationRebuildError {
     Boundary(String),
 }
 
-/// Recover the oldest unacknowledged source boundary and the Start/latest-mark anchor.
-pub fn recover_daily_boundary(
-    source_log_path: &Path,
+/// Log-pure daily-boundary candidates awaiting the paper-log anchor (#572).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DailyBoundaryCandidates {
+    boundaries: Vec<PendingBoundary>,
+}
+
+impl DailyBoundaryCandidates {
+    /// Observe and validate one matching source frame without reading the paper log (#572).
+    pub fn observe_daily_boundary(
+        &mut self,
+        envelope: &EventEnvelope,
+    ) -> Result<(), ObligationRebuildError> {
+        if envelope.source_id.0 != DAILY_BOUNDARY_SOURCE_ID {
+            return Ok(());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&envelope.payload)
+            .map_err(|error| ObligationRebuildError::Boundary(error.to_string()))?;
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("daily_boundary") {
+            return Err(ObligationRebuildError::Boundary(
+                "boundary source id carries an unexpected kind".to_owned(),
+            ));
+        }
+        let cutoff_unix = value
+            .get("cutoff_unix")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                ObligationRebuildError::Boundary("boundary cutoff is absent".to_owned())
+            })?;
+        self.boundaries.push(PendingBoundary {
+            cutoff_unix,
+            receipt: AppendReceipt {
+                sequence: envelope.seq,
+                this_hash: envelope.this_hash,
+            },
+        });
+        Ok(())
+    }
+}
+
+/// Compute and install the Start/latest-mark anchor before source observation (#572).
+pub fn recover_daily_boundary_anchor(
     paper_log_path: &Path,
     obligations: &mut ReconciliationObligations,
-) -> Result<(), ObligationRebuildError> {
+) -> Result<Option<i64>, ObligationRebuildError> {
     let frames = crate::paper_recovery::scan_paper_log(paper_log_path)
         .map_err(|error| ObligationRebuildError::PaperLog(error.to_string()))?;
     let era = crate::paper_recovery::paper_era(frames);
     let Some((_, start)) = era.start.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let start_unix = era
         .frames
@@ -346,40 +503,40 @@ pub fn recover_daily_boundary(
         .max()
         .unwrap_or(start_unix);
     obligations.set_boundary_anchor(anchor);
+    Ok(Some(anchor))
+}
 
-    let mut recovered = Vec::new();
-    for item in Reader::replay(source_log_path)? {
-        let (_sequence, envelope) = item?;
-        if envelope.source_id.0 != DAILY_BOUNDARY_SOURCE_ID {
-            continue;
-        }
-        let value: serde_json::Value = serde_json::from_slice(&envelope.payload)
-            .map_err(|error| ObligationRebuildError::Boundary(error.to_string()))?;
-        if value.get("kind").and_then(serde_json::Value::as_str) != Some("daily_boundary") {
-            return Err(ObligationRebuildError::Boundary(
-                "boundary source id carries an unexpected kind".to_owned(),
-            ));
-        }
-        let cutoff_unix = value
-            .get("cutoff_unix")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| {
-                ObligationRebuildError::Boundary("boundary cutoff is absent".to_owned())
-            })?;
-        if cutoff_unix > anchor {
-            recovered.push(PendingBoundary {
-                cutoff_unix,
-                receipt: AppendReceipt {
-                    sequence: envelope.seq,
-                    this_hash: envelope.this_hash,
-                },
-            });
-        }
-    }
-    recovered.sort_by_key(|boundary| (boundary.cutoff_unix, boundary.receipt.sequence));
-    if let Some(boundary) = recovered.first().copied() {
+/// Select and install the oldest source candidate after the computed paper anchor (#572).
+pub fn recover_daily_boundary_from_candidates(
+    candidates: DailyBoundaryCandidates,
+    anchor: i64,
+    obligations: &mut ReconciliationObligations,
+) {
+    if let Some(boundary) = candidates
+        .boundaries
+        .into_iter()
+        .filter(|boundary| boundary.cutoff_unix > anchor)
+        .min_by_key(|boundary| (boundary.cutoff_unix, boundary.receipt.sequence))
+    {
         obligations.install_boundary(boundary);
     }
+}
+
+/// Recover the oldest unacknowledged source boundary and the Start/latest-mark anchor.
+pub fn recover_daily_boundary(
+    source_log_path: &Path,
+    paper_log_path: &Path,
+    obligations: &mut ReconciliationObligations,
+) -> Result<(), ObligationRebuildError> {
+    let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, obligations)? else {
+        return Ok(());
+    };
+    let mut candidates = DailyBoundaryCandidates::default();
+    for item in Reader::replay(source_log_path)? {
+        let (_sequence, envelope) = item?;
+        candidates.observe_daily_boundary(&envelope)?;
+    }
+    recover_daily_boundary_from_candidates(candidates, anchor, obligations);
     Ok(())
 }
 
@@ -388,34 +545,12 @@ pub fn rebuild_reconciliation_obligations(
     source_log_path: &Path,
     paper_state: &PaperStateDb,
 ) -> Result<ReconciliationObligations, ObligationRebuildError> {
-    let mut obligations = ReconciliationObligations::default();
+    let mut candidates = ActivityCandidates::default();
     for item in Reader::replay(source_log_path)? {
         let (_seq, envelope) = item?;
-        if envelope.source_id.0 != ACTIVITY_WS_SOURCE_ID
-            || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
-            || envelope.parser_version != ACTIVITY_PARSER_VERSION
-        {
-            continue;
-        }
-        let activity = parse_activity_trade_observation(&envelope.payload)?;
-        if paper_state
-            .activity_group_state(activity.group_id.key())?
-            .is_none()
-        {
-            obligations.insert(ReconciliationTrigger {
-                wallet: activity.wallet,
-                source_time: activity.source_time.0,
-                source_trade_id: activity.group_id.key().clone(),
-                provenance: TradeProvenance::ActivityWs,
-                received_at: envelope.received_at.0,
-                receipt: pe_event_log::AppendReceipt {
-                    sequence: envelope.seq,
-                    this_hash: envelope.this_hash,
-                },
-            });
-        }
+        candidates.observe_activity(&envelope)?;
     }
-    Ok(obligations)
+    candidates.into_obligations(paper_state)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1165,6 +1300,14 @@ impl ReconciliationFetcher for RecordingFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use pe_core_types::CollateralAmount;
+    use pe_event_log::Writer;
+    use pe_paper_state::{ActivityBucketCommit, ActivityDispositionRecord};
+    use tempfile::tempdir;
+
+    use crate::paper_recovery::{
+        PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PortfolioMark, QualificationStarted, TailBinding,
+    };
 
     fn recorded(sequence: u64, url: &str, hash: &str) -> RecordedPageOccurrence {
         RecordedPageOccurrence(PageOccurrence {
@@ -1197,6 +1340,112 @@ mod tests {
             schema_version: ACTIVITY_SCHEMA_VERSION,
             parser_version: ACTIVITY_PARSER_VERSION,
         }
+    }
+
+    fn append_source_frame(
+        writer: &mut Writer,
+        source_id: &str,
+        payload: &[u8],
+        received_at_unix: i64,
+        schema_version: u32,
+        parser_version: u32,
+    ) -> AppendReceipt {
+        let timestamp = OffsetDateTime::from_unix_timestamp(received_at_unix).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(source_id.to_owned()),
+                schema_version,
+                parser_version,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: payload.to_vec(),
+            })
+            .unwrap()
+    }
+
+    fn activity_payload(transaction_suffix: char, source_unix: i64) -> Vec<u8> {
+        format!(
+            r#"{{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conditionId":"0xc1","asset":"123","side":"BUY","size":"5","price":"0.5","timestamp":{source_unix},"transactionHash":"0x{}","outcomeIndex":"0"}}"#,
+            transaction_suffix.to_string().repeat(64)
+        )
+        .into_bytes()
+    }
+
+    fn resolve_activity_group(paper_state: &PaperStateDb, payload: &[u8]) {
+        let activity = parse_activity_trade_observation(payload).unwrap();
+        paper_state
+            .commit_activity_bucket(&ActivityBucketCommit {
+                wallet: activity.wallet,
+                source_epoch: activity.source_time.0.unix_timestamp(),
+                dispositions: vec![ActivityDispositionRecord {
+                    source_trade_id: activity.group_id.key().clone(),
+                    transaction_hash: activity.group_id.components().transaction_hash.clone(),
+                    wallet: activity.wallet,
+                    source_epoch: activity.source_time.0.unix_timestamp(),
+                    semantic_revision: "candidate-split-test-v1".to_owned(),
+                    activity_type: "TRADE".to_owned(),
+                    disposition: "decision_pending".to_owned(),
+                    proof_json: "{\"version\":1}".to_owned(),
+                    no_copy: None,
+                }],
+                leader_positions: Vec::new(),
+                gate_results: Vec::new(),
+                history_effects: Vec::new(),
+                history_status: None,
+                pending: Vec::new(),
+                fence: None,
+                reanchor: None,
+                advance_cursor: false,
+            })
+            .unwrap();
+    }
+
+    fn empty_tail() -> TailBinding {
+        TailBinding {
+            physical_tail: 0,
+            last_sequence: None,
+            last_hash: blake3::Hash::from_bytes([0; 32]).to_hex().to_string(),
+        }
+    }
+
+    fn qualification_start(wallet: WalletAddress) -> PaperLogRecord {
+        PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+            starting_bankroll: CollateralAmount::from_atomic(100_000_000),
+            paper_prefix: empty_tail(),
+            source_prefix: empty_tail(),
+            live_prefix: empty_tail(),
+            artifact_blake3: "artifact".to_owned(),
+            static_config_hash: "static".to_owned(),
+            hot_config_hash: "hot".to_owned(),
+            generation: "generation".to_owned(),
+            activation_id: "activation".to_owned(),
+            ranking_batch_id: 572,
+            membership: vec![wallet],
+            membership_proofs_hash: "membership".to_owned(),
+            schema_version: 3,
+            parser_version: 1,
+            financial_semantic_version: 1,
+        }))
+    }
+
+    fn append_paper_record(
+        writer: &mut Writer,
+        record: &PaperLogRecord,
+        received_at_unix: i64,
+    ) -> AppendReceipt {
+        let timestamp = OffsetDateTime::from_unix_timestamp(received_at_unix).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(record).unwrap(),
+            })
+            .unwrap()
     }
 
     /// PASS: logically sorted saturated pages join by multiplicity while receipt output retains
@@ -1381,5 +1630,262 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn activity_candidates_filter_after_database_changes_and_match_rebuild() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let paper_state = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        let resolved_payload = activity_payload('a', 100);
+        let unresolved_payload = activity_payload('b', 101);
+        let suffix_payload = activity_payload('c', 102);
+        let unresolved_group = parse_activity_trade_observation(&unresolved_payload)
+            .unwrap()
+            .group_id
+            .key()
+            .clone();
+        let suffix_group = parse_activity_trade_observation(&suffix_payload)
+            .unwrap()
+            .group_id
+            .key()
+            .clone();
+
+        let mut writer = Writer::open(&source_path).unwrap();
+        append_source_frame(
+            &mut writer,
+            ACTIVITY_WS_SOURCE_ID,
+            &resolved_payload,
+            110,
+            ACTIVITY_SCHEMA_VERSION,
+            ACTIVITY_PARSER_VERSION,
+        );
+        let first_unresolved = append_source_frame(
+            &mut writer,
+            ACTIVITY_WS_SOURCE_ID,
+            &unresolved_payload,
+            111,
+            ACTIVITY_SCHEMA_VERSION,
+            ACTIVITY_PARSER_VERSION,
+        );
+        append_source_frame(
+            &mut writer,
+            ACTIVITY_WS_SOURCE_ID,
+            &unresolved_payload,
+            112,
+            ACTIVITY_SCHEMA_VERSION,
+            ACTIVITY_PARSER_VERSION,
+        );
+
+        let initial = Reader::replay(&source_path)
+            .unwrap()
+            .map(|item| item.unwrap().1)
+            .collect::<Vec<_>>();
+        let mut candidates = ActivityCandidates::default();
+        for envelope in &initial {
+            candidates.observe_activity(envelope).unwrap();
+        }
+        resolve_activity_group(&paper_state, &resolved_payload);
+
+        let suffix_receipt = append_source_frame(
+            &mut writer,
+            ACTIVITY_WS_SOURCE_ID,
+            &suffix_payload,
+            113,
+            ACTIVITY_SCHEMA_VERSION,
+            ACTIVITY_PARSER_VERSION,
+        );
+        let suffix = Reader::replay(&source_path)
+            .unwrap()
+            .nth(initial.len())
+            .unwrap()
+            .unwrap()
+            .1;
+        candidates.observe_activity(&suffix).unwrap();
+        drop(writer);
+
+        let split = candidates.into_obligations(&paper_state).unwrap();
+        let rebuilt = rebuild_reconciliation_obligations(&source_path, &paper_state).unwrap();
+        assert_eq!(split, rebuilt);
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            split
+                .observation(
+                    &WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                    101,
+                    &unresolved_group,
+                )
+                .unwrap()
+                .0,
+            first_unresolved,
+            "duplicate observations retain their earliest source receipt"
+        );
+        assert_eq!(
+            split
+                .observation(
+                    &WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                    102,
+                    &suffix_group,
+                )
+                .unwrap()
+                .0,
+            suffix_receipt,
+            "a later-observed log suffix remains after the final state filter"
+        );
+    }
+
+    #[test]
+    fn malformed_activity_candidate_matches_rebuild_error() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let paper_state = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        let mut writer = Writer::open(&source_path).unwrap();
+        append_source_frame(
+            &mut writer,
+            ACTIVITY_WS_SOURCE_ID,
+            b"{",
+            100,
+            ACTIVITY_SCHEMA_VERSION,
+            ACTIVITY_PARSER_VERSION,
+        );
+        drop(writer);
+        let envelope = Reader::replay(&source_path)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .1;
+        let observed = ActivityCandidates::default()
+            .observe_activity(&envelope)
+            .unwrap_err();
+        let rebuilt = rebuild_reconciliation_obligations(&source_path, &paper_state).unwrap_err();
+        assert!(matches!(observed, ObligationRebuildError::Activity(_)));
+        assert!(matches!(rebuilt, ObligationRebuildError::Activity(_)));
+        assert_eq!(observed.to_string(), rebuilt.to_string());
+    }
+
+    #[test]
+    fn daily_boundary_candidates_match_recovery_with_paper_anchor() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let paper_path = dir.path().join("paper.log");
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        append_paper_record(&mut paper_writer, &qualification_start(wallet), 100);
+        append_paper_record(
+            &mut paper_writer,
+            &PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
+                boundary_receipt: AppendReceipt {
+                    sequence: pe_core_types::EventSeq(7),
+                    this_hash: blake3::Hash::from_bytes([7; 32]),
+                },
+                cutoff_unix: 200,
+                source_tail: empty_tail(),
+                financial_prefix_seq: None,
+                prices: Vec::new(),
+                cash: rust_decimal::Decimal::ZERO,
+                equity: rust_decimal::Decimal::ZERO,
+                invalid: None,
+            })),
+            201,
+        );
+        drop(paper_writer);
+
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        for cutoff_unix in [300, 150] {
+            append_source_frame(
+                &mut source_writer,
+                DAILY_BOUNDARY_SOURCE_ID,
+                &serde_json::to_vec(&serde_json::json!({
+                    "kind": "daily_boundary",
+                    "cutoff_unix": cutoff_unix,
+                }))
+                .unwrap(),
+                cutoff_unix,
+                1,
+                1,
+            );
+        }
+        let expected = append_source_frame(
+            &mut source_writer,
+            DAILY_BOUNDARY_SOURCE_ID,
+            &serde_json::to_vec(&serde_json::json!({
+                "kind": "daily_boundary",
+                "cutoff_unix": 250,
+            }))
+            .unwrap(),
+            250,
+            1,
+            1,
+        );
+        drop(source_writer);
+
+        let mut candidates = DailyBoundaryCandidates::default();
+        for item in Reader::replay(&source_path).unwrap() {
+            candidates.observe_daily_boundary(&item.unwrap().1).unwrap();
+        }
+        let mut split = ReconciliationObligations::default();
+        let anchor = recover_daily_boundary_anchor(&paper_path, &mut split)
+            .unwrap()
+            .unwrap();
+        recover_daily_boundary_from_candidates(candidates, anchor, &mut split);
+
+        let mut recovered = ReconciliationObligations::default();
+        recover_daily_boundary(&source_path, &paper_path, &mut recovered).unwrap();
+        assert_eq!(split, recovered);
+        assert_eq!(split.boundary_anchor(), Some(200));
+        assert_eq!(
+            split.pending_boundary(),
+            Some(PendingBoundary {
+                cutoff_unix: 250,
+                receipt: expected,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_daily_boundary_candidates_preserve_errors() {
+        let dir = tempdir().unwrap();
+        for (name, payload, expected) in [
+            (
+                "kind",
+                serde_json::to_vec(&serde_json::json!({"kind": "other", "cutoff_unix": 1}))
+                    .unwrap(),
+                "boundary source id carries an unexpected kind",
+            ),
+            (
+                "cutoff",
+                serde_json::to_vec(&serde_json::json!({"kind": "daily_boundary"})).unwrap(),
+                "boundary cutoff is absent",
+            ),
+        ] {
+            let path = dir.path().join(format!("{name}.log"));
+            let mut writer = Writer::open(&path).unwrap();
+            append_source_frame(&mut writer, DAILY_BOUNDARY_SOURCE_ID, &payload, 1, 1, 1);
+            drop(writer);
+            let envelope = Reader::replay(&path).unwrap().next().unwrap().unwrap().1;
+            let error = DailyBoundaryCandidates::default()
+                .observe_daily_boundary(&envelope)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ObligationRebuildError::Boundary(ref message) if message == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn daily_boundary_recovery_before_financial_start_does_not_read_source_log() {
+        let dir = tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let missing_source_path = dir.path().join("source-does-not-exist.log");
+        drop(Writer::open(&paper_path).unwrap());
+
+        let mut obligations = ReconciliationObligations::default();
+        recover_daily_boundary(&missing_source_path, &paper_path, &mut obligations).unwrap();
+
+        assert!(obligations.boundary_anchor().is_none());
+        assert!(obligations.pending_boundary().is_none());
+        assert!(!missing_source_path.exists());
     }
 }
