@@ -62,43 +62,83 @@ impl Scanner {
         }
     }
 
-    /// Verify a recorded prefix and the complete current suffix without
-    /// requiring the current log to end at the recorded migration boundary.
-    /// This is the roll-forward resume check for append-only logs (#544).
+    /// Verify a recorded prefix and the complete current suffix in one pass.
+    ///
+    /// The boundary verdict is deferred until the scan reaches a clean end, so a typed frame
+    /// failure in the suffix takes precedence over a boundary mismatch (#572).
     pub fn verify_prefix(binding: &LogTailBinding) -> Result<LogTailBinding, LogError> {
-        let current = Self::verify(&binding.path)?;
-        if current.physical_tail < binding.physical_tail {
-            return Err(LogError::Io(std::io::Error::new(
+        let file = File::open(&binding.path)?;
+        let mut observer = |_: u64, _: &EventEnvelope| {};
+        let (outcome, verdict) = walk_open(&binding.path, &file, Some(binding), &mut observer)?;
+        if let Some(incomplete) = outcome.incomplete_tail {
+            return Err(LogError::Truncated {
+                at: incomplete.next_sequence,
+                byte_offset: incomplete.byte_offset,
+            });
+        }
+        verdict.require_match()?;
+        Ok(outcome.verified_tail)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixVerdict {
+    NotRequested,
+    Matched,
+    Shorter,
+    Mismatch,
+}
+
+impl PrefixVerdict {
+    pub(crate) fn require_match(self) -> Result<(), LogError> {
+        match self {
+            Self::NotRequested | Self::Matched => Ok(()),
+            Self::Shorter => Err(LogError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "event log is shorter than the recorded migration boundary",
-            )));
-        }
-
-        let file = File::open(&binding.path)?;
-        let mut reader = BufReader::new(file);
-        verify_file_header(&binding.path, &mut reader)?;
-        let mut state = ScanState::after_header();
-        while state.physical_tail() < binding.physical_tail {
-            match read_verified_frame(&mut reader, &mut state)? {
-                ScanStep::Frame(_) => {}
-                ScanStep::Eof | ScanStep::Incomplete(_) => {
-                    return Err(LogError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "recorded migration boundary is not a complete frame boundary",
-                    )));
-                }
-            }
-        }
-        if state.physical_tail() != binding.physical_tail
-            || state.next_sequence.checked_sub(1).map(EventSeq) != binding.last_sequence
-            || state.previous_hash != binding.last_hash
-        {
-            return Err(LogError::Io(std::io::Error::new(
+            ))),
+            Self::Mismatch => Err(LogError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "event log does not match the recorded migration boundary",
-            )));
+            ))),
         }
-        Ok(current)
+    }
+}
+
+struct PrefixTracker<'a> {
+    expected: Option<&'a LogTailBinding>,
+    matched: bool,
+}
+
+impl<'a> PrefixTracker<'a> {
+    fn new(expected: Option<&'a LogTailBinding>) -> Self {
+        Self {
+            expected,
+            matched: false,
+        }
+    }
+
+    fn observe(&mut self, state: &ScanState) {
+        let Some(expected) = self.expected else {
+            return;
+        };
+        if state.physical_tail == expected.physical_tail
+            && state.next_sequence.checked_sub(1).map(EventSeq) == expected.last_sequence
+            && state.previous_hash == expected.last_hash
+        {
+            self.matched = true;
+        }
+    }
+
+    fn verdict(&self, final_state: &ScanState) -> PrefixVerdict {
+        match self.expected {
+            None => PrefixVerdict::NotRequested,
+            Some(_) if self.matched => PrefixVerdict::Matched,
+            Some(expected) if final_state.physical_tail < expected.physical_tail => {
+                PrefixVerdict::Shorter
+            }
+            Some(_) => PrefixVerdict::Mismatch,
+        }
     }
 }
 
@@ -235,25 +275,63 @@ pub(crate) fn read_verified_frame(
 }
 
 pub(crate) fn inspect_open(path: &Path, file: &File) -> Result<ScanOutcome, LogError> {
+    let mut observer = |_: u64, _: &EventEnvelope| {};
+    let (outcome, _) = walk_open(path, file, None, &mut observer)?;
+    Ok(outcome)
+}
+
+/// Walk an already-open, exclusively locked log without mutating it (#572).
+///
+/// Frame verification has one owner. The prefix verdict is returned separately so the writer can
+/// reject a truncation into the trusted prefix before deciding whether tail repair is permitted.
+pub(crate) fn walk_locked(
+    path: &Path,
+    file: &File,
+    expected_prefix: Option<&LogTailBinding>,
+    observer: &mut dyn FnMut(u64, &EventEnvelope),
+) -> Result<(ScanOutcome, PrefixVerdict), LogError> {
+    walk_open(path, file, expected_prefix, observer)
+}
+
+fn walk_open(
+    path: &Path,
+    file: &File,
+    expected_prefix: Option<&LogTailBinding>,
+    observer: &mut dyn FnMut(u64, &EventEnvelope),
+) -> Result<(ScanOutcome, PrefixVerdict), LogError> {
     let resolved_path = std::fs::canonicalize(path)?;
     let mut reader = BufReader::new(file);
     verify_file_header(path, &mut reader)?;
     let mut state = ScanState::after_header();
+    let mut prefix = PrefixTracker::new(expected_prefix);
+    prefix.observe(&state);
 
     loop {
+        let frame_start = state.physical_tail();
         match read_verified_frame(&mut reader, &mut state)? {
-            ScanStep::Frame(_) => {}
+            ScanStep::Frame(envelope) => {
+                observer(frame_start, &envelope);
+                prefix.observe(&state);
+            }
             ScanStep::Eof => {
-                return Ok(ScanOutcome {
-                    verified_tail: tail_binding(resolved_path, &state),
-                    incomplete_tail: None,
-                });
+                let verdict = prefix.verdict(&state);
+                return Ok((
+                    ScanOutcome {
+                        verified_tail: tail_binding(resolved_path, &state),
+                        incomplete_tail: None,
+                    },
+                    verdict,
+                ));
             }
             ScanStep::Incomplete(incomplete_tail) => {
-                return Ok(ScanOutcome {
-                    verified_tail: tail_binding(resolved_path, &state),
-                    incomplete_tail: Some(incomplete_tail),
-                });
+                let verdict = prefix.verdict(&state);
+                return Ok((
+                    ScanOutcome {
+                        verified_tail: tail_binding(resolved_path, &state),
+                        incomplete_tail: Some(incomplete_tail),
+                    },
+                    verdict,
+                ));
             }
         }
     }
