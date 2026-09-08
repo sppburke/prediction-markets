@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
-use pe_event_log::{AppendReceipt, Reader};
+use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader, Scanner};
 use pe_paper_state::FinancialSnapshot;
 use pe_risk_engine::{
     EquityInputs, PnlWindow, RiskHaltCause, RiskMathError, RiskSnapshot, current_equity,
@@ -79,6 +79,8 @@ pub enum RiskInputsUnavailable {
     PriceFuture,
     #[error("position price evidence conflicts")]
     PriceConflict,
+    #[error("the source log is being re-verified after an append uncertainty")]
+    SourceLogUncertain,
     #[error("the immediately preceding midnight mark is missing")]
     MarkMissing,
     #[error("the immediately preceding midnight mark is duplicated")]
@@ -897,6 +899,7 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
     next_byte_offset: Option<u64>,
+    suspended: bool,
 }
 
 #[derive(Clone)]
@@ -912,42 +915,96 @@ pub struct SourceReceiptIndex {
     source_log_path: Option<Arc<PathBuf>>,
 }
 
+/// Incomplete externally driven source-receipt projection (#572).
+///
+/// The staging value exposes no reads and becomes usable only after [`Self::complete`] binds its
+/// observed frames to a scanner-verified physical log tail.
+pub struct SourceReceiptIndexStaging {
+    canonical_source_log_path: PathBuf,
+    frames: Vec<SourceFrameMetadata>,
+}
+
+impl SourceReceiptIndexStaging {
+    /// Observe one verified source frame while constructing an external projection (#572).
+    pub fn observe(
+        &mut self,
+        byte_offset: u64,
+        envelope: &EventEnvelope,
+    ) -> Result<(), RiskInputsUnavailable> {
+        let receipt = AppendReceipt {
+            sequence: envelope.seq,
+            this_hash: envelope.this_hash,
+        };
+        let received_millis = received_at_millis(&envelope.received_at)?;
+        let expected_sequence = u64::try_from(self.frames.len())
+            .map(EventSeq)
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if envelope.seq != expected_sequence {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        self.frames.push(SourceFrameMetadata {
+            receipt,
+            received_millis,
+            byte_offset: Some(byte_offset),
+        });
+        Ok(())
+    }
+
+    /// Complete an external projection only when its path and logical tail match exactly (#572).
+    pub fn complete(
+        self,
+        binding: &LogTailBinding,
+    ) -> Result<SourceReceiptIndex, RiskInputsUnavailable> {
+        let indexed_last_sequence = self.frames.last().map(|frame| frame.receipt.sequence);
+        let indexed_last_hash = self
+            .frames
+            .last()
+            .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                frame.receipt.this_hash
+            });
+        if binding.path != self.canonical_source_log_path
+            || binding.last_sequence != indexed_last_sequence
+            || binding.last_hash != indexed_last_hash
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        Ok(SourceReceiptIndex {
+            state: Arc::new(RwLock::new(SourceReceiptIndexState {
+                frames: self.frames,
+                next_byte_offset: Some(binding.physical_tail),
+                suspended: false,
+            })),
+            source_log_path: Some(Arc::new(self.canonical_source_log_path)),
+        })
+    }
+}
+
 impl SourceReceiptIndex {
+    /// Start an externally driven source-receipt projection bound to the canonical log path (#572).
+    pub fn staging(
+        source_log_path: &Path,
+    ) -> Result<SourceReceiptIndexStaging, RiskInputsUnavailable> {
+        let canonical_source_log_path = std::fs::canonicalize(source_log_path)
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        Ok(SourceReceiptIndexStaging {
+            canonical_source_log_path,
+            frames: Vec::new(),
+        })
+    }
+
     /// Rebuild the complete verified source-log projection at boot.
     pub fn replay(source_log_path: &Path) -> Result<Self, RiskInputsUnavailable> {
-        let mut frames = Vec::new();
+        let mut staging = Self::staging(source_log_path)?;
         for item in Reader::replay_with_offsets(source_log_path)
             .map_err(|_| RiskInputsUnavailable::PriceMissing)?
         {
             let (byte_offset, _sequence, envelope) =
                 item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-            let receipt = AppendReceipt {
-                sequence: envelope.seq,
-                this_hash: envelope.this_hash,
-            };
-            let received_millis = received_at_millis(&envelope.received_at)?;
-            let expected_sequence = u64::try_from(frames.len())
-                .map(EventSeq)
-                .map_err(|_| RiskInputsUnavailable::Overflow)?;
-            if envelope.seq != expected_sequence {
-                return Err(RiskInputsUnavailable::PriceConflict);
-            }
-            frames.push(SourceFrameMetadata {
-                receipt,
-                received_millis,
-                byte_offset: Some(byte_offset),
-            });
+            staging.observe(byte_offset, &envelope)?;
         }
-        let next_byte_offset = std::fs::metadata(source_log_path)
-            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
-            .len();
-        Ok(Self {
-            state: Arc::new(RwLock::new(SourceReceiptIndexState {
-                frames,
-                next_byte_offset: Some(next_byte_offset),
-            })),
-            source_log_path: Some(Arc::new(source_log_path.to_owned())),
-        })
+        let binding =
+            Scanner::verify(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        staging.complete(&binding)
     }
 
     /// Extend the projection with an append that the source-log owner has already synchronized.
@@ -1022,8 +1079,29 @@ impl SourceReceiptIndex {
     /// synchronized the physical tail, but before it retries the held envelope. The stored next
     /// byte offset is the boundary between already indexed frames and the newly verified suffix.
     pub(crate) fn catch_up_verified_tail(&self) -> Result<(), RiskInputsUnavailable> {
+        self.catch_up(None, &mut |_, _| {})
+    }
+
+    /// Recover exactly the source-log suffix ending at `expected_tail`, reporting each frame (#572).
+    pub fn catch_up_to(
+        &self,
+        expected_tail: u64,
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+    ) -> Result<(), RiskInputsUnavailable> {
+        self.catch_up(Some(expected_tail), observer)
+    }
+
+    fn catch_up(
+        &self,
+        expected_tail: Option<u64>,
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+    ) -> Result<(), RiskInputsUnavailable> {
         let Some(path) = self.source_log_path.as_ref() else {
-            return Ok(());
+            return if expected_tail.is_some() {
+                Err(RiskInputsUnavailable::PriceMissing)
+            } else {
+                Ok(())
+            };
         };
         let (indexed_len, next_byte_offset, indexed_last_hash) = {
             let state = self
@@ -1044,9 +1122,13 @@ impl SourceReceiptIndex {
                     }),
             )
         };
-        let verified_tail = std::fs::metadata(path.as_ref())
+        let current_tail = std::fs::metadata(path.as_ref())
             .map_err(|_| RiskInputsUnavailable::PriceMissing)?
             .len();
+        if expected_tail.is_some_and(|expected| current_tail != expected) {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        let verified_tail = expected_tail.unwrap_or(current_tail);
         if verified_tail < next_byte_offset {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
@@ -1068,6 +1150,7 @@ impl SourceReceiptIndex {
             if envelope.seq != expected_sequence || envelope.prev_hash != previous_hash {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
+            observer(byte_offset, &envelope);
             let receipt = AppendReceipt {
                 sequence: envelope.seq,
                 this_hash: envelope.this_hash,
@@ -1082,6 +1165,14 @@ impl SourceReceiptIndex {
             byte_offset = frame_end;
         }
         if byte_offset != verified_tail {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        if expected_tail.is_some()
+            && std::fs::metadata(path.as_ref())
+                .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+                .len()
+                != verified_tail
+        {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
 
@@ -1106,21 +1197,48 @@ impl SourceReceiptIndex {
         Ok(())
     }
 
-    pub(crate) fn received_millis(
+    /// Return the receipt and receive millisecond stored for `sequence`, when present (#572).
+    pub fn receipt_at(
         &self,
-        receipt: AppendReceipt,
-    ) -> Result<i64, RiskInputsUnavailable> {
+        sequence: EventSeq,
+    ) -> Result<Option<(AppendReceipt, i64)>, RiskInputsUnavailable> {
         let state = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let index =
-            usize::try_from(receipt.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
-        state
+        if state.suspended {
+            return Err(RiskInputsUnavailable::SourceLogUncertain);
+        }
+        let index = usize::try_from(sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        Ok(state
             .frames
             .get(index)
-            .filter(|metadata| metadata.receipt == receipt)
-            .map(|metadata| metadata.received_millis)
+            .map(|metadata| (metadata.receipt, metadata.received_millis)))
+    }
+
+    /// Suspend source-receipt reads while append uncertainty is being re-verified (#572).
+    pub fn suspend(&self) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .suspended = true;
+    }
+
+    /// Resume source-receipt reads after append uncertainty has been re-verified (#572).
+    pub fn resume(&self) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .suspended = false;
+    }
+
+    pub(crate) fn received_millis(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<i64, RiskInputsUnavailable> {
+        self.receipt_at(receipt.sequence)?
+            .filter(|(known_receipt, _)| *known_receipt == receipt)
+            .map(|(_, received_millis)| received_millis)
             .ok_or(RiskInputsUnavailable::PriceMissing)
     }
 
@@ -1136,6 +1254,9 @@ impl SourceReceiptIndex {
                 .state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.suspended {
+                return Err(RiskInputsUnavailable::SourceLogUncertain);
+            }
             let metadata = state
                 .frames
                 .get(sequence_index)
@@ -1401,7 +1522,7 @@ mod tests {
         PolymarketTokenId, Probability, ReceivedAt, ShareAmount, Side, SourceId, SourceTimestamp,
         WalletAddress,
     };
-    use pe_event_log::{ContentType, EnvelopeIn, EventEnvelope, Writer};
+    use pe_event_log::{ContentType, EnvelopeIn, Writer};
     use pe_execution_core::{
         AdmissionReceipts, BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
         LadderAskAudit, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit,
@@ -1424,6 +1545,45 @@ mod tests {
             sequence: EventSeq(sequence),
             this_hash: blake3::Hash::from_bytes([byte; 32]),
         }
+    }
+
+    fn source_input(unix: i64, payload: &[u8]) -> EnvelopeIn {
+        let at = OffsetDateTime::from_unix_timestamp(unix).unwrap();
+        EnvelopeIn {
+            source_id: SourceId("source-receipt-index".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at),
+            received_at: ReceivedAt(at),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn observe_source_log(path: &Path) -> SourceReceiptIndexStaging {
+        let mut staging = SourceReceiptIndex::staging(path).unwrap();
+        for item in Reader::replay_with_offsets(path).unwrap() {
+            let (byte_offset, _, envelope) = item.unwrap();
+            staging.observe(byte_offset, &envelope).unwrap();
+        }
+        staging
+    }
+
+    type SourceIndexSnapshot = (Vec<(AppendReceipt, i64, Option<u64>)>, Option<u64>);
+
+    fn source_index_snapshot(index: &SourceReceiptIndex) -> SourceIndexSnapshot {
+        let state = index
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state
+                .frames
+                .iter()
+                .map(|frame| (frame.receipt, frame.received_millis, frame.byte_offset))
+                .collect(),
+            state.next_byte_offset,
+        )
     }
 
     fn frame(sequence: u64, unix: i64, record: PaperLogRecord) -> ScannedPaperFrame {
@@ -1730,6 +1890,10 @@ mod tests {
                 "position price evidence conflicts",
             ),
             (
+                RiskInputsUnavailable::SourceLogUncertain,
+                "the source log is being re-verified after an append uncertainty",
+            ),
+            (
                 RiskInputsUnavailable::MarkMissing,
                 "the immediately preceding midnight mark is missing",
             ),
@@ -1995,6 +2159,287 @@ mod tests {
         assert_eq!(maintained, from_scratch);
         assert_eq!(maintained.latest.sample_count, 1);
         assert_eq!(maintained.latest.p95_ms, Some(2_000));
+    }
+
+    /// PASS: an empty externally observed projection becomes the same path-bound index as replay,
+    /// including its header-only next offset.
+    #[test]
+    fn source_receipt_staging_matches_empty_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        drop(Writer::open(&source_path).unwrap());
+
+        let replayed = SourceReceiptIndex::replay(&source_path).unwrap();
+        let binding = Scanner::verify(&source_path).unwrap();
+        let staged = observe_source_log(&source_path).complete(&binding).unwrap();
+
+        assert_eq!(
+            source_index_snapshot(&staged),
+            source_index_snapshot(&replayed)
+        );
+        assert_eq!(
+            source_index_snapshot(&staged).1,
+            Some(binding.physical_tail)
+        );
+    }
+
+    /// PASS: external observation retains exactly replay's receipts, receive times, frame offsets,
+    /// and verified next offset for a non-empty log.
+    #[test]
+    fn source_receipt_staging_matches_nonempty_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        writer.append_synced(source_input(11, b"second")).unwrap();
+        drop(writer);
+
+        let replayed = SourceReceiptIndex::replay(&source_path).unwrap();
+        let binding = Scanner::verify(&source_path).unwrap();
+        let staged = observe_source_log(&source_path).complete(&binding).unwrap();
+
+        assert_eq!(
+            source_index_snapshot(&staged),
+            source_index_snapshot(&replayed)
+        );
+        assert_eq!(
+            source_index_snapshot(&staged).1,
+            Some(binding.physical_tail)
+        );
+    }
+
+    /// PASS: staging completion rejects a different canonical path and either logical-tail drift.
+    #[test]
+    fn source_receipt_staging_rejects_mismatched_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let other_path = dir.path().join("other.log");
+        for path in [&source_path, &other_path] {
+            let mut writer = Writer::open(path).unwrap();
+            writer.append_synced(source_input(10, b"same")).unwrap();
+        }
+
+        let other_binding = Scanner::verify(&other_path).unwrap();
+        assert!(matches!(
+            observe_source_log(&source_path).complete(&other_binding),
+            Err(RiskInputsUnavailable::PriceConflict)
+        ));
+
+        let binding = Scanner::verify(&source_path).unwrap();
+        let mut wrong_sequence = binding.clone();
+        wrong_sequence.last_sequence = Some(EventSeq(99));
+        assert!(matches!(
+            observe_source_log(&source_path).complete(&wrong_sequence),
+            Err(RiskInputsUnavailable::PriceConflict)
+        ));
+
+        let mut wrong_hash = binding;
+        wrong_hash.last_hash = blake3::Hash::from_bytes([99; 32]);
+        assert!(matches!(
+            observe_source_log(&source_path).complete(&wrong_hash),
+            Err(RiskInputsUnavailable::PriceConflict)
+        ));
+    }
+
+    /// PASS: bounded catch-up accepts an empty suffix without notifying the observer or changing
+    /// the projection.
+    #[test]
+    fn source_receipt_catch_up_to_accepts_empty_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let before = source_index_snapshot(&index);
+        let expected_tail = std::fs::metadata(&source_path).unwrap().len();
+        let mut observed = Vec::new();
+
+        index
+            .catch_up_to(expected_tail, &mut |offset, envelope| {
+                observed.push((offset, envelope.seq));
+            })
+            .unwrap();
+
+        assert!(observed.is_empty());
+        assert_eq!(source_index_snapshot(&index), before);
+    }
+
+    /// PASS: bounded catch-up reports exactly the newly recovered frames at their physical starts
+    /// and commits their receipts through the requested tail.
+    #[test]
+    fn source_receipt_catch_up_to_observes_valid_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(11, b"second")).unwrap();
+        writer.append_synced(source_input(12, b"third")).unwrap();
+        drop(writer);
+        let expected_tail = std::fs::metadata(&source_path).unwrap().len();
+        let expected = Reader::replay_with_offsets(&source_path)
+            .unwrap()
+            .skip(1)
+            .map(|item| {
+                let (offset, _, envelope) = item.unwrap();
+                (offset, envelope.seq, envelope.payload)
+            })
+            .collect::<Vec<_>>();
+        let mut observed = Vec::new();
+
+        index
+            .catch_up_to(expected_tail, &mut |offset, envelope| {
+                observed.push((offset, envelope.seq, envelope.payload.clone()));
+            })
+            .unwrap();
+
+        assert_eq!(observed, expected);
+        assert_eq!(source_index_snapshot(&index).0.len(), 3);
+        assert_eq!(source_index_snapshot(&index).1, Some(expected_tail));
+    }
+
+    /// PASS: bounded catch-up refuses a suffix whose first frame does not continue the indexed
+    /// hash, without committing any recovered metadata.
+    #[test]
+    fn source_receipt_catch_up_to_rejects_wrong_preceding_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        index
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frames[0]
+            .receipt
+            .this_hash = blake3::Hash::from_bytes([99; 32]);
+        let before = source_index_snapshot(&index);
+
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(11, b"second")).unwrap();
+        drop(writer);
+        let expected_tail = std::fs::metadata(&source_path).unwrap().len();
+
+        assert_eq!(
+            index.catch_up_to(expected_tail, &mut |_, _| {}),
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+        assert_eq!(source_index_snapshot(&index), before);
+    }
+
+    /// PASS: bounded catch-up refuses an incomplete final frame and leaves the projection at its
+    /// prior verified boundary.
+    #[test]
+    fn source_receipt_catch_up_to_rejects_incomplete_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let before = source_index_snapshot(&index);
+
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(11, b"second")).unwrap();
+        drop(writer);
+        let full_tail = std::fs::metadata(&source_path).unwrap().len();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        file.set_len(full_tail - 1).unwrap();
+        let expected_tail = full_tail - 1;
+
+        assert_eq!(
+            index.catch_up_to(expected_tail, &mut |_, _| {}),
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+        assert_eq!(source_index_snapshot(&index), before);
+    }
+
+    /// PASS: bounded catch-up refuses a file longer than the caller's exact expected tail before
+    /// observing or committing any suffix frame.
+    #[test]
+    fn source_receipt_catch_up_to_rejects_longer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let before = source_index_snapshot(&index);
+        let expected_tail = std::fs::metadata(&source_path).unwrap().len();
+
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(11, b"second")).unwrap();
+        drop(writer);
+        let mut observed = 0;
+
+        assert_eq!(
+            index.catch_up_to(expected_tail, &mut |_, _| observed += 1),
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+        assert_eq!(observed, 0);
+        assert_eq!(source_index_snapshot(&index), before);
+    }
+
+    /// PASS: sequence lookup distinguishes absence from the exact stored receipt and receive time.
+    #[test]
+    fn source_receipt_lookup_has_absent_and_present_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let stored = writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+
+        assert_eq!(index.receipt_at(EventSeq(1)).unwrap(), None);
+        assert_eq!(
+            index.receipt_at(EventSeq(0)).unwrap(),
+            Some((stored, 10_000))
+        );
+    }
+
+    /// PASS: suspension fails all source-receipt lookups closed while leaving recovery available;
+    /// resume restores access to the exact indexed frame.
+    #[test]
+    fn source_receipt_suspend_and_resume_gate_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let stored = writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+
+        index.suspend();
+        assert_eq!(
+            index.receipt_at(stored.sequence),
+            Err(RiskInputsUnavailable::SourceLogUncertain)
+        );
+        assert_eq!(
+            index.received_millis(stored),
+            Err(RiskInputsUnavailable::SourceLogUncertain)
+        );
+        assert_eq!(
+            index.source_envelope(stored),
+            Err(RiskInputsUnavailable::SourceLogUncertain)
+        );
+        let tail = std::fs::metadata(&source_path).unwrap().len();
+        index.catch_up_to(tail, &mut |_, _| {}).unwrap();
+
+        index.resume();
+        assert_eq!(
+            index.receipt_at(stored.sequence).unwrap(),
+            Some((stored, 10_000))
+        );
+        assert_eq!(index.received_millis(stored).unwrap(), 10_000);
+        assert_eq!(index.source_envelope(stored).unwrap().payload, b"first");
     }
 
     /// PASS: the maintained index retains zero payload bytes, and appending metadata while an
