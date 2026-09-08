@@ -3,14 +3,15 @@
 //! final frame, refusal of a truncation into the recorded prefix, a typed boot failure on poison
 //! followed by restart recovery, the handoff drift check, and the not-installed fallbacks.
 #![cfg(feature = "scenario")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pe_core_types::{
-    BasisPoints, CollateralAmount, EventSeq, ReceivedAt, SourceId, SourceTimestamp, WalletAddress,
+    BasisPoints, CollateralAmount, EventSeq, ReceivedAt, ReconstructionQuality, SourceId,
+    SourceTimestamp, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
 use pe_execution_core::LiveJournal;
@@ -24,7 +25,7 @@ use pe_service::risk_inputs::SourceReceiptIndex;
 use pe_service::source_log_boot::{SourceLogBoot, SourceLogBootHooks};
 use pe_service::trade_poller::{DAILY_BOUNDARY_SOURCE_ID, rebuild_reconciliation_obligations};
 use pe_source_polymarket_public::{ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION};
-use pe_trader_index::{ReconstructionQuality, Watchlist, WatchlistEntry, WatchlistTier};
+use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rusqlite::Connection;
 use rust_decimal_macros::dec;
 use time::OffsetDateTime;
@@ -151,10 +152,8 @@ fn version_one_fixture() -> (tempfile::TempDir, PaperMigrationPaths) {
         &paths.source_log,
         envelope("migration-fixture", 1, 1, br#"{"source":1}"#, NOW_UNIX),
     );
-    append(
-        &paths.paper_log,
-        envelope("migration-fixture", 1, 1, br#"{"paper":1}"#, NOW_UNIX),
-    );
+    // Header-only: every paper-log frame is decoded as a paper record by its consumers.
+    drop(Writer::open(&paths.paper_log).unwrap());
     drop(LiveJournal::open(&paths.live_journal).unwrap());
     std::fs::write(
         &paths.legacy_history,
@@ -183,22 +182,39 @@ fn installed_fixture() -> (tempfile::TempDir, PaperMigrationPaths) {
     (dir, paths)
 }
 
-fn recorded_source_tail(paths: &PaperMigrationPaths) -> u64 {
+fn recorded_source(paths: &PaperMigrationPaths) -> pe_event_log::LogTailBinding {
     MigrationMetadata::read(&paths.fixed_main)
         .unwrap()
         .unwrap()
         .activation_tails
         .unwrap()
         .source
-        .physical_tail
+}
+
+fn recorded_source_tail(paths: &PaperMigrationPaths) -> u64 {
+    recorded_source(paths).physical_tail
+}
+
+/// Sequence of the frame `offset` frames after the recorded activation prefix.
+fn sequence_after_prefix(paths: &PaperMigrationPaths, offset: u64) -> Option<EventSeq> {
+    let last = recorded_source(paths).last_sequence.unwrap().0;
+    Some(EventSeq(last + offset))
 }
 
 fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
-fn assert_same_receipts(index: &SourceReceiptIndex, expected: &SourceReceiptIndex, frames: u64) {
-    for sequence in 0..=frames {
+fn open_error(paths: &PaperMigrationPaths, financial_era: bool) -> anyhow::Error {
+    match SourceLogBoot::open(paths, financial_era) {
+        Err(error) => error,
+        Ok(Some(_)) => panic!("expected the boot walk to fail, it opened"),
+        Ok(None) => panic!("expected the boot walk to fail, it reported not installed"),
+    }
+}
+
+fn assert_same_receipts(index: &SourceReceiptIndex, expected: &SourceReceiptIndex, last: u64) {
+    for sequence in 0..=last + 1 {
         let sequence = EventSeq(sequence);
         assert_eq!(
             index.receipt_at(sequence).unwrap(),
@@ -225,8 +241,16 @@ fn installed_boot_walks_once_and_publishes_only_after_the_suffix_walk() {
     let mut boot = opened.boot;
     let mut sink = opened.sink;
     assert_eq!(opened.binding, Scanner::verify(&paths.source_log).unwrap());
+    assert_eq!(
+        opened.binding.last_sequence,
+        sequence_after_prefix(&paths, 4)
+    );
     let walked = SourceReceiptIndex::replay(&paths.source_log).unwrap();
-    assert_same_receipts(&boot.receipt_index(), &walked, 5);
+    assert_same_receipts(
+        &boot.receipt_index(),
+        &walked,
+        opened.binding.last_sequence.unwrap().0,
+    );
 
     // Boot appends land after the whole-file walk and are walked once, bounded by the sink tail.
     sink.append_durable(activity_envelope("0xt3", NOW_UNIX + 4))
@@ -235,9 +259,13 @@ fn installed_boot_walks_once_and_publishes_only_after_the_suffix_walk() {
         .unwrap(); // coalesces with the earlier group; the earliest receipt wins
     let after = boot.extend(&mut sink).unwrap();
     assert_eq!(after, Scanner::verify(&paths.source_log).unwrap());
-    assert_eq!(after.last_sequence, Some(EventSeq(6)));
+    assert_eq!(after.last_sequence, sequence_after_prefix(&paths, 6));
     let extended = SourceReceiptIndex::replay(&paths.source_log).unwrap();
-    assert_same_receipts(&boot.receipt_index(), &extended, 6);
+    assert_same_receipts(
+        &boot.receipt_index(),
+        &extended,
+        after.last_sequence.unwrap().0,
+    );
 
     let paper_state = PaperStateDb::open(&paths.fixed_main).unwrap();
     let published = boot.obligations(&paper_state, &paths.paper_log).unwrap();
@@ -312,7 +340,7 @@ fn torn_final_frame_after_the_prefix_is_repaired_once_under_the_lock() {
         .unwrap();
     let after = boot.extend(&mut sink).unwrap();
     assert_eq!(after, Scanner::verify(&paths.source_log).unwrap());
-    assert_eq!(after.last_sequence, Some(EventSeq(3)));
+    assert_eq!(after.last_sequence, sequence_after_prefix(&paths, 3));
 }
 
 #[test]
@@ -329,7 +357,7 @@ fn truncation_into_the_recorded_prefix_is_refused_without_repair() {
     drop(file);
     let bytes_before = std::fs::read(&paths.source_log).unwrap();
 
-    let error = SourceLogBoot::open(&paths, false).unwrap_err();
+    let error = open_error(&paths, false);
     assert!(
         format!("{error:#}").contains("verify and open source event log"),
         "{error:#}"
@@ -355,7 +383,7 @@ fn reducer_errors_refuse_publication_and_scanner_errors_take_precedence() {
             NOW_UNIX + 1,
         ),
     );
-    let error = SourceLogBoot::open(&paths, false).unwrap_err();
+    let error = open_error(&paths, false);
     assert!(
         format!("{error:#}").contains("reduce source-log frames during the boot walk"),
         "{error:#}"
@@ -367,7 +395,7 @@ fn reducer_errors_refuse_publication_and_scanner_errors_take_precedence() {
     let flip = bytes.len() - 40;
     bytes[flip] ^= 0xff;
     std::fs::write(&paths.source_log, &bytes).unwrap();
-    let error = SourceLogBoot::open(&paths, false).unwrap_err();
+    let error = open_error(&paths, false);
     let rendered = format!("{error:#}");
     assert!(
         rendered.contains("verify and open source event log"),
@@ -404,7 +432,10 @@ fn poisoned_sink_fails_the_boot_typed_and_a_restart_recovers() {
     // A plain restart re-verifies the complete file and resumes without operator state.
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
     assert_eq!(opened.binding, Scanner::verify(&paths.source_log).unwrap());
-    assert_eq!(opened.binding.last_sequence, Some(EventSeq(2)));
+    assert_eq!(
+        opened.binding.last_sequence,
+        sequence_after_prefix(&paths, 2)
+    );
     let mut boot = opened.boot;
     let mut sink = opened.sink;
     let after = boot.extend(&mut sink).unwrap();
@@ -461,7 +492,7 @@ fn pre_financial_boot_ignores_a_malformed_daily_boundary_frame_and_a_financial_b
     );
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
     drop(opened);
-    let error = SourceLogBoot::open(&paths, true).unwrap_err();
+    let error = open_error(&paths, true);
     assert!(
         format!("{error:#}").contains("reduce source-log frames during the boot walk"),
         "{error:#}"
@@ -500,7 +531,10 @@ fn financial_boot_replays_start_membership_through_the_index_and_recovers_the_bo
     let expected = replay_membership(&era, start_batch(), &paths.source_log)
         .unwrap()
         .unwrap();
-    assert_eq!(replayed.watchlist, expected.watchlist);
+    assert_eq!(
+        serde_json::to_vec(&replayed.watchlist.entries).unwrap(),
+        serde_json::to_vec(&expected.watchlist.entries).unwrap()
+    );
     assert_eq!(
         replayed.last_ranking_batch_id,
         expected.last_ranking_batch_id
