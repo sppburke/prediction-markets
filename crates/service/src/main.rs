@@ -18,8 +18,8 @@ use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_migration::{
     PaperMigrationBoot, PaperMigrationPaths, append_remote_authority_snapshot,
-    record_activation_facts, rollback_version_one, validate_initial_configuration,
-    validate_migration_authority,
+    record_activation_facts, rollback_version_one, update_installed_log_paths,
+    validate_initial_configuration, validate_migration_authority,
 };
 use pe_service::paper_recovery::{
     active_risk_halts, build_leader_ledger, paper_era, reconcile_paper_state, replay_membership,
@@ -189,6 +189,9 @@ async fn main() -> Result<()> {
     }
     if env::args().any(|a| a == "--rollback-paper-v1") {
         return run_rollback_paper_v1();
+    }
+    if env::args().any(|a| a == "--update-paper-migration-paths") {
+        return run_update_paper_migration_paths();
     }
     if args.iter().any(|argument| argument == "--qualify") {
         let options = pe_service::qualification::QualifyOptions {
@@ -1782,6 +1785,26 @@ fn run_rollback_paper_v1() -> Result<()> {
         &failed_side,
     )?;
     println!("paper-state version-one main restored; WAL/SHM sidecars were not restored");
+    Ok(())
+}
+
+/// Rebind the installed migration record of a generation that was moved as a whole (the
+/// rehearsal's private copy) to the configured paths, then exit (#570). A no-op where the recorded
+/// paths already match; refused for a main still in its recorded origin directory.
+fn run_update_paper_migration_paths() -> Result<()> {
+    let cfg = load_config()?;
+    let updated = update_installed_log_paths(&PaperMigrationPaths {
+        fixed_main: cfg.paper_state_db_path,
+        source_log: cfg.source_event_log_path,
+        paper_log: cfg.event_log_path.clone(),
+        live_journal: live_journal_path(&cfg.event_log_path),
+        legacy_history: cfg.legacy_wallet_history_path,
+        binary_identity: build_identity().to_owned(),
+    })?;
+    println!(
+        "paper migration paths {}",
+        if updated { "updated" } else { "unchanged" }
+    );
     Ok(())
 }
 

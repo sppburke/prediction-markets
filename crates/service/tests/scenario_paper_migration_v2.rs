@@ -277,3 +277,234 @@ fn paper_migration_resume_refuses_truncated_log_and_changed_identities() {
         }
     }
 }
+
+/// Drive the fixture through the one-time migration to an installed main.
+fn install_generation(paths: &PaperMigrationPaths) {
+    let migration = PaperMigrationBoot::prepare(paths.clone(), 1_788_192_000).unwrap();
+    append(&paths.source_log, br#"{"source":2}"#);
+    let side_state = PaperStateDb::open(&migration.active_main).unwrap();
+    side_state
+        .record_migration_activation_facts(
+            &serde_json::json!({"fixture": "complete"}),
+            &paths.binary_identity,
+        )
+        .unwrap();
+    drop(side_state);
+    migration.session.unwrap().finish().unwrap();
+    assert_eq!(
+        MigrationMetadata::read(&paths.fixed_main)
+            .unwrap()
+            .unwrap()
+            .phase,
+        MigrationPhase::Installed
+    );
+}
+
+/// Copy the five generation files into a fresh directory (the rehearsal's private copy) and
+/// return that directory's paths.
+fn copied_generation(paths: &PaperMigrationPaths) -> (tempfile::TempDir, PaperMigrationPaths) {
+    Connection::open(&paths.fixed_main)
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let copy = |from: &std::path::Path| {
+        let to = dir.path().join(from.file_name().unwrap());
+        std::fs::copy(from, &to).unwrap();
+        to
+    };
+    let copied = PaperMigrationPaths {
+        fixed_main: copy(&paths.fixed_main),
+        source_log: copy(&paths.source_log),
+        paper_log: copy(&paths.paper_log),
+        live_journal: copy(&paths.live_journal),
+        legacy_history: copy(&paths.legacy_history),
+        binary_identity: paths.binary_identity.clone(),
+    };
+    (dir, copied)
+}
+
+fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap()
+}
+
+/// PASS: a copied installed generation is refused by the boot pre-check until its recorded log
+/// paths are updated; the update rewrites only the three activation-tail paths, is idempotent,
+/// works on a schema-two copy before the writable upgrade, and leaves the original generation
+/// byte-identical and bootable (#570).
+#[test]
+fn copied_installed_generation_boots_after_updating_its_recorded_log_paths() {
+    let (_dir, paths) = migration_fixture();
+    install_generation(&paths);
+    let original_record = MigrationMetadata::read(&paths.fixed_main).unwrap().unwrap();
+    let original_bytes = std::fs::read(&paths.fixed_main).unwrap();
+
+    let (_copy_dir, copied) = copied_generation(&paths);
+    let refused = PaperMigrationBoot::prepare(copied.clone(), 1_788_192_003).unwrap_err();
+    assert!(
+        format!("{refused:#}")
+            .contains("configured source log no longer matches the migration record"),
+        "{refused:#}"
+    );
+
+    assert!(pe_service::paper_migration::update_installed_log_paths(&copied).unwrap());
+    let booted = PaperMigrationBoot::prepare(copied.clone(), 1_788_192_004).unwrap();
+    assert!(booted.session.is_none());
+    assert_eq!(booted.record.phase, MigrationPhase::Installed);
+    let mut expected_tails = original_record.activation_tails.clone().unwrap();
+    expected_tails.source.path = canonical(&copied.source_log);
+    expected_tails.paper.path = canonical(&copied.paper_log);
+    expected_tails.live_journal.path = canonical(&copied.live_journal);
+    assert_eq!(booted.record.activation_tails, Some(expected_tails));
+    assert_eq!(
+        booted.record.version_one_boundary,
+        original_record.version_one_boundary
+    );
+    assert_eq!(booted.record.side_main_path, original_record.side_main_path);
+    assert_eq!(booted.record.input_hashes, original_record.input_hashes);
+    assert!(!pe_service::paper_migration::update_installed_log_paths(&copied).unwrap());
+
+    // The production case: the copy is still at the exact-migration schema version. The update
+    // and the pre-check leave the version alone; only the writable open upgrades it.
+    let (_v2_dir, v2_copy) = copied_generation(&paths);
+    Connection::open(&v2_copy.fixed_main)
+        .unwrap()
+        .pragma_update(None, "user_version", LEGACY_EXACT_MIGRATION_VERSION)
+        .unwrap();
+    assert!(pe_service::paper_migration::update_installed_log_paths(&v2_copy).unwrap());
+    let v2_booted = PaperMigrationBoot::prepare(v2_copy.clone(), 1_788_192_005).unwrap();
+    assert_eq!(v2_booted.record.phase, MigrationPhase::Installed);
+    assert_eq!(
+        MigrationMetadata::schema_version(&v2_copy.fixed_main).unwrap(),
+        LEGACY_EXACT_MIGRATION_VERSION
+    );
+    drop(PaperStateDb::open(&v2_copy.fixed_main).unwrap());
+    assert_eq!(
+        MigrationMetadata::schema_version(&v2_copy.fixed_main).unwrap(),
+        SCHEMA_VERSION
+    );
+
+    assert_eq!(
+        MigrationMetadata::read(&paths.fixed_main).unwrap().unwrap(),
+        original_record
+    );
+    assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), original_bytes);
+    assert!(PaperMigrationBoot::prepare(paths, 1_788_192_006).is_ok());
+}
+
+/// PASS: the update refuses to rebind the original main to alternate logs, refuses a copy whose
+/// recorded prefix is mutated, truncated, or whose live journal carries invalid native content,
+/// and refuses an unknown schema version; a valid suffix appended after the recorded prefix is
+/// accepted (#570).
+#[test]
+fn updating_recorded_log_paths_refuses_the_origin_main_and_every_prefix_mismatch() {
+    let (_dir, paths) = migration_fixture();
+    install_generation(&paths);
+    let original_record = MigrationMetadata::read(&paths.fixed_main).unwrap().unwrap();
+    let original_bytes = std::fs::read(&paths.fixed_main).unwrap();
+    let recorded = original_record.activation_tails.clone().unwrap();
+
+    let (_alternate_dir, alternate) = copied_generation(&paths);
+    let rebind_production = PaperMigrationPaths {
+        fixed_main: paths.fixed_main.clone(),
+        source_log: alternate.source_log.clone(),
+        paper_log: alternate.paper_log.clone(),
+        live_journal: alternate.live_journal.clone(),
+        legacy_history: paths.legacy_history.clone(),
+        binary_identity: paths.binary_identity.clone(),
+    };
+    let refused =
+        pe_service::paper_migration::update_installed_log_paths(&rebind_production).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("origin directory"),
+        "{refused:#}"
+    );
+    assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), original_bytes);
+
+    let (_suffix_dir, with_suffix) = copied_generation(&paths);
+    append(&with_suffix.source_log, br#"{"source":9}"#);
+    assert!(pe_service::paper_migration::update_installed_log_paths(&with_suffix).unwrap());
+    assert!(PaperMigrationBoot::prepare(with_suffix, 1_788_192_007).is_ok());
+
+    let (_mutated_dir, mutated) = copied_generation(&paths);
+    let mut paper_bytes = std::fs::read(&mutated.paper_log).unwrap();
+    let inside_prefix = usize::try_from(recorded.paper.physical_tail).unwrap() - 1;
+    paper_bytes[inside_prefix] ^= 0xff;
+    std::fs::write(&mutated.paper_log, paper_bytes).unwrap();
+    let before = std::fs::read(&mutated.fixed_main).unwrap();
+    assert!(pe_service::paper_migration::update_installed_log_paths(&mutated).is_err());
+    assert_eq!(std::fs::read(&mutated.fixed_main).unwrap(), before);
+
+    let (_journal_dir, bad_journal) = copied_generation(&paths);
+    append(
+        &bad_journal.live_journal,
+        b"not a native live-journal event",
+    );
+    assert!(pe_service::paper_migration::update_installed_log_paths(&bad_journal).is_err());
+
+    let (_short_dir, truncated) = copied_generation(&paths);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&truncated.source_log)
+        .unwrap()
+        .set_len(recorded.source.physical_tail - 1)
+        .unwrap();
+    assert!(pe_service::paper_migration::update_installed_log_paths(&truncated).is_err());
+
+    let (_unknown_dir, unknown) = copied_generation(&paths);
+    Connection::open(&unknown.fixed_main)
+        .unwrap()
+        .pragma_update(None, "user_version", 999)
+        .unwrap();
+    assert!(pe_service::paper_migration::update_installed_log_paths(&unknown).is_err());
+
+    assert_eq!(
+        MigrationMetadata::read(&paths.fixed_main).unwrap().unwrap(),
+        original_record
+    );
+}
+
+/// PASS: the `--update-paper-migration-paths` command loads the configuration from the file plus
+/// the copied-generation overrides under a cleared environment, reports `updated` then
+/// `unchanged`, exits 0, and the copy boots afterwards (#570).
+#[test]
+fn update_paper_migration_paths_command_rebinds_a_copied_generation() {
+    let (dir, paths) = migration_fixture();
+    install_generation(&paths);
+    let (copy_dir, copied) = copied_generation(&paths);
+    let config = dir.path().join("service.toml");
+    std::fs::write(&config, "").unwrap();
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"))
+            .env_clear()
+            .env("PE_PAPER_STATE_DB_PATH", &copied.fixed_main)
+            .env("PE_EVENT_LOG_PATH", &copied.paper_log)
+            .env("PE_SOURCE_EVENT_LOG_PATH", &copied.source_log)
+            .env("PE_LEGACY_WALLET_HISTORY_PATH", &copied.legacy_history)
+            .env("PE_JSONL_LOG_PATH", copy_dir.path().join("paper.jsonl"))
+            .env("PE_STATUS_PATH", copy_dir.path().join("status.json"))
+            .arg(&config)
+            .arg("--update-paper-migration-paths")
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&first.stdout).trim(),
+        "paper migration paths updated"
+    );
+    let second = run();
+    assert!(second.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&second.stdout).trim(),
+        "paper migration paths unchanged"
+    );
+    let booted = PaperMigrationBoot::prepare(copied, 1_788_192_008).unwrap();
+    assert!(booted.session.is_none());
+    assert_eq!(booted.record.phase, MigrationPhase::Installed);
+}

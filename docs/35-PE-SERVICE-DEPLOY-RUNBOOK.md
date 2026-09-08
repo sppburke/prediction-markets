@@ -301,7 +301,11 @@ after #556 with a nonempty membership (#567): the rehearsal child upgrades only 
 in the canonical route the production file is written only inside Start, after the stop at
 `prepared`. Any read-write open by the reviewed binary would upgrade the production file in place
 and strand the installed binary's rollback, so never run the reviewed binary's `--report`,
-`--backfill-supabase`, or an ordinary start against the production paper state before Start. A new or reused checkpoint must have the exact six-entry `copied.sha256` inventory and pass
+`--backfill-supabase`, or an ordinary start against the production paper state before Start. Before
+starting the child, the harness runs the reviewed binary's `--update-paper-migration-paths` on the
+private copy, which verifies the recorded activation prefixes against the copied logs and rewrites
+only the copy's recorded log paths (the installed migration record binds absolute paths, #570); the
+production record is never touched. A new or reused checkpoint must have the exact six-entry `copied.sha256` inventory and pass
 `sha256sum --strict -c` before use. `PE_REHEARSAL_BIND` is mandatory and must be a numeric loopback
 address with a nonzero port different from the installed service's port; the harness passes it to
 the child as `PE_BIND`, derives the readiness URL from it, and runs against real first-party venue

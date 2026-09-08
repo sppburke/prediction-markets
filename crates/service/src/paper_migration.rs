@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail, ensure};
 use pe_core_types::{EventSeq, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
 use pe_event_log::envelope::{HashInput, compute_hashes};
-use pe_event_log::{ContentType, EnvelopeIn, Scanner};
+use pe_event_log::{ContentType, EnvelopeIn, LogTailBinding, Scanner};
 use pe_execution_core::LiveJournal;
 use pe_paper_state::{
     DurableLogBindings, LEGACY_EXACT_MIGRATION_VERSION, MigrationMetadata, MigrationPhase,
@@ -436,6 +436,65 @@ impl PaperMigrationSession {
         MigrationMetadata::finalize_side_main_v2(&self.paths.fixed_main)
             .context("seal installed version-two paper main")
     }
+}
+
+/// Offline: rebind the installed activation tails of a generation that was moved as a whole (the
+/// rehearsal's private copy) to the configured paths, after proving that every configured log
+/// still carries the recorded activation prefix with the installed branch's own checks (#570).
+/// Returns `false` without writing when the recorded paths already match; never touches the logs.
+/// The paper-state owner refuses a main that is still in its recorded origin directory, so the
+/// production generation cannot be rebound to alternate logs.
+pub fn update_installed_log_paths(paths: &PaperMigrationPaths) -> Result<bool> {
+    let schema = MigrationMetadata::schema_version(&paths.fixed_main)
+        .context("inspect fixed paper-state schema before updating migration paths")?;
+    ensure!(
+        schema == SCHEMA_VERSION || schema == LEGACY_EXACT_MIGRATION_VERSION,
+        "paper migration paths can only be updated on an installed version-two main (schema {schema})"
+    );
+    let record = MigrationMetadata::read(&paths.fixed_main)
+        .context("read installed paper migration record")?
+        .context("v2 paper main omitted migration record")?;
+    MigrationMetadata::verify_activation_facts(&paths.fixed_main)
+        .context("verify installed paper migration activation census")?;
+    ensure!(
+        record.phase == MigrationPhase::Installed,
+        "v2 paper main is not installed: {}",
+        record.phase
+    );
+    let recorded = record
+        .activation_tails
+        .as_ref()
+        .context("installed paper migration omitted activation tails")?;
+    let configured = DurableLogBindings {
+        source: LogTailBinding {
+            path: std::fs::canonicalize(&paths.source_log)?,
+            ..recorded.source.clone()
+        },
+        paper: LogTailBinding {
+            path: std::fs::canonicalize(&paths.paper_log)?,
+            ..recorded.paper.clone()
+        },
+        live_journal: LogTailBinding {
+            path: std::fs::canonicalize(&paths.live_journal)?,
+            ..recorded.live_journal.clone()
+        },
+    };
+    if configured.source.path == recorded.source.path
+        && configured.paper.path == recorded.paper.path
+        && configured.live_journal.path == recorded.live_journal.path
+    {
+        return Ok(false);
+    }
+    Scanner::verify_prefix(&configured.source)
+        .context("verify recorded source-log prefix at the configured path")?;
+    Scanner::verify_prefix(&configured.paper)
+        .context("verify recorded paper-log prefix at the configured path")?;
+    LiveJournal::verified_tail(&paths.live_journal)
+        .context("verify current native live-journal payloads")?;
+    Scanner::verify_prefix(&configured.live_journal)
+        .context("verify recorded live-journal prefix at the configured path")?;
+    MigrationMetadata::update_installed_log_paths(&paths.fixed_main, &configured)
+        .context("update installed paper migration paths")
 }
 
 /// Offline pre-append rollback. The fixed v1 record is the authority; all
