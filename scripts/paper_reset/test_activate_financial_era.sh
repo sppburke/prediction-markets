@@ -1282,6 +1282,112 @@ set -e
   fail "malformed optional risk-halt release row was not refused: $output"
 [[ ! -e "$root/test-state/archive-count" ]] || fail "malformed release row reached archive"
 
+# Scenario FE-EMPTY-MEMBERSHIP-FRESH-00F
+# Preconditions: a fresh invocation receives an empty membership file.
+# PASS: manifest construction refuses before creating durable state or stopping the service.
+# FAIL: the shared resume check handles the refusal, a manifest exists, or the service stops.
+root=$TEST_TMP/empty-membership-fresh
+setup_fixture "$root"
+printf '%s\n' '[]' > "$root/target/membership.json"
+driver_args "$root"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'membership must not be empty'* &&
+   "$output" != *'financial-era manifest membership is empty; refusing to go forward'* ]] ||
+  fail "fresh empty membership did not fail during manifest construction: $output"
+[[ ! -e "$root/pe-financial-era.json" && $(<"$root/test-state/service.active") == true &&
+   ! -e "$root/test-state/stop-count" ]] ||
+  fail "fresh empty membership created a manifest or stopped the service"
+
+# Scenario FE-EMPTY-MEMBERSHIP-PREPARED-00G
+# Preconditions: an older prepared manifest and the supplied membership file both record `[]`.
+# PASS: the shared pre-Start check refuses before service stop and leaves the manifest byte-identical.
+# FAIL: identity validation wins, the service stops, or the prepared manifest changes.
+root=$TEST_TMP/empty-membership-prepared
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "empty prepared membership setup did not reach prepared"
+printf '%s\n' '[]' > "$root/target/membership.json"
+python3 -c 'import json,sys
+path=sys.argv[1]; value=json.load(open(path)); value["membership"]=[]
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
+  "$root/pe-financial-era.json"
+manifest_before=$(sha256sum "$root/pe-financial-era.json")
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'financial-era manifest membership is empty; refusing to go forward'* &&
+   "$output" != *'membership identity changed'* ]] ||
+  fail "prepared empty membership did not reach the shared refusal: $output"
+manifest_after=$(sha256sum "$root/pe-financial-era.json")
+[[ "$manifest_before" == "$manifest_after" && $(<"$root/test-state/service.active") == true &&
+   ! -e "$root/test-state/stop-count" ]] ||
+  fail "prepared empty membership changed the manifest or stopped the service"
+
+# Scenario FE-EMPTY-MEMBERSHIP-GUARDED-00H
+# Preconditions: an older guarded manifest and the supplied membership file both record `[]`.
+# PASS: the shared pre-Start check refuses before archive or Start and leaves the manifest unchanged.
+# FAIL: identity validation wins, archive/Start occurs, or the guarded manifest changes.
+root=$TEST_TMP/empty-membership-guarded
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after guarded >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 && $(<"$root/test-state/stop-count") -eq 1 ]] ||
+  fail "empty guarded membership setup did not reach guarded"
+printf '%s\n' '[]' > "$root/target/membership.json"
+python3 -c 'import json,sys
+path=sys.argv[1]; value=json.load(open(path)); value["membership"]=[]
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
+  "$root/pe-financial-era.json"
+manifest_before=$(sha256sum "$root/pe-financial-era.json")
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'financial-era manifest membership is empty; refusing to go forward'* &&
+   "$output" != *'membership identity changed'* ]] ||
+  fail "guarded empty membership did not reach the shared refusal: $output"
+manifest_after=$(sha256sum "$root/pe-financial-era.json")
+[[ "$manifest_before" == "$manifest_after" && $(<"$root/test-state/stop-count") -eq 1 &&
+   ! -e "$root/test-state/archive-count" && ! -e "$root/test-state/complete-start" ]] ||
+  fail "guarded empty membership changed the manifest or crossed archive/Start"
+
+# Scenario FE-EMPTY-MEMBERSHIP-ROLLBACK-00I
+# Preconditions: an older prepared manifest and the supplied membership file both record `[]`.
+# PASS: no-Start rollback bypasses the forward refusal and durably reaches `rolled_back`.
+# FAIL: empty membership blocks rollback or any stop, archive, or Start mutation occurs.
+root=$TEST_TMP/empty-membership-rollback
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "empty membership rollback setup did not reach prepared"
+printf '%s\n' '[]' > "$root/target/membership.json"
+python3 -c 'import json,sys
+path=sys.argv[1]; value=json.load(open(path)); value["membership"]=[]
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
+  "$root/pe-financial-era.json"
+run_driver "$root" --rollback-before-start >/dev/null
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1])); assert value["state"]=="rolled_back"
+assert value["membership"] == [] and value["no_financial_mutation"] is True' \
+  "$root/pe-financial-era.json" || fail "empty membership no-Start rollback did not complete"
+[[ $(<"$root/test-state/service.active") == true && ! -e "$root/test-state/stop-count" &&
+   ! -e "$root/test-state/archive-count" && ! -e "$root/test-state/complete-start" ]] ||
+  fail "empty membership no-Start rollback crossed a mutation boundary"
+
 # Scenario FE-REHEARSAL-MISSING-01
 # Preconditions: a durable prepared manifest lacks the rehearsal binding expected by the driver.
 # PASS: the rerun returns the typed unbound-evidence refusal with the service and state untouched.
@@ -1560,9 +1666,9 @@ set -e
 [[ ! -e "$root/test-state/restore-count" ]] || fail "complete Start was rolled back"
 
 # Scenario FE-SERVICE-START-06
-# Preconditions: complete Start and adopted target artifacts.
-# Injected boundary: `before-manifest-started`, after systemctl start and its own receipt.
-# PASS: rerun rolls forward without repeating archive/start. FAIL: rollback or duplicate mutation.
+# Preconditions: complete Start and adopted target artifacts; the second fixture then records `[]`.
+# Injected boundary: `before-manifest-started`, after systemctl start and its own receipt, in each fixture.
+# PASS: both reruns roll forward without repeating archive/start. FAIL: refusal or duplicate mutation.
 root=$TEST_TMP/post-service-start
 setup_fixture "$root"
 driver_args "$root"
@@ -1581,6 +1687,33 @@ run_driver "$root" >/dev/null
 [[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "Start recovery repeated remote archive"
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
   fail "Start recovery did not durably roll forward to started"
+
+root=$TEST_TMP/post-service-start-empty-membership
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after before-manifest-started >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 && $(<"$root/test-state/service.active") == true ]] ||
+  fail "empty-membership post-service-start crash seam was not reached"
+printf '%s\n' '[]' > "$root/target/membership.json"
+python3 -c 'import json,sys
+path=sys.argv[1]; value=json.load(open(path)); assert value["state"]=="guarded"
+value["membership"]=[]
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
+  "$root/pe-financial-era.json"
+run_driver "$root" >/dev/null
+[[ $(<"$root/test-state/archive-count") -eq 1 ]] || fail "Start recovery repeated remote archive"
+[[ $(<"$root/test-state/start-count") -eq 1 && $(<"$root/test-state/live-schema-count") -eq 1 &&
+   $(<"$root/test-state/forward-refresh-count") -eq 1 ]] ||
+  fail "Start recovery with empty membership repeated a completed mutation"
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1])); assert value["state"]=="started" and value["membership"] == []' \
+  "$root/pe-financial-era.json" ||
+  fail "Start recovery with empty membership did not durably roll forward to started"
+root=$TEST_TMP/post-service-start
+driver_args "$root"
 
 # Scenario FE-VERIFY-07
 # Preconditions: first same-invocation status has source poll, anchors, producers, projection, and
@@ -1733,4 +1866,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
 done
 
-echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
