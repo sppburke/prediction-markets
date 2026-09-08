@@ -9770,6 +9770,187 @@ mod tests {
         ));
     }
 
+    /// PASS: prepare captures one complete membership proof from a schema-two paper state without
+    /// changing that file, while Start performs the deferred schema-three writable migration.
+    #[test]
+    fn financial_era_schema_two_prepare_is_read_only_until_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let paper_log = temp.path().join("paper.log");
+        let source_log = temp.path().join("source.log");
+        let live_journal = temp.path().join("live_journal.log");
+        let paper_state = temp.path().join("paper.db");
+        let status_path = temp.path().join("status.json");
+        let manifest_path = temp.path().join("financial-era.json");
+        let config_rows_path = temp.path().join("financial-config.json");
+        drop(Writer::open(&paper_log).unwrap());
+        drop(Writer::open(&source_log).unwrap());
+        drop(pe_execution_core::LiveJournal::open(&live_journal).unwrap());
+
+        let wallet = WalletAddress([42; 20]);
+        let at = 1_700_000_000;
+        let state = PaperStateDb::open(&paper_state).unwrap();
+        state
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{\"complete\":true}".to_owned(),
+                updated_at_unix: at,
+            })
+            .unwrap();
+        state.set_cursor(&wallet, at).unwrap();
+        state
+            .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: at,
+                anchored_at_unix: at,
+                ledger_hash_after: "financial-era-ledger".to_owned(),
+                positions_proof_hash: "financial-era-positions".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "financial-era-source".to_owned(),
+                proof_json: "{\"anchor\":1}".to_owned(),
+                recorded_at_unix: at,
+            }])
+            .unwrap();
+        drop(state);
+
+        let connection = rusqlite::Connection::open(&paper_state).unwrap();
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                pe_paper_state::LEGACY_EXACT_MIGRATION_VERSION,
+            )
+            .unwrap();
+        drop(connection);
+        let before_bytes = fs::read(&paper_state).unwrap();
+        let before_connection = rusqlite::Connection::open_with_flags(
+            &paper_state,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let before_version: i64 = before_connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        drop(before_connection);
+        assert_eq!(
+            before_version,
+            pe_paper_state::LEGACY_EXACT_MIGRATION_VERSION
+        );
+
+        fs::write(
+            &status_path,
+            br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}"#,
+        )
+        .unwrap();
+        let config_rows = financial_config_rows();
+        fs::write(&config_rows_path, serde_json::to_vec(&config_rows).unwrap()).unwrap();
+        let mut config = ServiceConfig {
+            event_log_path: paper_log.clone(),
+            source_event_log_path: source_log.clone(),
+            ..ServiceConfig::default()
+        };
+        config.paper_state_db_path = paper_state.clone();
+        config.status_path = status_path;
+        config.supabase_authoritative = true;
+        config.supabase_url = "https://unused.invalid".to_owned();
+        config.supabase_secret_key = "test-service-role".to_owned();
+
+        let mut manifest = FinancialEraManifest {
+            kind: FINANCIAL_ERA_KIND.to_owned(),
+            state: "prepared".to_owned(),
+            activation_id: "act-545".to_owned(),
+            generation: "g557".to_owned(),
+            fresh_bankroll: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+            target_revision: "1".repeat(40),
+            artifact_blake3: "a".repeat(64),
+            static_config_hash: "b".repeat(64),
+            ranking_batch_id: 545,
+            membership: vec![wallet],
+            schema_version: 3,
+            parser_version: 1,
+            financial_semantic_version: 1,
+            start_unix: at,
+            paths: FinancialEraPaths {
+                paper_log: paper_log.clone(),
+                source_log: source_log.clone(),
+                live_journal: live_journal.clone(),
+                paper_state: paper_state.clone(),
+            },
+            old_artifact_sha256: "d".repeat(64),
+            target_artifact_sha256: "e".repeat(64),
+            old_config_sha256: "f".repeat(64),
+            target_config_sha256: "0".repeat(64),
+            old_environment_sha256: "1".repeat(64),
+            target_environment_sha256: "2".repeat(64),
+            preparation: None,
+            stop_invoked: false,
+            service_was_active: None,
+            backup: None,
+            remote_census: None,
+            guarded_logs: None,
+            start_receipt: None,
+            started_unix: None,
+        };
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let preparation: FinancialEraPreparation = serde_json::from_str(
+            &run_financial_era(
+                FinancialEraCommand::Prepare,
+                &manifest_path,
+                &config,
+                Some(&config_rows_path),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!preparation.start.membership_proofs_hash.is_empty());
+        let membership_manifest = MembershipProofBinding::decode_and_verify(
+            &preparation.start.membership_proofs_hash,
+            &[wallet],
+        )
+        .unwrap();
+        assert_eq!(membership_manifest.membership, vec![wallet]);
+        assert_eq!(membership_manifest.proofs.len(), 1);
+
+        let after_prepare_bytes = fs::read(&paper_state).unwrap();
+        let after_prepare_connection = rusqlite::Connection::open_with_flags(
+            &paper_state,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let after_prepare_version: i64 = after_prepare_connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        drop(after_prepare_connection);
+        assert_eq!(after_prepare_bytes, before_bytes);
+        assert_eq!(after_prepare_version, before_version);
+
+        manifest.state = "guarded".to_owned();
+        manifest.preparation = Some(preparation.clone());
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let start_receipt: AppendReceipt = serde_json::from_str(
+            &run_financial_era(
+                FinancialEraCommand::Start,
+                &manifest_path,
+                &config,
+                Some(&config_rows_path),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(start_receipt, preparation.expected_receipt);
+        let started_connection = rusqlite::Connection::open_with_flags(
+            &paper_state,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let started_version: i64 = started_connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(started_version, pe_paper_state::SCHEMA_VERSION);
+    }
+
     #[test]
     fn financial_prepare_is_read_only_and_start_is_receipt_idempotent() {
         let temp = tempfile::tempdir().unwrap();
