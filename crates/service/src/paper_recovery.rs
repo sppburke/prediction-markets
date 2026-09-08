@@ -807,6 +807,33 @@ pub fn replay_membership(
     start_batch: Watchlist,
     source_log: &Path,
 ) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
+    replay_membership_from(
+        era,
+        start_batch,
+        MembershipReplaySource::SourceLog(source_log),
+    )
+}
+
+/// Reconstruct membership from a process-wide source receipt index that boot already verified.
+pub(crate) fn replay_membership_with_source(
+    era: &PaperEra,
+    start_batch: Watchlist,
+    source: &crate::qualification::PublishedMembershipSource,
+) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
+    replay_membership_from(era, start_batch, MembershipReplaySource::Published(source))
+}
+
+#[derive(Clone, Copy)]
+enum MembershipReplaySource<'a> {
+    SourceLog(&'a Path),
+    Published(&'a crate::qualification::PublishedMembershipSource),
+}
+
+fn replay_membership_from(
+    era: &PaperEra,
+    start_batch: Watchlist,
+    source: MembershipReplaySource<'_>,
+) -> Result<Option<ReplayedMembership>, MembershipReplayError> {
     let Some((_, start)) = &era.start else {
         return Ok(None);
     };
@@ -847,11 +874,18 @@ pub fn replay_membership(
             last_ranking_batch_id,
         }));
     };
-    let membership_source = crate::qualification::PublishedMembershipSource::scan(source_log)
-        .map_err(|source| MembershipReplayError::Evidence {
-            sequence: first_membership_sequence,
-            source,
-        })?;
+    let scanned_source;
+    let membership_source = match source {
+        MembershipReplaySource::SourceLog(source_log) => {
+            scanned_source = crate::qualification::PublishedMembershipSource::scan(source_log)
+                .map_err(|source| MembershipReplayError::Evidence {
+                    sequence: first_membership_sequence,
+                    source,
+                })?;
+            &scanned_source
+        }
+        MembershipReplaySource::Published(source) => source,
+    };
 
     for frame in &era.frames {
         let PaperLogFrame::Record(
@@ -886,7 +920,7 @@ pub fn replay_membership(
 
         let replacements = crate::qualification::replay_published_membership_change(
             record,
-            &membership_source,
+            membership_source,
             &present,
         )
         .map_err(|source| MembershipReplayError::Evidence {
@@ -1967,18 +2001,30 @@ mod paper_log_tests {
         drop(source_writer);
 
         let era = paper_era(scan_paper_log(&paper_path).unwrap());
-        let replayed = replay_membership(
-            &era,
-            watchlist(vec![
-                watchlist_entry(first, 600),
-                watchlist_entry(second, 500),
-                watchlist_entry(third, 400),
-                watchlist_entry(fourth, 300),
-            ]),
-            &source_path,
-        )
-        .unwrap()
-        .unwrap();
+        let initial_entries = vec![
+            watchlist_entry(first, 600),
+            watchlist_entry(second, 500),
+            watchlist_entry(third, 400),
+            watchlist_entry(fourth, 300),
+        ];
+        let replayed = replay_membership(&era, watchlist(initial_entries.clone()), &source_path)
+            .unwrap()
+            .unwrap();
+        let indexed_source = crate::qualification::PublishedMembershipSource::from_index(
+            crate::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap(),
+        );
+        let indexed =
+            replay_membership_with_source(&era, watchlist(initial_entries), &indexed_source)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            indexed.last_ranking_batch_id,
+            replayed.last_ranking_batch_id
+        );
+        assert_eq!(
+            serde_json::to_vec(&indexed.watchlist.entries).unwrap(),
+            serde_json::to_vec(&replayed.watchlist.entries).unwrap()
+        );
         assert_eq!(replayed.last_ranking_batch_id, 8);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, first);
