@@ -360,6 +360,80 @@ impl MigrationMetadata {
         Ok(record)
     }
 
+    /// Rebind the installed activation tails of a generation that was moved as a whole (a
+    /// rehearsal's private copy) to their new canonical paths (#570). Only an installed main is
+    /// accepted; the main and all three logs must sit together outside the recorded origin
+    /// directory (the parent of the recorded side main), so the production generation is refused
+    /// even when its paths already match; and every tail, sequence, and hash must equal the
+    /// recorded value, so only the three `activation_tails` paths ever change. Returns `false`
+    /// without writing when a moved copy's recorded paths already equal `configured`.
+    pub fn update_installed_log_paths(
+        main: &Path,
+        configured: &DurableLogBindings,
+    ) -> Result<bool, PaperStateError> {
+        let connection = open_bootstrap(main)?;
+        let mut record =
+            read_record(&connection)?.ok_or(PaperStateError::MigrationRecordMissing)?;
+        let recorded = match (record.phase, record.activation_tails.as_ref()) {
+            (MigrationPhase::Installed, Some(tails)) => tails.clone(),
+            _ => {
+                return Err(PaperStateError::MigrationPhaseTransition {
+                    from: record.phase.to_string(),
+                    to: "update_installed_log_paths (installed required)".to_owned(),
+                });
+            }
+        };
+        let main_dir = std::fs::canonicalize(main)?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                PaperStateError::Corrupt("paper main has no parent directory".to_owned())
+            })?;
+        if record.side_main_path.parent() == Some(main_dir.as_path()) {
+            return Err(PaperStateError::Corrupt(format!(
+                "installed log paths can only be updated for a generation moved as a whole: {} \
+                 is still in the recorded origin directory",
+                main.display()
+            )));
+        }
+        for (name, binding) in [
+            (DurableLogName::Source, &configured.source),
+            (DurableLogName::Paper, &configured.paper),
+            (DurableLogName::LiveJournal, &configured.live_journal),
+        ] {
+            if binding.path.parent() != Some(main_dir.as_path()) {
+                return Err(PaperStateError::Corrupt(format!(
+                    "installed log paths can only be updated for a generation moved as a whole: \
+                     {name} log {} is not beside {}",
+                    binding.path.display(),
+                    main.display()
+                )));
+            }
+        }
+        let relocated = DurableLogBindings {
+            source: LogTailBinding {
+                path: configured.source.path.clone(),
+                ..recorded.source.clone()
+            },
+            paper: LogTailBinding {
+                path: configured.paper.path.clone(),
+                ..recorded.paper.clone()
+            },
+            live_journal: LogTailBinding {
+                path: configured.live_journal.path.clone(),
+                ..recorded.live_journal.clone()
+            },
+        };
+        verify_log_bindings(&relocated, configured)
+            .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+        if relocated == recorded {
+            return Ok(false);
+        }
+        record.activation_tails = Some(relocated);
+        write_record(main, connection, &record)?;
+        Ok(true)
+    }
+
     /// Bring the side main to the fixed main's exact synchronized record. Immutable identity
     /// divergence fails closed; a missing side record is initialized from the authority.
     pub fn mirror_to_side(fixed_path: &Path, side_path: &Path) -> Result<(), PaperStateError> {
@@ -1029,6 +1103,137 @@ mod tests {
             side_main_path: dir.join("paper_state.v2.abc123.db"),
             input_hashes: BTreeMap::from([("sidecar".to_owned(), "abc123".to_owned())]),
         }
+    }
+
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, canonical)
+    }
+
+    /// An installed main at `dir` whose record was written beside `origin`.
+    fn installed_main(dir: &Path, origin: &Path) -> (PathBuf, MigrationRecord) {
+        let main = dir.join("paper_state.db");
+        drop(PaperStateDb::open(&main).unwrap());
+        let record = MigrationRecord {
+            version_one_boundary: DurableLogBindings {
+                source: tail(&origin.join("source.log"), 1),
+                paper: tail(&origin.join("paper.log"), 2),
+                live_journal: tail(&origin.join("live_journal.log"), 3),
+            },
+            activation_tails: Some(DurableLogBindings {
+                source: tail(&origin.join("source.log"), 4),
+                paper: tail(&origin.join("paper.log"), 5),
+                live_journal: tail(&origin.join("live_journal.log"), 6),
+            }),
+            phase: MigrationPhase::Installed,
+            side_main_path: origin.join("paper_state.v2.abc123.db"),
+            input_hashes: BTreeMap::from([("sidecar".to_owned(), "abc123".to_owned())]),
+        };
+        write_record(&main, open_bootstrap(&main).unwrap(), &record).unwrap();
+        (main, record)
+    }
+
+    /// The same bindings with every path moved into `dir`.
+    fn moved(bindings: &DurableLogBindings, dir: &Path) -> DurableLogBindings {
+        let rebase = |binding: &LogTailBinding| LogTailBinding {
+            path: dir.join(binding.path.file_name().unwrap()),
+            ..binding.clone()
+        };
+        DurableLogBindings {
+            source: rebase(&bindings.source),
+            paper: rebase(&bindings.paper),
+            live_journal: rebase(&bindings.live_journal),
+        }
+    }
+
+    /// PASS: a main moved as a whole gets exactly its three activation-tail paths rebound; the
+    /// version-one boundary, side main path, phase, and input hashes stay equal; a second call is
+    /// a no-op.
+    #[test]
+    fn update_installed_log_paths_rewrites_only_the_moved_activation_tails() {
+        let (_origin, origin_dir) = canonical_tempdir();
+        let (_copy, copy_dir) = canonical_tempdir();
+        let (main, original) = installed_main(&copy_dir, &origin_dir);
+        let configured = moved(original.activation_tails.as_ref().unwrap(), &copy_dir);
+
+        assert!(MigrationMetadata::update_installed_log_paths(&main, &configured).unwrap());
+        let updated = MigrationMetadata::read(&main).unwrap().unwrap();
+        assert_eq!(updated.activation_tails.as_ref(), Some(&configured));
+        assert_eq!(updated.version_one_boundary, original.version_one_boundary);
+        assert_eq!(updated.side_main_path, original.side_main_path);
+        assert_eq!(updated.phase, MigrationPhase::Installed);
+        assert_eq!(updated.input_hashes, original.input_hashes);
+
+        assert!(!MigrationMetadata::update_installed_log_paths(&main, &configured).unwrap());
+        assert_eq!(MigrationMetadata::read(&main).unwrap().unwrap(), updated);
+    }
+
+    /// PASS: a main still in its origin directory, a log outside the main's directory, any tail
+    /// or hash difference, and a record that is not installed are all refused without a write.
+    #[test]
+    fn update_installed_log_paths_refuses_every_unsafe_request_without_writing() {
+        let (_origin, origin_dir) = canonical_tempdir();
+        let (_copy, copy_dir) = canonical_tempdir();
+        let (_elsewhere, elsewhere_dir) = canonical_tempdir();
+
+        let (origin_main, origin_record) = installed_main(&origin_dir, &origin_dir);
+        let alternate = moved(
+            origin_record.activation_tails.as_ref().unwrap(),
+            &elsewhere_dir,
+        );
+        assert!(matches!(
+            MigrationMetadata::update_installed_log_paths(&origin_main, &alternate),
+            Err(PaperStateError::Corrupt(message)) if message.contains("origin directory")
+        ));
+        let own_paths = origin_record.activation_tails.clone().unwrap();
+        assert!(matches!(
+            MigrationMetadata::update_installed_log_paths(&origin_main, &own_paths),
+            Err(PaperStateError::Corrupt(message)) if message.contains("origin directory")
+        ));
+        assert_eq!(
+            MigrationMetadata::read(&origin_main).unwrap().unwrap(),
+            origin_record
+        );
+
+        let (main, installed) = installed_main(&copy_dir, &origin_dir);
+        let recorded = installed.activation_tails.as_ref().unwrap();
+        let scattered = moved(recorded, &elsewhere_dir);
+        assert!(matches!(
+            MigrationMetadata::update_installed_log_paths(&main, &scattered),
+            Err(PaperStateError::Corrupt(message)) if message.contains("is not beside")
+        ));
+        let mut changed = moved(recorded, &copy_dir);
+        changed.paper.last_hash = Hash::from_bytes([9; 32]);
+        assert!(matches!(
+            MigrationMetadata::update_installed_log_paths(&main, &changed),
+            Err(PaperStateError::Corrupt(message)) if message.contains("paper log LastHash")
+        ));
+        let mut longer = moved(recorded, &copy_dir);
+        longer.source.physical_tail += 1;
+        assert!(matches!(
+            MigrationMetadata::update_installed_log_paths(&main, &longer),
+            Err(PaperStateError::Corrupt(message)) if message.contains("source log PhysicalTail")
+        ));
+        assert_eq!(MigrationMetadata::read(&main).unwrap().unwrap(), installed);
+
+        let unfinished_main = copy_dir.join("unfinished.db");
+        drop(PaperStateDb::open(&unfinished_main).unwrap());
+        let unfinished = record(&origin_dir);
+        write_record(
+            &unfinished_main,
+            open_bootstrap(&unfinished_main).unwrap(),
+            &unfinished,
+        )
+        .unwrap();
+        assert!(matches!(
+            MigrationMetadata::update_installed_log_paths(&unfinished_main, &moved(&unfinished.version_one_boundary, &copy_dir)),
+            Err(PaperStateError::MigrationPhaseTransition { from, .. }) if from == MigrationPhase::BoundaryRecorded.to_string()
+        ));
+        assert_eq!(
+            MigrationMetadata::read(&unfinished_main).unwrap().unwrap(),
+            unfinished
+        );
     }
 
     #[test]

@@ -508,6 +508,16 @@ service_child_env=(
   "PE_LEGACY_WALLET_HISTORY_PATH=$copy_dir/wallet_market_history.json"
 )
 
+# The copy's installed migration record still binds the production log paths. Rebind it to the
+# copy with the reviewed binary before anything else touches the private copy (#570): the verb
+# verifies the recorded activation prefixes against the copied logs and rewrites only the copy's
+# record. The production generation is never named here.
+update_output=$(env -i "${service_child_env[@]}" "$binary" "$config" --update-paper-migration-paths) || {
+  echo "FATAL: rehearsal copy migration paths were not updated" >&2
+  exit 1
+}
+echo "rehearsal copy migration paths: $update_output"
+
 wallet=$(sqlite3 "$copy_dir/paper_state.db" \
   "select c.wallet_hex from poll_cursors c join position_anchors a on a.wallet_hex=c.wallet_hex where c.activity_cutoff_unix is not null and c.reanchor_required=0 and c.wallet_hex not in (select wallet_hex from wallet_fences) order by c.wallet_hex limit 1;")
 [[ "$wallet" =~ ^0x[0-9a-f]{40}$ ]] || {

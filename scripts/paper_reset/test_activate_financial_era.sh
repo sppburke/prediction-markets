@@ -472,6 +472,31 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
       echo '{"complete_start":false,"repaired":false}'
     fi
     ;;
+  *--update-paper-migration-paths*)
+    # Runs under env -i with only the copied-generation overrides (#570): derive the fixture
+    # root from the copied database path, never from PE_ACTIVATION_TEST_ROOT.
+    [[ ! -v PE_SUPABASE_SECRET_KEY && ! -v SUPABASE_DB_URL ]] || {
+      echo "paper migration path update received a privileged credential" >&2
+      exit 96
+    }
+    case "$PE_PAPER_STATE_DB_PATH" in
+      */rehearsal/copy/paper_state.db)
+        fixture_root=${PE_PAPER_STATE_DB_PATH%/rehearsal/copy/paper_state.db}
+        ;;
+      *)
+        echo "paper migration path update did not target the rehearsal copy" >&2
+        exit 96
+        ;;
+    esac
+    [[ "${PE_EVENT_LOG_PATH-}" == "$fixture_root/rehearsal/copy/paper.log" &&
+       "${PE_SOURCE_EVENT_LOG_PATH-}" == "$fixture_root/rehearsal/copy/source_events.log" ]] || {
+      echo "paper migration path update did not receive the copied log overrides" >&2
+      exit 96
+    }
+    [[ ! -f "$fixture_root/test-state/paths-update-error" ]] || exit 94
+    printf '%s\n' "$PE_PAPER_STATE_DB_PATH" > "$fixture_root/test-state/paths-updated"
+    echo 'paper migration paths updated'
+    ;;
   *)
     [[ "${PE_SUPABASE_ANON_KEY-}" == sb_publishable_rehearsal &&
        "${PE_SUPABASE_SECRET_KEY-}" == "$PE_SUPABASE_ANON_KEY" &&
@@ -486,6 +511,10 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
         /usr/bin/ln -s "$0" "$fixture_root/proc/$$/exe"
         ;;
     esac
+    [[ -f "$fixture_root/test-state/paths-updated" ]] || {
+      echo "rehearsal child started before the copy's migration paths were updated" >&2
+      exit 93
+    }
     /usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" \
       "$fixture_root/test-state/rehearsal-account-status" <<'PY'
 import datetime,json,os,sqlite3,sys
@@ -795,6 +824,10 @@ root=$TEST_TMP/rehearsal-bindings
 setup_rehearsal_fixture "$root" true none
 output=$(run_rehearsal_fixture "$root" 2>&1)
 [[ "$output" == *REHEARSAL545_PASS* ]] || fail "bound rehearsal did not pass: $output"
+[[ "$(cat "$root/test-state/paths-updated")" == "$root/rehearsal/copy/paper_state.db" ]] ||
+  fail "rehearsal did not update the copy's migration paths before starting the child"
+[[ "$output" == *"rehearsal copy migration paths: paper migration paths updated"* ]] ||
+  fail "rehearsal output did not report the migration path update: $output"
 grep -Fq "PROCESS_EXE expected=$root/rehearsal/artifacts-1111111/pe-service resolved=$root/rehearsal/artifacts-1111111/pe-service matches=true" \
   "$root/rehearsal/watch-1111111.log" ||
   fail "rehearsal watch log did not bind the running private executable"
@@ -870,6 +903,23 @@ assert financial["old_config_sha256"] != financial["target_config_sha256"]
 assert financial["old_environment_sha256"] != financial["target_environment_sha256"]' \
   "$root/pe-activation.json" "$root/pe-financial-era.json" "$root/rehearsal/evidence.json" ||
   fail "joined rehearsal/driver fixture conflated inherited and target identities"
+
+# Scenario REHEARSAL-PATHS-UPDATE-01A
+# Preconditions: a clean copied generation whose migration path update fails (#570).
+# PASS: the harness stops with the fatal line before any child starts and never passes.
+# FAIL: the child starts, the rehearsal passes, or the fatal line is missing.
+root=$TEST_TMP/rehearsal-paths-update
+setup_rehearsal_fixture "$root" true none
+: > "$root/test-state/paths-update-error"
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *"FATAL: rehearsal copy migration paths were not updated"* ]] ||
+  fail "failed migration path update did not stop the rehearsal: $output"
+[[ "$output" != *REHEARSAL545_PASS* ]] || fail "rehearsal passed after a failed migration path update"
+[[ ! -e "$root/rehearsal/copy/status.json" && ! -e "$root/test-state/paths-updated" ]] ||
+  fail "rehearsal child or marker appeared after a failed migration path update"
 
 # Scenarios REHEARSAL-ACCOUNTS-02A..02D
 # Preconditions: both privileged censuses contain one identical off account; the publishable-only
@@ -1866,4 +1916,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
 done
 
-echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03 and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03, REHEARSAL-PATHS-UPDATE-01A and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
