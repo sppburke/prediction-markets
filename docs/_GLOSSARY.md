@@ -621,7 +621,10 @@ frame boundaries, size, checksum, decompression, envelope decode, sequence, stor
 hash, and BLAKE3 chain. Only a scanner-proven incomplete final frame may be truncated and
 synchronized under the exclusive writer lock; interior corruption and every other mismatch are
 fatal. Append, flush, or synchronization uncertainty poisons the writer. The account-tagged
-`live_journal.log` uses its native verified replay for the same binding fields.
+`live_journal.log` uses its native verified replay for the same binding fields. An ordinary
+installed boot walks the source log once under that lock, binds the recorded activation prefix
+during the same walk, and publishes the boot projections built from it only after the walk and
+every reducer succeeded (#572).
 
 Paper schema-v1-to-v2 migration is a machine-owned roll-forward state machine:
 `boundary_recorded → version_two_inputs_appending → side_state_built →
