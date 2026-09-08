@@ -7896,4 +7896,115 @@ mod tests {
             .unwrap();
         assert_eq!(integer_mirrors, 0);
     }
+
+    /// The pre-#545 schema, verbatim, as an installed main still at the exact-migration version.
+    const SCHEMA_V2: &str = include_str!("../tests/fixtures/paper_state_schema_v2.sql");
+
+    fn installed_schema_two_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("installed_v2.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V2).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO fills VALUES ('legacy','m',0,'buy',3,'0.25',7);
+                 INSERT INTO positions VALUES ('m',0,3,0);
+                 INSERT INTO settled_markets VALUES ('settled','[\"1\",\"0\"]','2.5',1700000000);
+                 INSERT INTO meta (key, value) VALUES ('probe', '{\"record\":true}');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        path
+    }
+
+    /// PASS: an installed pre-#545 main (the verbatim checked-in schema at `user_version = 2`) is
+    /// migrated in place by the first writable open: whole-contract columns become exact strings,
+    /// the untouched tables keep their rows and storage classes, and the file is stamped current.
+    /// FAIL: the real installed layout differs from the partial fixtures the migration was tested on.
+    #[test]
+    fn installed_schema_two_main_migrates_losslessly_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_schema_two_fixture(dir.path());
+        drop(PaperStateDb::open(&path).unwrap());
+        drop(PaperStateDb::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let fill: (String, String, String, i64) = connection
+            .query_row(
+                "SELECT quantity_str, principal_str, fee_str, prepared_seq FROM fills",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(fill, ("3".to_owned(), "0.75".to_owned(), "0".to_owned(), 7));
+        let settled: (String, String, i64) = connection
+            .query_row(
+                "SELECT outcome_prices, credit_applied, settled_at_unix FROM settled_markets \
+                 WHERE market_id = 'settled'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            settled,
+            ("[\"1\",\"0\"]".to_owned(), "2.5".to_owned(), 1_700_000_000)
+        );
+        let probe: (String, String) = connection
+            .query_row(
+                "SELECT value, typeof(value) FROM meta WHERE key = 'probe'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(probe, ("{\"record\":true}".to_owned(), "text".to_owned()));
+        let affinity: String = connection
+            .query_row(
+                "SELECT type FROM pragma_table_info('meta') WHERE name = 'value'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(affinity.eq_ignore_ascii_case("blob"));
+        let pending: i64 = connection
+            .query_row("SELECT COUNT(*) FROM decision_pending", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    /// PASS: the read-only opener used before Start admits an installed schema-2 main without
+    /// writing a byte; the strict opener still rejects it; neither admits an unknown version.
+    /// FAIL: a read-only open migrates, or the qualifier's strict guard was widened (#567).
+    #[test]
+    fn read_only_openers_admit_or_reject_the_exact_migration_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_schema_two_fixture(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        let state = PaperStateDb::open_read_only_allowing_unmigrated(&path).unwrap();
+        assert!(state.open_decision_pending().unwrap().is_empty());
+        drop(state);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(matches!(
+            PaperStateDb::open_read_only(&path),
+            Err(PaperStateError::SchemaVersionMismatch {
+                found: 2,
+                expected: SCHEMA_VERSION
+            })
+        ));
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 999_i64)
+            .unwrap();
+        assert!(matches!(
+            PaperStateDb::open_read_only_allowing_unmigrated(&path),
+            Err(PaperStateError::SchemaVersionMismatch { found: 999, .. })
+        ));
+        assert!(matches!(
+            PaperStateDb::open_read_only(&path),
+            Err(PaperStateError::SchemaVersionMismatch { found: 999, .. })
+        ));
+    }
 }
