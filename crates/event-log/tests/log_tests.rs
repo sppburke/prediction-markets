@@ -930,9 +930,22 @@ fn open_verified_refuses_incomplete_or_wrong_prefix_without_repair() {
         Err(error) => panic!("expected a file-identity mismatch, got {error}"),
         Ok(_) => panic!("a binding for another file was accepted"),
     }
-    // The stored-binding entry point applies the same identity rule, also on a torn twin.
+    // The stored-binding entry point applies the same identity rule: a foreign binding whose
+    // offset, sequence, and hash equal this file's verified tail must not authorize the repair
+    // of a torn frame after that tail.
+    {
+        let mut writer = Writer::open(&own_path).unwrap();
+        writer.append(make_envelope(b"torn".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
     let own_bytes = std::fs::read(&own_path).unwrap();
-    std::fs::write(&own_path, &own_bytes[..own_bytes.len() - 1]).unwrap();
+    let torn = own_bytes[..own_bytes.len() - 1].to_vec();
+    std::fs::write(&own_path, &torn).unwrap();
+    let own_tail = Scanner::inspect(&own_path).unwrap().verified_tail;
+    assert_eq!(own_tail.physical_tail, twin_binding.physical_tail);
+    assert_eq!(own_tail.last_sequence, twin_binding.last_sequence);
+    assert_eq!(own_tail.last_hash, twin_binding.last_hash);
+    assert_ne!(own_tail.path, twin_binding.path);
     match Writer::open_with_expected_tail(&own_path, &twin_binding) {
         Err(LogError::Io(error)) => assert_eq!(
             error.to_string(),
@@ -943,7 +956,7 @@ fn open_verified_refuses_incomplete_or_wrong_prefix_without_repair() {
     }
     assert_eq!(
         std::fs::read(&own_path).unwrap(),
-        own_bytes[..own_bytes.len() - 1],
+        torn,
         "a foreign binding must not authorize repair"
     );
 }
