@@ -273,11 +273,22 @@ scripts/deploy/rehearsal545.sh --dry-run \
   --target-config <reviewed-service.toml> \
   --target-environment <reviewed-production-env> \
   <reviewed-40-hex>
-SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/rehearsal545.sh \
+read -r SUPABASE_DB_URL < <mode-0600-session-pooler-url-file> && export SUPABASE_DB_URL
+PE_REHEARSAL_ROOT=<fresh-root-for-this-attempt> PE_REHEARSAL_BIND=<loopback:port> \
+  scripts/deploy/rehearsal545.sh \
   --target-config <reviewed-service.toml> \
   --target-environment <reviewed-production-env> \
   <reviewed-40-hex>
 ```
+
+Load the database-admin URL from a mode-0600 file with `read -r … && export`, never as an inline
+`NAME=value` prefix or `$(<file)` substitution: both print the value under shell tracing, which the
+driver's own confidentiality tests forbid. Run each attempt under an explicitly assigned fresh
+`PE_REHEARSAL_ROOT` with no `PE_REHEARSAL_COPY_DIR` or `PE_REHEARSAL_EVIDENCE_HASH_FILE` override
+(an override is taken verbatim and may point anywhere): the harness writes fixed-name artifacts per
+revision under the root and its evidence binds the result manifest by absolute path, so a fresh root
+preserves every earlier attempt and never reuses a copy the reanchor probe has already mutated. Reuse a
+root only to resume with an untouched copy; never delete an earlier attempt's root.
 
 The no-target `--dry-run <reviewed-40-hex>` form used by CI is intentionally a path-independent
 parser/syntax check. The reviewed target pair remains accepted in dry-run and is mandatory for an
@@ -285,7 +296,12 @@ actual rehearsal; if either target flag is present, both must be present.
 
 The harness requires `/home/sean/pe-activation.json` to be `verified`, reads the active generation
 from it, and checkpoints its SQLite database, all three framed logs, and the captured legacy-history
-input. A new or reused checkpoint must have the exact six-entry `copied.sha256` inventory and pass
+input. The rehearsal and the driver's `prepare` accept an installed schema-2 generation written at or
+after #556 with a nonempty membership (#567): the rehearsal child upgrades only its private copy, and
+in the canonical route the production file is written only inside Start, after the stop at
+`prepared`. Any read-write open by the reviewed binary would upgrade the production file in place
+and strand the installed binary's rollback, so never run the reviewed binary's `--report`,
+`--backfill-supabase`, or an ordinary start against the production paper state before Start. A new or reused checkpoint must have the exact six-entry `copied.sha256` inventory and pass
 `sha256sum --strict -c` before use. `PE_REHEARSAL_BIND` is mandatory and must be a numeric loopback
 address with a nonzero port different from the installed service's port; the harness passes it to
 the child as `PE_BIND`, derives the readiness URL from it, and runs against real first-party venue
@@ -386,8 +402,8 @@ service. The live-schema boundary converts both `live_positions` quantity column
 Run the exact reviewed driver command on the production host:
 
 ```bash
-SUPABASE_DB_URL=<session-pooler-url> \
-  scripts/paper_reset/activate_financial_era.sh \
+read -r SUPABASE_DB_URL < <mode-0600-session-pooler-url-file> && export SUPABASE_DB_URL
+scripts/paper_reset/activate_financial_era.sh \
   --target-binary <reviewed-pe-service> \
   --target-config <reviewed-service.toml> \
   --target-environment <reviewed-production-env> \
