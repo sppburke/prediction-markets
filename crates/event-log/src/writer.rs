@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::{EnvelopeIn, EventEnvelope, HashInput, compute_hashes};
 use crate::frame::{HEADER_LEN, write_file_header, write_frame};
-use crate::scanner::{LogTailBinding, inspect_open, walk_locked};
+use crate::scanner::{LogTailBinding, PrefixVerdict, inspect_open, walk_locked};
 use crate::{LogError, PoisonReason};
 
 trait DurableWrite: Write + Send + Sync {
@@ -179,9 +179,12 @@ impl Writer {
         }
 
         let (scan, verdict) = walk_locked(path, &file, expected_prefix, observer)?;
+        // As `Scanner::verify_prefix`: with an expected prefix, a torn final frame is reported
+        // before any boundary verdict unless the prefix matched (the tear then lies wholly after
+        // it and is repaired below). A tear that cuts into the prefix can never match.
         if let Some(incomplete) = scan.incomplete_tail
-            && expected_prefix
-                .is_some_and(|expected| incomplete.byte_offset < expected.physical_tail)
+            && expected_prefix.is_some()
+            && verdict != PrefixVerdict::Matched
         {
             return Err(LogError::Truncated {
                 at: incomplete.next_sequence,
@@ -192,8 +195,10 @@ impl Writer {
 
         if scan.incomplete_tail.is_some() {
             file.set_len(scan.verified_tail.physical_tail)?;
-            file.sync_all()?;
         }
+        // As `open`: the verified prefix is synchronized whether or not a repair happened, so a
+        // previous writer's synchronization uncertainty is cleared before the binding is published.
+        file.sync_all()?;
         file.seek(SeekFrom::Start(scan.verified_tail.physical_tail))?;
         let next_seq = match scan.verified_tail.last_sequence {
             None => 0,

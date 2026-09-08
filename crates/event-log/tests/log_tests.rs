@@ -864,8 +864,6 @@ fn open_verified_repairs_only_an_incomplete_tail_after_a_matching_prefix() {
 
 #[test]
 fn open_verified_refuses_incomplete_or_wrong_prefix_without_repair() {
-    const MISMATCH: &str = "event log does not match the recorded migration boundary";
-
     let dir = tmp_dir();
     let cuts_prefix_path = dir.path().join("open-cuts-prefix.log");
     {
@@ -900,12 +898,38 @@ fn open_verified_refuses_incomplete_or_wrong_prefix_without_repair() {
     let incomplete = bytes[..bytes.len() - 1].to_vec();
     std::fs::write(&wrong_prefix_path, &incomplete).unwrap();
     wrong_prefix.last_hash = blake3::Hash::from_bytes([0xff; 32]);
-    match Writer::open_verified(&wrong_prefix_path, Some(&wrong_prefix), &mut |_, _| {}) {
-        Err(LogError::Io(error)) => assert_eq!(error.to_string(), MISMATCH),
-        Err(error) => panic!("expected prefix mismatch, got {error}"),
-        Ok(_) => panic!("wrong prefix was accepted"),
-    }
+    // A torn tail with an unmatched prefix is reported as `Scanner::verify_prefix` reports it.
+    assert!(matches!(
+        Scanner::verify_prefix(&wrong_prefix),
+        Err(LogError::Truncated { .. })
+    ));
+    assert!(matches!(
+        Writer::open_verified(&wrong_prefix_path, Some(&wrong_prefix), &mut |_, _| {}),
+        Err(LogError::Truncated { .. })
+    ));
     assert_eq!(std::fs::read(&wrong_prefix_path).unwrap(), incomplete);
+
+    // A binding for a different file never matches, even with byte-identical contents.
+    let own_path = dir.path().join("open-own-file.log");
+    let twin_path = dir.path().join("open-twin-file.log");
+    for path in [&own_path, &twin_path] {
+        let mut writer = Writer::open(path).unwrap();
+        writer.append(make_envelope(b"same".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let twin_binding = Scanner::verify(&twin_path).unwrap();
+    assert_eq!(
+        Scanner::verify(&own_path).unwrap().last_hash,
+        twin_binding.last_hash
+    );
+    match Writer::open_verified(&own_path, Some(&twin_binding), &mut |_, _| {}) {
+        Err(LogError::Io(error)) => assert_eq!(
+            error.to_string(),
+            "event log does not match the recorded migration boundary"
+        ),
+        Err(error) => panic!("expected a file-identity mismatch, got {error}"),
+        Ok(_) => panic!("a binding for another file was accepted"),
+    }
 }
 
 #[test]

@@ -42,12 +42,14 @@ pub struct SourceLogBootHooks {
     pub poison_sink_before_extend: std::sync::atomic::AtomicBool,
 }
 
-/// The reducers fed by every verified frame. The first reducer error is latched and reported after
-/// the walk; a physical scanner error surfaces first because the walk itself returns it.
+/// The reducers fed by every verified frame. Each reducer latches its own first error, reported
+/// after the walk in owner order (activity, then daily boundary); a physical scanner error
+/// surfaces first because the walk itself returns it.
 struct Reducers {
     activity: ActivityCandidates,
     daily_boundary: Option<DailyBoundaryCandidates>,
-    first_error: Option<ObligationRebuildError>,
+    activity_error: Option<ObligationRebuildError>,
+    boundary_error: Option<ObligationRebuildError>,
     frames: u64,
 }
 
@@ -56,32 +58,35 @@ impl Reducers {
         Self {
             activity: ActivityCandidates::default(),
             daily_boundary: financial_era.then(DailyBoundaryCandidates::default),
-            first_error: None,
+            activity_error: None,
+            boundary_error: None,
             frames: 0,
         }
     }
 
     fn observe(&mut self, envelope: &EventEnvelope) {
         self.frames = self.frames.saturating_add(1);
-        if self.first_error.is_some() {
-            return;
+        if self.activity_error.is_none()
+            && let Err(error) = self.activity.observe_activity(envelope)
+        {
+            self.activity_error = Some(error);
         }
-        if let Err(error) = self.activity.observe_activity(envelope) {
-            self.first_error = Some(error);
-            return;
-        }
-        if let Some(candidates) = self.daily_boundary.as_mut()
+        if self.boundary_error.is_none()
+            && let Some(candidates) = self.daily_boundary.as_mut()
             && let Err(error) = candidates.observe_daily_boundary(envelope)
         {
-            self.first_error = Some(error);
+            self.boundary_error = Some(error);
         }
     }
 
     fn take_error(&mut self) -> Result<()> {
-        match self.first_error.take() {
-            Some(error) => Err(error).context("reduce source-log frames during the boot walk"),
-            None => Ok(()),
+        if let Some(error) = self.activity_error.take() {
+            return Err(error).context("rebuild durable activity reconciliation obligations");
         }
+        if let Some(error) = self.boundary_error.take() {
+            return Err(error).context("recover causal daily boundary");
+        }
+        Ok(())
     }
 }
 

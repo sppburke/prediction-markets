@@ -916,14 +916,14 @@ pub struct SourceReceiptIndex {
 ///
 /// The staging value exposes no reads and becomes usable only after [`Self::complete`] binds its
 /// observed frames to a scanner-verified physical log tail.
-pub struct SourceReceiptIndexStaging {
+pub(crate) struct SourceReceiptIndexStaging {
     canonical_source_log_path: PathBuf,
     frames: Vec<SourceFrameMetadata>,
 }
 
 impl SourceReceiptIndexStaging {
     /// Observe one verified source frame while constructing an external projection (#572).
-    pub fn observe(
+    pub(crate) fn observe(
         &mut self,
         byte_offset: u64,
         envelope: &EventEnvelope,
@@ -948,7 +948,7 @@ impl SourceReceiptIndexStaging {
     }
 
     /// Complete an external projection only when its path and logical tail match exactly (#572).
-    pub fn complete(
+    pub(crate) fn complete(
         self,
         binding: &LogTailBinding,
     ) -> Result<SourceReceiptIndex, RiskInputsUnavailable> {
@@ -981,7 +981,7 @@ impl SourceReceiptIndexStaging {
 
 impl SourceReceiptIndex {
     /// Start an externally driven source-receipt projection bound to the canonical log path (#572).
-    pub fn staging(
+    pub(crate) fn staging(
         source_log_path: &Path,
     ) -> Result<SourceReceiptIndexStaging, RiskInputsUnavailable> {
         let canonical_source_log_path = std::fs::canonicalize(source_log_path)
@@ -1085,7 +1085,7 @@ impl SourceReceiptIndex {
     }
 
     /// Recover exactly the source-log suffix ending at `expected_tail`, reporting each frame (#572).
-    pub fn catch_up_to(
+    pub(crate) fn catch_up_to(
         &self,
         expected_tail: u64,
         observer: &mut dyn FnMut(u64, &EventEnvelope),

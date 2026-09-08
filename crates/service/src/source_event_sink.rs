@@ -51,7 +51,7 @@ impl SourceEventSink {
     /// handed to `observer` with its start offset, the recorded prefix (when given) must match,
     /// and only a scanner-proven incomplete final frame after that prefix is repaired. Returns
     /// the sink and the whole-file binding.
-    pub fn open_verified(
+    pub(crate) fn open_verified(
         path: impl AsRef<Path>,
         expected_prefix: Option<&LogTailBinding>,
         observer: &mut dyn FnMut(u64, &EventEnvelope),
@@ -76,7 +76,7 @@ impl SourceEventSink {
 
     /// The synchronized tail of the locked writer: one sync, then the file length must equal the
     /// writer's byte cursor. A poisoned or discarded writer is a typed error, never a binding.
-    pub fn verified_tail(&mut self) -> Result<LogTailBinding, LogError> {
+    pub(crate) fn verified_tail(&mut self) -> Result<LogTailBinding, LogError> {
         let Some(writer) = self.writer.as_mut() else {
             return Err(LogError::Io(std::io::Error::other(
                 "source event sink poisoned",

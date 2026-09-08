@@ -107,13 +107,16 @@ impl PrefixVerdict {
 
 struct PrefixTracker<'a> {
     expected: Option<&'a LogTailBinding>,
+    /// The binding names one canonical file; a binding for another file can never match.
+    same_file: bool,
     matched: bool,
 }
 
 impl<'a> PrefixTracker<'a> {
-    fn new(expected: Option<&'a LogTailBinding>) -> Self {
+    fn new(expected: Option<&'a LogTailBinding>, resolved_path: &Path) -> Self {
         Self {
             expected,
+            same_file: expected.is_none_or(|expected| expected.path == resolved_path),
             matched: false,
         }
     }
@@ -122,7 +125,8 @@ impl<'a> PrefixTracker<'a> {
         let Some(expected) = self.expected else {
             return;
         };
-        if state.physical_tail == expected.physical_tail
+        if self.same_file
+            && state.physical_tail == expected.physical_tail
             && state.next_sequence.checked_sub(1).map(EventSeq) == expected.last_sequence
             && state.previous_hash == expected.last_hash
         {
@@ -133,6 +137,7 @@ impl<'a> PrefixTracker<'a> {
     fn verdict(&self, final_state: &ScanState) -> PrefixVerdict {
         match self.expected {
             None => PrefixVerdict::NotRequested,
+            Some(_) if !self.same_file => PrefixVerdict::Mismatch,
             Some(_) if self.matched => PrefixVerdict::Matched,
             Some(expected) if final_state.physical_tail < expected.physical_tail => {
                 PrefixVerdict::Shorter
@@ -280,7 +285,8 @@ pub(crate) fn inspect_open(path: &Path, file: &File) -> Result<ScanOutcome, LogE
     Ok(outcome)
 }
 
-/// Walk an already-open, exclusively locked log without mutating it (#572).
+/// Walk an already-open handle without mutating it (#572). The writer holds the exclusive lock
+/// when a repair may follow; `verify_prefix` walks a plain read handle.
 ///
 /// Frame verification has one owner. The prefix verdict is returned separately so the writer can
 /// reject a truncation into the trusted prefix before deciding whether tail repair is permitted.
@@ -294,7 +300,7 @@ pub(crate) fn walk_locked(
     let mut reader = BufReader::new(file);
     verify_file_header(path, &mut reader)?;
     let mut state = ScanState::after_header();
-    let mut prefix = PrefixTracker::new(expected_prefix);
+    let mut prefix = PrefixTracker::new(expected_prefix, &resolved_path);
     prefix.observe(&state);
 
     loop {

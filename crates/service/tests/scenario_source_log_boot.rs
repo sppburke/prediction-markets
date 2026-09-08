@@ -205,6 +205,20 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
+/// Bytes this process has requested through read system calls (Linux `/proc/self/io`), which
+/// counts page-cache hits too: one whole-file walk reads about the file's length.
+#[cfg(target_os = "linux")]
+fn read_chars() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("rchar: "))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 fn open_error(paths: &PaperMigrationPaths, financial_era: bool) -> anyhow::Error {
     match SourceLogBoot::open(paths, financial_era) {
         Err(error) => error,
@@ -385,7 +399,7 @@ fn reducer_errors_refuse_publication_and_scanner_errors_take_precedence() {
     );
     let error = open_error(&paths, false);
     assert!(
-        format!("{error:#}").contains("reduce source-log frames during the boot walk"),
+        format!("{error:#}").contains("rebuild durable activity reconciliation obligations"),
         "{error:#}"
     );
 
@@ -402,7 +416,7 @@ fn reducer_errors_refuse_publication_and_scanner_errors_take_precedence() {
         "{rendered}"
     );
     assert!(
-        !rendered.contains("reduce source-log frames"),
+        !rendered.contains("activity reconciliation obligations"),
         "the physical scanner error must win: {rendered}"
     );
 }
@@ -494,7 +508,7 @@ fn pre_financial_boot_ignores_a_malformed_daily_boundary_frame_and_a_financial_b
     drop(opened);
     let error = open_error(&paths, true);
     assert!(
-        format!("{error:#}").contains("reduce source-log frames during the boot walk"),
+        format!("{error:#}").contains("recover causal daily boundary"),
         "{error:#}"
     );
 }
@@ -627,4 +641,55 @@ fn migration_record_drift_after_the_walk_falls_back_to_the_full_prefix_verificat
     let resumed = boot.prepare_installed(paths.clone(), NOW_UNIX + 6).unwrap();
     assert_eq!(resumed.record.phase, MigrationPhase::Installed);
     let _keep: PathBuf = resumed.active_main;
+}
+
+/// Acceptance criterion 1: an installed boot reads the source log once (plus the bounded suffix
+/// of its own appends). Measured through the process read counter rather than an internal
+/// counter, so any hidden second pass in migration resume, membership replay, or obligation
+/// rebuild would show up as a second file length.
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_boot_reads_the_source_log_once() {
+    let (_dir, paths) = installed_fixture();
+    {
+        let mut writer = Writer::open(&paths.source_log).unwrap();
+        for index in 0..20_000_i64 {
+            writer
+                .append(activity_envelope(
+                    &format!("0x{index:064x}"),
+                    NOW_UNIX + 1 + index,
+                ))
+                .unwrap();
+        }
+        writer.sync().unwrap();
+    }
+    let length = file_len(&paths.source_log);
+    assert!(length > 2_000_000, "fixture log is {length} bytes");
+    let paper_state = PaperStateDb::open(&paths.fixed_main).unwrap();
+
+    let before = read_chars();
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    let mut boot = opened.boot;
+    let mut sink = opened.sink;
+    let resumed = boot
+        .prepare_installed(paths.clone(), NOW_UNIX + 10)
+        .unwrap();
+    assert_eq!(resumed.record.phase, MigrationPhase::Installed);
+    sink.append_durable(activity_envelope("0xboot", NOW_UNIX + 30_000))
+        .unwrap();
+    let after_binding = boot.extend(&mut sink).unwrap();
+    let obligations = boot.obligations(&paper_state, &paths.paper_log).unwrap();
+    boot.verify_handoff(&mut sink).unwrap();
+    let read = read_chars() - before;
+
+    assert_eq!(obligations.len(), 20_001);
+    assert_eq!(after_binding, Scanner::verify(&paths.source_log).unwrap());
+    assert!(
+        read >= length,
+        "the walk must read the whole log: read {read} of {length} bytes"
+    );
+    assert!(
+        read < length + length / 2,
+        "more than one whole-file pass: read {read} bytes for a {length}-byte log"
+    );
 }

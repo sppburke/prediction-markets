@@ -161,13 +161,13 @@ pub struct ReconciliationObligations {
 
 /// Log-pure websocket candidates awaiting one durable-state filter (#572).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ActivityCandidates {
+pub(crate) struct ActivityCandidates {
     by_wallet: CoalescedObligations,
 }
 
 impl ActivityCandidates {
     /// Observe one source frame without consulting paper state (#572).
-    pub fn observe_activity(
+    pub(crate) fn observe_activity(
         &mut self,
         envelope: &EventEnvelope,
     ) -> Result<(), ObligationRebuildError> {
@@ -197,7 +197,7 @@ impl ActivityCandidates {
 
     /// Number of coalesced candidates.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.by_wallet
             .values()
             .flat_map(BTreeMap::values)
@@ -205,14 +205,9 @@ impl ActivityCandidates {
             .sum()
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_wallet.is_empty()
-    }
-
     /// Filter the coalesced log candidates against durable paper state (#572). The result is a
     /// keyed map, so the visiting order does not affect it.
-    pub fn into_obligations(
+    pub(crate) fn into_obligations(
         self,
         paper_state: &PaperStateDb,
     ) -> Result<ReconciliationObligations, ObligationRebuildError> {
@@ -415,13 +410,13 @@ pub enum ObligationRebuildError {
 
 /// Log-pure daily-boundary candidates awaiting the paper-log anchor (#572).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DailyBoundaryCandidates {
+pub(crate) struct DailyBoundaryCandidates {
     boundaries: Vec<PendingBoundary>,
 }
 
 impl DailyBoundaryCandidates {
     /// Observe and validate one matching source frame without reading the paper log (#572).
-    pub fn observe_daily_boundary(
+    pub(crate) fn observe_daily_boundary(
         &mut self,
         envelope: &EventEnvelope,
     ) -> Result<(), ObligationRebuildError> {
@@ -453,7 +448,7 @@ impl DailyBoundaryCandidates {
 }
 
 /// Compute and install the Start/latest-mark anchor before source observation (#572).
-pub fn recover_daily_boundary_anchor(
+pub(crate) fn recover_daily_boundary_anchor(
     paper_log_path: &Path,
     obligations: &mut ReconciliationObligations,
 ) -> Result<Option<i64>, ObligationRebuildError> {
@@ -489,7 +484,7 @@ pub fn recover_daily_boundary_anchor(
 }
 
 /// Select and install the oldest source candidate after the computed paper anchor (#572).
-pub fn recover_daily_boundary_from_candidates(
+pub(crate) fn recover_daily_boundary_from_candidates(
     candidates: DailyBoundaryCandidates,
     anchor: i64,
     obligations: &mut ReconciliationObligations,
