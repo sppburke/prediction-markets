@@ -69,7 +69,7 @@ impl Scanner {
     pub fn verify_prefix(binding: &LogTailBinding) -> Result<LogTailBinding, LogError> {
         let file = File::open(&binding.path)?;
         let mut observer = |_: u64, _: &EventEnvelope| {};
-        let (outcome, verdict) = walk_open(&binding.path, &file, Some(binding), &mut observer)?;
+        let (outcome, verdict) = walk_locked(&binding.path, &file, Some(binding), &mut observer)?;
         if let Some(incomplete) = outcome.incomplete_tail {
             return Err(LogError::Truncated {
                 at: incomplete.next_sequence,
@@ -276,7 +276,7 @@ pub(crate) fn read_verified_frame(
 
 pub(crate) fn inspect_open(path: &Path, file: &File) -> Result<ScanOutcome, LogError> {
     let mut observer = |_: u64, _: &EventEnvelope| {};
-    let (outcome, _) = walk_open(path, file, None, &mut observer)?;
+    let (outcome, _) = walk_locked(path, file, None, &mut observer)?;
     Ok(outcome)
 }
 
@@ -285,15 +285,6 @@ pub(crate) fn inspect_open(path: &Path, file: &File) -> Result<ScanOutcome, LogE
 /// Frame verification has one owner. The prefix verdict is returned separately so the writer can
 /// reject a truncation into the trusted prefix before deciding whether tail repair is permitted.
 pub(crate) fn walk_locked(
-    path: &Path,
-    file: &File,
-    expected_prefix: Option<&LogTailBinding>,
-    observer: &mut dyn FnMut(u64, &EventEnvelope),
-) -> Result<(ScanOutcome, PrefixVerdict), LogError> {
-    walk_open(path, file, expected_prefix, observer)
-}
-
-fn walk_open(
     path: &Path,
     file: &File,
     expected_prefix: Option<&LogTailBinding>,
