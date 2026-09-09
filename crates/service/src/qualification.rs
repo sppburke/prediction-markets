@@ -10781,7 +10781,7 @@ mod tests {
     /// FAIL: non-admitted trades block selection or missing/open/V2 decisions satisfy completeness.
     #[test]
     fn post_start_non_admitted_trade_does_not_block_selection() {
-        for disposition in ["non_entry", "decision_pending"] {
+        for disposition in ["not_buy", "decision_pending"] {
             let (continuation, observations) = single_read_fixture(2, "0xsell", "SELL", true);
             let temp = tempfile::tempdir().unwrap();
             let state = PaperStateDb::open(&temp.path().join("state.db")).unwrap();
@@ -10792,7 +10792,7 @@ mod tests {
                 &prefix_at(Some(3)),
                 &observations,
             );
-            if disposition == "non_entry" {
+            if disposition == "not_buy" {
                 assert!(result.unwrap().rows.is_empty());
             } else {
                 assert!(
@@ -10916,6 +10916,108 @@ mod tests {
             );
         }
     }
+    /// PASS: source verification loads the recorded A/0-to-B/1 correction and accepts B/1;
+    /// without a correction it accepts A/0. All three identity mutations and uncorrected B/1
+    /// return InsufficientEvidence.
+    /// FAIL: a valid corrected/uncorrected read fails, or a mismatched identity is accepted.
+    #[test]
+    fn verify_decision_source_inputs_honors_recorded_identity_correction() {
+        let (raw, observations) = single_read_fixture(2, "0xraw", "BUY", true);
+        assert_eq!(raw.version(), 4);
+        assert_eq!(
+            observations[&2].schema_version,
+            crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            observations[&raw.read_commitment.unwrap().sequence.0].source_id,
+            crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        );
+        let aggregate = parsed_aggregates(&[&observations[&2].payload]).remove(0);
+        let stamped = MarketOutcomeId::new(raw.facts.market_id.clone(), OutcomeId(0));
+        assert_eq!(raw.facts.outcome_id, stamped.outcome());
+        let verified = MarketOutcomeId::new(
+            MarketId(VenueMarketId("0xverified".to_owned())),
+            OutcomeId(1),
+        );
+        let other =
+            MarketOutcomeId::new(MarketId(VenueMarketId("0xother".to_owned())), OutcomeId(0));
+        let mutation = LedgerMutation::from_activity(&aggregate).unwrap();
+        let corrected = mutation
+            .clone()
+            .with_verified_identity(verified.clone(), "metadata-proof".to_owned());
+        assert_eq!(
+            corrected.effect.correction(),
+            Some(&IdentityCorrection {
+                stamped,
+                verified: verified.clone(),
+                evidence_hash: "metadata-proof".to_owned(),
+            })
+        );
+        let wrong_stamped = pe_position_ledger::LedgerEffect::Corrected {
+            effect: Box::new(corrected.effect.effective().clone()),
+            correction: IdentityCorrection {
+                stamped: other.clone(),
+                ..corrected.effect.correction().unwrap().clone()
+            },
+        };
+        let wrong_verified = mutation
+            .clone()
+            .with_verified_identity(other, "metadata-proof".to_owned());
+        let mut effective = raw.clone();
+        effective.facts.market_id = verified.market().clone();
+        effective.facts.outcome_id = verified.outcome();
+
+        for (case, continuation, effect, passes) in [
+            ("corrected", &effective, &corrected.effect, true),
+            ("frozen stamped", &raw, &corrected.effect, false),
+            ("wrong stamped", &effective, &wrong_stamped, false),
+            ("wrong verified", &effective, &wrong_verified.effect, false),
+            ("uncorrected", &raw, &mutation.effect, true),
+            ("uncorrected verified", &effective, &mutation.effect, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state.db");
+            let state = PaperStateDb::open(&path).unwrap();
+            store_read_decision(&state, continuation, "decision_pending", true);
+            let proof_json = AppliedEffect {
+                effect: effect.clone(),
+                clamped_residual: None,
+            }
+            .to_document()
+            .unwrap();
+            // Keep each document valid so rejection must come from binding it to the raw read.
+            assert_eq!(
+                AppliedEffect::from_document(&proof_json).unwrap().effect,
+                *effect
+            );
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE activity_groups SET proof_json = ?1 WHERE source_trade_id = ?2",
+                        rusqlite::params![proof_json, continuation.facts.source_trade_id.0],
+                    )
+                    .unwrap(),
+                1
+            );
+            let result = verify_decision_source_inputs(
+                &state,
+                &replayed_no_copy_decision(continuation),
+                &observations,
+            );
+            if passes {
+                assert!(result.is_ok(), "{case}: {result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(&error, QualificationError::InsufficientEvidence(message)
+                        if message == "decision continuation differs from its raw activity aggregate"),
+                    "{case}: {error}"
+                );
+            }
+        }
+    }
+
     /// PASS: raw identity requires equality without correction; a correction binds both stamped and verified identities and preserves every other fact check.
     /// FAIL: an unbound correction or changed amount can validate a frozen continuation.
     #[test]
