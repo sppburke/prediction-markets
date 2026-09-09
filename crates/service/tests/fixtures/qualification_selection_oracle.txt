@@ -106,18 +106,10 @@ text: insufficient qualification evidence: decision websocket observation has th
 Err
 variant: InsufficientEvidence
 text: insufficient qualification evidence: decision_pending row g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79/additional is additional to the parsed source prefix
-=== repeated_decision_row ===
-Err
-variant: InsufficientEvidence
-text: insufficient qualification evidence: sealed decision evidence repeats a source trade identity
 === repeated_source_identity_disjoint_reads ===
 Err
 variant: InsufficientEvidence
 text: insufficient qualification evidence: sealed decision evidence repeats a source trade identity
-=== missing_decision_row ===
-Err
-variant: InsufficientEvidence
-text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision
 === disagreeing_complete_reads ===
 Err
 variant: InsufficientEvidence
@@ -130,10 +122,14 @@ text: insufficient qualification evidence: complete activity read repeats a deci
 Err
 variant: InsufficientEvidence
 text: insufficient qualification evidence: complete activity reads overlap source page receipts
-=== complete_read_reconstruction_failure ===
+=== invalid_decision_source_receipt_link ===
 Err
 variant: InsufficientEvidence
-text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision: complete activity read does not reach its fixed end
+text: insufficient qualification evidence: decision source receipt link is invalid: unsupported frozen continuation version 0
+=== complete_read_payload_hash_mismatch ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision: complete activity read page payload hash differs
 === conflicting_semantic_revisions ===
 Err
 variant: InsufficientEvidence

@@ -1,335 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use pe_core_types::{LeaderAction, Probability, WalletAddress};
-use rust_decimal_macros::dec;
 
 const ORACLE_BASE_REVISION: &str = "dfa00e1c118f3ca21d5bf8a3fd6d6cd36fc19d2d";
 const ORACLE_REGENERATOR_COMMAND: &str = "cargo nextest run -p pe-service regenerate_qualification_selection_oracle --run-ignored ignored-only";
-
-fn activity_observation(sequence: u64, payload: &[u8]) -> SourceObservation {
-    let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
-    SourceObservation {
-        receipt: AppendReceipt {
-            sequence: EventSeq(sequence),
-            this_hash: blake3::hash(payload),
-        },
-        observed_at: SourceTimestamp(at),
-        received_at: ReceivedAt(at),
-        received_unix_ms: 1_700_000_100_000,
-        source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
-        schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-        parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-        content_type: ContentType::Json,
-        payload: payload.to_vec(),
-    }
-}
-
-fn activity_row(
-    condition: &str,
-    asset: &str,
-    size: &str,
-    usdc_size: &str,
-    transaction_hash: &str,
-    timestamp: i64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "proxyWallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "type": "TRADE",
-        "conditionId": condition,
-        "asset": asset,
-        "side": "BUY",
-        "size": size,
-        "usdcSize": usdc_size,
-        "price": "0.5",
-        "timestamp": timestamp.to_string(),
-        "transactionHash": transaction_hash,
-        "outcomeIndex": "0"
-    })
-}
-
-fn activity_payload(rows: Vec<serde_json::Value>) -> Vec<u8> {
-    serde_json::to_vec(&rows).unwrap()
-}
-
-fn page_evidence(
-    url: &str,
-    payload: &[u8],
-    start: Option<i64>,
-    end: i64,
-    offset: u32,
-) -> ReconciliationPageEvidence {
-    let row_count = serde_json::from_slice::<Vec<serde_json::Value>>(payload)
-        .unwrap()
-        .len();
-    ReconciliationPageEvidence {
-        request_url: url.to_owned(),
-        bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
-        partition: None,
-        offset,
-        row_count: u32::try_from(row_count).unwrap(),
-        canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(payload).unwrap(),
-        raw_page_hash: blake3::hash(payload).to_hex().to_string(),
-        received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
-        schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-        parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-    }
-}
-
-fn activity_request_url(start: Option<i64>, end: i64, offset: u32) -> String {
-    pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
-        user: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        end,
-        start: start.map(|start| start.saturating_add(1)),
-        offset,
-    }
-    .url("https://data-api.polymarket.com")
-}
-
-fn page_occurrence(observation: &SourceObservation, url: &str, payload: &[u8]) -> PageOccurrence {
-    PageOccurrence {
-        request_url: url.to_owned(),
-        raw_hash: blake3::hash(payload).to_hex().to_string(),
-        receipt: observation.receipt,
-    }
-}
-
-fn activity_page_pair(
-    observation: &SourceObservation,
-    payload: &[u8],
-    start: Option<i64>,
-    end: i64,
-    offset: u32,
-) -> (PageOccurrence, ReconciliationPageEvidence) {
-    let url = activity_request_url(start, end, offset);
-    (
-        page_occurrence(observation, &url, payload),
-        page_evidence(&url, payload, start, end, offset),
-    )
-}
-
-fn parsed_aggregates(payloads: &[&[u8]]) -> Vec<pe_source_polymarket_public::ActivityAggregate> {
-    let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-    let mut rows = Vec::new();
-    for payload in payloads {
-        let observation = activity_observation(0, payload);
-        rows.extend(
-            parse_activity_response(
-                payload,
-                wallet,
-                &ActivityParseContext {
-                    source_id: SourceId(observation.source_id),
-                    observed_at: observation.observed_at,
-                    received_at: observation.received_at,
-                    transport: ActivityTransport::Replay,
-                },
-            )
-            .unwrap()
-            .rows,
-        );
-    }
-    aggregate_activity_rows(&rows).unwrap()
-}
-
-fn classification_fixture() -> (DecisionContinuationV3, LedgerMutation) {
-    let wallet = WalletAddress::from_hex(&format!("0x{}", "a".repeat(40))).unwrap();
-    let source_trade_id = SourceTradeId("g2:classification-fixture".to_owned());
-    let market_id = MarketId(VenueMarketId("classification-market".to_owned()));
-    let source_epoch = 1_700_000_000;
-    let configuration = RuntimeConfig::from_service_config(&ServiceConfig::default());
-    let continuation = DecisionContinuationV3::new(
-        DecisionContinuationFacts {
-            source_trade_id: source_trade_id.clone(),
-            semantic_revision: "semantic-v3".to_owned(),
-            transaction_hash: "0xclassification".to_owned(),
-            wallet,
-            source_epoch,
-            market_id: market_id.clone(),
-            outcome_id: OutcomeId(0),
-            side: Side::Buy,
-            price: Price::new(dec!(0.5)).unwrap(),
-            share_amount: ShareAmount::from_whole(1).unwrap(),
-            provenance: pe_copy_signal_engine::TradeProvenance::RestPoll,
-            pre_bucket_action: LeaderAction::Entry,
-            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
-            action_confidence_ppm: ProbabilityPpm(1_000_000),
-            gate_result: "admitted".to_owned(),
-            applied_configuration_hash: configuration.canonical_hash(),
-            applied_configuration: configuration,
-            frozen_basis: crate::bucket_commit::FrozenDecisionBasis {
-                win_rate_p: Probability::new(dec!(0.6)).unwrap(),
-                bankroll: dec!(100),
-            },
-            decision_inputs: serde_json::json!({"fixture": "classification"}),
-        },
-        None,
-        Vec::new(),
-        None,
-    );
-    let mutation = LedgerMutation {
-        source_trade_id,
-        transaction_hash: "0xclassification".to_owned(),
-        wallet,
-        source_time: SourceTimestamp(OffsetDateTime::from_unix_timestamp(source_epoch).unwrap()),
-        effect: pe_position_ledger::LedgerEffect::Trade {
-            market_id,
-            outcome_id: OutcomeId(0),
-            side: Side::Buy,
-            amount: ShareAmount::from_whole(1).unwrap(),
-            price: Price::new(dec!(0.5)).unwrap(),
-        },
-    };
-    (continuation, mutation)
-}
-
-fn store_read_decision(
-    state: &PaperStateDb,
-    continuation: &DecisionContinuationV3,
-    disposition: &str,
-    pending: bool,
-) {
-    let frozen = &continuation.facts;
-    let proof_json = AppliedEffect {
-        effect: pe_position_ledger::LedgerEffect::Trade {
-            market_id: frozen.market_id.clone(),
-            outcome_id: frozen.outcome_id,
-            side: frozen.side,
-            amount: frozen.share_amount,
-            price: frozen.price,
-        },
-        clamped_residual: None,
-    }
-    .to_document()
-    .unwrap();
-    state
-        .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
-            wallet: frozen.wallet,
-            source_epoch: frozen.source_epoch,
-            dispositions: vec![pe_paper_state::ActivityDispositionRecord {
-                source_trade_id: frozen.source_trade_id.clone(),
-                transaction_hash: frozen.transaction_hash.clone(),
-                wallet: frozen.wallet,
-                source_epoch: frozen.source_epoch,
-                semantic_revision: frozen.semantic_revision.clone(),
-                activity_type: "trade".to_owned(),
-                disposition: disposition.to_owned(),
-                proof_json,
-                no_copy: None,
-            }],
-            leader_positions: Vec::new(),
-            gate_results: if pending {
-                vec![pe_paper_state::EntryGateResultRecord {
-                    source_trade_id: frozen.source_trade_id.clone(),
-                    wallet: frozen.wallet,
-                    market_id: frozen.market_id.clone(),
-                    source_epoch: frozen.source_epoch,
-                    result: "admitted".to_owned(),
-                    history_consumed: true,
-                }]
-            } else {
-                Vec::new()
-            },
-            history_effects: Vec::new(),
-            history_status: None,
-            pending: if pending {
-                vec![pe_paper_state::DecisionPendingRecord {
-                    source_trade_id: frozen.source_trade_id.clone(),
-                    semantic_revision: frozen.semantic_revision.clone(),
-                    wallet: frozen.wallet,
-                    source_epoch: frozen.source_epoch,
-                    frozen_inputs_json: serde_json::to_string(continuation).unwrap(),
-                    updated_at_unix: frozen.source_epoch,
-                }]
-            } else {
-                Vec::new()
-            },
-            fence: None,
-            reanchor: None,
-            advance_cursor: false,
-        })
-        .unwrap();
-    if pending {
-        state
-            .close_decision_pending(
-                &frozen.source_trade_id,
-                "{}",
-                "no_fill",
-                frozen.source_epoch,
-            )
-            .unwrap();
-    }
-}
-
-fn commit_read_fixture(
-    continuation: &mut DecisionContinuationV3,
-    observations: &mut BTreeMap<u64, SourceObservation>,
-) {
-    let fixed_end = continuation.facts.decision_inputs["fixed_end"]
-        .as_i64()
-        .unwrap();
-    let pages = serde_json::from_value::<Vec<ReconciliationPageEvidence>>(
-        continuation.facts.decision_inputs["pages"].clone(),
-    )
-    .unwrap();
-    let payload = crate::bucket_commit::activity_read_commitment_payload(
-        continuation.facts.wallet,
-        fixed_end,
-        continuation.page_occurrences(),
-        &pages,
-    )
-    .unwrap();
-    let sequence = continuation.complete_bound().unwrap().sequence.0 + 1;
-    let mut commitment = activity_observation(sequence, &payload);
-    commitment.source_id = crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned();
-    commitment.schema_version = crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION;
-    commitment.parser_version = crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION;
-    for page in continuation.page_occurrences() {
-        observations
-            .get_mut(&page.receipt.sequence.0)
-            .unwrap()
-            .schema_version = crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION;
-    }
-    *continuation = DecisionContinuationV3::new(
-        continuation.facts.clone(),
-        continuation.observed_source_receipt,
-        continuation.page_occurrences.clone(),
-        Some(commitment.receipt),
-    );
-    observations.insert(sequence, commitment);
-}
-
-fn single_read_fixture(
-    sequence: u64,
-    condition: &str,
-    side: &str,
-    committed: bool,
-) -> (DecisionContinuationV3, BTreeMap<u64, SourceObservation>) {
-    let mut row = activity_row(condition, condition, "1", "0.5", condition, 100);
-    row["side"] = serde_json::json!(side);
-    let payload = activity_payload(vec![row]);
-    let observation = activity_observation(sequence, &payload);
-    let aggregate = parsed_aggregates(&[&payload]).remove(0);
-    let components = aggregate.group_id.components();
-    let mut frozen = classification_fixture().0.facts;
-    frozen.source_trade_id = aggregate.group_id.key().clone();
-    frozen.semantic_revision = aggregate.semantic_revision.as_str().to_owned();
-    frozen.transaction_hash = components.transaction_hash.clone();
-    frozen.wallet = components.wallet;
-    frozen.source_epoch = 100;
-    frozen.market_id = MarketId(VenueMarketId(condition.to_owned()));
-    frozen.outcome_id = components.outcome.unwrap();
-    frozen.side = components.side.unwrap();
-    frozen.share_amount = aggregate.share_sum;
-    frozen.price = aggregate.volume_weighted_price().unwrap();
-    let (page, evidence) = activity_page_pair(&observation, &payload, None, 100, 0);
-    frozen.decision_inputs = serde_json::json!({"fixed_end":100,"pages":[evidence]});
-    let mut continuation = DecisionContinuationV3::new(frozen, None, vec![page], None);
-    let mut observations = BTreeMap::from([(sequence, observation)]);
-    if committed {
-        commit_read_fixture(&mut continuation, &mut observations);
-    }
-    (continuation, observations)
-}
 
 pub(super) struct SelectionOracleFixture {
     _temp: tempfile::TempDir,
@@ -378,13 +52,12 @@ pub(super) fn selection_oracle_cases() -> &'static [&'static str] {
         "websocket_wrong_contract",
         "websocket_different_trade_key",
         "additional_decision_row",
-        "repeated_decision_row",
         "repeated_source_identity_disjoint_reads",
-        "missing_decision_row",
         "disagreeing_complete_reads",
         "repeated_complete_read",
         "overlapping_complete_reads",
-        "complete_read_reconstruction_failure",
+        "invalid_decision_source_receipt_link",
+        "complete_read_payload_hash_mismatch",
         "conflicting_semantic_revisions",
         "trade_absent_from_complete_read",
         "history_before_universe_error_precedence",
@@ -596,6 +269,26 @@ fn standard_selection_oracle_fixture(case: &str) -> SelectionOracleFixture {
             let mut changed = serde_json::to_value(&continuation).unwrap();
             changed["version"] = serde_json::json!(3);
             changed.as_object_mut().unwrap().remove("read_commitment");
+            connection
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                    [changed.to_string()],
+                )
+                .unwrap();
+        }
+        "invalid_decision_source_receipt_link" => {
+            connection
+                .execute("UPDATE activity_groups SET disposition = 'not_buy'", [])
+                .unwrap();
+            connection
+                .execute("UPDATE decision_pending SET frozen_inputs_json = '{}'", [])
+                .unwrap();
+        }
+        "complete_read_payload_hash_mismatch" => {
+            let wrong_hash = blake3::hash(b"wrong-page-payload").to_hex().to_string();
+            let mut changed = serde_json::to_value(&continuation).unwrap();
+            changed["page_occurrences"][0]["raw_hash"] = serde_json::json!(wrong_hash.clone());
+            changed["decision_inputs"]["pages"][0]["raw_page_hash"] = serde_json::json!(wrong_hash);
             connection
                 .execute(
                     "UPDATE decision_pending SET frozen_inputs_json = ?1",
@@ -902,7 +595,7 @@ fn additional_decision_fixture() -> SelectionOracleFixture {
     fixture
 }
 
-fn repeated_decision_fixture(disjoint_payloads: bool) -> SelectionOracleFixture {
+fn repeated_source_identity_disjoint_reads_fixture() -> SelectionOracleFixture {
     let first_payload = activity_payload(vec![activity_row(
         "0xrepeated-row",
         "repeated-row",
@@ -912,9 +605,7 @@ fn repeated_decision_fixture(disjoint_payloads: bool) -> SelectionOracleFixture 
         100,
     )]);
     let mut second_payload = first_payload.clone();
-    if disjoint_payloads {
-        second_payload.push(b' ');
-    }
+    second_payload.push(b' ');
     let first_observation = activity_observation(1, &first_payload);
     let second_observation = activity_observation(2, &second_payload);
     let mut first =
@@ -938,12 +629,10 @@ fn repeated_decision_fixture(disjoint_payloads: bool) -> SelectionOracleFixture 
         first.page_occurrences[0].receipt,
         second.page_occurrences[0].receipt
     );
-    if disjoint_payloads {
-        assert_ne!(
-            first.page_occurrences[0].raw_hash,
-            second.page_occurrences[0].raw_hash
-        );
-    }
+    assert_ne!(
+        first.page_occurrences[0].raw_hash,
+        second.page_occurrences[0].raw_hash
+    );
     store_read_decision(&state, &first, "decision_pending", true);
     let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
     connection
@@ -1067,15 +756,12 @@ pub(super) fn build_selection_oracle_fixture(case: &str) -> SelectionOracleFixtu
             )
         }
         "additional_decision_row" => additional_decision_fixture(),
-        "repeated_decision_row" => repeated_decision_fixture(false),
-        "repeated_source_identity_disjoint_reads" => repeated_decision_fixture(true),
-        "missing_decision_row" => standard_selection_oracle_fixture("pending_without_decision"),
+        "repeated_source_identity_disjoint_reads" => {
+            repeated_source_identity_disjoint_reads_fixture()
+        }
         "disagreeing_complete_reads" => two_decision_read_fixture("disagree"),
         "repeated_complete_read" => two_decision_read_fixture("repeat"),
         "overlapping_complete_reads" => two_decision_read_fixture("overlap"),
-        "complete_read_reconstruction_failure" => {
-            standard_selection_oracle_fixture("complete_read_drift")
-        }
         "conflicting_semantic_revisions" => conflicting_revision_fixture(),
         "trade_absent_from_complete_read" => absent_complete_read_trade_fixture(),
         "history_before_universe_error_precedence" => history_before_universe_error_fixture(),

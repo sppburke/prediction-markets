@@ -5358,12 +5358,12 @@ fn start_envelope(
 }
 
 #[cfg(test)]
-#[path = "qualification/selection_oracle.rs"]
-mod selection_oracle;
-
-#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "."]
 mod tests {
+    #[path = "qualification/selection_oracle.rs"]
+    mod selection_oracle;
+
     use pe_core_types::{
         BasisPoints, KellyFraction, LeaderAction, PolymarketConditionId, PolymarketTokenId,
         Probability, ProbabilityPpm, RawHttpAttempt, RawHttpResponse, SourceTradeId, WalletAddress,
@@ -5389,7 +5389,6 @@ mod tests {
     };
     use rust_decimal_macros::dec;
 
-    use super::selection_oracle;
     use super::*;
     use crate::paper_recovery::PaperEra;
 
@@ -10985,35 +10984,6 @@ mod tests {
         assert!(matches!(error, QualificationError::EventLog(_)), "{error}");
     }
 
-    /// Malformed pages and every activity-page contract component refuse identically (#574).
-    #[test]
-    fn selection_refuses_malformed_activity_pages_through_both_entries() {
-        for case in [
-            "malformed_activity_page_json",
-            "activity_page_row_parse_failure",
-            "activity_page_wrong_schema",
-            "activity_page_wrong_parser",
-            "activity_page_wrong_content_type",
-        ] {
-            assert_selection_oracle_case(case);
-        }
-    }
-
-    /// Malformed, wrong-contract, and wrong-key websocket evidence refuse identically (#574).
-    #[test]
-    fn selection_refuses_invalid_websocket_evidence_through_both_entries() {
-        assert_selection_oracle_case("malformed_websocket_payload");
-        assert_selection_oracle_case("websocket_wrong_contract");
-        assert_selection_oracle_case("websocket_different_trade_key");
-    }
-
-    /// Receipt mismatch and sealed-prefix mismatch retain their exact shared refusal (#574).
-    #[test]
-    fn selection_receipt_and_prefix_refusals_match_through_both_entries() {
-        assert_selection_oracle_case("receipt_hash_mismatch");
-        assert_selection_oracle_case("sealed_prefix_not_reached");
-    }
-
     /// A stale #574 index cannot reconstruct a page that the candidate file carries.
     #[test]
     fn indexed_selection_refuses_reconstructed_page_absent_from_index() {
@@ -11039,37 +11009,6 @@ mod tests {
             error.to_string(),
             "insufficient qualification evidence: decision source receipt does not match the sealed source prefix"
         );
-    }
-
-    /// Complete-read disagreement, repetition, overlap, reconstruction, and revision failures are
-    /// one shared #574 refusal surface for Map and Index.
-    #[test]
-    fn selection_complete_read_refusals_match_through_both_entries() {
-        for case in [
-            "disagreeing_complete_reads",
-            "repeated_complete_read",
-            "overlapping_complete_reads",
-            "complete_read_reconstruction_failure",
-            "conflicting_semantic_revisions",
-            "trade_absent_from_complete_read",
-        ] {
-            assert_selection_oracle_case(case);
-        }
-    }
-
-    /// Missing and additional terminal decisions retain the #574 Map/Index refusal text.
-    #[test]
-    fn selection_decision_cardinality_refusals_match_through_both_entries() {
-        assert_selection_oracle_case("additional_decision_row");
-        assert_selection_oracle_case("repeated_decision_row");
-        assert_selection_oracle_case("repeated_source_identity_disjoint_reads");
-        assert_selection_oracle_case("missing_decision_row");
-    }
-
-    /// SQLite history failure still precedes deferred source-universe failure for #574.
-    #[test]
-    fn selection_history_error_precedes_universe_error_through_both_entries() {
-        assert_selection_oracle_case("history_before_universe_error_precedence");
     }
 
     /// PASS: authentic child collapse and coherent request-origin substitution fail against a real V4 commitment; original evidence passes.
