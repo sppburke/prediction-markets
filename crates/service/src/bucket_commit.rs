@@ -222,7 +222,6 @@ impl DecisionContinuationV3 {
     /// ordered page occurrences, and read commitment (#565). Consumed by the open-continuation
     /// validator and qualification's read-scope agreement.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn same_complete_read(&self, other: &Self) -> bool {
         self.facts.wallet == other.facts.wallet
             && self.facts.decision_inputs == other.facts.decision_inputs
@@ -900,6 +899,391 @@ impl DecisionContinuationV3 {
         })
     }
 }
+
+// ── #565 VALIDATE lane: open-continuation validation ──────────────────────────
+
+/// Fail-closed boot/census error identifying the open row and its validation cause.
+#[derive(Debug, thiserror::Error)]
+#[error("open decision continuation {source_trade_id}: {cause}")]
+pub struct ContinuationValidationError {
+    pub source_trade_id: SourceTradeId,
+    pub cause: String,
+}
+
+/// Validate every open continuation before any can resume, reconstructing each shared read once.
+pub fn validate_open_continuations(
+    paper_state: &PaperStateDb,
+    source_receipts: &SourceReceiptIndex,
+) -> Result<usize, ContinuationValidationError> {
+    let rows = paper_state.open_decision_pending().map_err(|error| {
+        ContinuationValidationError {
+            // The query failed before it could return a row identity.
+            source_trade_id: SourceTradeId("<open-decision-scan>".to_owned()),
+            cause: error.to_string(),
+        }
+    })?;
+    let validated = rows.len();
+    let mut reads = Vec::<(DecisionContinuationV3, Vec<DecisionContinuationV3>)>::new();
+    let mut page_reads = HashMap::<pe_core_types::EventSeq, usize>::new();
+    for row in rows {
+        let fail = |cause: String| ContinuationValidationError {
+            source_trade_id: row.source_trade_id.clone(),
+            cause,
+        };
+        let continuation =
+            DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
+        if continuation.page_occurrences().is_empty() {
+            return Err(fail(
+                "open decision continuation has no receipt-bearing activity read".to_owned(),
+            ));
+        }
+        continuation
+            .verify_websocket_receipt(source_receipts)
+            .map_err(|error| fail(error.to_string()))?;
+        let shared_read = continuation
+            .page_occurrences()
+            .iter()
+            .find_map(|page| page_reads.get(&page.receipt.sequence).copied());
+        if let Some(index) = shared_read {
+            let (existing, related) = &mut reads[index];
+            if !continuation.same_complete_read(existing)
+                || continuation.version() != existing.version()
+            {
+                return Err(fail(
+                    "decision continuations disagree about one complete activity read".to_owned(),
+                ));
+            }
+            related.push(continuation);
+        } else {
+            for page in continuation.page_occurrences() {
+                page_reads.insert(page.receipt.sequence, reads.len());
+            }
+            reads.push((continuation, Vec::new()));
+        }
+    }
+    for (continuation, related) in reads {
+        let mut lookup = |receipt| {
+            #[cfg(test)]
+            continuation_validation_tests::LOOKUPS.with(|count| count.set(count.get() + 1));
+            source_receipts
+                .source_envelope(receipt)
+                .map(|envelope| CompleteActivityPage {
+                    payload: envelope.payload,
+                    observed_at: envelope.observed_at,
+                    received_at: envelope.received_at,
+                    source_id: envelope.source_id.0,
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    content_type: envelope.content_type,
+                })
+        };
+        let aggregates = continuation
+            .reconstruct_complete_activity_read(&mut lookup)
+            .map_err(|error| ContinuationValidationError {
+                source_trade_id: continuation.facts.source_trade_id.clone(),
+                cause: error.to_string(),
+            })?;
+        for continuation in std::iter::once(&continuation).chain(&related) {
+            let facts = &continuation.facts;
+            let fail = |cause: String| ContinuationValidationError {
+                source_trade_id: facts.source_trade_id.clone(),
+                cause,
+            };
+            let mut matching = aggregates
+                .iter()
+                .filter(|aggregate| aggregate.group_id.key() == &facts.source_trade_id);
+            let aggregate = matching.next().ok_or_else(|| {
+                fail("complete activity read has no aggregate for the open decision".to_owned())
+            })?;
+            if matching.next().is_some() {
+                return Err(fail(
+                    "complete activity read repeats the open decision aggregate".to_owned(),
+                ));
+            }
+            let state = paper_state
+                .activity_group_state(&facts.source_trade_id)
+                .map_err(|error| fail(error.to_string()))?
+                .ok_or_else(|| fail("open decision has no durable activity group".to_owned()))?;
+            if state.semantic_revision != facts.semantic_revision
+                || state.transaction_hash != facts.transaction_hash
+            {
+                return Err(fail(
+                    "open decision differs from its durable activity group".to_owned(),
+                ));
+            }
+            let applied = AppliedEffect::from_document(&state.proof_json)
+                .map_err(|error| fail(error.to_string()))?;
+            crate::qualification::verify_decision_continuation_facts(
+                aggregate,
+                facts,
+                applied.effect.correction(),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        }
+    }
+    Ok(validated)
+}
+
+#[cfg(test)]
+pub(crate) mod continuation_validation_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::cell::Cell;
+
+    use pe_event_log::{EnvelopeIn, Writer};
+    use pe_source_polymarket_public::ActivityRequestBounds;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    thread_local! {
+        pub(super) static LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Engine-created open rows from two BUYs in one real, committed complete read.
+    pub(crate) fn producer_fixture() -> (tempfile::TempDir, Arc<PaperStateDb>, SourceReceiptIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let epoch = 1_700_000_000;
+        let fixed_end = epoch + 10;
+        let observed_at =
+            SourceTimestamp(time::OffsetDateTime::from_unix_timestamp(fixed_end).unwrap());
+        let received_at =
+            ReceivedAt(time::OffsetDateTime::from_unix_timestamp(fixed_end + 1).unwrap());
+        let payload = serde_json::to_vec(&json!([
+            {
+                "proxyWallet": wallet.to_string(), "timestamp": epoch,
+                "conditionId": "0xcondition-a", "type": "TRADE", "size": "2.000000",
+                "usdcSize": "1.000000", "transactionHash": "0xtransaction-a", "price": "0.5",
+                "asset": "asset-a", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes",
+                "isCombo": false
+            },
+            {
+                "proxyWallet": wallet.to_string(), "timestamp": epoch,
+                "conditionId": "0xcondition-b", "type": "TRADE", "size": "4.000000",
+                "usdcSize": "2.000000", "transactionHash": "0xtransaction-b", "price": "0.5",
+                "asset": "asset-b", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes",
+                "isCombo": false
+            }
+        ]))
+        .unwrap();
+        let source_id = SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned());
+        let parsed = parse_activity_response(
+            &payload,
+            wallet,
+            &ActivityParseContext {
+                source_id: source_id.clone(),
+                observed_at: observed_at.clone(),
+                received_at: received_at.clone(),
+                transport: ActivityTransport::Rest,
+            },
+        )
+        .unwrap();
+        let aggregates = parsed.aggregates().unwrap();
+        assert_eq!(aggregates.len(), 2);
+        let path = dir.path().join("source.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let page_receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id,
+                schema_version: crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+                observed_at: observed_at.clone(),
+                received_at: received_at.clone(),
+                content_type: ContentType::Json,
+                payload: payload.clone(),
+            })
+            .unwrap();
+        let request_url = PolymarketEndpoint::UserPositionActivityPage {
+            user: wallet.to_string(),
+            end: fixed_end,
+            start: None,
+            offset: 0,
+        }
+        .url("https://data-api.polymarket.com");
+        let raw_hash = blake3::hash(&payload).to_hex().to_string();
+        let pages = vec![ReconciliationPageEvidence {
+            request_url: request_url.clone(),
+            bounds: Some(ActivityRequestBounds {
+                start: None,
+                end: fixed_end,
+            }),
+            partition: None,
+            offset: 0,
+            row_count: 2,
+            canonical_page_hash: canonical_page_hash(&payload).unwrap(),
+            raw_page_hash: raw_hash.clone(),
+            received_at: received_at.clone(),
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+        }];
+        let occurrences = vec![PageOccurrence {
+            request_url,
+            raw_hash,
+            receipt: page_receipt,
+        }];
+        let commitment = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                observed_at,
+                received_at,
+                content_type: ContentType::Json,
+                payload: activity_read_commitment_payload(wallet, fixed_end, &occurrences, &pages)
+                    .unwrap(),
+            })
+            .unwrap();
+        drop(writer);
+        paper_state.set_cursor(&wallet, 0).unwrap();
+        paper_state
+            .install_anchors(&[AnchorInstallRecord {
+                wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: 0,
+                anchored_at_unix: 0,
+                ledger_hash_after: "empty".to_owned(),
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "validation-fixture".to_owned(),
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 0,
+            }])
+            .unwrap();
+        let context = BucketDecisionContext {
+            applied_configuration: RuntimeConfig::from_service_config(
+                &crate::config::ServiceConfig::default(),
+            ),
+            decision_inputs_json: json!({"fixed_end": fixed_end, "pages": pages}).to_string(),
+            page_occurrences: occurrences,
+            observed_source_receipts: HashMap::new(),
+            read_commitment: Some(commitment),
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            signal_config: SignalConfig::default(),
+            copy_eligible: true,
+            bracket_commit: false,
+            recorded_at_unix: fixed_end + 1,
+            observation_provenance: HashMap::new(),
+            no_copy_dispositions: HashMap::new(),
+            identity_overrides: HashMap::new(),
+            identity_unresolved: HashSet::new(),
+            history_status: Some(WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{\"fixed_end_walk\":\"complete\"}".to_owned(),
+                updated_at_unix: fixed_end + 1,
+            }),
+        };
+        let result = BucketCommitEngine::load(paper_state.clone(), PositionLedger::new())
+            .unwrap()
+            .commit(
+                aggregates,
+                &context,
+                FrozenDecisionBasis {
+                    win_rate_p: Probability::new(dec!(0.7)).unwrap(),
+                    bankroll: dec!(1000),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.pending.len(), 2);
+        assert!(result.newly_fenced.is_none());
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        (dir, paper_state, index)
+    }
+
+    /// PASS: real engine-created V4 rows validate; changing only one frozen price names that row.
+    /// FAIL: valid rows fail, altered facts pass, the wrong identity is reported, or rows are repaired.
+    #[test]
+    fn validate_open_continuations_accepts_producer_shaped_rows_and_rejects_altered_facts() {
+        let (dir, paper_state, index) = producer_fixture();
+        assert_eq!(
+            validate_open_continuations(&paper_state, &index).unwrap(),
+            2
+        );
+        let before = paper_state.open_decision_pending().unwrap();
+        let row = &before[1];
+        let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+        frozen["price"] = serde_json::to_value(Price::new(dec!(0.6)).unwrap()).unwrap();
+        let altered = frozen.to_string();
+        let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+        conn.execute(
+            "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![altered, row.source_trade_id.0],
+        )
+        .unwrap();
+        let error = validate_open_continuations(&paper_state, &index).unwrap_err();
+        assert_eq!(error.source_trade_id, row.source_trade_id);
+        assert!(
+            error
+                .cause
+                .contains("differs from its raw activity aggregate")
+        );
+        assert!(error.to_string().contains(&row.source_trade_id.0));
+        assert_eq!(
+            paper_state
+                .decision_pending_for(&row.source_trade_id)
+                .unwrap()
+                .unwrap()
+                .frozen_inputs_json,
+            altered
+        );
+        assert_eq!(paper_state.open_decision_pending().unwrap().len(), 2);
+    }
+
+    /// PASS: two decisions sharing a read perform exactly one page lookup and one commitment lookup.
+    /// FAIL: a shared read is reconstructed per row or an extra observation/page scan is performed.
+    #[test]
+    fn shared_read_is_reconstructed_once() {
+        let (_dir, paper_state, index) = producer_fixture();
+        LOOKUPS.with(|count| count.set(0));
+        assert_eq!(
+            validate_open_continuations(&paper_state, &index).unwrap(),
+            2
+        );
+        assert_eq!(LOOKUPS.with(Cell::get), 2);
+    }
+
+    /// PASS: receipt-free open V2 rows and inconsistent descriptions of shared receipts are refused.
+    /// FAIL: erased receipt evidence passes, shared-read disagreement passes, or the wrong row is named.
+    #[test]
+    fn validate_open_continuations_rejects_legacy_reads_and_disagreement() {
+        let (dir, paper_state, index) = producer_fixture();
+        let rows = paper_state.open_decision_pending().unwrap();
+        let row = &rows[1];
+        let original: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+        let mut legacy = original.clone();
+        legacy["version"] = json!(2);
+        for key in [
+            "page_occurrences",
+            "observed_source_receipt",
+            "read_commitment",
+        ] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let mut disagreement = original;
+        disagreement["decision_inputs"]["fixed_end"] = json!(1_700_000_011);
+        let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+        for (altered, cause) in [
+            (legacy, "no receipt-bearing activity read"),
+            (
+                disagreement,
+                "decision continuations disagree about one complete activity read",
+            ),
+        ] {
+            conn.execute(
+                "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                rusqlite::params![altered.to_string(), row.source_trade_id.0],
+            )
+            .unwrap();
+            let error = validate_open_continuations(&paper_state, &index).unwrap_err();
+            assert_eq!(error.source_trade_id, row.source_trade_id);
+            assert!(error.cause.contains(cause), "{error}");
+        }
+    }
+}
+
+// ── End #565 VALIDATE lane ───────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum BucketCommitError {

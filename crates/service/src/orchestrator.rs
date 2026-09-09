@@ -324,6 +324,8 @@ pub struct Orchestrator<
     /// remains the owner; this queue only preserves its causal boot order.
     pending_boot: VecDeque<IncomingTrade>,
     pending_continuations: HashMap<SourceTradeId, DecisionContinuationV3>,
+    /// A committed continuation failed to load; stop the critical owner before more control work.
+    pending_load_failure: Option<String>,
     /// True only while replaying continuations that were open at process boot. Newly committed
     /// buckets still pass the current source-health gate before their financial disposition.
     resuming_boot: bool,
@@ -1293,7 +1295,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                             Ok(Some(trade)) => self.handle_trade(trade).await,
                             Ok(None) => {}
                             Err(error) => {
-                                error!(%error, trade = %source_trade_id, "load committed decision continuation failed");
+                                let msg = error.to_string();
+                                self.pending_load_failure = Some(msg.clone());
+                                let _ = committed.send(Err(msg));
+                                return;
                             }
                         }
                     }
@@ -1550,6 +1555,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             watchlist_writer_lock: config.watchlist_writer_lock,
             pending_boot,
             pending_continuations,
+            pending_load_failure: None,
             resuming_boot: false,
             financial_log_paths: None,
             source_receipts: None,
@@ -1629,13 +1635,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     ) -> Result<Option<IncomingTrade>, anyhow::Error> {
         let row = self
             .paper_state
-            .open_decision_pending()
-            .map_err(|error| anyhow::anyhow!("read open continuations: {error}"))?
-            .into_iter()
-            .find(|row| &row.source_trade_id == source_trade_id);
+            .decision_pending_for(source_trade_id)
+            .map_err(|error| anyhow::anyhow!("read pending {source_trade_id}: {error}"))?;
         let Some(row) = row else {
             return Ok(None);
         };
+        if row.state != pe_paper_state::DecisionPendingState::Open {
+            return Ok(None);
+        }
         let continuation = DecisionContinuationV3::from_durable(&row)
             .map_err(|error| anyhow::anyhow!("decode pending {source_trade_id}: {error}"))?;
         let trade = continuation
@@ -1716,6 +1723,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let mut draining = false;
         let mut control_done = false;
         loop {
+            if let Some(msg) = self.pending_load_failure.take() {
+                return Err(OrchestratorRunError::PendingRecovery(msg));
+            }
             if self.intake_stopped {
                 return Err(OrchestratorRunError::PaperDurabilityUncertain);
             }
@@ -3454,6 +3464,142 @@ mod tests {
     use crate::supabase_state::SourceEvidence;
 
     const NOW: i64 = 1_700_000_000;
+
+    /// PASS: keyed recovery ignores a corrupt unrelated open row, rebuilds/caches only the requested
+    /// open row, skips missing/terminal rows, and reports the requested identity on a load error.
+    /// FAIL: recovery scans all open rows, resumes terminal rows, or hides decode/read failures.
+    #[tokio::test]
+    async fn load_pending_continuation_uses_single_row_lookup_and_resumes_only_open_rows() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use pe_event_log::Writer;
+        use pe_source_polymarket_public::FixtureFetcher;
+        use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
+        use rust_decimal::Decimal;
+
+        use crate::bucket_commit::DecisionContinuationV3;
+        use crate::bucket_commit::continuation_validation_tests::producer_fixture;
+        use crate::clob_book::FixtureClobBookFetcher;
+        use crate::entry_gate::CopyEntryGateConfig;
+        use crate::health::new_shared_health;
+        use crate::live_watchlist::LiveWatchlist;
+        use crate::mid_price_cache::MidPriceCache;
+
+        let (dir, paper_state, _index) = producer_fixture();
+        let rows = paper_state.open_decision_pending().unwrap();
+        let target = &rows[1];
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(2);
+        let mut orchestrator = Orchestrator::new(
+            LiveWatchlist::new(pe_trader_index::Watchlist {
+                entries: Vec::new(),
+                snapshot_at: pe_core_types::SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                active_count: 0,
+                incubator_count: 0,
+            }),
+            super::OrchestratorConfig {
+                bankroll: Decimal::from(1000),
+                mode: ExecutionMode::Paper,
+                signal_config: Default::default(),
+                max_resolution_horizon_secs: 0,
+                min_resolution_horizon_secs: 0,
+                max_fill_price: Decimal::ZERO,
+                min_fill_price: Decimal::ZERO,
+                price_impact_cap_bps: 100,
+                entry_gate_config: CopyEntryGateConfig,
+                runtime_config: None,
+                live_accounts: None,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+                watchlist_writer_lock: None,
+            },
+            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+            Writer::open(&dir.path().join("paper.log")).unwrap(),
+            paper_state.clone(),
+            crate::paper_recovery::build_leader_ledger(&paper_state).unwrap(),
+            new_shared_health(false),
+            MidPriceCache::with_fetcher(
+                FixtureFetcher::new(HashMap::new()),
+                "https://gamma.test".to_owned(),
+            ),
+            control_rx,
+            None,
+            None,
+            None,
+            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        )
+        .unwrap();
+        orchestrator.pending_boot.clear();
+        orchestrator.pending_continuations.clear();
+
+        // A full scan now fails at the durable row parser, before any JSON is decoded.
+        let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+        conn.execute(
+            "UPDATE decision_pending SET wallet_hex = 'invalid-wallet' WHERE source_trade_id = ?1",
+            [&rows[0].source_trade_id.0],
+        )
+        .unwrap();
+        assert!(paper_state.open_decision_pending().is_err());
+        let missing = pe_core_types::SourceTradeId("missing".to_owned());
+        assert!(
+            orchestrator
+                .load_pending_continuation(&missing)
+                .unwrap()
+                .is_none()
+        );
+        let expected = DecisionContinuationV3::from_durable(target).unwrap();
+        let trade = orchestrator
+            .load_pending_continuation(&target.source_trade_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(trade.source_trade_id, target.source_trade_id);
+        assert_eq!(trade.price, expected.facts.price);
+        assert_eq!(trade.contracts, expected.facts.share_amount);
+        assert_eq!(
+            orchestrator
+                .pending_continuations
+                .get(&target.source_trade_id),
+            Some(&expected)
+        );
+        assert_eq!(orchestrator.pending_continuations.len(), 1);
+
+        orchestrator.pending_continuations.clear();
+        paper_state
+            .close_decision_pending(&target.source_trade_id, "{}", "test_terminal", NOW + 20)
+            .unwrap();
+        conn.execute(
+            "UPDATE decision_pending SET frozen_inputs_json = '{}' WHERE source_trade_id = ?1",
+            [&target.source_trade_id.0],
+        )
+        .unwrap();
+        assert!(
+            orchestrator
+                .load_pending_continuation(&target.source_trade_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(orchestrator.pending_continuations.is_empty());
+
+        conn.execute("UPDATE decision_pending SET state = 'open', terminal_disposition = NULL WHERE source_trade_id = ?1",
+            [&target.source_trade_id.0]).unwrap();
+        let error = orchestrator
+            .load_pending_continuation(&target.source_trade_id)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("decode pending {}", target.source_trade_id))
+        );
+        let error = orchestrator
+            .load_pending_continuation(&rows[0].source_trade_id)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("read pending {}", rows[0].source_trade_id))
+        );
+        assert!(orchestrator.pending_continuations.is_empty());
+    }
 
     /// The active runtime redrive, resolution validation, and result-application call sites all
     /// use this selector, which must stay on the configured source log rather than the receipt
