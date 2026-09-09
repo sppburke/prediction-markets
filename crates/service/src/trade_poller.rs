@@ -917,23 +917,10 @@ impl TradePoller {
         if buckets.is_empty() {
             return Ok(());
         }
-        let payload =
-            activity_read_commitment_payload(wallet, fixed_end, &page_occurrences, &activity.pages)
-                .map_err(|_| ReconciliationError::PageReceiptMismatch)?;
-        let recorded_at = (self.now)();
-        let read_commitment = self
-            .source_log
-            .append(EnvelopeIn {
-                source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
-                schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-                parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
-                observed_at: SourceTimestamp(recorded_at),
-                received_at: ReceivedAt(recorded_at),
-                content_type: ContentType::Json,
-                payload,
-            })
-            .await
-            .map_err(|SourceLogHandleError::Closed| ReconciliationError::SourceLogClosed)?;
+        // One commitment per complete read, synchronized before the first bucket that can make
+        // new activity durable (#565). Cursor-overlap repeats of already-durable seconds commit no
+        // new group and reference no commitment, so a quiet wallet appends nothing per round.
+        let mut read_commitment: Option<AppendReceipt> = None;
         if let Some(latest_activity) = buckets
             .iter()
             .flatten()
@@ -970,6 +957,30 @@ impl TradePoller {
                     .all(|group| bucket_ids.contains(group))
             {
                 break;
+            }
+            if read_commitment.is_none() {
+                let mut has_new_group = false;
+                for aggregate in &bucket {
+                    if self
+                        .paper_state
+                        .activity_group_state(aggregate.group_id.key())?
+                        .is_none()
+                    {
+                        has_new_group = true;
+                        break;
+                    }
+                }
+                if has_new_group {
+                    read_commitment = Some(
+                        self.append_read_commitment(
+                            wallet,
+                            fixed_end,
+                            &page_occurrences,
+                            &activity.pages,
+                        )
+                        .await?,
+                    );
+                }
             }
             let identities = self.resolve_bucket(&bucket).await?;
             let context = self.context(
@@ -1009,7 +1020,7 @@ impl TradePoller {
         copy_eligible: bool,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
         page_occurrences: &[PageOccurrence],
-        read_commitment: AppendReceipt,
+        read_commitment: Option<AppendReceipt>,
         bucket: &[ActivityAggregate],
         identities: BucketIdentities,
     ) -> Result<BucketDecisionContext, ReconciliationError> {
@@ -1063,8 +1074,7 @@ impl TradePoller {
             page_occurrences: page_occurrences.to_vec(),
             observed_source_receipts,
             reconstruction_quality,
-            read_commitment: Some(read_commitment),
-
+            read_commitment,
             signal_config: self.signal_config.clone(),
             copy_eligible,
             bracket_commit: false,
@@ -1075,6 +1085,32 @@ impl TradePoller {
             identity_unresolved: identities.unresolved,
             history_status: None,
         })
+    }
+
+    /// Synchronize the commitment record binding one complete read (#565); the receipt is
+    /// acknowledged only after the durable append, exactly like a page.
+    async fn append_read_commitment(
+        &self,
+        wallet: WalletAddress,
+        fixed_end: i64,
+        page_occurrences: &[PageOccurrence],
+        pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
+    ) -> Result<AppendReceipt, ReconciliationError> {
+        let payload = activity_read_commitment_payload(wallet, fixed_end, page_occurrences, pages)
+            .map_err(|_| ReconciliationError::PageReceiptMismatch)?;
+        let recorded_at = (self.now)();
+        self.source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                observed_at: SourceTimestamp(recorded_at),
+                received_at: ReceivedAt(recorded_at),
+                content_type: ContentType::Json,
+                payload,
+            })
+            .await
+            .map_err(|SourceLogHandleError::Closed| ReconciliationError::SourceLogClosed)
     }
 
     async fn resolve_bucket(

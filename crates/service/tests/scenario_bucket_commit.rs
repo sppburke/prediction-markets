@@ -2444,7 +2444,10 @@ async fn boot_validation_rejects_fact_altered_row_before_any_resume() {
     }
     .await;
     let error = result.unwrap_err();
-    assert_eq!(error.source_trade_id, altered.source_trade_id);
+    assert_eq!(
+        error.source_trade_id.as_ref(),
+        Some(&altered.source_trade_id)
+    );
     assert!(error.to_string().contains(&altered.source_trade_id.0));
     assert_eq!(resumes, 0);
     assert_eq!(paper.open_decision_pending().unwrap().len(), 2);
@@ -2599,7 +2602,7 @@ async fn corrected_continuation_identity_validates_across_consumers() {
         if matches!(mutation, "control" | "corrected") {
             assert_eq!(result.unwrap(), 1, "{mutation}");
         } else {
-            assert_eq!(result.unwrap_err().source_trade_id, id, "{mutation}");
+            assert_eq!(result.unwrap_err().source_trade_id, Some(id), "{mutation}");
         }
     }
     // Fresh control-message load: the engine records the correction before the owner loads it.

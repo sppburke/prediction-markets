@@ -982,11 +982,11 @@ impl DecisionContinuationV3 {
 
 // ── #565 VALIDATE lane: open-continuation validation ──────────────────────────
 
-/// Fail-closed boot/census error identifying the open row and its validation cause.
+/// Fail-closed boot/census error identifying the open row (when one was reached) and its cause.
 #[derive(Debug, thiserror::Error)]
-#[error("open decision continuation {source_trade_id}: {cause}")]
+#[error("open decision continuation {}: {cause}", source_trade_id.as_ref().map_or("<scan>", |id| id.0.as_str()))]
 pub struct ContinuationValidationError {
-    pub source_trade_id: SourceTradeId,
+    pub source_trade_id: Option<SourceTradeId>,
     pub cause: String,
 }
 
@@ -995,19 +995,19 @@ pub fn validate_open_continuations(
     paper_state: &PaperStateDb,
     source_receipts: &SourceReceiptIndex,
 ) -> Result<usize, ContinuationValidationError> {
-    let rows = paper_state.open_decision_pending().map_err(|error| {
-        ContinuationValidationError {
-            // The query failed before it could return a row identity.
-            source_trade_id: SourceTradeId("<open-decision-scan>".to_owned()),
-            cause: error.to_string(),
-        }
-    })?;
+    let rows =
+        paper_state
+            .open_decision_pending()
+            .map_err(|error| ContinuationValidationError {
+                source_trade_id: None,
+                cause: error.to_string(),
+            })?;
     let validated = rows.len();
     let mut reads = Vec::<(DecisionContinuationV3, Vec<DecisionContinuationV3>)>::new();
     let mut page_reads = HashMap::<pe_core_types::EventSeq, usize>::new();
     for row in rows {
         let fail = |cause: String| ContinuationValidationError {
-            source_trade_id: row.source_trade_id.clone(),
+            source_trade_id: Some(row.source_trade_id.clone()),
             cause,
         };
         let continuation =
@@ -1060,13 +1060,13 @@ pub fn validate_open_continuations(
         let aggregates = continuation
             .reconstruct_complete_activity_read(&mut lookup)
             .map_err(|error| ContinuationValidationError {
-                source_trade_id: continuation.facts.source_trade_id.clone(),
+                source_trade_id: Some(continuation.facts.source_trade_id.clone()),
                 cause: error.to_string(),
             })?;
         for continuation in std::iter::once(&continuation).chain(&related) {
             let facts = &continuation.facts;
             let fail = |cause: String| ContinuationValidationError {
-                source_trade_id: facts.source_trade_id.clone(),
+                source_trade_id: Some(facts.source_trade_id.clone()),
                 cause,
             };
             let mut matching = aggregates
@@ -1293,7 +1293,7 @@ pub(crate) mod continuation_validation_tests {
         )
         .unwrap();
         let error = validate_open_continuations(&paper_state, &index).unwrap_err();
-        assert_eq!(error.source_trade_id, row.source_trade_id);
+        assert_eq!(error.source_trade_id.as_ref(), Some(&row.source_trade_id));
         assert!(
             error
                 .cause
@@ -1314,7 +1314,7 @@ pub(crate) mod continuation_validation_tests {
     /// PASS: two decisions sharing a read perform exactly one page lookup and one commitment lookup.
     /// FAIL: a shared read is reconstructed per row or an extra observation/page scan is performed.
     #[test]
-    fn shared_read_is_reconstructed_once() {
+    fn validate_open_continuations_reconstructs_a_shared_read_once() {
         let (_dir, paper_state, index) = producer_fixture();
         LOOKUPS.with(|count| count.set(0));
         assert_eq!(
@@ -1357,7 +1357,7 @@ pub(crate) mod continuation_validation_tests {
             )
             .unwrap();
             let error = validate_open_continuations(&paper_state, &index).unwrap_err();
-            assert_eq!(error.source_trade_id, row.source_trade_id);
+            assert_eq!(error.source_trade_id.as_ref(), Some(&row.source_trade_id));
             assert!(error.cause.contains(cause), "{error}");
         }
     }

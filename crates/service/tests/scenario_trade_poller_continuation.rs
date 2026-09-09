@@ -377,11 +377,16 @@ async fn recorded_poll(
     let ledger = build_leader_ledger(&paper).unwrap();
     let mut engine = BucketCommitEngine::load(Arc::clone(&paper), ledger).unwrap();
     let source_sink = SourceEventSink::open(source_path).unwrap();
+    // The coordinator records every acknowledged append in the process index; a repeat round
+    // over an existing log must start from that log's verified receipts, as production does.
+    let source_receipts = pe_service::risk_inputs::SourceReceiptIndex::replay(source_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(8);
     let (trigger_tx, trigger_rx) = mpsc::channel(4);
     let health = new_shared_health_with_ws(false, true, 90);
     let ingest = tokio::spawn(
-        ActivityIngest::poll_only(source_sink, source_rx, trigger_tx, Arc::clone(&health)).run(),
+        ActivityIngest::poll_only(source_sink, source_rx, trigger_tx, Arc::clone(&health))
+            .with_source_receipt_index(source_receipts)
+            .run(),
     );
     let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
         Arc::new(GammaFetcher),
