@@ -121,6 +121,8 @@ fn context(epoch: i64) -> BucketDecisionContext {
         page_occurrences: Vec::new(),
         observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        read_commitment: None,
+
         signal_config: Default::default(),
         copy_eligible: false,
         bracket_commit: false,

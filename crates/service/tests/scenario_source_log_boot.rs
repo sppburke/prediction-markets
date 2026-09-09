@@ -5,6 +5,8 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -643,6 +645,8 @@ fn migration_record_drift_after_the_walk_falls_back_to_the_full_prefix_verificat
     let _keep: PathBuf = resumed.active_main;
 }
 
+/// PASS: installed boot plus open-row validation reads less than 1.5 source-log lengths.
+/// FAIL: a hidden second whole-log pass exceeds that bound.
 /// Acceptance criterion 1: an installed boot reads the source log once (plus the bounded suffix
 /// of its own appends). Measured through the process read counter rather than an internal
 /// counter, so a hidden second pass in the walk, migration resume, obligation rebuild, or the
@@ -664,9 +668,10 @@ fn installed_boot_reads_the_source_log_once() {
         }
         writer.sync().unwrap();
     }
+    let paper_state = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+    install_committed_open_read(&paper_state, &paths.source_log);
     let length = file_len(&paths.source_log);
     assert!(length > 2_000_000, "fixture log is {length} bytes");
-    let paper_state = PaperStateDb::open(&paths.fixed_main).unwrap();
 
     let before = read_chars();
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
@@ -680,6 +685,11 @@ fn installed_boot_reads_the_source_log_once() {
         .unwrap();
     let after_binding = boot.extend(&mut sink).unwrap();
     let obligations = boot.obligations(&paper_state, &paths.paper_log).unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper_state, &boot.receipt_index())
+            .unwrap(),
+        1
+    );
     boot.verify_handoff(&mut sink).unwrap();
     let read = read_chars() - before;
 
@@ -692,5 +702,94 @@ fn installed_boot_reads_the_source_log_once() {
     assert!(
         read < length + length / 2,
         "more than one whole-file pass: read {read} bytes for a {length}-byte log"
+    );
+}
+
+fn install_committed_open_read(paper: &Arc<PaperStateDb>, source_log: &Path) {
+    let wallet = WalletAddress::from_hex(WALLET).unwrap();
+    support::install_empty_anchor(paper, wallet, 0);
+    paper
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet,
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: NOW_UNIX,
+        })
+        .unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": WALLET, "timestamp": NOW_UNIX + 25_000,
+        "conditionId": "0xboot-open", "type": "TRADE", "size": "2.5", "usdcSize": "1.25",
+        "transactionHash": "0xboot-open", "price": "0.5", "asset": "boot-token",
+        "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false,
+    }]))
+    .unwrap();
+    let mut writer = Writer::open(source_log).unwrap();
+    let (read, commitment) = support::append_committed_read(
+        &mut writer,
+        wallet,
+        &payload,
+        NOW_UNIX + 25_001,
+        NOW_UNIX + 25_002,
+    );
+    let context = support::read_context(&read, commitment, NOW_UNIX + 25_003);
+    let mut engine = pe_service::bucket_commit::BucketCommitEngine::load(
+        Arc::clone(paper),
+        pe_service::paper_recovery::build_leader_ledger(paper).unwrap(),
+    )
+    .unwrap();
+    let committed = engine
+        .commit(
+            read.aggregates,
+            &context,
+            pe_service::bucket_commit::FrozenDecisionBasis {
+                win_rate_p: pe_core_types::Probability::ZERO,
+                bankroll: rust_decimal::Decimal::ZERO,
+            },
+        )
+        .unwrap();
+    assert_eq!(committed.pending.len(), 1);
+}
+
+/// PASS: validation reads only its referenced page and commitment after indexing a log with
+/// 20,000 trailing padding frames. FAIL: validation performs another whole-log scan.
+#[cfg(target_os = "linux")]
+#[test]
+fn continuation_validation_reads_only_referenced_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    install_committed_open_read(&paper, &source_path);
+    let referenced_bytes = file_len(&source_path);
+    {
+        let mut writer = Writer::open(&source_path).unwrap();
+        for index in 0..20_000_i64 {
+            writer
+                .append(envelope(
+                    "scenario.padding",
+                    1,
+                    1,
+                    &serde_json::to_vec(
+                        &serde_json::json!({"index": index, "padding": "x".repeat(128)}),
+                    )
+                    .unwrap(),
+                    NOW_UNIX,
+                ))
+                .unwrap();
+        }
+        writer.sync().unwrap();
+    }
+    let padding_bytes = file_len(&source_path) - referenced_bytes;
+    let index = SourceReceiptIndex::replay(&source_path).unwrap();
+    let before = read_chars();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+        1
+    );
+    let read = read_chars() - before;
+    assert!(padding_bytes > 2_000_000);
+    assert!(read > 0, "the referenced source frames must be read");
+    assert!(
+        read < padding_bytes / 10,
+        "validation read {read} bytes with {referenced_bytes} referenced bytes and {padding_bytes} padding bytes"
     );
 }

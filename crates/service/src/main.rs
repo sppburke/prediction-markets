@@ -193,6 +193,23 @@ async fn main() -> Result<()> {
     if env::args().any(|a| a == "--update-paper-migration-paths") {
         return run_update_paper_migration_paths();
     }
+    if args
+        .iter()
+        .any(|argument| argument == "--validate-open-continuations")
+    {
+        let paper_state = PaperStateDb::open_read_only(&PathBuf::from(required_arg_value(
+            &args,
+            "--paper-state",
+        )?))?;
+        let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&PathBuf::from(
+            required_arg_value(&args, "--source-log")?,
+        ))
+        .context("build verified source receipt index for open-continuation census")?;
+        let validated =
+            pe_service::bucket_commit::validate_open_continuations(&paper_state, &index)?;
+        println!("open_rows={validated} validated={validated}");
+        return Ok(());
+    }
     if args.iter().any(|argument| argument == "--qualify") {
         let options = pe_service::qualification::QualifyOptions {
             paper_log: PathBuf::from(required_arg_value(&args, "--paper-log")?),
@@ -910,6 +927,10 @@ async fn main() -> Result<()> {
         None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
             .context("build verified source receipt index")?,
     };
+    let open_rows =
+        pe_service::bucket_commit::validate_open_continuations(&paper_state, &source_receipts)
+            .context("validate open decision continuations before resume")?;
+    info!(open_rows, "open decision continuations validated");
     let risk_halt_release = financial_start.is_some().then(|| {
         RiskHaltReleaseHandle::new(
             cfg.event_log_path.clone(),

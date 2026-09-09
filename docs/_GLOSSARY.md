@@ -414,7 +414,9 @@ state. A single first BUY consumes history even if a later copy gate rejects it;
 same-market candidates in one second are all recorded as ambiguous. `decision_pending` bridges
 the durable ledger/gate/history commit to the later production-only continuation: `open` is
 closed only by a terminal disposition, and replay consumes the recorded transition without
-executing the continuation. A changed semantic revision, unprovable activity, invalid mapping,
+executing the continuation. Receipt-bearing continuations pair `ActivityWs` provenance with a
+websocket source receipt exactly; REST provenance has no websocket receipt. A changed semantic
+revision, unprovable activity, invalid mapping,
 or ledger arithmetic failure creates a monotonic `wallet_fences` row. Fenced wallets are removed
 from effective membership/projection and cannot copy; there is no delete owner for a fence.
 

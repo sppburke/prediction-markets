@@ -55,21 +55,18 @@ use axum::{
 };
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
-    BasisPoints, CollateralAmount, LeaderAction, MarketId, OutcomeId, PolymarketConditionId,
-    PolymarketTokenId, Price, ProbabilityPpm, ReceivedAt, ReconstructionQuality, ShareAmount, Side,
-    SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+    BasisPoints, CollateralAmount, MarketId, OutcomeId, PolymarketConditionId, PolymarketTokenId,
+    Price, ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp,
+    SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Reader, Scanner, Writer};
 use pe_execution_core::{AdmissionReceipts, LiveAdmissionArtifact};
-use pe_paper_state::{
-    ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
-    LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
-};
+use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
-use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationFacts};
+use pe_service::bucket_commit::BucketDecisionContext;
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook, ReqwestClobBookFetcher};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
@@ -92,7 +89,7 @@ use pe_service::{config::ServiceConfig, mark_prices::HistoricalMarkAdapter};
 use pe_source_polymarket_public::{
     ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, ACTIVITY_WS_SUBSCRIBE, ActivityWsError,
     ActivityWsPeer, FixtureFetcher, LiveMarketEvidence, parse_activity_frame,
-    parse_activity_response, parse_activity_trade_observation,
+    parse_activity_trade_observation,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -331,6 +328,7 @@ fn build_orchestrator(
             watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -1500,17 +1498,14 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
     }]))
     .unwrap();
     let mut source_writer = Writer::open(&source_path).unwrap();
-    let page_receipt = source_writer
-        .append_synced(EnvelopeIn {
-            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
-            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-            observed_at: SourceTimestamp(observed_at),
-            received_at: ReceivedAt(observed_at),
-            content_type: ContentType::Json,
-            payload: activity.clone(),
-        })
-        .unwrap();
+    let (read, commitment_receipt) = support::append_committed_read(
+        &mut source_writer,
+        leader_wallet(),
+        &activity,
+        observed_at.unix_timestamp(),
+        observed_at.unix_timestamp(),
+    );
+    let page_receipt = read.page.receipt;
     drop(source_writer);
     let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
 
@@ -1660,6 +1655,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
         OrchestratorConfig {
             bankroll: dec!(10_000),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -1709,23 +1705,10 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
         .unwrap();
     let run = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
 
-    let parse_context = pe_source_polymarket_public::ActivityParseContext {
-        source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
-        observed_at: SourceTimestamp(observed_at),
-        received_at: ReceivedAt(observed_at),
-        transport: pe_source_polymarket_public::ActivityTransport::Rest,
-    };
-    let aggregates = parse_activity_response(&activity, leader_wallet(), &parse_context)
-        .unwrap()
-        .aggregates()
-        .unwrap();
-    let source_trade_id = aggregates[0].group_id.key().clone();
-    let (decision_inputs_json, occurrence) = support::producer_shaped_activity_page(
-        leader_wallet(),
-        &activity,
-        observed_at.unix_timestamp(),
-        page_receipt,
-    );
+    let source_trade_id = read.aggregates[0].group_id.key().clone();
+    let aggregates = read.aggregates;
+    let decision_inputs_json = read.decision_inputs_json;
+    let occurrence = read.page;
     let (committed, acknowledgement) = oneshot::channel();
     control_tx
         .send(
@@ -1737,6 +1720,8 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
                     page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    read_commitment: Some(commitment_receipt),
+
                     signal_config: SignalConfig::default(),
                     copy_eligible: true,
                     bracket_commit: false,
@@ -1850,17 +1835,14 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
     }]))
     .unwrap();
     let mut source_writer = Writer::open(&source_path).unwrap();
-    let page_receipt = source_writer
-        .append_synced(EnvelopeIn {
-            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
-            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-            observed_at: SourceTimestamp(observed_at),
-            received_at: ReceivedAt(observed_at),
-            content_type: ContentType::Json,
-            payload: activity.clone(),
-        })
-        .unwrap();
+    let (read, commitment_receipt) = support::append_committed_read(
+        &mut source_writer,
+        leader_wallet(),
+        &activity,
+        observed_at.unix_timestamp(),
+        observed_at.unix_timestamp(),
+    );
+    let page_receipt = read.page.receipt;
     drop(source_writer);
     let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
     let source_sink = SourceEventSink::open(&source_path).unwrap();
@@ -2006,6 +1988,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
         OrchestratorConfig {
             bankroll: dec!(10_000),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -2052,23 +2035,10 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
         )
         .unwrap();
     let run = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
-    let parse_context = pe_source_polymarket_public::ActivityParseContext {
-        source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
-        observed_at: SourceTimestamp(observed_at),
-        received_at: ReceivedAt(observed_at),
-        transport: pe_source_polymarket_public::ActivityTransport::Rest,
-    };
-    let aggregates = parse_activity_response(&activity, leader_wallet(), &parse_context)
-        .unwrap()
-        .aggregates()
-        .unwrap();
-    let source_trade_id = aggregates[0].group_id.key().clone();
-    let (decision_inputs_json, occurrence) = support::producer_shaped_activity_page(
-        leader_wallet(),
-        &activity,
-        observed_at.unix_timestamp(),
-        page_receipt,
-    );
+    let source_trade_id = read.aggregates[0].group_id.key().clone();
+    let aggregates = read.aggregates;
+    let decision_inputs_json = read.decision_inputs_json;
+    let occurrence = read.page;
     let (committed, acknowledgement) = oneshot::channel();
     control_tx
         .send(
@@ -2080,6 +2050,8 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
                     page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    read_commitment: Some(commitment_receipt),
+
                     signal_config: SignalConfig::default(),
                     copy_eligible: true,
                     bracket_commit: false,
@@ -2378,91 +2350,56 @@ async fn ws4_acknowledged_bucket_stays_financially_closed() {
 async fn decision_pending_boot_resume_is_terminal_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
-    let source_trade_id = SourceTradeId(format!("g2:{}", "a".repeat(64)));
+    support::install_empty_anchor(&paper_state, leader_wallet(), 0);
     let source_epoch = 1_i64;
-    let semantic_revision = "revision-v2".to_owned();
-    let applied_configuration = pe_service::runtime_config::RuntimeConfig::from_service_config(
-        &pe_service::config::ServiceConfig::default(),
-    );
-    let frozen = DecisionContinuationFacts {
-        source_trade_id: source_trade_id.clone(),
-        semantic_revision: semantic_revision.clone(),
-        transaction_hash: "0xpending".to_owned(),
-        wallet: leader_wallet(),
+    let body = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": leader_wallet().to_string(), "timestamp": source_epoch,
+        "conditionId": market().to_string(), "type": "TRADE", "size": "1", "usdcSize": "0.5",
+        "transactionHash": "0xpending", "price": "0.5", "asset": "pending-token",
+        "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false,
+    }]))
+    .unwrap();
+    let read = support::producer_shaped_read(
+        leader_wallet(),
+        &body,
         source_epoch,
-        market_id: market(),
-        outcome_id: OutcomeId(0),
-        side: Side::Buy,
-        price: Price(dec!(0.50)),
-        share_amount: ShareAmount::from_whole(1).unwrap(),
-        provenance: TradeProvenance::ActivityWs,
-        pre_bucket_action: LeaderAction::Entry,
-        reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-        action_confidence_ppm: ProbabilityPpm(1_000_000),
-        gate_result: "admitted".to_owned(),
-        frozen_basis: pe_service::bucket_commit::FrozenDecisionBasis {
-            win_rate_p: pe_core_types::Probability::ZERO,
-            bankroll: rust_decimal::Decimal::ZERO,
-        },
-        applied_configuration_hash: applied_configuration.canonical_hash(),
-        applied_configuration,
-        decision_inputs: serde_json::json!({"source_window":"complete"}),
-    };
-    paper_state
-        .commit_activity_bucket(&ActivityBucketCommit {
-            wallet: leader_wallet(),
-            source_epoch,
-            dispositions: vec![ActivityDispositionRecord {
-                source_trade_id: source_trade_id.clone(),
-                transaction_hash: "0xpending".to_owned(),
-                wallet: leader_wallet(),
-                source_epoch,
-                semantic_revision: semantic_revision.clone(),
-                activity_type: "TRADE".to_owned(),
-                disposition: "decision_pending".to_owned(),
-                proof_json: "{\"bucket_epoch\":1}".to_owned(),
-                no_copy: None,
-            }],
-            leader_positions: vec![LeaderPositionRow {
-                wallet: leader_wallet(),
-                market_id: market(),
-                outcome_id: OutcomeId(0),
-                long_contracts: ShareAmount::from_whole(1).unwrap(),
-                short_contracts: ShareAmount::ZERO,
-            }],
-            gate_results: vec![EntryGateResultRecord {
-                source_trade_id: source_trade_id.clone(),
-                wallet: leader_wallet(),
-                market_id: market(),
-                source_epoch,
-                result: "admitted".to_owned(),
-                history_consumed: true,
-            }],
-            history_effects: vec![MarketHistoryRecord {
-                wallet: leader_wallet(),
-                market_id: market(),
-                first_epoch: source_epoch,
-                source_trade_id: source_trade_id.clone(),
-            }],
-            history_status: Some(WalletHistoryStatusRecord {
-                wallet: leader_wallet(),
-                complete: true,
-                proof_json: "{\"fixed_end_walk\":\"complete\"}".to_owned(),
-                updated_at_unix: 2,
-            }),
-            pending: vec![DecisionPendingRecord {
-                source_trade_id: source_trade_id.clone(),
-                semantic_revision,
-                wallet: leader_wallet(),
-                source_epoch,
-                frozen_inputs_json: support::legacy_continuation_v2_json(&frozen),
-                updated_at_unix: 2,
-            }],
-            fence: None,
-            reanchor: None,
-            advance_cursor: true,
-        })
-        .unwrap();
+        2,
+        support::scenario_receipt(2),
+    );
+    let source_trade_id = read.aggregates[0].group_id.key().clone();
+    let mut context = support::read_context(&read, support::scenario_receipt(3), 2);
+    context
+        .observation_provenance
+        .insert(source_trade_id.clone(), TradeProvenance::ActivityWs);
+    context
+        .observed_source_receipts
+        .insert(source_trade_id.clone(), support::scenario_receipt(1));
+    context.history_status = Some(WalletHistoryStatusRecord {
+        wallet: leader_wallet(),
+        complete: true,
+        proof_json: "{}".to_owned(),
+        updated_at_unix: 2,
+    });
+    let mut engine = pe_service::bucket_commit::BucketCommitEngine::load(
+        Arc::clone(&paper_state),
+        build_leader_ledger(&paper_state).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        engine
+            .commit(
+                read.aggregates,
+                &context,
+                pe_service::bucket_commit::FrozenDecisionBasis {
+                    win_rate_p: pe_core_types::Probability::ZERO,
+                    bankroll: Decimal::ZERO,
+                }
+            )
+            .unwrap()
+            .pending,
+        vec![source_trade_id.clone()]
+    );
+    drop(engine);
 
     let (mut first, first_control) = build_orchestrator(
         dir.path(),

@@ -889,6 +889,8 @@ fn bracket_context(
         page_occurrences: Vec::new(),
         observed_source_receipts: HashMap::new(),
         reconstruction_quality,
+        read_commitment: None,
+
         signal_config: SignalConfig::default(),
         copy_eligible: false,
         bracket_commit: true,
