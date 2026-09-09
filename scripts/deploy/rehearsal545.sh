@@ -387,19 +387,24 @@ fi
 copy_manifest_sha256=$(sha256sum "$copy_manifest" | awk '{print $1}')
 
 # Issue #584: bind the checkpointed copy's terminal pre-#545 continuation inventory before any
-# reviewed-binary verb mutates that private copy.
+# reviewed-binary verb mutates that private copy. One structural predicate (SQLite's built-in JSON
+# functions) owns the definition for both queries: the root version is the integer 2, the applied
+# configuration object has no `era` key at all (a JSON null is not absence), and its `fill_mode` is
+# text. Substring matching would misclassify `"version":20`, a nested `"version":2`, or JSON with
+# whitespace.
+read -r -d '' legacy_continuation_predicate <<'SQL' || true
+state = 'terminal'
+  and json_valid(frozen_inputs_json)
+  and json_type(frozen_inputs_json, '$.version') = 'integer'
+  and json_extract(frozen_inputs_json, '$.version') = 2
+  and json_type(frozen_inputs_json, '$.applied_configuration') = 'object'
+  and json_type(frozen_inputs_json, '$.applied_configuration.era') is null
+  and json_type(frozen_inputs_json, '$.applied_configuration.fill_mode') = 'text'
+SQL
 legacy_continuations_count=$(sqlite3 -readonly "$copy_dir/paper_state.db" \
-  "select count(*) from decision_pending
-    where state = 'terminal'
-      and instr(frozen_inputs_json, '\"version\":2') > 0
-      and instr(frozen_inputs_json, '\"era\"') = 0
-      and instr(frozen_inputs_json, '\"fill_mode\"') > 0;")
+  "select count(*) from decision_pending where $legacy_continuation_predicate;")
 legacy_continuations_digest=$(sqlite3 -readonly "$copy_dir/paper_state.db" \
-  "select source_trade_id from decision_pending
-    where state = 'terminal'
-      and instr(frozen_inputs_json, '\"version\":2') > 0
-      and instr(frozen_inputs_json, '\"era\"') = 0
-      and instr(frozen_inputs_json, '\"fill_mode\"') > 0
+  "select source_trade_id from decision_pending where $legacy_continuation_predicate
     order by source_trade_id;" | sha256sum | awk '{print $1}')
 printf 'rehearsal copy legacy continuations: count=%s digest=%s\n' \
   "$legacy_continuations_count" "$legacy_continuations_digest"

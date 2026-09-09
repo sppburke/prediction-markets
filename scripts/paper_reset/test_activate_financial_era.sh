@@ -954,18 +954,25 @@ for fence_cause in position_overflow unexpected_test_cause; do
 done
 
 # Scenario REHEARSAL-LEGACY-CONTINUATIONS-08D (#584)
-# Preconditions: the checkpoint source has one terminal pre-#545 version-2 continuation and one
-# era-bearing version-3 continuation. PASS: the copy census binds only the legacy row and the
-# otherwise-clean rehearsal still passes. FAIL: the row is missed, overcounted, or changes PASS.
+# Preconditions: the checkpoint source has three terminal pre-#545 version-2 continuations (one
+# compact, one with JSON whitespace, one whose decision inputs carry an unrelated "era") and three rows that must not count: an era-bearing version-3
+# row, a version-20 row, and a version-3 row whose nested decision inputs contain "version":2 and
+# "fill_mode". PASS: the copy census binds exactly the three legacy rows and the otherwise-clean
+# rehearsal still passes. FAIL: a row is missed, a non-legacy row is counted, or PASS changes.
 root=$TEST_TMP/rehearsal-legacy-continuations
 setup_rehearsal_fixture "$root" true none
 legacy_source_trade_id="g2:$(printf '5%.0s' {1..64})"
 current_source_trade_id="g2:$(printf '6%.0s' {1..64})"
+spaced_source_trade_id="g2:$(printf '7%.0s' {1..64})"
+version20_source_trade_id="g2:$(printf '8%.0s' {1..64})"
+nested_source_trade_id="g2:$(printf '9%.0s' {1..64})"
+decoy_inputs_source_trade_id="g2:$(printf 'a%.0s' {1..64})"
 python3 - "$root/prediction-markets/gen/g557/paper_state.db" \
-  "$legacy_source_trade_id" "$current_source_trade_id" <<'PY'
+  "$legacy_source_trade_id" "$current_source_trade_id" "$spaced_source_trade_id" \
+  "$version20_source_trade_id" "$nested_source_trade_id" "$decoy_inputs_source_trade_id" <<'PY'
 import json, sqlite3, sys
 
-database, legacy_id, current_id = sys.argv[1:]
+database, legacy_id, current_id, spaced_id, version20_id, nested_id, decoy_inputs_id = sys.argv[1:]
 legacy_configuration = {
     "active_watchlist_size": 100,
     "mode": "paper",
@@ -998,6 +1005,25 @@ rows = (
     (current_id, "3" * 64,
      json.dumps({"version": 3, "source_trade_id": current_id,
                  "applied_configuration": financial_configuration}, separators=(",", ":")), 2),
+    # The same legacy shape serialized with JSON whitespace still counts.
+    (spaced_id, "7" * 64,
+     json.dumps({"version": 2, "source_trade_id": spaced_id,
+                 "applied_configuration": legacy_configuration}, separators=(", ", ": ")), 3),
+    # A version-20 row shares the substring "version":2 and must not count.
+    (version20_id, "8" * 64,
+     json.dumps({"version": 20, "source_trade_id": version20_id,
+                 "applied_configuration": legacy_configuration}, separators=(",", ":")), 4),
+    # A current row whose nested decision inputs carry "version":2 and "fill_mode" must not count.
+    (nested_id, "9" * 64,
+     json.dumps({"version": 3, "source_trade_id": nested_id,
+                 "decision_inputs": {"version": 2, "fill_mode": "clob_best_ask"},
+                 "applied_configuration": financial_configuration}, separators=(",", ":")), 5),
+    # A legacy row whose unconstrained decision inputs mention "era" still counts: only the
+    # applied configuration object decides.
+    (decoy_inputs_id, "a" * 64,
+     json.dumps({"version": 2, "source_trade_id": decoy_inputs_id,
+                 "decision_inputs": {"era": "unrelated-evidence"},
+                 "applied_configuration": legacy_configuration}, separators=(",", ":")), 6),
 )
 connection = sqlite3.connect(database)
 for source_trade_id, revision, frozen, updated_at in rows:
@@ -1009,16 +1035,17 @@ for source_trade_id, revision, frozen, updated_at in rows:
 connection.commit()
 connection.close()
 PY
-legacy_digest=$(printf '%s\n' "$legacy_source_trade_id" | sha256sum | awk '{print $1}')
+legacy_digest=$(printf '%s\n%s\n%s\n' "$legacy_source_trade_id" "$spaced_source_trade_id" \
+  "$decoy_inputs_source_trade_id" | sort | sha256sum | awk '{print $1}')
 output=$(run_rehearsal_fixture "$root" 2>&1)
 [[ "$output" == *REHEARSAL545_PASS* ]] ||
   fail "legacy-continuation census rehearsal did not pass: $output"
-[[ "$output" == *"rehearsal copy legacy continuations: count=1 digest=$legacy_digest"* ]] ||
+[[ "$output" == *"rehearsal copy legacy continuations: count=3 digest=$legacy_digest"* ]] ||
   fail "legacy-continuation census log is missing or incorrect: $output"
 manifest_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_path"])' \
   "$root/rehearsal/evidence.json")
 [[ $(grep -c '^legacy_continuations=' "$manifest_path") -eq 1 ]] &&
-  grep -Fxq "legacy_continuations=1:$legacy_digest" "$manifest_path" ||
+  grep -Fxq "legacy_continuations=3:$legacy_digest" "$manifest_path" ||
   fail "legacy-continuation result-manifest row is missing or incorrect"
 
 # Scenario REHEARSAL-PATHS-UPDATE-01A

@@ -2947,7 +2947,11 @@ mod continuation_v3_tests {
     }
 
     fn legacy17_facts(decision_inputs: Value) -> DecisionContinuationFacts {
-        let mut facts = facts(decision_inputs);
+        with_legacy17(facts(decision_inputs))
+    }
+
+    /// Replace only the configuration and its hash so the facts model a pre-#545 record.
+    fn with_legacy17(mut facts: DecisionContinuationFacts) -> DecisionContinuationFacts {
         facts.applied_configuration = synthetic_legacy17_runtime_config();
         facts.applied_configuration_hash = facts.applied_configuration.canonical_hash();
         facts
@@ -3462,8 +3466,9 @@ mod continuation_v3_tests {
         Ok(source)
     }
 
-    /// PASS: V3/V4 decode exactly the two paired provenance/receipt forms; V2 is unchanged.
-    /// FAIL: either mismatch decodes, or a paired form is rejected.
+    /// PASS: V3/V4 decode exactly the two paired provenance/receipt forms; a historical V2
+    /// record decodes without a receipt and keeps either provenance.
+    /// FAIL: either mismatch decodes, a paired form is rejected, or V2 loses its provenance.
     #[test]
     fn receipt_provenance_pairing_is_bijective() {
         for version in [3, 4] {
@@ -3483,17 +3488,20 @@ mod continuation_v3_tests {
                             Err(DecisionContinuationError::DurableMismatch)
                         ));
                     }
-                    let legacy_facts = legacy17_facts(continuation.facts.decision_inputs.clone());
-                    let mut legacy = durable(&continuation);
-                    legacy.frozen_inputs_json = legacy_v2_json(&legacy_facts);
-                    assert_eq!(
-                        DecisionContinuationV3::from_durable(&legacy)
-                            .unwrap()
-                            .version(),
-                        2
-                    );
                 }
             }
+        }
+        // A pre-#545 version-2 record carries no receipt, so both provenances decode without one
+        // and the decoded facts keep the provenance the writer froze (#584).
+        for provenance in [TradeProvenance::RestPoll, TradeProvenance::ActivityWs] {
+            let (mut continuation, _) = committed_empty_read();
+            continuation.facts.provenance = provenance;
+            let mut legacy = durable(&continuation);
+            legacy.frozen_inputs_json = legacy_v2_json(&with_legacy17(continuation.facts));
+            let decoded = DecisionContinuationV3::from_durable(&legacy).unwrap();
+            assert_eq!(decoded.version(), 2);
+            assert_eq!(decoded.facts.provenance, provenance);
+            assert!(decoded.observed_source_receipt.is_none());
         }
     }
 
