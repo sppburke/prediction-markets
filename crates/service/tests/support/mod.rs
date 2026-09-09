@@ -219,6 +219,8 @@ pub async fn send_trade_bucket_with_config(
                 page_occurrences: vec![occurrence],
                 observed_source_receipts: HashMap::new(),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                read_commitment: None,
+
                 signal_config: SignalConfig::default(),
                 copy_eligible: true,
                 bracket_commit: false,

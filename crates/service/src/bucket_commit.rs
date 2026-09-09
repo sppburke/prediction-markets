@@ -41,6 +41,14 @@ use crate::position_seeder::{AnchorInstall, ledger_capture};
 use crate::risk_inputs::SourceReceiptIndex;
 use crate::runtime_config::RuntimeConfig;
 
+/// Source id of the per-read commitment record appended after one complete fixed-end activity
+/// read and before any of its buckets commit (#565). Never parsed as an activity page.
+pub const ACTIVITY_READ_COMMITMENT_SOURCE_ID: &str = "pe-service.activity-read-commitment";
+pub const ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION: u32 = 1;
+pub const ACTIVITY_READ_COMMITMENT_PARSER_VERSION: u32 = 1;
+const ACTIVITY_READ_COMMITMENT_DOMAIN: &[u8] = b"prediction-edge/activity-read-commitment/v1";
+const ACTIVITY_READ_COMMITMENT_VERSION: u16 = 1;
+
 /// Decision inputs already read before the atomic bucket commit.
 #[derive(Debug, Clone)]
 pub struct BucketDecisionContext {
@@ -51,6 +59,9 @@ pub struct BucketDecisionContext {
     pub page_occurrences: Vec<PageOccurrence>,
     /// Lowest websocket receipt per admitted group; frozen only in continuation V3.
     pub observed_source_receipts: HashMap<SourceTradeId, AppendReceipt>,
+    /// Receipt of the complete-read commitment record appended for this read (#565). `None` only
+    /// for non-copying bracket contexts, which never freeze a continuation.
+    pub read_commitment: Option<AppendReceipt>,
     pub reconstruction_quality: ReconstructionQuality,
     pub signal_config: SignalConfig,
     pub copy_eligible: bool,
@@ -148,6 +159,9 @@ pub struct DecisionContinuationV3 {
     pub facts: DecisionContinuationFacts,
     pub observed_source_receipt: Option<AppendReceipt>,
     pub page_occurrences: Vec<PageOccurrence>,
+    /// Receipt of the complete-read commitment record; present exactly in wire version 4 (#565).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_commitment: Option<AppendReceipt>,
 }
 
 /// One source-log activity page resolved by its frozen V3 receipt.
@@ -164,7 +178,7 @@ pub(crate) struct CompleteActivityPage {
 /// Fail-closed error from the shared complete-read reconstruction owner.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub(crate) struct CompleteActivityReadError(String);
+pub struct CompleteActivityReadError(String);
 
 fn complete_activity_read_error(message: impl Into<String>) -> CompleteActivityReadError {
     CompleteActivityReadError(message.into())
@@ -182,17 +196,38 @@ struct CompleteActivitySegment {
 }
 
 impl DecisionContinuationV3 {
+    /// Wire version 4 when the read commitment is present, version 3 otherwise.
     pub(crate) fn new(
         facts: DecisionContinuationFacts,
         observed_source_receipt: Option<AppendReceipt>,
         page_occurrences: Vec<PageOccurrence>,
+        read_commitment: Option<AppendReceipt>,
     ) -> Self {
         Self {
-            version: 3,
+            version: if read_commitment.is_some() { 4 } else { 3 },
             facts,
             observed_source_receipt,
             page_occurrences,
+            read_commitment,
         }
+    }
+
+    /// Durable wire version (2, 3, or 4).
+    #[must_use]
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Whether both continuations describe one complete read: equal wallet, logical read proof,
+    /// ordered page occurrences, and read commitment (#565). Consumed by the open-continuation
+    /// validator and qualification's read-scope agreement.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn same_complete_read(&self, other: &Self) -> bool {
+        self.facts.wallet == other.facts.wallet
+            && self.facts.decision_inputs == other.facts.decision_inputs
+            && self.page_occurrences == other.page_occurrences
+            && self.read_commitment == other.read_commitment
     }
 
     /// Greatest synchronized activity-page receipt in this complete read.
@@ -479,9 +514,13 @@ impl DecisionContinuationV3 {
         };
         for page in &self.page_occurrences {
             let envelope = source_receipts.source_envelope(page.receipt)?;
-            if envelope.source_id.0 != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
-                || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
-                || envelope.parser_version != ACTIVITY_PARSER_VERSION
+            if activity_page_generation(
+                &envelope.source_id.0,
+                envelope.schema_version,
+                envelope.parser_version,
+                &envelope.content_type,
+            )
+            .is_err()
                 || envelope.raw_payload_hash.to_hex().as_str() != page.raw_hash
             {
                 return Err(DecisionContinuationError::SourceReceiptMismatch {
@@ -489,24 +528,7 @@ impl DecisionContinuationV3 {
                 });
             }
         }
-        if let Some(websocket) = self.observed_source_receipt {
-            let envelope = source_receipts.source_envelope(websocket)?;
-            let activity = parse_activity_trade_observation(&envelope.payload).map_err(|_| {
-                DecisionContinuationError::SourceReceiptMismatch {
-                    sequence: websocket.sequence.0,
-                }
-            })?;
-            if envelope.source_id.0 != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
-                || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
-                || envelope.parser_version != ACTIVITY_PARSER_VERSION
-                || activity.wallet != self.facts.wallet
-                || activity.group_id.key() != &self.facts.source_trade_id
-            {
-                return Err(DecisionContinuationError::SourceReceiptMismatch {
-                    sequence: websocket.sequence.0,
-                });
-            }
-        }
+        self.verify_websocket_receipt(source_receipts)?;
         let observed_unix_ms = source_receipts.received_millis(selected)?;
         self.observation_at(observed_unix_ms)
             .ok_or(DecisionContinuationError::SourceReceiptMismatch {
@@ -516,7 +538,139 @@ impl DecisionContinuationV3 {
     }
 }
 
-fn joined_read_pages<'a>(
+impl DecisionContinuationV3 {
+    /// Verify the frozen websocket receipt, when present, through exact indexed reads: source
+    /// contract, payload parse, and binding to this continuation's wallet and trade (#565).
+    pub(crate) fn verify_websocket_receipt(
+        &self,
+        source_receipts: &SourceReceiptIndex,
+    ) -> Result<(), DecisionContinuationError> {
+        let Some(websocket) = self.observed_source_receipt else {
+            return Ok(());
+        };
+        let envelope = source_receipts.source_envelope(websocket)?;
+        let activity = parse_activity_trade_observation(&envelope.payload).map_err(|_| {
+            DecisionContinuationError::SourceReceiptMismatch {
+                sequence: websocket.sequence.0,
+            }
+        })?;
+        if envelope.source_id.0 != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+            || envelope.schema_version != ACTIVITY_SCHEMA_VERSION
+            || envelope.parser_version != ACTIVITY_PARSER_VERSION
+            || activity.wallet != self.facts.wallet
+            || activity.group_id.key() != &self.facts.source_trade_id
+        {
+            return Err(DecisionContinuationError::SourceReceiptMismatch {
+                sequence: websocket.sequence.0,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Which producer generation wrote one reconciliation page envelope (#565).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageGeneration {
+    /// Written before the read commitment existed (`schema_version == ACTIVITY_SCHEMA_VERSION`).
+    Historical,
+    /// Written by a commitment-aware producer (`schema_version == ACTIVITY_POLL_PAGE_SCHEMA_VERSION`).
+    Committed,
+}
+
+/// The one shared page-contract check: source id, schema generation, parser version, and content
+/// type of one reconciliation page envelope. Every verifier routes its page checks through here.
+pub(crate) fn activity_page_generation(
+    source_id: &str,
+    schema_version: u32,
+    parser_version: u32,
+    content_type: &ContentType,
+) -> Result<PageGeneration, CompleteActivityReadError> {
+    if source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+        || parser_version != ACTIVITY_PARSER_VERSION
+        || *content_type != ContentType::Json
+    {
+        return Err(complete_activity_read_error(
+            "complete activity read page has the wrong source contract",
+        ));
+    }
+    match schema_version {
+        ACTIVITY_SCHEMA_VERSION => Ok(PageGeneration::Historical),
+        crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION => Ok(PageGeneration::Committed),
+        _ => Err(complete_activity_read_error(
+            "complete activity read page has the wrong source contract",
+        )),
+    }
+}
+
+/// Payload of the complete-read commitment record (#565): the canonical digest of one complete
+/// fixed-end read, bound to its wallet and fixed end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityReadCommitment {
+    pub version: u16,
+    pub wallet: WalletAddress,
+    pub fixed_end: i64,
+    /// Lowercase hex BLAKE3 over the domain separator and the canonical preimage bytes.
+    pub digest: String,
+}
+
+/// Typed, domain-separated preimage: the wallet, the fixed end, and every page occurrence joined
+/// to its page evidence in producer order (multiplicity preserved). Serialized through
+/// `serde_json::Value`, so object keys are sorted and the encoding is canonical.
+#[derive(Serialize)]
+struct ActivityReadPreimage<'a> {
+    wallet: WalletAddress,
+    fixed_end: i64,
+    pages: Vec<(&'a PageOccurrence, &'a ReconciliationPageEvidence)>,
+}
+
+/// Digest binding one complete read: producer and every verifier compute it identically.
+pub(crate) fn activity_read_digest(
+    wallet: WalletAddress,
+    fixed_end: i64,
+    occurrences: &[PageOccurrence],
+    pages: &[ReconciliationPageEvidence],
+) -> Result<blake3::Hash, CompleteActivityReadError> {
+    let preimage = ActivityReadPreimage {
+        wallet,
+        fixed_end,
+        pages: joined_read_pages(occurrences, pages)?,
+    };
+    let canonical = serde_json::to_value(&preimage)
+        .and_then(|value| serde_json::to_vec(&value))
+        .map_err(|error| {
+            complete_activity_read_error(format!(
+                "complete activity read commitment preimage failed: {error}"
+            ))
+        })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ACTIVITY_READ_COMMITMENT_DOMAIN);
+    hasher.update(&canonical);
+    Ok(hasher.finalize())
+}
+
+/// Commitment record payload bytes for one complete read (the producer and real-log harnesses).
+pub fn activity_read_commitment_payload(
+    wallet: WalletAddress,
+    fixed_end: i64,
+    occurrences: &[PageOccurrence],
+    pages: &[ReconciliationPageEvidence],
+) -> Result<Vec<u8>, CompleteActivityReadError> {
+    let digest = activity_read_digest(wallet, fixed_end, occurrences, pages)?;
+    serde_json::to_vec(&ActivityReadCommitment {
+        version: ACTIVITY_READ_COMMITMENT_VERSION,
+        wallet,
+        fixed_end,
+        digest: digest.to_hex().to_string(),
+    })
+    .map_err(|error| {
+        complete_activity_read_error(format!(
+            "complete activity read commitment payload failed: {error}"
+        ))
+    })
+}
+
+pub(crate) fn joined_read_pages<'a>(
     occurrences: &'a [PageOccurrence],
     pages: &'a [ReconciliationPageEvidence],
 ) -> Result<Vec<(&'a PageOccurrence, &'a ReconciliationPageEvidence)>, CompleteActivityReadError> {
@@ -566,15 +720,12 @@ where
             "complete activity read page receipt lookup failed: {error}"
         ))
     })?;
-    if source.source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
-        || source.schema_version != ACTIVITY_SCHEMA_VERSION
-        || source.parser_version != ACTIVITY_PARSER_VERSION
-        || source.content_type != ContentType::Json
-    {
-        return Err(complete_activity_read_error(
-            "complete activity read page has the wrong source contract",
-        ));
-    }
+    activity_page_generation(
+        &source.source_id,
+        source.schema_version,
+        source.parser_version,
+        &source.content_type,
+    )?;
     if blake3::hash(&source.payload).to_hex().as_str() != occurrence.raw_hash {
         return Err(complete_activity_read_error(
             "complete activity read page payload hash differs",
@@ -691,6 +842,7 @@ impl DecisionContinuationV3 {
                     facts: legacy.facts,
                     observed_source_receipt: None,
                     page_occurrences: Vec::new(),
+                    read_commitment: None,
                 }
             }
             3 => serde_json::from_value(value)?,
@@ -1387,6 +1539,7 @@ impl BucketCommitEngine {
                                     .get(&source_trade_id)
                                     .copied(),
                                 context.page_occurrences.clone(),
+                                context.read_commitment,
                             ))?;
                         pending.push(DecisionPendingRecord {
                             source_trade_id: source_trade_id.clone(),
@@ -2303,6 +2456,7 @@ mod continuation_v3_tests {
             facts(complete_read_inputs(fixed_end, &proof)),
             Some(receipt(7)),
             pages,
+            None,
         );
         let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(decoded.version, 3);
@@ -2334,6 +2488,7 @@ mod continuation_v3_tests {
             facts(complete_read_inputs(fixed_end, &proof)),
             None,
             pages,
+            None,
         );
         let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(
@@ -2432,6 +2587,7 @@ mod continuation_v3_tests {
             facts(complete_read_inputs(fixed_end, &proof)),
             None,
             occurrences,
+            None,
         );
         let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(
@@ -2467,8 +2623,12 @@ mod continuation_v3_tests {
             receipt: receipt(1),
         };
         for missing_proof in [json!({}), json!({"unrelated": true})] {
-            let current =
-                DecisionContinuationV3::new(facts(missing_proof), None, vec![occurrence.clone()]);
+            let current = DecisionContinuationV3::new(
+                facts(missing_proof),
+                None,
+                vec![occurrence.clone()],
+                None,
+            );
             let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
             let error = current
                 .reconstruct_complete_activity_read(&mut lookup)
@@ -2485,6 +2645,7 @@ mod continuation_v3_tests {
             facts: facts(json!({"legacy": true})),
             observed_source_receipt: None,
             page_occurrences: vec![occurrence],
+            read_commitment: None,
         };
         let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
         let error = version_two
@@ -2511,6 +2672,7 @@ mod continuation_v3_tests {
             )),
             None,
             vec![occurrence.clone()],
+            None,
         );
         DecisionContinuationV3::from_durable(&durable(&valid)).unwrap();
 
@@ -2521,8 +2683,12 @@ mod continuation_v3_tests {
             json!({"fixed_end": 1_700_000_000, "pages": []}),
             pages_without_fixed_end,
         ] {
-            let invalid =
-                DecisionContinuationV3::new(facts(decision_inputs), None, vec![occurrence.clone()]);
+            let invalid = DecisionContinuationV3::new(
+                facts(decision_inputs),
+                None,
+                vec![occurrence.clone()],
+                None,
+            );
             assert!(matches!(
                 DecisionContinuationV3::from_durable(&durable(&invalid)),
                 Err(DecisionContinuationError::DurableMismatch)
@@ -2547,6 +2713,7 @@ mod continuation_v3_tests {
             )),
             None,
             vec![occurrence.clone()],
+            None,
         );
         let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
         assert_eq!(
@@ -2566,6 +2733,7 @@ mod continuation_v3_tests {
             facts(complete_read_inputs(1_700_000_000, &[tampered_evidence])),
             None,
             vec![tampered_occurrence],
+            None,
         );
         let error = tampered
             .reconstruct_complete_activity_read(&mut lookup)
@@ -2589,6 +2757,7 @@ mod continuation_v3_tests {
             facts(complete_read_inputs(1_700_000_000, &[evidence])),
             None,
             vec![occurrence],
+            None,
         );
         let mut lookup = |_receipt| -> Result<_, &str> { Ok(activity_page(payload)) };
         let error = continuation
@@ -2646,6 +2815,7 @@ mod continuation_v3_tests {
             facts(complete_read_inputs(1_700_000_000, &evidence)),
             None,
             occurrences,
+            None,
         );
         let terminal_sequence = u64::from(terminal_offset / RECONCILIATION_PAGE_LIMIT) + 1;
         let mut lookup = |page: AppendReceipt| -> Result<_, &str> {

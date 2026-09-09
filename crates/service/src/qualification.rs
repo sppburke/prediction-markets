@@ -5766,6 +5766,7 @@ mod tests {
             },
             None,
             Vec::new(),
+            None,
         );
         let mutation = LedgerMutation {
             source_trade_id,
@@ -9627,6 +9628,7 @@ mod tests {
                     raw_hash,
                     receipt: late_receipt,
                 }],
+                None,
             ))
             .unwrap();
         let connection = rusqlite::Connection::open(&paper_state).unwrap();

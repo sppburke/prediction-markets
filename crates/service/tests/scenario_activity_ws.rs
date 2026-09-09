@@ -331,6 +331,7 @@ fn build_orchestrator(
             watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -1660,6 +1661,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
         OrchestratorConfig {
             bankroll: dec!(10_000),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -1737,6 +1739,8 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
                     page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    read_commitment: None,
+
                     signal_config: SignalConfig::default(),
                     copy_eligible: true,
                     bracket_commit: false,
@@ -2006,6 +2010,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
         OrchestratorConfig {
             bankroll: dec!(10_000),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -2080,6 +2085,8 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
                     page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    read_commitment: None,
+
                     signal_config: SignalConfig::default(),
                     copy_eligible: true,
                     bracket_commit: false,

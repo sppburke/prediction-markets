@@ -3899,6 +3899,8 @@ fn produced_decision_continuation(
         },
         reconstruction_quality: ReconstructionQuality::new(100)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
+
+        read_commitment: None,
         signal_config: pe_copy_signal_engine::SignalConfig::default(),
         copy_eligible: true,
         bracket_commit: false,

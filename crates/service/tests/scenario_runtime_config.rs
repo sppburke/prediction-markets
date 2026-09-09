@@ -312,6 +312,7 @@ async fn run_with(
             watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -433,6 +434,7 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
             watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -546,6 +548,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
             watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -587,6 +590,8 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
                 page_occurrences: vec![proof.1],
                 observed_source_receipts: HashMap::new(),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                read_commitment: None,
+
                 signal_config: SignalConfig::default(),
                 copy_eligible: true,
                 bracket_commit: false,
@@ -697,6 +702,7 @@ async fn run_gate_with(
             watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,

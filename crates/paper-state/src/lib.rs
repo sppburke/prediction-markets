@@ -228,6 +228,8 @@ pub struct ActivityGroupState {
     pub semantic_revision: String,
     pub source_epoch: i64,
     pub disposition: String,
+    /// Canonical applied-effect document recorded with the group (#565).
+    pub proof_json: String,
 }
 
 /// Durable result of applying the first-entry rule to one trade group.
@@ -867,7 +869,7 @@ impl PaperStateDb {
     ) -> Result<Option<ActivityGroupState>, PaperStateError> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT transaction_hash, semantic_revision, source_epoch, disposition \
+            "SELECT transaction_hash, semantic_revision, source_epoch, disposition, proof_json \
              FROM activity_groups WHERE source_trade_id = ?1",
             params![source_trade_id.0],
             |row| {
@@ -876,6 +878,7 @@ impl PaperStateDb {
                     semantic_revision: row.get(1)?,
                     source_epoch: row.get(2)?,
                     disposition: row.get(3)?,
+                    proof_json: row.get(4)?,
                 })
             },
         )

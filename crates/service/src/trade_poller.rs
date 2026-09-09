@@ -48,6 +48,9 @@ use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome, anchor
 /// Source id stamped on every fixed-end activity page before it is parsed.
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
 pub const DAILY_BOUNDARY_SOURCE_ID: &str = "pe-service.boundary";
+/// Service-owned envelope schema of reconciliation pages written by a commitment-aware producer
+/// (#565). The activity parser contract (`ACTIVITY_PARSER_VERSION`) is unchanged.
+pub const ACTIVITY_POLL_PAGE_SCHEMA_VERSION: u32 = 3;
 /// Best-effort cadence for refreshing venue-authoritative position anchors.
 pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -573,6 +576,7 @@ pub struct TradePoller {
     control_tx: mpsc::Sender<OrchestratorControl>,
     paper_state: Arc<PaperStateDb>,
     health: SharedHealth,
+
     signal_config: SignalConfig,
     runtime_config: LiveRuntimeConfig,
     obligations: ReconciliationObligations,
@@ -614,6 +618,7 @@ impl TradePoller {
         control_tx: mpsc::Sender<OrchestratorControl>,
         paper_state: Arc<PaperStateDb>,
         health: SharedHealth,
+
         signal_config: SignalConfig,
         runtime_config: LiveRuntimeConfig,
         obligations: ReconciliationObligations,
@@ -1034,6 +1039,8 @@ impl TradePoller {
             page_occurrences: page_occurrences.to_vec(),
             observed_source_receipts,
             reconstruction_quality,
+            read_commitment: None,
+
             signal_config: self.signal_config.clone(),
             copy_eligible,
             bracket_commit: false,

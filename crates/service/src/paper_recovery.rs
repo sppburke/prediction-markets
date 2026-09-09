@@ -2871,6 +2871,7 @@ mod anchor_replay_tests {
             semantic_revision: "revision-b".to_owned(),
             source_epoch: 100,
             disposition: "applied".to_owned(),
+            proof_json: String::new(),
         };
         assert!(matches!(
             verify_replayed_group_revision(Some(&durable), &group),

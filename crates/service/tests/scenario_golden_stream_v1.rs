@@ -1735,6 +1735,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
         OrchestratorConfig {
             bankroll: STARTING_BANKROLL,
             mode: ExecutionMode::Paper,
+
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
@@ -1882,6 +1883,8 @@ async fn golden_source_stream_replays_exact_economic_core() {
                     recorded.websocket_receipt,
                 )]),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                read_commitment: None,
+
                 signal_config: Default::default(),
                 copy_eligible: true,
                 bracket_commit: false,

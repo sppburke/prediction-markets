@@ -189,6 +189,8 @@ fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
         page_occurrences: vec![proof.1],
         observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        read_commitment: None,
+
         signal_config: Default::default(),
         copy_eligible: true,
         bracket_commit: false,
