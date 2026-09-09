@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pe_copy_signal_engine::SignalConfig;
+use pe_copy_signal_engine::{SignalConfig, TradeProvenance};
 use pe_core_types::{
     AccountId, BasisPoints, CollateralAmount, EventSeq, OutcomeId, PolymarketConditionId, Price,
     ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, WalletAddress,
@@ -36,11 +36,17 @@ use pe_position_ledger::PositionLedger;
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
-use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
+use pe_risk_engine::{BinaryPayout, RiskBlock, aggregate_resolution_credit};
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
-use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
+use pe_service::bucket_commit::{
+    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+    ACTIVITY_READ_COMMITMENT_SOURCE_ID, ActivityReadCommitment, BucketCommitEngine,
+    BucketDecisionContext, DecisionContinuationV3,
+};
 use pe_service::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
-use pe_service::decision_replay::{DecisionPostBoundaryEvidence, replay_decision_pending};
+use pe_service::decision_replay::{
+    DecisionPostBoundaryEvidence, WinnerFollowDecisionInputs, replay_decision_pending,
+};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_venue_adapter::LiveAdmissionBuilder;
@@ -50,16 +56,16 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{
-    CanonicalFillResult, CanonicalResolutionResult, FINANCIAL_SEMANTIC_VERSION,
-    PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, SealReason, TailBinding, paper_era,
-    scan_paper_log,
+    CanonicalFillResult, CanonicalResolutionResult, FINANCIAL_SEMANTIC_VERSION, MembershipChange,
+    MembershipReason, PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, SealReason,
+    TailBinding, paper_era, scan_paper_log,
 };
 use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
 use pe_service::qualification::{
     FinancialEraCommand, FinancialEraManifest, FinancialEraPaths, FinancialEraPreparation,
     QualificationReport, QualificationVerdict, qualification_completion, run_financial_era,
 };
-use pe_service::risk_inputs::SourceReceiptIndex;
+use pe_service::risk_inputs::{RiskInputsUnavailable, SourceReceiptIndex};
 use pe_service::runtime_config::{ConfigRow, RuntimeConfig};
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::supabase_sink::SupabaseFillRow;
@@ -67,12 +73,14 @@ use pe_service::supabase_state::{
     FillV2Outcome, PreparedFillRequest, PreparedResolutionRequest, SupabaseStateError,
     SupabaseStateTrait,
 };
+use pe_service::trade_poller::{ACTIVITY_POLL_PAGE_SCHEMA_VERSION, ACTIVITY_POLL_SOURCE_ID};
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityTransport, BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION,
-    CLOB_RESOLUTION_SCHEMA_VERSION, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
-    PageFetcher, parse_activity_response, validate_live_market,
+    BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
+    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, PageFetcher, validate_live_market,
 };
-use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, SizingMode, WinnerFollowStrategy};
+use pe_strategy_winner_follow::{
+    ExecutionMode, PerTradeCap, SizingMode, WinnerFollowDeclineAudit, WinnerFollowStrategy,
+};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{AskLevel, LadderPlan, PreparedPolymarketBuy, parse_compact_market};
 use rust_decimal::Decimal;
@@ -87,6 +95,15 @@ const FIXED_UNIX: i64 = 1_800_000_000;
 const DAY_SECS: i64 = 86_400;
 const QUALIFICATION_DAYS: usize = 30;
 const COPIES_PER_DAY: usize = 3;
+const ORIGINAL_COPIES: usize = QUALIFICATION_DAYS * COPIES_PER_DAY;
+const HELD_COPY: usize = COPIES_PER_DAY;
+const PRICE_CONFLICT_DECISION: usize = ORIGINAL_COPIES;
+// Three normal wins earn $7.47; eleven $2.55 losses then leave the day at -$20.58.
+const LOSS_COPIES: usize = 11;
+const FIRST_LOSS_COPY: usize = PRICE_CONFLICT_DECISION + 1;
+const BLOCKED_DECISION: usize = FIRST_LOSS_COPY + LOSS_COPIES;
+const TOTAL_DECISIONS: usize = BLOCKED_DECISION + 1;
+const TOTAL_FILLS: usize = ORIGINAL_COPIES + LOSS_COPIES;
 const STARTING_BANKROLL: Decimal = dec!(1_000);
 
 fn fixture(name: &str) -> &'static [u8] {
@@ -123,11 +140,22 @@ async fn append_source_at(
     } else {
         1
     };
+    let (schema_version, parser_version) = match source_id {
+        ACTIVITY_POLL_SOURCE_ID => (
+            ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+        ),
+        ACTIVITY_READ_COMMITMENT_SOURCE_ID => (
+            ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+            ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+        ),
+        _ => (version, version),
+    };
     source_log
         .append(EnvelopeIn {
             source_id: SourceId(source_id.to_owned()),
-            schema_version: version,
-            parser_version: version,
+            schema_version,
+            parser_version,
             observed_at: SourceTimestamp(timestamp),
             received_at: ReceivedAt(timestamp),
             content_type: ContentType::Json,
@@ -160,6 +188,13 @@ fn append_qualification_start(
 }
 
 fn golden_source_unix(anchor_cutoff: i64, index: usize) -> i64 {
+    if index == PRICE_CONFLICT_DECISION {
+        return golden_source_unix(anchor_cutoff, HELD_COPY) + 5;
+    }
+    if index >= FIRST_LOSS_COPY {
+        return golden_source_unix(anchor_cutoff, ORIGINAL_COPIES - 1)
+            + 10 * i64::try_from(index - FIRST_LOSS_COPY + 1).unwrap();
+    }
     let day = index / COPIES_PER_DAY;
     let within_day = index % COPIES_PER_DAY;
     if day == 0 {
@@ -197,6 +232,7 @@ struct GoldenRecordedTrade {
     bodies: GoldenTradeBodies,
     websocket_receipt: AppendReceipt,
     page_receipt: AppendReceipt,
+    commitment_receipt: AppendReceipt,
     admission: LiveAdmissionArtifact,
     book: OrderBook,
     resolution_receipt: AppendReceipt,
@@ -217,7 +253,11 @@ fn golden_trade_bodies(index: usize, source_unix: i64) -> GoldenTradeBodies {
         };
     }
 
-    let wallet_hex = format!("0x{:040x}", index + 1);
+    let wallet_hex = if index >= ORIGINAL_COPIES {
+        WALLET.to_owned()
+    } else {
+        format!("0x{:040x}", index + 1)
+    };
     let condition = format!("0x{:064x}", index + 1);
     let transaction = format!("0x{:064x}", index + 10_000);
     let yes_token = (index * 2 + 101).to_string();
@@ -265,6 +305,13 @@ fn golden_trade_bodies(index: usize, source_unix: i64) -> GoldenTradeBodies {
     resolution["condition_id"] = condition.clone().into();
     resolution["tokens"][0]["token_id"] = yes_token.into();
     resolution["tokens"][1]["token_id"] = no_token.into();
+
+    if (FIRST_LOSS_COPY..BLOCKED_DECISION).contains(&index) {
+        resolution["tokens"][0]["winner"] = false.into();
+        resolution["tokens"][0]["price"] = "0".into();
+        resolution["tokens"][1]["winner"] = true.into();
+        resolution["tokens"][1]["price"] = "1".into();
+    }
 
     GoldenTradeBodies {
         wallet: WalletAddress::from_hex(&wallet_hex).unwrap(),
@@ -555,6 +602,15 @@ impl PageFetcher for GoldenGammaFetcher {
             .split('&')
             .filter_map(|pair| pair.strip_prefix("condition_ids="))
             .filter_map(|condition| self.markets.get(condition).cloned())
+            .flat_map(|market| {
+                if market["conditionId"] == format!("0x{:064x}", HELD_COPY + 1) {
+                    let mut conflicting = market.clone();
+                    conflicting["outcomePrices"] = "[\"0.60\",\"0.40\"]".into();
+                    vec![market, conflicting]
+                } else {
+                    vec![market]
+                }
+            })
             .collect::<Vec<_>>();
         Ok(serde_json::to_vec(&markets).unwrap())
     }
@@ -562,7 +618,7 @@ impl PageFetcher for GoldenGammaFetcher {
 
 fn golden_mid_cache(anchor_cutoff: i64) -> MidPriceCache<GoldenGammaFetcher> {
     const BASE: &str = "fixture://gamma";
-    let markets = (0..QUALIFICATION_DAYS * COPIES_PER_DAY)
+    let markets = (0..TOTAL_DECISIONS)
         .map(|index| {
             let source_unix = golden_source_unix(anchor_cutoff, index);
             let bodies = golden_trade_bodies(index, source_unix);
@@ -750,6 +806,7 @@ fn rewrite_source_preimage(
     let mut found = false;
     let mut receipts = ReceiptMap::new();
     let mut prefixes = PrefixMap::new();
+    let mut latest_page: Option<(Vec<u8>, i64, AppendReceipt)> = None;
     for item in Reader::replay(source_path).unwrap() {
         let (_, envelope) = item.unwrap();
         let original_receipt = AppendReceipt {
@@ -768,6 +825,20 @@ fn rewrite_source_preimage(
                 }
             }
         }
+        if envelope.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID {
+            let commitment: ActivityReadCommitment = serde_json::from_slice(&payload).unwrap();
+            let (page_payload, received_unix, receipt) = latest_page.as_ref().unwrap();
+            payload = support::producer_shaped_read(
+                commitment.wallet,
+                page_payload,
+                commitment.fixed_end,
+                *received_unix,
+                *receipt,
+            )
+            .commitment_payload;
+        }
+        let page = (envelope.source_id.0 == ACTIVITY_POLL_SOURCE_ID)
+            .then(|| (payload.clone(), envelope.received_at.0.unix_timestamp()));
         let rewritten_receipt = writer
             .append_synced(EnvelopeIn {
                 source_id: envelope.source_id,
@@ -779,6 +850,9 @@ fn rewrite_source_preimage(
                 payload,
             })
             .unwrap();
+        if let Some((payload, received_unix)) = page {
+            latest_page = Some((payload, received_unix, rewritten_receipt));
+        }
         let physical_tail = std::fs::metadata(destination).unwrap().len();
         receipts.insert(receipt_map_key(original_receipt), rewritten_receipt);
         prefixes.insert(
@@ -982,7 +1056,6 @@ fn clone_state(state_path: &std::path::Path, destination: &std::path::Path) {
 
 fn decision_evidence_digest(paper_path: &std::path::Path, state_path: &std::path::Path) -> String {
     let era = paper_era(scan_paper_log(paper_path).unwrap());
-    let (_, start) = era.start.as_ref().unwrap();
     let sealed_source_prefix = era
         .frames
         .iter()
@@ -994,18 +1067,26 @@ fn decision_evidence_digest(paper_path: &std::path::Path, state_path: &std::path
         })
         .unwrap();
     let state = PaperStateDb::open(state_path).unwrap();
-    let keys = state
-        .decision_pending_history()
-        .unwrap()
+    let mut rows = state.decision_pending_history().unwrap();
+    // Every golden trade has one websocket observation preceding its sole activity page.
+    // Qualification orders by that earliest receipt, not by SQLite's source-epoch order.
+    rows.sort_by_key(|row| {
+        let continuation = DecisionContinuationV3::from_durable(row).unwrap();
+        let websocket = continuation.observed_source_receipt.unwrap();
+        assert_eq!(continuation.page_occurrences.len(), 1);
+        assert!(websocket.sequence < continuation.page_occurrences[0].receipt.sequence);
+        (
+            websocket.sequence,
+            row.source_trade_id.0.clone(),
+            row.semantic_revision.clone(),
+        )
+    });
+    let keys = rows
         .into_iter()
         .map(|row| (row.source_trade_id, row.semantic_revision))
         .collect::<Vec<_>>();
     let evidence = state
-        .seal_decision_evidence_for_source_prefix(
-            &keys,
-            start.source_prefix.last_sequence,
-            sealed_source_prefix.last_sequence,
-        )
+        .seal_decision_evidence_for_source_prefix(&keys, &keys, sealed_source_prefix.last_sequence)
         .unwrap();
     blake3::hash(&evidence).to_hex().to_string()
 }
@@ -1140,7 +1221,9 @@ fn assert_decision_preimage_rejected(
                     .unwrap(),
                 1
             );
-            format!("source-log trade {source_trade_id} has no terminal decision_pending row")
+            format!(
+                "source-log trade {source_trade_id} has no reconstructable receipt-bearing decision"
+            )
         }
         PreimageMutation::Tamper => {
             let frozen: String = connection
@@ -1468,7 +1551,14 @@ async fn resolve_golden_trade(
         parsed_resolution.condition_id.as_deref(),
         Some(bodies.condition.0.as_str())
     );
-    let payout = BinaryPayoutVector::winner(0).unwrap();
+    let raw_resolution: serde_json::Value = serde_json::from_slice(&bodies.resolution).unwrap();
+    let winner = raw_resolution["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|token| token["winner"] == true)
+        .unwrap();
+    let payout = BinaryPayoutVector::winner(winner).unwrap();
     let binary_payout = BinaryPayout::new(payout.decimals()[0], payout.decimals()[1]).unwrap();
     assert_eq!(
         aggregate_resolution_credit(&[(0, expected_shares)], &binary_payout).unwrap(),
@@ -1494,7 +1584,9 @@ async fn resolve_golden_trade(
 ///
 /// Preconditions: the checked-in v1 corpus seeds one deterministic 30-day future stream; every
 /// websocket and complete-page receipt enters the source log before its acknowledged bucket commit.
-/// PASS: runtime writes Start, 90 exact fill/resolution pairs, 31 marks, and Complete seal; the
+/// PASS: runtime writes Start, 101 exact fill/resolution pairs, a full-rerank transition,
+/// an IntradayDrawdownStop decline and a held-position PriceConflict decline (neither has a
+/// Financial Final), 31 marks, and a Complete seal; the
 /// network-free `pe-service --qualify` replay is exact and Pass with identical classifications,
 /// admission audits, economic core hashes, risk snapshots/decisions, and exact arithmetic while
 /// paper/live wrapper hashes differ.
@@ -1643,8 +1735,8 @@ async fn golden_source_stream_replays_exact_economic_core() {
     .await;
 
     let preimage_append_started = Instant::now();
-    let mut recorded_trades = Vec::with_capacity(QUALIFICATION_DAYS * COPIES_PER_DAY);
-    for index in 0..QUALIFICATION_DAYS * COPIES_PER_DAY {
+    let mut recorded_trades = Vec::with_capacity(TOTAL_DECISIONS);
+    for index in 0..TOTAL_DECISIONS {
         let source_unix = golden_source_unix(anchor_cutoff, index);
         let bodies = golden_trade_bodies(index, source_unix);
         let websocket_receipt = append_source_at(
@@ -1658,6 +1750,20 @@ async fn golden_source_stream_replays_exact_economic_core() {
             &source_log,
             "polymarket-public.activity-reconciliation",
             &bodies.activity,
+            source_unix,
+        )
+        .await;
+        let read = support::producer_shaped_read(
+            bodies.wallet,
+            &bodies.activity,
+            source_unix,
+            source_unix,
+            page_receipt,
+        );
+        let commitment_receipt = append_source_at(
+            &source_log,
+            ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+            &read.commitment_payload,
             source_unix,
         )
         .await;
@@ -1717,6 +1823,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             bodies,
             websocket_receipt,
             page_receipt,
+            commitment_receipt,
             admission,
             book,
             resolution_receipt,
@@ -1831,14 +1938,24 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let mut financial_commit_elapsed = Duration::ZERO;
     let mut mark_elapsed = Duration::ZERO;
     let mut first_day_resolutions = Vec::new();
+    let mut membership_publication = None;
+    let mut conflict_trade_id = None;
+    let mut blocked_trade_id = None;
+    let mut conflict_price_receipt = None;
 
     for day in 0..QUALIFICATION_DAYS {
-        for within_day in 0..COPIES_PER_DAY {
-            let index = day * COPIES_PER_DAY + within_day;
+        let mut indices = (day * COPIES_PER_DAY..(day + 1) * COPIES_PER_DAY).collect::<Vec<_>>();
+        if day == 1 {
+            indices.insert(1, PRICE_CONFLICT_DECISION);
+        }
+        // Keep the stop inside the seal without exercising the separate next-day halt release.
+        if day + 1 == QUALIFICATION_DAYS {
+            indices.extend(FIRST_LOSS_COPY..TOTAL_DECISIONS);
+        }
+        for index in indices {
             let source_unix = golden_source_unix(anchor_cutoff, index);
             let recorded = &recorded_trades[index];
             let bodies = &recorded.bodies;
-            let now = OffsetDateTime::from_unix_timestamp(source_unix).unwrap();
             hooks
                 .admission_artifacts
                 .lock()
@@ -1852,44 +1969,38 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 .financial_clock_unix
                 .store(source_unix, std::sync::atomic::Ordering::SeqCst);
 
-            let parse_context = ActivityParseContext {
-                source_id: SourceId("polymarket-public.activity-reconciliation".to_owned()),
-                observed_at: SourceTimestamp(now),
-                received_at: ReceivedAt(now),
-                transport: ActivityTransport::Rest,
-            };
-            let aggregate =
-                parse_activity_response(&bodies.activity, bodies.wallet, &parse_context)
-                    .unwrap()
-                    .aggregates()
-                    .unwrap()
-                    .remove(0);
+            let mut read = support::producer_shaped_read(
+                bodies.wallet,
+                &bodies.activity,
+                source_unix,
+                source_unix,
+                recorded.page_receipt,
+            );
+            assert_eq!(read.aggregates.len(), 1);
+            let aggregate = read.aggregates.remove(0);
             let source_trade_id = aggregate.group_id.key().clone();
             if index == 0 {
                 first_admission = Some(recorded.admission.clone());
             }
-            let (decision_inputs_json, page_occurrence) = support::producer_shaped_activity_page(
-                bodies.wallet,
-                &bodies.activity,
-                source_unix,
-                recorded.page_receipt,
-            );
             let context = BucketDecisionContext {
                 applied_configuration: runtime_config.clone(),
-                decision_inputs_json,
-                page_occurrences: vec![page_occurrence],
+                decision_inputs_json: read.decision_inputs_json,
+                page_occurrences: vec![read.page],
                 observed_source_receipts: HashMap::from([(
                     source_trade_id.clone(),
                     recorded.websocket_receipt,
                 )]),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-                read_commitment: None,
+                read_commitment: Some(recorded.commitment_receipt),
 
                 signal_config: Default::default(),
                 copy_eligible: true,
                 bracket_commit: false,
                 recorded_at_unix: source_unix,
-                observation_provenance: HashMap::new(),
+                observation_provenance: HashMap::from([(
+                    source_trade_id.clone(),
+                    TradeProvenance::ActivityWs,
+                )]),
                 no_copy_dispositions: HashMap::new(),
                 identity_overrides: HashMap::new(),
                 identity_unresolved: Default::default(),
@@ -1915,6 +2026,73 @@ async fn golden_source_stream_replays_exact_economic_core() {
             bucket_commit_elapsed += bucket_commit_started.elapsed();
             assert_eq!(result.dispositions[&source_trade_id.0], "decision_pending");
             assert!(!paper.is_decision_pending_open(&source_trade_id).unwrap());
+            if index == PRICE_CONFLICT_DECISION || index == BLOCKED_DECISION {
+                let row = paper
+                    .decision_pending_for(&source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let replayed = replay_decision_pending(&row).unwrap();
+                let terminal = &replayed.post_boundary.body.terminal;
+                assert!(terminal.final_receipt.is_none());
+                assert!(terminal.fill.is_none());
+                let decline = terminal.decline.as_ref().unwrap();
+                if index == PRICE_CONFLICT_DECISION {
+                    assert_eq!(
+                        decline.outcome,
+                        WinnerFollowDeclineAudit::RiskInputsUnavailable
+                    );
+                    let WinnerFollowDecisionInputs::RiskInputsUnavailable { cause, evidence } =
+                        &decline.inputs
+                    else {
+                        panic!("price conflict did not record its risk acquisition failure");
+                    };
+                    assert_eq!(*cause, RiskInputsUnavailable::PriceConflict);
+                    assert_eq!(evidence.price_receipts.len(), 1);
+                    conflict_price_receipt = Some(evidence.price_receipts[0]);
+                    conflict_trade_id = Some(source_trade_id);
+                    let held = &recorded_trades[HELD_COPY];
+                    assert_ne!(held.bodies.condition, bodies.condition);
+                    let open = paper.financial_snapshot(source_unix).unwrap().positions;
+                    assert_eq!(open.len(), 1);
+                    assert_eq!(open[0].market_id.to_string(), held.bodies.condition.0);
+                    resolve_golden_trade(
+                        &control_tx,
+                        &hooks,
+                        &held.bodies,
+                        held.resolution_receipt,
+                        expected_shares,
+                        expected_credit,
+                        source_unix + 1,
+                    )
+                    .await;
+                } else {
+                    assert_eq!(
+                        decline.outcome,
+                        WinnerFollowDeclineAudit::Blocked(RiskBlock::IntradayDrawdownStop)
+                    );
+                    let WinnerFollowDecisionInputs::Evaluated { economic } = &decline.inputs else {
+                        panic!("drawdown decline did not record evaluated economics");
+                    };
+                    assert_eq!(
+                        economic.risk.decision,
+                        RiskDecisionAudit::Blocked {
+                            reason: RiskBlock::IntradayDrawdownStop
+                        }
+                    );
+                    assert_eq!(economic.risk.snapshot.intraday_pnl_bps, BasisPoints(-206));
+                    assert_eq!(economic.all_in_debit().unwrap().to_decimal(), dec!(2.55));
+                    blocked_trade_id = Some(source_trade_id);
+                }
+                assert!(
+                    paper
+                        .financial_snapshot(source_unix + 1)
+                        .unwrap()
+                        .positions
+                        .is_empty()
+                );
+                financial_commit_elapsed += financial_commit_started.elapsed();
+                continue;
+            }
             let after_fill = paper.financial_snapshot(source_unix).unwrap();
             assert!(
                 after_fill
@@ -1926,7 +2104,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
 
             if index == COPIES_PER_DAY - 1 {
                 first_day_resolutions.push(index);
-            } else {
+            } else if index != HELD_COPY {
                 let resolution_unix = source_unix + 1;
                 resolve_golden_trade(
                     &control_tx,
@@ -1934,7 +2112,11 @@ async fn golden_source_stream_replays_exact_economic_core() {
                     bodies,
                     recorded.resolution_receipt,
                     expected_shares,
-                    expected_credit,
+                    if (FIRST_LOSS_COPY..BLOCKED_DECISION).contains(&index) {
+                        CollateralAmount::ZERO
+                    } else {
+                        expected_credit
+                    },
                     resolution_unix,
                 )
                 .await;
@@ -2156,6 +2338,50 @@ async fn golden_source_stream_replays_exact_economic_core() {
             );
             financial_commit_elapsed += resolution_started.elapsed();
         }
+        if day == 1 {
+            assert!(paper.open_decision_pending().unwrap().is_empty());
+            assert!(
+                paper
+                    .financial_snapshot(cutoff)
+                    .unwrap()
+                    .positions
+                    .is_empty()
+            );
+            let replacements = golden_watchlist(&wallets)
+                .entries
+                .into_iter()
+                .filter(|entry| entry.wallet != wallets[1])
+                .collect::<Vec<_>>();
+            // These artifact/evidence types and their source constant are crate-private;
+            // use their exact serialized producer contract at this integration boundary.
+            let ranking_receipt = append_source_at(
+                &source_log,
+                "pe-service.watchlist-ranking",
+                &serde_json::to_vec(&serde_json::json!({"batch_id": 565, "entries": replacements}))
+                    .unwrap(),
+                cutoff,
+            )
+            .await;
+            let change = MembershipChange {
+                reason: MembershipReason::FullRerank,
+                removed: vec![wallets[1]],
+                added: Vec::new(),
+                capacity: runtime_config.active_watchlist_size,
+                ranking_batch_id: Some(565),
+                evidence: serde_json::json!({"kind": "full_rerank", "ranking_receipt": ranking_receipt, "admission_receipts": []}),
+            };
+            let (acknowledged, acknowledgement) = oneshot::channel();
+            control_tx
+                .send(OrchestratorControl::PublishMembership {
+                    change: change.clone(),
+                    replacements,
+                    acknowledged,
+                })
+                .await
+                .unwrap();
+            let receipt = acknowledgement.await.unwrap().unwrap();
+            membership_publication = Some((receipt, change));
+        }
     }
 
     eprintln!(
@@ -2177,17 +2403,62 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let sealed_era = paper_era(scan_paper_log(&paper_path).unwrap());
     let completion = qualification_completion(&sealed_era).unwrap();
     assert_eq!(completion.complete_days, QUALIFICATION_DAYS);
+    assert_eq!(completion.causal_closes, TOTAL_FILLS);
+
+    let (membership_receipt, membership_change) = membership_publication.unwrap();
+    let membership_frames = sealed_era
+        .frames
+        .iter()
+        .filter(|frame| {
+            matches!(
+                frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::MembershipChanged { .. })
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(membership_frames.len(), 1);
+    assert_eq!(membership_frames[0].receipt, membership_receipt);
+    let PaperLogFrame::Record(recorded_membership) = &membership_frames[0].frame else {
+        panic!("membership frame was not a typed record");
+    };
+    assert_eq!(*recorded_membership, membership_change.into_record());
+    let price_receipt = conflict_price_receipt.unwrap();
+    let (_, acquisition) = Reader::replay(&source_path)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|(_, envelope)| envelope.seq == price_receipt.sequence)
+        .unwrap();
+    assert_eq!(acquisition.this_hash, price_receipt.this_hash);
+    assert_eq!(acquisition.source_id.0, "polymarket.gamma.markets");
     assert_eq!(
-        completion.causal_closes,
-        QUALIFICATION_DAYS * COPIES_PER_DAY
+        (acquisition.schema_version, acquisition.parser_version),
+        (2, 1)
     );
+    let acquisition: serde_json::Value = serde_json::from_slice(&acquisition.payload).unwrap();
+    assert_eq!(acquisition["result"], "page");
+    assert_eq!(acquisition["usable"], true);
+    let raw: Vec<u8> = serde_json::from_value(acquisition["payload"].clone()).unwrap();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0]["conditionId"],
+        recorded_trades[HELD_COPY].bodies.condition.0
+    );
+    assert_eq!(rows[0]["conditionId"], rows[1]["conditionId"]);
+    assert_eq!(rows[0]["outcomePrices"], "[\"0.50\",\"0.50\"]");
+    assert_eq!(rows[1]["outcomePrices"], "[\"0.60\",\"0.40\"]");
 
     let decision_rows = paper.decision_pending_history().unwrap();
-    assert_eq!(decision_rows.len(), QUALIFICATION_DAYS * COPIES_PER_DAY);
+    assert_eq!(decision_rows.len(), TOTAL_DECISIONS);
     assert!(decision_rows.iter().all(|row| {
         replay_decision_pending(row).is_ok_and(|decision| {
             decision.continuation.facts.gate_result == "admitted"
+                && decision.continuation.version() == 4
+                && decision.continuation.read_commitment.is_some()
+                && decision.continuation.facts.provenance == TradeProvenance::ActivityWs
                 && decision.post_boundary.body.terminal.final_receipt.is_some()
+                    == (Some(&row.source_trade_id) != conflict_trade_id.as_ref()
+                        && Some(&row.source_trade_id) != blocked_trade_id.as_ref())
         })
     }));
     let prepared_fills = sealed_era
@@ -2203,7 +2474,19 @@ async fn golden_source_stream_replays_exact_economic_core() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(prepared_fills.len(), QUALIFICATION_DAYS * COPIES_PER_DAY);
+    assert_eq!(prepared_fills.len(), TOTAL_FILLS);
+    assert_eq!(paper.settled_count().unwrap(), TOTAL_FILLS);
+    for (record, _) in &prepared_fills {
+        let PaperLogRecord::FinancialPrepared {
+            payload: pe_service::paper_recovery::FinancialPayload::Fill { operation, .. },
+            ..
+        } = record
+        else {
+            panic!("prepared fill had a different payload");
+        };
+        assert_ne!(Some(&operation.source_trade_id), conflict_trade_id.as_ref());
+        assert_ne!(Some(&operation.source_trade_id), blocked_trade_id.as_ref());
+    }
     for (_, economic) in &prepared_fills {
         assert!(economic.observation.is_some());
         assert_eq!(
@@ -2270,10 +2553,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             .count(),
         QUALIFICATION_DAYS + 1
     );
-    assert_eq!(
-        authority.mutations(),
-        QUALIFICATION_DAYS * COPIES_PER_DAY * 2
-    );
+    assert_eq!(authority.mutations(), TOTAL_FILLS * 2);
     eprintln!(
         "PERF golden_stream phase=seal elapsed={:?} total={:?}",
         seal_started.elapsed(),
@@ -2311,18 +2591,18 @@ async fn golden_source_stream_replays_exact_economic_core() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("verdict=Pass"));
     assert!(report.replay.exact);
-    assert_eq!(report.replay.decisions, QUALIFICATION_DAYS * COPIES_PER_DAY);
-    assert_eq!(
-        report.replay.financial_prepared,
-        QUALIFICATION_DAYS * COPIES_PER_DAY * 2
-    );
-    assert_eq!(
-        report.replay.financial_final,
-        QUALIFICATION_DAYS * COPIES_PER_DAY * 2
-    );
-    assert_eq!(report.replay.fills, QUALIFICATION_DAYS * COPIES_PER_DAY);
+    assert_eq!(report.replay.decisions, TOTAL_DECISIONS);
+    assert_eq!(report.replay.financial_prepared, TOTAL_FILLS * 2);
+    assert_eq!(report.replay.financial_final, TOTAL_FILLS * 2);
+    assert_eq!(report.replay.fills, TOTAL_FILLS);
+    assert_eq!(report.replay.no_fills, 2);
+    assert_eq!(report.replay.membership_changes, 1);
+    assert_eq!(report.replay.final_membership_count, wallets.len() - 1);
+    assert_eq!(report.demotions, 0);
+    assert_eq!(report.promotion_anchor_mark_unix, Some(anchor_cutoff));
+    assert_eq!(report.absolute_profit_loss, Some(dec!(196.05)));
     assert_eq!(report.complete_days, QUALIFICATION_DAYS);
-    assert_eq!(report.closed_copies, QUALIFICATION_DAYS * COPIES_PER_DAY);
+    assert_eq!(report.closed_copies, TOTAL_FILLS);
     assert_eq!(report.paper_p95_delay_ms, Some(0));
     assert_eq!(
         report.evidence.economic_core_hashes,
@@ -2331,7 +2611,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
     );
-    assert_eq!(runtime_risks.len(), QUALIFICATION_DAYS * COPIES_PER_DAY);
+    assert_eq!(runtime_risks.len(), TOTAL_FILLS);
     assert!(
         runtime_risks
             .iter()
@@ -2406,7 +2686,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let tamper_started = Instant::now();
     let tamper_root = dir.path().join("preimage-corpora");
     std::fs::create_dir(&tamper_root).unwrap();
-    let last_recorded = recorded_trades.last().unwrap();
+    let last_recorded = &recorded_trades[ORIGINAL_COPIES - 1];
     let last_decision = decision_rows.last().unwrap();
     let price_receipt = sealed_era
         .frames
