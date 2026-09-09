@@ -10815,51 +10815,50 @@ mod tests {
         }
     }
 
-    fn assert_selection_oracle_case(case: &str) {
-        let oracle = include_str!("../tests/fixtures/qualification_selection_oracle.txt");
-        let fixture = selection_oracle::build_selection_oracle_fixture(case);
-        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
-        let candidate = fixture.candidate();
-        let map = decision_rows_for_source_prefix(
-            &fixture.state,
-            &fixture.source_path,
-            &fixture.start,
-            &fixture.sealed,
-        );
-        let indexed = decision_rows_for_indexed_source_prefix(
-            &fixture.state,
-            &index,
-            &candidate,
-            &fixture.start,
-        );
-        let expected = selection_oracle::expected_selection_oracle_result(oracle, case);
-        assert_eq!(
-            selection_oracle::render_selection_oracle_result(map.as_ref()),
-            expected,
-            "Map selection differs for oracle case {case}"
-        );
-        assert_eq!(
-            selection_oracle::render_selection_oracle_result(
-                indexed.as_ref().map(|(selected, _)| selected)
-            ),
-            expected,
-            "Index selection differs for oracle case {case}"
-        );
-        assert_selection_results_equal(map, indexed, &fixture.sealed);
-    }
-
     /// The offline Map adapter and runtime Index adapter preserve the pre-#574 characterization.
     #[test]
     fn qualification_selection_matches_characterization_through_both_adapters() {
         let oracle = include_str!("../tests/fixtures/qualification_selection_oracle.txt");
+        let mut map_characterization = selection_oracle::selection_oracle_header();
+        for case in selection_oracle::selection_oracle_cases() {
+            let fixture = selection_oracle::build_selection_oracle_fixture(case);
+            let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+            let candidate = fixture.candidate();
+            let map = decision_rows_for_source_prefix(
+                &fixture.state,
+                &fixture.source_path,
+                &fixture.start,
+                &fixture.sealed,
+            );
+            let indexed = decision_rows_for_indexed_source_prefix(
+                &fixture.state,
+                &index,
+                &candidate,
+                &fixture.start,
+            );
+            let expected = selection_oracle::expected_selection_oracle_result(oracle, case);
+            let map_rendering = selection_oracle::render_selection_oracle_result(map.as_ref());
+            assert_eq!(
+                map_rendering, expected,
+                "Map selection differs for oracle case {case}"
+            );
+            assert_eq!(
+                selection_oracle::render_selection_oracle_result(
+                    indexed.as_ref().map(|(selected, _)| selected)
+                ),
+                expected,
+                "Index selection differs for oracle case {case}"
+            );
+            assert_selection_results_equal(map, indexed, &fixture.sealed);
+            map_characterization.push_str(&selection_oracle::selection_oracle_section(
+                case,
+                &map_rendering,
+            ));
+        }
         assert_eq!(
-            selection_oracle::selection_oracle_output(),
-            oracle,
+            map_characterization, oracle,
             "Map selection differs from the frozen pre-#574 characterization"
         );
-        for case in selection_oracle::selection_oracle_cases() {
-            assert_selection_oracle_case(case);
-        }
     }
 
     /// Both #574 adapters return identical point evidence and exact receipt refusals.

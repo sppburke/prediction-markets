@@ -796,7 +796,7 @@ pub(super) fn render_selection_oracle_result(
     }
 }
 
-fn selection_oracle_header() -> String {
+pub(super) fn selection_oracle_header() -> String {
     format!(
         "# Recorded from pre-#574 base revision {ORACLE_BASE_REVISION}.\n\
          # Command: {ORACLE_REGENERATOR_COMMAND}\n\
@@ -815,9 +815,13 @@ pub(super) fn selection_oracle_output() -> String {
             &fixture.sealed,
         );
         let rendered = render_selection_oracle_result(result.as_ref());
-        output.push_str(&format!("=== {case} ===\n{rendered}\n"));
+        output.push_str(&selection_oracle_section(case, &rendered));
     }
     output
+}
+
+pub(super) fn selection_oracle_section(case: &str, rendered: &str) -> String {
+    format!("=== {case} ===\n{rendered}\n")
 }
 
 pub(super) fn expected_selection_oracle_result<'a>(oracle: &'a str, case: &str) -> &'a str {

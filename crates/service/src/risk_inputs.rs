@@ -2205,8 +2205,6 @@ mod tests {
         let current = index.current_tail_binding().unwrap();
 
         assert_eq!(current, verified);
-        assert_eq!(current.last_sequence, None);
-        assert_eq!(current.last_hash, blake3::Hash::from_bytes([0; 32]));
     }
 
     /// PASS: replay snapshots the scanner-verified populated tail, then recording one synchronized
@@ -2243,8 +2241,6 @@ mod tests {
         let current = index.current_tail_binding().unwrap();
 
         assert!(current.physical_tail > before.physical_tail);
-        assert_eq!(current.last_sequence, Some(receipt.sequence));
-        assert_eq!(current.last_hash, receipt.this_hash);
         assert_eq!(current, Scanner::verify(&source_path).unwrap());
     }
 

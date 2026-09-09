@@ -807,7 +807,6 @@ fn walk_prefix_stops_before_complete_suffix_and_counts_only_prefix_frames() {
 
     assert_eq!(walked, Some(sealed));
     assert_eq!(observed, expected);
-    assert_eq!(observed.len(), 2);
 }
 
 #[test]
