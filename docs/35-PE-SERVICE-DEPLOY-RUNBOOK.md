@@ -871,7 +871,7 @@ change, or a hash mismatch.
 schema-3 reconciliation page has become durable in the source log (the first successor poll page
 crosses that boundary, before any commitment or version-4 continuation exists). After it, preserve
 all state and roll forward with an executable that retains schema-3 page and version-4 continuation
-compatibility; see the [open-continuation census](#validate-open-continuations-census). Never delete
+compatibility; see the [open-continuation census](#565-open-continuation-census-before-deployment). Never delete
 records or rewrite rows to make an older reader accept them.
 
 ```bash
