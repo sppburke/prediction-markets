@@ -1910,9 +1910,9 @@ impl PaperStateDb {
         Ok(pending)
     }
 
-    /// Complete continuation history for deterministic offline replay. Unlike
-    /// production boot recovery this is read-only and includes terminal rows;
-    /// callers consume the recorded terminal transition without executing it.
+    /// Complete continuation history for deterministic replay and boot-time terminal verification
+    /// (#584): the orchestrator replays every terminal row at boot, while open recovery separately
+    /// resumes only open rows.
     pub fn decision_pending_history(&self) -> Result<Vec<DecisionPendingRow>, PaperStateError> {
         let conn = self.lock();
         let mut statement = conn.prepare(

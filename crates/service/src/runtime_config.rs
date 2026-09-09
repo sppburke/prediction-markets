@@ -172,6 +172,97 @@ struct LegacyCompatibility {
     polymarket_fee_rate: Decimal,
 }
 
+/// Exact `RuntimeConfig` wire shape frozen by pre-#545 version-two continuations (#584).
+#[derive(Debug, Deserialize)]
+struct Pre545RuntimeConfig {
+    active_watchlist_size: usize,
+    mode: String,
+    max_fill_price: Decimal,
+    min_fill_price: Decimal,
+    min_resolution_horizon_secs: u64,
+    max_resolution_horizon_secs: u64,
+    fill_mode: Pre545FillMode,
+    price_impact_cap_bps: i32,
+    flip_human_approved: bool,
+    kelly_fraction_above_default_human_approved: bool,
+    polymarket_fee_rate: Decimal,
+    kelly_fraction_override: Option<KellyFraction>,
+    per_trade_cap: PerTradeCap,
+    slippage_rate: Decimal,
+    sizing_mode: SizingMode,
+    sizing_dollar_usd: Decimal,
+    sizing_contracts: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Pre545FillMode {
+    ClobBestAsk,
+    LeaderHaircut,
+}
+
+impl From<Pre545RuntimeConfig> for RuntimeConfig {
+    fn from(value: Pre545RuntimeConfig) -> Self {
+        let fill_mode = match value.fill_mode {
+            Pre545FillMode::ClobBestAsk => "clob_best_ask",
+            Pre545FillMode::LeaderHaircut => "leader_haircut",
+        };
+        Self {
+            era: ConfigEra::Legacy17,
+            active_watchlist_size: value.active_watchlist_size,
+            mode: value.mode,
+            max_fill_price: value.max_fill_price,
+            min_fill_price: value.min_fill_price,
+            min_resolution_horizon_secs: value.min_resolution_horizon_secs,
+            max_resolution_horizon_secs: value.max_resolution_horizon_secs,
+            price_impact_cap_bps: value.price_impact_cap_bps,
+            flip_human_approved: value.flip_human_approved,
+            kelly_fraction_above_default_human_approved: value
+                .kelly_fraction_above_default_human_approved,
+            kelly_fraction_override: value.kelly_fraction_override,
+            per_trade_cap: value.per_trade_cap,
+            slippage_rate: value.slippage_rate,
+            sizing_mode: value.sizing_mode,
+            sizing_dollar_usd: value.sizing_dollar_usd,
+            sizing_contracts: value.sizing_contracts,
+            legacy_compatibility: Some(LegacyCompatibility {
+                fill_mode: fill_mode.to_owned(),
+                polymarket_fee_rate: value.polymarket_fee_rate,
+            }),
+        }
+    }
+}
+
+/// Decode only the exact pre-#545 frozen configuration shape retained by issue #584.
+pub(crate) fn decode_pre_545_runtime_config(
+    value: serde_json::Value,
+) -> Result<RuntimeConfig, serde_json::Error> {
+    let object = value.as_object().ok_or_else(|| {
+        <serde_json::Error as serde::de::Error>::custom(
+            "pre-#545 RuntimeConfig must be a JSON object",
+        )
+    })?;
+    let expected = LEGACY_HOT_CONFIG_KEYS.into_iter().collect::<HashSet<_>>();
+    let missing = LEGACY_HOT_CONFIG_KEYS
+        .into_iter()
+        .filter(|key| !object.contains_key(*key))
+        .collect::<Vec<_>>();
+    let mut unexpected = object
+        .keys()
+        .filter(|key| !expected.contains(key.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    unexpected.sort_unstable();
+    if !missing.is_empty() || !unexpected.is_empty() {
+        return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+            "pre-#545 RuntimeConfig key set mismatch: missing [{}]; unexpected [{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        )));
+    }
+    serde_json::from_value::<Pre545RuntimeConfig>(value).map(RuntimeConfig::from)
+}
+
 impl RuntimeConfig {
     /// Scenario/test baseline. Production boot never uses this as authority: it requires and
     /// validates a complete Supabase snapshot before producers start.
@@ -874,6 +965,122 @@ mod tests {
         assert_eq!(parsed.era, ConfigEra::Legacy17);
         assert!(parse_config(&legacy, &baseline(), false, ConfigEra::Financial15).is_err());
         assert!(parse_config(&complete_rows(), &baseline(), false, ConfigEra::Legacy17).is_err());
+    }
+
+    #[test]
+    fn pre_545_wire_decodes_the_historical_shape_with_its_frozen_hash() {
+        let original =
+            parse_config(&legacy_rows(), &baseline(), false, ConfigEra::Legacy17).unwrap();
+        let frozen_hash = original.canonical_hash();
+        let mut wrapper = serde_json::json!({"applied_configuration": original});
+        crate::bucket_commit::pre_545_applied_configuration(&mut wrapper);
+        let wire = wrapper
+            .as_object_mut()
+            .unwrap()
+            .remove("applied_configuration")
+            .unwrap();
+
+        let decoded_wire: Pre545RuntimeConfig = serde_json::from_value(wire).unwrap();
+        let decoded = RuntimeConfig::from(decoded_wire);
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.canonical_hash(), frozen_hash);
+    }
+
+    #[test]
+    fn pre_545_wire_refuses_era_unknown_keys_missing_kelly_override_and_unknown_fill_mode() {
+        let original =
+            parse_config(&legacy_rows(), &baseline(), false, ConfigEra::Legacy17).unwrap();
+        let mut wrapper = serde_json::json!({"applied_configuration": original});
+        crate::bucket_commit::pre_545_applied_configuration(&mut wrapper);
+        let historical = wrapper["applied_configuration"].clone();
+
+        let mut era = historical.clone();
+        era["era"] = serde_json::json!("legacy17");
+        let mut null_era = historical.clone();
+        null_era["era"] = serde_json::Value::Null;
+        let mut missing_override = historical.clone();
+        missing_override
+            .as_object_mut()
+            .unwrap()
+            .remove("kelly_fraction_override");
+        let mut unknown_fill_mode = historical;
+        unknown_fill_mode["fill_mode"] = serde_json::json!("market");
+
+        for (document, offending) in [
+            (era, "era"),
+            (null_era, "era"),
+            (missing_override, "kelly_fraction_override"),
+            (unknown_fill_mode, "market"),
+        ] {
+            let error = decode_pre_545_runtime_config(document).unwrap_err();
+            assert!(error.to_string().contains(offending), "{error}");
+        }
+    }
+
+    #[test]
+    fn runtime_config_current_json_shapes_are_unchanged() {
+        let financial =
+            parse_config(&complete_rows(), &baseline(), false, ConfigEra::Financial15).unwrap();
+        let expected_financial = serde_json::json!({
+            "era": "financial15",
+            "active_watchlist_size": 100,
+            "mode": "paper",
+            "max_fill_price": "0.85",
+            "min_fill_price": "0.15",
+            "min_resolution_horizon_secs": 60,
+            "max_resolution_horizon_secs": 172800,
+            "price_impact_cap_bps": 100,
+            "flip_human_approved": false,
+            "kelly_fraction_above_default_human_approved": false,
+            "kelly_fraction_override": null,
+            "per_trade_cap": {"kind": "unlimited"},
+            "slippage_rate": "0.01",
+            "sizing_mode": {"kind": "dollar", "value": {"usd": "25"}},
+            "sizing_dollar_usd": "25",
+            "sizing_contracts": 1
+        });
+        let financial_json = serde_json::to_value(&financial).unwrap();
+        assert_eq!(financial_json, expected_financial);
+        assert!(
+            !financial_json
+                .as_object()
+                .unwrap()
+                .contains_key("legacy_compatibility")
+        );
+        assert_eq!(
+            serde_json::from_value::<RuntimeConfig>(financial_json).unwrap(),
+            financial
+        );
+
+        let legacy = parse_config(&legacy_rows(), &baseline(), false, ConfigEra::Legacy17).unwrap();
+        let expected_legacy = serde_json::json!({
+            "era": "legacy17",
+            "active_watchlist_size": 100,
+            "mode": "paper",
+            "max_fill_price": "0.85",
+            "min_fill_price": "0.15",
+            "min_resolution_horizon_secs": 60,
+            "max_resolution_horizon_secs": 172800,
+            "price_impact_cap_bps": 100,
+            "flip_human_approved": false,
+            "kelly_fraction_above_default_human_approved": false,
+            "kelly_fraction_override": null,
+            "per_trade_cap": {"kind": "unlimited"},
+            "slippage_rate": "0.01",
+            "sizing_mode": {"kind": "dollar", "value": {"usd": "25"}},
+            "sizing_dollar_usd": "25",
+            "sizing_contracts": 1,
+            "legacy_compatibility": {
+                "fill_mode": "clob_best_ask",
+                "polymarket_fee_rate": "0.04"
+            }
+        });
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(legacy_json, expected_legacy);
+        assert_eq!(
+            serde_json::from_value::<RuntimeConfig>(legacy_json).unwrap(),
+            legacy
+        );
     }
 
     #[test]

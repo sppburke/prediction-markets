@@ -795,7 +795,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::ServiceConfig;
+    use crate::bucket_commit::{pre_545_frozen_inputs, synthetic_legacy17_runtime_config};
     use crate::runtime_config::RuntimeConfig;
 
     const ORIGIN_MAIN_TERMINAL: &str =
@@ -807,11 +807,8 @@ mod tests {
         serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
     }
 
-    fn continuation(source_trade_id: &SourceTradeId) -> DecisionContinuationFacts {
-        continuation_with_configuration(
-            source_trade_id,
-            RuntimeConfig::from_service_config(&ServiceConfig::default()),
-        )
+    fn legacy17_continuation(source_trade_id: &SourceTradeId) -> DecisionContinuationFacts {
+        continuation_with_configuration(source_trade_id, origin_main_configuration())
     }
 
     fn continuation_with_configuration(
@@ -845,29 +842,7 @@ mod tests {
     }
 
     fn origin_main_configuration() -> RuntimeConfig {
-        let configuration: RuntimeConfig = serde_json::from_value(json!({
-            "era": "legacy17",
-            "active_watchlist_size": 100,
-            "mode": "paper",
-            "max_fill_price": "0.85",
-            "min_fill_price": "0.15",
-            "min_resolution_horizon_secs": 60,
-            "max_resolution_horizon_secs": 172_800,
-            "price_impact_cap_bps": 100,
-            "flip_human_approved": false,
-            "kelly_fraction_above_default_human_approved": false,
-            "kelly_fraction_override": null,
-            "per_trade_cap": {"kind": "mode_default"},
-            "slippage_rate": "0.01",
-            "sizing_mode": {"kind": "kelly"},
-            "sizing_dollar_usd": "0",
-            "sizing_contracts": 0,
-            "legacy_compatibility": {
-                "fill_mode": "clob_best_ask",
-                "polymarket_fee_rate": "0.04"
-            }
-        }))
-        .unwrap();
+        let configuration = synthetic_legacy17_runtime_config();
         assert_eq!(
             configuration.canonical_hash(),
             "f602cee694f90f8e48cdd43e70d6d9398879a9991662492af82ec4f7df31b222"
@@ -897,8 +872,7 @@ mod tests {
     }
 
     fn legacy_v2_json(facts: &DecisionContinuationFacts) -> String {
-        let facts = serde_json::to_string(facts).unwrap();
-        format!(r#"{{"version":2,{}"#, facts.strip_prefix('{').unwrap())
+        pre_545_frozen_inputs(facts)
     }
 
     fn accumulator(continuation: &DecisionContinuationFacts) -> DecisionEvidenceAccumulator {
@@ -947,7 +921,7 @@ mod tests {
         terminal: TerminalDispositionEvidence,
     ) -> DecisionPendingRow {
         let source_trade_id = SourceTradeId(format!("g2:{source_suffix}"));
-        let continuation = continuation(&source_trade_id);
+        let continuation = legacy17_continuation(&source_trade_id);
         let evidence = accumulator(&continuation)
             .render(authority, terminal.clone())
             .unwrap();
@@ -1240,7 +1214,7 @@ mod tests {
     #[test]
     fn pre_side_effect_checkpoint_round_trips_and_rejects_tampering() {
         let source_trade_id = SourceTradeId("g2:checkpoint".to_owned());
-        let continuation = continuation(&source_trade_id);
+        let continuation = legacy17_continuation(&source_trade_id);
         let evidence = accumulator(&continuation);
         let checkpoint = evidence.checkpoint_json().unwrap();
         let mut row = DecisionPendingRow {
