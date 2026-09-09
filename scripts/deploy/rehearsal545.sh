@@ -386,6 +386,29 @@ else
 fi
 copy_manifest_sha256=$(sha256sum "$copy_manifest" | awk '{print $1}')
 
+# Issue #584: bind the checkpointed copy's terminal pre-#545 continuation inventory before any
+# reviewed-binary verb mutates that private copy. One structural predicate (SQLite's built-in JSON
+# functions) owns the definition for both queries: the root version is the integer 2, the applied
+# configuration object has no `era` key at all (a JSON null is not absence), and its `fill_mode` is
+# text. Substring matching would misclassify `"version":20`, a nested `"version":2`, or JSON with
+# whitespace.
+read -r -d '' legacy_continuation_predicate <<'SQL' || true
+state = 'terminal'
+  and json_valid(frozen_inputs_json)
+  and json_type(frozen_inputs_json, '$.version') = 'integer'
+  and json_extract(frozen_inputs_json, '$.version') = 2
+  and json_type(frozen_inputs_json, '$.applied_configuration') = 'object'
+  and json_type(frozen_inputs_json, '$.applied_configuration.era') is null
+  and json_type(frozen_inputs_json, '$.applied_configuration.fill_mode') = 'text'
+SQL
+legacy_continuations_count=$(sqlite3 -readonly "$copy_dir/paper_state.db" \
+  "select count(*) from decision_pending where $legacy_continuation_predicate;")
+legacy_continuations_digest=$(sqlite3 -readonly "$copy_dir/paper_state.db" \
+  "select source_trade_id from decision_pending where $legacy_continuation_predicate
+    order by source_trade_id;" | sha256sum | awk '{print $1}')
+printf 'rehearsal copy legacy continuations: count=%s digest=%s\n' \
+  "$legacy_continuations_count" "$legacy_continuations_digest"
+
 rehearsal_env_file="$root/environment-$short.rehearsal.env"
 rehearsal_env_stage=$(mktemp "$root/.environment-$short.rehearsal.XXXXXX")
 python3 - "$env_file" "$rehearsal_env_stage" "$environment_sha256" 3< <(
@@ -897,6 +920,8 @@ manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
     "$service_invocation_pid" "$rehearsal_bind" "$rehearsal_port" "$installed_bind" \
     "$readiness_base_url" "$wallet" "$anchor_before"
   printf 'final=%s\n' "$last"
+  printf 'legacy_continuations=%s:%s\n' \
+    "$legacy_continuations_count" "$legacy_continuations_digest"
   printf 'copy_manifest_sha256=%s\naccount_census_before_count=%s\naccount_census_before_sha256=%s\naccount_census_before_safe=true\naccount_census_after_count=%s\naccount_census_after_sha256=%s\naccount_census_after_safe=%s\naccount_census_before_after_identical=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
     "$copy_manifest_sha256" \
     "$account_census_before_count" \

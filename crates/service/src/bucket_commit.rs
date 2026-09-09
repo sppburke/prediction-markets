@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::position_seeder::{AnchorInstall, ledger_capture};
 use crate::risk_inputs::SourceReceiptIndex;
-use crate::runtime_config::RuntimeConfig;
+use crate::runtime_config::{RuntimeConfig, decode_pre_545_runtime_config};
 
 /// Source id of the per-read commitment record appended after one complete fixed-end activity
 /// read and before any of its buckets commit (#565). Never parsed as an activity page.
@@ -163,6 +163,64 @@ pub struct DecisionContinuationV3 {
     /// Receipt of the complete-read commitment record; present exactly in wire version 4 (#565).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_commitment: Option<AppendReceipt>,
+}
+
+/// Rewrite one synthetic continuation to the exact pre-#545 configuration shape (#584).
+#[cfg(test)]
+#[track_caller]
+#[allow(clippy::expect_used)]
+pub(crate) fn pre_545_applied_configuration(value: &mut Value) {
+    let configuration = value
+        .get_mut("applied_configuration")
+        .and_then(Value::as_object_mut)
+        .expect("continuation must contain an applied_configuration object");
+    let era = configuration
+        .remove("era")
+        .expect("current RuntimeConfig must contain era");
+    assert_eq!(era, Value::String("legacy17".to_owned()));
+    let mut compatibility = configuration
+        .remove("legacy_compatibility")
+        .and_then(|value| value.as_object().cloned())
+        .expect("Legacy17 RuntimeConfig must contain compatibility data");
+    for key in ["fill_mode", "polymarket_fee_rate"] {
+        configuration.insert(
+            key.to_owned(),
+            compatibility
+                .remove(key)
+                .expect("Legacy17 compatibility pair must be complete"),
+        );
+    }
+    assert!(compatibility.is_empty());
+}
+
+/// Serialize synthetic historical facts as an exact pre-#545 version-two continuation (#584).
+#[cfg(test)]
+#[track_caller]
+#[allow(clippy::expect_used)]
+pub(crate) fn pre_545_frozen_inputs(facts: &DecisionContinuationFacts) -> String {
+    let mut value = serde_json::to_value(facts).expect("facts must serialize");
+    value
+        .as_object_mut()
+        .expect("serialized facts must be an object")
+        .insert("version".to_owned(), Value::from(2));
+    pre_545_applied_configuration(&mut value);
+    serde_json::to_string(&value).expect("pre-#545 continuation must serialize")
+}
+
+/// Shared synthetic owner of the Legacy17 compatibility values used by #584 tests.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn synthetic_legacy17_runtime_config() -> RuntimeConfig {
+    let mut value = serde_json::to_value(RuntimeConfig::from_service_config(
+        &crate::config::ServiceConfig::default(),
+    ))
+    .expect("RuntimeConfig must serialize");
+    value["era"] = Value::String("legacy17".to_owned());
+    value["legacy_compatibility"] = json!({
+        "fill_mode": "clob_best_ask",
+        "polymarket_fee_rate": "0.04"
+    });
+    serde_json::from_value(value).expect("synthetic Legacy17 RuntimeConfig must deserialize")
 }
 
 /// One source-log activity page resolved by its frozen V3 receipt.
@@ -913,7 +971,7 @@ pub enum DecisionContinuationError {
 impl DecisionContinuationV3 {
     /// Decode and bind a frozen continuation to its durable outer row.
     pub fn from_durable(row: &DecisionPendingRow) -> Result<Self, DecisionContinuationError> {
-        let value: Value = serde_json::from_str(&row.frozen_inputs_json)?;
+        let mut value: Value = serde_json::from_str(&row.frozen_inputs_json)?;
         let version = value
             .get("version")
             .and_then(Value::as_u64)
@@ -921,6 +979,15 @@ impl DecisionContinuationV3 {
             .ok_or(DecisionContinuationError::Version(0))?;
         let continuation = match version {
             2 => {
+                let applied_configuration =
+                    value.get_mut("applied_configuration").ok_or_else(|| {
+                        <serde_json::Error as serde::de::Error>::custom(
+                            "missing field `applied_configuration`",
+                        )
+                    })?;
+                let configuration =
+                    decode_pre_545_runtime_config(std::mem::take(applied_configuration))?;
+                *applied_configuration = serde_json::to_value(configuration)?;
                 let legacy: DecisionContinuationV2Wire = serde_json::from_value(value)?;
                 Self {
                     version: legacy.version,
@@ -1236,9 +1303,7 @@ pub(crate) mod continuation_validation_tests {
             }])
             .unwrap();
         let context = BucketDecisionContext {
-            applied_configuration: RuntimeConfig::from_service_config(
-                &crate::config::ServiceConfig::default(),
-            ),
+            applied_configuration: synthetic_legacy17_runtime_config(),
             decision_inputs_json: json!({"fixed_end": fixed_end, "pages": pages}).to_string(),
             page_occurrences: occurrences,
             observed_source_receipts: HashMap::new(),
@@ -1338,6 +1403,7 @@ pub(crate) mod continuation_validation_tests {
         let original: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
         let mut legacy = original.clone();
         legacy["version"] = json!(2);
+        pre_545_applied_configuration(&mut legacy);
         for key in [
             "page_occurrences",
             "observed_source_receipt",
@@ -2880,9 +2946,19 @@ mod continuation_v3_tests {
         }
     }
 
+    fn legacy17_facts(decision_inputs: Value) -> DecisionContinuationFacts {
+        with_legacy17(facts(decision_inputs))
+    }
+
+    /// Replace only the configuration and its hash so the facts model a pre-#545 record.
+    fn with_legacy17(mut facts: DecisionContinuationFacts) -> DecisionContinuationFacts {
+        facts.applied_configuration = synthetic_legacy17_runtime_config();
+        facts.applied_configuration_hash = facts.applied_configuration.canonical_hash();
+        facts
+    }
+
     fn legacy_v2_json(facts: &DecisionContinuationFacts) -> String {
-        let facts = serde_json::to_string(facts).unwrap();
-        format!(r#"{{"version":2,{}"#, facts.strip_prefix('{').unwrap())
+        pre_545_frozen_inputs(facts)
     }
 
     fn durable(value: &impl Serialize) -> DecisionPendingRow {
@@ -2970,12 +3046,67 @@ mod continuation_v3_tests {
             })
         );
 
-        let legacy = facts(json!({"fixed_end": fixed_end}));
+        let legacy = legacy17_facts(json!({"fixed_end": fixed_end}));
         let mut row = durable(&value);
         row.frozen_inputs_json = legacy_v2_json(&legacy);
         let decoded = DecisionContinuationV3::from_durable(&row).unwrap();
         assert_eq!(decoded.version, 2);
         assert_eq!(decoded.observation_at(1_700_000_000_004), None);
+    }
+
+    #[test]
+    fn from_durable_accepts_pre_545_version_2() {
+        let facts = legacy17_facts(json!({"fixed_end": 1_700_000_010_i64}));
+        let holder = DecisionContinuationV3::new(facts.clone(), None, Vec::new(), None);
+        let mut row = durable(&holder);
+        row.frozen_inputs_json = pre_545_frozen_inputs(&facts);
+
+        let decoded = DecisionContinuationV3::from_durable(&row).unwrap();
+        assert_eq!(decoded.version(), 2);
+        assert_eq!(decoded.facts, facts);
+        assert_eq!(
+            decoded.facts.applied_configuration.canonical_hash(),
+            decoded.facts.applied_configuration_hash
+        );
+    }
+
+    #[test]
+    fn from_durable_refuses_version_2_with_era() {
+        let facts = legacy17_facts(json!({"fixed_end": 1_700_000_010_i64}));
+        let holder = DecisionContinuationV3::new(facts.clone(), None, Vec::new(), None);
+        let mut row = durable(&holder);
+        let mut era_bearing = serde_json::to_value(&facts).unwrap();
+        era_bearing
+            .as_object_mut()
+            .unwrap()
+            .insert("version".to_owned(), json!(2));
+
+        for era in [json!("legacy17"), Value::Null] {
+            let mut document = era_bearing.clone();
+            document["applied_configuration"]["era"] = era;
+            row.frozen_inputs_json = document.to_string();
+            let error = DecisionContinuationV3::from_durable(&row).unwrap_err();
+            assert!(matches!(&error, DecisionContinuationError::Json(_)));
+            assert!(error.to_string().contains("era"), "{error}");
+        }
+    }
+
+    #[test]
+    fn from_durable_refuses_era_less_version_3_and_4() {
+        let facts = legacy17_facts(json!({"fixed_end": 1_700_000_010_i64}));
+        let holder = DecisionContinuationV3::new(facts, None, Vec::new(), None);
+        let mut row = durable(&holder);
+        let mut era_less = serde_json::to_value(&holder).unwrap();
+        pre_545_applied_configuration(&mut era_less);
+
+        for version in [3, 4] {
+            let mut document = era_less.clone();
+            document["version"] = json!(version);
+            row.frozen_inputs_json = document.to_string();
+            let error = DecisionContinuationV3::from_durable(&row).unwrap_err();
+            assert!(matches!(&error, DecisionContinuationError::Json(_)));
+            assert!(error.to_string().contains("era"), "{error}");
+        }
     }
 
     /// PASS: polling observation time and hashes are recovered through exact receipt-index reads
@@ -3335,8 +3466,9 @@ mod continuation_v3_tests {
         Ok(source)
     }
 
-    /// PASS: V3/V4 decode exactly the two paired provenance/receipt forms; V2 is unchanged.
-    /// FAIL: either mismatch decodes, or a paired form is rejected.
+    /// PASS: V3/V4 decode exactly the two paired provenance/receipt forms; a historical V2
+    /// record decodes without a receipt and keeps either provenance.
+    /// FAIL: either mismatch decodes, a paired form is rejected, or V2 loses its provenance.
     #[test]
     fn receipt_provenance_pairing_is_bijective() {
         for version in [3, 4] {
@@ -3356,16 +3488,20 @@ mod continuation_v3_tests {
                             Err(DecisionContinuationError::DurableMismatch)
                         ));
                     }
-                    let mut legacy = durable(&continuation);
-                    legacy.frozen_inputs_json = legacy_v2_json(&continuation.facts);
-                    assert_eq!(
-                        DecisionContinuationV3::from_durable(&legacy)
-                            .unwrap()
-                            .version(),
-                        2
-                    );
                 }
             }
+        }
+        // A pre-#545 version-2 record carries no receipt, so both provenances decode without one
+        // and the decoded facts keep the provenance the writer froze (#584).
+        for provenance in [TradeProvenance::RestPoll, TradeProvenance::ActivityWs] {
+            let (mut continuation, _) = committed_empty_read();
+            continuation.facts.provenance = provenance;
+            let mut legacy = durable(&continuation);
+            legacy.frozen_inputs_json = legacy_v2_json(&with_legacy17(continuation.facts));
+            let decoded = DecisionContinuationV3::from_durable(&legacy).unwrap();
+            assert_eq!(decoded.version(), 2);
+            assert_eq!(decoded.facts.provenance, provenance);
+            assert!(decoded.observed_source_receipt.is_none());
         }
     }
 

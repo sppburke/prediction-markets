@@ -6211,7 +6211,7 @@ mod tests {
                     1005,
                     EVALUATED_MS - 5_000,
                     crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
-                    pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                    crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
                     pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
                     b"[]",
                 ),
@@ -6250,6 +6250,12 @@ mod tests {
                 ),
             ),
         ]);
+        let fixed_end = continuation.facts.source_epoch + 10;
+        let (page, page_evidence) =
+            activity_page_pair(source.get(&1005).unwrap(), b"[]", None, fixed_end, 0);
+        continuation.facts.decision_inputs =
+            serde_json::json!({"fixed_end": fixed_end, "pages": [page_evidence]});
+        continuation = DecisionContinuationV3::new(continuation.facts, None, vec![page], None);
         let admission_market = validate_live_market(
             gamma,
             clob_long,
@@ -6483,9 +6489,7 @@ mod tests {
                     terminal,
                 )
                 .unwrap();
-        let facts_json = serde_json::to_string(&continuation.facts).unwrap();
-        let frozen_inputs_json =
-            format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap());
+        let frozen_inputs_json = serde_json::to_string(&continuation).unwrap();
         let decision = replay_decision_pending(&DecisionPendingRow {
             source_trade_id: continuation.facts.source_trade_id.clone(),
             semantic_revision: continuation.facts.semantic_revision.clone(),
@@ -7327,9 +7331,7 @@ mod tests {
             &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
         )
         .unwrap();
-        let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
-        let frozen_inputs_json =
-            format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap());
+        let frozen_inputs_json = serde_json::to_string(&decision.continuation).unwrap();
         let recomputed = replay_decision_pending(&DecisionPendingRow {
             source_trade_id: decision.continuation.facts.source_trade_id.clone(),
             semantic_revision: decision.continuation.facts.semantic_revision.clone(),
@@ -7400,10 +7402,7 @@ mod tests {
             semantic_revision: decision.continuation.facts.semantic_revision.clone(),
             wallet: decision.continuation.facts.wallet,
             source_epoch: decision.continuation.facts.source_epoch,
-            frozen_inputs_json: {
-                let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
-                format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap())
-            },
+            frozen_inputs_json: serde_json::to_string(&decision.continuation).unwrap(),
             post_commit_inputs_json: String::new(),
             state: DecisionPendingState::Terminal,
             terminal_disposition: Some("no_fill".to_owned()),
@@ -7449,10 +7448,7 @@ mod tests {
             semantic_revision: decision.continuation.facts.semantic_revision.clone(),
             wallet: decision.continuation.facts.wallet,
             source_epoch: decision.continuation.facts.source_epoch,
-            frozen_inputs_json: {
-                let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
-                format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap())
-            },
+            frozen_inputs_json: serde_json::to_string(&decision.continuation).unwrap(),
             post_commit_inputs_json: String::new(),
             state: DecisionPendingState::Terminal,
             terminal_disposition: Some("no_fill".to_owned()),
@@ -7527,10 +7523,7 @@ mod tests {
             semantic_revision: decision.continuation.facts.semantic_revision.clone(),
             wallet: decision.continuation.facts.wallet,
             source_epoch: decision.continuation.facts.source_epoch,
-            frozen_inputs_json: {
-                let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
-                format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap())
-            },
+            frozen_inputs_json: serde_json::to_string(&decision.continuation).unwrap(),
             post_commit_inputs_json: String::new(),
             state: DecisionPendingState::Terminal,
             terminal_disposition: Some("no_fill".to_owned()),
@@ -7601,10 +7594,7 @@ mod tests {
             semantic_revision: decision.continuation.facts.semantic_revision.clone(),
             wallet: decision.continuation.facts.wallet,
             source_epoch: decision.continuation.facts.source_epoch,
-            frozen_inputs_json: {
-                let facts_json = serde_json::to_string(&decision.continuation.facts).unwrap();
-                format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap())
-            },
+            frozen_inputs_json: serde_json::to_string(&decision.continuation).unwrap(),
             post_commit_inputs_json: String::new(),
             state: DecisionPendingState::Terminal,
             terminal_disposition: Some("no_fill".to_owned()),
@@ -10861,6 +10851,110 @@ mod tests {
         );
     }
 
+    /// A retained pre-#545 terminal row decodes during the full history walk but remains outside
+    /// post-Start receipt selection (#584).
+    #[test]
+    fn selectors_decode_past_a_retained_pre_545_row_and_exclude_it() {
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
+        let mut legacy = classification_fixture().0.facts;
+        legacy.source_trade_id = SourceTradeId(format!("g2:{}", "9".repeat(64)));
+        legacy.semantic_revision = "pre-545-semantic".to_owned();
+        legacy.transaction_hash = "0xretained-pre-545".to_owned();
+        legacy.source_epoch = 99;
+        legacy.applied_configuration = crate::bucket_commit::synthetic_legacy17_runtime_config();
+        legacy.applied_configuration_hash = legacy.applied_configuration.canonical_hash();
+        let proof_json = AppliedEffect {
+            effect: pe_position_ledger::LedgerEffect::Trade {
+                market_id: legacy.market_id.clone(),
+                outcome_id: legacy.outcome_id,
+                side: legacy.side,
+                amount: legacy.share_amount,
+                price: legacy.price,
+            },
+            clamped_residual: None,
+        }
+        .to_document()
+        .unwrap();
+        fixture
+            .state
+            .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                wallet: legacy.wallet,
+                source_epoch: legacy.source_epoch,
+                dispositions: vec![pe_paper_state::ActivityDispositionRecord {
+                    source_trade_id: legacy.source_trade_id.clone(),
+                    transaction_hash: legacy.transaction_hash.clone(),
+                    wallet: legacy.wallet,
+                    source_epoch: legacy.source_epoch,
+                    semantic_revision: legacy.semantic_revision.clone(),
+                    activity_type: "trade".to_owned(),
+                    disposition: "decision_pending".to_owned(),
+                    proof_json,
+                    no_copy: None,
+                }],
+                leader_positions: Vec::new(),
+                gate_results: vec![pe_paper_state::EntryGateResultRecord {
+                    source_trade_id: legacy.source_trade_id.clone(),
+                    wallet: legacy.wallet,
+                    market_id: legacy.market_id.clone(),
+                    source_epoch: legacy.source_epoch,
+                    result: "admitted".to_owned(),
+                    history_consumed: true,
+                }],
+                history_effects: Vec::new(),
+                history_status: None,
+                pending: vec![pe_paper_state::DecisionPendingRecord {
+                    source_trade_id: legacy.source_trade_id.clone(),
+                    semantic_revision: legacy.semantic_revision.clone(),
+                    wallet: legacy.wallet,
+                    source_epoch: legacy.source_epoch,
+                    frozen_inputs_json: crate::bucket_commit::pre_545_frozen_inputs(&legacy),
+                    updated_at_unix: legacy.source_epoch,
+                }],
+                fence: None,
+                reanchor: None,
+                advance_cursor: false,
+            })
+            .unwrap();
+        fixture
+            .state
+            .close_decision_pending(
+                &legacy.source_trade_id,
+                "{}",
+                "no_fill",
+                legacy.source_epoch,
+            )
+            .unwrap();
+
+        let map = decision_rows_for_source_prefix(
+            &fixture.state,
+            &fixture.source_path,
+            &fixture.start,
+            &fixture.sealed,
+        )
+        .unwrap();
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let (indexed, _) = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &fixture.candidate(),
+            &fixture.start,
+        )
+        .unwrap();
+        assert_eq!(map.rows, indexed.rows);
+        assert_eq!(map.in_prefix, indexed.in_prefix);
+        assert_eq!(map.rows.len(), 1);
+        assert!(
+            map.rows
+                .iter()
+                .all(|row| row.source_trade_id != legacy.source_trade_id)
+        );
+        assert!(
+            map.in_prefix
+                .iter()
+                .all(|(source_trade_id, _)| source_trade_id != &legacy.source_trade_id)
+        );
+    }
+
     /// Both #574 adapters return identical point evidence and exact receipt refusals.
     #[test]
     fn sealed_source_map_and_index_adapters_are_equivalent() {
@@ -11120,6 +11214,11 @@ mod tests {
                         erased["version"] = serde_json::json!(version);
                         erased.as_object_mut().unwrap().remove("read_commitment");
                         if version == 2 {
+                            let legacy = crate::bucket_commit::synthetic_legacy17_runtime_config();
+                            erased["applied_configuration_hash"] =
+                                serde_json::json!(legacy.canonical_hash());
+                            erased["applied_configuration"] = serde_json::to_value(legacy).unwrap();
+                            crate::bucket_commit::pre_545_applied_configuration(&mut erased);
                             erased.as_object_mut().unwrap().remove("page_occurrences");
                             erased
                                 .as_object_mut()
@@ -11283,7 +11382,13 @@ mod tests {
             }
         }
         for mutation in 0..4 {
-            let (continuation, observations) = single_read_fixture(2, "0xpending", "BUY", true);
+            let (mut continuation, observations) = single_read_fixture(2, "0xpending", "BUY", true);
+            if mutation == 1 {
+                continuation.facts.applied_configuration =
+                    crate::bucket_commit::synthetic_legacy17_runtime_config();
+                continuation.facts.applied_configuration_hash =
+                    continuation.facts.applied_configuration.canonical_hash();
+            }
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("state.db");
             let state = PaperStateDb::open(&path).unwrap();
@@ -11296,6 +11401,7 @@ mod tests {
                 1 => {
                     let mut erased = serde_json::to_value(&continuation).unwrap();
                     erased["version"] = serde_json::json!(2);
+                    crate::bucket_commit::pre_545_applied_configuration(&mut erased);
                     for key in [
                         "read_commitment",
                         "page_occurrences",

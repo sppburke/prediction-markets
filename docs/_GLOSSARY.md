@@ -436,6 +436,11 @@ the economic configuration hash.
 `kelly_fraction_override`, `per_trade_cap`, `slippage_rate`, `sizing_mode`,
 `sizing_dollar_usd`, and `sizing_contracts`.
 
+A version-2 decision continuation written before #545 carries the pre-#545 `RuntimeConfig` shape (no
+`era`, with `fill_mode` and `polymarket_fee_rate` at the top level); readers decode exactly that
+shape as `Legacy17` with those values as compatibility data, and every later continuation version
+carries the era-bearing shape.
+
 Missing, duplicate, unknown, malformed, cross-era, or cross-field-inconsistent rows reject the
 whole proposal and retain the whole last-good snapshot. The one canonical applied identity is a
 BLAKE3 hash of that era's values actually applied; a pending watchlist-capacity transition

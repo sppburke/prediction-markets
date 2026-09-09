@@ -1329,7 +1329,6 @@ mod paper_log_tests {
     use crate::live_watchlist::LiveWatchlist;
     use crate::mid_price_cache::MidPriceCache;
     use crate::orchestrator::{Orchestrator, OrchestratorConfig};
-    use crate::runtime_config::RuntimeConfig;
     use crate::watchlist_admission::{
         AdmissionPreparer, CAPACITY_CONFIG_SOURCE_ID, KNOCKOUT_CAUSAL_SOURCE_ID,
         MEMBERSHIP_ARTIFACT_PARSER_VERSION, MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
@@ -1369,29 +1368,7 @@ mod paper_log_tests {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("paper-state.sqlite");
         let paper_state = Arc::new(PaperStateDb::open(&state_path).unwrap());
-        let applied_configuration: RuntimeConfig = serde_json::from_value(serde_json::json!({
-            "era": "legacy17",
-            "active_watchlist_size": 100,
-            "mode": "paper",
-            "max_fill_price": "0.85",
-            "min_fill_price": "0.15",
-            "min_resolution_horizon_secs": 60,
-            "max_resolution_horizon_secs": 172_800,
-            "price_impact_cap_bps": 100,
-            "flip_human_approved": false,
-            "kelly_fraction_above_default_human_approved": false,
-            "kelly_fraction_override": null,
-            "per_trade_cap": {"kind": "mode_default"},
-            "slippage_rate": "0.01",
-            "sizing_mode": {"kind": "kelly"},
-            "sizing_dollar_usd": "0",
-            "sizing_contracts": 0,
-            "legacy_compatibility": {
-                "fill_mode": "clob_best_ask",
-                "polymarket_fee_rate": "0.04"
-            }
-        }))
-        .unwrap();
+        let applied_configuration = crate::bucket_commit::synthetic_legacy17_runtime_config();
         let applied_configuration_hash = applied_configuration.canonical_hash();
         assert_eq!(
             applied_configuration_hash,
@@ -1421,9 +1398,7 @@ mod paper_log_tests {
             },
             decision_inputs: serde_json::json!({"fixed_end": 1_700_000_010_i64, "pages": 1}),
         };
-        let facts_json = serde_json::to_string(&facts).unwrap();
-        let frozen_inputs_json =
-            format!(r#"{{"version":2,{}"#, facts_json.strip_prefix('{').unwrap());
+        let frozen_inputs_json = crate::bucket_commit::pre_545_frozen_inputs(&facts);
 
         let connection = rusqlite::Connection::open(&state_path).unwrap();
         connection
