@@ -491,6 +491,84 @@ fn decision_source_receipt(
     Ok(observation)
 }
 
+fn source_observation_from_envelope(
+    receipt: AppendReceipt,
+    received_unix_ms: i64,
+    envelope: EventEnvelope,
+) -> SourceObservation {
+    SourceObservation {
+        receipt,
+        observed_at: envelope.observed_at,
+        received_at: envelope.received_at,
+        received_unix_ms,
+        source_id: envelope.source_id.0,
+        schema_version: envelope.schema_version,
+        parser_version: envelope.parser_version,
+        content_type: envelope.content_type,
+        payload: envelope.payload,
+    }
+}
+
+/// Receipt-backed source adapters shared by sealed decision selection (#574).
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum SealedSource<'a> {
+    Map(&'a BTreeMap<u64, SourceObservation>),
+    Index(&'a SourceReceiptIndex),
+}
+
+impl SealedSource<'_> {
+    fn receipt(self, receipt: AppendReceipt) -> Result<(AppendReceipt, i64), QualificationError> {
+        match self {
+            Self::Map(source) => {
+                let observation = decision_source_receipt(source, receipt)?;
+                Ok((observation.receipt, observation.received_unix_ms))
+            }
+            Self::Index(index) => {
+                let Some((known_receipt, received_unix_ms)) =
+                    index.receipt_at(receipt.sequence).map_err(|error| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "decision source receipt lookup failed: {error}"
+                        ))
+                    })?
+                else {
+                    return insufficient(format!(
+                        "decision source receipt replay failed: source receipt sequence {} is absent",
+                        receipt.sequence.0
+                    ));
+                };
+                if known_receipt != receipt {
+                    return insufficient(format!(
+                        "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
+                        receipt.sequence.0
+                    ));
+                }
+                Ok((known_receipt, received_unix_ms))
+            }
+        }
+    }
+
+    fn observation(self, receipt: AppendReceipt) -> Result<SourceObservation, QualificationError> {
+        match self {
+            Self::Map(source) => Ok(decision_source_receipt(source, receipt)?.clone()),
+            Self::Index(index) => {
+                let (_, received_unix_ms) = self.receipt(receipt)?;
+                let envelope = index.source_envelope(receipt).map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "decision source observation {} could not be read: {error}",
+                        receipt.sequence.0
+                    ))
+                })?;
+                Ok(source_observation_from_envelope(
+                    receipt,
+                    received_unix_ms,
+                    envelope,
+                ))
+            }
+        }
+    }
+}
+
 fn decision_observation_from_source(
     continuation: &DecisionContinuationV3,
     source: &BTreeMap<u64, SourceObservation>,
@@ -1855,18 +1933,77 @@ pub(crate) fn decision_rows_for_source_prefix(
     decision_rows_from_source_observations(state, start_prefix, sealed_prefix, &observations)
 }
 
+/// Select sealed decisions from the process-wide receipt index without retaining source payloads
+/// while walking the source prefix (GitHub issue #574).
+#[allow(dead_code)]
+pub(crate) fn decision_rows_for_indexed_source_prefix(
+    state: &PaperStateDb,
+    index: &SourceReceiptIndex,
+    candidate: &LogTailBinding,
+    start_prefix: &TailBinding,
+) -> Result<(SelectedDecisionRows, TailBinding), QualificationError> {
+    let candidate_sequence = candidate.last_sequence.unwrap_or(EventSeq(0));
+    let mut source_universe = HashMap::new();
+    let mut universe_error = None;
+    let binding = Scanner::walk_prefix(candidate, &mut |_, envelope| {
+        if universe_error.is_some() {
+            return;
+        }
+        if let Err(error) =
+            fold_source_trade_universe(&mut source_universe, candidate_sequence, envelope.into())
+        {
+            universe_error = Some(error);
+        }
+    })?
+    .ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "source observations do not reach the sealed sequence/hash prefix".to_owned(),
+        )
+    })?;
+    let sealed_prefix = TailBinding::from(&binding);
+    let universe = universe_error.map_or_else(|| Ok(source_universe), Err);
+    let selected = decision_rows_from_sealed_source(
+        state,
+        start_prefix,
+        &sealed_prefix,
+        SealedSource::Index(index),
+        universe,
+    )?;
+    Ok((selected, sealed_prefix))
+}
+
 fn decision_rows_from_source_observations(
     state: &PaperStateDb,
     start_prefix: &TailBinding,
     sealed_prefix: &TailBinding,
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<SelectedDecisionRows, QualificationError> {
+    let source_universe = sealed_prefix.last_sequence.map_or_else(
+        || Ok(HashMap::new()),
+        |sealed_sequence| source_trade_universe(sealed_sequence, observations),
+    );
+    decision_rows_from_sealed_source(
+        state,
+        start_prefix,
+        sealed_prefix,
+        SealedSource::Map(observations),
+        source_universe,
+    )
+}
+
+fn decision_rows_from_sealed_source(
+    state: &PaperStateDb,
+    start_prefix: &TailBinding,
+    sealed_prefix: &TailBinding,
+    source: SealedSource<'_>,
+    source_universe: Result<HashMap<pe_core_types::SourceTradeId, u64>, QualificationError>,
+) -> Result<SelectedDecisionRows, QualificationError> {
     let start_sequence = start_prefix.last_sequence;
     let Some(sealed_sequence) = sealed_prefix.last_sequence else {
         return Ok(SelectedDecisionRows::default());
     };
     let history = state.decision_pending_history()?;
-    let source_universe = source_trade_universe(sealed_sequence, observations)?;
+    let source_universe = source_universe?;
     let terminal_rows = history
         .iter()
         .filter(|row| row.state == DecisionPendingState::Terminal)
@@ -1903,7 +2040,7 @@ fn decision_rows_from_source_observations(
             pending_groups.push((source_trade_id, group.semantic_revision));
         }
     }
-    let complete_reads = complete_activity_read_scopes(&history, sealed_sequence, observations)?;
+    let complete_reads = complete_activity_read_scopes(&history, sealed_sequence, source)?;
     for (source_trade_id, revision) in pending_groups {
         if !complete_reads.iter().any(|read| {
             read.decisions.contains_key(source_trade_id)
@@ -1919,7 +2056,7 @@ fn decision_rows_from_source_observations(
     }
     let required = decision_keys_from_source_observations(
         start_sequence,
-        observations,
+        source,
         &source_universe,
         &complete_reads,
     )?;
@@ -1951,12 +2088,12 @@ fn decision_rows_from_source_observations(
         {
             continue;
         }
-        if receipts.iter().any(|receipt| {
-            observations
-                .get(&receipt.sequence.0)
-                .is_none_or(|observation| observation.receipt != *receipt)
-        }) {
-            return insufficient("decision source receipt does not match the sealed source prefix");
+        for receipt in receipts {
+            if source.receipt(receipt).is_err() {
+                return insufficient(
+                    "decision source receipt does not match the sealed source prefix",
+                );
+            }
         }
         in_prefix.push((row.source_trade_id.clone(), row.semantic_revision.clone()));
         let Some(required_revision) = required_by_trade.get(&row.source_trade_id) else {
@@ -2001,7 +2138,7 @@ struct CompleteActivityReadScope {
 fn complete_activity_read_scopes(
     rows: &[DecisionPendingRow],
     sealed_sequence: EventSeq,
-    observations: &BTreeMap<u64, SourceObservation>,
+    source: SealedSource<'_>,
 ) -> Result<Vec<CompleteActivityReadScope>, QualificationError> {
     let mut reads = Vec::<CompleteActivityReadScope>::new();
     for row in rows {
@@ -2026,12 +2163,12 @@ fn complete_activity_read_scopes(
         {
             continue;
         }
-        if receipts.iter().any(|receipt| {
-            observations
-                .get(&receipt.sequence.0)
-                .is_none_or(|observation| observation.receipt != *receipt)
-        }) {
-            return insufficient("decision source receipt does not match the sealed source prefix");
+        for receipt in receipts {
+            if source.receipt(receipt).is_err() {
+                return insufficient(
+                    "decision source receipt does not match the sealed source prefix",
+                );
+            }
         }
         if let Some(existing) = reads
             .iter_mut()
@@ -2065,15 +2202,15 @@ fn complete_activity_read_scopes(
             return insufficient("complete activity reads overlap source page receipts");
         }
         let mut lookup = |receipt| -> Result<_, QualificationError> {
-            let observation = decision_source_receipt(observations, receipt)?;
+            let observation = source.observation(receipt)?;
             Ok(CompleteActivityPage {
-                payload: observation.payload.clone(),
-                observed_at: observation.observed_at.clone(),
-                received_at: observation.received_at.clone(),
-                source_id: observation.source_id.clone(),
+                payload: observation.payload,
+                observed_at: observation.observed_at,
+                received_at: observation.received_at,
+                source_id: observation.source_id,
                 schema_version: observation.schema_version,
                 parser_version: observation.parser_version,
-                content_type: observation.content_type.clone(),
+                content_type: observation.content_type,
             })
         };
         let aggregates = continuation
@@ -2108,52 +2245,113 @@ fn source_trade_universe(
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<HashMap<pe_core_types::SourceTradeId, u64>, QualificationError> {
     let mut first = HashMap::new();
-    for observation in observations.values().filter(|observation| {
-        observation.receipt.sequence <= sealed_sequence
-            && observation.source_id == crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
-    }) {
-        crate::bucket_commit::activity_page_generation(
-            &observation.source_id,
-            observation.schema_version,
-            observation.parser_version,
-            &observation.content_type,
-        )
-        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-        let raw_rows: Vec<Box<serde_json::value::RawValue>> =
-            serde_json::from_slice(&observation.payload).map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "activity observation JSON failed: {error}"
-                ))
-            })?;
-        let context = ActivityParseContext {
-            source_id: SourceId(observation.source_id.clone()),
-            observed_at: observation.observed_at.clone(),
-            received_at: observation.received_at.clone(),
-            transport: ActivityTransport::Replay,
-        };
-        for raw in raw_rows {
-            let row =
-                parse_activity_row(raw.get().as_bytes(), None, &context).map_err(|error| {
-                    QualificationError::InsufficientEvidence(format!(
-                        "activity observation parse failed: {error}"
-                    ))
-                })?;
-            let group_id = row.group_id().map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "activity observation identity failed: {error}"
-                ))
-            })?;
-            if group_id.components().activity_type == ActivityType::Trade {
-                first
-                    .entry(group_id.key().clone())
-                    .and_modify(|sequence: &mut u64| {
-                        *sequence = (*sequence).min(observation.receipt.sequence.0);
-                    })
-                    .or_insert(observation.receipt.sequence.0);
-            }
-        }
+    for observation in observations.values() {
+        fold_source_trade_universe(&mut first, sealed_sequence, observation.into())?;
     }
     Ok(first)
+}
+
+/// One source frame as the universe fold sees it, borrowed from either a replayed
+/// `SourceObservation` (offline map path) or a walked `EventEnvelope` (runtime path) (#574).
+struct SourcePageRef<'a> {
+    sequence: EventSeq,
+    source_id: &'a str,
+    schema_version: u32,
+    parser_version: u32,
+    content_type: &'a ContentType,
+    observed_at: &'a SourceTimestamp,
+    received_at: &'a ReceivedAt,
+    payload: &'a [u8],
+}
+
+impl<'a> From<&'a SourceObservation> for SourcePageRef<'a> {
+    fn from(observation: &'a SourceObservation) -> Self {
+        Self {
+            sequence: observation.receipt.sequence,
+            source_id: &observation.source_id,
+            schema_version: observation.schema_version,
+            parser_version: observation.parser_version,
+            content_type: &observation.content_type,
+            observed_at: &observation.observed_at,
+            received_at: &observation.received_at,
+            payload: &observation.payload,
+        }
+    }
+}
+
+impl<'a> From<&'a pe_event_log::EventEnvelope> for SourcePageRef<'a> {
+    fn from(envelope: &'a pe_event_log::EventEnvelope) -> Self {
+        Self {
+            sequence: envelope.seq,
+            source_id: &envelope.source_id.0,
+            schema_version: envelope.schema_version,
+            parser_version: envelope.parser_version,
+            content_type: &envelope.content_type,
+            observed_at: &envelope.observed_at,
+            received_at: &envelope.received_at,
+            payload: &envelope.payload,
+        }
+    }
+}
+
+fn fold_source_trade_universe(
+    first: &mut HashMap<pe_core_types::SourceTradeId, u64>,
+    sealed_sequence: EventSeq,
+    page: SourcePageRef<'_>,
+) -> Result<(), QualificationError> {
+    let SourcePageRef {
+        sequence,
+        source_id,
+        schema_version,
+        parser_version,
+        content_type,
+        observed_at,
+        received_at,
+        payload,
+    } = page;
+    if sequence > sealed_sequence || source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
+        return Ok(());
+    }
+    crate::bucket_commit::activity_page_generation(
+        source_id,
+        schema_version,
+        parser_version,
+        content_type,
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let raw_rows: Vec<Box<serde_json::value::RawValue>> =
+        serde_json::from_slice(payload).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "activity observation JSON failed: {error}"
+            ))
+        })?;
+    let context = ActivityParseContext {
+        source_id: SourceId(source_id.to_owned()),
+        observed_at: observed_at.clone(),
+        received_at: received_at.clone(),
+        transport: ActivityTransport::Replay,
+    };
+    for raw in raw_rows {
+        let row = parse_activity_row(raw.get().as_bytes(), None, &context).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "activity observation parse failed: {error}"
+            ))
+        })?;
+        let group_id = row.group_id().map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "activity observation identity failed: {error}"
+            ))
+        })?;
+        if group_id.components().activity_type == ActivityType::Trade {
+            first
+                .entry(group_id.key().clone())
+                .and_modify(|first_sequence: &mut u64| {
+                    *first_sequence = (*first_sequence).min(sequence.0);
+                })
+                .or_insert(sequence.0);
+        }
+    }
+    Ok(())
 }
 
 /// Reconstruct each immutable fixed-end activity read before deriving composite decision keys.
@@ -2161,7 +2359,7 @@ fn source_trade_universe(
 /// and a group's earliest raw receipt decides whether its production aggregate predates Start.
 fn decision_keys_from_source_observations(
     start_sequence: Option<EventSeq>,
-    observations: &BTreeMap<u64, SourceObservation>,
+    source: SealedSource<'_>,
     source_universe: &HashMap<pe_core_types::SourceTradeId, u64>,
     complete_reads: &[CompleteActivityReadScope],
 ) -> Result<Vec<(u64, pe_core_types::SourceTradeId, String)>, QualificationError> {
@@ -2177,7 +2375,7 @@ fn decision_keys_from_source_observations(
             let Some(receipt) = *receipt else {
                 continue;
             };
-            let observation = decision_source_receipt(observations, receipt)?;
+            let observation = source.observation(receipt)?;
             let activity =
                 parse_activity_trade_observation(&observation.payload).map_err(|_| {
                     QualificationError::InsufficientEvidence(format!(
@@ -2662,17 +2860,11 @@ impl PublishedMembershipSource {
                 "MembershipChanged source receipt could not be read: {error}"
             ))
         })?;
-        Ok(Some(SourceObservation {
+        Ok(Some(source_observation_from_envelope(
             receipt,
-            observed_at: envelope.observed_at,
-            received_at: envelope.received_at,
             received_unix_ms,
-            source_id: envelope.source_id.0,
-            schema_version: envelope.schema_version,
-            parser_version: envelope.parser_version,
-            content_type: envelope.content_type,
-            payload: envelope.payload,
-        }))
+            envelope,
+        )))
     }
 
     pub(crate) fn scan(source_log: &Path) -> Result<Self, QualificationError> {
@@ -8098,9 +8290,13 @@ mod tests {
         );
 
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
@@ -8157,9 +8353,13 @@ mod tests {
         );
 
         let source_universe = source_trade_universe(EventSeq(3), &observations).unwrap();
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.row_count, 2);
@@ -8203,9 +8403,13 @@ mod tests {
 
         let source_universe =
             source_trade_universe(EventSeq(child_sequence), &observations).unwrap();
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.share_sum.to_decimal(), dec!(3));
@@ -8409,7 +8613,7 @@ mod tests {
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
             Some(EventSeq(1)),
-            &observations,
+            SealedSource::Map(&observations),
             &source_universe,
             &[pre_read, post_read],
         )
@@ -8559,9 +8763,13 @@ mod tests {
         );
         let source_universe = source_trade_universe(EventSeq(0), &observations)
             .expect("valid source universe derives from the activity row");
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .expect("valid complete activity read derives one decision key");
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .expect("valid complete activity read derives one decision key");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
 
@@ -10494,6 +10702,1135 @@ mod tests {
             last_sequence: sequence.map(EventSeq),
             last_hash: "00".repeat(32),
         }
+    }
+
+    struct SelectionOracleFixture {
+        _temp: tempfile::TempDir,
+        state: PaperStateDb,
+        source_path: PathBuf,
+        start: TailBinding,
+        sealed: TailBinding,
+    }
+
+    fn selection_oracle_cases() -> [&'static str; 16] {
+        [
+            "empty_history",
+            "start_only",
+            "post_start_v3",
+            "post_start_v4",
+            "pre_start_websocket_v3",
+            "pre_start_websocket_v4",
+            "post_start_sell",
+            "pending_without_decision",
+            "open_decision",
+            "semantic_revision_drift",
+            "complete_read_drift",
+            "missing_read_commitment",
+            "receipt_hash_mismatch",
+            "downgraded_v4",
+            "commitment_wrong_source",
+            "missing_activity_group",
+        ]
+    }
+
+    fn selection_oracle_websocket(continuation: &DecisionContinuationV3) -> SourceObservation {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "proxyWallet": continuation.facts.wallet.to_string(),
+            "conditionId": "0xoracle",
+            "asset": "0xoracle",
+            "side": "BUY",
+            "size": 1,
+            "price": 0.5,
+            "timestamp": 100,
+            "transactionHash": "0xoracle",
+            "outcomeIndex": 0
+        }))
+        .unwrap();
+        let mut websocket = activity_observation(1, &payload);
+        websocket.source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
+        websocket
+    }
+
+    fn materialize_selection_source(
+        path: &Path,
+        continuations: &mut [&mut DecisionContinuationV3],
+        observations: BTreeMap<u64, SourceObservation>,
+    ) -> (TailBinding, BTreeMap<u64, TailBinding>) {
+        let mut writer = Writer::open(path).unwrap();
+        let empty = TailBinding::from(&Scanner::verify(path).unwrap());
+        let mut boundaries = BTreeMap::new();
+        for (logical_sequence, mut observation) in observations {
+            if observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+                && let Some(continuation) = continuations
+                    .iter()
+                    .find(|continuation| continuation.read_commitment == Some(observation.receipt))
+            {
+                let fixed_end = continuation.facts.decision_inputs["fixed_end"]
+                    .as_i64()
+                    .unwrap();
+                let pages = serde_json::from_value::<Vec<ReconciliationPageEvidence>>(
+                    continuation.facts.decision_inputs["pages"].clone(),
+                )
+                .unwrap();
+                observation.payload = crate::bucket_commit::activity_read_commitment_payload(
+                    continuation.facts.wallet,
+                    fixed_end,
+                    continuation.page_occurrences(),
+                    &pages,
+                )
+                .unwrap();
+            }
+            let old_receipt = observation.receipt;
+            let actual_receipt = writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(observation.source_id),
+                    schema_version: observation.schema_version,
+                    parser_version: observation.parser_version,
+                    observed_at: observation.observed_at,
+                    received_at: observation.received_at,
+                    content_type: observation.content_type,
+                    payload: observation.payload,
+                })
+                .unwrap();
+            for continuation in continuations.iter_mut() {
+                for page in &mut continuation.page_occurrences {
+                    if page.receipt == old_receipt {
+                        page.receipt = actual_receipt;
+                    }
+                }
+                if continuation.observed_source_receipt == Some(old_receipt) {
+                    continuation.observed_source_receipt = Some(actual_receipt);
+                }
+                if continuation.read_commitment == Some(old_receipt) {
+                    continuation.read_commitment = Some(actual_receipt);
+                }
+            }
+            boundaries.insert(
+                logical_sequence,
+                TailBinding::from(&Scanner::verify(path).unwrap()),
+            );
+        }
+        drop(writer);
+        let sealed = boundaries
+            .last_key_value()
+            .map_or(empty.clone(), |(_, binding)| binding.clone());
+        (sealed, boundaries)
+    }
+
+    fn build_selection_oracle_fixture(case: &str) -> SelectionOracleFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        if case == "empty_history" {
+            let mut no_continuations = Vec::new();
+            let (sealed, _) = materialize_selection_source(
+                &source_path,
+                no_continuations.as_mut_slice(),
+                BTreeMap::new(),
+            );
+            return SelectionOracleFixture {
+                _temp: temp,
+                state,
+                source_path,
+                start: sealed.clone(),
+                sealed,
+            };
+        }
+
+        let committed = matches!(
+            case,
+            "post_start_v4"
+                | "pre_start_websocket_v4"
+                | "missing_read_commitment"
+                | "receipt_hash_mismatch"
+                | "downgraded_v4"
+                | "commitment_wrong_source"
+        );
+        let (mut continuation, mut observations) =
+            single_read_fixture(2, "0xoracle", "BUY", committed);
+        if matches!(case, "pre_start_websocket_v3" | "pre_start_websocket_v4") {
+            let websocket = selection_oracle_websocket(&continuation);
+            continuation.observed_source_receipt = Some(websocket.receipt);
+            continuation.facts.provenance = pe_copy_signal_engine::TradeProvenance::ActivityWs;
+            observations.insert(1, websocket);
+        }
+        if case == "commitment_wrong_source" {
+            let sequence = continuation.read_commitment.unwrap().sequence.0;
+            observations.get_mut(&sequence).unwrap().source_id =
+                crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned();
+        }
+        let (sealed, boundaries) =
+            materialize_selection_source(&source_path, &mut [&mut continuation], observations);
+        let start = if case.starts_with("pre_start_websocket") {
+            boundaries.get(&1).unwrap().clone()
+        } else if case == "start_only" {
+            sealed.clone()
+        } else {
+            TailBinding::from(&LogTailBinding {
+                path: std::fs::canonicalize(&source_path).unwrap(),
+                physical_tail: 5,
+                last_sequence: None,
+                last_hash: blake3::Hash::from_bytes([0; 32]),
+            })
+        };
+
+        match case {
+            "start_only" | "missing_activity_group" => {}
+            "post_start_sell" => {
+                store_read_decision(&state, &continuation, "not_buy", false);
+            }
+            "pending_without_decision" => {
+                store_read_decision(&state, &continuation, "decision_pending", false);
+            }
+            _ => store_read_decision(&state, &continuation, "decision_pending", true),
+        }
+
+        let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
+        match case {
+            "open_decision" => {
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET state = 'open', terminal_disposition = NULL",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "semantic_revision_drift" => {
+                connection
+                    .execute(
+                        "UPDATE activity_groups SET semantic_revision = 'different'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "complete_read_drift" => {
+                let mut changed = continuation.clone();
+                changed.facts.decision_inputs["fixed_end"] = serde_json::json!(101);
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                        [serde_json::to_string(&changed).unwrap()],
+                    )
+                    .unwrap();
+            }
+            "missing_read_commitment" => {
+                let mut changed = serde_json::to_value(&continuation).unwrap();
+                changed.as_object_mut().unwrap().remove("read_commitment");
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                        [changed.to_string()],
+                    )
+                    .unwrap();
+            }
+            "receipt_hash_mismatch" => {
+                let mut changed = serde_json::to_value(&continuation).unwrap();
+                changed["read_commitment"]["this_hash"] =
+                    serde_json::json!(blake3::hash(b"wrong").to_hex().to_string());
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                        [changed.to_string()],
+                    )
+                    .unwrap();
+            }
+            "downgraded_v4" => {
+                let mut changed = serde_json::to_value(&continuation).unwrap();
+                changed["version"] = serde_json::json!(3);
+                changed.as_object_mut().unwrap().remove("read_commitment");
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                        [changed.to_string()],
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        SelectionOracleFixture {
+            _temp: temp,
+            state,
+            source_path,
+            start,
+            sealed,
+        }
+    }
+
+    fn qualification_error_variant(error: &QualificationError) -> &'static str {
+        match error {
+            QualificationError::PaperLog(_) => "PaperLog",
+            QualificationError::EventLog(_) => "EventLog",
+            QualificationError::PaperState(_) => "PaperState",
+            QualificationError::Json(_) => "Json",
+            QualificationError::Io(_) => "Io",
+            QualificationError::InsufficientEvidence(_) => "InsufficientEvidence",
+        }
+    }
+
+    fn render_selection_oracle_result(
+        result: Result<SelectedDecisionRows, QualificationError>,
+    ) -> String {
+        match result {
+            Ok(selected) => format!(
+                "Ok\nrows: {:?}\nin_prefix: {:?}",
+                selected.rows, selected.in_prefix
+            ),
+            Err(error) => format!(
+                "Err\nvariant: {}\ntext: {}",
+                qualification_error_variant(&error),
+                error
+            ),
+        }
+    }
+
+    fn selection_oracle_output() -> String {
+        let mut output = String::new();
+        for case in selection_oracle_cases() {
+            let fixture = build_selection_oracle_fixture(case);
+            let rendered = render_selection_oracle_result(decision_rows_for_source_prefix(
+                &fixture.state,
+                &fixture.source_path,
+                &fixture.start,
+                &fixture.sealed,
+            ));
+            output.push_str(&format!("=== {case} ===\n{rendered}\n"));
+        }
+        output
+    }
+
+    /// Regenerate the pre-refactor selection characterization data for GitHub issue #574.
+    #[test]
+    #[ignore = "deliberately regenerates checked-in qualification selection characterization"]
+    fn regenerate_qualification_selection_oracle() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qualification_selection_oracle.txt");
+        fs::write(path, selection_oracle_output()).unwrap();
+    }
+
+    fn assert_selection_results_equal(
+        map: Result<SelectedDecisionRows, QualificationError>,
+        indexed: Result<(SelectedDecisionRows, TailBinding), QualificationError>,
+        expected_binding: &TailBinding,
+    ) {
+        match (map, indexed) {
+            (Ok(map), Ok((indexed, binding))) => {
+                assert_eq!(map.rows, indexed.rows);
+                assert_eq!(map.in_prefix, indexed.in_prefix);
+                assert_eq!(binding.physical_tail, expected_binding.physical_tail);
+                assert_eq!(binding.last_sequence, expected_binding.last_sequence);
+                assert_eq!(binding.last_hash, expected_binding.last_hash);
+            }
+            (Err(map), Err(indexed)) => {
+                assert_eq!(
+                    qualification_error_variant(&map),
+                    qualification_error_variant(&indexed)
+                );
+                assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
+            }
+            (map, indexed) => assert_eq!(
+                format!("Map: {map:?}"),
+                format!("Index: {indexed:?}"),
+                "Map/Index selection result variants differ"
+            ),
+        }
+    }
+
+    /// The offline Map adapter and runtime Index adapter preserve the pre-#574 characterization.
+    #[test]
+    fn qualification_selection_matches_characterization_through_both_adapters() {
+        assert_eq!(
+            selection_oracle_output(),
+            include_str!("../tests/fixtures/qualification_selection_oracle.txt")
+        );
+        for case in selection_oracle_cases() {
+            let fixture = build_selection_oracle_fixture(case);
+            let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+            let candidate = Scanner::verify(&fixture.source_path).unwrap();
+            let map = decision_rows_for_source_prefix(
+                &fixture.state,
+                &fixture.source_path,
+                &fixture.start,
+                &fixture.sealed,
+            );
+            let indexed = decision_rows_for_indexed_source_prefix(
+                &fixture.state,
+                &index,
+                &candidate,
+                &fixture.start,
+            );
+            assert_selection_results_equal(map, indexed, &fixture.sealed);
+        }
+    }
+
+    /// Both #574 adapters return identical point evidence and exact receipt refusals.
+    #[test]
+    fn sealed_source_map_and_index_adapters_are_equivalent() {
+        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let observations = source_observations(&fixture.source_path, &fixture.sealed).unwrap();
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let present = observations.first_key_value().unwrap().1.receipt;
+        assert_eq!(
+            SealedSource::Map(&observations).receipt(present).unwrap(),
+            SealedSource::Index(&index).receipt(present).unwrap()
+        );
+        assert_eq!(
+            SealedSource::Map(&observations)
+                .observation(present)
+                .unwrap(),
+            SealedSource::Index(&index).observation(present).unwrap()
+        );
+
+        let absent = AppendReceipt {
+            sequence: EventSeq(99),
+            this_hash: blake3::hash(b"absent"),
+        };
+        let wrong_hash = AppendReceipt {
+            this_hash: blake3::hash(b"wrong"),
+            ..present
+        };
+        for receipt in [absent, wrong_hash] {
+            let map_receipt = SealedSource::Map(&observations)
+                .receipt(receipt)
+                .unwrap_err();
+            let indexed_receipt = SealedSource::Index(&index).receipt(receipt).unwrap_err();
+            assert_eq!(
+                qualification_error_variant(&map_receipt),
+                qualification_error_variant(&indexed_receipt)
+            );
+            assert_eq!(
+                map_receipt.to_string().as_bytes(),
+                indexed_receipt.to_string().as_bytes()
+            );
+            let map = SealedSource::Map(&observations)
+                .observation(receipt)
+                .unwrap_err();
+            let indexed = SealedSource::Index(&index)
+                .observation(receipt)
+                .unwrap_err();
+            assert_eq!(
+                qualification_error_variant(&map),
+                qualification_error_variant(&indexed)
+            );
+            assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
+        }
+    }
+
+    /// An indexed #574 point read maps the underlying risk-input failure without hiding its text.
+    #[test]
+    fn sealed_source_index_maps_point_read_failure() {
+        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let present = index.receipt_at(EventSeq(0)).unwrap().unwrap().0;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.source_path)
+            .unwrap()
+            .set_len(5)
+            .unwrap();
+        let error = SealedSource::Index(&index)
+            .observation(present)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QualificationError::InsufficientEvidence(ref message)
+                if message == "decision source observation 0 could not be read: position price evidence conflicts"
+        ));
+    }
+
+    /// An uncarried #574 candidate is evidence-insufficient; physical corruption remains EventLog.
+    #[test]
+    fn indexed_selection_distinguishes_unreached_prefix_from_corruption() {
+        for mismatch_hash in [false, true] {
+            let fixture = build_selection_oracle_fixture("post_start_v3");
+            let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+            let mut candidate = Scanner::verify(&fixture.source_path).unwrap();
+            if mismatch_hash {
+                candidate.last_hash = blake3::hash(b"different");
+            } else {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fixture.source_path)
+                    .unwrap()
+                    .set_len(5)
+                    .unwrap();
+            }
+            let error = decision_rows_for_indexed_source_prefix(
+                &fixture.state,
+                &index,
+                &candidate,
+                &fixture.start,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                QualificationError::InsufficientEvidence(ref message)
+                    if message == "source observations do not reach the sealed sequence/hash prefix"
+            ));
+        }
+
+        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        let mut bytes = fs::read(&fixture.source_path).unwrap();
+        bytes[10] ^= 1;
+        fs::write(&fixture.source_path, bytes).unwrap();
+        let error = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        )
+        .unwrap_err();
+        assert!(matches!(error, QualificationError::EventLog(_)), "{error}");
+    }
+
+    fn assert_selection_fixture_refuses(fixture: &SelectionOracleFixture, expected: &str) {
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        let map = decision_rows_for_source_prefix(
+            &fixture.state,
+            &fixture.source_path,
+            &fixture.start,
+            &fixture.sealed,
+        );
+        let indexed = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        );
+        assert!(
+            map.as_ref()
+                .is_err_and(|error| error.to_string().contains(expected)),
+            "Map did not contain {expected:?}: {map:?}"
+        );
+        assert!(
+            indexed
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains(expected)),
+            "Index did not contain {expected:?}: {indexed:?}"
+        );
+        assert_selection_results_equal(map, indexed, &fixture.sealed);
+    }
+
+    fn raw_activity_selection_fixture(
+        payload: &[u8],
+        schema_version: u32,
+        parser_version: u32,
+        content_type: ContentType,
+    ) -> SelectionOracleFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        let mut writer = Writer::open(&source_path).unwrap();
+        let start = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+        let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                schema_version,
+                parser_version,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type,
+                payload: payload.to_vec(),
+            })
+            .unwrap();
+        drop(writer);
+        let sealed = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+        SelectionOracleFixture {
+            _temp: temp,
+            state,
+            source_path,
+            start,
+            sealed,
+        }
+    }
+
+    fn websocket_selection_fixture(
+        payload: &[u8],
+        source_id: &str,
+        schema_version: u32,
+        parser_version: u32,
+    ) -> SelectionOracleFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        let (mut continuation, mut observations) = single_read_fixture(2, "0xoracle", "BUY", false);
+        let mut websocket = activity_observation(1, payload);
+        websocket.source_id = source_id.to_owned();
+        websocket.schema_version = schema_version;
+        websocket.parser_version = parser_version;
+        continuation.observed_source_receipt = Some(websocket.receipt);
+        continuation.facts.provenance = pe_copy_signal_engine::TradeProvenance::ActivityWs;
+        observations.insert(1, websocket);
+        let (sealed, _) =
+            materialize_selection_source(&source_path, &mut [&mut continuation], observations);
+        store_read_decision(&state, &continuation, "decision_pending", true);
+        SelectionOracleFixture {
+            _temp: temp,
+            state,
+            source_path,
+            start: TailBinding {
+                physical_tail: 5,
+                last_sequence: None,
+                last_hash: "00".repeat(32),
+            },
+            sealed,
+        }
+    }
+
+    /// Malformed pages and every activity-page contract component refuse identically (#574).
+    #[test]
+    fn selection_refuses_malformed_activity_pages_through_both_entries() {
+        let cases = [
+            (
+                b"{".as_slice(),
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                ContentType::Json,
+                "activity observation JSON failed",
+            ),
+            (
+                br#"[{"type":"TRADE"}]"#.as_slice(),
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                ContentType::Json,
+                "activity observation parse failed",
+            ),
+            (
+                b"[]".as_slice(),
+                99,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                ContentType::Json,
+                "wrong source contract",
+            ),
+            (
+                b"[]".as_slice(),
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                99,
+                ContentType::Json,
+                "wrong source contract",
+            ),
+            (
+                b"[]".as_slice(),
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                ContentType::Raw,
+                "wrong source contract",
+            ),
+        ];
+        for (payload, schema, parser, content_type, expected) in cases {
+            let fixture = raw_activity_selection_fixture(payload, schema, parser, content_type);
+            assert_selection_fixture_refuses(&fixture, expected);
+        }
+    }
+
+    /// Malformed, wrong-contract, and wrong-key websocket evidence refuse identically (#574).
+    #[test]
+    fn selection_refuses_invalid_websocket_evidence_through_both_entries() {
+        let correct =
+            selection_oracle_websocket(&single_read_fixture(2, "0xoracle", "BUY", false).0);
+        let cases = [
+            (
+                b"{".as_slice(),
+                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                "decision websocket observation 0 is invalid",
+            ),
+            (
+                correct.payload.as_slice(),
+                "wrong.websocket.source",
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                "decision websocket observation has the wrong source contract",
+            ),
+            (
+                correct.payload.as_slice(),
+                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+                99,
+                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                "decision websocket observation has the wrong source contract",
+            ),
+        ];
+        for (payload, source_id, schema, parser, expected) in cases {
+            let fixture = websocket_selection_fixture(payload, source_id, schema, parser);
+            assert_selection_fixture_refuses(&fixture, expected);
+        }
+
+        let different = serde_json::to_vec(&serde_json::json!({
+            "proxyWallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "conditionId": "0xdifferent",
+            "asset": "0xdifferent",
+            "side": "BUY",
+            "size": 1,
+            "price": 0.5,
+            "timestamp": 100,
+            "transactionHash": "0xdifferent",
+            "outcomeIndex": 0
+        }))
+        .unwrap();
+        let fixture = websocket_selection_fixture(
+            &different,
+            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+        );
+        assert_selection_fixture_refuses(
+            &fixture,
+            "decision websocket observation has the wrong source contract",
+        );
+    }
+
+    /// Receipt mismatch and sealed-prefix mismatch retain their exact shared refusal (#574).
+    #[test]
+    fn selection_receipt_and_prefix_refusals_match_through_both_entries() {
+        let receipt = build_selection_oracle_fixture("receipt_hash_mismatch");
+        assert_selection_fixture_refuses(
+            &receipt,
+            "decision source receipt does not match the sealed source prefix",
+        );
+
+        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let mut map_prefix = fixture.sealed.clone();
+        map_prefix.last_hash = blake3::hash(b"wrong").to_hex().to_string();
+        let mut candidate = Scanner::verify(&fixture.source_path).unwrap();
+        candidate.last_hash = blake3::hash(b"wrong");
+        let map = decision_rows_for_source_prefix(
+            &fixture.state,
+            &fixture.source_path,
+            &fixture.start,
+            &map_prefix,
+        )
+        .unwrap_err();
+        let indexed = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        )
+        .unwrap_err();
+        assert_eq!(
+            map.to_string(),
+            "insufficient qualification evidence: source observations do not reach the sealed sequence/hash prefix"
+        );
+        assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
+    }
+
+    /// A stale #574 index cannot reconstruct a page that the candidate file carries.
+    #[test]
+    fn indexed_selection_refuses_reconstructed_page_absent_from_index() {
+        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        assert!(
+            decision_rows_for_source_prefix(
+                &fixture.state,
+                &fixture.source_path,
+                &fixture.start,
+                &fixture.sealed,
+            )
+            .is_ok()
+        );
+        let error = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &SourceReceiptIndex::default(),
+            &candidate,
+            &fixture.start,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "insufficient qualification evidence: decision source receipt does not match the sealed source prefix"
+        );
+    }
+
+    /// Earliest source membership at-or-before Start is excluded by both #574 entries.
+    #[test]
+    fn source_universe_membership_before_start_is_not_selected() {
+        let fixture = build_selection_oracle_fixture("start_only");
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        let map = decision_rows_for_source_prefix(
+            &fixture.state,
+            &fixture.source_path,
+            &fixture.start,
+            &fixture.sealed,
+        )
+        .unwrap();
+        let (indexed, _) = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        )
+        .unwrap();
+        assert!(map.rows.is_empty());
+        assert!(map.in_prefix.is_empty());
+        assert_eq!(map.rows, indexed.rows);
+        assert_eq!(map.in_prefix, indexed.in_prefix);
+    }
+
+    fn continuation_for_activity_page(
+        observation: &SourceObservation,
+        payload: &[u8],
+        condition: &str,
+    ) -> DecisionContinuationV3 {
+        let aggregate = parsed_aggregates(&[payload])
+            .into_iter()
+            .find(|aggregate| {
+                aggregate
+                    .group_id
+                    .components()
+                    .condition_id
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.0 == condition)
+            })
+            .unwrap();
+        let components = aggregate.group_id.components();
+        let mut frozen = classification_fixture().0.facts;
+        frozen.source_trade_id = aggregate.group_id.key().clone();
+        frozen.semantic_revision = aggregate.semantic_revision.as_str().to_owned();
+        frozen.transaction_hash = components.transaction_hash.clone();
+        frozen.wallet = components.wallet;
+        frozen.source_epoch = 100;
+        frozen.market_id = MarketId(VenueMarketId(condition.to_owned()));
+        frozen.outcome_id = components.outcome.unwrap();
+        frozen.side = components.side.unwrap();
+        frozen.share_amount = aggregate.share_sum;
+        frozen.price = aggregate.volume_weighted_price().unwrap();
+        let (page, evidence) = activity_page_pair(observation, payload, None, 100, 0);
+        frozen.decision_inputs = serde_json::json!({"fixed_end": 100, "pages": [evidence]});
+        DecisionContinuationV3::new(frozen, None, vec![page], None)
+    }
+
+    fn two_decision_read_fixture(kind: &str) -> SelectionOracleFixture {
+        let payload = activity_payload(vec![
+            activity_row("0xread-a", "read-a", "1", "0.5", "0xread-a", 100),
+            activity_row("0xread-b", "read-b", "1", "0.5", "0xread-b", 100),
+        ]);
+        let observation = activity_observation(2, &payload);
+        let mut first = continuation_for_activity_page(&observation, &payload, "0xread-a");
+        let mut second = continuation_for_activity_page(&observation, &payload, "0xread-b");
+        first.facts.source_epoch = 99;
+        match kind {
+            "disagree" => {
+                second.facts.decision_inputs["agreement_marker"] = serde_json::json!(false);
+            }
+            "overlap" => {
+                let request_url = activity_request_url(None, 101, 0);
+                second.page_occurrences[0].request_url = request_url.clone();
+                second.facts.decision_inputs["fixed_end"] = serde_json::json!(101);
+                second.facts.decision_inputs["pages"][0]["request_url"] =
+                    serde_json::json!(request_url);
+                second.facts.decision_inputs["pages"][0]["bounds"]["end"] = serde_json::json!(101);
+            }
+            "repeat" => {}
+            _ => unreachable!(),
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        let (sealed, _) = materialize_selection_source(
+            &source_path,
+            &mut [&mut first, &mut second],
+            BTreeMap::from([(2, observation)]),
+        );
+        store_read_decision(&state, &first, "decision_pending", true);
+        if kind == "repeat" {
+            store_read_decision(&state, &second, "not_buy", false);
+            let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE decision_pending_unconstrained AS SELECT * FROM decision_pending;
+                     INSERT INTO decision_pending_unconstrained SELECT * FROM decision_pending;
+                     DROP TABLE decision_pending;
+                     ALTER TABLE decision_pending_unconstrained RENAME TO decision_pending;",
+                )
+                .unwrap();
+        } else {
+            store_read_decision(&state, &second, "decision_pending", true);
+        }
+        SelectionOracleFixture {
+            _temp: temp,
+            state,
+            source_path,
+            start: TailBinding {
+                physical_tail: 5,
+                last_sequence: None,
+                last_hash: "00".repeat(32),
+            },
+            sealed,
+        }
+    }
+
+    fn conflicting_revision_fixture() -> SelectionOracleFixture {
+        let first_payload = activity_payload(vec![
+            activity_row(
+                "0xrevision-a",
+                "revision-a",
+                "1",
+                "0.5",
+                "0xrevision-a",
+                100,
+            ),
+            activity_row(
+                "0xrevision-b",
+                "revision-b",
+                "1",
+                "0.5",
+                "0xrevision-b",
+                100,
+            ),
+        ]);
+        let second_payload = activity_payload(vec![
+            activity_row("0xrevision-a", "revision-a", "2", "1", "0xrevision-a", 100),
+            activity_row("0xrevision-b", "revision-b", "2", "1", "0xrevision-b", 100),
+        ]);
+        let first_observation = activity_observation(1, &first_payload);
+        let second_observation = activity_observation(2, &second_payload);
+        let mut first =
+            continuation_for_activity_page(&first_observation, &first_payload, "0xrevision-a");
+        let mut second =
+            continuation_for_activity_page(&second_observation, &second_payload, "0xrevision-b");
+        first.facts.source_epoch = 99;
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        let (sealed, _) = materialize_selection_source(
+            &source_path,
+            &mut [&mut first, &mut second],
+            BTreeMap::from([(1, first_observation), (2, second_observation)]),
+        );
+        store_read_decision(&state, &first, "decision_pending", true);
+        store_read_decision(&state, &second, "decision_pending", true);
+        SelectionOracleFixture {
+            _temp: temp,
+            state,
+            source_path,
+            start: TailBinding {
+                physical_tail: 5,
+                last_sequence: None,
+                last_hash: "00".repeat(32),
+            },
+            sealed,
+        }
+    }
+
+    fn absent_complete_read_trade_fixture() -> SelectionOracleFixture {
+        let (mut page_trade, mut observations) =
+            single_read_fixture(2, "0xpage-trade", "BUY", false);
+        let (mut decision, _) = single_read_fixture(2, "0xdecision-trade", "BUY", false);
+        decision.page_occurrences = page_trade.page_occurrences.clone();
+        decision.facts.decision_inputs = page_trade.facts.decision_inputs.clone();
+        let websocket_payload = serde_json::to_vec(&serde_json::json!({
+            "proxyWallet": decision.facts.wallet.to_string(),
+            "conditionId": "0xdecision-trade",
+            "asset": "0xdecision-trade",
+            "side": "BUY",
+            "size": 1,
+            "price": 0.5,
+            "timestamp": 100,
+            "transactionHash": "0xdecision-trade",
+            "outcomeIndex": 0
+        }))
+        .unwrap();
+        let mut websocket = activity_observation(1, &websocket_payload);
+        websocket.source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
+        decision.observed_source_receipt = Some(websocket.receipt);
+        decision.facts.provenance = pe_copy_signal_engine::TradeProvenance::ActivityWs;
+        observations.insert(1, websocket);
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
+        let (sealed, _) = materialize_selection_source(
+            &source_path,
+            &mut [&mut page_trade, &mut decision],
+            observations,
+        );
+        store_read_decision(&state, &page_trade, "not_buy", false);
+        store_read_decision(&state, &decision, "decision_pending", true);
+        SelectionOracleFixture {
+            _temp: temp,
+            state,
+            source_path,
+            start: TailBinding {
+                physical_tail: 5,
+                last_sequence: None,
+                last_hash: "00".repeat(32),
+            },
+            sealed,
+        }
+    }
+
+    /// Complete-read disagreement, repetition, overlap, reconstruction, and revision failures are
+    /// one shared #574 refusal surface for Map and Index.
+    #[test]
+    fn selection_complete_read_refusals_match_through_both_entries() {
+        for (kind, expected) in [
+            (
+                "disagree",
+                "decision continuations disagree about one complete activity read",
+            ),
+            (
+                "repeat",
+                "complete activity read repeats a decision identity",
+            ),
+            (
+                "overlap",
+                "complete activity reads overlap source page receipts",
+            ),
+        ] {
+            let fixture = two_decision_read_fixture(kind);
+            assert_selection_fixture_refuses(&fixture, expected);
+        }
+        let reconstruction = build_selection_oracle_fixture("complete_read_drift");
+        assert_selection_fixture_refuses(
+            &reconstruction,
+            "complete activity read does not reach its fixed end",
+        );
+        let revisions = conflicting_revision_fixture();
+        assert_selection_fixture_refuses(
+            &revisions,
+            "has multiple semantic revisions in the sealed prefix",
+        );
+        let absent = absent_complete_read_trade_fixture();
+        assert_selection_fixture_refuses(&absent, "is absent from its complete activity read");
+    }
+
+    fn additional_decision_fixture() -> SelectionOracleFixture {
+        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let connection = rusqlite::Connection::open(fixture._temp.path().join("paper.db")).unwrap();
+        let frozen: String = connection
+            .query_row(
+                "SELECT frozen_inputs_json FROM decision_pending",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut changed = serde_json::from_str::<serde_json::Value>(&frozen).unwrap();
+        changed["semantic_revision"] = serde_json::json!("additional");
+        connection
+            .execute("UPDATE activity_groups SET disposition = 'not_buy'", [])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE decision_pending SET semantic_revision = 'additional', frozen_inputs_json = ?1",
+                [changed.to_string()],
+            )
+            .unwrap();
+        fixture
+    }
+
+    /// Missing and additional terminal decisions retain the #574 Map/Index refusal text.
+    #[test]
+    fn selection_decision_cardinality_refusals_match_through_both_entries() {
+        for case in ["pending_without_decision", "open_decision"] {
+            let fixture = build_selection_oracle_fixture(case);
+            assert_selection_fixture_refuses(
+                &fixture,
+                "has no reconstructable receipt-bearing decision",
+            );
+        }
+        let additional = additional_decision_fixture();
+        assert_selection_fixture_refuses(&additional, "is additional to the parsed source prefix");
+    }
+
+    /// SQLite history failure still precedes deferred source-universe failure for #574.
+    #[test]
+    fn selection_history_error_precedes_universe_error_through_both_entries() {
+        let fixture = raw_activity_selection_fixture(
+            b"{",
+            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            ContentType::Json,
+        );
+        rusqlite::Connection::open(fixture._temp.path().join("paper.db"))
+            .unwrap()
+            .execute("DROP TABLE decision_pending", [])
+            .unwrap();
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        let map = decision_rows_for_source_prefix(
+            &fixture.state,
+            &fixture.source_path,
+            &fixture.start,
+            &fixture.sealed,
+        );
+        let indexed = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        );
+        assert!(matches!(map, Err(QualificationError::PaperState(_))));
+        assert!(matches!(indexed, Err(QualificationError::PaperState(_))));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn qualification_read_chars() -> u64 {
+        fs::read_to_string("/proc/self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// The #574 runtime selector walks one large sealed prefix and point-reads only its referenced
+    /// decision evidence; 20,000 trailing frames must not induce a second whole-log replay.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn indexed_selection_reads_one_large_source_prefix() {
+        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        let mut writer = Writer::open(&fixture.source_path).unwrap();
+        for frame in 0..20_000_u64 {
+            let mut payload = vec![0_u8; 1_536];
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"qualification-selection-padding");
+            hasher.update(&frame.to_le_bytes());
+            hasher.finalize_xof().fill(&mut payload);
+            writer
+                .append(EnvelopeIn {
+                    source_id: SourceId("qualification.selection.padding".to_owned()),
+                    schema_version: 1,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Raw,
+                    payload,
+                })
+                .unwrap();
+        }
+        writer.sync().unwrap();
+        drop(writer);
+        let length = fs::metadata(&fixture.source_path).unwrap().len();
+        assert!(length >= 20_000_000, "fixture log is only {length} bytes");
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        let before = qualification_read_chars();
+        let (selected, returned) = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        )
+        .unwrap();
+        let read = qualification_read_chars() - before;
+        assert_eq!(selected.rows.len(), 1);
+        assert_eq!(returned, TailBinding::from(&candidate));
+        assert!(
+            read >= length,
+            "the selector read {read} bytes for a {length}-byte sealed prefix"
+        );
+        assert!(
+            read < length + length / 2,
+            "the selector read {read} bytes for a {length}-byte sealed prefix"
+        );
     }
 
     /// PASS: authentic child collapse and coherent request-origin substitution fail against a real V4 commitment; original evidence passes.

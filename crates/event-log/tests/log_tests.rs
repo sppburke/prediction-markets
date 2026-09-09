@@ -776,6 +776,197 @@ fn verify_prefix_returns_a_canonical_path_for_noncanonical_input() {
 }
 
 #[test]
+fn walk_prefix_stops_before_complete_suffix_and_counts_only_prefix_frames() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-complete-suffix.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let sealed = Scanner::verify(&path).unwrap();
+    let expected = Reader::replay_with_offsets(&path)
+        .unwrap()
+        .map(|item| {
+            let (offset, sequence, _) = item.unwrap();
+            (offset, sequence)
+        })
+        .collect::<Vec<_>>();
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"suffix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+
+    let mut observed = Vec::new();
+    let walked = Scanner::walk_prefix(&sealed, &mut |offset, envelope| {
+        observed.push((offset, envelope.seq));
+    })
+    .unwrap();
+
+    assert_eq!(walked, Some(sealed));
+    assert_eq!(observed, expected);
+    assert_eq!(observed.len(), 2);
+}
+
+#[test]
+fn walk_prefix_stops_before_torn_suffix() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-torn-suffix.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"prefix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let sealed = Scanner::verify(&path).unwrap();
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer
+            .append(make_envelope(b"torn suffix".to_vec()))
+            .unwrap();
+        writer.sync().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+
+    let mut observed = Vec::new();
+    let walked = Scanner::walk_prefix(&sealed, &mut |offset, envelope| {
+        observed.push((offset, envelope.seq));
+    })
+    .unwrap();
+
+    assert_eq!(walked, Some(sealed));
+    assert_eq!(observed, vec![(5, EventSeq(0))]);
+}
+
+#[test]
+fn walk_prefix_returns_none_when_a_frame_straddles_the_tail() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-straddled-tail.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"frame".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let mut inside_frame = Scanner::verify(&path).unwrap();
+    inside_frame.physical_tail = 6;
+
+    assert_eq!(
+        Scanner::walk_prefix(&inside_frame, &mut |_, _| {}).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn walk_prefix_returns_none_for_terminal_sequence_or_hash_mismatch() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-terminal-mismatch.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"frame".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let good = Scanner::verify(&path).unwrap();
+    let wrong_sequence = LogTailBinding {
+        last_sequence: Some(EventSeq(99)),
+        ..good.clone()
+    };
+    let wrong_hash = LogTailBinding {
+        last_hash: blake3::Hash::from_bytes([0xff; 32]),
+        ..good
+    };
+
+    for sealed in [&wrong_sequence, &wrong_hash] {
+        assert_eq!(Scanner::walk_prefix(sealed, &mut |_, _| {}).unwrap(), None);
+    }
+}
+
+#[test]
+fn walk_prefix_returns_none_for_clean_end_before_candidate() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-short-file.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let first_tail = Scanner::verify(&path).unwrap();
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let sealed = Scanner::verify(&path).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(first_tail.physical_tail)
+        .unwrap();
+
+    assert_eq!(Scanner::walk_prefix(&sealed, &mut |_, _| {}).unwrap(), None);
+}
+
+#[test]
+fn walk_prefix_reports_torn_frame_below_candidate() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-torn-prefix.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"first".to_vec())).unwrap();
+        writer.append(make_envelope(b"second".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let sealed = Scanner::verify(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+
+    assert!(matches!(
+        Scanner::walk_prefix(&sealed, &mut |_, _| {}),
+        Err(LogError::Truncated {
+            at: EventSeq(1),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn walk_prefix_preserves_corruption_error_below_candidate() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-corrupt-prefix.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"frame".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let sealed = Scanner::verify(&path).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[9] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+
+    let verify_error = Scanner::verify(&path).unwrap_err();
+    let walk_error = Scanner::walk_prefix(&sealed, &mut |_, _| {}).unwrap_err();
+    assert!(matches!(&verify_error, LogError::CrcMismatch { .. }));
+    assert!(matches!(&walk_error, LogError::CrcMismatch { .. }));
+    assert_eq!(walk_error.to_string(), verify_error.to_string());
+}
+
+#[test]
+fn walk_prefix_round_trips_genesis_without_observing_frames() {
+    let dir = tmp_dir();
+    let path = dir.path().join("walk-genesis.log");
+    drop(Writer::open(&path).unwrap());
+    let genesis = Scanner::verify(&path).unwrap();
+    let mut observer_calls = 0;
+
+    let walked = Scanner::walk_prefix(&genesis, &mut |_, _| observer_calls += 1).unwrap();
+
+    assert_eq!(walked, Some(genesis));
+    assert_eq!(observer_calls, 0);
+}
+
+#[test]
 fn open_verified_matches_open_and_reports_verified_frames() {
     let dir = tmp_dir();
     let ordinary_path = dir.path().join("ordinary.log");
