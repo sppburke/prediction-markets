@@ -222,7 +222,6 @@ impl DecisionContinuationV3 {
     /// ordered page occurrences, and read commitment (#565). Consumed by the open-continuation
     /// validator and qualification's read-scope agreement.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn same_complete_read(&self, other: &Self) -> bool {
         self.facts.wallet == other.facts.wallet
             && self.facts.decision_inputs == other.facts.decision_inputs
@@ -307,6 +306,59 @@ impl DecisionContinuationV3 {
         }
         let rows = match (wire.fixed_end, wire.pages.as_deref()) {
             (Some(fixed_end), Some(pages)) => {
+                if self.version == 4 {
+                    let receipt = self.read_commitment.ok_or_else(|| {
+                        complete_activity_read_error("complete activity read commitment is missing")
+                    })?;
+                    if self
+                        .page_occurrences
+                        .iter()
+                        .any(|page| page.receipt.sequence >= receipt.sequence)
+                    {
+                        return Err(complete_activity_read_error(
+                            "complete activity read commitment precedes its pages",
+                        ));
+                    }
+                    let source = lookup(receipt).map_err(|error| {
+                        complete_activity_read_error(format!(
+                            "complete activity read commitment receipt lookup failed: {error}"
+                        ))
+                    })?;
+                    if source.source_id != ACTIVITY_READ_COMMITMENT_SOURCE_ID
+                        || source.schema_version != ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION
+                        || source.parser_version != ACTIVITY_READ_COMMITMENT_PARSER_VERSION
+                        || source.content_type != ContentType::Json
+                    {
+                        return Err(complete_activity_read_error(
+                            "complete activity read commitment has the wrong source contract",
+                        ));
+                    }
+                    let commitment: ActivityReadCommitment =
+                        serde_json::from_slice(&source.payload).map_err(|error| {
+                            complete_activity_read_error(format!(
+                                "complete activity read commitment is invalid: {error}"
+                            ))
+                        })?;
+                    let digest = activity_read_digest(
+                        self.facts.wallet,
+                        fixed_end,
+                        &self.page_occurrences,
+                        pages,
+                    )?;
+                    if commitment.version != ACTIVITY_READ_COMMITMENT_VERSION
+                        || commitment.wallet != self.facts.wallet
+                        || commitment.fixed_end != fixed_end
+                        || commitment.digest != digest.to_hex().as_str()
+                    {
+                        return Err(complete_activity_read_error(
+                            "complete activity read commitment differs from its frozen proof",
+                        ));
+                    }
+                } else if self.version != 3 || self.read_commitment.is_some() {
+                    return Err(complete_activity_read_error(
+                        "complete activity read has inconsistent wire generation",
+                    ));
+                }
                 self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?
             }
             (None, None) => {
@@ -422,7 +474,7 @@ impl DecisionContinuationV3 {
             }
             let mut segment_rows = Vec::new();
             for (occurrence, page) in pages {
-                let source = complete_activity_page(occurrence, lookup)?;
+                let source = complete_activity_page(occurrence, self.version, lookup)?;
                 let actual_canonical_hash =
                     canonical_page_hash(&source.payload).map_err(|error| {
                         complete_activity_read_error(format!(
@@ -514,13 +566,13 @@ impl DecisionContinuationV3 {
         };
         for page in &self.page_occurrences {
             let envelope = source_receipts.source_envelope(page.receipt)?;
-            if activity_page_generation(
+            if !activity_page_generation(
                 &envelope.source_id.0,
                 envelope.schema_version,
                 envelope.parser_version,
                 &envelope.content_type,
             )
-            .is_err()
+            .is_ok_and(|generation| generation.matches_continuation(self.version))
                 || envelope.raw_payload_hash.to_hex().as_str() != page.raw_hash
             {
                 return Err(DecisionContinuationError::SourceReceiptMismatch {
@@ -575,6 +627,15 @@ pub(crate) enum PageGeneration {
     Historical,
     /// Written by a commitment-aware producer (`schema_version == ACTIVITY_POLL_PAGE_SCHEMA_VERSION`).
     Committed,
+}
+
+impl PageGeneration {
+    pub(crate) fn matches_continuation(self, version: u16) -> bool {
+        matches!(
+            (self, version),
+            (Self::Historical, 3) | (Self::Committed, 4)
+        )
+    }
 }
 
 /// The one shared page-contract check: source id, schema generation, parser version, and content
@@ -709,6 +770,7 @@ pub(crate) fn joined_read_pages<'a>(
 
 fn complete_activity_page<L, E>(
     occurrence: &PageOccurrence,
+    version: u16,
     lookup: &mut L,
 ) -> Result<CompleteActivityPage, CompleteActivityReadError>
 where
@@ -720,12 +782,17 @@ where
             "complete activity read page receipt lookup failed: {error}"
         ))
     })?;
-    activity_page_generation(
+    let generation = activity_page_generation(
         &source.source_id,
         source.schema_version,
         source.parser_version,
         &source.content_type,
     )?;
+    if !generation.matches_continuation(version) {
+        return Err(complete_activity_read_error(
+            "complete activity read page generation differs from continuation version",
+        ));
+    }
     if blake3::hash(&source.payload).to_hex().as_str() != occurrence.raw_hash {
         return Err(complete_activity_read_error(
             "complete activity read page payload hash differs",
@@ -845,7 +912,7 @@ impl DecisionContinuationV3 {
                     read_commitment: None,
                 }
             }
-            3 => serde_json::from_value(value)?,
+            3 | 4 => serde_json::from_value(value)?,
             version => return Err(DecisionContinuationError::Version(version)),
         };
         let frozen = &continuation.facts;
@@ -859,7 +926,19 @@ impl DecisionContinuationV3 {
         {
             return Err(DecisionContinuationError::DurableMismatch);
         }
-        if version == 3 {
+        if matches!(version, 3 | 4) {
+            if (frozen.provenance == TradeProvenance::ActivityWs)
+                != continuation.observed_source_receipt.is_some()
+                || (version == 4) != continuation.read_commitment.is_some()
+                || continuation.read_commitment.is_some_and(|receipt| {
+                    continuation
+                        .page_occurrences
+                        .iter()
+                        .any(|page| page.receipt.sequence >= receipt.sequence)
+                })
+            {
+                return Err(DecisionContinuationError::DurableMismatch);
+            }
             let page_occurrences = continuation.page_occurrences();
             if page_occurrences.is_empty() {
                 return Err(DecisionContinuationError::DurableMismatch);
@@ -1529,6 +1608,12 @@ impl BucketCommitEngine {
                         if context.page_occurrences.is_empty() {
                             return Err(BucketCommitError::Invariant(
                                 "admitted continuation is missing source page receipts".to_owned(),
+                            ));
+                        }
+                        if context.read_commitment.is_none() {
+                            return Err(BucketCommitError::Invariant(
+                                "admitted continuation is missing its complete-read commitment"
+                                    .to_owned(),
                             ));
                         }
                         let frozen_inputs_json =
@@ -2393,7 +2478,7 @@ mod continuation_v3_tests {
             side: Side::Buy,
             price: Price::new(dec!(0.5)).unwrap(),
             share_amount: ShareAmount::from_whole(1).unwrap(),
-            provenance: TradeProvenance::ActivityWs,
+            provenance: TradeProvenance::RestPoll,
             pre_bucket_action: LeaderAction::Entry,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
             action_confidence_ppm: ProbabilityPpm(1_000_000),
@@ -2452,12 +2537,9 @@ mod continuation_v3_tests {
             },
         ];
         let proof = proof_for_occurrences(fixed_end, &pages);
-        let value = DecisionContinuationV3::new(
-            facts(complete_read_inputs(fixed_end, &proof)),
-            Some(receipt(7)),
-            pages,
-            None,
-        );
+        let mut frozen = facts(complete_read_inputs(fixed_end, &proof));
+        frozen.provenance = TradeProvenance::ActivityWs;
+        let value = DecisionContinuationV3::new(frozen, Some(receipt(7)), pages, None);
         let decoded = DecisionContinuationV3::from_durable(&durable(&value)).unwrap();
         assert_eq!(decoded.version, 3);
         assert_eq!(decoded.page_occurrences().len(), 2);
@@ -2830,5 +2912,252 @@ mod continuation_v3_tests {
             .reconstruct_complete_activity_read(&mut lookup)
             .unwrap_err();
         assert!(error.to_string().contains("page evidence is invalid"));
+    }
+    fn committed_empty_read() -> (DecisionContinuationV3, Vec<u8>) {
+        let (page, evidence) = activity_page_fixture(b"[]", None, 100, 0, receipt(2));
+        let mut frozen = facts(complete_read_inputs(100, std::slice::from_ref(&evidence)));
+        frozen.provenance = TradeProvenance::RestPoll;
+        let payload = activity_read_commitment_payload(
+            frozen.wallet,
+            100,
+            std::slice::from_ref(&page),
+            &[evidence],
+        )
+        .unwrap();
+        (
+            DecisionContinuationV3::new(frozen, None, vec![page], Some(receipt(3))),
+            payload,
+        )
+    }
+
+    fn committed_lookup(
+        receipt: AppendReceipt,
+        commitment_payload: &[u8],
+    ) -> Result<CompleteActivityPage, String> {
+        let mut source = activity_page(b"[]");
+        match receipt.sequence.0 {
+            2 => source.schema_version = crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+            3 => {
+                source.source_id = ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned();
+                source.schema_version = ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION;
+                source.parser_version = ACTIVITY_READ_COMMITMENT_PARSER_VERSION;
+                source.payload = commitment_payload.to_vec();
+            }
+            _ => return Err("receipt outside prefix".to_owned()),
+        }
+        Ok(source)
+    }
+
+    /// PASS: V3/V4 decode exactly the two paired provenance/receipt forms; V2 is unchanged.
+    /// FAIL: either mismatch decodes, or a paired form is rejected.
+    #[test]
+    fn receipt_provenance_pairing_is_bijective() {
+        for version in [3, 4] {
+            for provenance in [TradeProvenance::RestPoll, TradeProvenance::ActivityWs] {
+                for websocket in [None, Some(receipt(1))] {
+                    let (mut continuation, _) = committed_empty_read();
+                    continuation.version = version;
+                    continuation.read_commitment = (version == 4).then(|| receipt(3));
+                    continuation.facts.provenance = provenance;
+                    continuation.observed_source_receipt = websocket;
+                    let result = DecisionContinuationV3::from_durable(&durable(&continuation));
+                    if (provenance == TradeProvenance::ActivityWs) == websocket.is_some() {
+                        assert!(result.is_ok());
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(DecisionContinuationError::DurableMismatch)
+                        ));
+                    }
+                    let mut legacy = durable(&continuation);
+                    legacy.frozen_inputs_json = legacy_v2_json(&continuation.facts);
+                    assert_eq!(
+                        DecisionContinuationV3::from_durable(&legacy)
+                            .unwrap()
+                            .version(),
+                        2
+                    );
+                }
+            }
+        }
+    }
+
+    /// PASS: missing, early, wrong, unavailable, and downgraded commitments fail at decode or reconstruction.
+    /// FAIL: altered commitment identity or schema-3 evidence without V4 reconstructs.
+    #[test]
+    fn read_commitment_missing_wrong_out_of_prefix_or_downgraded_fails() {
+        let (continuation, payload) = committed_empty_read();
+        let decoded = DecisionContinuationV3::from_durable(&durable(&continuation)).unwrap();
+        assert!(
+            decoded
+                .reconstruct_complete_activity_read(&mut |receipt| committed_lookup(
+                    receipt, &payload
+                ))
+                .is_ok()
+        );
+        for commitment in [None, Some(receipt(1)), Some(receipt(2))] {
+            let mut changed = continuation.clone();
+            changed.read_commitment = commitment;
+            assert!(matches!(
+                DecisionContinuationV3::from_durable(&durable(&changed)),
+                Err(DecisionContinuationError::DurableMismatch)
+            ));
+        }
+        let mut wrong = continuation.clone();
+        wrong.read_commitment = Some(receipt(4));
+        let wrong = DecisionContinuationV3::from_durable(&durable(&wrong)).unwrap();
+        assert!(
+            wrong
+                .reconstruct_complete_activity_read(&mut |receipt| committed_lookup(
+                    receipt, &payload
+                ))
+                .is_err()
+        );
+        let mut wrong_payload: ActivityReadCommitment = serde_json::from_slice(&payload).unwrap();
+        wrong_payload.digest = "00".repeat(32);
+        assert!(
+            continuation
+                .reconstruct_complete_activity_read(&mut |receipt| committed_lookup(
+                    receipt,
+                    &serde_json::to_vec(&wrong_payload).unwrap()
+                ))
+                .is_err()
+        );
+        assert!(
+            continuation
+                .reconstruct_complete_activity_read(&mut |receipt| {
+                    if receipt.sequence.0 > 2 {
+                        Err("outside sealed prefix".to_owned())
+                    } else {
+                        committed_lookup(receipt, &payload)
+                    }
+                })
+                .is_err()
+        );
+        let mut downgraded = continuation.clone();
+        downgraded.version = 3;
+        assert!(DecisionContinuationV3::from_durable(&durable(&downgraded)).is_err());
+        downgraded.read_commitment = None;
+        let downgraded = DecisionContinuationV3::from_durable(&durable(&downgraded)).unwrap();
+        assert!(
+            downgraded
+                .reconstruct_complete_activity_read(&mut |receipt| committed_lookup(
+                    receipt, &payload
+                ))
+                .is_err()
+        );
+        assert!(
+            continuation
+                .reconstruct_complete_activity_read(&mut |receipt| {
+                    let mut source = committed_lookup(receipt, &payload)?;
+                    if receipt.sequence.0 == 2 {
+                        source.schema_version = ACTIVITY_SCHEMA_VERSION;
+                    }
+                    Ok::<_, String>(source)
+                })
+                .is_err()
+        );
+    }
+
+    /// PASS: two continuations agreeing on one read cause exactly one page and one commitment lookup.
+    /// FAIL: reconstruction repeats per row, or same_complete_read ignores a load-bearing field.
+    #[test]
+    fn shared_read_is_reconstructed_once() {
+        let (first, payload) = committed_empty_read();
+        let mut second = first.clone();
+        second.facts.source_trade_id = SourceTradeId("g2:second".to_owned());
+        let mut reads = Vec::<DecisionContinuationV3>::new();
+        let mut calls = 0;
+        for continuation in [first.clone(), second.clone()] {
+            if reads
+                .iter()
+                .any(|read| read.same_complete_read(&continuation))
+            {
+                continue;
+            }
+            continuation
+                .reconstruct_complete_activity_read(&mut |receipt| {
+                    calls += 1;
+                    committed_lookup(receipt, &payload)
+                })
+                .unwrap();
+            reads.push(continuation);
+        }
+        assert_eq!(reads.len(), 1);
+        assert_eq!(calls, 2);
+        second.read_commitment = Some(receipt(4));
+        assert!(!first.same_complete_read(&second));
+        second = first.clone();
+        second.facts.decision_inputs["fixed_end"] = json!(101);
+        assert!(!first.same_complete_read(&second));
+        second = first.clone();
+        second.facts.wallet = WalletAddress([2; 20]);
+        assert!(!first.same_complete_read(&second));
+        second = first.clone();
+        second.page_occurrences[0].receipt = receipt(1);
+        assert!(!first.same_complete_read(&second));
+    }
+
+    /// PASS: a verified websocket receipt binds both wallet and trade in the dispatch path.
+    /// FAIL: a wrong-wallet or wrong-trade receipt is accepted despite valid envelope hashes.
+    #[test]
+    fn websocket_receipt_binds_wallet_and_trade() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("websocket.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let websocket = json!({"topic":"activity","type":"trades","payload": {
+            "proxyWallet":"0x1111111111111111111111111111111111111111",
+            "conditionId":"0xcondition", "asset":"123", "side":"BUY", "size":1,
+            "price":0.5, "timestamp":1700000000, "transactionHash":"0xtransaction", "outcomeIndex":0
+        }});
+        let payload = serde_json::to_vec(&websocket["payload"]).unwrap();
+        let activity = parse_activity_trade_observation(&payload).unwrap();
+        let ws = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload,
+            })
+            .unwrap();
+        let page = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: b"[]".to_vec(),
+            })
+            .unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        let (occurrence, proof) = activity_page_fixture(b"[]", None, 1700000000, 0, page);
+        let mut frozen = facts(complete_read_inputs(1700000000, &[proof]));
+        frozen.provenance = TradeProvenance::ActivityWs;
+        frozen.source_trade_id = activity.group_id.key().clone();
+        let continuation = DecisionContinuationV3::new(frozen, Some(ws), vec![occurrence], None);
+        assert!(
+            continuation
+                .observation_from_receipt_index(&index)
+                .unwrap()
+                .is_some()
+        );
+        let mut wrong = continuation.clone();
+        wrong.facts.wallet = WalletAddress([2; 20]);
+        assert!(matches!(
+            wrong.observation_from_receipt_index(&index),
+            Err(DecisionContinuationError::SourceReceiptMismatch { .. })
+        ));
+        wrong = continuation;
+        wrong.facts.source_trade_id = SourceTradeId("g2:wrong".to_owned());
+        assert!(matches!(
+            wrong.observation_from_receipt_index(&index),
+            Err(DecisionContinuationError::SourceReceiptMismatch { .. })
+        ));
     }
 }

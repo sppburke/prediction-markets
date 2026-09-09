@@ -47,12 +47,11 @@ use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityAssetMapping, ActivityType, BinaryPayoutVector, ClobPayoutResolution,
-    ClobPricesHistoryClient, FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION,
-    GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION,
-    LIVE_MARKET_SCHEMA_VERSION, PositionClassification, ReconciliationFetcher,
-    fetch_complete_positions, parse_activity_trade_observation, parse_clob_market,
-    validate_live_market,
+    ActivityAssetMapping, BinaryPayoutVector, ClobPayoutResolution, ClobPricesHistoryClient,
+    FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
+    PositionClassification, ReconciliationFetcher, fetch_complete_positions,
+    parse_activity_trade_observation, parse_clob_market, validate_live_market,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowError, WinnerFollowStrategy,
@@ -3006,12 +3005,21 @@ where
             "{source_id} receipt is absent from the sealed source prefix"
         ))
     })?;
-    if observation.source_id != source_id
-        || observation.schema_version != schema_version
-        || observation.parser_version != parser_version
-        || observation.content_type != ContentType::Json
-        || observation.received_unix_ms > evidence_cutoff_unix_ms
-    {
+    let contract_matches = if source_id == crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
+        crate::bucket_commit::activity_page_generation(
+            &observation.source_id,
+            observation.schema_version,
+            observation.parser_version,
+            &observation.content_type,
+        )
+        .is_ok()
+    } else {
+        observation.source_id == source_id
+            && observation.schema_version == schema_version
+            && observation.parser_version == parser_version
+            && observation.content_type == ContentType::Json
+    };
+    if !contract_matches || observation.received_unix_ms > evidence_cutoff_unix_ms {
         return Err(economic_replay_error(format!(
             "{source_id} receipt has the wrong source contract or is noncausal"
         )));
@@ -3024,9 +3032,16 @@ struct LiveObservationBinding<'a> {
     account_id: &'a AccountId,
     identity: &'a LiveOrderIdentity,
     continuation: &'a DecisionContinuationV3,
+    correction: Option<&'a pe_position_ledger::IdentityCorrection>,
 }
 
-type LiveObservationPageIndex = HashMap<SourceTradeId, DecisionContinuationV3>;
+type LiveObservationPageIndex = HashMap<
+    SourceTradeId,
+    (
+        DecisionContinuationV3,
+        Option<pe_position_ledger::IdentityCorrection>,
+    ),
+>;
 
 /// Source trade ids named by the admissions in `events` (the only continuations replay needs).
 fn referenced_source_trade_ids(events: &[LiveJournalEvent]) -> HashSet<SourceTradeId> {
@@ -3059,7 +3074,21 @@ fn live_observation_page_index(
         };
         let continuation = DecisionContinuationV3::from_durable(&row)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-        pages.insert(continuation.facts.source_trade_id.clone(), continuation);
+        let group = paper_state
+            .activity_group_state(source_trade_id)
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+        if group.semantic_revision != continuation.facts.semantic_revision
+            || group.transaction_hash != continuation.facts.transaction_hash
+        {
+            return Err(ProjectionReducerError::InvalidRiskEvidence);
+        }
+        let applied = pe_position_ledger::AppliedEffect::from_document(&group.proof_json)
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+        pages.insert(
+            continuation.facts.source_trade_id.clone(),
+            (continuation, applied.effect.correction().cloned()),
+        );
     }
     Ok(pages)
 }
@@ -3101,7 +3130,7 @@ fn validate_live_observation_trade(
             "economic observation REST evidence contains duplicate recorded trades",
         ));
     }
-    let components = aggregate.group_id.components();
+    let frozen = &binding.continuation.facts;
     let outcome_id = u16::try_from(projection.outcome_id).map_err(|_| {
         economic_replay_error("current live fill projection has an invalid outcome")
     })?;
@@ -3109,14 +3138,10 @@ fn validate_live_observation_trade(
         && outcome_id == u16::from(economic.market.outcome_index)
         && projection.side == "buy"
         && economic.market.side == Side::Buy;
-    let activity_matches_projection = components.activity_type == ActivityType::Trade
-        && components.wallet == leader
-        && components
-            .condition_id
-            .as_ref()
-            .is_some_and(|condition| condition.0 == projection.market_id)
-        && components.outcome == Some(OutcomeId(outcome_id))
-        && components.side == Some(Side::Buy);
+    let activity_matches_projection = frozen.wallet == leader
+        && frozen.market_id.to_string() == projection.market_id
+        && frozen.outcome_id == OutcomeId(outcome_id)
+        && frozen.side == Side::Buy;
     if !projection_matches_economic || !activity_matches_projection {
         return Err(economic_replay_error(
             "economic observation trade identity differs from the live admission",
@@ -3142,6 +3167,7 @@ fn validate_live_observation_trade(
     crate::qualification::verify_decision_continuation_facts(
         aggregate,
         &binding.continuation.facts,
+        binding.correction,
     )
     .map_err(|error| {
         economic_replay_error(format!(
@@ -3248,21 +3274,6 @@ where
         ));
     }
     if let Some(binding) = live_binding {
-        let Some(greatest_page) = binding
-            .continuation
-            .page_occurrences()
-            .iter()
-            .max_by_key(|page| page.receipt.sequence)
-        else {
-            return Err(economic_replay_error(
-                "economic observation continuation has no complete-read pages",
-            ));
-        };
-        if greatest_page.receipt != observation.complete_bound_receipt {
-            return Err(economic_replay_error(
-                "economic observation completeness bound is not the greatest page receipt",
-            ));
-        }
         if binding.continuation.observation_receipt() != Some(observation.source_receipt)
             || binding.continuation.complete_bound() != Some(observation.complete_bound_receipt)
         {
@@ -3271,11 +3282,25 @@ where
             ));
         }
         let mut activity_page_lookup = |receipt| -> Result<_, EconomicReplayError> {
+            let (source_id, schema, parser) =
+                if Some(receipt) == binding.continuation.read_commitment {
+                    (
+                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                    )
+                } else {
+                    (
+                        crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+                        pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                        pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                    )
+                };
             let source = exact_economic_source(
                 receipt,
-                crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
-                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                source_id,
+                schema,
+                parser,
                 evidence_cutoff_unix_ms,
                 lookup,
             )?;
@@ -3672,7 +3697,7 @@ fn verify_replayed_live_risk_with_index(
             .clone()
             .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
     );
-    let continuation = evidence
+    let (continuation, correction) = evidence
         .observation_pages
         .get(&source_trade_id)
         .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
@@ -3699,6 +3724,7 @@ fn verify_replayed_live_risk_with_index(
             account_id,
             identity: &admission.identity,
             continuation,
+            correction: correction.as_ref(),
         }),
         |receipt| {
             let envelope = match evidence.source_receipts {
@@ -3842,6 +3868,24 @@ fn produced_decision_continuation(
         .filter_map(|page| page.bounds.map(|bounds| bounds.end))
         .max()
         .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+    let commitment_payload = crate::bucket_commit::activity_read_commitment_payload(
+        wallet,
+        fixed_end,
+        &page_occurrences,
+        &page_evidence,
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let read_commitment = AppendReceipt {
+        sequence: pe_core_types::EventSeq(
+            observation
+                .complete_bound_receipt
+                .sequence
+                .0
+                .checked_add(1)
+                .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
+        ),
+        this_hash: blake3::hash(&commitment_payload),
+    };
     let configuration = crate::runtime_config::RuntimeConfig::from_service_config(
         &crate::config::ServiceConfig::default(),
     );
@@ -3900,7 +3944,7 @@ fn produced_decision_continuation(
         reconstruction_quality: ReconstructionQuality::new(100)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
 
-        read_commitment: None,
+        read_commitment: Some(read_commitment),
         signal_config: pe_copy_signal_engine::SignalConfig::default(),
         copy_eligible: true,
         bracket_commit: false,
@@ -4034,7 +4078,20 @@ fn produced_observation_index(
             page,
         )],
     );
-    Ok(HashMap::from([(source_trade_id, continuation?)]))
+    let continuation = continuation?;
+    // This legacy log harness retains historical schema-2 page envelopes.
+    let continuation =
+        if bound.schema_version == pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION {
+            DecisionContinuationV3::new(
+                continuation.facts,
+                continuation.observed_source_receipt,
+                continuation.page_occurrences,
+                None,
+            )
+        } else {
+            continuation
+        };
+    Ok(HashMap::from([(source_trade_id, (continuation, None))]))
 }
 
 #[cfg(test)]
@@ -9309,6 +9366,7 @@ mod tests {
                 observed_at,
             )],
         );
+        record_read_commitment(&mut sources, &continuation);
         (prepared, account_id, sources, continuation)
     }
 
@@ -9364,6 +9422,83 @@ mod tests {
         produced_decision_continuation(identity, observation, aggregate, pages).unwrap()
     }
 
+    fn read_commitment_source(
+        continuation: &DecisionContinuationV3,
+    ) -> (AppendReceipt, RecordedEconomicSource) {
+        let pages = serde_json::from_value::<
+            Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
+        >(continuation.facts.decision_inputs["pages"].clone())
+        .unwrap();
+        let payload = crate::bucket_commit::activity_read_commitment_payload(
+            continuation.facts.wallet,
+            continuation.facts.decision_inputs["fixed_end"]
+                .as_i64()
+                .unwrap(),
+            continuation.page_occurrences(),
+            &pages,
+        )
+        .unwrap();
+        (
+            continuation.read_commitment.unwrap(),
+            RecordedEconomicSource {
+                payload,
+                received_unix_ms: pages
+                    .iter()
+                    .map(|page| {
+                        i64::try_from(page.received_at.0.unix_timestamp_nanos() / 1_000_000)
+                            .unwrap()
+                    })
+                    .max()
+                    .unwrap(),
+                source_id: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+                schema_version: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                parser_version: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                content_type: ContentType::Json,
+            },
+        )
+    }
+
+    fn record_read_commitment(
+        sources: &mut Vec<(AppendReceipt, RecordedEconomicSource)>,
+        continuation: &DecisionContinuationV3,
+    ) {
+        sources.retain(|(_, source)| {
+            source.source_id != crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        });
+        for (receipt, source) in sources.iter_mut() {
+            if continuation
+                .page_occurrences()
+                .iter()
+                .any(|page| page.receipt == *receipt)
+            {
+                source.schema_version = crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION;
+            }
+        }
+        sources.push(read_commitment_source(continuation));
+    }
+
+    fn record_read_commitment_envelope(
+        sources: &mut Vec<EventEnvelope>,
+        continuation: &DecisionContinuationV3,
+    ) {
+        sources.retain(|source| {
+            source.source_id.0 != crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        });
+        for source in sources.iter_mut() {
+            if continuation.page_occurrences().iter().any(|page| {
+                page.receipt.sequence == source.seq && page.receipt.this_hash == source.this_hash
+            }) {
+                source.schema_version = crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION;
+            }
+        }
+        let (receipt, source) = read_commitment_source(continuation);
+        let at = source_time_from_millis(source.received_unix_ms).unwrap();
+        let mut envelope = source_envelope(receipt, &source.source_id, source.payload, at);
+        envelope.schema_version = source.schema_version;
+        envelope.parser_version = source.parser_version;
+        sources.push(envelope);
+    }
+
     fn replay_observation_fixture(
         prepared: &pe_execution_core::LiveOrderPreparedAudit,
         account_id: &AccountId,
@@ -9379,6 +9514,7 @@ mod tests {
                 account_id,
                 identity: &prepared.identity,
                 continuation,
+                correction: None,
             }),
             |receipt| {
                 sources
@@ -9727,6 +9863,7 @@ mod tests {
         );
         let continuation =
             observation_continuation(&prepared, &[graph.selected_payload.as_slice()], graph.pages);
+        record_read_commitment(&mut sources, &continuation);
         (prepared, account_id, sources, continuation)
     }
 
@@ -9883,7 +10020,51 @@ mod tests {
                 ),
             ],
         );
+        record_read_commitment(&mut sources, &continuation);
         (prepared, account_id, sources, continuation)
+    }
+
+    /// PASS: authentic terminal-child collapse and coherent origin substitution fail against the unchanged V4 commitment with a live binding; the original read passes.
+    /// FAIL: strict live replay accepts a mutable continuation that redefines its committed read.
+    #[test]
+    fn strict_live_economic_rejects_read_commitment_substitution() {
+        let (prepared, account_id, sources, continuation) =
+            saturated_observation_replay_fixture(false, false);
+        replay_observation_fixture(&prepared, &account_id, &sources, &continuation).unwrap();
+        let mut collapsed = continuation.clone();
+        let leaf = collapsed.page_occurrences.last().unwrap().clone();
+        let evidence = collapsed.facts.decision_inputs["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| page["request_url"] == leaf.request_url)
+            .unwrap()
+            .clone();
+        collapsed.page_occurrences = vec![leaf];
+        collapsed.facts.decision_inputs["pages"] = serde_json::json!([evidence]);
+        let mut substituted = continuation.clone();
+        for occurrence in &mut substituted.page_occurrences {
+            occurrence.request_url = occurrence
+                .request_url
+                .replace("https://data-api.polymarket.com", "https://other.example");
+        }
+        for evidence in substituted.facts.decision_inputs["pages"]
+            .as_array_mut()
+            .unwrap()
+        {
+            evidence["request_url"] = serde_json::json!(
+                evidence["request_url"]
+                    .as_str()
+                    .unwrap()
+                    .replace("https://data-api.polymarket.com", "https://other.example")
+            );
+        }
+        for changed in [collapsed, substituted] {
+            let error = replay_observation_fixture(&prepared, &account_id, &sources, &changed)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("commitment differs"), "{error}");
+        }
     }
 
     /// PASS: strict economic replay resolves both observation receipts, their ordered receive
@@ -10051,8 +10232,9 @@ mod tests {
                         ),
                     ],
                 );
+                record_read_commitment_envelope(&mut sources, &continuation);
                 let source_trade_id = continuation.facts.source_trade_id.clone();
-                let observation_pages = HashMap::from([(source_trade_id, continuation)]);
+                let observation_pages = HashMap::from([(source_trade_id, (continuation, None))]);
 
                 verify_replayed_live_risk_with_index(
                     &account_id,
@@ -10148,8 +10330,9 @@ mod tests {
                 &[graph.selected_payload.as_slice()],
                 graph.pages,
             );
+            record_read_commitment_envelope(&mut sources, &continuation);
             let source_trade_id = continuation.facts.source_trade_id.clone();
-            let observation_pages = HashMap::from([(source_trade_id, continuation)]);
+            let observation_pages = HashMap::from([(source_trade_id, (continuation, None))]);
 
             verify_replayed_live_risk_with_index(
                 &account_id,
@@ -10255,6 +10438,7 @@ mod tests {
             ],
         );
 
+        record_read_commitment(&mut sources, &continuation);
         replay_observation_fixture(&prepared, &account_id, &sources, &continuation).unwrap();
     }
 
@@ -12310,6 +12494,18 @@ mod tests {
                 complete_bound.received_at.0,
             )],
         );
+        let continuation = if complete_bound.schema_version
+            == pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+        {
+            DecisionContinuationV3::new(
+                continuation.facts,
+                continuation.observed_source_receipt,
+                continuation.page_occurrences,
+                None,
+            )
+        } else {
+            continuation
+        };
         let frozen_inputs_json = serde_json::to_string(&continuation).unwrap();
         state
             .config
@@ -12325,7 +12521,18 @@ mod tests {
                     semantic_revision: continuation.facts.semantic_revision.clone(),
                     activity_type: "trade".to_owned(),
                     disposition: "decision_pending".to_owned(),
-                    proof_json: serde_json::json!({"fixture": "live-replay"}).to_string(),
+                    proof_json: pe_position_ledger::AppliedEffect {
+                        effect: pe_position_ledger::LedgerEffect::Trade {
+                            market_id: continuation.facts.market_id.clone(),
+                            outcome_id: continuation.facts.outcome_id,
+                            side: continuation.facts.side,
+                            amount: continuation.facts.share_amount,
+                            price: continuation.facts.price,
+                        },
+                        clamped_residual: None,
+                    }
+                    .to_document()
+                    .unwrap(),
                     no_copy: None,
                 }],
                 leader_positions: Vec::new(),

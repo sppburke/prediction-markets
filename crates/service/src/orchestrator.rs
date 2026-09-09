@@ -528,6 +528,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         )
         .map_err(|error| error.to_string())?;
         let decision_keys = decisions
+            .rows
             .into_iter()
             .map(|row| (row.source_trade_id, row.semantic_revision))
             .collect::<Vec<_>>();
@@ -535,7 +536,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .paper_state
             .seal_decision_evidence_for_source_prefix(
                 &decision_keys,
-                started.source_prefix.last_sequence,
+                &decisions.in_prefix,
                 sealed_source_prefix.last_sequence,
             )
             .map_err(|error| error.to_string())?;

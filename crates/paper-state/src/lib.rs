@@ -463,6 +463,8 @@ struct SealDecisionScope {
     observed_source_receipt: Option<AppendReceipt>,
     #[serde(default)]
     page_occurrences: Vec<SealPageOccurrence>,
+    #[serde(default)]
+    read_commitment: Option<AppendReceipt>,
 }
 
 #[derive(Deserialize)]
@@ -1988,17 +1990,19 @@ impl PaperStateDb {
         Ok(bytes)
     }
 
-    /// Seal the source-derived key set and prove that it is the exact version-three decision set
-    /// for the source receipt interval. The selection and every companion read share one SQLite
-    /// read transaction, so a missing, open, additional, or revision-mismatched row cannot be
+    /// Seal the selected keys and atomically recheck the service's classification of every
+    /// receipt-bearing version-three/four row inside the sealed source prefix. The selection and
+    /// every companion read share one SQLite read transaction, so a missing, open, additional, or
+    /// revision-mismatched selected row cannot be
     /// hidden by a self-consistent projection read.
     pub fn seal_decision_evidence_for_source_prefix(
         &self,
-        keys: &[(SourceTradeId, String)],
-        start_exclusive: Option<EventSeq>,
+        selected: &[(SourceTradeId, String)],
+        in_prefix: &[(SourceTradeId, String)],
         sealed_inclusive: Option<EventSeq>,
     ) -> Result<Vec<u8>, PaperStateError> {
-        let requested = validate_seal_decision_keys(keys)?;
+        let requested = validate_seal_decision_keys(selected)?;
+        let classified = validate_seal_decision_keys(in_prefix)?;
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let mut statement = tx.prepare(
@@ -2021,25 +2025,25 @@ impl PaperStateDb {
                 .iter()
                 .map(|page| page.receipt)
                 .chain(scope.observed_source_receipt)
+                .chain(scope.read_commitment)
                 .collect::<Vec<_>>();
-            let in_scope = scope.version == 3
+            let in_scope = matches!(scope.version, 3 | 4)
                 && !receipts.is_empty()
                 && receipts.iter().all(|receipt| {
-                    start_exclusive.is_none_or(|start| receipt.sequence > start)
-                        && sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
+                    sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
                 });
             if in_scope {
                 stored.insert((source_trade_id, semantic_revision));
             }
         }
         drop(statement);
-        if requested != stored {
+        if classified != stored || !requested.is_subset(&classified) {
             return Err(PaperStateError::SealEvidenceSelectionMismatch {
                 requested: requested.len(),
                 stored: stored.len(),
             });
         }
-        let bytes = Self::seal_decision_evidence_in_transaction(&tx, keys)?;
+        let bytes = Self::seal_decision_evidence_in_transaction(&tx, selected)?;
         tx.commit()?;
         Ok(bytes)
     }
@@ -7186,12 +7190,68 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            db.seal_decision_evidence_for_source_prefix(&[], None, Some(EventSeq(5))),
+            db.seal_decision_evidence_for_source_prefix(&[], &[], Some(EventSeq(5))),
             Err(PaperStateError::SealEvidenceSelectionMismatch {
                 requested: 0,
                 stored: 1,
             })
         ));
+    }
+
+    /// PASS: the transaction checks all V3/V4 receipts including commitment and websocket against the service classification, then seals only selected keys.
+    /// FAIL: omitted/extra in-prefix keys or a selected key outside that set is accepted; historical evidence bytes change.
+    #[test]
+    fn source_prefix_seal_checks_the_service_in_prefix_classification() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let keys = vec![(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())];
+        for version in [3, 4] {
+            let frozen = serde_json::json!({
+                "version": version,
+                "observed_source_receipt": append_receipt(1, 1),
+                "page_occurrences": [{"receipt": append_receipt(2, 2)}],
+                "read_commitment": if version == 4 { Some(append_receipt(3, 3)) } else { None },
+            });
+            db.lock()
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                    [frozen.to_string()],
+                )
+                .unwrap();
+            let original = db.seal_decision_evidence(&keys).unwrap();
+            assert_eq!(
+                db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(3)))
+                    .unwrap(),
+                original
+            );
+            assert_eq!(
+                db.seal_decision_evidence_for_source_prefix(&[], &keys, Some(EventSeq(3)))
+                    .unwrap(),
+                db.seal_decision_evidence(&[]).unwrap()
+            );
+            assert!(matches!(
+                db.seal_decision_evidence_for_source_prefix(&keys, &[], Some(EventSeq(3))),
+                Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
+            ));
+            let mut extra = keys.clone();
+            extra.push((SourceTradeId("g2:extra".to_owned()), "rev-1".to_owned()));
+            assert!(matches!(
+                db.seal_decision_evidence_for_source_prefix(&[], &extra, Some(EventSeq(3))),
+                Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
+            ));
+            assert!(matches!(
+                db.seal_decision_evidence_for_source_prefix(&extra, &keys, Some(EventSeq(3))),
+                Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
+            ));
+            if version == 4 {
+                assert!(
+                    db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(2)))
+                        .is_err()
+                );
+                db.seal_decision_evidence_for_source_prefix(&[], &[], Some(EventSeq(2)))
+                    .unwrap();
+            }
+        }
     }
 
     fn append_receipt(sequence: u64, byte: u8) -> AppendReceipt {

@@ -7,7 +7,7 @@
 //! A websocket observation remains an obligation, derived from the source log
 //! on restart, until its group has a durable terminal/apply record.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -37,7 +37,9 @@ use crate::activity_ingest::{
 };
 use crate::asset_identity::AssetIdentityResolver;
 use crate::bucket_commit::{
-    BucketCommitResult, BucketDecisionContext, IdentityOverride, PageOccurrence,
+    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+    ACTIVITY_READ_COMMITMENT_SOURCE_ID, BucketCommitResult, BucketDecisionContext,
+    IdentityOverride, PageOccurrence, activity_read_commitment_payload, joined_read_pages,
 };
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
@@ -912,6 +914,26 @@ impl TradePoller {
         };
         let page_occurrences = recording.join_occurrences(&activity.pages)?;
         let buckets = activity.buckets()?;
+        if buckets.is_empty() {
+            return Ok(());
+        }
+        let payload =
+            activity_read_commitment_payload(wallet, fixed_end, &page_occurrences, &activity.pages)
+                .map_err(|_| ReconciliationError::PageReceiptMismatch)?;
+        let recorded_at = (self.now)();
+        let read_commitment = self
+            .source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                observed_at: SourceTimestamp(recorded_at),
+                received_at: ReceivedAt(recorded_at),
+                content_type: ContentType::Json,
+                payload,
+            })
+            .await
+            .map_err(|SourceLogHandleError::Closed| ReconciliationError::SourceLogClosed)?;
         if let Some(latest_activity) = buckets
             .iter()
             .flatten()
@@ -958,6 +980,7 @@ impl TradePoller {
                 copy_eligible,
                 &activity.pages,
                 &page_occurrences,
+                read_commitment,
                 &bucket,
                 identities,
             )?;
@@ -986,6 +1009,7 @@ impl TradePoller {
         copy_eligible: bool,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
         page_occurrences: &[PageOccurrence],
+        read_commitment: AppendReceipt,
         bucket: &[ActivityAggregate],
         identities: BucketIdentities,
     ) -> Result<BucketDecisionContext, ReconciliationError> {
@@ -1039,7 +1063,7 @@ impl TradePoller {
             page_occurrences: page_occurrences.to_vec(),
             observed_source_receipts,
             reconstruction_quality,
-            read_commitment: None,
+            read_commitment: Some(read_commitment),
 
             signal_config: self.signal_config.clone(),
             copy_eligible,
@@ -1189,44 +1213,7 @@ struct RecordingFetcher {
     inner: Arc<dyn ReconciliationFetcher>,
     source_log: SourceLogHandle,
     append_closed: Arc<AtomicBool>,
-    occurrences: Arc<Mutex<Vec<RecordedPageOccurrence>>>,
-}
-
-struct RecordedPageOccurrence(PageOccurrence);
-
-fn join_recorded_occurrences(
-    occurrences: &[RecordedPageOccurrence],
-    pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
-) -> Result<Vec<PageOccurrence>, ReconciliationError> {
-    if occurrences.len() != pages.len() {
-        return Err(ReconciliationError::PageReceiptMismatch);
-    }
-    let mut receipt_queues = BTreeMap::<(String, String), VecDeque<usize>>::new();
-    for (index, occurrence) in occurrences.iter().enumerate() {
-        receipt_queues
-            .entry((
-                occurrence.0.request_url.clone(),
-                occurrence.0.raw_hash.clone(),
-            ))
-            .or_default()
-            .push_back(index);
-    }
-    for evidence in pages {
-        let key = (evidence.request_url.clone(), evidence.raw_page_hash.clone());
-        let Some(queue) = receipt_queues.get_mut(&key) else {
-            return Err(ReconciliationError::PageReceiptMismatch);
-        };
-        if queue.pop_front().is_none() {
-            return Err(ReconciliationError::PageReceiptMismatch);
-        }
-    }
-    if receipt_queues.values().any(|queue| !queue.is_empty()) {
-        return Err(ReconciliationError::PageReceiptMismatch);
-    }
-    Ok(occurrences
-        .iter()
-        .map(|occurrence| occurrence.0.clone())
-        .collect())
+    occurrences: Arc<Mutex<Vec<PageOccurrence>>>,
 }
 
 impl RecordingFetcher {
@@ -1238,7 +1225,9 @@ impl RecordingFetcher {
             .occurrences
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        join_recorded_occurrences(&occurrences, pages)
+        joined_read_pages(&occurrences, pages)
+            .map_err(|_| ReconciliationError::PageReceiptMismatch)?;
+        Ok(occurrences.clone())
     }
 }
 
@@ -1252,7 +1241,7 @@ impl ReconciliationFetcher for RecordingFetcher {
             let received_at = OffsetDateTime::now_utc();
             let envelope = EnvelopeIn {
                 source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
-                schema_version: ACTIVITY_SCHEMA_VERSION,
+                schema_version: ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
                 parser_version: ACTIVITY_PARSER_VERSION,
                 observed_at: SourceTimestamp(received_at),
                 received_at: ReceivedAt(received_at),
@@ -1270,11 +1259,11 @@ impl ReconciliationFetcher for RecordingFetcher {
             self.occurrences
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(RecordedPageOccurrence(PageOccurrence {
+                .push(PageOccurrence {
                     request_url: url.to_owned(),
                     raw_hash: blake3::hash(&payload).to_hex().to_string(),
                     receipt,
-                }));
+                });
             Ok(payload)
         })
     }
@@ -1293,15 +1282,15 @@ mod tests {
         PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PortfolioMark, QualificationStarted, TailBinding,
     };
 
-    fn recorded(sequence: u64, url: &str, hash: &str) -> RecordedPageOccurrence {
-        RecordedPageOccurrence(PageOccurrence {
+    fn recorded(sequence: u64, url: &str, hash: &str) -> PageOccurrence {
+        PageOccurrence {
             request_url: url.to_owned(),
             raw_hash: hash.to_owned(),
             receipt: AppendReceipt {
                 sequence: pe_core_types::EventSeq(sequence),
                 this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap_or(0); 32]),
             },
-        })
+        }
     }
 
     fn evidence(
@@ -1446,19 +1435,16 @@ mod tests {
             evidence("child", "same", 2),
             evidence("parent", "p", 3),
         ];
-        let joined = join_recorded_occurrences(&acquired, &logical).unwrap();
+        let joined = joined_read_pages(&acquired, &logical).unwrap();
         assert_eq!(
             joined
                 .iter()
-                .map(|page| page.receipt.sequence.0)
+                .map(|(page, _)| page.receipt.sequence.0)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         let missing = vec![evidence("child", "same", 1), evidence("parent", "p", 2)];
-        assert!(matches!(
-            join_recorded_occurrences(&acquired, &missing),
-            Err(ReconciliationError::PageReceiptMismatch)
-        ));
+        assert!(joined_read_pages(&acquired, &missing).is_err());
     }
 
     #[test]
