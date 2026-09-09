@@ -3,6 +3,8 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod support;
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -45,13 +47,19 @@ const EPOCH: i64 = 1_900_000_000;
 struct QueueFetcher {
     pages: Mutex<VecDeque<Vec<u8>>>,
     calls: AtomicUsize,
+    urls: Mutex<Vec<String>>,
 }
 
 impl QueueFetcher {
     fn new(page: Vec<u8>) -> Self {
+        Self::from_pages(vec![page])
+    }
+
+    fn from_pages(pages: Vec<Vec<u8>>) -> Self {
         Self {
-            pages: Mutex::new(VecDeque::from([page])),
+            pages: Mutex::new(pages.into()),
             calls: AtomicUsize::new(0),
+            urls: Mutex::new(Vec::new()),
         }
     }
 
@@ -63,10 +71,11 @@ impl QueueFetcher {
 impl ReconciliationFetcher for QueueFetcher {
     fn fetch<'a>(
         &'a self,
-        _url: &'a str,
+        url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.urls.lock().unwrap().push(url.to_owned());
             self.pages
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -352,4 +361,312 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
             Ok(LedgerEffect::RawOnly)
         ));
     }
+}
+
+type RecordedBucket = (
+    Vec<ActivityAggregate>,
+    Arc<BucketDecisionContext>,
+    pe_service::bucket_commit::BucketCommitResult,
+);
+
+async fn recorded_poll(
+    paper: Arc<PaperStateDb>,
+    source_path: &std::path::Path,
+    fetcher: Arc<QueueFetcher>,
+) -> Vec<RecordedBucket> {
+    let ledger = build_leader_ledger(&paper).unwrap();
+    let mut engine = BucketCommitEngine::load(Arc::clone(&paper), ledger).unwrap();
+    let source_sink = SourceEventSink::open(source_path).unwrap();
+    let (source_log, source_rx) = SourceLogHandle::channel(8);
+    let (trigger_tx, trigger_rx) = mpsc::channel(4);
+    let health = new_shared_health_with_ws(false, true, 90);
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(source_sink, source_rx, trigger_tx, Arc::clone(&health)).run(),
+    );
+    let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
+        Arc::new(GammaFetcher),
+        BASE_URL.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source_log.clone(),
+    ));
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    let control = tokio::spawn(async move {
+        let mut commits = Vec::new();
+        while let Some(OrchestratorControl::CommitActivityBucket {
+            aggregates,
+            context,
+            committed,
+        }) = control_rx.recv().await
+        {
+            let result = engine
+                .commit(aggregates.clone(), &context, zero_basis())
+                .unwrap();
+            commits.push((aggregates, Arc::clone(&context), result.clone()));
+            let _ = committed.send(Ok(result));
+        }
+        commits
+    });
+    let now = OffsetDateTime::from_unix_timestamp(EPOCH + 10).unwrap();
+    let result = TradePoller::new(
+        TradePollerConfig {
+            base_url: BASE_URL.to_owned(),
+            poll_interval_secs: 30,
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
+        },
+        LiveWatchlist::new(watchlist()),
+        fetcher,
+        asset_identity,
+        source_log,
+        trigger_rx,
+        control_tx,
+        paper,
+        health,
+        SignalConfig::default(),
+        LiveRuntimeConfig::new(RuntimeConfig::from_service_config(
+            &pe_service::config::ServiceConfig::default(),
+        )),
+        ReconciliationObligations::default(),
+        None,
+    )
+    .with_clock(Arc::new(move || now))
+    .run_until(async {})
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    ingest.await.unwrap();
+    control.await.unwrap()
+}
+
+fn source_frames(path: &std::path::Path) -> Vec<pe_event_log::EventEnvelope> {
+    pe_event_log::Reader::replay(path)
+        .unwrap()
+        .map(|item| item.unwrap().1)
+        .collect()
+}
+
+/// PASS: a real saturated poll writes schema-3 pages then one commitment and a V4 open row;
+/// restart validates all references and reproduces every committed aggregate/effect. An empty
+/// read and an already-committed repeat append no commitment. FAIL: evidence or idempotency differs.
+#[tokio::test]
+async fn poller_multipage_commitment_survives_restart() {
+    use pe_service::bucket_commit::{ACTIVITY_READ_COMMITMENT_SOURCE_ID, DecisionContinuationV3};
+    use pe_service::trade_poller::{ACTIVITY_POLL_PAGE_SCHEMA_VERSION, ACTIVITY_POLL_SOURCE_ID};
+    use pe_source_polymarket_public::{
+        ACTIVITY_MAX_OFFSET, PolymarketEndpoint, RECONCILIATION_PAGE_LIMIT, fetch_complete_activity,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let state_path = dir.path().join("paper.db");
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    support::install_empty_anchor(&paper, wallet(), 0);
+    paper
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(),
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+    let root_page_count = ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT + 1;
+    assert_eq!(root_page_count, 11);
+    // The root contains 11 seconds of 500 identical members per group. Its saturated tail
+    // forces the real reader to refetch older, terminal-second and newer child windows.
+    let full_pages: Vec<Vec<u8>> = (0..root_page_count)
+        .map(|index| {
+            let epoch = EPOCH + 10 - i64::from(index);
+            let row = activity_row(
+                "TRADE",
+                &format!("0xmulti-{epoch}"),
+                MARKET_B,
+                "BUY",
+                "0.002",
+                "asset-b",
+                epoch,
+            );
+            serde_json::to_vec(&vec![
+                row;
+                usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap()
+            ])
+            .unwrap()
+        })
+        .collect();
+    let empty = b"[]".to_vec();
+    let mut pages = full_pages.clone();
+    pages.push(empty.clone()); // older child (-1, EPOCH-1]
+    pages.push(full_pages.last().unwrap().clone()); // terminal second, offset zero
+    pages.push(empty.clone()); // terminal second, offset 500
+    pages.extend(full_pages.iter().take(10).cloned()); // newer child, offsets 0..4500
+    pages.push(empty.clone()); // newer child, offset 5000
+    let fetcher = Arc::new(QueueFetcher::from_pages(pages.clone()));
+    let commits = recorded_poll(Arc::clone(&paper), &source_path, Arc::clone(&fetcher)).await;
+    assert_eq!(fetcher.calls(), pages.len());
+    assert_eq!(commits.len(), 11);
+    assert_eq!(
+        commits
+            .iter()
+            .map(|(_, _, result)| result.pending.len())
+            .sum::<usize>(),
+        1
+    );
+    let mut expected_urls = Vec::new();
+    let mut request = |end, start, offset| {
+        expected_urls.push(
+            PolymarketEndpoint::UserPositionActivityPage {
+                user: wallet().to_string(),
+                end,
+                start,
+                offset,
+            }
+            .url(BASE_URL),
+        )
+    };
+    for offset in
+        (0..=ACTIVITY_MAX_OFFSET).step_by(usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap())
+    {
+        request(EPOCH + 10, Some(0), offset);
+    }
+    request(EPOCH - 1, Some(0), 0);
+    request(EPOCH, Some(EPOCH), 0);
+    request(EPOCH, Some(EPOCH), RECONCILIATION_PAGE_LIMIT);
+    for offset in
+        (0..=ACTIVITY_MAX_OFFSET).step_by(usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap())
+    {
+        request(EPOCH + 10, Some(EPOCH + 1), offset);
+    }
+    assert_eq!(*fetcher.urls.lock().unwrap(), expected_urls);
+    let frames = source_frames(&source_path);
+    for frame in frames.iter().take(pages.len()) {
+        assert_eq!(frame.source_id.0, ACTIVITY_POLL_SOURCE_ID);
+        assert_eq!(frame.schema_version, ACTIVITY_POLL_PAGE_SCHEMA_VERSION);
+        assert_eq!(
+            frame.parser_version,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+        );
+    }
+    let commitment_frame = &frames[pages.len()];
+    assert_eq!(
+        commitment_frame.source_id.0,
+        ACTIVITY_READ_COMMITMENT_SOURCE_ID
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
+            .count(),
+        1
+    );
+    let commitment = pe_event_log::AppendReceipt {
+        sequence: commitment_frame.seq,
+        this_hash: commitment_frame.this_hash,
+    };
+    let rows = paper.open_decision_pending().unwrap();
+    assert_eq!(rows.len(), 1);
+    let continuation = DecisionContinuationV3::from_durable(&rows[0]).unwrap();
+    assert_eq!(continuation.version(), 4);
+    assert_eq!(continuation.read_commitment, Some(commitment));
+    assert_eq!(continuation.page_occurrences.len(), pages.len());
+    for (_, context, _) in &commits {
+        assert_eq!(context.read_commitment, Some(commitment));
+    }
+    let groups_before = paper.activity_groups_after(&wallet(), 0).unwrap();
+    let positions_before = paper.leader_positions().unwrap();
+    drop(paper);
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap();
+    for page in &continuation.page_occurrences {
+        assert_eq!(
+            index.receipt_at(page.receipt.sequence).unwrap().unwrap().0,
+            page.receipt
+        );
+    }
+    assert_eq!(
+        index.receipt_at(commitment.sequence).unwrap().unwrap().0,
+        commitment
+    );
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+        1
+    );
+    // Reconstruct through the production complete-reader using only the recorded page payloads.
+    let replay_fetcher = QueueFetcher::from_pages(
+        frames
+            .iter()
+            .take(pages.len())
+            .map(|frame| frame.payload.clone())
+            .collect(),
+    );
+    let reconstructed =
+        fetch_complete_activity(&replay_fetcher, BASE_URL, wallet(), Some(-1), EPOCH + 10)
+            .await
+            .unwrap();
+    let buckets = reconstructed.buckets().unwrap();
+    for (rebuilt, (committed, _, _)) in buckets.iter().zip(&commits) {
+        assert_eq!(rebuilt, committed);
+        for aggregate in rebuilt {
+            let durable = paper
+                .activity_group_state(aggregate.group_id.key())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                durable.semantic_revision,
+                aggregate.semantic_revision.as_str()
+            );
+            assert_eq!(
+                durable.transaction_hash,
+                aggregate.group_id.components().transaction_hash
+            );
+            assert_eq!(
+                pe_position_ledger::AppliedEffect::from_document(&durable.proof_json)
+                    .unwrap()
+                    .effect,
+                pe_position_ledger::LedgerMutation::from_activity(aggregate)
+                    .unwrap()
+                    .effect
+            );
+        }
+    }
+    assert_eq!(buckets.len(), commits.len());
+    assert_eq!(
+        paper.activity_groups_after(&wallet(), 0).unwrap(),
+        groups_before
+    );
+    assert_eq!(paper.leader_positions().unwrap(), positions_before);
+    // An empty next read has no bucket and must not mint a commitment.
+    let empty_commits = recorded_poll(
+        Arc::clone(&paper),
+        &source_path,
+        Arc::new(QueueFetcher::new(empty.clone())),
+    )
+    .await;
+    assert!(empty_commits.is_empty());
+    assert_eq!(
+        source_frames(&source_path)
+            .iter()
+            .filter(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
+            .count(),
+        1
+    );
+    // Cursor overlap re-observes the latest second: the engine must report already_committed.
+    let repeat = recorded_poll(
+        Arc::clone(&paper),
+        &source_path,
+        Arc::new(QueueFetcher::from_pages(vec![full_pages[0].clone(), empty])),
+    )
+    .await;
+    assert_eq!(repeat.len(), 1);
+    assert!(repeat[0].2.already_committed);
+    assert!(repeat[0].2.pending.is_empty());
+    assert_eq!(
+        source_frames(&source_path)
+            .iter()
+            .filter(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
+            .count(),
+        1,
+        "repeat read with no new buckets must not append another commitment"
+    );
+    assert_eq!(
+        paper.activity_groups_after(&wallet(), 0).unwrap(),
+        groups_before
+    );
+    assert_eq!(paper.open_decision_pending().unwrap(), rows);
 }
