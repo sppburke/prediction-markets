@@ -10060,6 +10060,290 @@ mod tests {
         }
     }
 
+    /// PASS: strict live replay loads an engine-recorded A/0-to-B/1 correction from paper state
+    /// and accepts B/1; the uncorrected A/0 control passes. Changed frozen, stamped, or verified
+    /// identities and uncorrected B/1 all fail.
+    /// FAIL: a valid correction/control fails, or any mismatched identity replays successfully.
+    #[test]
+    fn strict_live_economic_honors_recorded_identity_correction() {
+        use crate::bucket_commit::{BucketCommitEngine, BucketDecisionContext, IdentityOverride};
+        use pe_core_types::MarketOutcomeId;
+        use pe_position_ledger::{AppliedEffect, LedgerEffect, LedgerMutation, PositionLedger};
+
+        for case in [
+            "corrected",
+            "frozen stamped",
+            "wrong stamped",
+            "wrong verified",
+            "uncorrected",
+            "uncorrected verified",
+        ] {
+            let (mut prepared, account_id, mut sources, raw) = observation_replay_fixture();
+            let corrected = !case.starts_with("uncorrected");
+            let stamped = MarketOutcomeId::new(raw.facts.market_id.clone(), OutcomeId(0));
+            assert_eq!(raw.facts.outcome_id, stamped.outcome());
+            let verified = MarketOutcomeId::new(
+                MarketId(VenueMarketId(format!("0x{}", "88".repeat(32)))),
+                OutcomeId(1),
+            );
+            let other = MarketOutcomeId::new(
+                MarketId(VenueMarketId(format!("0x{}", "99".repeat(32)))),
+                OutcomeId(0),
+            );
+            let source_trade_id = raw.facts.source_trade_id.clone();
+            let wallet = raw.facts.wallet;
+            let source_epoch = raw.facts.source_epoch;
+            let rest = &sources
+                .iter()
+                .find(|(receipt, _)| Some(*receipt) == raw.complete_bound())
+                .unwrap()
+                .1;
+            assert_eq!(
+                rest.schema_version,
+                crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION
+            );
+            let at = source_time_from_millis(rest.received_unix_ms).unwrap();
+            let aggregate = pe_source_polymarket_public::parse_activity_response(
+                &rest.payload,
+                wallet,
+                &pe_source_polymarket_public::ActivityParseContext {
+                    source_id: SourceId(rest.source_id.clone()),
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    transport: pe_source_polymarket_public::ActivityTransport::Replay,
+                },
+            )
+            .unwrap()
+            .aggregates()
+            .unwrap()
+            .remove(0);
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("paper.db");
+            let state = Arc::new(PaperStateDb::open(&path).unwrap());
+            let cutoff = source_epoch - 1;
+            state.set_cursor(&wallet, cutoff).unwrap();
+            state
+                .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                    wallet,
+                    balances: Vec::new(),
+                    activity_cutoff_unix: cutoff,
+                    anchored_at_unix: cutoff,
+                    ledger_hash_after: "empty".to_owned(),
+                    positions_proof_hash: "empty".to_owned(),
+                    activity_bounds_json: "[]".to_owned(),
+                    source_log_generation: "identity-correction-fixture".to_owned(),
+                    proof_json: "{}".to_owned(),
+                    recorded_at_unix: cutoff,
+                }])
+                .unwrap();
+            let context = BucketDecisionContext {
+                applied_configuration: raw.facts.applied_configuration.clone(),
+                decision_inputs_json: raw.facts.decision_inputs.to_string(),
+                page_occurrences: raw.page_occurrences().to_vec(),
+                observed_source_receipts: HashMap::from([(
+                    source_trade_id.clone(),
+                    raw.observed_source_receipt.unwrap(),
+                )]),
+                read_commitment: raw.read_commitment,
+                reconstruction_quality: raw.facts.reconstruction_quality,
+                signal_config: pe_copy_signal_engine::SignalConfig::default(),
+                copy_eligible: true,
+                bracket_commit: false,
+                recorded_at_unix: source_epoch,
+                observation_provenance: HashMap::from([(
+                    source_trade_id.clone(),
+                    raw.facts.provenance,
+                )]),
+                no_copy_dispositions: HashMap::new(),
+                identity_overrides: if corrected {
+                    HashMap::from([(
+                        source_trade_id.clone(),
+                        IdentityOverride {
+                            verified: verified.clone(),
+                            evidence_hash: "metadata-proof".to_owned(),
+                        },
+                    )])
+                } else {
+                    HashMap::new()
+                },
+                identity_unresolved: HashSet::new(),
+                history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
+                    wallet,
+                    complete: true,
+                    proof_json: serde_json::json!({"fixture": "complete"}).to_string(),
+                    updated_at_unix: source_epoch,
+                }),
+            };
+            let result = BucketCommitEngine::load(Arc::clone(&state), PositionLedger::new())
+                .unwrap()
+                .commit(vec![aggregate.clone()], &context, raw.facts.frozen_basis)
+                .unwrap();
+            assert_eq!(result.pending, vec![source_trade_id.clone()], "{case}");
+            let referenced = HashSet::from([source_trade_id.clone()]);
+            let produced = live_observation_page_index(&state, &referenced).unwrap();
+            let (continuation, correction) = &produced[&source_trade_id];
+            assert_eq!(continuation.version(), 4);
+            assert_eq!(continuation.read_commitment, raw.read_commitment);
+            assert_eq!(
+                correction.as_ref(),
+                corrected.then_some(&pe_position_ledger::IdentityCorrection {
+                    stamped: stamped.clone(),
+                    verified: verified.clone(),
+                    evidence_hash: "metadata-proof".to_owned(),
+                })
+            );
+            let mut continuation = continuation.clone();
+            match case {
+                "frozen stamped" => {
+                    continuation.facts.market_id = stamped.market().clone();
+                    continuation.facts.outcome_id = stamped.outcome();
+                }
+                "uncorrected verified" => {
+                    continuation.facts.market_id = verified.market().clone();
+                    continuation.facts.outcome_id = verified.outcome();
+                }
+                _ => {}
+            }
+            let mut applied = AppliedEffect::from_document(
+                &state
+                    .activity_group_state(&source_trade_id)
+                    .unwrap()
+                    .unwrap()
+                    .proof_json,
+            )
+            .unwrap();
+            match case {
+                "wrong stamped" => {
+                    let LedgerEffect::Corrected { correction, .. } = &mut applied.effect else {
+                        panic!("producer must record the identity correction");
+                    };
+                    correction.stamped = other;
+                }
+                "wrong verified" => {
+                    applied.effect = LedgerMutation::from_activity(&aggregate)
+                        .unwrap()
+                        .with_verified_identity(other, "metadata-proof".to_owned())
+                        .effect;
+                }
+                _ => {}
+            }
+            // Mutations remain valid documents; the consumer must reject the broken binding.
+            let proof_json = applied.to_document().unwrap();
+            assert_eq!(AppliedEffect::from_document(&proof_json).unwrap(), applied);
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE activity_groups SET proof_json = ?1 WHERE source_trade_id = ?2",
+                        rusqlite::params![proof_json, source_trade_id.0],
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(connection.execute(
+                "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                rusqlite::params![serde_json::to_string(&continuation).unwrap(), source_trade_id.0],
+            ).unwrap(), 1);
+
+            if corrected || case == "uncorrected verified" {
+                let condition = PolymarketConditionId(verified.market().to_string());
+                let economic = &mut prepared.economic;
+                economic.market.market_id = condition.0.clone();
+                economic.market.condition_id = condition.clone();
+                economic.market.outcome_index = 1;
+                economic.admission.market.condition_id = condition.clone();
+                economic
+                    .admission
+                    .market
+                    .ordered_outcome_token_ids
+                    .swap(0, 1);
+                economic.admission.settlement.condition_id = condition.clone();
+                let projection = prepared.identity.fill_projection.as_deref_mut().unwrap();
+                projection.market_id = condition.0.clone();
+                projection.outcome_id = 1;
+
+                // The raw asset remains token 123, now verified as outcome 1 of market B.
+                let [gamma, long, compact, book] = economic_source_payloads(&condition.0);
+                let mut gamma: serde_json::Value = serde_json::from_slice(&gamma).unwrap();
+                gamma[0]["clobTokenIds"] = serde_json::json!("[\"124\",\"123\"]");
+                let mut long: serde_json::Value = serde_json::from_slice(&long).unwrap();
+                long["tokens"][0]["token_id"] = serde_json::json!("124");
+                long["tokens"][1]["token_id"] = serde_json::json!("123");
+                let mut compact: serde_json::Value = serde_json::from_slice(&compact).unwrap();
+                compact["t"][0]["t"] = serde_json::json!("124");
+                compact["t"][1]["t"] = serde_json::json!("123");
+                let long = serde_json::to_vec(&long).unwrap();
+                economic.admission.settlement.raw_evidence_hash =
+                    blake3::hash(&long).to_hex().to_string();
+                for (receipt, payload) in [
+                    (
+                        economic.admission.receipts.gamma,
+                        serde_json::to_vec(&gamma).unwrap(),
+                    ),
+                    (economic.admission.receipts.clob_long, long),
+                    (
+                        economic.admission.receipts.clob_compact,
+                        serde_json::to_vec(&compact).unwrap(),
+                    ),
+                    (economic.book_receipt, book),
+                ] {
+                    sources
+                        .iter_mut()
+                        .find(|(candidate, _)| *candidate == receipt)
+                        .unwrap()
+                        .1
+                        .payload = payload;
+                }
+                bind_reconciled_activity_decision(
+                    &mut prepared,
+                    &account_id,
+                    aggregate.source_time.0,
+                    raw.facts.price,
+                    raw.facts.share_amount,
+                );
+            }
+            let index = live_observation_page_index(&state, &referenced).unwrap();
+            let (continuation, correction) = &index[&source_trade_id];
+            let economic = &prepared.economic;
+            let replay = replay_source_backed_economic_with_live_binding(
+                economic,
+                economic.risk.evaluated_at_unix_ms,
+                CollateralAmount::from_atomic(10_000_000),
+                Some(LiveObservationBinding {
+                    account_id: &account_id,
+                    identity: &prepared.identity,
+                    continuation,
+                    correction: correction.as_ref(),
+                }),
+                |receipt| {
+                    sources
+                        .iter()
+                        .find(|(candidate, _)| *candidate == receipt)
+                        .map(|(_, source)| source.clone())
+                        .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+                },
+            );
+            if matches!(case, "corrected" | "uncorrected") {
+                replay
+                    .unwrap()
+                    .recompose(
+                        economic,
+                        economic.risk.clone(),
+                        prepared.identity.config_hash.clone(),
+                    )
+                    .unwrap();
+            } else {
+                let error = replay.err().unwrap();
+                let expected = if case == "frozen stamped" {
+                    "economic observation trade identity differs from the live admission"
+                } else {
+                    "decision continuation differs from its raw activity aggregate"
+                };
+                assert!(error.to_string().contains(expected), "{case}: {error}");
+            }
+        }
+    }
+
     /// PASS: strict economic replay resolves both observation receipts, their ordered receive
     /// clocks, source contracts, and websocket provenance before accepting the economic record.
     /// FAIL: either the websocket or REST observation provenance cannot replay from valid inputs.
