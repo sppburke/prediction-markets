@@ -511,7 +511,6 @@ fn source_observation_from_envelope(
 
 /// Receipt-backed source adapters shared by sealed decision selection (#574).
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 enum SealedSource<'a> {
     Map(&'a BTreeMap<u64, SourceObservation>),
     Index(&'a SourceReceiptIndex),
@@ -1923,6 +1922,7 @@ pub(crate) struct SelectedDecisionRows {
 
 /// Select post-Start decisions by their earliest verified source observation and classify all
 /// in-prefix rows for the transactional sealer. SQLite timestamps never determine membership.
+#[cfg(test)]
 pub(crate) fn decision_rows_for_source_prefix(
     state: &PaperStateDb,
     source_log_path: &Path,
@@ -1935,7 +1935,6 @@ pub(crate) fn decision_rows_for_source_prefix(
 
 /// Select sealed decisions from the process-wide receipt index without retaining source payloads
 /// while walking the source prefix (GitHub issue #574).
-#[allow(dead_code)]
 pub(crate) fn decision_rows_for_indexed_source_prefix(
     state: &PaperStateDb,
     index: &SourceReceiptIndex,

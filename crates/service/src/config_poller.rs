@@ -658,6 +658,8 @@ mod tests {
 
     use rust_decimal::Decimal;
     use tokio::sync::Notify;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
     use crate::config::ServiceConfig;
@@ -734,6 +736,31 @@ mod tests {
     impl ConfigFetcher for PendingFetcher {
         async fn fetch(&self) -> Result<Vec<ConfigRow>, SupabaseError> {
             std::future::pending().await
+        }
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CaptureWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
         }
     }
 
@@ -1028,6 +1055,86 @@ mod tests {
         .await;
         assert_eq!(responder.await.unwrap(), Ok(()));
         assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
+    }
+
+    /// PASS: a physical seal error is retried at the next poll and logged byte-for-byte each time.
+    #[tokio::test]
+    async fn poll_once_retries_unchanged_qualification_seal_error() {
+        let live = LiveRuntimeConfig::new(boot());
+        let status = RuntimeConfigStatus::new(&live.snapshot());
+        let (requests, _rx) = request_channel(100);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let seal = QualificationSealHandle::new(control);
+        let error = pe_event_log::LogError::CrcMismatch {
+            at_seq: pe_core_types::EventSeq(7),
+            byte_offset: 42,
+        }
+        .to_string();
+        let expected = error.clone();
+        let responder = async move {
+            for _ in 0..2 {
+                let Some(message) = control_rx.recv().await else {
+                    return Err("control channel closed before both SealChecks");
+                };
+                let OrchestratorControl::SealCheck { acknowledged, .. } = message else {
+                    return Err("received another control before SealCheck");
+                };
+                acknowledged
+                    .send(Err(error.clone()))
+                    .map_err(|_| "seal acknowledgement receiver dropped")?;
+            }
+            Ok::<(), &'static str>(())
+        };
+        let polls = async {
+            for _ in 0..2 {
+                poll_once(
+                    &live,
+                    &status,
+                    &OkFetcher(rows_with("max_fill_price", "0.50")),
+                    &requests,
+                    false,
+                    ConfigEra::Financial15,
+                    None,
+                    Some(&seal),
+                )
+                .await;
+            }
+        };
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_writer(CaptureWriter(Arc::clone(&captured)))
+            .finish();
+
+        let (_, responder) = async { tokio::join!(polls, responder) }
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(responder, Ok(()));
+
+        assert_eq!(live.snapshot().max_fill_price, Decimal::new(85, 2));
+        let bytes = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let warnings = String::from_utf8(bytes)
+            .expect("captured tracing is UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL"))
+            .filter(|line| {
+                line.get("message").and_then(serde_json::Value::as_str)
+                    == Some(
+                        "qualification seal check was not synchronized; keeping last-known-good config",
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2);
+        for warning in warnings {
+            assert_eq!(
+                warning.get("error").and_then(serde_json::Value::as_str),
+                Some(expected.as_str())
+            );
+        }
     }
 
     #[tokio::test]

@@ -629,6 +629,10 @@ during the same walk, and publishes the boot projections built from it only afte
 every reducer succeeded; the walked binding is reused only while that writer stays the sole
 appender and its synchronized tail equals its byte cursor, which detects external length drift but
 not an equal-length rewrite of already-verified bytes (#572).
+The runtime qualification seal verifies the sealed prefix with one scanner walk bounded by the
+caller's candidate (the just-recorded mark tail at a completion boundary, the receipt-index tail on
+configuration drift), reads the frames its decision rows reference exactly through the receipt
+index, and retains no payload map (#574).
 
 Paper schema-v1-to-v2 migration is a machine-owned roll-forward state machine:
 `boundary_recorded → version_two_inputs_appending → side_state_built →

@@ -1009,6 +1009,38 @@ impl SourceReceiptIndex {
         Ok(staging.complete_at(physical_tail))
     }
 
+    /// Snapshot the synchronized indexed source tail without reading the log (GitHub issue #574).
+    pub fn current_tail_binding(&self) -> Result<LogTailBinding, RiskInputsUnavailable> {
+        let (path, physical_tail, last_sequence, last_hash) = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let path = self
+                .source_log_path
+                .as_ref()
+                .map(|path| path.as_ref().clone())
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let physical_tail = state
+                .next_byte_offset
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let last_sequence = state.frames.last().map(|frame| frame.receipt.sequence);
+            let last_hash = state
+                .frames
+                .last()
+                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                    frame.receipt.this_hash
+                });
+            (path, physical_tail, last_sequence, last_hash)
+        };
+        Ok(LogTailBinding {
+            path,
+            physical_tail,
+            last_sequence,
+            last_hash,
+        })
+    }
+
     /// Extend the projection with an append that the source-log owner has already synchronized.
     pub(crate) fn record_synced_append(
         &self,
@@ -2157,6 +2189,73 @@ mod tests {
             source_index_snapshot(&staged).1,
             Some(binding.physical_tail)
         );
+    }
+
+    /// PASS: a completed header-only index exposes the canonical genesis binding without I/O.
+    #[test]
+    fn current_tail_binding_is_genesis_for_completed_header_only_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        drop(Writer::open(&source_path).unwrap());
+        let verified = Scanner::verify(&source_path).unwrap();
+        let index = observe_source_log(&source_path)
+            .complete(&verified)
+            .unwrap();
+
+        let current = index.current_tail_binding().unwrap();
+
+        assert_eq!(current, verified);
+        assert_eq!(current.last_sequence, None);
+        assert_eq!(current.last_hash, blake3::Hash::from_bytes([0; 32]));
+    }
+
+    /// PASS: replay snapshots every field of the scanner-verified populated source tail.
+    #[test]
+    fn current_tail_binding_matches_scanner_after_populated_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        writer.append_synced(source_input(11, b"second")).unwrap();
+        drop(writer);
+        let verified = Scanner::verify(&source_path).unwrap();
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+
+        assert_eq!(index.current_tail_binding().unwrap(), verified);
+    }
+
+    /// PASS: recording one synchronized append advances the indexed binding to that frame's tail.
+    #[test]
+    fn current_tail_binding_advances_after_recorded_synced_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        writer.append_synced(source_input(10, b"first")).unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let before = index.current_tail_binding().unwrap();
+        let appended = source_input(11, b"second");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let receipt = writer
+            .append_synced(EnvelopeIn {
+                source_id: appended.source_id.clone(),
+                schema_version: appended.schema_version,
+                parser_version: appended.parser_version,
+                observed_at: appended.observed_at.clone(),
+                received_at: appended.received_at.clone(),
+                content_type: appended.content_type.clone(),
+                payload: appended.payload.clone(),
+            })
+            .unwrap();
+        drop(writer);
+
+        index.record_synced_append(receipt, &appended).unwrap();
+        let current = index.current_tail_binding().unwrap();
+
+        assert!(current.physical_tail > before.physical_tail);
+        assert_eq!(current.last_sequence, Some(receipt.sequence));
+        assert_eq!(current.last_hash, receipt.this_hash);
+        assert_eq!(current, Scanner::verify(&source_path).unwrap());
     }
 
     /// PASS: external observation retains exactly replay's receipts, receive times, frame offsets,
