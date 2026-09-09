@@ -386,6 +386,24 @@ else
 fi
 copy_manifest_sha256=$(sha256sum "$copy_manifest" | awk '{print $1}')
 
+# Issue #584: bind the checkpointed copy's terminal pre-#545 continuation inventory before any
+# reviewed-binary verb mutates that private copy.
+legacy_continuations_count=$(sqlite3 -readonly "$copy_dir/paper_state.db" \
+  "select count(*) from decision_pending
+    where state = 'terminal'
+      and instr(frozen_inputs_json, '\"version\":2') > 0
+      and instr(frozen_inputs_json, '\"era\"') = 0
+      and instr(frozen_inputs_json, '\"fill_mode\"') > 0;")
+legacy_continuations_digest=$(sqlite3 -readonly "$copy_dir/paper_state.db" \
+  "select source_trade_id from decision_pending
+    where state = 'terminal'
+      and instr(frozen_inputs_json, '\"version\":2') > 0
+      and instr(frozen_inputs_json, '\"era\"') = 0
+      and instr(frozen_inputs_json, '\"fill_mode\"') > 0
+    order by source_trade_id;" | sha256sum | awk '{print $1}')
+printf 'rehearsal copy legacy continuations: count=%s digest=%s\n' \
+  "$legacy_continuations_count" "$legacy_continuations_digest"
+
 rehearsal_env_file="$root/environment-$short.rehearsal.env"
 rehearsal_env_stage=$(mktemp "$root/.environment-$short.rehearsal.XXXXXX")
 python3 - "$env_file" "$rehearsal_env_stage" "$environment_sha256" 3< <(
@@ -897,6 +915,8 @@ manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
     "$service_invocation_pid" "$rehearsal_bind" "$rehearsal_port" "$installed_bind" \
     "$readiness_base_url" "$wallet" "$anchor_before"
   printf 'final=%s\n' "$last"
+  printf 'legacy_continuations=%s:%s\n' \
+    "$legacy_continuations_count" "$legacy_continuations_digest"
   printf 'copy_manifest_sha256=%s\naccount_census_before_count=%s\naccount_census_before_sha256=%s\naccount_census_before_safe=true\naccount_census_after_count=%s\naccount_census_after_sha256=%s\naccount_census_after_safe=%s\naccount_census_before_after_identical=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
     "$copy_manifest_sha256" \
     "$account_census_before_count" \

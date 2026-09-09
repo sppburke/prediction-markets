@@ -197,7 +197,7 @@ export_financial_config_rows() {
 }
 
 read_rehearsal_evidence() {
-  python3 -c 'import hashlib,json,os,sys
+  python3 -c 'import hashlib,json,os,re,sys
 evidence_path,expected_revision,expected_artifact,expected_artifact_sha,expected_activation,expected_generation,expected_config_sha,expected_environment_sha=sys.argv[1:]
 def refuse(reason):
     print("REHEARSAL_REFUSAL="+reason,file=sys.stderr)
@@ -226,10 +226,17 @@ try:
     with open(manifest_path,encoding="utf-8") as source:
         for raw in source:
             key,separator,value=raw.rstrip("\n").partition("=")
-            if not separator or not key or key in rows: refuse("malformed_result_manifest")
+            if not separator or not key: refuse("malformed_result_manifest")
+            if key in rows:
+                refuse("malformed_legacy_continuations" if key == "legacy_continuations" else "malformed_result_manifest")
             rows[key]=value
 except (OSError,UnicodeError):
     refuse("malformed_result_manifest")
+# Issue #584: this row stays in the hash-bound result manifest, not the fixed-shape outer JSON.
+legacy_continuations=rows.get("legacy_continuations")
+if legacy_continuations is None: refuse("missing_legacy_continuations")
+if re.fullmatch(r"[0-9]+:[0-9a-f]{64}",legacy_continuations) is None:
+    refuse("malformed_legacy_continuations")
 for key in ("result","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256","rehearsal_environment_sha256"):
     if rows.get(key) != evidence.get(key): refuse("evidence_identity_mismatch")
 if rows.get("sha") != evidence.get("target_revision"): refuse("reviewed_revision_mismatch")
@@ -261,6 +268,7 @@ bound={
     "config_sha256":evidence["config_sha256"],
     "environment_sha256":evidence["environment_sha256"],
     "rehearsal_environment_sha256":evidence["rehearsal_environment_sha256"],
+    "legacy_continuations":legacy_continuations,
 }
 print(json.dumps(bound,sort_keys=True,separators=(",",":")))' \
     "$rehearsal_evidence" "$target_revision" "$artifact_blake3" "$target_artifact_sha256" \

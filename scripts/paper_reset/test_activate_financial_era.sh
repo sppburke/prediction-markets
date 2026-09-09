@@ -320,9 +320,11 @@ write_rehearsal_evidence() {
   local root=$1
   local artifact_sha256=${2:-$(sha256sum "$root/target/pe-service" | awk '{print $1}')}
   local rehearsal=$root/rehearsal manifest=$root/rehearsal/manifest.txt digest config_sha256 environment_sha256
+  local empty_sha256
   local rehearsal_environment_sha256=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
   config_sha256=$(sha256sum "$root/target/service.toml" | awk '{print $1}')
   environment_sha256=$(sha256sum "$root/target/service.env" | awk '{print $1}')
+  empty_sha256=$(printf '' | sha256sum | awk '{print $1}')
   mkdir -p "$rehearsal"
   printf '%s\n' \
     'result=PASS' \
@@ -334,6 +336,7 @@ write_rehearsal_evidence() {
     'activation_id=act-545' \
     "generation_dir=$root/prediction-markets/gen/g557" \
     'copy_manifest_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    "legacy_continuations=0:$empty_sha256" \
     'readiness_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
     "config_sha256=$config_sha256" \
     "environment_sha256=$environment_sha256" \
@@ -413,6 +416,9 @@ create table bankroll(id integer primary key, bankroll_str text not null);
 insert into bankroll values(0,"10000"); create table meta(key text primary key,value blob not null);
 create table poll_cursors(wallet_hex text primary key,activity_cutoff_unix integer,reanchor_required integer);
 create table position_anchors(wallet_hex text,anchor_seq integer);
+create table decision_pending(source_trade_id text, semantic_revision text, wallet_hex text,
+source_epoch integer, frozen_inputs_json text, post_commit_inputs_json text, state text,
+terminal_disposition text, updated_at_unix integer);
 create table wallet_fences(wallet_hex text,cause text);
 insert into poll_cursors values("0x0000000000000000000000000000000000000545",1,0);
 insert into position_anchors values("0x0000000000000000000000000000000000000545",1);
@@ -868,6 +874,7 @@ assert rehearsal_credentials == ["sb_publishable_rehearsal","sb_publishable_rehe
 rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
 for key in ("activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256","rehearsal_environment_sha256"):
     assert rows[key]==e[key]
+assert rows["legacy_continuations"] == "0:" + hashlib.sha256(b"").hexdigest()
 before=open(census_before_path,"rb").read()
 after=open(census_after_path,"rb").read()
 assert rows["account_census_before_count"]==str(len(before.splitlines()))
@@ -899,7 +906,9 @@ set -e
 [[ $status -eq 86 ]] || fail "authentic rehearsal evidence did not join the financial driver fixture"
 python3 -c 'import json,sys
 activation=json.load(open(sys.argv[1])); financial=json.load(open(sys.argv[2])); evidence=json.load(open(sys.argv[3]))
+rows=dict(line.rstrip("\n").split("=",1) for line in open(evidence["manifest_path"],encoding="utf-8"))
 assert financial["rehearsal_evidence"]["sha256"] == evidence["evidence_sha256"]
+assert financial["rehearsal_evidence"]["legacy_continuations"] == rows["legacy_continuations"]
 assert financial["target_config_sha256"] == evidence["config_sha256"]
 assert financial["target_environment_sha256"] == evidence["environment_sha256"]
 assert financial["old_artifact_sha256"] == activation["artifacts"]["binary"]["sha256"]
@@ -943,6 +952,74 @@ for fence_cause in position_overflow unexpected_test_cause; do
     fail "unlisted fence cause $fence_cause did not fail as unsafe evidence: $output"
   [[ "$output" != *REHEARSAL545_PASS* ]] || fail "unlisted fence cause $fence_cause passed"
 done
+
+# Scenario REHEARSAL-LEGACY-CONTINUATIONS-08D (#584)
+# Preconditions: the checkpoint source has one terminal pre-#545 version-2 continuation and one
+# era-bearing version-3 continuation. PASS: the copy census binds only the legacy row and the
+# otherwise-clean rehearsal still passes. FAIL: the row is missed, overcounted, or changes PASS.
+root=$TEST_TMP/rehearsal-legacy-continuations
+setup_rehearsal_fixture "$root" true none
+legacy_source_trade_id="g2:$(printf '5%.0s' {1..64})"
+current_source_trade_id="g2:$(printf '6%.0s' {1..64})"
+python3 - "$root/prediction-markets/gen/g557/paper_state.db" \
+  "$legacy_source_trade_id" "$current_source_trade_id" <<'PY'
+import json, sqlite3, sys
+
+database, legacy_id, current_id = sys.argv[1:]
+legacy_configuration = {
+    "active_watchlist_size": 100,
+    "mode": "paper",
+    "max_fill_price": "0.85",
+    "min_fill_price": "0.15",
+    "min_resolution_horizon_secs": 60,
+    "max_resolution_horizon_secs": 172800,
+    "price_impact_cap_bps": 100,
+    "flip_human_approved": False,
+    "kelly_fraction_above_default_human_approved": False,
+    "kelly_fraction_override": None,
+    "per_trade_cap": {"kind": "unlimited"},
+    "slippage_rate": "0.01",
+    "sizing_mode": {"kind": "dollar"},
+    "sizing_dollar_usd": "25",
+    "sizing_contracts": 1,
+    "fill_mode": "clob_best_ask",
+    "polymarket_fee_rate": "0.04",
+}
+assert len(legacy_configuration) == 17
+financial_configuration = {
+    "era": "financial15",
+    **{key: value for key, value in legacy_configuration.items()
+       if key not in {"fill_mode", "polymarket_fee_rate"}},
+}
+rows = (
+    (legacy_id, "2" * 64,
+     json.dumps({"version": 2, "source_trade_id": legacy_id,
+                 "applied_configuration": legacy_configuration}, separators=(",", ":")), 1),
+    (current_id, "3" * 64,
+     json.dumps({"version": 3, "source_trade_id": current_id,
+                 "applied_configuration": financial_configuration}, separators=(",", ":")), 2),
+)
+connection = sqlite3.connect(database)
+for source_trade_id, revision, frozen, updated_at in rows:
+    connection.execute(
+        "insert into decision_pending values(?,?,?,?,?,?,?,?,?)",
+        (source_trade_id, revision, "0x" + "5" * 40, updated_at, frozen, "{}",
+         "terminal", "no_fill", updated_at),
+    )
+connection.commit()
+connection.close()
+PY
+legacy_digest=$(printf '%s\n' "$legacy_source_trade_id" | sha256sum | awk '{print $1}')
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] ||
+  fail "legacy-continuation census rehearsal did not pass: $output"
+[[ "$output" == *"rehearsal copy legacy continuations: count=1 digest=$legacy_digest"* ]] ||
+  fail "legacy-continuation census log is missing or incorrect: $output"
+manifest_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_path"])' \
+  "$root/rehearsal/evidence.json")
+[[ $(grep -c '^legacy_continuations=' "$manifest_path") -eq 1 ]] &&
+  grep -Fxq "legacy_continuations=1:$legacy_digest" "$manifest_path" ||
+  fail "legacy-continuation result-manifest row is missing or incorrect"
 
 # Scenario REHEARSAL-PATHS-UPDATE-01A
 # Preconditions: a clean copied generation whose migration path update fails (#570).
@@ -1509,6 +1586,51 @@ set -e
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == prepared ]] ||
   fail "unbound rehearsal evidence advanced the prepared manifest"
 
+# Scenarios FE-REHEARSAL-LEGACY-MISSING-01A and FE-REHEARSAL-LEGACY-MALFORMED-01B (#584)
+# Preconditions: PASS evidence remains hash-consistent after its legacy-continuation row is removed
+# or malformed. PASS: each form receives its exact typed refusal before any durable mutation.
+# FAIL: the driver reports another refusal or crosses the prepared boundary.
+for evidence_case in missing malformed; do
+  root="$TEST_TMP/rehearsal-legacy-$evidence_case"
+  setup_fixture "$root"
+  python3 - "$root/rehearsal/evidence.json" "$evidence_case" <<'PY'
+import hashlib, json, sys
+
+evidence_path, mode = sys.argv[1:]
+with open(evidence_path, encoding="utf-8") as source:
+    evidence = json.load(source)
+manifest_path = evidence["manifest_path"]
+rows = []
+found = 0
+with open(manifest_path, encoding="utf-8") as source:
+    for raw in source:
+        if raw.startswith("legacy_continuations="):
+            found += 1
+            if mode == "missing":
+                continue
+            raw = "legacy_continuations=1:not-a-digest\n"
+        rows.append(raw)
+assert found == 1
+with open(manifest_path, "w", encoding="utf-8") as output:
+    output.writelines(rows)
+with open(manifest_path, "rb") as source:
+    evidence["evidence_sha256"] = hashlib.sha256(source.read()).hexdigest()
+with open(evidence_path, "w", encoding="utf-8") as output:
+    json.dump(evidence, output, sort_keys=True, separators=(",", ":"))
+PY
+  driver_args "$root"
+  expected="${evidence_case}_legacy_continuations"
+  set +e
+  output=$(run_driver "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *"REHEARSAL_REFUSAL=$expected"* ]] ||
+    fail "$evidence_case legacy-continuation evidence was not typed-refused: $output"
+  [[ ! -e "$root/pe-financial-era.json" && $(<"$root/test-state/service.active") == true &&
+     ! -e "$root/test-state/stop-count" ]] ||
+    fail "$evidence_case legacy-continuation evidence crossed the prepared boundary"
+done
+
 # Scenario FE-REHEARSAL-ARTIFACT-02
 # Preconditions: PASS evidence is internally hash-consistent but names a different binary artifact.
 # PASS: the typed artifact refusal occurs before the financial manifest or service mutation exists.
@@ -1956,4 +2078,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
 done
 
-echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03, REHEARSAL-PATHS-UPDATE-01A, REHEARSAL-FENCES-08A..08C and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03, FE-REHEARSAL-LEGACY-MISSING-01A/FE-REHEARSAL-LEGACY-MALFORMED-01B, REHEARSAL-PATHS-UPDATE-01A, REHEARSAL-FENCES-08A..08D and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"

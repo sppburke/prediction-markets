@@ -382,11 +382,14 @@ both environment identities. `environment_sha256` is the reviewed production tar
 `rehearsal_environment_sha256` is the generated publishable-only derivative. Preserve and review the
 JSON file and its result manifest. The result manifest records each privileged census's count,
 SHA-256, and safety result plus `account_census_before_after_identical`; the outer JSON's
-`evidence_sha256` binds those fields as part of the exact result-manifest bytes. The financial driver
-compares the production identity to `--target-environment`, binds both before entering `prepared`,
-and revalidates them from disk before entering `guarded`. The copy manifest, result manifest, and
-outer JSON are installed with the shared durable atomic-write primitive (file sync, rename, then
-parent-directory sync).
+`evidence_sha256` binds those fields as part of the exact result-manifest bytes. The result manifest
+also records `legacy_continuations=N:<digest>`. It counts terminal pre-#545 version-2 continuations
+in the checkpointed copy and hashes their sorted source-trade IDs. The copy is production's state at
+checkpoint time. The financial driver requires this row and carries it into its bound rehearsal
+object. It compares the production identity to `--target-environment`, binds both before entering
+`prepared`, and revalidates them from disk before entering `guarded`. The copy manifest, result
+manifest, and outer JSON use the shared durable atomic-write primitive. It synchronizes the file,
+renames it, and then synchronizes the parent directory.
 
 The mandatory production rehearsal is the PostgREST-level authorization proof: it runs the real
 service through the target project's PostgREST endpoint with the publishable key in both credential
@@ -502,6 +505,17 @@ is inert, then starts the old service and records `rolled_back`. A no-mutation r
 remote restore and refresh. At or after Start, rollback is forbidden: preserve the append-only era and
 recover with a compatible reader.
 
+Before Start, rollback restores remote or local state only when mutation occurred; otherwise it
+records the applicable restore-skipped result. If the service was active on entry, it restarts the
+still-installed, #557-hash-verified pre-#545 binary; if it was inactive, it remains inactive.
+
+After Start, retained pre-#545 version-2 continuation records survive the financial-era reset and
+remain boot inputs of this generation. Every binary started against it after Start, including any
+rollback target, must carry the pre-#545 version-2 continuation decoder (issue #584). The durable
+`target_revision` in `/home/sean/pe-financial-era.json` is the first post-Start compatible revision.
+Recovery binaries must be that revision or reviewed descendants that retain the decoder. A post-#565
+artifact without it fails boot with `verify terminal pending …: missing field era`.
+
 The driver invokes these early-dispatch service commands; they accept either `--name=value` or
 `--name value` spellings:
 
@@ -545,6 +559,15 @@ It emits canonical compact JSON plus one trailing newline and reports its BLAKE3
 `Pass` under `_GLOSSARY.md` permits the one subsequent manual paper-to-live-tiny review.
 
 ### #565 open-continuation census before deployment
+
+For the #545 activation route, the driver's persisted successful `preparation` is the first-swap
+proof. Its `--financial-era=prepare` command refuses any open continuation. No standalone
+`--validate-open-continuations` run is required for that route.
+
+While the #545 activation is pending, a post-#545 binary is staged and rehearsed only. A successful
+open-continuation census does not authorize a plain swap. The binary enters production through
+`activate_financial_era.sh` after a rehearsal attempt passes from a fresh root on the exact merged,
+hash-bound release tree.
 
 Before swapping the binary, quiesce the service and take a consistent copy of the active paper
 state and source log using the SQLite `.backup` and `cp -p` mechanics in
@@ -878,6 +901,13 @@ crosses that boundary, before any commitment or version-4 continuation exists). 
 all state and roll forward with an executable that retains schema-3 page and version-4 continuation
 compatibility; see the [open-continuation census](#565-open-continuation-census-before-deployment). Never delete
 records or rewrite rows to make an older reader accept them.
+
+**Financial-era compatibility prerequisite (#584):** every ordinary rollback after Start must retain
+the pre-#545 version-2 continuation decoder. Those records survive the financial-era reset and remain
+boot inputs of the generation. The durable `target_revision` in
+`/home/sean/pe-financial-era.json` is the first compatible revision. The rollback target must be that
+revision or a reviewed descendant that retains the decoder. A post-#565 artifact without it fails
+boot with `verify terminal pending …: missing field era`.
 
 ```bash
 cp -p target/release/pe-service.bak-<prior-sha12> /tmp/pe-service.rollback.<prior-sha12>
