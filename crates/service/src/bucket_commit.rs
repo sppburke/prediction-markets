@@ -54,10 +54,11 @@ const ACTIVITY_READ_COMMITMENT_VERSION: u16 = 1;
 pub struct BucketDecisionContext {
     pub applied_configuration: RuntimeConfig,
     pub decision_inputs_json: String,
-    /// Receipt-bearing page occurrences are frozen only in continuation V3. They stay out of
-    /// `decision_inputs`, which owns the logical read proof rather than source-log identities.
+    /// Receipt-bearing page occurrences are frozen in continuation versions 3 and 4. They stay
+    /// out of `decision_inputs`, which owns the logical read proof rather than source-log
+    /// identities.
     pub page_occurrences: Vec<PageOccurrence>,
-    /// Lowest websocket receipt per admitted group; frozen only in continuation V3.
+    /// Lowest websocket receipt per admitted group; frozen in continuation versions 3 and 4.
     pub observed_source_receipts: HashMap<SourceTradeId, AppendReceipt>,
     /// Receipt of the complete-read commitment record appended for this read (#565). `None` only
     /// for non-copying bracket contexts, which never freeze a continuation.
@@ -620,6 +621,28 @@ impl DecisionContinuationV3 {
     }
 }
 
+impl DecisionContinuationFacts {
+    /// The applied effect recorded with this trade's durable activity group, which must carry the
+    /// frozen semantic revision and transaction hash (#565). The effect's recorded identity
+    /// correction, when present, is what the fact comparator honors.
+    pub(crate) fn durable_group_effect(
+        &self,
+        paper_state: &PaperStateDb,
+    ) -> Result<AppliedEffect, String> {
+        let group = paper_state
+            .activity_group_state(&self.source_trade_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "decision activity group is absent".to_owned())?;
+        if group.semantic_revision != self.semantic_revision
+            || group.transaction_hash != self.transaction_hash
+        {
+            return Err("decision activity group differs from its frozen identity".to_owned());
+        }
+        AppliedEffect::from_document(&group.proof_json)
+            .map_err(|error| format!("decision activity effect is invalid: {error}"))
+    }
+}
+
 /// Which producer generation wrote one reconciliation page envelope (#565).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PageGeneration {
@@ -759,11 +782,6 @@ pub(crate) fn joined_read_pages<'a>(
                 )
             })?;
         joined.push((occurrence, page));
-    }
-    if evidence.values().any(|pages| !pages.is_empty()) {
-        return Err(complete_activity_read_error(
-            "complete activity read has unbound page evidence",
-        ));
     }
     Ok(joined)
 }
@@ -980,8 +998,6 @@ impl DecisionContinuationV3 {
     }
 }
 
-// ── #565 VALIDATE lane: open-continuation validation ──────────────────────────
-
 /// Fail-closed boot/census error identifying the open row (when one was reached) and its cause.
 #[derive(Debug, thiserror::Error)]
 #[error("open decision continuation {}: {cause}", source_trade_id.as_ref().map_or("<scan>", |id| id.0.as_str()))]
@@ -1080,19 +1096,7 @@ pub fn validate_open_continuations(
                     "complete activity read repeats the open decision aggregate".to_owned(),
                 ));
             }
-            let state = paper_state
-                .activity_group_state(&facts.source_trade_id)
-                .map_err(|error| fail(error.to_string()))?
-                .ok_or_else(|| fail("open decision has no durable activity group".to_owned()))?;
-            if state.semantic_revision != facts.semantic_revision
-                || state.transaction_hash != facts.transaction_hash
-            {
-                return Err(fail(
-                    "open decision differs from its durable activity group".to_owned(),
-                ));
-            }
-            let applied = AppliedEffect::from_document(&state.proof_json)
-                .map_err(|error| fail(error.to_string()))?;
+            let applied = facts.durable_group_effect(paper_state).map_err(fail)?;
             crate::qualification::verify_decision_continuation_facts(
                 aggregate,
                 facts,
@@ -1314,7 +1318,7 @@ pub(crate) mod continuation_validation_tests {
     /// PASS: two decisions sharing a read perform exactly one page lookup and one commitment lookup.
     /// FAIL: a shared read is reconstructed per row or an extra observation/page scan is performed.
     #[test]
-    fn validate_open_continuations_reconstructs_a_shared_read_once() {
+    fn shared_read_is_reconstructed_once() {
         let (_dir, paper_state, index) = producer_fixture();
         LOOKUPS.with(|count| count.set(0));
         assert_eq!(
@@ -1362,8 +1366,6 @@ pub(crate) mod continuation_validation_tests {
         }
     }
 }
-
-// ── End #565 VALIDATE lane ───────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum BucketCommitError {
@@ -3444,32 +3446,14 @@ mod continuation_v3_tests {
         );
     }
 
-    /// PASS: two continuations agreeing on one read cause exactly one page and one commitment lookup.
-    /// FAIL: reconstruction repeats per row, or same_complete_read ignores a load-bearing field.
+    /// PASS: `same_complete_read` binds every field that defines one complete read.
+    /// FAIL: a changed commitment, logical proof, occurrence list, or wallet still compares equal.
     #[test]
-    fn shared_read_is_reconstructed_once() {
-        let (first, payload) = committed_empty_read();
+    fn same_complete_read_binds_every_read_field() {
+        let (first, _payload) = committed_empty_read();
         let mut second = first.clone();
         second.facts.source_trade_id = SourceTradeId("g2:second".to_owned());
-        let mut reads = Vec::<DecisionContinuationV3>::new();
-        let mut calls = 0;
-        for continuation in [first.clone(), second.clone()] {
-            if reads
-                .iter()
-                .any(|read| read.same_complete_read(&continuation))
-            {
-                continue;
-            }
-            continuation
-                .reconstruct_complete_activity_read(&mut |receipt| {
-                    calls += 1;
-                    committed_lookup(receipt, &payload)
-                })
-                .unwrap();
-            reads.push(continuation);
-        }
-        assert_eq!(reads.len(), 1);
-        assert_eq!(calls, 2);
+        assert!(first.same_complete_read(&second));
         second.read_commitment = Some(receipt(4));
         assert!(!first.same_complete_read(&second));
         second = first.clone();

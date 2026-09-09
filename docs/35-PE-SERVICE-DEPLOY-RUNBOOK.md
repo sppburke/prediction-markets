@@ -550,7 +550,9 @@ against that copy; never run the rehearsal itself for this gate, because it rebi
 sets `reanchor_required`, and boots the service.
 
 ```bash
-pe-service --validate-open-continuations \
+# the staged candidate executable, e.g. /tmp/pe-service.new.<sha12>; the installed pre-#565
+# executable does not implement this flag
+/tmp/pe-service.new.<sha12> --validate-open-continuations \
   --paper-state <quiesced-copy/paper_state.db> \
   --source-log <quiesced-copy/source_events.log>
 ```
@@ -559,7 +561,9 @@ Record stdout, stderr, and the exit status. Success prints `open_rows=N validate
 A validation failure exits nonzero with `open decision continuation <source_trade_id>: <cause>`;
 it blocks the swap for diagnosis without repairing rows or fabricating dispositions. Normal boot
 uses the same validator and logs `open decision continuations validated` with `open_rows=N` before
-resuming any open row. The ordinary [rollback](#rollback) to a pre-#565 binary is available only
+resuming any open row. A boot-time validation failure is a startup error on stderr/journal (live
+fan-out, the HTTP server, and the status writer have not started yet); the row stays intact and the
+unit's `Restart=on-failure` policy repeats the failed start until the row is diagnosed. The ordinary [rollback](#rollback) to a pre-#565 binary is available only
 before the first synchronized schema-3 reconciliation page. After that boundary, preserve all state
 and use a binary retaining schema-3 page and V4 continuation compatibility; never delete records or
 rewrite rows to make an older reader accept them.
@@ -861,7 +865,14 @@ earlier promotion review can arm an account.
 
 The same swap, reversed, plus one restart — triggered by any missing reader record, fewer than two
 live readers on the second bounded check, sink poison, a restart loop, an unexplained financial-state
-change, or a hash mismatch:
+change, or a hash mismatch.
+
+**Compatibility prerequisite (#565):** reverse to a pre-#565 executable only while no synchronized
+schema-3 reconciliation page has become durable in the source log (the first successor poll page
+crosses that boundary, before any commitment or version-4 continuation exists). After it, preserve
+all state and roll forward with an executable that retains schema-3 page and version-4 continuation
+compatibility; see the [open-continuation census](#validate-open-continuations-census). Never delete
+records or rewrite rows to make an older reader accept them.
 
 ```bash
 cp -p target/release/pe-service.bak-<prior-sha12> /tmp/pe-service.rollback.<prior-sha12>

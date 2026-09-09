@@ -3074,16 +3074,9 @@ fn live_observation_page_index(
         };
         let continuation = DecisionContinuationV3::from_durable(&row)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-        let group = paper_state
-            .activity_group_state(source_trade_id)
-            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?
-            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
-        if group.semantic_revision != continuation.facts.semantic_revision
-            || group.transaction_hash != continuation.facts.transaction_hash
-        {
-            return Err(ProjectionReducerError::InvalidRiskEvidence);
-        }
-        let applied = pe_position_ledger::AppliedEffect::from_document(&group.proof_json)
+        let applied = continuation
+            .facts
+            .durable_group_effect(paper_state)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
         pages.insert(
             continuation.facts.source_trade_id.clone(),
@@ -3138,11 +3131,11 @@ fn validate_live_observation_trade(
         && outcome_id == u16::from(economic.market.outcome_index)
         && projection.side == "buy"
         && economic.market.side == Side::Buy;
-    let activity_matches_projection = frozen.wallet == leader
+    let frozen_matches_projection = frozen.wallet == leader
         && frozen.market_id.to_string() == projection.market_id
         && frozen.outcome_id == OutcomeId(outcome_id)
         && frozen.side == Side::Buy;
-    if !projection_matches_economic || !activity_matches_projection {
+    if !projection_matches_economic || !frozen_matches_projection {
         return Err(economic_replay_error(
             "economic observation trade identity differs from the live admission",
         ));

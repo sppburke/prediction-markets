@@ -7119,6 +7119,8 @@ mod tests {
         .unwrap();
     }
 
+    /// PASS: the version-one seal evidence document renders byte-identical to the pinned golden
+    /// bytes for the fixture rows. FAIL: any change to the canonical encoding of historical rows.
     #[test]
     fn seal_decision_evidence_has_golden_canonical_bytes() {
         let (_dir, db) = db();
@@ -7169,6 +7171,9 @@ mod tests {
         ));
     }
 
+    /// PASS: a receipt-bearing row inside the sealed prefix that the service did not classify
+    /// makes the transactional seal refuse with the stored/requested counts.
+    /// FAIL: an unclassified in-prefix row is silently accepted.
     #[test]
     fn source_prefix_seal_rejects_an_additional_scoped_decision_in_one_transaction() {
         let (_dir, db) = db();

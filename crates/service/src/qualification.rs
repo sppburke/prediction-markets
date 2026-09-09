@@ -1867,6 +1867,16 @@ fn decision_rows_from_source_observations(
     };
     let history = state.decision_pending_history()?;
     let source_universe = source_trade_universe(sealed_sequence, observations)?;
+    let terminal_rows = history
+        .iter()
+        .filter(|row| row.state == DecisionPendingState::Terminal)
+        .map(|row| {
+            (
+                (row.source_trade_id.clone(), row.semantic_revision.clone()),
+                row,
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let mut pending_groups = Vec::new();
     for (source_trade_id, first_sequence) in &source_universe {
         if start_sequence.is_some_and(|start| *first_sequence <= start.0) {
@@ -1880,11 +1890,8 @@ fn decision_rows_from_source_observations(
                 ))
             })?;
         if group.disposition == "decision_pending" {
-            let row = history.iter().find(|row| {
-                row.source_trade_id == *source_trade_id
-                    && row.semantic_revision == group.semantic_revision
-                    && row.state == DecisionPendingState::Terminal
-            });
+            let row =
+                terminal_rows.get(&(source_trade_id.clone(), group.semantic_revision.clone()));
             let receipt_bearing = row
                 .and_then(|row| DecisionContinuationV3::from_durable(row).ok())
                 .is_some_and(|continuation| matches!(continuation.version(), 3 | 4));
@@ -1912,7 +1919,6 @@ fn decision_rows_from_source_observations(
     }
     let required = decision_keys_from_source_observations(
         start_sequence,
-        sealed_sequence,
         observations,
         &source_universe,
         &complete_reads,
@@ -2155,28 +2161,20 @@ fn source_trade_universe(
 /// and a group's earliest raw receipt decides whether its production aggregate predates Start.
 fn decision_keys_from_source_observations(
     start_sequence: Option<EventSeq>,
-    sealed_sequence: EventSeq,
     observations: &BTreeMap<u64, SourceObservation>,
     source_universe: &HashMap<pe_core_types::SourceTradeId, u64>,
     complete_reads: &[CompleteActivityReadScope],
 ) -> Result<Vec<(u64, pe_core_types::SourceTradeId, String)>, QualificationError> {
+    // `complete_activity_read_scopes` already excluded every read with a receipt beyond the
+    // sealed prefix (pages, websocket, commitment); no further prefix filter applies here.
     let candidates = complete_reads
         .iter()
-        .flat_map(|read| {
-            read.decisions
-                .iter()
-                .filter_map(|(source_trade_id, observed)| {
-                    observed
-                        .is_none_or(|receipt| receipt.sequence <= sealed_sequence)
-                        .then_some(source_trade_id.clone())
-                })
-        })
+        .flat_map(|read| read.decisions.keys().cloned())
         .collect::<HashSet<_>>();
     let mut first_observations = source_universe.clone();
     for read in complete_reads {
         for (source_trade_id, receipt) in &read.decisions {
-            let Some(receipt) = receipt.filter(|receipt| receipt.sequence <= sealed_sequence)
-            else {
+            let Some(receipt) = *receipt else {
                 continue;
             };
             let observation = decision_source_receipt(observations, receipt)?;
@@ -2888,21 +2886,9 @@ fn verify_decision_source_inputs(
     if matching.next().is_some() {
         return insufficient("decision raw pages reconstruct duplicate aggregate identities");
     }
-    let group = state
-        .activity_group_state(&frozen.source_trade_id)?
-        .ok_or_else(|| {
-            QualificationError::InsufficientEvidence("decision activity group is absent".to_owned())
-        })?;
-    if group.semantic_revision != frozen.semantic_revision
-        || group.transaction_hash != frozen.transaction_hash
-    {
-        return insufficient("decision activity group differs from its frozen identity");
-    }
-    let applied = AppliedEffect::from_document(&group.proof_json).map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "decision activity effect is invalid: {error}"
-        ))
-    })?;
+    let applied = frozen
+        .durable_group_effect(state)
+        .map_err(QualificationError::InsufficientEvidence)?;
     verify_decision_continuation_facts(aggregate, frozen, applied.effect.correction())?;
     Ok(observation)
 }
@@ -8112,14 +8098,9 @@ mod tests {
         );
 
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
-        let keys = decision_keys_from_source_observations(
-            None,
-            EventSeq(2),
-            &observations,
-            &source_universe,
-            &[read],
-        )
-        .unwrap();
+        let keys =
+            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
+                .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
@@ -8176,14 +8157,9 @@ mod tests {
         );
 
         let source_universe = source_trade_universe(EventSeq(3), &observations).unwrap();
-        let keys = decision_keys_from_source_observations(
-            None,
-            EventSeq(3),
-            &observations,
-            &source_universe,
-            &[read],
-        )
-        .unwrap();
+        let keys =
+            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
+                .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.row_count, 2);
@@ -8227,14 +8203,9 @@ mod tests {
 
         let source_universe =
             source_trade_universe(EventSeq(child_sequence), &observations).unwrap();
-        let keys = decision_keys_from_source_observations(
-            None,
-            EventSeq(child_sequence),
-            &observations,
-            &source_universe,
-            &[read],
-        )
-        .unwrap();
+        let keys =
+            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
+                .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.share_sum.to_decimal(), dec!(3));
@@ -8438,7 +8409,6 @@ mod tests {
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
             Some(EventSeq(1)),
-            EventSeq(2),
             &observations,
             &source_universe,
             &[pre_read, post_read],
@@ -8589,14 +8559,9 @@ mod tests {
         );
         let source_universe = source_trade_universe(EventSeq(0), &observations)
             .expect("valid source universe derives from the activity row");
-        let keys = decision_keys_from_source_observations(
-            None,
-            EventSeq(0),
-            &observations,
-            &source_universe,
-            &[read],
-        )
-        .expect("valid complete activity read derives one decision key");
+        let keys =
+            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
+                .expect("valid complete activity read derives one decision key");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
 

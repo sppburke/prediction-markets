@@ -917,10 +917,11 @@ impl TradePoller {
         if buckets.is_empty() {
             return Ok(());
         }
-        // One commitment per complete read, synchronized before the first bucket that can make
-        // new activity durable (#565). Cursor-overlap repeats of already-durable seconds commit no
-        // new group and reference no commitment, so a quiet wallet appends nothing per round.
-        let mut read_commitment: Option<AppendReceipt> = None;
+        // One commitment per complete read with buckets, synchronized before any bucket commits
+        // (#565); every decision frozen from this read references it.
+        let read_commitment = self
+            .append_read_commitment(wallet, fixed_end, &page_occurrences, &activity.pages)
+            .await?;
         if let Some(latest_activity) = buckets
             .iter()
             .flatten()
@@ -957,30 +958,6 @@ impl TradePoller {
                     .all(|group| bucket_ids.contains(group))
             {
                 break;
-            }
-            if read_commitment.is_none() {
-                let mut has_new_group = false;
-                for aggregate in &bucket {
-                    if self
-                        .paper_state
-                        .activity_group_state(aggregate.group_id.key())?
-                        .is_none()
-                    {
-                        has_new_group = true;
-                        break;
-                    }
-                }
-                if has_new_group {
-                    read_commitment = Some(
-                        self.append_read_commitment(
-                            wallet,
-                            fixed_end,
-                            &page_occurrences,
-                            &activity.pages,
-                        )
-                        .await?,
-                    );
-                }
             }
             let identities = self.resolve_bucket(&bucket).await?;
             let context = self.context(
@@ -1020,7 +997,7 @@ impl TradePoller {
         copy_eligible: bool,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
         page_occurrences: &[PageOccurrence],
-        read_commitment: Option<AppendReceipt>,
+        read_commitment: AppendReceipt,
         bucket: &[ActivityAggregate],
         identities: BucketIdentities,
     ) -> Result<BucketDecisionContext, ReconciliationError> {
@@ -1074,7 +1051,7 @@ impl TradePoller {
             page_occurrences: page_occurrences.to_vec(),
             observed_source_receipts,
             reconstruction_quality,
-            read_commitment,
+            read_commitment: Some(read_commitment),
             signal_config: self.signal_config.clone(),
             copy_eligible,
             bracket_commit: false,

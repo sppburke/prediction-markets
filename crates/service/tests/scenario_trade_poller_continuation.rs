@@ -451,7 +451,8 @@ fn source_frames(path: &std::path::Path) -> Vec<pe_event_log::EventEnvelope> {
 
 /// PASS: a real saturated poll writes schema-3 pages then one commitment and a V4 open row;
 /// restart validates all references and reproduces every committed aggregate/effect. An empty
-/// read and an already-committed repeat append no commitment. FAIL: evidence or idempotency differs.
+/// read appends no commitment; an already-committed repeat read appends its own commitment but
+/// commits no new group and no pending row. FAIL: evidence or idempotency differs.
 #[tokio::test]
 async fn poller_multipage_commitment_survives_restart() {
     use pe_service::bucket_commit::{ACTIVITY_READ_COMMITMENT_SOURCE_ID, DecisionContinuationV3};
@@ -666,8 +667,8 @@ async fn poller_multipage_commitment_survives_restart() {
             .iter()
             .filter(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
             .count(),
-        1,
-        "repeat read with no new buckets must not append another commitment"
+        2,
+        "a repeat read with a bucket commits its own read commitment; the already-committed bucket references none"
     );
     assert_eq!(
         paper.activity_groups_after(&wallet(), 0).unwrap(),

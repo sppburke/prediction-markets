@@ -14,8 +14,8 @@ use pe_core_types::{
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
 use pe_service::bucket_commit::{
     ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-    ACTIVITY_READ_COMMITMENT_SOURCE_ID, BucketDecisionContext, DecisionContinuationFacts,
-    PageOccurrence, activity_read_commitment_payload,
+    ACTIVITY_READ_COMMITMENT_SOURCE_ID, BucketDecisionContext, PageOccurrence,
+    activity_read_commitment_payload,
 };
 use pe_service::config::ServiceConfig;
 use pe_service::orchestrator_control::OrchestratorControl;
@@ -81,11 +81,8 @@ pub fn producer_shaped_read(
         },
     )
     .unwrap();
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(payload).unwrap();
-    assert!(
-        rows.len()
-            < usize::try_from(pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT).unwrap()
-    );
+    let row_count = u32::try_from(parsed.rows.len()).unwrap();
+    assert!(row_count < pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT);
     let raw_hash = blake3::hash(payload).to_hex().to_string();
     let evidence = ReconciliationPageEvidence {
         request_url: request_url.clone(),
@@ -95,7 +92,7 @@ pub fn producer_shaped_read(
         }),
         partition: None,
         offset: 0,
-        row_count: u32::try_from(rows.len()).unwrap(),
+        row_count,
         canonical_page_hash: canonical_page_hash(payload).unwrap(),
         raw_page_hash: raw_hash.clone(),
         received_at,
@@ -164,11 +161,6 @@ pub fn append_committed_read(
         })
         .unwrap();
     (read, commitment)
-}
-
-pub fn legacy_continuation_v2_json(facts: &DecisionContinuationFacts) -> String {
-    let facts = serde_json::to_string(facts).unwrap();
-    format!(r#"{{"version":2,{}"#, facts.strip_prefix('{').unwrap())
 }
 
 pub fn install_empty_anchor(
