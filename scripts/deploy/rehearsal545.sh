@@ -57,6 +57,9 @@ env_file=${target_environment:-not-supplied}
 copy_dir=${PE_REHEARSAL_COPY_DIR:-"$root/gen-$short"}
 rehearsal_bind=${PE_REHEARSAL_BIND:-}
 timeout_secs=${PE_REHEARSAL_TIMEOUT_SECS:-10800}
+# Explicit #545 rehearsal allowlist; strings are WalletFenceCause::as_str values (crates/position-ledger/src/lib.rs).
+# A wallet_fences row with any other cause is unexpected evidence and fails the run.
+expected_fence_causes="'order_dependent_equal_second','position_underflow','conversion_unknown_conditions'"
 poll_secs=${PE_REHEARSAL_POLL_SECS:-10}
 evidence_hash_file=${PE_REHEARSAL_EVIDENCE_HASH_FILE:-"$root/evidence-$short.json"}
 
@@ -612,7 +615,7 @@ observe_database_final() {
   sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
     "select coalesce((select max(anchor_seq) from position_anchors where wallet_hex='$wallet'),-1),
             coalesce((select reanchor_required from poll_cursors where wallet_hex='$wallet'),1),
-            (select count(*) from wallet_fences where cause not in ('order_dependent_equal_second','position_underflow'));"
+            (select count(*) from wallet_fences where cause not in ($expected_fence_causes));"
 }
 
 env -i "${service_child_env[@]}" python3 -c '
@@ -716,7 +719,7 @@ fence_anchor_census() {
     reanchor=$(sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
       "select reanchor_required from poll_cursors where wallet_hex='$wallet';" 2>/dev/null || echo 1)
     unexpected=$(sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
-      "select count(*) from wallet_fences where cause not in ('order_dependent_equal_second','position_underflow');" 2>/dev/null || echo 1)
+      "select count(*) from wallet_fences where cause not in ($expected_fence_causes);" 2>/dev/null || echo 1)
     anchored=0
     [[ "$anchor_after" =~ ^-?[0-9]+$ && "$anchor_after" -gt "$anchor_before" && "$reanchor" == 0 ]] && anchored=1
     printf '%s %s\n' "$anchored" "$unexpected" > "$fence_state.tmp"

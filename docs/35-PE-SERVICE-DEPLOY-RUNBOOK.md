@@ -366,7 +366,10 @@ The run stops at the first complete same-invocation proof, the first unsafe obse
 exit, or its bound. PASS requires the reviewed revision, a complete ordinary poll after start,
 successful re-anchor, real readiness, healthy critical owners, identical safe
 before/after privileged account censuses, the expected authorization-denied child snapshot, and no
-credit loss, unexpected fence/error, or successful database write. Immediately before PASS, the
+credit loss, unexpected fence/error, or successful database write. For this rehearsal, an
+unexpected fence is a `wallet_fences` row whose cause is outside the explicit incident-reviewed
+allowlist in `rehearsal545.sh`; membership in `WalletFenceCause` alone does not make a newly
+observed fence expected. Immediately before PASS, the
 harness quiesces the child, synchronously rescans one exact complete service-log prefix, queries the
 current anchor/reanchor/fence database observation, and takes the final privileged account census.
 The result binds that prefix's byte length and SHA-256 plus the database and census values; unsafe
