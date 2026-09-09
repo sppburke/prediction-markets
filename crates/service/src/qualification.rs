@@ -5358,6 +5358,10 @@ fn start_envelope(
 }
 
 #[cfg(test)]
+#[path = "qualification/selection_oracle.rs"]
+mod selection_oracle;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use pe_core_types::{
@@ -5385,6 +5389,7 @@ mod tests {
     };
     use rust_decimal_macros::dec;
 
+    use super::selection_oracle;
     use super::*;
     use crate::paper_recovery::PaperEra;
 
@@ -10783,309 +10788,6 @@ mod tests {
         }
     }
 
-    struct SelectionOracleFixture {
-        _temp: tempfile::TempDir,
-        state: PaperStateDb,
-        source_path: PathBuf,
-        start: TailBinding,
-        sealed: TailBinding,
-    }
-
-    fn selection_oracle_cases() -> [&'static str; 16] {
-        [
-            "empty_history",
-            "start_only",
-            "post_start_v3",
-            "post_start_v4",
-            "pre_start_websocket_v3",
-            "pre_start_websocket_v4",
-            "post_start_sell",
-            "pending_without_decision",
-            "open_decision",
-            "semantic_revision_drift",
-            "complete_read_drift",
-            "missing_read_commitment",
-            "receipt_hash_mismatch",
-            "downgraded_v4",
-            "commitment_wrong_source",
-            "missing_activity_group",
-        ]
-    }
-
-    fn selection_oracle_websocket(continuation: &DecisionContinuationV3) -> SourceObservation {
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "proxyWallet": continuation.facts.wallet.to_string(),
-            "conditionId": "0xoracle",
-            "asset": "0xoracle",
-            "side": "BUY",
-            "size": 1,
-            "price": 0.5,
-            "timestamp": 100,
-            "transactionHash": "0xoracle",
-            "outcomeIndex": 0
-        }))
-        .unwrap();
-        let mut websocket = activity_observation(1, &payload);
-        websocket.source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
-        websocket
-    }
-
-    fn materialize_selection_source(
-        path: &Path,
-        continuations: &mut [&mut DecisionContinuationV3],
-        observations: BTreeMap<u64, SourceObservation>,
-    ) -> (TailBinding, BTreeMap<u64, TailBinding>) {
-        let mut writer = Writer::open(path).unwrap();
-        let empty = TailBinding::from(&Scanner::verify(path).unwrap());
-        let mut boundaries = BTreeMap::new();
-        for (logical_sequence, mut observation) in observations {
-            if observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
-                && let Some(continuation) = continuations
-                    .iter()
-                    .find(|continuation| continuation.read_commitment == Some(observation.receipt))
-            {
-                let fixed_end = continuation.facts.decision_inputs["fixed_end"]
-                    .as_i64()
-                    .unwrap();
-                let pages = serde_json::from_value::<Vec<ReconciliationPageEvidence>>(
-                    continuation.facts.decision_inputs["pages"].clone(),
-                )
-                .unwrap();
-                observation.payload = crate::bucket_commit::activity_read_commitment_payload(
-                    continuation.facts.wallet,
-                    fixed_end,
-                    continuation.page_occurrences(),
-                    &pages,
-                )
-                .unwrap();
-            }
-            let old_receipt = observation.receipt;
-            let actual_receipt = writer
-                .append_synced(EnvelopeIn {
-                    source_id: SourceId(observation.source_id),
-                    schema_version: observation.schema_version,
-                    parser_version: observation.parser_version,
-                    observed_at: observation.observed_at,
-                    received_at: observation.received_at,
-                    content_type: observation.content_type,
-                    payload: observation.payload,
-                })
-                .unwrap();
-            for continuation in continuations.iter_mut() {
-                for page in &mut continuation.page_occurrences {
-                    if page.receipt == old_receipt {
-                        page.receipt = actual_receipt;
-                    }
-                }
-                if continuation.observed_source_receipt == Some(old_receipt) {
-                    continuation.observed_source_receipt = Some(actual_receipt);
-                }
-                if continuation.read_commitment == Some(old_receipt) {
-                    continuation.read_commitment = Some(actual_receipt);
-                }
-            }
-            boundaries.insert(
-                logical_sequence,
-                TailBinding::from(&Scanner::verify(path).unwrap()),
-            );
-        }
-        drop(writer);
-        let sealed = boundaries
-            .last_key_value()
-            .map_or(empty.clone(), |(_, binding)| binding.clone());
-        (sealed, boundaries)
-    }
-
-    fn build_selection_oracle_fixture(case: &str) -> SelectionOracleFixture {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.log");
-        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
-        if case == "empty_history" {
-            let mut no_continuations = Vec::new();
-            let (sealed, _) = materialize_selection_source(
-                &source_path,
-                no_continuations.as_mut_slice(),
-                BTreeMap::new(),
-            );
-            return SelectionOracleFixture {
-                _temp: temp,
-                state,
-                source_path,
-                start: sealed.clone(),
-                sealed,
-            };
-        }
-
-        let committed = matches!(
-            case,
-            "post_start_v4"
-                | "pre_start_websocket_v4"
-                | "missing_read_commitment"
-                | "receipt_hash_mismatch"
-                | "downgraded_v4"
-                | "commitment_wrong_source"
-        );
-        let (mut continuation, mut observations) =
-            single_read_fixture(2, "0xoracle", "BUY", committed);
-        if matches!(case, "pre_start_websocket_v3" | "pre_start_websocket_v4") {
-            let websocket = selection_oracle_websocket(&continuation);
-            continuation.observed_source_receipt = Some(websocket.receipt);
-            continuation.facts.provenance = pe_copy_signal_engine::TradeProvenance::ActivityWs;
-            observations.insert(1, websocket);
-        }
-        if case == "commitment_wrong_source" {
-            let sequence = continuation.read_commitment.unwrap().sequence.0;
-            observations.get_mut(&sequence).unwrap().source_id =
-                crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned();
-        }
-        let (sealed, boundaries) =
-            materialize_selection_source(&source_path, &mut [&mut continuation], observations);
-        let start = if case.starts_with("pre_start_websocket") {
-            boundaries.get(&1).unwrap().clone()
-        } else if case == "start_only" {
-            sealed.clone()
-        } else {
-            TailBinding::from(&LogTailBinding {
-                path: std::fs::canonicalize(&source_path).unwrap(),
-                physical_tail: 5,
-                last_sequence: None,
-                last_hash: blake3::Hash::from_bytes([0; 32]),
-            })
-        };
-
-        match case {
-            "start_only" | "missing_activity_group" => {}
-            "post_start_sell" => {
-                store_read_decision(&state, &continuation, "not_buy", false);
-            }
-            "pending_without_decision" => {
-                store_read_decision(&state, &continuation, "decision_pending", false);
-            }
-            _ => store_read_decision(&state, &continuation, "decision_pending", true),
-        }
-
-        let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
-        match case {
-            "open_decision" => {
-                connection
-                    .execute(
-                        "UPDATE decision_pending SET state = 'open', terminal_disposition = NULL",
-                        [],
-                    )
-                    .unwrap();
-            }
-            "semantic_revision_drift" => {
-                connection
-                    .execute(
-                        "UPDATE activity_groups SET semantic_revision = 'different'",
-                        [],
-                    )
-                    .unwrap();
-            }
-            "complete_read_drift" => {
-                let mut changed = continuation.clone();
-                changed.facts.decision_inputs["fixed_end"] = serde_json::json!(101);
-                connection
-                    .execute(
-                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
-                        [serde_json::to_string(&changed).unwrap()],
-                    )
-                    .unwrap();
-            }
-            "missing_read_commitment" => {
-                let mut changed = serde_json::to_value(&continuation).unwrap();
-                changed.as_object_mut().unwrap().remove("read_commitment");
-                connection
-                    .execute(
-                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
-                        [changed.to_string()],
-                    )
-                    .unwrap();
-            }
-            "receipt_hash_mismatch" => {
-                let mut changed = serde_json::to_value(&continuation).unwrap();
-                changed["read_commitment"]["this_hash"] =
-                    serde_json::json!(blake3::hash(b"wrong").to_hex().to_string());
-                connection
-                    .execute(
-                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
-                        [changed.to_string()],
-                    )
-                    .unwrap();
-            }
-            "downgraded_v4" => {
-                let mut changed = serde_json::to_value(&continuation).unwrap();
-                changed["version"] = serde_json::json!(3);
-                changed.as_object_mut().unwrap().remove("read_commitment");
-                connection
-                    .execute(
-                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
-                        [changed.to_string()],
-                    )
-                    .unwrap();
-            }
-            _ => {}
-        }
-        SelectionOracleFixture {
-            _temp: temp,
-            state,
-            source_path,
-            start,
-            sealed,
-        }
-    }
-
-    fn qualification_error_variant(error: &QualificationError) -> &'static str {
-        match error {
-            QualificationError::PaperLog(_) => "PaperLog",
-            QualificationError::EventLog(_) => "EventLog",
-            QualificationError::PaperState(_) => "PaperState",
-            QualificationError::Json(_) => "Json",
-            QualificationError::Io(_) => "Io",
-            QualificationError::InsufficientEvidence(_) => "InsufficientEvidence",
-        }
-    }
-
-    fn render_selection_oracle_result(
-        result: Result<SelectedDecisionRows, QualificationError>,
-    ) -> String {
-        match result {
-            Ok(selected) => format!(
-                "Ok\nrows: {:?}\nin_prefix: {:?}",
-                selected.rows, selected.in_prefix
-            ),
-            Err(error) => format!(
-                "Err\nvariant: {}\ntext: {}",
-                qualification_error_variant(&error),
-                error
-            ),
-        }
-    }
-
-    fn selection_oracle_output() -> String {
-        let mut output = String::new();
-        for case in selection_oracle_cases() {
-            let fixture = build_selection_oracle_fixture(case);
-            let rendered = render_selection_oracle_result(decision_rows_for_source_prefix(
-                &fixture.state,
-                &fixture.source_path,
-                &fixture.start,
-                &fixture.sealed,
-            ));
-            output.push_str(&format!("=== {case} ===\n{rendered}\n"));
-        }
-        output
-    }
-
-    /// Regenerate the pre-refactor selection characterization data for GitHub issue #574.
-    #[test]
-    #[ignore = "deliberately regenerates checked-in qualification selection characterization"]
-    fn regenerate_qualification_selection_oracle() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/qualification_selection_oracle.txt");
-        fs::write(path, selection_oracle_output()).unwrap();
-    }
-
     fn assert_selection_results_equal(
         map: Result<SelectedDecisionRows, QualificationError>,
         indexed: Result<(SelectedDecisionRows, TailBinding), QualificationError>,
@@ -11101,8 +10803,8 @@ mod tests {
             }
             (Err(map), Err(indexed)) => {
                 assert_eq!(
-                    qualification_error_variant(&map),
-                    qualification_error_variant(&indexed)
+                    selection_oracle::qualification_error_variant(&map),
+                    selection_oracle::qualification_error_variant(&indexed)
                 );
                 assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
             }
@@ -11114,37 +10816,57 @@ mod tests {
         }
     }
 
+    fn assert_selection_oracle_case(case: &str) {
+        let oracle = include_str!("../tests/fixtures/qualification_selection_oracle.txt");
+        let fixture = selection_oracle::build_selection_oracle_fixture(case);
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let candidate = fixture.candidate();
+        let map = decision_rows_for_source_prefix(
+            &fixture.state,
+            &fixture.source_path,
+            &fixture.start,
+            &fixture.sealed,
+        );
+        let indexed = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        );
+        let expected = selection_oracle::expected_selection_oracle_result(oracle, case);
+        assert_eq!(
+            selection_oracle::render_selection_oracle_result(map.as_ref()),
+            expected,
+            "Map selection differs for oracle case {case}"
+        );
+        assert_eq!(
+            selection_oracle::render_selection_oracle_result(
+                indexed.as_ref().map(|(selected, _)| selected)
+            ),
+            expected,
+            "Index selection differs for oracle case {case}"
+        );
+        assert_selection_results_equal(map, indexed, &fixture.sealed);
+    }
+
     /// The offline Map adapter and runtime Index adapter preserve the pre-#574 characterization.
     #[test]
     fn qualification_selection_matches_characterization_through_both_adapters() {
+        let oracle = include_str!("../tests/fixtures/qualification_selection_oracle.txt");
         assert_eq!(
-            selection_oracle_output(),
-            include_str!("../tests/fixtures/qualification_selection_oracle.txt")
+            selection_oracle::selection_oracle_output(),
+            oracle,
+            "Map selection differs from the frozen pre-#574 characterization"
         );
-        for case in selection_oracle_cases() {
-            let fixture = build_selection_oracle_fixture(case);
-            let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
-            let candidate = Scanner::verify(&fixture.source_path).unwrap();
-            let map = decision_rows_for_source_prefix(
-                &fixture.state,
-                &fixture.source_path,
-                &fixture.start,
-                &fixture.sealed,
-            );
-            let indexed = decision_rows_for_indexed_source_prefix(
-                &fixture.state,
-                &index,
-                &candidate,
-                &fixture.start,
-            );
-            assert_selection_results_equal(map, indexed, &fixture.sealed);
+        for case in selection_oracle::selection_oracle_cases() {
+            assert_selection_oracle_case(case);
         }
     }
 
     /// Both #574 adapters return identical point evidence and exact receipt refusals.
     #[test]
     fn sealed_source_map_and_index_adapters_are_equivalent() {
-        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
         let observations = source_observations(&fixture.source_path, &fixture.sealed).unwrap();
         let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
         let present = observations.first_key_value().unwrap().1.receipt;
@@ -11173,8 +10895,8 @@ mod tests {
                 .unwrap_err();
             let indexed_receipt = SealedSource::Index(&index).receipt(receipt).unwrap_err();
             assert_eq!(
-                qualification_error_variant(&map_receipt),
-                qualification_error_variant(&indexed_receipt)
+                selection_oracle::qualification_error_variant(&map_receipt),
+                selection_oracle::qualification_error_variant(&indexed_receipt)
             );
             assert_eq!(
                 map_receipt.to_string().as_bytes(),
@@ -11187,8 +10909,8 @@ mod tests {
                 .observation(receipt)
                 .unwrap_err();
             assert_eq!(
-                qualification_error_variant(&map),
-                qualification_error_variant(&indexed)
+                selection_oracle::qualification_error_variant(&map),
+                selection_oracle::qualification_error_variant(&indexed)
             );
             assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
         }
@@ -11197,7 +10919,7 @@ mod tests {
     /// An indexed #574 point read maps the underlying risk-input failure without hiding its text.
     #[test]
     fn sealed_source_index_maps_point_read_failure() {
-        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
         let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
         let present = index.receipt_at(EventSeq(0)).unwrap().unwrap().0;
         fs::OpenOptions::new()
@@ -11220,7 +10942,7 @@ mod tests {
     #[test]
     fn indexed_selection_distinguishes_unreached_prefix_from_corruption() {
         for mismatch_hash in [false, true] {
-            let fixture = build_selection_oracle_fixture("post_start_v3");
+            let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
             let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
             let mut candidate = Scanner::verify(&fixture.source_path).unwrap();
             if mismatch_hash {
@@ -11247,7 +10969,7 @@ mod tests {
             ));
         }
 
-        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
         let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
         let candidate = Scanner::verify(&fixture.source_path).unwrap();
         let mut bytes = fs::read(&fixture.source_path).unwrap();
@@ -11263,245 +10985,39 @@ mod tests {
         assert!(matches!(error, QualificationError::EventLog(_)), "{error}");
     }
 
-    fn assert_selection_fixture_refuses(fixture: &SelectionOracleFixture, expected: &str) {
-        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
-        let candidate = Scanner::verify(&fixture.source_path).unwrap();
-        let map = decision_rows_for_source_prefix(
-            &fixture.state,
-            &fixture.source_path,
-            &fixture.start,
-            &fixture.sealed,
-        );
-        let indexed = decision_rows_for_indexed_source_prefix(
-            &fixture.state,
-            &index,
-            &candidate,
-            &fixture.start,
-        );
-        assert!(
-            map.as_ref()
-                .is_err_and(|error| error.to_string().contains(expected)),
-            "Map did not contain {expected:?}: {map:?}"
-        );
-        assert!(
-            indexed
-                .as_ref()
-                .is_err_and(|error| error.to_string().contains(expected)),
-            "Index did not contain {expected:?}: {indexed:?}"
-        );
-        assert_selection_results_equal(map, indexed, &fixture.sealed);
-    }
-
-    fn raw_activity_selection_fixture(
-        payload: &[u8],
-        schema_version: u32,
-        parser_version: u32,
-        content_type: ContentType,
-    ) -> SelectionOracleFixture {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.log");
-        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
-        let mut writer = Writer::open(&source_path).unwrap();
-        let start = TailBinding::from(&Scanner::verify(&source_path).unwrap());
-        let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
-        writer
-            .append_synced(EnvelopeIn {
-                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
-                schema_version,
-                parser_version,
-                observed_at: SourceTimestamp(at),
-                received_at: ReceivedAt(at),
-                content_type,
-                payload: payload.to_vec(),
-            })
-            .unwrap();
-        drop(writer);
-        let sealed = TailBinding::from(&Scanner::verify(&source_path).unwrap());
-        SelectionOracleFixture {
-            _temp: temp,
-            state,
-            source_path,
-            start,
-            sealed,
-        }
-    }
-
-    fn websocket_selection_fixture(
-        payload: &[u8],
-        source_id: &str,
-        schema_version: u32,
-        parser_version: u32,
-    ) -> SelectionOracleFixture {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.log");
-        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
-        let (mut continuation, mut observations) = single_read_fixture(2, "0xoracle", "BUY", false);
-        let mut websocket = activity_observation(1, payload);
-        websocket.source_id = source_id.to_owned();
-        websocket.schema_version = schema_version;
-        websocket.parser_version = parser_version;
-        continuation.observed_source_receipt = Some(websocket.receipt);
-        continuation.facts.provenance = pe_copy_signal_engine::TradeProvenance::ActivityWs;
-        observations.insert(1, websocket);
-        let (sealed, _) =
-            materialize_selection_source(&source_path, &mut [&mut continuation], observations);
-        store_read_decision(&state, &continuation, "decision_pending", true);
-        SelectionOracleFixture {
-            _temp: temp,
-            state,
-            source_path,
-            start: TailBinding {
-                physical_tail: 5,
-                last_sequence: None,
-                last_hash: "00".repeat(32),
-            },
-            sealed,
-        }
-    }
-
     /// Malformed pages and every activity-page contract component refuse identically (#574).
     #[test]
     fn selection_refuses_malformed_activity_pages_through_both_entries() {
-        let cases = [
-            (
-                b"{".as_slice(),
-                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                ContentType::Json,
-                "activity observation JSON failed",
-            ),
-            (
-                br#"[{"type":"TRADE"}]"#.as_slice(),
-                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                ContentType::Json,
-                "activity observation parse failed",
-            ),
-            (
-                b"[]".as_slice(),
-                99,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                ContentType::Json,
-                "wrong source contract",
-            ),
-            (
-                b"[]".as_slice(),
-                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                99,
-                ContentType::Json,
-                "wrong source contract",
-            ),
-            (
-                b"[]".as_slice(),
-                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                ContentType::Raw,
-                "wrong source contract",
-            ),
-        ];
-        for (payload, schema, parser, content_type, expected) in cases {
-            let fixture = raw_activity_selection_fixture(payload, schema, parser, content_type);
-            assert_selection_fixture_refuses(&fixture, expected);
+        for case in [
+            "malformed_activity_page_json",
+            "activity_page_row_parse_failure",
+            "activity_page_wrong_schema",
+            "activity_page_wrong_parser",
+            "activity_page_wrong_content_type",
+        ] {
+            assert_selection_oracle_case(case);
         }
     }
 
     /// Malformed, wrong-contract, and wrong-key websocket evidence refuse identically (#574).
     #[test]
     fn selection_refuses_invalid_websocket_evidence_through_both_entries() {
-        let correct =
-            selection_oracle_websocket(&single_read_fixture(2, "0xoracle", "BUY", false).0);
-        let cases = [
-            (
-                b"{".as_slice(),
-                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
-                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                "decision websocket observation 0 is invalid",
-            ),
-            (
-                correct.payload.as_slice(),
-                "wrong.websocket.source",
-                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                "decision websocket observation has the wrong source contract",
-            ),
-            (
-                correct.payload.as_slice(),
-                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
-                99,
-                pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                "decision websocket observation has the wrong source contract",
-            ),
-        ];
-        for (payload, source_id, schema, parser, expected) in cases {
-            let fixture = websocket_selection_fixture(payload, source_id, schema, parser);
-            assert_selection_fixture_refuses(&fixture, expected);
-        }
-
-        let different = serde_json::to_vec(&serde_json::json!({
-            "proxyWallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "conditionId": "0xdifferent",
-            "asset": "0xdifferent",
-            "side": "BUY",
-            "size": 1,
-            "price": 0.5,
-            "timestamp": 100,
-            "transactionHash": "0xdifferent",
-            "outcomeIndex": 0
-        }))
-        .unwrap();
-        let fixture = websocket_selection_fixture(
-            &different,
-            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
-            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-        );
-        assert_selection_fixture_refuses(
-            &fixture,
-            "decision websocket observation has the wrong source contract",
-        );
+        assert_selection_oracle_case("malformed_websocket_payload");
+        assert_selection_oracle_case("websocket_wrong_contract");
+        assert_selection_oracle_case("websocket_different_trade_key");
     }
 
     /// Receipt mismatch and sealed-prefix mismatch retain their exact shared refusal (#574).
     #[test]
     fn selection_receipt_and_prefix_refusals_match_through_both_entries() {
-        let receipt = build_selection_oracle_fixture("receipt_hash_mismatch");
-        assert_selection_fixture_refuses(
-            &receipt,
-            "decision source receipt does not match the sealed source prefix",
-        );
-
-        let fixture = build_selection_oracle_fixture("post_start_v3");
-        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
-        let mut map_prefix = fixture.sealed.clone();
-        map_prefix.last_hash = blake3::hash(b"wrong").to_hex().to_string();
-        let mut candidate = Scanner::verify(&fixture.source_path).unwrap();
-        candidate.last_hash = blake3::hash(b"wrong");
-        let map = decision_rows_for_source_prefix(
-            &fixture.state,
-            &fixture.source_path,
-            &fixture.start,
-            &map_prefix,
-        )
-        .unwrap_err();
-        let indexed = decision_rows_for_indexed_source_prefix(
-            &fixture.state,
-            &index,
-            &candidate,
-            &fixture.start,
-        )
-        .unwrap_err();
-        assert_eq!(
-            map.to_string(),
-            "insufficient qualification evidence: source observations do not reach the sealed sequence/hash prefix"
-        );
-        assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
+        assert_selection_oracle_case("receipt_hash_mismatch");
+        assert_selection_oracle_case("sealed_prefix_not_reached");
     }
 
     /// A stale #574 index cannot reconstruct a page that the candidate file carries.
     #[test]
     fn indexed_selection_refuses_reconstructed_page_absent_from_index() {
-        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
         let candidate = Scanner::verify(&fixture.source_path).unwrap();
         assert!(
             decision_rows_for_source_prefix(
@@ -11528,323 +11044,37 @@ mod tests {
     /// Earliest source membership at-or-before Start is excluded by both #574 entries.
     #[test]
     fn source_universe_membership_before_start_is_not_selected() {
-        let fixture = build_selection_oracle_fixture("start_only");
-        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
-        let candidate = Scanner::verify(&fixture.source_path).unwrap();
-        let map = decision_rows_for_source_prefix(
-            &fixture.state,
-            &fixture.source_path,
-            &fixture.start,
-            &fixture.sealed,
-        )
-        .unwrap();
-        let (indexed, _) = decision_rows_for_indexed_source_prefix(
-            &fixture.state,
-            &index,
-            &candidate,
-            &fixture.start,
-        )
-        .unwrap();
-        assert!(map.rows.is_empty());
-        assert!(map.in_prefix.is_empty());
-        assert_eq!(map.rows, indexed.rows);
-        assert_eq!(map.in_prefix, indexed.in_prefix);
-    }
-
-    fn continuation_for_activity_page(
-        observation: &SourceObservation,
-        payload: &[u8],
-        condition: &str,
-    ) -> DecisionContinuationV3 {
-        let aggregate = parsed_aggregates(&[payload])
-            .into_iter()
-            .find(|aggregate| {
-                aggregate
-                    .group_id
-                    .components()
-                    .condition_id
-                    .as_ref()
-                    .is_some_and(|candidate| candidate.0 == condition)
-            })
-            .unwrap();
-        let components = aggregate.group_id.components();
-        let mut frozen = classification_fixture().0.facts;
-        frozen.source_trade_id = aggregate.group_id.key().clone();
-        frozen.semantic_revision = aggregate.semantic_revision.as_str().to_owned();
-        frozen.transaction_hash = components.transaction_hash.clone();
-        frozen.wallet = components.wallet;
-        frozen.source_epoch = 100;
-        frozen.market_id = MarketId(VenueMarketId(condition.to_owned()));
-        frozen.outcome_id = components.outcome.unwrap();
-        frozen.side = components.side.unwrap();
-        frozen.share_amount = aggregate.share_sum;
-        frozen.price = aggregate.volume_weighted_price().unwrap();
-        let (page, evidence) = activity_page_pair(observation, payload, None, 100, 0);
-        frozen.decision_inputs = serde_json::json!({"fixed_end": 100, "pages": [evidence]});
-        DecisionContinuationV3::new(frozen, None, vec![page], None)
-    }
-
-    fn two_decision_read_fixture(kind: &str) -> SelectionOracleFixture {
-        let payload = activity_payload(vec![
-            activity_row("0xread-a", "read-a", "1", "0.5", "0xread-a", 100),
-            activity_row("0xread-b", "read-b", "1", "0.5", "0xread-b", 100),
-        ]);
-        let observation = activity_observation(2, &payload);
-        let mut first = continuation_for_activity_page(&observation, &payload, "0xread-a");
-        let mut second = continuation_for_activity_page(&observation, &payload, "0xread-b");
-        first.facts.source_epoch = 99;
-        match kind {
-            "disagree" => {
-                second.facts.decision_inputs["agreement_marker"] = serde_json::json!(false);
-            }
-            "overlap" => {
-                let request_url = activity_request_url(None, 101, 0);
-                second.page_occurrences[0].request_url = request_url.clone();
-                second.facts.decision_inputs["fixed_end"] = serde_json::json!(101);
-                second.facts.decision_inputs["pages"][0]["request_url"] =
-                    serde_json::json!(request_url);
-                second.facts.decision_inputs["pages"][0]["bounds"]["end"] = serde_json::json!(101);
-            }
-            "repeat" => {}
-            _ => unreachable!(),
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.log");
-        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
-        let (sealed, _) = materialize_selection_source(
-            &source_path,
-            &mut [&mut first, &mut second],
-            BTreeMap::from([(2, observation)]),
-        );
-        store_read_decision(&state, &first, "decision_pending", true);
-        if kind == "repeat" {
-            store_read_decision(&state, &second, "not_buy", false);
-            let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE decision_pending_unconstrained AS SELECT * FROM decision_pending;
-                     INSERT INTO decision_pending_unconstrained SELECT * FROM decision_pending;
-                     DROP TABLE decision_pending;
-                     ALTER TABLE decision_pending_unconstrained RENAME TO decision_pending;",
-                )
-                .unwrap();
-        } else {
-            store_read_decision(&state, &second, "decision_pending", true);
-        }
-        SelectionOracleFixture {
-            _temp: temp,
-            state,
-            source_path,
-            start: TailBinding {
-                physical_tail: 5,
-                last_sequence: None,
-                last_hash: "00".repeat(32),
-            },
-            sealed,
-        }
-    }
-
-    fn conflicting_revision_fixture() -> SelectionOracleFixture {
-        let first_payload = activity_payload(vec![
-            activity_row(
-                "0xrevision-a",
-                "revision-a",
-                "1",
-                "0.5",
-                "0xrevision-a",
-                100,
-            ),
-            activity_row(
-                "0xrevision-b",
-                "revision-b",
-                "1",
-                "0.5",
-                "0xrevision-b",
-                100,
-            ),
-        ]);
-        let second_payload = activity_payload(vec![
-            activity_row("0xrevision-a", "revision-a", "2", "1", "0xrevision-a", 100),
-            activity_row("0xrevision-b", "revision-b", "2", "1", "0xrevision-b", 100),
-        ]);
-        let first_observation = activity_observation(1, &first_payload);
-        let second_observation = activity_observation(2, &second_payload);
-        let mut first =
-            continuation_for_activity_page(&first_observation, &first_payload, "0xrevision-a");
-        let mut second =
-            continuation_for_activity_page(&second_observation, &second_payload, "0xrevision-b");
-        first.facts.source_epoch = 99;
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.log");
-        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
-        let (sealed, _) = materialize_selection_source(
-            &source_path,
-            &mut [&mut first, &mut second],
-            BTreeMap::from([(1, first_observation), (2, second_observation)]),
-        );
-        store_read_decision(&state, &first, "decision_pending", true);
-        store_read_decision(&state, &second, "decision_pending", true);
-        SelectionOracleFixture {
-            _temp: temp,
-            state,
-            source_path,
-            start: TailBinding {
-                physical_tail: 5,
-                last_sequence: None,
-                last_hash: "00".repeat(32),
-            },
-            sealed,
-        }
-    }
-
-    fn absent_complete_read_trade_fixture() -> SelectionOracleFixture {
-        let (mut page_trade, mut observations) =
-            single_read_fixture(2, "0xpage-trade", "BUY", false);
-        let (mut decision, _) = single_read_fixture(2, "0xdecision-trade", "BUY", false);
-        decision.page_occurrences = page_trade.page_occurrences.clone();
-        decision.facts.decision_inputs = page_trade.facts.decision_inputs.clone();
-        let websocket_payload = serde_json::to_vec(&serde_json::json!({
-            "proxyWallet": decision.facts.wallet.to_string(),
-            "conditionId": "0xdecision-trade",
-            "asset": "0xdecision-trade",
-            "side": "BUY",
-            "size": 1,
-            "price": 0.5,
-            "timestamp": 100,
-            "transactionHash": "0xdecision-trade",
-            "outcomeIndex": 0
-        }))
-        .unwrap();
-        let mut websocket = activity_observation(1, &websocket_payload);
-        websocket.source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
-        decision.observed_source_receipt = Some(websocket.receipt);
-        decision.facts.provenance = pe_copy_signal_engine::TradeProvenance::ActivityWs;
-        observations.insert(1, websocket);
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.log");
-        let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
-        let (sealed, _) = materialize_selection_source(
-            &source_path,
-            &mut [&mut page_trade, &mut decision],
-            observations,
-        );
-        store_read_decision(&state, &page_trade, "not_buy", false);
-        store_read_decision(&state, &decision, "decision_pending", true);
-        SelectionOracleFixture {
-            _temp: temp,
-            state,
-            source_path,
-            start: TailBinding {
-                physical_tail: 5,
-                last_sequence: None,
-                last_hash: "00".repeat(32),
-            },
-            sealed,
-        }
+        assert_selection_oracle_case("source_universe_membership_before_start");
     }
 
     /// Complete-read disagreement, repetition, overlap, reconstruction, and revision failures are
     /// one shared #574 refusal surface for Map and Index.
     #[test]
     fn selection_complete_read_refusals_match_through_both_entries() {
-        for (kind, expected) in [
-            (
-                "disagree",
-                "decision continuations disagree about one complete activity read",
-            ),
-            (
-                "repeat",
-                "complete activity read repeats a decision identity",
-            ),
-            (
-                "overlap",
-                "complete activity reads overlap source page receipts",
-            ),
+        for case in [
+            "disagreeing_complete_reads",
+            "repeated_complete_read",
+            "overlapping_complete_reads",
+            "complete_read_reconstruction_failure",
+            "conflicting_semantic_revisions",
+            "trade_absent_from_complete_read",
         ] {
-            let fixture = two_decision_read_fixture(kind);
-            assert_selection_fixture_refuses(&fixture, expected);
+            assert_selection_oracle_case(case);
         }
-        let reconstruction = build_selection_oracle_fixture("complete_read_drift");
-        assert_selection_fixture_refuses(
-            &reconstruction,
-            "complete activity read does not reach its fixed end",
-        );
-        let revisions = conflicting_revision_fixture();
-        assert_selection_fixture_refuses(
-            &revisions,
-            "has multiple semantic revisions in the sealed prefix",
-        );
-        let absent = absent_complete_read_trade_fixture();
-        assert_selection_fixture_refuses(&absent, "is absent from its complete activity read");
-    }
-
-    fn additional_decision_fixture() -> SelectionOracleFixture {
-        let fixture = build_selection_oracle_fixture("post_start_v3");
-        let connection = rusqlite::Connection::open(fixture._temp.path().join("paper.db")).unwrap();
-        let frozen: String = connection
-            .query_row(
-                "SELECT frozen_inputs_json FROM decision_pending",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let mut changed = serde_json::from_str::<serde_json::Value>(&frozen).unwrap();
-        changed["semantic_revision"] = serde_json::json!("additional");
-        connection
-            .execute("UPDATE activity_groups SET disposition = 'not_buy'", [])
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE decision_pending SET semantic_revision = 'additional', frozen_inputs_json = ?1",
-                [changed.to_string()],
-            )
-            .unwrap();
-        fixture
     }
 
     /// Missing and additional terminal decisions retain the #574 Map/Index refusal text.
     #[test]
     fn selection_decision_cardinality_refusals_match_through_both_entries() {
-        for case in ["pending_without_decision", "open_decision"] {
-            let fixture = build_selection_oracle_fixture(case);
-            assert_selection_fixture_refuses(
-                &fixture,
-                "has no reconstructable receipt-bearing decision",
-            );
-        }
-        let additional = additional_decision_fixture();
-        assert_selection_fixture_refuses(&additional, "is additional to the parsed source prefix");
+        assert_selection_oracle_case("additional_decision_row");
+        assert_selection_oracle_case("repeated_decision_row");
+        assert_selection_oracle_case("missing_decision_row");
     }
 
     /// SQLite history failure still precedes deferred source-universe failure for #574.
     #[test]
     fn selection_history_error_precedes_universe_error_through_both_entries() {
-        let fixture = raw_activity_selection_fixture(
-            b"{",
-            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-            ContentType::Json,
-        );
-        rusqlite::Connection::open(fixture._temp.path().join("paper.db"))
-            .unwrap()
-            .execute("DROP TABLE decision_pending", [])
-            .unwrap();
-        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
-        let candidate = Scanner::verify(&fixture.source_path).unwrap();
-        let map = decision_rows_for_source_prefix(
-            &fixture.state,
-            &fixture.source_path,
-            &fixture.start,
-            &fixture.sealed,
-        );
-        let indexed = decision_rows_for_indexed_source_prefix(
-            &fixture.state,
-            &index,
-            &candidate,
-            &fixture.start,
-        );
-        assert!(matches!(map, Err(QualificationError::PaperState(_))));
-        assert!(matches!(indexed, Err(QualificationError::PaperState(_))));
+        assert_selection_oracle_case("history_before_universe_error_precedence");
     }
 
     #[cfg(target_os = "linux")]
@@ -11864,7 +11094,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn indexed_selection_reads_one_large_source_prefix() {
-        let fixture = build_selection_oracle_fixture("post_start_v3");
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
         let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
         let mut writer = Writer::open(&fixture.source_path).unwrap();
         for frame in 0..20_000_u64 {

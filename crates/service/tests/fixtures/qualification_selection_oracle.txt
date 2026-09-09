@@ -1,3 +1,7 @@
+# Recorded from pre-#574 base revision dfa00e1c118f3ca21d5bf8a3fd6d6cd36fc19d2d.
+# Command: cargo nextest run -p pe-service regenerate_qualification_selection_oracle --run-ignored ignored-only
+# Run the regenerator on that exact base revision to refresh this file.
+
 === empty_history ===
 Ok
 rows: []
@@ -62,3 +66,83 @@ text: insufficient qualification evidence: complete activity read page has the w
 Err
 variant: InsufficientEvidence
 text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no durable activity group
+=== sealed_prefix_not_reached ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source observations do not reach the sealed sequence/hash prefix
+=== malformed_activity_page_json ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: activity observation JSON failed: invalid type: map, expected a sequence at line 1 column 0
+=== activity_page_row_parse_failure ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: activity observation parse failed: activity window invalidated: activity row 0 omitted proxyWallet
+=== activity_page_wrong_schema ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read page has the wrong source contract
+=== activity_page_wrong_parser ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read page has the wrong source contract
+=== activity_page_wrong_content_type ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read page has the wrong source contract
+=== malformed_websocket_payload ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision websocket observation 0 is invalid
+=== websocket_wrong_contract ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision websocket observation has the wrong source contract
+=== websocket_different_trade_key ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision websocket observation has the wrong source contract
+=== source_universe_membership_before_start ===
+Ok
+rows: []
+in_prefix: []
+=== additional_decision_row ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision_pending row g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79/additional is additional to the parsed source prefix
+=== repeated_decision_row ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: sealed decision evidence repeats a source trade identity
+=== missing_decision_row ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision
+=== disagreeing_complete_reads ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision continuations disagree about one complete activity read
+=== repeated_complete_read ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read repeats a decision identity
+=== overlapping_complete_reads ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity reads overlap source page receipts
+=== complete_read_reconstruction_failure ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision: complete activity read does not reach its fixed end
+=== conflicting_semantic_revisions ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source trade g2:3c37bd7c2d3d19313fe7347e8544c6fab6b3ce5fc7945eb29d5e97255dfafdd3 has multiple semantic revisions in the sealed prefix
+=== trade_absent_from_complete_read ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision source trade g2:c7354946ebcd69ff65dbcbb37e37b5b65d10e4ed3260652c2de30b51bc83779c is absent from its complete activity read
+=== history_before_universe_error_precedence ===
+Err
+variant: PaperState
+text: paper state: sqlite error: no such table: decision_pending
