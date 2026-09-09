@@ -3515,7 +3515,7 @@ mod tests {
                 watchlist_writer_lock: None,
             },
             WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-            Writer::open(&dir.path().join("paper.log")).unwrap(),
+            Writer::open(dir.path().join("paper.log")).unwrap(),
             paper_state.clone(),
             crate::paper_recovery::build_leader_ledger(&paper_state).unwrap(),
             new_shared_health(false),
