@@ -522,6 +522,13 @@ status,database,scenario_path=sys.argv[1:]
 db=sqlite3.connect(database)
 db.execute("insert into position_anchors values(?,?)",("0x0000000000000000000000000000000000000545",2))
 db.execute("update poll_cursors set reanchor_required=0 where wallet_hex=?",("0x0000000000000000000000000000000000000545",))
+fences_path=os.path.join(os.path.dirname(scenario_path),"rehearsal-fences")
+if os.path.exists(fences_path):
+    for line in open(fences_path,encoding="utf-8"):
+        line=line.strip()
+        if line:
+            wallet,cause=line.split("|",1)
+            db.execute("insert into wallet_fences values(?,?)",(wallet,cause))
 db.commit(); db.close()
 value={
  "revision":"1"*40,"updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -903,6 +910,39 @@ assert financial["old_config_sha256"] != financial["target_config_sha256"]
 assert financial["old_environment_sha256"] != financial["target_environment_sha256"]' \
   "$root/pe-activation.json" "$root/pe-financial-era.json" "$root/rehearsal/evidence.json" ||
   fail "joined rehearsal/driver fixture conflated inherited and target identities"
+
+# Scenarios REHEARSAL-FENCES-08A..08C
+# Preconditions: the fake child durably fences non-probe wallets after startup; the probe wallet
+# (...0545) is never fenced.
+# PASS: every allowlisted cause still passes with unexpected_fences:0 and anchored=1; a defined
+# but unlisted cause and a non-enum cause each fail with reason=unsafe_evidence.
+# FAIL: an allowlisted cause fails, or an unlisted cause records REHEARSAL545_PASS.
+root=$TEST_TMP/rehearsal-fences-allowlisted
+setup_rehearsal_fixture "$root" true none
+printf '%s\n' \
+  '0x00000000000000000000000000000000000000a1|order_dependent_equal_second' \
+  '0x00000000000000000000000000000000000000a2|position_underflow' \
+  '0x00000000000000000000000000000000000000a3|conversion_unknown_conditions' \
+  > "$root/test-state/rehearsal-fences"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "allowlisted fence causes did not pass: $output"
+[[ $(<"$root/rehearsal/fences-1111111.state") == '1 0' ]] ||
+  fail "allowlisted fence causes changed the fence/anchor census: $(<"$root/rehearsal/fences-1111111.state")"
+grep -Fq 'unexpected_fences:0' \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_path"])' "$root/rehearsal/evidence.json")" ||
+  fail "allowlisted fence causes were counted as unexpected"
+for fence_cause in position_overflow unexpected_test_cause; do
+  root=$TEST_TMP/rehearsal-fences-$fence_cause
+  setup_rehearsal_fixture "$root" true none
+  printf '%s\n' "0x00000000000000000000000000000000000000b1|$fence_cause" > "$root/test-state/rehearsal-fences"
+  set +e
+  output=$(run_rehearsal_fixture "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=unsafe_evidence"* ]] ||
+    fail "unlisted fence cause $fence_cause did not fail as unsafe evidence: $output"
+  [[ "$output" != *REHEARSAL545_PASS* ]] || fail "unlisted fence cause $fence_cause passed"
+done
 
 # Scenario REHEARSAL-PATHS-UPDATE-01A
 # Preconditions: a clean copied generation whose migration path update fails (#570).
@@ -1916,4 +1956,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
 done
 
-echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03, REHEARSAL-PATHS-UPDATE-01A and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03, REHEARSAL-PATHS-UPDATE-01A, REHEARSAL-FENCES-08A..08C and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
