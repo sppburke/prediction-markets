@@ -566,7 +566,9 @@ it blocks the swap for diagnosis without repairing rows or fabricating dispositi
 uses the same validator and logs `open decision continuations validated` with `open_rows=N` before
 resuming any open row. A boot-time validation failure is a startup error on stderr/journal (live
 fan-out, the HTTP server, and the status writer have not started yet); the row stays intact and the
-unit's `Restart=on-failure` policy repeats the failed start until the row is diagnosed. The ordinary [rollback](#rollback) to a pre-#565 binary is available only
+unit's `Restart=on-failure` policy repeats the failed start until the row is diagnosed. A `paper durability became uncertain` exit (for example after a failed risk-halt append)
+repeats the same way until storage works; preserve the era and the pending rows and diagnose
+storage. The ordinary [rollback](#rollback) to a pre-#565 binary is available only
 before the first synchronized schema-3 reconciliation page. After that boundary, preserve all state
 and use a binary retaining schema-3 page and V4 continuation compatibility; never delete records or
 rewrite rows to make an older reader accept them.
