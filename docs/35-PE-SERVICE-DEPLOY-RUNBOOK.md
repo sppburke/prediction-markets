@@ -541,6 +541,29 @@ pe-service --qualify \
 It emits canonical compact JSON plus one trailing newline and reports its BLAKE3 hash. Only a sealed
 `Pass` under `_GLOSSARY.md` permits the one subsequent manual paper-to-live-tiny review.
 
+### #565 open-continuation census before deployment
+
+Before swapping the binary, quiesce the service and take a consistent copy of the active paper
+state and source log using the SQLite `.backup` and `cp -p` mechanics in
+[`rehearsal545.sh`](../scripts/deploy/rehearsal545.sh). Run only this network-free, read-only census
+against that copy; never run the rehearsal itself for this gate, because it rebinds migration paths,
+sets `reanchor_required`, and boots the service.
+
+```bash
+pe-service --validate-open-continuations \
+  --paper-state <quiesced-copy/paper_state.db> \
+  --source-log <quiesced-copy/source_events.log>
+```
+
+Record stdout, stderr, and the exit status. Success prints `open_rows=N validated=N` and exits zero.
+A validation failure exits nonzero with `open decision continuation <source_trade_id>: <cause>`;
+it blocks the swap for diagnosis without repairing rows or fabricating dispositions. Normal boot
+uses the same validator and logs `open decision continuations validated` with `open_rows=N` before
+resuming any open row. The ordinary [rollback](#rollback) to a pre-#565 binary is available only
+before the first synchronized schema-3 reconciliation page. After that boundary, preserve all state
+and use a binary retaining schema-3 page and V4 continuation compatibility; never delete records or
+rewrite rows to make an older reader accept them.
+
 ## Facts
 
 | item | value |
