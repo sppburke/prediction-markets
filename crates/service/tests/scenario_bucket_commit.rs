@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pe_core_types::{
-    MarketId, MarketOutcomeId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId,
-    SourceTimestamp, VenueMarketId, WalletAddress,
+    MarketId, MarketOutcomeId, OutcomeId, ReconstructionQuality, ShareAmount, VenueMarketId,
+    WalletAddress,
 };
 use pe_paper_state::{
     DecisionPendingState, NoCopyDisposition, PaperStateDb, WalletHistoryStatusRecord,
@@ -28,11 +28,8 @@ use pe_service::paper_recovery::{
     WalletLedgerReplayError, build_leader_ledger, replay_wallet_ledger,
 };
 use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
-use pe_source_polymarket_public::{
-    ActivityAggregate, ActivityParseContext, ActivityTransport, parse_activity_response,
-};
+use pe_source_polymarket_public::ActivityAggregate;
 use serde_json::{Value, json};
-use time::OffsetDateTime;
 
 const WALLET_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const FENCED_WALLET_HEX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -44,37 +41,103 @@ fn wallet() -> WalletAddress {
     WalletAddress::from_hex(WALLET_HEX).unwrap()
 }
 
-fn timestamp(epoch: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(epoch).unwrap()
+/// Keep the source rows beside the parsed group until the complete bucket payload is assembled.
+#[derive(Clone)]
+struct FixtureAggregate {
+    rows: Vec<Value>,
+    aggregate: ActivityAggregate,
 }
 
-fn aggregate_rows_for_wallet(wallet_hex: &str, mut rows: Vec<Value>) -> ActivityAggregate {
+impl std::ops::Deref for FixtureAggregate {
+    type Target = ActivityAggregate;
+    fn deref(&self) -> &Self::Target {
+        &self.aggregate
+    }
+}
+
+fn aggregate_rows_for_wallet(wallet_hex: &str, mut rows: Vec<Value>) -> FixtureAggregate {
     let epoch = rows[0]["timestamp"].as_i64().expect("fixture epoch");
     for row in &mut rows {
         row["proxyWallet"] = json!(wallet_hex);
     }
-    let context = ActivityParseContext {
-        source_id: SourceId("polymarket-data-api".to_owned()),
-        observed_at: SourceTimestamp(timestamp(epoch + 10)),
-        received_at: ReceivedAt(timestamp(epoch + 11)),
-        transport: ActivityTransport::Rest,
-    };
-    let window = parse_activity_response(
-        &serde_json::to_vec(&rows).unwrap(),
+    let read = support::producer_shaped_read(
         WalletAddress::from_hex(wallet_hex).unwrap(),
-        &context,
-    )
-    .unwrap();
-    let mut aggregates = window.aggregates().unwrap();
-    assert_eq!(aggregates.len(), 1);
-    aggregates.remove(0)
+        &serde_json::to_vec(&rows).unwrap(),
+        epoch,
+        epoch + 11,
+        support::scenario_receipt(2),
+    );
+    assert_eq!(read.aggregates.len(), 1);
+    FixtureAggregate {
+        rows,
+        aggregate: read.aggregates.into_iter().next().unwrap(),
+    }
 }
 
-fn aggregate_rows(rows: Vec<Value>) -> ActivityAggregate {
+/// Assemble each commit's complete payload before asking the production engine to commit it.
+trait CommitFixtureRead {
+    fn commit_read(
+        &mut self,
+        groups: Vec<FixtureAggregate>,
+        context: &BucketDecisionContext,
+        basis: pe_service::bucket_commit::FrozenDecisionBasis,
+    ) -> Result<
+        pe_service::bucket_commit::BucketCommitResult,
+        pe_service::bucket_commit::BucketCommitError,
+    >;
+}
+
+impl CommitFixtureRead for BucketCommitEngine {
+    fn commit_read(
+        &mut self,
+        groups: Vec<FixtureAggregate>,
+        template: &BucketDecisionContext,
+        basis: pe_service::bucket_commit::FrozenDecisionBasis,
+    ) -> Result<
+        pe_service::bucket_commit::BucketCommitResult,
+        pe_service::bucket_commit::BucketCommitError,
+    > {
+        let wallet = groups[0].group_id.components().wallet;
+        let fixed_end = groups
+            .iter()
+            .map(|group| group.source_time.0.unix_timestamp())
+            .max()
+            .unwrap();
+        let rows: Vec<_> = groups.iter().flat_map(|group| group.rows.iter()).collect();
+        let read = support::producer_shaped_read(
+            wallet,
+            &serde_json::to_vec(&rows).unwrap(),
+            fixed_end,
+            template.recorded_at_unix,
+            support::scenario_receipt(u64::try_from(fixed_end).unwrap()),
+        );
+        assert_eq!(read.aggregates.len(), groups.len());
+        // Preserve caller order so permutation scenarios still exercise the engine's ordering.
+        let aggregates = groups
+            .iter()
+            .map(|group| {
+                let parsed = read
+                    .aggregates
+                    .iter()
+                    .find(|parsed| parsed.group_id == group.group_id)
+                    .unwrap();
+                assert_eq!(parsed, &group.aggregate);
+                parsed.clone()
+            })
+            .collect();
+        let mut context = template.clone();
+        context.read_commitment = Some(support::scenario_receipt(read.page.receipt.sequence.0 + 1));
+        context.decision_inputs_json = read.decision_inputs_json;
+        context.page_occurrences = vec![read.page];
+        self.commit(aggregates, &context, basis)
+    }
+}
+
+fn aggregate_rows(rows: Vec<Value>) -> FixtureAggregate {
     aggregate_rows_for_wallet(WALLET_HEX, rows)
 }
 
-fn aggregate(row: Value) -> ActivityAggregate {
+fn aggregate(row: Value) -> FixtureAggregate {
     aggregate_rows(vec![row])
 }
 
@@ -87,7 +150,7 @@ fn position_row(
     size: &str,
     price: &str,
     epoch: i64,
-) -> ActivityAggregate {
+) -> FixtureAggregate {
     aggregate(json!({
         "timestamp": epoch,
         "conditionId": market,
@@ -110,7 +173,7 @@ fn pair_effect(
     market: &str,
     size: &str,
     epoch: i64,
-) -> ActivityAggregate {
+) -> FixtureAggregate {
     pair_effect_for_wallet(
         WALLET_HEX,
         activity_type,
@@ -128,7 +191,7 @@ fn pair_effect_for_wallet(
     market: &str,
     size: &str,
     epoch: i64,
-) -> ActivityAggregate {
+) -> FixtureAggregate {
     aggregate_rows_for_wallet(
         wallet_hex,
         vec![json!({
@@ -148,7 +211,7 @@ fn pair_effect_for_wallet(
     )
 }
 
-fn combo_effect(activity_type: &str, transaction_hash: &str, epoch: i64) -> ActivityAggregate {
+fn combo_effect(activity_type: &str, transaction_hash: &str, epoch: i64) -> FixtureAggregate {
     aggregate(json!({
         "timestamp": epoch,
         "conditionId": MARKET_A,
@@ -172,21 +235,12 @@ fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
     }
 }
 fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
-    let proof = support::producer_shaped_activity_page(
-        wallet(),
-        b"[]",
-        epoch,
-        pe_event_log::AppendReceipt {
-            sequence: pe_core_types::EventSeq(u64::try_from(epoch).unwrap()),
-            this_hash: blake3::hash(format!("receipt-{epoch}").as_bytes()),
-        },
-    );
     BucketDecisionContext {
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
         ),
-        decision_inputs_json: proof.0,
-        page_occurrences: vec![proof.1],
+        decision_inputs_json: String::new(),
+        page_occurrences: Vec::new(),
         observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         read_commitment: None,
@@ -290,7 +344,7 @@ fn pre_anchor_groups_are_covered_without_arithmetic_or_copy_side_effects() {
     let sell = position_row("TRADE", "0xcovered2", MARKET_B, 0, "SELL", "4", "0.5", 100);
     let buy = position_row("TRADE", "0xcovered3", MARKET_A, 0, "BUY", "2", "0.5", 100);
     let result = engine
-        .commit(vec![redeem, sell, buy], &context(100, true), zero_basis())
+        .commit_read(vec![redeem, sell, buy], &context(100, true), zero_basis())
         .unwrap();
 
     assert!(
@@ -325,7 +379,7 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     let first = position_row("TRADE", "0xlate1", MARKET_A, 0, "BUY", "1", "0.5", 100);
     let first_id = first.group_id.key().clone();
     let result = engine
-        .commit(vec![first.clone()], &context(100, true), zero_basis())
+        .commit_read(vec![first.clone()], &context(100, true), zero_basis())
         .unwrap();
     assert_eq!(result.dispositions[&first_id.0], "anchor_covered_late");
     assert_eq!(
@@ -342,7 +396,7 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     let partial = position_row("TRADE", "0xlate2", MARKET_B, 0, "BUY", "2", "0.5", 100);
     let partial_id = partial.group_id.key().clone();
     let result = engine
-        .commit(vec![first, partial], &context(100, true), zero_basis())
+        .commit_read(vec![first, partial], &context(100, true), zero_basis())
         .unwrap();
     assert_eq!(result.dispositions[&partial_id.0], "anchor_covered_late");
     assert_eq!(
@@ -358,7 +412,7 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     let late = position_row("TRADE", "0xlate3", MARKET_B, 1, "BUY", "3", "0.5", 100);
     let late_id = late.group_id.key().clone();
     let result = engine
-        .commit(vec![late], &context(100, true), zero_basis())
+        .commit_read(vec![late], &context(100, true), zero_basis())
         .unwrap();
     assert_eq!(result.dispositions[&late_id.0], "anchor_covered_late");
     assert_eq!(
@@ -377,7 +431,7 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     let copy = position_row("TRADE", "0xlate-copy", MARKET_C, 0, "BUY", "1", "0.5", 101);
     let copy_id = copy.group_id.key().clone();
     let result = engine
-        .commit(vec![copy], &context(101, true), zero_basis())
+        .commit_read(vec![copy], &context(101, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.dispositions[&copy_id.0],
@@ -394,7 +448,7 @@ fn verified_identity_override_commits_v2_and_replays_with_v1() {
     let (dir, paper, mut engine) = fresh_anchored();
     let legacy = position_row("TRADE", "0xidentity-v1", MARKET_A, 0, "BUY", "2", "0.4", 90);
     engine
-        .commit(vec![legacy], &context(90, true), zero_basis())
+        .commit_read(vec![legacy], &context(90, true), zero_basis())
         .unwrap();
 
     let corrected = position_row("TRADE", "0xidentity-v2", MARKET_A, 0, "BUY", "3", "0.6", 91);
@@ -408,7 +462,7 @@ fn verified_identity_override_commits_v2_and_replays_with_v1() {
         },
     );
     let result = engine
-        .commit(vec![corrected.clone()], &corrected_context, zero_basis())
+        .commit_read(vec![corrected.clone()], &corrected_context, zero_basis())
         .unwrap();
 
     assert_eq!(result.dispositions[&corrected_id.0], "decision_pending");
@@ -438,7 +492,7 @@ fn verified_identity_override_commits_v2_and_replays_with_v1() {
     assert_eq!(correction.evidence_hash, "gamma-page-hash");
 
     let retry = engine
-        .commit(vec![corrected], &corrected_context, zero_basis())
+        .commit_read(vec![corrected], &corrected_context, zero_basis())
         .unwrap();
     assert!(retry.already_committed);
     assert_eq!(state(&engine, MARKET_B, 1).atomic(), 3_000_000);
@@ -495,7 +549,7 @@ fn unverified_identity_is_raw_only_reanchors_and_replays() {
     );
 
     let result = engine
-        .commit(vec![unverified], &unresolved_context, zero_basis())
+        .commit_read(vec![unverified], &unresolved_context, zero_basis())
         .unwrap();
     assert_eq!(result.dispositions[&source_trade_id.0], "raw_only");
     assert!(result.pending.is_empty());
@@ -564,7 +618,7 @@ fn bracket_unverified_covered_group_is_raw_only_without_reanchor_then_anchors() 
     );
 
     let result = engine
-        .commit(vec![unverified], &bracket_context, zero_basis())
+        .commit_read(vec![unverified], &bracket_context, zero_basis())
         .unwrap();
     assert_eq!(result.dispositions[&source_trade_id.0], "raw_only");
     assert!(result.pending.is_empty());
@@ -625,7 +679,7 @@ fn unresolved_member_after_partial_durable_bucket_keeps_the_partial_commit_fence
     );
     let committed_id = committed.group_id.key().clone();
     engine
-        .commit(vec![committed.clone()], &context(92, true), zero_basis())
+        .commit_read(vec![committed.clone()], &context(92, true), zero_basis())
         .unwrap();
 
     let unresolved = position_row(
@@ -654,7 +708,7 @@ fn unresolved_member_after_partial_durable_bucket_keeps_the_partial_commit_fence
     );
 
     let result = engine
-        .commit(vec![committed, unresolved], &mixed_context, zero_basis())
+        .commit_read(vec![committed, unresolved], &mixed_context, zero_basis())
         .unwrap();
 
     assert_eq!(result.dispositions[&committed_id.0], "already_committed");
@@ -730,7 +784,7 @@ fn covered_identity_resolution_uses_verified_history_and_keeps_unverified_raw_on
     );
 
     let result = engine
-        .commit(vec![corrected, unverified], &resolved_context, zero_basis())
+        .commit_read(vec![corrected, unverified], &resolved_context, zero_basis())
         .unwrap();
     assert_eq!(result.dispositions[&corrected_id.0], "anchor_covered_late");
     assert_eq!(result.dispositions[&unverified_id.0], "raw_only");
@@ -799,7 +853,7 @@ fn mixed_corrected_unverified_bucket_rolls_back_every_surface_then_retries() {
 
     assert!(
         engine
-            .commit(
+            .commit_read(
                 vec![corrected.clone(), unverified.clone()],
                 &mixed_context,
                 zero_basis(),
@@ -839,7 +893,7 @@ fn mixed_corrected_unverified_bucket_rolls_back_every_surface_then_retries() {
     drop(connection);
 
     let result = engine
-        .commit(vec![corrected, unverified], &mixed_context, zero_basis())
+        .commit_read(vec![corrected, unverified], &mixed_context, zero_basis())
         .unwrap();
     assert_eq!(result.dispositions[&unverified_id.0], "raw_only");
     assert_eq!(state(&engine, MARKET_B, 1).atomic(), 3_000_000);
@@ -861,7 +915,7 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
     paper.set_cursor(&fenced_wallet, 0).unwrap();
     install_anchor_for_wallet(&mut engine, &paper, fenced_wallet, 0, Vec::new(), 91);
     let fence = engine
-        .commit(
+        .commit_read(
             vec![pair_effect_for_wallet(
                 FENCED_WALLET_HEX,
                 "CONVERSION",
@@ -907,9 +961,9 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
         .unwrap();
 
     let result = engine.commit_batch(|engine| {
-        engine.commit(vec![first.clone()], &first_context, zero_basis())?;
-        engine.commit(vec![fence_in_batch.clone()], &fence_context, zero_basis())?;
-        engine.commit(vec![third.clone()], &third_context, zero_basis())?;
+        engine.commit_read(vec![first.clone()], &first_context, zero_basis())?;
+        engine.commit_read(vec![fence_in_batch.clone()], &fence_context, zero_basis())?;
+        engine.commit_read(vec![third.clone()], &third_context, zero_basis())?;
         Ok(())
     });
     assert!(result.is_err());
@@ -941,9 +995,9 @@ fn ordinary_batch_failure_restores_database_and_engine_then_retry_commits_all() 
     drop(connection);
     let committed = engine
         .commit_batch(|engine| {
-            let first = engine.commit(vec![first], &first_context, zero_basis())?;
-            let fence = engine.commit(vec![fence_in_batch], &fence_context, zero_basis())?;
-            let third = engine.commit(vec![third], &third_context, zero_basis())?;
+            let first = engine.commit_read(vec![first], &first_context, zero_basis())?;
+            let fence = engine.commit_read(vec![fence_in_batch], &fence_context, zero_basis())?;
+            let third = engine.commit_read(vec![third], &third_context, zero_basis())?;
             Ok([first, fence, third])
         })
         .unwrap();
@@ -1013,20 +1067,20 @@ fn replay_is_identical_for_batched_and_single_bucket_commits() {
 
     batch_engine
         .commit_batch(|engine| {
-            engine.commit(vec![first.clone()], &first_context, zero_basis())?;
-            engine.commit(vec![second.clone()], &second_context, zero_basis())?;
-            engine.commit(vec![third.clone()], &third_context, zero_basis())?;
+            engine.commit_read(vec![first.clone()], &first_context, zero_basis())?;
+            engine.commit_read(vec![second.clone()], &second_context, zero_basis())?;
+            engine.commit_read(vec![third.clone()], &third_context, zero_basis())?;
             Ok(())
         })
         .unwrap();
     single_engine
-        .commit(vec![first], &first_context, zero_basis())
+        .commit_read(vec![first], &first_context, zero_basis())
         .unwrap();
     single_engine
-        .commit(vec![second], &second_context, zero_basis())
+        .commit_read(vec![second], &second_context, zero_basis())
         .unwrap();
     single_engine
-        .commit(vec![third], &third_context, zero_basis())
+        .commit_read(vec![third], &third_context, zero_basis())
         .unwrap();
 
     let batch_replay = replay_wallet_ledger(&batch_paper, wallet()).unwrap();
@@ -1068,7 +1122,7 @@ fn replay_is_identical_for_batched_and_single_bucket_commits() {
 fn split_merge_redeem_preserve_exact_fractional_balances_atomically() {
     let (_dir, paper, mut engine) = fresh_anchored();
     engine
-        .commit(
+        .commit_read(
             vec![pair_effect(
                 "SPLIT",
                 "0x01",
@@ -1081,7 +1135,7 @@ fn split_merge_redeem_preserve_exact_fractional_balances_atomically() {
         )
         .unwrap();
     engine
-        .commit(
+        .commit_read(
             vec![pair_effect("MERGE", "0x02", MARKET_A, "500000.125000", 101)],
             &context(101, false),
             zero_basis(),
@@ -1095,7 +1149,7 @@ fn split_merge_redeem_preserve_exact_fractional_balances_atomically() {
         position_row("REDEEM", "0x04", MARKET_A, 1, "", "1.250000", "0", 102),
     ];
     engine
-        .commit(redemptions, &context(102, false), zero_basis())
+        .commit_read(redemptions, &context(102, false), zero_basis())
         .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 5_999_999_999_999);
     assert_eq!(state(&engine, MARKET_A, 1).atomic(), 5_999_998_750_000);
@@ -1136,7 +1190,7 @@ fn trade_aggregate_uses_exact_size_weighted_price_and_not_usdc_audit() {
         }),
     ]);
     engine
-        .commit(vec![trade], &context(150, true), zero_basis())
+        .commit_read(vec![trade], &context(150, true), zero_basis())
         .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     let row = paper.open_decision_pending().unwrap().remove(0);
@@ -1179,7 +1233,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
             vec![first, second]
         };
         let result = engine
-            .commit(groups, &context(200, true), zero_basis())
+            .commit_read(groups, &context(200, true), zero_basis())
             .unwrap();
         assert!(result.pending.is_empty());
         assert!(
@@ -1209,7 +1263,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         position_row("TRADE", "0x32", MARKET_A, 0, "BUY", "2", "0.6", 210),
     ];
     engine
-        .commit(groups, &context(210, true), zero_basis())
+        .commit_read(groups, &context(210, true), zero_basis())
         .unwrap();
     drop(engine);
     drop(paper);
@@ -1217,7 +1271,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
     let ledger = build_leader_ledger(&restarted).unwrap();
     let mut restarted_engine = BucketCommitEngine::load(Arc::clone(&restarted), ledger).unwrap();
     let later = restarted_engine
-        .commit(
+        .commit_read(
             vec![position_row(
                 "TRADE", "0x33", MARKET_A, 1, "BUY", "1", "0.5", 211,
             )],
@@ -1244,7 +1298,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
         } else {
             vec![buy, sell]
         };
-        let result = engine.commit(groups, &no_copy, zero_basis()).unwrap();
+        let result = engine.commit_read(groups, &no_copy, zero_basis()).unwrap();
         assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
         (
             paper.leader_positions().unwrap(),
@@ -1258,7 +1312,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
     fn split_merge(reverse: bool) -> (Vec<pe_paper_state::LeaderPositionRow>, Value) {
         let (_dir, paper, mut engine) = fresh_anchored();
         engine
-            .commit(
+            .commit_read(
                 vec![pair_effect("SPLIT", "0x37", MARKET_A, "2", 251)],
                 &context(251, true),
                 zero_basis(),
@@ -1272,7 +1326,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
             vec![split, merge]
         };
         let result = engine
-            .commit(groups, &context(252, false), zero_basis())
+            .commit_read(groups, &context(252, false), zero_basis())
             .unwrap();
         assert_eq!(state(&engine, MARKET_A, 0).atomic(), 2_000_000);
         assert_eq!(state(&engine, MARKET_A, 1).atomic(), 2_000_000);
@@ -1289,7 +1343,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
 fn different_markets_create_independent_pending_deliveries_and_restart_does_not_reapply() {
     let (dir, paper, mut engine) = fresh_anchored();
     let result = engine
-        .commit(
+        .commit_read(
             vec![
                 position_row("TRADE", "0x41", MARKET_A, 0, "BUY", "1.25", "0.4", 300),
                 position_row("TRADE", "0x42", MARKET_B, 0, "BUY", "2.75", "0.6", 300),
@@ -1373,7 +1427,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
 fn terminal_decision_pending_retains_financial_final_receipt() {
     let (dir, paper, mut engine) = fresh_anchored();
     let result = engine
-        .commit(
+        .commit_read(
             vec![position_row(
                 "TRADE", "0x43", MARKET_A, 0, "BUY", "1.25", "0.4", 302,
             )],
@@ -1438,14 +1492,14 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
     let conversion = pair_effect("CONVERSION", "0x51", MARKET_A, "1", 400);
     let trade = position_row("TRADE", "0x52", MARKET_B, 0, "BUY", "7", "0.5", 400);
     let result = engine
-        .commit(vec![trade, conversion], &context(400, true), zero_basis())
+        .commit_read(vec![trade, conversion], &context(400, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, Some(WalletFenceCause::Conversion));
     assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
     assert!(paper.is_wallet_fenced(&wallet()).unwrap());
 
     let later = engine
-        .commit(
+        .commit_read(
             vec![position_row(
                 "TRADE", "0x53", MARKET_B, 0, "BUY", "0.000001", "0.5", 401,
             )],
@@ -1463,7 +1517,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
 
     let (_dir, paper, mut engine) = fresh_anchored();
     let result = engine
-        .commit(
+        .commit_read(
             vec![pair_effect("MERGE", "0x61", MARKET_A, "0.000001", 500)],
             &context(500, true),
             zero_basis(),
@@ -1476,7 +1530,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
 
     let (_dir, paper, mut engine) = fresh_anchored();
     let result = engine
-        .commit(
+        .commit_read(
             vec![combo_effect("FUTURE_POSITION_EFFECT", "0x62", 501)],
             &context(501, true),
             zero_basis(),
@@ -1487,7 +1541,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
 
     let (_dir, paper, mut engine) = fresh_anchored();
     let result = engine
-        .commit(
+        .commit_read(
             vec![combo_effect("CONVERSION", "0x63", 502)],
             &context(502, true),
             zero_basis(),
@@ -1501,7 +1555,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
 fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
     let (_dir, paper, mut engine) = fresh_anchored();
     engine
-        .commit(
+        .commit_read(
             vec![position_row(
                 "TRADE", "0x70", MARKET_A, 0, "BUY", "5", "0.5", 559,
             )],
@@ -1525,7 +1579,7 @@ fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
     let sentinel_id = sentinel.group_id.key().clone();
     let sell = position_row("TRADE", "0x72", MARKET_A, 0, "SELL", "1", "0.5", 560);
     let result = engine
-        .commit(vec![sentinel, sell], &context(560, true), zero_basis())
+        .commit_read(vec![sentinel, sell], &context(560, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
@@ -1540,7 +1594,7 @@ fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
     let buy = position_row("TRADE", "0x73", MARKET_A, 0, "BUY", "2", "0.5", 561);
     let buy_id = buy.group_id.key().clone();
     let result = engine
-        .commit(vec![buy], &context(561, true), zero_basis())
+        .commit_read(vec![buy], &context(561, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
@@ -1577,7 +1631,7 @@ fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
     let mut after_anchor = context(562, true);
     after_anchor.copy_eligible = false;
     engine
-        .commit(
+        .commit_read(
             vec![position_row(
                 "TRADE", "0x74", MARKET_A, 0, "BUY", "2", "0.5", 562,
             )],
@@ -1594,7 +1648,7 @@ fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
     let split = pair_effect("SPLIT", "0x65", MARKET_A, "1", 550);
     let sell = position_row("TRADE", "0x66", MARKET_A, 0, "SELL", "2", "0.5", 550);
     let result = engine
-        .commit(vec![sell, split], &context(550, true), zero_basis())
+        .commit_read(vec![sell, split], &context(550, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -1611,7 +1665,9 @@ fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
         pair_effect("SPLIT", "0x67", MARKET_A, "1.250000", 551),
         position_row("TRADE", "0x68", MARKET_B, 0, "BUY", "2.750000", "0.5", 551),
     ];
-    let result = engine.commit(disjoint, &no_copy, zero_basis()).unwrap();
+    let result = engine
+        .commit_read(disjoint, &no_copy, zero_basis())
+        .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_250_000);
     assert_eq!(state(&engine, MARKET_A, 1).atomic(), 1_250_000);
@@ -1662,7 +1718,7 @@ fn sibling_redeem_residual_commits_version_three_and_replay_checks_it() {
         570,
     );
     let result = engine
-        .commit(vec![clamped, exact], &context(570, true), zero_basis())
+        .commit_read(vec![clamped, exact], &context(570, true), zero_basis())
         .unwrap();
 
     assert!(
@@ -1757,7 +1813,7 @@ fn replay_rejects_documents_that_attempt_to_stack_redeem_tolerance() {
         1,
     );
     engine
-        .commit(
+        .commit_read(
             vec![
                 position_row(
                     "REDEEM",
@@ -1848,7 +1904,7 @@ fn already_fenced_commit_serializes_only_clamped_redeems_as_version_three() {
         1,
     );
     engine
-        .commit(
+        .commit_read(
             vec![pair_effect(
                 "CONVERSION",
                 "0xfence-first",
@@ -1881,7 +1937,7 @@ fn already_fenced_commit_serializes_only_clamped_redeems_as_version_three() {
         581,
     );
     let result = engine
-        .commit(vec![clamped, exact], &context(581, true), zero_basis())
+        .commit_read(vec![clamped, exact], &context(581, true), zero_basis())
         .unwrap();
 
     assert!(
@@ -1932,7 +1988,7 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
         position_row("REDEEM", "0xstack-b", MARKET_A, 0, "", "0.000020", "0", 590),
     ];
     let result = engine
-        .commit(stacking, &context(590, true), zero_basis())
+        .commit_read(stacking, &context(590, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -1967,7 +2023,7 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
         ),
     ];
     let result = engine
-        .commit(split_and_redeem, &context(591, true), zero_basis())
+        .commit_read(split_and_redeem, &context(591, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -1992,7 +2048,7 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
         })
         .collect::<Vec<_>>();
     let result = engine
-        .commit(five_connected, &context(592, true), zero_basis())
+        .commit_read(five_connected, &context(592, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -2037,7 +2093,7 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
         ),
     ];
     let result = engine
-        .commit(sell_then_redeem, &context(593, true), zero_basis())
+        .commit_read(sell_then_redeem, &context(593, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -2079,7 +2135,7 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
         ),
     ];
     let result = engine
-        .commit(merge_and_redeem, &context(594, true), zero_basis())
+        .commit_read(merge_and_redeem, &context(594, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -2097,14 +2153,14 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
     let original = position_row("TRADE", "0x71", MARKET_A, 0, "BUY", "1.250000", "0.4", 600);
     let original_id = original.group_id.key().clone();
     engine
-        .commit(vec![original], &no_copy, zero_basis())
+        .commit_read(vec![original], &no_copy, zero_basis())
         .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_250_000);
 
     let changed = position_row("TRADE", "0x71", MARKET_A, 0, "BUY", "9.000000", "0.4", 600);
     assert_eq!(changed.group_id.key(), &original_id);
     let result = engine
-        .commit(vec![changed], &no_copy, zero_basis())
+        .commit_read(vec![changed], &no_copy, zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -2134,11 +2190,15 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
         1,
     );
     let first = position_row("REDEEM", "0x81", MARKET_A, 0, "", "5", "0", 700);
-    engine.commit(vec![first], &no_copy, zero_basis()).unwrap();
+    engine
+        .commit_read(vec![first], &no_copy, zero_basis())
+        .unwrap();
     let late = position_row("REDEEM", "0x82", MARKET_B, 0, "", "5", "0", 700);
     let late_id = late.group_id.key().clone();
     let cursor_before = paper.cursor(&wallet()).unwrap();
-    let result = engine.commit(vec![late], &no_copy, zero_basis()).unwrap();
+    let result = engine
+        .commit_read(vec![late], &no_copy, zero_basis())
+        .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(
         result.dispositions[&late_id.0],
@@ -2165,7 +2225,7 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
     let decrement = position_row("TRADE", "0x83", MARKET_B, 0, "SELL", "1", "0.5", 701);
     let decrement_id = decrement.group_id.key().clone();
     let result = engine
-        .commit(vec![decrement], &context(701, true), zero_basis())
+        .commit_read(vec![decrement], &context(701, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(
@@ -2205,7 +2265,7 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
     let mut after_anchor = context(702, true);
     after_anchor.copy_eligible = false;
     let applied = engine
-        .commit(
+        .commit_read(
             vec![position_row(
                 "TRADE",
                 "0xafter-late-anchor",
@@ -2232,13 +2292,13 @@ fn mixed_durable_and_unseen_equal_second_groups_still_fence() {
     let durable = position_row("TRADE", "0x83", MARKET_A, 0, "BUY", "2", "0.4", 710);
     let durable_id = durable.group_id.key().clone();
     engine
-        .commit(vec![durable.clone()], &no_copy, zero_basis())
+        .commit_read(vec![durable.clone()], &no_copy, zero_basis())
         .unwrap();
     let unseen = position_row("TRADE", "0x84", MARKET_B, 0, "BUY", "5", "0.6", 710);
     let unseen_id = unseen.group_id.key().clone();
 
     let result = engine
-        .commit(vec![durable, unseen], &no_copy, zero_basis())
+        .commit_read(vec![durable, unseen], &no_copy, zero_basis())
         .unwrap();
 
     assert_eq!(result.dispositions[&durable_id.0], "already_committed");
@@ -2282,4 +2342,331 @@ fn legacy_history_import_is_once_only_and_remains_conservative() {
         !paper.gate_history().unwrap()[&wallet()]
             .contains(&MarketId(VenueMarketId(MARKET_B.to_owned())))
     );
+}
+
+fn committed_source_read(
+    dir: &tempfile::TempDir,
+    groups: &[FixtureAggregate],
+) -> (support::ProducerShapedRead, pe_event_log::AppendReceipt) {
+    let rows: Vec<_> = groups.iter().flat_map(|group| group.rows.iter()).collect();
+    let epoch = groups
+        .iter()
+        .map(|group| group.source_time.0.unix_timestamp())
+        .max()
+        .unwrap();
+    let mut writer = pe_event_log::Writer::open(dir.path().join("source.log")).unwrap();
+    support::append_committed_read(
+        &mut writer,
+        wallet(),
+        &serde_json::to_vec(&rows).unwrap(),
+        epoch + 10,
+        epoch + 11,
+    )
+}
+
+fn commit_open_source_read(
+    engine: &mut BucketCommitEngine,
+    read: &support::ProducerShapedRead,
+    receipt: pe_event_log::AppendReceipt,
+    overrides: HashMap<pe_core_types::SourceTradeId, IdentityOverride>,
+) {
+    let epoch = read.aggregates[0].source_time.0.unix_timestamp();
+    let mut context = context(epoch, true);
+    context.decision_inputs_json = read.decision_inputs_json.clone();
+    context.page_occurrences = vec![read.page.clone()];
+    context.read_commitment = Some(receipt);
+    context.identity_overrides = overrides;
+    let committed = engine
+        .commit(read.aggregates.clone(), &context, zero_basis())
+        .unwrap();
+    assert_eq!(committed.pending.len(), read.aggregates.len());
+}
+
+/// PASS: the fact-altered row is named and validation stops before any resume, admission,
+/// dispatch seed, financial prepare, or paper order. FAIL: either row resumes or the edit passes.
+#[tokio::test]
+async fn boot_validation_rejects_fact_altered_row_before_any_resume() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let (read, commitment) = committed_source_read(
+        &dir,
+        &[
+            position_row("TRADE", "0xvalid-open", MARKET_A, 0, "BUY", "2", "0.4", 900),
+            position_row(
+                "TRADE",
+                "0xaltered-open",
+                MARKET_B,
+                0,
+                "BUY",
+                "3",
+                "0.6",
+                900,
+            ),
+        ],
+    );
+    commit_open_source_read(&mut engine, &read, commitment, HashMap::new());
+    let rows = paper.open_decision_pending().unwrap();
+    assert_eq!(rows.len(), 2);
+    let altered = &rows[1];
+    let mut frozen: Value = serde_json::from_str(&altered.frozen_inputs_json).unwrap();
+    frozen["price"] = json!("0.7");
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![frozen.to_string(), altered.source_trade_id.0],
+        )
+        .unwrap();
+    drop(connection);
+    drop(engine);
+    let hooks = support::continuation_hooks(920);
+    let paper_path = dir.path().join("paper.log");
+    drop(pe_event_log::Writer::open(&paper_path).unwrap());
+    let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+        .unwrap();
+    let mut resumes = 0;
+    // Same ordering as service boot: validate the entire census before constructing the owner.
+    let result = async {
+        let count = pe_service::bucket_commit::validate_open_continuations(&paper, &index)?;
+        let (_control, receiver) = tokio::sync::mpsc::channel(4);
+        let mut orchestrator = support::continuation_orchestrator(
+            Arc::clone(&paper),
+            &paper_path,
+            wallet(),
+            receiver,
+            Arc::clone(&hooks),
+        );
+        resumes += count;
+        orchestrator
+            .resume_pending_before_producers()
+            .await
+            .unwrap();
+        Ok::<_, pe_service::bucket_commit::ContinuationValidationError>(count)
+    }
+    .await;
+    let error = result.unwrap_err();
+    assert_eq!(error.source_trade_id, altered.source_trade_id);
+    assert!(error.to_string().contains(&altered.source_trade_id.0));
+    assert_eq!(resumes, 0);
+    assert_eq!(paper.open_decision_pending().unwrap().len(), 2);
+    support::assert_no_continuation_side_effects(
+        &paper,
+        &dir.path().join("paper.db"),
+        &paper_path,
+        &hooks,
+    );
+}
+
+/// PASS: reopened real-log continuations each reach one terminal transition; a second restart
+/// changes no terminal rows, bucket effects, history, or balances. FAIL: any row is lost or reapplied.
+#[tokio::test]
+async fn valid_pending_restart_resumes_once() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let (read, commitment) = committed_source_read(
+        &dir,
+        &[
+            position_row("TRADE", "0xrestart-a", MARKET_A, 0, "BUY", "2", "0.4", 910),
+            position_row("TRADE", "0xrestart-b", MARKET_B, 0, "BUY", "3", "0.6", 910),
+        ],
+    );
+    commit_open_source_read(&mut engine, &read, commitment, HashMap::new());
+    let positions = paper.leader_positions().unwrap();
+    let history = paper.gate_history().unwrap();
+    let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+    let cursor = paper.cursor(&wallet()).unwrap();
+    drop(engine);
+    drop(paper);
+    let state_path = dir.path().join("paper.db");
+    let paper_path = dir.path().join("paper.log");
+    let mut terminal = Vec::new();
+    for restart in 0..2 {
+        let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+        let index =
+            pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+                .unwrap();
+        assert_eq!(
+            pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+            if restart == 0 { 2 } else { 0 }
+        );
+        let (_control, receiver) = tokio::sync::mpsc::channel(4);
+        let mut orchestrator = support::continuation_orchestrator(
+            Arc::clone(&paper),
+            &paper_path,
+            wallet(),
+            receiver,
+            support::continuation_hooks(930),
+        );
+        orchestrator
+            .resume_pending_before_producers()
+            .await
+            .unwrap();
+        orchestrator
+            .resume_pending_before_producers()
+            .await
+            .unwrap();
+        assert!(paper.open_decision_pending().unwrap().is_empty());
+        let rows = paper.decision_pending_history().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.state, DecisionPendingState::Terminal);
+            assert_eq!(
+                replay_decision_pending(row)
+                    .unwrap()
+                    .post_boundary
+                    .body
+                    .terminal
+                    .reason,
+                "financial_era_not_started"
+            );
+        }
+        if restart == 0 {
+            terminal = rows;
+        } else {
+            assert_eq!(rows, terminal);
+        }
+        assert_eq!(paper.leader_positions().unwrap(), positions);
+        assert_eq!(paper.gate_history().unwrap(), history);
+        assert_eq!(paper.activity_groups_after(&wallet(), 0).unwrap(), groups);
+        assert_eq!(paper.cursor(&wallet()).unwrap(), cursor);
+    }
+}
+
+/// PASS: recorded corrections and an uncorrected control validate at boot; changing either
+/// frozen identity or stamped/verified agreement fails. Dynamic load preserves corrected facts.
+/// FAIL: a valid correction is refused, a mutation passes, or fresh loading restores the raw identity.
+#[tokio::test]
+async fn corrected_continuation_identity_validates_across_consumers() {
+    for mutation in [
+        "control",
+        "corrected",
+        "market",
+        "outcome",
+        "stamped",
+        "verified",
+    ] {
+        let (dir, paper, mut engine) = fresh_anchored();
+        let (read, commitment) = committed_source_read(
+            &dir,
+            &[position_row(
+                "TRADE",
+                "0xcorrected-open",
+                MARKET_A,
+                0,
+                "BUY",
+                "2",
+                "0.4",
+                940,
+            )],
+        );
+        let id = read.aggregates[0].group_id.key().clone();
+        let overrides = if mutation == "control" {
+            HashMap::new()
+        } else {
+            HashMap::from([(
+                id.clone(),
+                IdentityOverride {
+                    verified: market_outcome(MARKET_B, 1),
+                    evidence_hash: "recorded-gamma-proof".to_owned(),
+                },
+            )])
+        };
+        commit_open_source_read(&mut engine, &read, commitment, overrides);
+        let row = paper.open_decision_pending().unwrap().remove(0);
+        let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+        if matches!(mutation, "market" | "outcome") {
+            let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+            if mutation == "market" {
+                frozen["market_id"] = json!(MARKET_C);
+            } else {
+                frozen["outcome_id"] = json!(0);
+            }
+            connection.execute("UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2", rusqlite::params![frozen.to_string(), id.0]).unwrap();
+        } else if matches!(mutation, "stamped" | "verified") {
+            let group = paper.activity_group_state(&id).unwrap().unwrap();
+            let mut proof: Value = serde_json::from_str(&group.proof_json).unwrap();
+            proof["correction"][mutation] =
+                serde_json::to_value(market_outcome(MARKET_C, 0)).unwrap();
+            connection
+                .execute(
+                    "UPDATE activity_groups SET proof_json = ?1 WHERE source_trade_id = ?2",
+                    rusqlite::params![proof.to_string(), id.0],
+                )
+                .unwrap();
+        }
+        let index =
+            pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+                .unwrap();
+        let result = pe_service::bucket_commit::validate_open_continuations(&paper, &index);
+        if matches!(mutation, "control" | "corrected") {
+            assert_eq!(result.unwrap(), 1, "{mutation}");
+        } else {
+            assert_eq!(result.unwrap_err().source_trade_id, id, "{mutation}");
+        }
+    }
+    // Fresh control-message load: the engine records the correction before the owner loads it.
+    let (dir, paper, engine) = fresh_anchored();
+    drop(engine);
+    paper
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(),
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: 940,
+        })
+        .unwrap();
+    let (read, commitment) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xdynamic-corrected",
+            MARKET_A,
+            0,
+            "BUY",
+            "2",
+            "0.4",
+            950,
+        )],
+    );
+    let id = read.aggregates[0].group_id.key().clone();
+    let mut context = support::read_context(&read, commitment, 960);
+    context.identity_overrides.insert(
+        id.clone(),
+        IdentityOverride {
+            verified: market_outcome(MARKET_B, 1),
+            evidence_hash: "recorded-gamma-proof".to_owned(),
+        },
+    );
+    let (control, receiver) = tokio::sync::mpsc::channel(4);
+    let orchestrator = support::continuation_orchestrator(
+        Arc::clone(&paper),
+        &dir.path().join("paper.log"),
+        wallet(),
+        receiver,
+        support::continuation_hooks(960),
+    );
+    let run = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+    let (committed, acknowledgement) = tokio::sync::oneshot::channel();
+    control
+        .send(
+            pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
+                aggregates: read.aggregates,
+                context: Arc::new(context),
+                committed,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        acknowledgement.await.unwrap().unwrap().pending,
+        vec![id.clone()]
+    );
+    drop(control);
+    run.await.unwrap();
+    let row = paper.decision_pending_for(&id).unwrap().unwrap();
+    assert_eq!(row.state, DecisionPendingState::Terminal);
+    let continuation = DecisionContinuationV3::from_durable(&row).unwrap();
+    assert_eq!(
+        continuation.facts.market_id,
+        MarketId(VenueMarketId(MARKET_B.to_owned()))
+    );
+    assert_eq!(continuation.facts.outcome_id, OutcomeId(1));
 }
