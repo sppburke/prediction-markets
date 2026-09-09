@@ -1885,22 +1885,13 @@ fn source_observations(
             break;
         }
         let received_unix_ms = received_unix_ms(&envelope)?;
+        let receipt = AppendReceipt {
+            sequence,
+            this_hash: envelope.this_hash,
+        };
         observations.insert(
             sequence.0,
-            SourceObservation {
-                receipt: AppendReceipt {
-                    sequence,
-                    this_hash: envelope.this_hash,
-                },
-                observed_at: envelope.observed_at,
-                received_at: envelope.received_at,
-                received_unix_ms,
-                source_id: envelope.source_id.0,
-                schema_version: envelope.schema_version,
-                parser_version: envelope.parser_version,
-                content_type: envelope.content_type,
-                payload: envelope.payload,
-            },
+            source_observation_from_envelope(receipt, received_unix_ms, envelope),
         );
     }
     let expected_hash = tail_hash(prefix)?;

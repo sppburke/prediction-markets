@@ -4183,6 +4183,16 @@ mod tests {
         drop(source_writer);
         let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
         let candidate = source_receipts.current_tail_binding().unwrap();
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        append_source(
+            &mut source_writer,
+            crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+            SEAL_START_UNIX + 2,
+            b"[]".to_vec(),
+        );
+        drop(source_writer);
+        let file_tail = Scanner::verify(&source_path).unwrap();
+        assert_ne!(file_tail, candidate);
         let mut orchestrator = test_orchestrator(
             paper_path.clone(),
             source_path,
@@ -4199,6 +4209,60 @@ mod tests {
         let seals = sealed_records(&paper_path);
         assert_eq!(seals.len(), 1);
         assert_eq!(seals[0].source_prefix, TailBinding::from(&candidate));
+        assert_ne!(seals[0].source_prefix, TailBinding::from(&file_tail));
+    }
+
+    /// PASS: a clean source-log end before the indexed candidate crosses `SealCheck` as the exact
+    /// evidence-insufficient acknowledgement and does not append a seal.
+    #[tokio::test]
+    async fn seal_check_refuses_clean_truncation_before_index_candidate() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            ..
+        } = started_seal_fixture("start-hash");
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        append_source(
+            &mut source_writer,
+            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            SEAL_START_UNIX + 1,
+            br#"{"kind":"retained"}"#.to_vec(),
+        );
+        let preceding_tail = Scanner::verify(&source_path).unwrap();
+        append_source(
+            &mut source_writer,
+            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            SEAL_START_UNIX + 2,
+            br#"{"kind":"truncated"}"#.to_vec(),
+        );
+        drop(source_writer);
+        let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let candidate = source_receipts.current_tail_binding().unwrap();
+        assert_ne!(candidate, preceding_tail);
+        let mut orchestrator = test_orchestrator(
+            paper_path.clone(),
+            source_path.clone(),
+            paper_writer,
+            state,
+            source_receipts,
+        );
+        let source_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        source_file.set_len(preceding_tail.physical_tail).unwrap();
+        source_file.sync_all().unwrap();
+        drop(source_file);
+        assert_eq!(Scanner::verify(&source_path).unwrap(), preceding_tail);
+
+        assert_eq!(
+            apply_seal_check_control(&mut orchestrator, "changed-hash").await,
+            Err("insufficient qualification evidence: source observations do not reach the sealed sequence/hash prefix".to_owned())
+        );
+        assert!(sealed_records(&paper_path).is_empty());
     }
 
     /// PASS: an existing seal returns through `SealCheck` before opening its renamed source path.

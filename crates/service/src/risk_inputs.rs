@@ -1010,7 +1010,7 @@ impl SourceReceiptIndex {
     }
 
     /// Snapshot the synchronized indexed source tail without reading the log (GitHub issue #574).
-    pub fn current_tail_binding(&self) -> Result<LogTailBinding, RiskInputsUnavailable> {
+    pub(crate) fn current_tail_binding(&self) -> Result<LogTailBinding, RiskInputsUnavailable> {
         let (path, physical_tail, last_sequence, last_hash) = {
             let state = self
                 .state
