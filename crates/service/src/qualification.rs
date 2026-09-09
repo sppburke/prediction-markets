@@ -491,6 +491,83 @@ fn decision_source_receipt(
     Ok(observation)
 }
 
+fn source_observation_from_envelope(
+    receipt: AppendReceipt,
+    received_unix_ms: i64,
+    envelope: EventEnvelope,
+) -> SourceObservation {
+    SourceObservation {
+        receipt,
+        observed_at: envelope.observed_at,
+        received_at: envelope.received_at,
+        received_unix_ms,
+        source_id: envelope.source_id.0,
+        schema_version: envelope.schema_version,
+        parser_version: envelope.parser_version,
+        content_type: envelope.content_type,
+        payload: envelope.payload,
+    }
+}
+
+/// Receipt-backed source adapters shared by sealed decision selection (#574).
+#[derive(Clone, Copy)]
+enum SealedSource<'a> {
+    Map(&'a BTreeMap<u64, SourceObservation>),
+    Index(&'a SourceReceiptIndex),
+}
+
+impl SealedSource<'_> {
+    fn receipt(self, receipt: AppendReceipt) -> Result<(AppendReceipt, i64), QualificationError> {
+        match self {
+            Self::Map(source) => {
+                let observation = decision_source_receipt(source, receipt)?;
+                Ok((observation.receipt, observation.received_unix_ms))
+            }
+            Self::Index(index) => {
+                let Some((known_receipt, received_unix_ms)) =
+                    index.receipt_at(receipt.sequence).map_err(|error| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "decision source receipt lookup failed: {error}"
+                        ))
+                    })?
+                else {
+                    return insufficient(format!(
+                        "decision source receipt replay failed: source receipt sequence {} is absent",
+                        receipt.sequence.0
+                    ));
+                };
+                if known_receipt != receipt {
+                    return insufficient(format!(
+                        "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
+                        receipt.sequence.0
+                    ));
+                }
+                Ok((known_receipt, received_unix_ms))
+            }
+        }
+    }
+
+    fn observation(self, receipt: AppendReceipt) -> Result<SourceObservation, QualificationError> {
+        match self {
+            Self::Map(source) => Ok(decision_source_receipt(source, receipt)?.clone()),
+            Self::Index(index) => {
+                let (_, received_unix_ms) = self.receipt(receipt)?;
+                let envelope = index.source_envelope(receipt).map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "decision source observation {} could not be read: {error}",
+                        receipt.sequence.0
+                    ))
+                })?;
+                Ok(source_observation_from_envelope(
+                    receipt,
+                    received_unix_ms,
+                    envelope,
+                ))
+            }
+        }
+    }
+}
+
 fn decision_observation_from_source(
     continuation: &DecisionContinuationV3,
     source: &BTreeMap<u64, SourceObservation>,
@@ -1808,22 +1885,13 @@ fn source_observations(
             break;
         }
         let received_unix_ms = received_unix_ms(&envelope)?;
+        let receipt = AppendReceipt {
+            sequence,
+            this_hash: envelope.this_hash,
+        };
         observations.insert(
             sequence.0,
-            SourceObservation {
-                receipt: AppendReceipt {
-                    sequence,
-                    this_hash: envelope.this_hash,
-                },
-                observed_at: envelope.observed_at,
-                received_at: envelope.received_at,
-                received_unix_ms,
-                source_id: envelope.source_id.0,
-                schema_version: envelope.schema_version,
-                parser_version: envelope.parser_version,
-                content_type: envelope.content_type,
-                payload: envelope.payload,
-            },
+            source_observation_from_envelope(receipt, received_unix_ms, envelope),
         );
     }
     let expected_hash = tail_hash(prefix)?;
@@ -1845,6 +1913,7 @@ pub(crate) struct SelectedDecisionRows {
 
 /// Select post-Start decisions by their earliest verified source observation and classify all
 /// in-prefix rows for the transactional sealer. SQLite timestamps never determine membership.
+#[cfg(test)]
 pub(crate) fn decision_rows_for_source_prefix(
     state: &PaperStateDb,
     source_log_path: &Path,
@@ -1855,18 +1924,76 @@ pub(crate) fn decision_rows_for_source_prefix(
     decision_rows_from_source_observations(state, start_prefix, sealed_prefix, &observations)
 }
 
+/// Select sealed decisions from the process-wide receipt index without retaining source payloads
+/// while walking the source prefix (GitHub issue #574).
+pub(crate) fn decision_rows_for_indexed_source_prefix(
+    state: &PaperStateDb,
+    index: &SourceReceiptIndex,
+    candidate: &LogTailBinding,
+    start_prefix: &TailBinding,
+) -> Result<(SelectedDecisionRows, TailBinding), QualificationError> {
+    let candidate_sequence = candidate.last_sequence.unwrap_or(EventSeq(0));
+    let mut source_universe = HashMap::new();
+    let mut universe_error = None;
+    let binding = Scanner::walk_prefix(candidate, &mut |_, envelope| {
+        if universe_error.is_some() {
+            return;
+        }
+        if let Err(error) =
+            fold_source_trade_universe(&mut source_universe, candidate_sequence, envelope.into())
+        {
+            universe_error = Some(error);
+        }
+    })?
+    .ok_or_else(|| {
+        QualificationError::InsufficientEvidence(
+            "source observations do not reach the sealed sequence/hash prefix".to_owned(),
+        )
+    })?;
+    let sealed_prefix = TailBinding::from(&binding);
+    let universe = universe_error.map_or_else(|| Ok(source_universe), Err);
+    let selected = decision_rows_from_sealed_source(
+        state,
+        start_prefix,
+        &sealed_prefix,
+        SealedSource::Index(index),
+        universe,
+    )?;
+    Ok((selected, sealed_prefix))
+}
+
 fn decision_rows_from_source_observations(
     state: &PaperStateDb,
     start_prefix: &TailBinding,
     sealed_prefix: &TailBinding,
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<SelectedDecisionRows, QualificationError> {
+    let source_universe = sealed_prefix.last_sequence.map_or_else(
+        || Ok(HashMap::new()),
+        |sealed_sequence| source_trade_universe(sealed_sequence, observations),
+    );
+    decision_rows_from_sealed_source(
+        state,
+        start_prefix,
+        sealed_prefix,
+        SealedSource::Map(observations),
+        source_universe,
+    )
+}
+
+fn decision_rows_from_sealed_source(
+    state: &PaperStateDb,
+    start_prefix: &TailBinding,
+    sealed_prefix: &TailBinding,
+    source: SealedSource<'_>,
+    source_universe: Result<HashMap<pe_core_types::SourceTradeId, u64>, QualificationError>,
+) -> Result<SelectedDecisionRows, QualificationError> {
     let start_sequence = start_prefix.last_sequence;
     let Some(sealed_sequence) = sealed_prefix.last_sequence else {
         return Ok(SelectedDecisionRows::default());
     };
     let history = state.decision_pending_history()?;
-    let source_universe = source_trade_universe(sealed_sequence, observations)?;
+    let source_universe = source_universe?;
     let terminal_rows = history
         .iter()
         .filter(|row| row.state == DecisionPendingState::Terminal)
@@ -1903,7 +2030,7 @@ fn decision_rows_from_source_observations(
             pending_groups.push((source_trade_id, group.semantic_revision));
         }
     }
-    let complete_reads = complete_activity_read_scopes(&history, sealed_sequence, observations)?;
+    let complete_reads = complete_activity_read_scopes(&history, sealed_sequence, source)?;
     for (source_trade_id, revision) in pending_groups {
         if !complete_reads.iter().any(|read| {
             read.decisions.contains_key(source_trade_id)
@@ -1919,7 +2046,7 @@ fn decision_rows_from_source_observations(
     }
     let required = decision_keys_from_source_observations(
         start_sequence,
-        observations,
+        source,
         &source_universe,
         &complete_reads,
     )?;
@@ -1951,12 +2078,12 @@ fn decision_rows_from_source_observations(
         {
             continue;
         }
-        if receipts.iter().any(|receipt| {
-            observations
-                .get(&receipt.sequence.0)
-                .is_none_or(|observation| observation.receipt != *receipt)
-        }) {
-            return insufficient("decision source receipt does not match the sealed source prefix");
+        for receipt in receipts {
+            if source.receipt(receipt).is_err() {
+                return insufficient(
+                    "decision source receipt does not match the sealed source prefix",
+                );
+            }
         }
         in_prefix.push((row.source_trade_id.clone(), row.semantic_revision.clone()));
         let Some(required_revision) = required_by_trade.get(&row.source_trade_id) else {
@@ -2001,7 +2128,7 @@ struct CompleteActivityReadScope {
 fn complete_activity_read_scopes(
     rows: &[DecisionPendingRow],
     sealed_sequence: EventSeq,
-    observations: &BTreeMap<u64, SourceObservation>,
+    source: SealedSource<'_>,
 ) -> Result<Vec<CompleteActivityReadScope>, QualificationError> {
     let mut reads = Vec::<CompleteActivityReadScope>::new();
     for row in rows {
@@ -2026,12 +2153,12 @@ fn complete_activity_read_scopes(
         {
             continue;
         }
-        if receipts.iter().any(|receipt| {
-            observations
-                .get(&receipt.sequence.0)
-                .is_none_or(|observation| observation.receipt != *receipt)
-        }) {
-            return insufficient("decision source receipt does not match the sealed source prefix");
+        for receipt in receipts {
+            if source.receipt(receipt).is_err() {
+                return insufficient(
+                    "decision source receipt does not match the sealed source prefix",
+                );
+            }
         }
         if let Some(existing) = reads
             .iter_mut()
@@ -2065,15 +2192,15 @@ fn complete_activity_read_scopes(
             return insufficient("complete activity reads overlap source page receipts");
         }
         let mut lookup = |receipt| -> Result<_, QualificationError> {
-            let observation = decision_source_receipt(observations, receipt)?;
+            let observation = source.observation(receipt)?;
             Ok(CompleteActivityPage {
-                payload: observation.payload.clone(),
-                observed_at: observation.observed_at.clone(),
-                received_at: observation.received_at.clone(),
-                source_id: observation.source_id.clone(),
+                payload: observation.payload,
+                observed_at: observation.observed_at,
+                received_at: observation.received_at,
+                source_id: observation.source_id,
                 schema_version: observation.schema_version,
                 parser_version: observation.parser_version,
-                content_type: observation.content_type.clone(),
+                content_type: observation.content_type,
             })
         };
         let aggregates = continuation
@@ -2108,52 +2235,113 @@ fn source_trade_universe(
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<HashMap<pe_core_types::SourceTradeId, u64>, QualificationError> {
     let mut first = HashMap::new();
-    for observation in observations.values().filter(|observation| {
-        observation.receipt.sequence <= sealed_sequence
-            && observation.source_id == crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
-    }) {
-        crate::bucket_commit::activity_page_generation(
-            &observation.source_id,
-            observation.schema_version,
-            observation.parser_version,
-            &observation.content_type,
-        )
-        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-        let raw_rows: Vec<Box<serde_json::value::RawValue>> =
-            serde_json::from_slice(&observation.payload).map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "activity observation JSON failed: {error}"
-                ))
-            })?;
-        let context = ActivityParseContext {
-            source_id: SourceId(observation.source_id.clone()),
-            observed_at: observation.observed_at.clone(),
-            received_at: observation.received_at.clone(),
-            transport: ActivityTransport::Replay,
-        };
-        for raw in raw_rows {
-            let row =
-                parse_activity_row(raw.get().as_bytes(), None, &context).map_err(|error| {
-                    QualificationError::InsufficientEvidence(format!(
-                        "activity observation parse failed: {error}"
-                    ))
-                })?;
-            let group_id = row.group_id().map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "activity observation identity failed: {error}"
-                ))
-            })?;
-            if group_id.components().activity_type == ActivityType::Trade {
-                first
-                    .entry(group_id.key().clone())
-                    .and_modify(|sequence: &mut u64| {
-                        *sequence = (*sequence).min(observation.receipt.sequence.0);
-                    })
-                    .or_insert(observation.receipt.sequence.0);
-            }
-        }
+    for observation in observations.values() {
+        fold_source_trade_universe(&mut first, sealed_sequence, observation.into())?;
     }
     Ok(first)
+}
+
+/// One source frame as the universe fold sees it, borrowed from either a replayed
+/// `SourceObservation` (offline map path) or a walked `EventEnvelope` (runtime path) (#574).
+struct SourcePageRef<'a> {
+    sequence: EventSeq,
+    source_id: &'a str,
+    schema_version: u32,
+    parser_version: u32,
+    content_type: &'a ContentType,
+    observed_at: &'a SourceTimestamp,
+    received_at: &'a ReceivedAt,
+    payload: &'a [u8],
+}
+
+impl<'a> From<&'a SourceObservation> for SourcePageRef<'a> {
+    fn from(observation: &'a SourceObservation) -> Self {
+        Self {
+            sequence: observation.receipt.sequence,
+            source_id: &observation.source_id,
+            schema_version: observation.schema_version,
+            parser_version: observation.parser_version,
+            content_type: &observation.content_type,
+            observed_at: &observation.observed_at,
+            received_at: &observation.received_at,
+            payload: &observation.payload,
+        }
+    }
+}
+
+impl<'a> From<&'a pe_event_log::EventEnvelope> for SourcePageRef<'a> {
+    fn from(envelope: &'a pe_event_log::EventEnvelope) -> Self {
+        Self {
+            sequence: envelope.seq,
+            source_id: &envelope.source_id.0,
+            schema_version: envelope.schema_version,
+            parser_version: envelope.parser_version,
+            content_type: &envelope.content_type,
+            observed_at: &envelope.observed_at,
+            received_at: &envelope.received_at,
+            payload: &envelope.payload,
+        }
+    }
+}
+
+fn fold_source_trade_universe(
+    first: &mut HashMap<pe_core_types::SourceTradeId, u64>,
+    sealed_sequence: EventSeq,
+    page: SourcePageRef<'_>,
+) -> Result<(), QualificationError> {
+    let SourcePageRef {
+        sequence,
+        source_id,
+        schema_version,
+        parser_version,
+        content_type,
+        observed_at,
+        received_at,
+        payload,
+    } = page;
+    if sequence > sealed_sequence || source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
+        return Ok(());
+    }
+    crate::bucket_commit::activity_page_generation(
+        source_id,
+        schema_version,
+        parser_version,
+        content_type,
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let raw_rows: Vec<Box<serde_json::value::RawValue>> =
+        serde_json::from_slice(payload).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "activity observation JSON failed: {error}"
+            ))
+        })?;
+    let context = ActivityParseContext {
+        source_id: SourceId(source_id.to_owned()),
+        observed_at: observed_at.clone(),
+        received_at: received_at.clone(),
+        transport: ActivityTransport::Replay,
+    };
+    for raw in raw_rows {
+        let row = parse_activity_row(raw.get().as_bytes(), None, &context).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "activity observation parse failed: {error}"
+            ))
+        })?;
+        let group_id = row.group_id().map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "activity observation identity failed: {error}"
+            ))
+        })?;
+        if group_id.components().activity_type == ActivityType::Trade {
+            first
+                .entry(group_id.key().clone())
+                .and_modify(|first_sequence: &mut u64| {
+                    *first_sequence = (*first_sequence).min(sequence.0);
+                })
+                .or_insert(sequence.0);
+        }
+    }
+    Ok(())
 }
 
 /// Reconstruct each immutable fixed-end activity read before deriving composite decision keys.
@@ -2161,7 +2349,7 @@ fn source_trade_universe(
 /// and a group's earliest raw receipt decides whether its production aggregate predates Start.
 fn decision_keys_from_source_observations(
     start_sequence: Option<EventSeq>,
-    observations: &BTreeMap<u64, SourceObservation>,
+    source: SealedSource<'_>,
     source_universe: &HashMap<pe_core_types::SourceTradeId, u64>,
     complete_reads: &[CompleteActivityReadScope],
 ) -> Result<Vec<(u64, pe_core_types::SourceTradeId, String)>, QualificationError> {
@@ -2177,7 +2365,7 @@ fn decision_keys_from_source_observations(
             let Some(receipt) = *receipt else {
                 continue;
             };
-            let observation = decision_source_receipt(observations, receipt)?;
+            let observation = source.observation(receipt)?;
             let activity =
                 parse_activity_trade_observation(&observation.payload).map_err(|_| {
                     QualificationError::InsufficientEvidence(format!(
@@ -2662,17 +2850,11 @@ impl PublishedMembershipSource {
                 "MembershipChanged source receipt could not be read: {error}"
             ))
         })?;
-        Ok(Some(SourceObservation {
+        Ok(Some(source_observation_from_envelope(
             receipt,
-            observed_at: envelope.observed_at,
-            received_at: envelope.received_at,
             received_unix_ms,
-            source_id: envelope.source_id.0,
-            schema_version: envelope.schema_version,
-            parser_version: envelope.parser_version,
-            content_type: envelope.content_type,
-            payload: envelope.payload,
-        }))
+            envelope,
+        )))
     }
 
     pub(crate) fn scan(source_log: &Path) -> Result<Self, QualificationError> {
@@ -5177,7 +5359,11 @@ fn start_envelope(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "."]
 mod tests {
+    #[path = "qualification/selection_oracle.rs"]
+    mod selection_oracle;
+
     use pe_core_types::{
         BasisPoints, KellyFraction, LeaderAction, PolymarketConditionId, PolymarketTokenId,
         Probability, ProbabilityPpm, RawHttpAttempt, RawHttpResponse, SourceTradeId, WalletAddress,
@@ -8187,9 +8373,13 @@ mod tests {
         );
 
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
@@ -8246,9 +8436,13 @@ mod tests {
         );
 
         let source_universe = source_trade_universe(EventSeq(3), &observations).unwrap();
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.row_count, 2);
@@ -8292,9 +8486,13 @@ mod tests {
 
         let source_universe =
             source_trade_universe(EventSeq(child_sequence), &observations).unwrap();
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .unwrap();
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.share_sum.to_decimal(), dec!(3));
@@ -8498,7 +8696,7 @@ mod tests {
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
             Some(EventSeq(1)),
-            &observations,
+            SealedSource::Map(&observations),
             &source_universe,
             &[pre_read, post_read],
         )
@@ -8648,9 +8846,13 @@ mod tests {
         );
         let source_universe = source_trade_universe(EventSeq(0), &observations)
             .expect("valid source universe derives from the activity row");
-        let keys =
-            decision_keys_from_source_observations(None, &observations, &source_universe, &[read])
-                .expect("valid complete activity read derives one decision key");
+        let keys = decision_keys_from_source_observations(
+            None,
+            SealedSource::Map(&observations),
+            &source_universe,
+            &[read],
+        )
+        .expect("valid complete activity read derives one decision key");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, target_id);
 
@@ -10583,6 +10785,229 @@ mod tests {
             last_sequence: sequence.map(EventSeq),
             last_hash: "00".repeat(32),
         }
+    }
+
+    fn assert_selection_results_equal(
+        map: Result<SelectedDecisionRows, QualificationError>,
+        indexed: Result<(SelectedDecisionRows, TailBinding), QualificationError>,
+        expected_binding: &TailBinding,
+    ) {
+        match (map, indexed) {
+            (Ok(map), Ok((indexed, binding))) => {
+                assert_eq!(map.rows, indexed.rows);
+                assert_eq!(map.in_prefix, indexed.in_prefix);
+                assert_eq!(binding.physical_tail, expected_binding.physical_tail);
+                assert_eq!(binding.last_sequence, expected_binding.last_sequence);
+                assert_eq!(binding.last_hash, expected_binding.last_hash);
+            }
+            (Err(map), Err(indexed)) => {
+                assert_eq!(
+                    selection_oracle::qualification_error_variant(&map),
+                    selection_oracle::qualification_error_variant(&indexed)
+                );
+                assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
+            }
+            (map, indexed) => assert_eq!(
+                format!("Map: {map:?}"),
+                format!("Index: {indexed:?}"),
+                "Map/Index selection result variants differ"
+            ),
+        }
+    }
+
+    /// The offline Map adapter and runtime Index adapter preserve the pre-#574 characterization.
+    #[test]
+    fn qualification_selection_matches_characterization_through_both_adapters() {
+        let oracle = include_str!("../tests/fixtures/qualification_selection_oracle.txt");
+        let mut map_characterization = selection_oracle::selection_oracle_header();
+        for case in selection_oracle::selection_oracle_cases() {
+            let fixture = selection_oracle::build_selection_oracle_fixture(case);
+            let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+            let candidate = fixture.candidate();
+            let map = decision_rows_for_source_prefix(
+                &fixture.state,
+                &fixture.source_path,
+                &fixture.start,
+                &fixture.sealed,
+            );
+            let indexed = decision_rows_for_indexed_source_prefix(
+                &fixture.state,
+                &index,
+                &candidate,
+                &fixture.start,
+            );
+            let expected = selection_oracle::expected_selection_oracle_result(oracle, case);
+            let map_rendering = selection_oracle::render_selection_oracle_result(map.as_ref());
+            assert_eq!(
+                map_rendering, expected,
+                "Map selection differs for oracle case {case}"
+            );
+            assert_eq!(
+                selection_oracle::render_selection_oracle_result(
+                    indexed.as_ref().map(|(selected, _)| selected)
+                ),
+                expected,
+                "Index selection differs for oracle case {case}"
+            );
+            assert_selection_results_equal(map, indexed, &fixture.sealed);
+            map_characterization.push_str(&selection_oracle::selection_oracle_section(
+                case,
+                &map_rendering,
+            ));
+        }
+        assert_eq!(
+            map_characterization, oracle,
+            "Map selection differs from the frozen pre-#574 characterization"
+        );
+    }
+
+    /// Both #574 adapters return identical point evidence and exact receipt refusals.
+    #[test]
+    fn sealed_source_map_and_index_adapters_are_equivalent() {
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
+        let observations = source_observations(&fixture.source_path, &fixture.sealed).unwrap();
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let present = observations.first_key_value().unwrap().1.receipt;
+        assert_eq!(
+            SealedSource::Map(&observations).receipt(present).unwrap(),
+            SealedSource::Index(&index).receipt(present).unwrap()
+        );
+        assert_eq!(
+            SealedSource::Map(&observations)
+                .observation(present)
+                .unwrap(),
+            SealedSource::Index(&index).observation(present).unwrap()
+        );
+
+        let absent = AppendReceipt {
+            sequence: EventSeq(99),
+            this_hash: blake3::hash(b"absent"),
+        };
+        let wrong_hash = AppendReceipt {
+            this_hash: blake3::hash(b"wrong"),
+            ..present
+        };
+        for receipt in [absent, wrong_hash] {
+            let map_receipt = SealedSource::Map(&observations)
+                .receipt(receipt)
+                .unwrap_err();
+            let indexed_receipt = SealedSource::Index(&index).receipt(receipt).unwrap_err();
+            assert_eq!(
+                selection_oracle::qualification_error_variant(&map_receipt),
+                selection_oracle::qualification_error_variant(&indexed_receipt)
+            );
+            assert_eq!(
+                map_receipt.to_string().as_bytes(),
+                indexed_receipt.to_string().as_bytes()
+            );
+            let map = SealedSource::Map(&observations)
+                .observation(receipt)
+                .unwrap_err();
+            let indexed = SealedSource::Index(&index)
+                .observation(receipt)
+                .unwrap_err();
+            assert_eq!(
+                selection_oracle::qualification_error_variant(&map),
+                selection_oracle::qualification_error_variant(&indexed)
+            );
+            assert_eq!(map.to_string().as_bytes(), indexed.to_string().as_bytes());
+        }
+    }
+
+    /// An indexed #574 point read maps the underlying risk-input failure without hiding its text.
+    #[test]
+    fn sealed_source_index_maps_point_read_failure() {
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let present = index.receipt_at(EventSeq(0)).unwrap().unwrap().0;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.source_path)
+            .unwrap()
+            .set_len(5)
+            .unwrap();
+        let error = SealedSource::Index(&index)
+            .observation(present)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QualificationError::InsufficientEvidence(ref message)
+                if message == "decision source observation 0 could not be read: position price evidence conflicts"
+        ));
+    }
+
+    /// An uncarried #574 candidate is evidence-insufficient; physical corruption remains EventLog.
+    #[test]
+    fn indexed_selection_distinguishes_unreached_prefix_from_corruption() {
+        for mismatch_hash in [false, true] {
+            let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
+            let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+            let mut candidate = Scanner::verify(&fixture.source_path).unwrap();
+            if mismatch_hash {
+                candidate.last_hash = blake3::hash(b"different");
+            } else {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fixture.source_path)
+                    .unwrap()
+                    .set_len(5)
+                    .unwrap();
+            }
+            let error = decision_rows_for_indexed_source_prefix(
+                &fixture.state,
+                &index,
+                &candidate,
+                &fixture.start,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                QualificationError::InsufficientEvidence(ref message)
+                    if message == "source observations do not reach the sealed sequence/hash prefix"
+            ));
+        }
+
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
+        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        let mut bytes = fs::read(&fixture.source_path).unwrap();
+        bytes[10] ^= 1;
+        fs::write(&fixture.source_path, bytes).unwrap();
+        let error = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &index,
+            &candidate,
+            &fixture.start,
+        )
+        .unwrap_err();
+        assert!(matches!(error, QualificationError::EventLog(_)), "{error}");
+    }
+
+    /// A stale #574 index cannot reconstruct a page that the candidate file carries.
+    #[test]
+    fn indexed_selection_refuses_reconstructed_page_absent_from_index() {
+        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
+        let candidate = Scanner::verify(&fixture.source_path).unwrap();
+        assert!(
+            decision_rows_for_source_prefix(
+                &fixture.state,
+                &fixture.source_path,
+                &fixture.start,
+                &fixture.sealed,
+            )
+            .is_ok()
+        );
+        let error = decision_rows_for_indexed_source_prefix(
+            &fixture.state,
+            &SourceReceiptIndex::default(),
+            &candidate,
+            &fixture.start,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "insufficient qualification evidence: decision source receipt does not match the sealed source prefix"
+        );
     }
 
     /// PASS: authentic child collapse and coherent request-origin substitution fail against a real V4 commitment; original evidence passes.

@@ -1,0 +1,144 @@
+# Recorded from pre-#574 base revision dfa00e1c118f3ca21d5bf8a3fd6d6cd36fc19d2d.
+# Command: cargo nextest run -p pe-service regenerate_qualification_selection_oracle --run-ignored ignored-only
+# Run the regenerator on that exact base revision to refresh this file.
+
+=== empty_history ===
+Ok
+rows: []
+in_prefix: []
+=== start_only ===
+Ok
+rows: []
+in_prefix: []
+=== post_start_v3 ===
+Ok
+rows: [DecisionPendingRow { source_trade_id: SourceTradeId("g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79"), semantic_revision: "fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94", wallet: WalletAddress(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa), source_epoch: 100, frozen_inputs_json: "{\"version\":3,\"source_trade_id\":\"g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79\",\"semantic_revision\":\"fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94\",\"transaction_hash\":\"0xoracle\",\"wallet\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"source_epoch\":100,\"market_id\":\"0xoracle\",\"outcome_id\":0,\"side\":\"Buy\",\"price\":\"0.5\",\"share_amount\":1000000,\"provenance\":\"rest_poll\",\"pre_bucket_action\":\"Entry\",\"reconstruction_quality\":100,\"action_confidence_ppm\":1000000,\"gate_result\":\"admitted\",\"applied_configuration_hash\":\"d37f6c59f9819d87709af07257642dce2d7f145df14d5abf6e69f4b76b4e2a11\",\"applied_configuration\":{\"era\":\"financial15\",\"active_watchlist_size\":100,\"mode\":\"paper\",\"max_fill_price\":\"0.85\",\"min_fill_price\":\"0.15\",\"min_resolution_horizon_secs\":60,\"max_resolution_horizon_secs\":172800,\"price_impact_cap_bps\":100,\"flip_human_approved\":false,\"kelly_fraction_above_default_human_approved\":false,\"kelly_fraction_override\":null,\"per_trade_cap\":{\"kind\":\"mode_default\"},\"slippage_rate\":\"0.01\",\"sizing_mode\":{\"kind\":\"kelly\"},\"sizing_dollar_usd\":\"0\",\"sizing_contracts\":0},\"frozen_basis\":{\"win_rate_p\":\"0.6\",\"bankroll\":\"100\"},\"decision_inputs\":{\"fixed_end\":100,\"pages\":[{\"bounds\":{\"end\":100,\"start\":null},\"canonical_page_hash\":\"0952c1385e05e0931888e2c5ffda4044be479748303d907422627d551e4ac752\",\"offset\":0,\"parser_version\":2,\"partition\":null,\"raw_page_hash\":\"0952c1385e05e0931888e2c5ffda4044be479748303d907422627d551e4ac752\",\"received_at\":\"1970-01-01T00:00:00Z\",\"request_url\":\"https://data-api.polymarket.com/activity?user=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end=100\",\"row_count\":1,\"schema_version\":2}]},\"observed_source_receipt\":null,\"page_occurrences\":[{\"request_url\":\"https://data-api.polymarket.com/activity?user=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end=100\",\"raw_hash\":\"0952c1385e05e0931888e2c5ffda4044be479748303d907422627d551e4ac752\",\"receipt\":{\"sequence\":0,\"this_hash\":\"10776e8dcb468e8b97f6fe19686fcbb58186b54b77a57a8b1794a2c92d9e7d32\"}}]}", post_commit_inputs_json: "{}", state: Terminal, terminal_disposition: Some("no_fill"), updated_at_unix: 100 }]
+in_prefix: [(SourceTradeId("g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79"), "fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94")]
+=== post_start_v4 ===
+Ok
+rows: [DecisionPendingRow { source_trade_id: SourceTradeId("g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79"), semantic_revision: "fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94", wallet: WalletAddress(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa), source_epoch: 100, frozen_inputs_json: "{\"version\":4,\"source_trade_id\":\"g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79\",\"semantic_revision\":\"fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94\",\"transaction_hash\":\"0xoracle\",\"wallet\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"source_epoch\":100,\"market_id\":\"0xoracle\",\"outcome_id\":0,\"side\":\"Buy\",\"price\":\"0.5\",\"share_amount\":1000000,\"provenance\":\"rest_poll\",\"pre_bucket_action\":\"Entry\",\"reconstruction_quality\":100,\"action_confidence_ppm\":1000000,\"gate_result\":\"admitted\",\"applied_configuration_hash\":\"d37f6c59f9819d87709af07257642dce2d7f145df14d5abf6e69f4b76b4e2a11\",\"applied_configuration\":{\"era\":\"financial15\",\"active_watchlist_size\":100,\"mode\":\"paper\",\"max_fill_price\":\"0.85\",\"min_fill_price\":\"0.15\",\"min_resolution_horizon_secs\":60,\"max_resolution_horizon_secs\":172800,\"price_impact_cap_bps\":100,\"flip_human_approved\":false,\"kelly_fraction_above_default_human_approved\":false,\"kelly_fraction_override\":null,\"per_trade_cap\":{\"kind\":\"mode_default\"},\"slippage_rate\":\"0.01\",\"sizing_mode\":{\"kind\":\"kelly\"},\"sizing_dollar_usd\":\"0\",\"sizing_contracts\":0},\"frozen_basis\":{\"win_rate_p\":\"0.6\",\"bankroll\":\"100\"},\"decision_inputs\":{\"fixed_end\":100,\"pages\":[{\"bounds\":{\"end\":100,\"start\":null},\"canonical_page_hash\":\"0952c1385e05e0931888e2c5ffda4044be479748303d907422627d551e4ac752\",\"offset\":0,\"parser_version\":2,\"partition\":null,\"raw_page_hash\":\"0952c1385e05e0931888e2c5ffda4044be479748303d907422627d551e4ac752\",\"received_at\":\"1970-01-01T00:00:00Z\",\"request_url\":\"https://data-api.polymarket.com/activity?user=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end=100\",\"row_count\":1,\"schema_version\":2}]},\"observed_source_receipt\":null,\"page_occurrences\":[{\"request_url\":\"https://data-api.polymarket.com/activity?user=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end=100\",\"raw_hash\":\"0952c1385e05e0931888e2c5ffda4044be479748303d907422627d551e4ac752\",\"receipt\":{\"sequence\":0,\"this_hash\":\"ea48f803a4ad8151461f9e1566c81d7863a8ebbeddd5c6286584ae3c47c494b0\"}}],\"read_commitment\":{\"sequence\":1,\"this_hash\":\"3351a7f09ae666877a0960610b5f6648cb63c643579ff7435fc97d5bd1826a2d\"}}", post_commit_inputs_json: "{}", state: Terminal, terminal_disposition: Some("no_fill"), updated_at_unix: 100 }]
+in_prefix: [(SourceTradeId("g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79"), "fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94")]
+=== pre_start_websocket_v3 ===
+Ok
+rows: []
+in_prefix: [(SourceTradeId("g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79"), "fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94")]
+=== pre_start_websocket_v4 ===
+Ok
+rows: []
+in_prefix: [(SourceTradeId("g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79"), "fd9f591045d6398c5f20b2504c08478e4d08834515f2d870dd107436987c2f94")]
+=== post_start_sell ===
+Ok
+rows: []
+in_prefix: []
+=== pending_without_decision ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision
+=== open_decision ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision
+=== semantic_revision_drift ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision
+=== complete_read_drift ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision: complete activity read does not reach its fixed end
+=== missing_read_commitment ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision
+=== receipt_hash_mismatch ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision source receipt does not match the sealed source prefix
+=== downgraded_v4 ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision: complete activity read page generation differs from continuation version
+=== commitment_wrong_source ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read page has the wrong source contract
+=== missing_activity_group ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no durable activity group
+=== sealed_prefix_not_reached ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source observations do not reach the sealed sequence/hash prefix
+=== malformed_activity_page_json ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: activity observation JSON failed: invalid type: map, expected a sequence at line 1 column 0
+=== activity_page_row_parse_failure ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: activity observation parse failed: activity window invalidated: activity row 0 omitted proxyWallet
+=== activity_page_wrong_schema ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read page has the wrong source contract
+=== activity_page_wrong_parser ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read page has the wrong source contract
+=== activity_page_wrong_content_type ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read page has the wrong source contract
+=== malformed_websocket_payload ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision websocket observation 0 is invalid
+=== websocket_wrong_contract ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision websocket observation has the wrong source contract
+=== websocket_different_trade_key ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision websocket observation has the wrong source contract
+=== additional_decision_row ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision_pending row g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79/additional is additional to the parsed source prefix
+=== repeated_source_identity_disjoint_reads ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: sealed decision evidence repeats a source trade identity
+=== disagreeing_complete_reads ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision continuations disagree about one complete activity read
+=== repeated_complete_read ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity read repeats a decision identity
+=== overlapping_complete_reads ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: complete activity reads overlap source page receipts
+=== invalid_decision_source_receipt_link ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision source receipt link is invalid: unsupported frozen continuation version 0
+=== complete_read_payload_hash_mismatch ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source-log trade g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79 has no reconstructable receipt-bearing decision: complete activity read page payload hash differs
+=== conflicting_semantic_revisions ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: source trade g2:3c37bd7c2d3d19313fe7347e8544c6fab6b3ce5fc7945eb29d5e97255dfafdd3 has multiple semantic revisions in the sealed prefix
+=== trade_absent_from_complete_read ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: decision source trade g2:c7354946ebcd69ff65dbcbb37e37b5b65d10e4ed3260652c2de30b51bc83779c is absent from its complete activity read
+=== history_before_universe_error_precedence ===
+Err
+variant: PaperState
+text: paper state: sqlite error: no such table: decision_pending

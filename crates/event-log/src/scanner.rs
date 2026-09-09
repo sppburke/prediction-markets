@@ -79,6 +79,30 @@ impl Scanner {
         verdict.require_match()?;
         Ok(outcome.verified_tail)
     }
+
+    /// Verify and observe only the frames that begin below a sealed physical tail (#574).
+    ///
+    /// Returns `None` when the file ends before the tail, a frame crosses it, or its terminal
+    /// sequence and hash do not match. Physical frame failures below the tail remain errors.
+    pub fn walk_prefix(
+        sealed: &LogTailBinding,
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+    ) -> Result<Option<LogTailBinding>, LogError> {
+        let file = File::open(&sealed.path)?;
+        let (outcome, verdict) = walk_locked(
+            &sealed.path,
+            &file,
+            WalkRequest::until_expected_prefix(sealed),
+            observer,
+        )?;
+        if let Some(incomplete) = outcome.incomplete_tail {
+            return Err(LogError::Truncated {
+                at: incomplete.next_sequence,
+                byte_offset: incomplete.byte_offset,
+            });
+        }
+        Ok((verdict == PrefixVerdict::Matched).then_some(outcome.verified_tail))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +167,41 @@ impl<'a> PrefixTracker<'a> {
                 PrefixVerdict::Shorter
             }
             Some(_) => PrefixVerdict::Mismatch,
+        }
+    }
+
+    fn verdict_before_read(&self, state: &ScanState) -> Option<PrefixVerdict> {
+        let expected = self.expected?;
+        (state.physical_tail >= expected.physical_tail).then(|| self.verdict(state))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkBoundary {
+    PhysicalEof,
+    ExpectedPrefix,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalkRequest<'a> {
+    expected_prefix: Option<&'a LogTailBinding>,
+    boundary: WalkBoundary,
+}
+
+impl<'a> WalkRequest<'a> {
+    fn until_expected_prefix(expected_prefix: &'a LogTailBinding) -> Self {
+        Self {
+            expected_prefix: Some(expected_prefix),
+            boundary: WalkBoundary::ExpectedPrefix,
+        }
+    }
+}
+
+impl<'a> From<Option<&'a LogTailBinding>> for WalkRequest<'a> {
+    fn from(expected_prefix: Option<&'a LogTailBinding>) -> Self {
+        Self {
+            expected_prefix,
+            boundary: WalkBoundary::PhysicalEof,
         }
     }
 }
@@ -281,29 +340,41 @@ pub(crate) fn read_verified_frame(
 
 pub(crate) fn inspect_open(path: &Path, file: &File) -> Result<ScanOutcome, LogError> {
     let mut observer = |_: u64, _: &EventEnvelope| {};
-    let (outcome, _) = walk_locked(path, file, None, &mut observer)?;
+    let (outcome, _) = walk_locked(path, file, Option::<&LogTailBinding>::None, &mut observer)?;
     Ok(outcome)
 }
 
 /// Walk an already-open handle without mutating it (#572). The writer holds the exclusive lock
-/// when a repair may follow; `verify_prefix` walks a plain read handle.
+/// when a repair may follow; `verify_prefix` and `walk_prefix` walk a plain read handle.
 ///
 /// Frame verification has one owner. The prefix verdict is returned separately so the writer can
 /// reject a truncation into the trusted prefix before deciding whether tail repair is permitted.
-pub(crate) fn walk_locked(
+pub(crate) fn walk_locked<'a>(
     path: &Path,
     file: &File,
-    expected_prefix: Option<&LogTailBinding>,
+    request: impl Into<WalkRequest<'a>>,
     observer: &mut dyn FnMut(u64, &EventEnvelope),
 ) -> Result<(ScanOutcome, PrefixVerdict), LogError> {
+    let request = request.into();
     let resolved_path = std::fs::canonicalize(path)?;
     let mut reader = BufReader::new(file);
     verify_file_header(path, &mut reader)?;
     let mut state = ScanState::after_header();
-    let mut prefix = PrefixTracker::new(expected_prefix, &resolved_path);
+    let mut prefix = PrefixTracker::new(request.expected_prefix, &resolved_path);
     prefix.observe(&state);
 
     loop {
+        if request.boundary == WalkBoundary::ExpectedPrefix
+            && let Some(verdict) = prefix.verdict_before_read(&state)
+        {
+            return Ok((
+                ScanOutcome {
+                    verified_tail: tail_binding(resolved_path, &state),
+                    incomplete_tail: None,
+                },
+                verdict,
+            ));
+        }
         let frame_start = state.physical_tail();
         match read_verified_frame(&mut reader, &mut state)? {
             ScanStep::Frame(envelope) => {
