@@ -243,7 +243,7 @@ pub struct OrchestratorConfig {
 }
 
 /// Scenario-only deterministic seams (#546): fixed admission-clock instants and historical mark
-/// results consumed in order, plus one-shot faults immediately before the two durable writes whose
+/// results consumed in order, plus one-shot faults immediately before the durable writes whose
 /// rollback the fan-in acceptance suite must prove. Compiled only with the `scenario` feature;
 /// production has no clock/result injection and no fault path.
 #[cfg(feature = "scenario")]
@@ -260,6 +260,8 @@ pub struct ScenarioHooks {
     pub financial_clock_unix: std::sync::atomic::AtomicI64,
     pub fail_next_stage_seed: std::sync::atomic::AtomicBool,
     pub fail_next_no_copy_commit: std::sync::atomic::AtomicBool,
+    /// One-shot fault standing in for a failed `RiskHaltChanged` append.
+    pub fail_next_halt_append: std::sync::atomic::AtomicBool,
 }
 
 pub struct Orchestrator<
@@ -398,12 +400,31 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         evidence: serde_json::Value,
     ) -> Result<pe_event_log::AppendReceipt, String> {
         let key = (owner.clone(), cause);
-        let receipt = self.append_paper_record(&PaperLogRecord::RiskHaltChanged {
+        let record = PaperLogRecord::RiskHaltChanged {
             owner,
             cause,
             state,
             evidence,
-        })?;
+        };
+        #[cfg(feature = "scenario")]
+        let injected = self.take_scenario_fault(|h| &h.fail_next_halt_append);
+        #[cfg(not(feature = "scenario"))]
+        let injected = false;
+        let appended = if injected {
+            Err("injected risk halt append failure".to_owned())
+        } else {
+            self.append_paper_record(&record)
+        };
+        let receipt = match appended {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                // The frame's durability is unknown, so the in-memory halt set can no longer stand
+                // in for the paper prefix; stop intake and let the restart rebuild it from the log.
+                error!(%error, owner = ?key.0, ?cause, ?state, "risk halt append failed; stopping intake");
+                self.intake_stopped = true;
+                return Err(error);
+            }
+        };
         match state {
             crate::paper_recovery::HaltState::Engaged => {
                 self.active_risk_halts.insert(key);
@@ -1323,19 +1344,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     }
                     result
                 };
-                if let Ok(result) = &result {
-                    for source_trade_id in &result.pending {
-                        match self.load_pending_continuation(source_trade_id) {
-                            Ok(Some(trade)) => self.handle_trade(trade).await,
-                            Ok(None) => {}
-                            Err(error) => {
-                                let msg = error.to_string();
-                                self.pending_load_failure = Some(msg.clone());
-                                let _ = committed.send(Err(msg));
-                                return;
-                            }
-                        }
-                    }
+                if let Ok(result) = &result
+                    && let Err(msg) = self.resume_committed_rows(&result.pending).await
+                {
+                    self.pending_load_failure = Some(msg.clone());
+                    let _ = committed.send(Err(msg));
+                    return;
                 }
                 let result = result.map_err(|error| error.to_string());
                 let _ = committed.send(result);
@@ -1685,6 +1699,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         self.pending_continuations
             .insert(source_trade_id.clone(), continuation);
         Ok(Some(trade))
+    }
+
+    /// Resume the continuations a bucket commit created, in commit order. The loop stops at the
+    /// first row that leaves paper durability uncertain: the remaining rows stay pending for the
+    /// restart, which rebuilds the halt set from the log before resuming them.
+    async fn resume_committed_rows(&mut self, pending: &[SourceTradeId]) -> Result<(), String> {
+        for source_trade_id in pending {
+            if self.intake_stopped {
+                break;
+            }
+            match self.load_pending_continuation(source_trade_id) {
+                Ok(Some(trade)) => self.handle_trade(trade).await,
+                Ok(None) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "scenario")]
@@ -3024,6 +3055,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .await
         {
             Ok(risk) => risk,
+            Err(_) if self.intake_stopped => {
+                // A risk halt append failed inside this evaluation: the halt state's durability is
+                // uncertain, so the decision stays pending for the restart instead of recording a
+                // decline that qualification could not replay.
+                error!(trade = %trade.source_trade_id, "paper risk halt append failed; decision left pending");
+                return;
+            }
             Err(failure) => {
                 let decline = pe_strategy_winner_follow::WinnerFollowError::RiskInputsUnavailable;
                 let reason = format!("{decline}: {}", failure.cause);
@@ -3931,11 +3969,17 @@ mod tests {
             .collect()
     }
 
-    /// PASS: keyed recovery ignores a corrupt unrelated open row, rebuilds/caches only the requested
-    /// open row, skips missing/terminal rows, and reports the requested identity on a load error.
-    /// FAIL: recovery scans all open rows, resumes terminal rows, or hides decode/read failures.
-    #[tokio::test]
-    async fn load_pending_continuation_uses_single_row_lookup_and_resumes_only_open_rows() {
+    /// Orchestrator over the producer fixture's paper state with no boot rows or continuations.
+    fn producer_orchestrator(
+        dir: &tempfile::TempDir,
+        paper_state: std::sync::Arc<pe_paper_state::PaperStateDb>,
+    ) -> (
+        Orchestrator<
+            pe_source_polymarket_public::FixtureFetcher,
+            crate::clob_book::FixtureClobBookFetcher,
+        >,
+        tokio::sync::mpsc::Sender<crate::orchestrator_control::OrchestratorControl>,
+    ) {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -3944,18 +3988,13 @@ mod tests {
         use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
         use rust_decimal::Decimal;
 
-        use crate::bucket_commit::DecisionContinuationV3;
-        use crate::bucket_commit::continuation_validation_tests::producer_fixture;
         use crate::clob_book::FixtureClobBookFetcher;
         use crate::entry_gate::CopyEntryGateConfig;
         use crate::health::new_shared_health;
         use crate::live_watchlist::LiveWatchlist;
         use crate::mid_price_cache::MidPriceCache;
 
-        let (dir, paper_state, _index) = producer_fixture();
-        let rows = paper_state.open_decision_pending().unwrap();
-        let target = &rows[1];
-        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(2);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(2);
         let mut orchestrator = Orchestrator::new(
             LiveWatchlist::new(pe_trader_index::Watchlist {
                 entries: Vec::new(),
@@ -3997,6 +4036,50 @@ mod tests {
         .unwrap();
         orchestrator.pending_boot.clear();
         orchestrator.pending_continuations.clear();
+        (orchestrator, control_tx)
+    }
+
+    /// PASS: once paper durability is uncertain, resuming a committed bucket loads and handles no
+    /// further row: every row stays open with its frozen inputs and no continuation is registered.
+    /// FAIL: a row is loaded, resumed, or terminalized after the latch.
+    #[tokio::test]
+    async fn resume_committed_rows_stops_once_paper_durability_is_uncertain() {
+        use crate::bucket_commit::continuation_validation_tests::producer_fixture;
+
+        let (dir, paper_state, _index) = producer_fixture();
+        let before = paper_state.open_decision_pending().unwrap();
+        let ids = before
+            .iter()
+            .map(|row| row.source_trade_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        let (mut orchestrator, _control_tx) = producer_orchestrator(&dir, paper_state.clone());
+        orchestrator.intake_stopped = true;
+
+        orchestrator.resume_committed_rows(&ids).await.unwrap();
+
+        assert!(orchestrator.pending_continuations.is_empty());
+        let after = paper_state.open_decision_pending().unwrap();
+        assert_eq!(after.len(), 2);
+        for (row, expected) in after.iter().zip(&before) {
+            assert_eq!(row.source_trade_id, expected.source_trade_id);
+            assert_eq!(row.state, pe_paper_state::DecisionPendingState::Open);
+            assert_eq!(row.frozen_inputs_json, expected.frozen_inputs_json);
+        }
+    }
+
+    /// PASS: keyed recovery ignores a corrupt unrelated open row, rebuilds/caches only the requested
+    /// open row, skips missing/terminal rows, and reports the requested identity on a load error.
+    /// FAIL: recovery scans all open rows, resumes terminal rows, or hides decode/read failures.
+    #[tokio::test]
+    async fn load_pending_continuation_uses_single_row_lookup_and_resumes_only_open_rows() {
+        use crate::bucket_commit::DecisionContinuationV3;
+        use crate::bucket_commit::continuation_validation_tests::producer_fixture;
+
+        let (dir, paper_state, _index) = producer_fixture();
+        let rows = paper_state.open_decision_pending().unwrap();
+        let target = &rows[1];
+        let (mut orchestrator, _control_tx) = producer_orchestrator(&dir, paper_state.clone());
 
         // A full scan now fails at the durable row parser, before any JSON is decoded.
         let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();

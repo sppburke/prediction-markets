@@ -801,6 +801,72 @@ async fn dynamic_continuation_load_failure_stops_the_orchestrator() {
     support::assert_no_continuation_side_effects(&paper, &state_path, &paper_path, &hooks);
 }
 
+/// PASS: a failed `RiskHaltChanged` append makes the acknowledgement an error, writes no halt
+/// frame, and run_coordinated returns PaperDurabilityUncertain so the restart rebuilds the halt
+/// set from the paper log. FAIL: the failure is acknowledged as success, a frame is written, or
+/// the orchestrator keeps running with an in-memory halt set the log does not carry.
+#[tokio::test]
+async fn risk_halt_append_failure_stops_the_orchestrator() {
+    let dir = TempDir::new().unwrap();
+    let state_path = dir.path().join("paper_state.db");
+    let paper_path = dir.path().join("paper.log");
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    record_complete_history(&paper);
+    let hooks = support::continuation_hooks(1_700_000_102);
+    let (control, receiver) = mpsc::channel(4);
+    let orchestrator = support::continuation_orchestrator(
+        Arc::clone(&paper),
+        &paper_path,
+        leader_wallet(),
+        receiver,
+        Arc::clone(&hooks),
+    );
+    hooks
+        .fail_next_halt_append
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let run = tokio::spawn(orchestrator.run_coordinated(std::future::pending::<()>()));
+    let (acknowledged, acknowledgement) = oneshot::channel();
+    control
+        .send(OrchestratorControl::RiskHaltChange {
+            owner: pe_service::paper_recovery::RiskHaltOwner::Paper,
+            cause: pe_risk_engine::RiskHaltCause::IntradayDrawdown,
+            state: pe_service::paper_recovery::HaltState::Engaged,
+            evidence: serde_json::json!({}),
+            acknowledged,
+        })
+        .await
+        .unwrap();
+    let acknowledgement = acknowledgement.await.unwrap();
+    assert!(
+        acknowledgement.is_err(),
+        "failed halt append was acknowledged: {acknowledgement:?}"
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(pe_service::orchestrator::OrchestratorRunError::PaperDurabilityUncertain)
+        ),
+        "{result:?}"
+    );
+    let halt_frames = pe_service::paper_recovery::scan_paper_log(&paper_path)
+        .unwrap()
+        .into_iter()
+        .filter(|frame| {
+            matches!(
+                frame.frame,
+                pe_service::paper_recovery::PaperLogFrame::Record(
+                    pe_service::paper_recovery::PaperLogRecord::RiskHaltChanged { .. }
+                )
+            )
+        })
+        .count();
+    assert_eq!(halt_frames, 0);
+}
+
 /// PASS: real-log helper returns aggregates from its recorded payload, independent receive time,
 /// and ordered page/commitment receipts resolvable after reopening. FAIL: any binding drifts.
 #[test]
