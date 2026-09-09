@@ -36,7 +36,7 @@ use pe_position_ledger::PositionLedger;
 use pe_resolver_card::{
     VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
 };
-use pe_risk_engine::{BinaryPayout, RiskBlock, aggregate_resolution_credit};
+use pe_risk_engine::{BinaryPayout, RiskBlock, RiskHaltCause, aggregate_resolution_credit};
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
 use pe_service::bucket_commit::{
     ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
@@ -56,9 +56,9 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{
-    CanonicalFillResult, CanonicalResolutionResult, FINANCIAL_SEMANTIC_VERSION, MembershipChange,
-    MembershipReason, PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, SealReason,
-    TailBinding, paper_era, scan_paper_log,
+    CanonicalFillResult, CanonicalResolutionResult, FINANCIAL_SEMANTIC_VERSION, HaltState,
+    MembershipChange, MembershipReason, PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord,
+    RiskHaltOwner, SealReason, TailBinding, paper_era, scan_paper_log,
 };
 use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
 use pe_service::qualification::{
@@ -103,6 +103,9 @@ const LOSS_COPIES: usize = 11;
 const FIRST_LOSS_COPY: usize = PRICE_CONFLICT_DECISION + 1;
 const BLOCKED_DECISION: usize = FIRST_LOSS_COPY + LOSS_COPIES;
 const TOTAL_DECISIONS: usize = BLOCKED_DECISION + 1;
+/// Corpus day that streams the losing copies: the intraday stop engages here and releases
+/// mechanically at the next day's first evaluation.
+const LOSS_DAY: usize = 2;
 const TOTAL_FILLS: usize = ORIGINAL_COPIES + LOSS_COPIES;
 const STARTING_BANKROLL: Decimal = dec!(1_000);
 
@@ -192,7 +195,7 @@ fn golden_source_unix(anchor_cutoff: i64, index: usize) -> i64 {
         return golden_source_unix(anchor_cutoff, HELD_COPY) + 5;
     }
     if index >= FIRST_LOSS_COPY {
-        return golden_source_unix(anchor_cutoff, ORIGINAL_COPIES - 1)
+        return golden_source_unix(anchor_cutoff, (LOSS_DAY + 1) * COPIES_PER_DAY - 1)
             + 10 * i64::try_from(index - FIRST_LOSS_COPY + 1).unwrap();
     }
     let day = index / COPIES_PER_DAY;
@@ -1585,7 +1588,8 @@ async fn resolve_golden_trade(
 /// Preconditions: the checked-in v1 corpus seeds one deterministic 30-day future stream; every
 /// websocket and complete-page receipt enters the source log before its acknowledged bucket commit.
 /// PASS: runtime writes Start, 101 exact fill/resolution pairs, a full-rerank transition,
-/// an IntradayDrawdownStop decline and a held-position PriceConflict decline (neither has a
+/// an IntradayDrawdownStop decline whose halt releases mechanically the next day, a
+/// held-position PriceConflict decline (neither has a
 /// Financial Final), 31 marks, and a Complete seal; the
 /// network-free `pe-service --qualify` replay is exact and Pass with identical classifications,
 /// admission audits, economic core hashes, risk snapshots/decisions, and exact arithmetic while
@@ -1948,8 +1952,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
         if day == 1 {
             indices.insert(1, PRICE_CONFLICT_DECISION);
         }
-        // Keep the stop inside the seal without exercising the separate next-day halt release.
-        if day + 1 == QUALIFICATION_DAYS {
+        if day == LOSS_DAY {
             indices.extend(FIRST_LOSS_COPY..TOTAL_DECISIONS);
         }
         for index in indices {
@@ -2404,6 +2407,34 @@ async fn golden_source_stream_replays_exact_economic_core() {
     let completion = qualification_completion(&sealed_era).unwrap();
     assert_eq!(completion.complete_days, QUALIFICATION_DAYS);
     assert_eq!(completion.causal_closes, TOTAL_FILLS);
+    let halt_transitions = sealed_era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::RiskHaltChanged {
+                owner,
+                cause,
+                state,
+                ..
+            }) => Some((owner.clone(), *cause, *state)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        halt_transitions,
+        vec![
+            (
+                RiskHaltOwner::Paper,
+                RiskHaltCause::IntradayDrawdown,
+                HaltState::Engaged
+            ),
+            (
+                RiskHaltOwner::Paper,
+                RiskHaltCause::IntradayDrawdown,
+                HaltState::Released
+            ),
+        ]
+    );
 
     let (membership_receipt, membership_change) = membership_publication.unwrap();
     let membership_frames = sealed_era

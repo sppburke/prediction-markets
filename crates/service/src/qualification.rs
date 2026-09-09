@@ -3406,7 +3406,7 @@ async fn verify_economic(
     )
     .await?;
     let era = paper_era(context.paper_prefix.to_vec());
-    let active_halts = active_risk_halts(&era);
+    let mut active_halts = active_risk_halts(&era);
     let latency_was_active =
         active_halts.contains(&(RiskHaltOwner::Paper, RiskHaltCause::CopyLatency));
     let proposed_debit = source_backed_economic
@@ -3441,6 +3441,14 @@ async fn verify_economic(
             "risk snapshot reconstruction failed: {error}"
         ))
     })?;
+    // The paper owner appends the transitions this same pre-overlay snapshot implies before it
+    // applies the overlay (`Orchestrator::synchronize_paper_risk_halts`), so a mechanically
+    // released paper cause carries no overlay and an engaged one is already at or beyond its
+    // stop, where the overlay is the identity. Only foreign-owner causes and the paper
+    // absolute-loss latch, which waits for its audited manual release, still clamp the replay.
+    active_halts.retain(|(owner, cause)| {
+        *owner != RiskHaltOwner::Paper || *cause == RiskHaltCause::AbsoluteLoss
+    });
     apply_global_risk_halts(&active_halts, &mut reconstructed);
     if reconstructed != economic.risk.snapshot {
         return insufficient("EconomicPrepared risk snapshot differs from causal replay");
@@ -6936,6 +6944,87 @@ mod tests {
                 economic
             );
         }
+    }
+
+    /// PASS: with a paper drawdown halt engaged at the prefix whose stop the evaluation's own
+    /// reconstructed value clears, the unclamped recorded snapshot verifies (the runtime released
+    /// the cause before applying the overlay) and the clone clamped by the stale prefix set is
+    /// rejected with the exact snapshot-mismatch reason. FAIL: either expectation is violated.
+    #[tokio::test]
+    async fn economic_risk_replay_releases_paper_halt_cleared_by_its_evaluation() {
+        // The receipt-backed fixture is already inside its intraday stop, so the rolling window
+        // is the cause whose recovered raw value clears its stop.
+        let cause = RiskHaltCause::Rolling7dDrawdown;
+        let stop = pe_risk_engine::ROLLING_7D_STOP_BPS;
+        let fixture = receipt_backed_decline_fixture().await;
+        let continuation = fixture.decision.continuation.clone();
+        let mut released = evaluated_economic(&fixture.decision).clone();
+        let raw = released.risk.snapshot.rolling_7d_pnl_bps.0;
+        assert!(
+            raw > stop,
+            "the release case requires a recovered raw value above the stop"
+        );
+        let halt = test_frame(
+            4,
+            released.risk.evaluated_at_unix_ms.div_euclid(1_000) - 20,
+            PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause,
+                state: crate::paper_recovery::HaltState::Engaged,
+                evidence: serde_json::json!({}),
+            },
+        );
+        released.risk.financial_prefix = halt.receipt;
+        let mut frames = fixture.frames.clone();
+        frames.push(halt);
+        let financial = financial_state_at_prefix(
+            fixture.start.starting_bankroll.to_decimal(),
+            &fixture.facts,
+            released.risk.financial_prefix,
+        )
+        .unwrap();
+        let operation = crate::paper_recovery::PaperFillOperationIdentity {
+            leader_wallet: continuation.facts.wallet,
+            source_trade_id: continuation.facts.source_trade_id,
+            observed_at_bucket: continuation.facts.source_epoch,
+        };
+        let replay = RiskReplayContext {
+            cash: financial.cash,
+            positions: &financial.positions,
+            fills: &financial.fills,
+            settlements: &financial.settlements,
+            last_completed: financial.last_completed,
+            start_receipt: frames[0].receipt,
+            paper_prefix: &frames,
+            source: &fixture.source,
+            prepared_received_unix_ms: released.risk.evaluated_at_unix_ms,
+            start_hot_config_hash: &fixture.start.hot_config_hash,
+            financial_semantic_version: fixture.start.financial_semantic_version,
+        };
+
+        assert_eq!(
+            verify_economic(&operation, &released, &replay, false)
+                .await
+                .unwrap(),
+            released,
+            "the released evaluation must verify unclamped"
+        );
+
+        let mut clamped = released.clone();
+        apply_global_risk_halts(
+            &HashSet::from([(RiskHaltOwner::Paper, cause)]),
+            &mut clamped.risk.snapshot,
+        );
+        clamped.risk.decision = match evaluate_risk(&clamped.risk.snapshot) {
+            RiskDecision::Approved => RiskDecisionAudit::Approved,
+            RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
+        };
+        assert_ne!(clamped.risk.snapshot, released.risk.snapshot);
+        assert!(matches!(
+            verify_economic(&operation, &clamped, &replay, false).await,
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason == "EconomicPrepared risk snapshot differs from causal replay"
+        ));
     }
 
     /// PASS: the verifier accepts a recorded Entry only when the shared complete-second
