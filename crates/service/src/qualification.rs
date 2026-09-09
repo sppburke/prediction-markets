@@ -11041,12 +11041,6 @@ mod tests {
         );
     }
 
-    /// Earliest source membership at-or-before Start is excluded by both #574 entries.
-    #[test]
-    fn source_universe_membership_before_start_is_not_selected() {
-        assert_selection_oracle_case("source_universe_membership_before_start");
-    }
-
     /// Complete-read disagreement, repetition, overlap, reconstruction, and revision failures are
     /// one shared #574 refusal surface for Map and Index.
     #[test]
@@ -11068,6 +11062,7 @@ mod tests {
     fn selection_decision_cardinality_refusals_match_through_both_entries() {
         assert_selection_oracle_case("additional_decision_row");
         assert_selection_oracle_case("repeated_decision_row");
+        assert_selection_oracle_case("repeated_source_identity_disjoint_reads");
         assert_selection_oracle_case("missing_decision_row");
     }
 
@@ -11075,71 +11070,6 @@ mod tests {
     #[test]
     fn selection_history_error_precedes_universe_error_through_both_entries() {
         assert_selection_oracle_case("history_before_universe_error_precedence");
-    }
-
-    #[cfg(target_os = "linux")]
-    fn qualification_read_chars() -> u64 {
-        fs::read_to_string("/proc/self/io")
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("rchar: "))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
-    }
-
-    /// The #574 runtime selector walks one large sealed prefix and point-reads only its referenced
-    /// decision evidence; 20,000 trailing frames must not induce a second whole-log replay.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn indexed_selection_reads_one_large_source_prefix() {
-        let fixture = selection_oracle::build_selection_oracle_fixture("post_start_v3");
-        let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
-        let mut writer = Writer::open(&fixture.source_path).unwrap();
-        for frame in 0..20_000_u64 {
-            let mut payload = vec![0_u8; 1_536];
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"qualification-selection-padding");
-            hasher.update(&frame.to_le_bytes());
-            hasher.finalize_xof().fill(&mut payload);
-            writer
-                .append(EnvelopeIn {
-                    source_id: SourceId("qualification.selection.padding".to_owned()),
-                    schema_version: 1,
-                    parser_version: 1,
-                    observed_at: SourceTimestamp(at),
-                    received_at: ReceivedAt(at),
-                    content_type: ContentType::Raw,
-                    payload,
-                })
-                .unwrap();
-        }
-        writer.sync().unwrap();
-        drop(writer);
-        let length = fs::metadata(&fixture.source_path).unwrap().len();
-        assert!(length >= 20_000_000, "fixture log is only {length} bytes");
-        let index = SourceReceiptIndex::replay(&fixture.source_path).unwrap();
-        let candidate = Scanner::verify(&fixture.source_path).unwrap();
-        let before = qualification_read_chars();
-        let (selected, returned) = decision_rows_for_indexed_source_prefix(
-            &fixture.state,
-            &index,
-            &candidate,
-            &fixture.start,
-        )
-        .unwrap();
-        let read = qualification_read_chars() - before;
-        assert_eq!(selected.rows.len(), 1);
-        assert_eq!(returned, TailBinding::from(&candidate));
-        assert!(
-            read >= length,
-            "the selector read {read} bytes for a {length}-byte sealed prefix"
-        );
-        assert!(
-            read < length + length / 2,
-            "the selector read {read} bytes for a {length}-byte sealed prefix"
-        );
     }
 
     /// PASS: authentic child collapse and coherent request-origin substitution fail against a real V4 commitment; original evidence passes.

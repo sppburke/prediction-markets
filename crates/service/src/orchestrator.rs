@@ -3803,7 +3803,37 @@ mod tests {
         source_receipts: SourceReceiptIndex,
     ) -> TestOrchestrator {
         let (_control_tx, control_rx) = mpsc::channel(4);
-        let mut orchestrator = Orchestrator::new(
+        let mut orchestrator = build_test_orchestrator(
+            paper_writer,
+            Arc::clone(&state),
+            control_rx,
+            String::new(),
+            Some(SupabaseStateClient::new(
+                reqwest::Client::new(),
+                "https://offline.invalid",
+                "seal-test-anon",
+                "seal-test-secret",
+            )),
+        );
+        let (source_log, _source_rx) = crate::activity_ingest::SourceLogHandle::channel(1);
+        orchestrator.boundary_mark_fetcher = Some(Arc::new(HistoricalMarkAdapter::new(
+            reqwest::Client::new(),
+            "https://offline.invalid",
+            source_log,
+        )));
+        orchestrator.financial_log_paths = Some((paper_path, source_path));
+        orchestrator.source_receipts = Some(source_receipts);
+        orchestrator
+    }
+
+    fn build_test_orchestrator(
+        paper_writer: Writer,
+        state: Arc<PaperStateDb>,
+        control_rx: mpsc::Receiver<OrchestratorControl>,
+        mid_price_base_url: String,
+        supabase_state: Option<SupabaseStateClient>,
+    ) -> TestOrchestrator {
+        Orchestrator::new(
             LiveWatchlist::new(Watchlist {
                 entries: Vec::new(),
                 snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
@@ -3831,28 +3861,14 @@ mod tests {
             Arc::clone(&state),
             crate::paper_recovery::build_leader_ledger(&state).unwrap(),
             new_shared_health(false),
-            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new()),
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), mid_price_base_url),
             control_rx,
             None,
             None,
-            Some(SupabaseStateClient::new(
-                reqwest::Client::new(),
-                "https://offline.invalid",
-                "seal-test-anon",
-                "seal-test-secret",
-            )),
+            supabase_state,
             Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
         )
-        .unwrap();
-        let (source_log, _source_rx) = crate::activity_ingest::SourceLogHandle::channel(1);
-        orchestrator.boundary_mark_fetcher = Some(Arc::new(HistoricalMarkAdapter::new(
-            reqwest::Client::new(),
-            "https://offline.invalid",
-            source_log,
-        )));
-        orchestrator.financial_log_paths = Some((paper_path, source_path));
-        orchestrator.source_receipts = Some(source_receipts);
-        orchestrator
+        .unwrap()
     }
 
     #[derive(Debug, Default)]
@@ -3969,74 +3985,36 @@ mod tests {
             .collect()
     }
 
-    /// Orchestrator over the producer fixture's paper state with no boot rows or continuations.
-    fn producer_orchestrator(
-        dir: &tempfile::TempDir,
-        paper_state: std::sync::Arc<pe_paper_state::PaperStateDb>,
-    ) -> (
-        Orchestrator<
-            pe_source_polymarket_public::FixtureFetcher,
-            crate::clob_book::FixtureClobBookFetcher,
-        >,
-        tokio::sync::mpsc::Sender<crate::orchestrator_control::OrchestratorControl>,
-    ) {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+    struct ContinuationOrchestratorFixture {
+        dir: tempfile::TempDir,
+        paper_state: Arc<PaperStateDb>,
+        rows: Vec<pe_paper_state::DecisionPendingRow>,
+        orchestrator: TestOrchestrator,
+        _control_tx: mpsc::Sender<OrchestratorControl>,
+    }
 
-        use pe_event_log::Writer;
-        use pe_source_polymarket_public::FixtureFetcher;
-        use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
-        use rust_decimal::Decimal;
-
-        use crate::clob_book::FixtureClobBookFetcher;
-        use crate::entry_gate::CopyEntryGateConfig;
-        use crate::health::new_shared_health;
-        use crate::live_watchlist::LiveWatchlist;
-        use crate::mid_price_cache::MidPriceCache;
-
-        let (control_tx, control_rx) = tokio::sync::mpsc::channel(2);
-        let mut orchestrator = Orchestrator::new(
-            LiveWatchlist::new(pe_trader_index::Watchlist {
-                entries: Vec::new(),
-                snapshot_at: pe_core_types::SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
-                active_count: 0,
-                incubator_count: 0,
-            }),
-            super::OrchestratorConfig {
-                bankroll: Decimal::from(1000),
-                mode: ExecutionMode::Paper,
-                signal_config: Default::default(),
-                max_resolution_horizon_secs: 0,
-                min_resolution_horizon_secs: 0,
-                max_fill_price: Decimal::ZERO,
-                min_fill_price: Decimal::ZERO,
-                price_impact_cap_bps: 100,
-                entry_gate_config: CopyEntryGateConfig,
-                runtime_config: None,
-                live_accounts: None,
-                activity_ws_enabled: false,
-                copy_latency_budget_secs: 2,
-                watchlist_writer_lock: None,
-            },
-            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+    /// Producer-created continuations with an orchestrator that has no boot-owned rows.
+    fn continuation_orchestrator_fixture() -> ContinuationOrchestratorFixture {
+        let (dir, paper_state, _index) =
+            crate::bucket_commit::continuation_validation_tests::producer_fixture();
+        let rows = paper_state.open_decision_pending().unwrap();
+        let (control_tx, control_rx) = mpsc::channel(2);
+        let mut orchestrator = build_test_orchestrator(
             Writer::open(dir.path().join("paper.log")).unwrap(),
-            paper_state.clone(),
-            crate::paper_recovery::build_leader_ledger(&paper_state).unwrap(),
-            new_shared_health(false),
-            MidPriceCache::with_fetcher(
-                FixtureFetcher::new(HashMap::new()),
-                "https://gamma.test".to_owned(),
-            ),
+            Arc::clone(&paper_state),
             control_rx,
+            "https://gamma.test".to_owned(),
             None,
-            None,
-            None,
-            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
-        )
-        .unwrap();
+        );
         orchestrator.pending_boot.clear();
         orchestrator.pending_continuations.clear();
-        (orchestrator, control_tx)
+        ContinuationOrchestratorFixture {
+            dir,
+            paper_state,
+            rows,
+            orchestrator,
+            _control_tx: control_tx,
+        }
     }
 
     /// PASS: once paper durability is uncertain, resuming a committed bucket loads and handles no
@@ -4044,16 +4022,18 @@ mod tests {
     /// FAIL: a row is loaded, resumed, or terminalized after the latch.
     #[tokio::test]
     async fn resume_committed_rows_stops_once_paper_durability_is_uncertain() {
-        use crate::bucket_commit::continuation_validation_tests::producer_fixture;
-
-        let (dir, paper_state, _index) = producer_fixture();
-        let before = paper_state.open_decision_pending().unwrap();
+        let ContinuationOrchestratorFixture {
+            dir: _dir,
+            paper_state,
+            rows: before,
+            mut orchestrator,
+            _control_tx,
+        } = continuation_orchestrator_fixture();
         let ids = before
             .iter()
             .map(|row| row.source_trade_id.clone())
             .collect::<Vec<_>>();
         assert_eq!(ids.len(), 2);
-        let (mut orchestrator, _control_tx) = producer_orchestrator(&dir, paper_state.clone());
         orchestrator.intake_stopped = true;
 
         orchestrator.resume_committed_rows(&ids).await.unwrap();
@@ -4074,12 +4054,15 @@ mod tests {
     #[tokio::test]
     async fn load_pending_continuation_uses_single_row_lookup_and_resumes_only_open_rows() {
         use crate::bucket_commit::DecisionContinuationV3;
-        use crate::bucket_commit::continuation_validation_tests::producer_fixture;
 
-        let (dir, paper_state, _index) = producer_fixture();
-        let rows = paper_state.open_decision_pending().unwrap();
+        let ContinuationOrchestratorFixture {
+            dir,
+            paper_state,
+            rows,
+            mut orchestrator,
+            _control_tx,
+        } = continuation_orchestrator_fixture();
         let target = &rows[1];
-        let (mut orchestrator, _control_tx) = producer_orchestrator(&dir, paper_state.clone());
 
         // A full scan now fails at the durable row parser, before any JSON is decoded.
         let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
@@ -4777,26 +4760,63 @@ mod tests {
         assert!(sealed_records(&paper_path).is_empty());
     }
 
-    /// PASS: sealing a large candidate performs one bounded source walk, not a second verify pass.
+    /// PASS: sealing a large candidate performs one bounded source walk plus indexed point reads
+    /// for its selected decision, not a second verify pass.
     #[cfg(target_os = "linux")]
     #[test]
     fn qualification_seal_reads_large_source_prefix_once() {
-        let StartedSealFixture {
-            _dir,
-            paper_path,
-            source_path,
-            state,
-            paper_writer,
-            ..
-        } = started_seal_fixture("start-hash");
-        let mut source_writer = Writer::open(&source_path).unwrap();
-        source_writer
-            .append(source_input(
-                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
-                SEAL_START_UNIX + 1,
-                b"referenced-artifact-boundary".to_vec(),
-            ))
+        let (dir, state, source_receipts) =
+            crate::bucket_commit::continuation_validation_tests::producer_fixture();
+        let source_path = source_receipts.current_tail_binding().unwrap().path;
+        let rows = state.open_decision_pending().unwrap();
+        assert_eq!(rows.len(), 2);
+        let selected = rows[0].clone();
+        let excluded = &rows[1];
+        let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+        connection
+            .execute(
+                "DELETE FROM decision_pending WHERE source_trade_id = ?1",
+                [&excluded.source_trade_id.0],
+            )
             .unwrap();
+        connection
+            .execute(
+                "UPDATE activity_groups SET disposition = 'not_buy' WHERE source_trade_id = ?1",
+                [&excluded.source_trade_id.0],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE activity_group_revisions SET disposition = 'not_buy' \
+                 WHERE source_trade_id = ?1",
+                [&excluded.source_trade_id.0],
+            )
+            .unwrap();
+        drop(connection);
+
+        let paper_path = dir.path().join("paper.log");
+        drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let start = append_paper(
+            &mut paper_writer,
+            &qualification_start(
+                TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
+                TailBinding {
+                    physical_tail: 5,
+                    last_sequence: None,
+                    last_hash: "00".repeat(32),
+                },
+                "start-hash",
+            ),
+            SEAL_START_UNIX,
+        );
+        state
+            .reset_financial_era(
+                start,
+                CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
+            )
+            .unwrap();
+        let mut source_writer = Writer::open(&source_path).unwrap();
         for index in 0..20_000_u64 {
             source_writer
                 .append(source_input(
@@ -4822,15 +4842,46 @@ mod tests {
                 .len()
                 < 200_000
         );
-        assert!(state.decision_pending_history().unwrap().len() < 100);
         let mut orchestrator = test_orchestrator(
             paper_path.clone(),
             source_path,
             paper_writer,
-            state,
+            Arc::clone(&state),
             source_receipts,
         );
-
+        state
+            .close_decision_pending(
+                &selected.source_trade_id,
+                "{}",
+                "seal-test-terminal",
+                SEAL_START_UNIX + 1,
+            )
+            .unwrap();
+        assert_eq!(state.decision_pending_history().unwrap().len(), 1);
+        let decision_keys = vec![(
+            selected.source_trade_id.clone(),
+            selected.semantic_revision.clone(),
+        )];
+        let expected_decision_evidence = state
+            .seal_decision_evidence_for_source_prefix(
+                &decision_keys,
+                &decision_keys,
+                candidate.last_sequence,
+            )
+            .unwrap();
+        let expected_digest = blake3::hash(&expected_decision_evidence)
+            .to_hex()
+            .to_string();
+        let expected_decision_evidence: serde_json::Value =
+            serde_json::from_slice(&expected_decision_evidence).unwrap();
+        assert_eq!(
+            expected_decision_evidence["rows"][0]["source_trade_id"],
+            selected.source_trade_id.0
+        );
+        assert_eq!(
+            expected_decision_evidence["rows"][0]["semantic_revision"],
+            selected.semantic_revision
+        );
         let before = read_chars();
         orchestrator
             .seal_qualification(
@@ -4849,7 +4900,9 @@ mod tests {
             read < source_length + source_length / 2,
             "more than one source-log pass: read {read} bytes for {source_length} bytes"
         );
-        assert_eq!(sealed_records(&paper_path).len(), 1);
+        let seals = sealed_records(&paper_path);
+        assert_eq!(seals.len(), 1);
+        assert_eq!(seals[0].decision_evidence_digest, expected_digest);
     }
 
     fn healthy_risk_snapshot() -> RiskSnapshot {
@@ -4892,10 +4945,6 @@ mod tests {
     /// FAIL: the boundary can seal early, seal invalid evidence, or misses the first valid mark.
     #[test]
     fn daily_boundary_requests_automatic_complete_seal_at_exact_threshold() {
-        type TestOrchestrator = Orchestrator<
-            pe_source_polymarket_public::FixtureFetcher,
-            crate::clob_book::FixtureClobBookFetcher,
-        >;
         let exact = QualificationCompletion {
             complete_days: 30,
             causal_closes: 90,

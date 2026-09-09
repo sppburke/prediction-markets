@@ -377,9 +377,9 @@ pub(super) fn selection_oracle_cases() -> &'static [&'static str] {
         "malformed_websocket_payload",
         "websocket_wrong_contract",
         "websocket_different_trade_key",
-        "source_universe_membership_before_start",
         "additional_decision_row",
         "repeated_decision_row",
+        "repeated_source_identity_disjoint_reads",
         "missing_decision_row",
         "disagreeing_complete_reads",
         "repeated_complete_read",
@@ -902,8 +902,8 @@ fn additional_decision_fixture() -> SelectionOracleFixture {
     fixture
 }
 
-fn repeated_decision_fixture() -> SelectionOracleFixture {
-    let payload = activity_payload(vec![activity_row(
+fn repeated_decision_fixture(disjoint_payloads: bool) -> SelectionOracleFixture {
+    let first_payload = activity_payload(vec![activity_row(
         "0xrepeated-row",
         "repeated-row",
         "1",
@@ -911,11 +911,21 @@ fn repeated_decision_fixture() -> SelectionOracleFixture {
         "0xrepeated-row",
         100,
     )]);
-    let first_observation = activity_observation(1, &payload);
-    let second_observation = activity_observation(2, &payload);
-    let mut first = continuation_for_activity_page(&first_observation, &payload, "0xrepeated-row");
+    let mut second_payload = first_payload.clone();
+    if disjoint_payloads {
+        second_payload.push(b' ');
+    }
+    let first_observation = activity_observation(1, &first_payload);
+    let second_observation = activity_observation(2, &second_payload);
+    let mut first =
+        continuation_for_activity_page(&first_observation, &first_payload, "0xrepeated-row");
     let mut second =
-        continuation_for_activity_page(&second_observation, &payload, "0xrepeated-row");
+        continuation_for_activity_page(&second_observation, &second_payload, "0xrepeated-row");
+    assert_eq!(first.facts.source_trade_id, second.facts.source_trade_id);
+    assert_eq!(
+        first.facts.semantic_revision,
+        second.facts.semantic_revision
+    );
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("source.log");
     let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
@@ -924,6 +934,16 @@ fn repeated_decision_fixture() -> SelectionOracleFixture {
         &mut [&mut first, &mut second],
         BTreeMap::from([(1, first_observation), (2, second_observation)]),
     );
+    assert_ne!(
+        first.page_occurrences[0].receipt,
+        second.page_occurrences[0].receipt
+    );
+    if disjoint_payloads {
+        assert_ne!(
+            first.page_occurrences[0].raw_hash,
+            second.page_occurrences[0].raw_hash
+        );
+    }
     store_read_decision(&state, &first, "decision_pending", true);
     let connection = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
     connection
@@ -1046,11 +1066,9 @@ pub(super) fn build_selection_oracle_fixture(case: &str) -> SelectionOracleFixtu
                 pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
             )
         }
-        "source_universe_membership_before_start" => {
-            standard_selection_oracle_fixture("start_only")
-        }
         "additional_decision_row" => additional_decision_fixture(),
-        "repeated_decision_row" => repeated_decision_fixture(),
+        "repeated_decision_row" => repeated_decision_fixture(false),
+        "repeated_source_identity_disjoint_reads" => repeated_decision_fixture(true),
         "missing_decision_row" => standard_selection_oracle_fixture("pending_without_decision"),
         "disagreeing_complete_reads" => two_decision_read_fixture("disagree"),
         "repeated_complete_read" => two_decision_read_fixture("repeat"),

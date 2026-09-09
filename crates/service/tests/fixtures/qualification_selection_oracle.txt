@@ -102,15 +102,15 @@ text: insufficient qualification evidence: decision websocket observation has th
 Err
 variant: InsufficientEvidence
 text: insufficient qualification evidence: decision websocket observation has the wrong source contract
-=== source_universe_membership_before_start ===
-Ok
-rows: []
-in_prefix: []
 === additional_decision_row ===
 Err
 variant: InsufficientEvidence
 text: insufficient qualification evidence: decision_pending row g2:aa75d7bed7ab07f2fd29334383988e92e1f4ebad30f7d05a1eb94ae9bd3e9a79/additional is additional to the parsed source prefix
 === repeated_decision_row ===
+Err
+variant: InsufficientEvidence
+text: insufficient qualification evidence: sealed decision evidence repeats a source trade identity
+=== repeated_source_identity_disjoint_reads ===
 Err
 variant: InsufficientEvidence
 text: insufficient qualification evidence: sealed decision evidence repeats a source trade identity

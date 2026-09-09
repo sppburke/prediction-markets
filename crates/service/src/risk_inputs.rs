@@ -2209,9 +2209,10 @@ mod tests {
         assert_eq!(current.last_hash, blake3::Hash::from_bytes([0; 32]));
     }
 
-    /// PASS: replay snapshots every field of the scanner-verified populated source tail.
+    /// PASS: replay snapshots the scanner-verified populated tail, then recording one synchronized
+    /// append advances the indexed binding to that frame's tail.
     #[test]
-    fn current_tail_binding_matches_scanner_after_populated_replay() {
+    fn current_tail_binding_advances_after_recorded_synced_append() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("source.log");
         let mut writer = Writer::open(&source_path).unwrap();
@@ -2220,21 +2221,10 @@ mod tests {
         drop(writer);
         let verified = Scanner::verify(&source_path).unwrap();
         let index = SourceReceiptIndex::replay(&source_path).unwrap();
-
         assert_eq!(index.current_tail_binding().unwrap(), verified);
-    }
 
-    /// PASS: recording one synchronized append advances the indexed binding to that frame's tail.
-    #[test]
-    fn current_tail_binding_advances_after_recorded_synced_append() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("source.log");
-        let mut writer = Writer::open(&source_path).unwrap();
-        writer.append_synced(source_input(10, b"first")).unwrap();
-        drop(writer);
-        let index = SourceReceiptIndex::replay(&source_path).unwrap();
         let before = index.current_tail_binding().unwrap();
-        let appended = source_input(11, b"second");
+        let appended = source_input(12, b"third");
         let mut writer = Writer::open(&source_path).unwrap();
         let receipt = writer
             .append_synced(EnvelopeIn {
