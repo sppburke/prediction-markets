@@ -8475,6 +8475,59 @@ mod tests {
     }
 
     #[test]
+    fn legacy_no_copy_repair_committed_before_financial_upgrade_completes_on_reopen() {
+        // An open interrupted after the repair transaction commits but before the schema-2
+        // financial upgrade and version stamp must be completed by the next writable open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = no_copy_repair_fixture(
+            dir.path(),
+            LEGACY_EXACT_MIGRATION_VERSION,
+            LEGACY_NO_COPY_PROVENANCE,
+        );
+        let rows_query = "SELECT * FROM no_copy_dispositions ORDER BY source_trade_id";
+        let ddl_query = "SELECT sql FROM sqlite_master WHERE name = 'no_copy_dispositions'";
+        let mut conn = Connection::open(&path).unwrap();
+        let rows = stored_rows(&conn, rows_query);
+        migrate_legacy_no_copy_provenance(&mut conn, false).unwrap();
+        let repaired_ddl = stored_rows(&conn, ddl_query);
+        assert!(!format!("{repaired_ddl:?}").contains("CHECK"));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LEGACY_EXACT_MIGRATION_VERSION);
+        drop(conn);
+
+        let db = PaperStateDb::open(&path).unwrap();
+        let conn = db.lock();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let financial_columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('fills')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(financial_columns.iter().any(|name| name == "quantity_str"));
+        assert_eq!(stored_rows(&conn, ddl_query), repaired_ddl);
+        assert_eq!(stored_rows(&conn, rows_query), rows);
+        assert!(
+            stored_rows(
+                &conn,
+                "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+            )
+            .is_empty()
+        );
+        conn.execute(
+            "INSERT INTO no_copy_dispositions VALUES ('late', 'reconciled_rest', 0, 'r', 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn read_only_openers_leave_legacy_no_copy_shape_unchanged() {
         for version in [LEGACY_EXACT_MIGRATION_VERSION, SCHEMA_VERSION] {
             let dir = tempfile::tempdir().unwrap();
