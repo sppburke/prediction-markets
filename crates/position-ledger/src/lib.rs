@@ -493,6 +493,9 @@ impl LedgerMutation {
                 })
         };
         let effect = match &components.activity_type {
+            ActivityType::Conversion if aggregate.share_sum == ShareAmount::ZERO => {
+                LedgerEffect::RawOnly
+            }
             ActivityType::Conversion => LedgerEffect::Conversion,
             ActivityType::Unknown(_) => LedgerEffect::UnknownEffect,
             ActivityType::Reward
@@ -1150,7 +1153,58 @@ pub fn classify_complete_second(
     history_complete: bool,
     has_market: &dyn Fn(&MarketId) -> bool,
 ) -> Result<SecondVerdict, LedgerError> {
-    if let Some(trigger) = order_independent_validity(ledger, wallet, mutations)? {
+    classify_with_second_proof(
+        SecondProof::Repaired,
+        ledger,
+        wallet,
+        mutations,
+        reconstruction_quality,
+        signal_config,
+        history_complete,
+        has_market,
+    )
+}
+
+/// Preserve the original four-mutation cutoff proof for legacy continuation replay.
+pub fn classify_complete_second_legacy(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    mutations: &[LedgerMutation],
+    reconstruction_quality: ReconstructionQuality,
+    signal_config: &SignalConfig,
+    history_complete: bool,
+    has_market: &dyn Fn(&MarketId) -> bool,
+) -> Result<SecondVerdict, LedgerError> {
+    classify_with_second_proof(
+        SecondProof::Legacy,
+        ledger,
+        wallet,
+        mutations,
+        reconstruction_quality,
+        signal_config,
+        history_complete,
+        has_market,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SecondProof {
+    Legacy,
+    Repaired,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_with_second_proof(
+    proof: SecondProof,
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    mutations: &[LedgerMutation],
+    reconstruction_quality: ReconstructionQuality,
+    signal_config: &SignalConfig,
+    history_complete: bool,
+    has_market: &dyn Fn(&MarketId) -> bool,
+) -> Result<SecondVerdict, LedgerError> {
+    if let Some(trigger) = order_independent_validity(ledger, wallet, mutations, proof)? {
         return Ok(SecondVerdict::OrderDependent { trigger });
     }
 
@@ -1288,16 +1342,67 @@ fn order_independent_validity(
     ledger: &PositionLedger,
     wallet: WalletAddress,
     mutations: &[LedgerMutation],
+    proof: SecondProof,
 ) -> Result<Option<SourceTradeId>, LedgerError> {
     for component in mutation_components(mutations) {
         let Some(first) = component.first() else {
             continue;
         };
-        if component.len() > 4 || !all_component_orders_match(ledger, wallet, &component)? {
+        let valid = match proof {
+            SecondProof::Repaired => same_side_component_validity(ledger, wallet, &component),
+            SecondProof::Legacy => None,
+        };
+        let valid = match valid {
+            Some(Ok(())) => true,
+            Some(Err(error)) if component.len() == 1 => return Err(error),
+            Some(Err(_)) => false,
+            None => component.len() <= 4 && all_component_orders_match(ledger, wallet, &component)?,
+        };
+        if !valid {
             return Ok(Some(first.source_trade_id.clone()));
         }
     }
     Ok(None)
+}
+
+// Ordinary same-side trades only decrease opposing inventory and increase same-side
+// inventory. A successful checked fold therefore proves every permutation has the
+// same representable final state and no residuals, without accumulating a total.
+fn same_side_component_validity(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    component: &[&LedgerMutation],
+) -> Option<Result<(), LedgerError>> {
+    let first = component.first()?;
+    let LedgerEffect::Trade {
+        market_id,
+        outcome_id,
+        side,
+        ..
+    } = first.effect.effective()
+    else {
+        return None;
+    };
+    if !component.iter().all(|mutation| {
+        mutation.wallet == wallet
+            && matches!(mutation.effect.effective(),
+            LedgerEffect::Trade { market_id: market, outcome_id: outcome, side: trade_side, .. }
+            if market == market_id && outcome == outcome_id && trade_side == side)
+    }) {
+        return None;
+    }
+    let key = MarketOutcomeId::new(market_id.clone(), *outcome_id);
+    let mut state = ledger
+        .position(&wallet)
+        .and_then(|snapshot| snapshot.positions.get(&key))
+        .cloned()
+        .unwrap_or_default();
+    Some(component.iter().try_for_each(|mutation| {
+        if let LedgerEffect::Trade { amount, .. } = mutation.effect.effective() {
+            apply_trade(&mut state, *side, *amount, &mutation.source_trade_id)?;
+        }
+        Ok(())
+    }))
 }
 
 fn mutation_components(mutations: &[LedgerMutation]) -> Vec<Vec<&LedgerMutation>> {
@@ -1807,6 +1912,235 @@ mod tests {
         );
     }
 
+    fn same_side_trades(w: WalletAddress, side: Side, amounts: &[u64]) -> Vec<LedgerMutation> {
+        amounts
+            .iter()
+            .enumerate()
+            .map(|(index, amount)| {
+                let trade = trade(w, side, 0, 0);
+                LedgerMutation {
+                    wallet: w,
+                    source_trade_id: SourceTradeId(format!("g2:trade-{index}")),
+                    transaction_hash: format!("0xtrade-{index}"),
+                    source_time: SourceTimestamp(trade.observed_at),
+                    effect: LedgerEffect::Trade {
+                        market_id: trade.market_id,
+                        outcome_id: trade.outcome_id,
+                        side,
+                        amount: ShareAmount::from_atomic(*amount),
+                        price: if index % 2 == 0 {
+                            trade.price
+                        } else {
+                            Price(dec!(0.7))
+                        },
+                    },
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn same_side_proof_matches_exhaustive_small_components() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for side in [Side::Buy, Side::Sell] {
+            for (long, short) in [
+                (0, 0),
+                (10, 0),
+                (0, 10),
+                (5, 7),
+                (u64::MAX, 1),
+                (1, u64::MAX),
+                (u64::MAX, 0),
+                (0, u64::MAX),
+            ] {
+                let mut ledger = ledger_with_longs(w, long, 0);
+                ledger.state_mut(w, &market(), OutcomeId(0)).short_contracts =
+                    ShareAmount::from_atomic(short);
+                for amounts in [
+                    &[1][..],
+                    &[1, 3][..],
+                    &[2, 5, 3][..],
+                    &[0, 2, 9, 1][..],
+                    &[u64::MAX, 1][..],
+                ] {
+                    let mutations = same_side_trades(w, side, amounts);
+                    let component = mutations.iter().collect::<Vec<_>>();
+                    let clone_count = ledger.full_clone_count.load(Ordering::Relaxed);
+                    let folded = same_side_component_validity(&ledger, w, &component).unwrap();
+                    assert_eq!(ledger.full_clone_count.load(Ordering::Relaxed), clone_count);
+                    let oracle = all_component_orders_match(&ledger, w, &component);
+                    assert_eq!(folded.is_ok(), oracle == Ok(true));
+                    let repaired =
+                        order_independent_validity(&ledger, w, &mutations, SecondProof::Repaired);
+                    assert_eq!(
+                        repaired,
+                        oracle.map(|valid| (!valid).then(|| mutations[0].source_trade_id.clone()))
+                    );
+                    assert_eq!(
+                        classify_complete_second(
+                            &ledger,
+                            w,
+                            &mutations,
+                            ReconstructionQuality::new(100).unwrap(),
+                            &SignalConfig::default(),
+                            true,
+                            &|_| false
+                        ),
+                        classify_complete_second_legacy(
+                            &ledger,
+                            w,
+                            &mutations,
+                            ReconstructionQuality::new(100).unwrap(),
+                            &SignalConfig::default(),
+                            true,
+                            &|_| false
+                        )
+                    );
+                    if repaired == Ok(None) {
+                        let (expected, _) = ledger.simulate_all_or_none(&mutations).unwrap();
+                        let mut orders = Vec::new();
+                        enumerate_mutation_orders(
+                            &mut component.clone(),
+                            &mut Vec::new(),
+                            &mut orders,
+                        );
+                        for order in orders {
+                            let (actual, applied) = ledger.simulate_all_or_none(&order).unwrap();
+                            assert_eq!(actual.snapshots(), expected.snapshots());
+                            assert!(
+                                applied
+                                    .iter()
+                                    .all(|effect| effect.clamped_residual.is_none())
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_side_proof_accepts_wide_total_after_opposite_inventory_netting() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for side in [Side::Buy, Side::Sell] {
+            for amounts in [[u64::MAX, 1], [1, u64::MAX], [u64::MAX, u64::MAX]] {
+                let mut ledger = ledger_with_longs(w, 0, 0);
+                let state = ledger.state_mut(w, &market(), OutcomeId(0));
+                match side {
+                    Side::Buy => state.short_contracts = ShareAmount::from_atomic(u64::MAX),
+                    Side::Sell => state.long_contracts = ShareAmount::from_atomic(u64::MAX),
+                }
+                let mutations = same_side_trades(w, side, &amounts);
+                assert_eq!(
+                    order_independent_validity(&ledger, w, &mutations, SecondProof::Repaired),
+                    Ok(None)
+                );
+                let applied = ledger.apply_all_or_none(&mutations).unwrap();
+                assert!(
+                    applied
+                        .iter()
+                        .all(|effect| effect.clamped_residual.is_none())
+                );
+                let state = ledger.state_mut(w, &market(), OutcomeId(0));
+                let (same, opposite) = match side {
+                    Side::Buy => (state.long_contracts, state.short_contracts),
+                    Side::Sell => (state.short_contracts, state.long_contracts),
+                };
+                assert_eq!(
+                    same.atomic(),
+                    if amounts == [u64::MAX, u64::MAX] {
+                        u64::MAX
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(opposite, ShareAmount::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn same_side_proof_refuses_true_final_overflow() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for side in [Side::Buy, Side::Sell] {
+            let mut ledger = PositionLedger::new();
+            let mutations = same_side_trades(w, side, &[u64::MAX, 1, 1, 1, 1]);
+            let before = ledger.snapshots().clone();
+            assert_eq!(
+                order_independent_validity(&ledger, w, &mutations, SecondProof::Repaired),
+                Ok(Some(mutations[0].source_trade_id.clone()))
+            );
+            assert!(matches!(
+                ledger.apply_all_or_none(&mutations),
+                Err(LedgerError::Overflow { .. })
+            ));
+            assert_eq!(ledger.snapshots(), &before);
+        }
+    }
+
+    #[test]
+    fn repaired_large_component_retains_ambiguity_and_legacy_cutoff() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let ledger = PositionLedger::new();
+        let mutations = same_side_trades(w, Side::Buy, &[1, 2, 3, 4, 5]);
+        let quality = ReconstructionQuality::new(100).unwrap();
+        let verdict = classify_complete_second(
+            &ledger,
+            w,
+            &mutations,
+            quality,
+            &SignalConfig::default(),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+        let SecondVerdict::OrderIndependent {
+            applied,
+            decisions,
+            first_entries,
+        } = verdict
+        else {
+            panic!("homogeneous proof refused");
+        };
+        assert_eq!(applied.len(), 5);
+        assert_eq!(first_entries.len(), 1);
+        assert!(decisions.iter().all(|decision| decision.entry
+            == EntryClassification::AmbiguousFirstEntrySameSecond
+            && decision.action_order_dependent));
+        assert!(matches!(
+            classify_complete_second_legacy(
+                &ledger,
+                w,
+                &mutations,
+                quality,
+                &SignalConfig::default(),
+                true,
+                &|_| false
+            )
+            .unwrap(),
+            SecondVerdict::OrderDependent { .. }
+        ));
+        for effect in [
+            merge_mutation(w, "g2:mixed", 1).effect,
+            LedgerEffect::Split {
+                market_id: market(),
+                amount: ShareAmount::from_atomic(1),
+            },
+            redeem_mutation(w, "g2:mixed", 1).effect,
+        ] {
+            let mut mixed = mutations.clone();
+            mixed[4].effect = effect;
+            assert!(
+                same_side_component_validity(&ledger, w, &mixed.iter().collect::<Vec<_>>())
+                    .is_none()
+            );
+            assert_eq!(
+                order_independent_validity(&ledger, w, &mixed, SecondProof::Repaired),
+                order_independent_validity(&ledger, w, &mixed, SecondProof::Legacy)
+            );
+        }
+    }
+
     #[test]
     fn redeem_residual_tolerance_cannot_stack_within_a_batch() {
         let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -1847,7 +2181,21 @@ mod tests {
             false,
         ))
         .unwrap();
+        assert_eq!(conversion.effect, LedgerEffect::RawOnly);
+        PositionLedger::new().apply(&conversion).unwrap();
+
+        let conversion = LedgerMutation::from_activity(&activity_aggregate(
+            "CONVERSION",
+            "1.000000",
+            None,
+            false,
+        ))
+        .unwrap();
         assert_eq!(conversion.effect, LedgerEffect::Conversion);
+        assert!(matches!(
+            PositionLedger::new().apply(&conversion),
+            Err(LedgerError::Conversion { .. })
+        ));
 
         let unknown =
             LedgerMutation::from_activity(&activity_aggregate("NEW_TYPE", "0.000000", None, false))

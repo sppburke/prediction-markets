@@ -1210,6 +1210,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         first_size: &str,
         second_size: &str,
         reverse: bool,
+        extra: usize,
     ) -> (
         std::collections::BTreeMap<String, String>,
         Vec<pe_paper_state::LeaderPositionRow>,
@@ -1227,11 +1228,22 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
             "0.79",
             200,
         );
-        let groups = if reverse {
-            vec![second, first]
-        } else {
-            vec![first, second]
-        };
+        let mut groups = vec![first, second];
+        groups.extend((0..extra).map(|index| {
+            position_row(
+                "TRADE",
+                &format!("0xextra-{index}"),
+                MARKET_A,
+                0,
+                "BUY",
+                "1",
+                "0.5",
+                200,
+            )
+        }));
+        if reverse {
+            groups.reverse();
+        }
         let result = engine
             .commit_read(groups, &context(200, true), zero_basis())
             .unwrap();
@@ -1253,15 +1265,31 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         )
     }
 
-    let left = run("1.125000", "2.875000", false);
-    let right = run("2.875000", "1.125000", true);
+    let left = run("1.125000", "2.875000", false, 0);
+    let right = run("2.875000", "1.125000", true, 0);
     assert_eq!(left, right, "g2 order/economics cannot select a winner");
 
+    assert_eq!(
+        run("1.125000", "2.875000", false, 6),
+        run("1.125000", "2.875000", true, 6)
+    );
+
     let (dir, paper, mut engine) = fresh_anchored();
-    let groups = vec![
-        position_row("TRADE", "0x31", MARKET_A, 0, "BUY", "1", "0.4", 210),
-        position_row("TRADE", "0x32", MARKET_A, 0, "BUY", "2", "0.6", 210),
-    ];
+    let groups = (0..8)
+        .rev()
+        .map(|index| {
+            position_row(
+                "TRADE",
+                &format!("0xrestart-{index}"),
+                MARKET_A,
+                0,
+                "BUY",
+                "1",
+                "0.4",
+                210,
+            )
+        })
+        .collect();
     engine
         .commit_read(groups, &context(210, true), zero_basis())
         .unwrap();
@@ -1969,6 +1997,65 @@ fn already_fenced_commit_serializes_only_clamped_redeems_as_version_three() {
 }
 
 #[test]
+fn homogeneous_five_buys_apply_and_allow_later_independent_entry() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let five_connected = (0..5)
+        .map(|ordinal| {
+            position_row(
+                "TRADE",
+                &format!("0xwide-{ordinal}"),
+                MARKET_A,
+                0,
+                "BUY",
+                "0.000001",
+                "0.5",
+                592,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = engine
+        .commit_read(five_connected, &context(592, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.newly_fenced, None);
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 5);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    assert!(result.pending.is_empty());
+    assert_eq!(result.dispositions.len(), 5);
+    assert!(
+        result
+            .dispositions
+            .values()
+            .all(|value| value == "ambiguous_first_entry_same_second")
+    );
+    assert!(
+        paper.gate_history().unwrap()[&wallet()]
+            .contains(&MarketId(VenueMarketId(MARKET_A.to_owned())))
+    );
+    let later = engine
+        .commit_read(
+            vec![position_row(
+                "TRADE",
+                "0xwide-later",
+                MARKET_B,
+                0,
+                "BUY",
+                "1",
+                "0.5",
+                593,
+            )],
+            &context(593, true),
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(later.pending.len(), 1);
+    assert_eq!(later.newly_fenced, None);
+    assert_eq!(
+        state(&engine, MARKET_B, 0),
+        ShareAmount::from_whole(1).unwrap()
+    );
+}
+
+#[test]
 fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() {
     let (_dir, paper, mut engine) = fresh();
     paper.set_cursor(&wallet(), 0).unwrap();
@@ -2033,11 +2120,11 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
     assert_eq!(state(&engine, MARKET_A, 1), ShareAmount::ZERO);
 
     let (_dir, paper, mut engine) = fresh_anchored();
-    let five_connected = (0..5)
+    let mut mixed = (0..4)
         .map(|ordinal| {
             position_row(
                 "TRADE",
-                &format!("0xwide-{ordinal}"),
+                &format!("0xwide-mixed-{ordinal}"),
                 MARKET_A,
                 0,
                 "BUY",
@@ -2047,8 +2134,15 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
             )
         })
         .collect::<Vec<_>>();
+    mixed.push(pair_effect(
+        "SPLIT",
+        "0xwide-mixed-split",
+        MARKET_A,
+        "0.000001",
+        592,
+    ));
     let result = engine
-        .commit_read(five_connected, &context(592, true), zero_basis())
+        .commit_read(mixed, &context(592, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,

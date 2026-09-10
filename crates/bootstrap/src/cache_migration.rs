@@ -47,7 +47,7 @@ use crate::reclamation_evidence::{
 const CACHE_BUILD_MANIFEST_VERSION: u32 = 1;
 const FROZEN_PAYLOAD_REFERENCE_VERSION: u32 = 1;
 const FINAL_STAGE_RECORD_VERSION: u32 = 2;
-const RANKER_CLASSIFIER_VERSION: u32 = 1;
+const RANKER_CLASSIFIER_VERSION: u32 = 2;
 const MAX_ACTIVITY_WALLET_FETCHES: usize = 16;
 
 const V2_SCHEMA: &str = "
@@ -1748,7 +1748,7 @@ pub fn activate_cache_v2_with_handoff(
         let installed = open_existing_ro(&request.fixed_path)?;
         require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
         integrity_check(&installed)?;
-        verify_finalized_v2_manifests(&installed)?;
+        verify_finalized_v2_manifests(&installed, ClassifierGeneration::Current)?;
         installed.close().map_err(|(_, error)| error)?;
         reject_nonempty_sidecars(&request.fixed_path)?;
         return Ok(CacheActivationReport {
@@ -1779,7 +1779,9 @@ pub fn activate_cache_v2_with_handoff(
         current.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current_version {
         0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
-        CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(&current)?,
+        CACHE_SCHEMA_VERSION_V2 => {
+            verify_finalized_v2_manifests(&current, ClassifierGeneration::Historical)?
+        }
         other => return invalid(format!("unsupported prior cache schema {other}")),
     }
     current.close().map_err(|(_, error)| error)?;
@@ -1822,7 +1824,7 @@ pub fn activate_cache_v2_with_handoff(
     let side = open_existing_ro(&request.side_path)?;
     require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
     integrity_check(&side)?;
-    verify_finalized_v2_manifests(&side)?;
+    verify_finalized_v2_manifests(&side, ClassifierGeneration::Current)?;
     side.close().map_err(|(_, error)| error)?;
     // The read-only validation of a WAL-mode main may itself allocate an SHM index. With the
     // pre-open sidecar rejection above complete, only nonempty WAL frames can add durable state;
@@ -2189,7 +2191,9 @@ fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 | CACHE_SCHEMA_VERSION_V1 => {}
-        CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(&connection)?,
+        CACHE_SCHEMA_VERSION_V2 => {
+            verify_finalized_v2_manifests(&connection, ClassifierGeneration::Historical)?
+        }
         other => return invalid(format!("prior cache has unsupported schema {other}")),
     }
     integrity_check(&connection)?;
@@ -2225,7 +2229,15 @@ fn required_max(connection: &Connection, table: &str, column: &str) -> Result<i6
     })
 }
 
-fn verify_finalized_v2_manifests(connection: &Connection) -> Result<(), BootstrapError> {
+enum ClassifierGeneration {
+    Current,
+    Historical,
+}
+
+fn verify_finalized_v2_manifests(
+    connection: &Connection,
+    generation: ClassifierGeneration,
+) -> Result<(), BootstrapError> {
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
     }
@@ -2270,11 +2282,23 @@ fn verify_finalized_v2_manifests(connection: &Connection) -> Result<(), Bootstra
         |row| row.get(0),
     )?;
     let actual_projection_digest = ranker_projection_digest(connection, activity_generation)?;
+    let classifier_matches = match generation {
+        ClassifierGeneration::Current => {
+            classifier_version == Some(i64::from(RANKER_CLASSIFIER_VERSION))
+        }
+        ClassifierGeneration::Historical => matches!(classifier_version, Some(1 | 2)),
+    };
+    let mismatched_rows: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ranker_entries_v2 WHERE classifier_version IS NOT ?1)",
+        params![classifier_version],
+        |row| row.get(0),
+    )?;
     if frozen == 0
         || phase != "finalized"
         || projection_count != Some(actual_projection_count)
         || projection_digest.as_deref() != Some(actual_projection_digest.as_str())
-        || classifier_version != Some(i64::from(RANKER_CLASSIFIER_VERSION))
+        || !classifier_matches
+        || mismatched_rows
     {
         return invalid(
             "installed cache omitted or changed its frozen/activity/ranker proof".to_owned(),

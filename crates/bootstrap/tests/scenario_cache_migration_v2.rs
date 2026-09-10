@@ -954,7 +954,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
     assert_eq!(projected.1, "2.625");
     assert_eq!(projected.2, "2.625");
     assert_eq!(projected.3, 1_800_057_600);
-    assert_eq!(projected.4, 1);
+    assert_eq!(projected.4, 2);
     assert_eq!(
         cache
             .raw_conn_for_test()
@@ -989,6 +989,366 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
             })
             .unwrap(),
         1
+    );
+}
+
+const CLASSIFIER_FIXED_END: i64 = 1_800_000_000;
+
+async fn retained_classifier_activity(dir: &TempDir, side: &std::path::Path) -> std::path::PathBuf {
+    let fixed_end = CLASSIFIER_FIXED_END;
+    drop(seed_v1(side, fixed_end - 10));
+    let manifest = write_build_manifest(dir, side);
+    migrate_cache_v2(side, &manifest).unwrap();
+    let frozen = write_frozen_reference(dir, fixed_end - 10, vec![WALLET.to_owned()]);
+    let row = |kind: &str, id: &str, market: &str, epoch: i64| {
+        serde_json::json!({
+            "proxyWallet": WALLET, "type": kind, "conditionId": market, "asset": "123",
+            "outcome": "Yes", "side": "BUY", "size": if kind == "CONVERSION" { "0" } else { "1" },
+            "usdcSize": if kind == "CONVERSION" { "0" } else { "0.5" }, "price": "0.5",
+            "timestamp": epoch, "transactionHash": id, "outcomeIndex": "0",
+        })
+    };
+    let mut rows = vec![
+        row("TRADE", "0xlater-b", "0xlater-b", fixed_end - 1),
+        row("TRADE", "0xlater-a", "0xlater-a", fixed_end - 2),
+    ];
+    rows.extend(
+        (0..5).map(|index| row("TRADE", &format!("0xwide-{index}"), "0xwide", fixed_end - 3)),
+    );
+    rows.push(row("CONVERSION", "0xzero", "0xconversion", fixed_end - 4));
+    let url = format!(
+        "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={fixed_end}"
+    );
+    populate_activity_v2(
+        side,
+        &FixtureFetcher::new(HashMap::from([(url, serde_json::to_vec(&rows).unwrap())])),
+        "https://data.example",
+        &frozen,
+        fixed_end,
+        7,
+        fixed_end + 1,
+    )
+    .await
+    .unwrap();
+    let markets = ["0xlater-a", "0xlater-b"].map(|market| {
+        serde_json::json!({
+            "condition_id": market, "active": true, "closed": true,
+            "end_date_iso": "2027-01-16T00:00:00Z", "is_50_50_outcome": false,
+            "tokens": [{"token_id":"123","outcome":"Yes","price":1,"winner":true},
+                       {"token_id":"456","outcome":"No","price":0,"winner":false}],
+        })
+    });
+    ClobFetcher::new(
+        "https://clob.example".to_owned(),
+        FixtureFetcher::new(HashMap::from([(
+            "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+            serde_json::to_vec(&serde_json::json!({"data": markets, "next_cursor": "LTE="}))
+                .unwrap(),
+        )])),
+    )
+    .fetch_closed_markets(&mut WalletCache::open(side).unwrap())
+    .await
+    .unwrap();
+    finalize_cache_v2(side, &dir.path().join("initial-stage.json"), fixed_end + 2).unwrap();
+    frozen
+}
+
+fn retained_activity_rows(
+    path: &std::path::Path,
+) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+    let connection = Connection::open(path).unwrap();
+    ["activity_groups_v2", "activity_coverage_manifests_v2"]
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| row.get(index))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (table.to_owned(), rows)
+        })
+        .collect()
+}
+
+// Build the authentic classifier-one result for this retained history: its first
+// zero conversion refused, so no later entry was projected. Preserve all source proof.
+fn retain_legacy_empty_projection(path: &std::path::Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute("DELETE FROM ranker_entries_v2", [])
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE cache_v2_migration_state SET ranker_projection_count = 0,
+        ranker_projection_digest = ?1, ranker_classifier_version = 1 WHERE singleton = 1",
+            params![format!("{:x}", Sha256::digest(b"[]"))],
+        )
+        .unwrap();
+}
+
+async fn assert_no_activity_recollection(side: &std::path::Path, frozen: &std::path::Path) {
+    let fetcher = YieldingFetcher::default();
+    populate_activity_v2(
+        side,
+        &fetcher,
+        "https://data.example",
+        frozen,
+        CLASSIFIER_FIXED_END,
+        7,
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .await
+    .unwrap();
+    assert!(fetcher.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    let frozen = retained_classifier_activity(&dir, &side).await;
+    retain_legacy_empty_projection(&side);
+    let retained = retained_activity_rows(&side);
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER abort_projection_rebuild BEFORE INSERT ON ranker_entries_v2
+        BEGIN SELECT RAISE(ABORT, 'forced classifier rebuild crash'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        finalize_cache_v2(
+            &side,
+            &dir.path().join("failed-rebuild-stage.json"),
+            CLASSIFIER_FIXED_END + 3
+        )
+        .is_err()
+    );
+    let connection = Connection::open(&side).unwrap();
+    assert_eq!(connection.query_row("SELECT ranker_classifier_version, ranker_projection_count FROM cache_v2_migration_state", [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).unwrap(), (1, 0));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM ranker_entries_v2", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    connection
+        .execute_batch("DROP TRIGGER abort_projection_rebuild")
+        .unwrap();
+    drop(connection);
+    assert_eq!(retained_activity_rows(&side), retained);
+    let stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("rebuilt-stage.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    assert_eq!(stage.version, 2);
+    assert_eq!(stage.ranker_classifier_version, 2);
+    assert_eq!(stage.ranker_projection_count, 2);
+    assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
+    let connection = Connection::open(&side).unwrap();
+    let rows = connection
+        .prepare(
+            "SELECT groups_v2.condition_id, ranker.classifier_version
+        FROM ranker_entries_v2 ranker JOIN activity_groups_v2 groups_v2 USING (source_trade_id)
+        ORDER BY groups_v2.condition_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![("0xlater-a".to_owned(), 2), ("0xlater-b".to_owned(), 2)]
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT ranker_classifier_version FROM cache_v2_migration_state",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    drop(connection);
+    assert_eq!(retained_activity_rows(&side), retained);
+    assert_no_activity_recollection(&side, &frozen).await;
+}
+
+#[tokio::test]
+async fn stale_classifier_projection_cannot_be_certified() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("fixed.db");
+    let side = dir.path().join("side.db");
+    retained_classifier_activity(&dir, &fixed).await;
+    let frozen = retained_classifier_activity(&dir, &side).await;
+    // Old certification alone cannot install as a current candidate, even with
+    // authentic count/digest proof for its empty legacy projection.
+    retain_legacy_empty_projection(&side);
+    let request = |hash| CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: dir.path().join(format!("prior-{hash}.db")),
+        expected_side_sha256: hash,
+    };
+    let error = activate_cache_v2(&request(sha256_file(&side).unwrap())).unwrap_err();
+    assert!(
+        error.to_string().contains("frozen/activity/ranker proof"),
+        "{error}"
+    );
+    finalize_cache_v2(
+        &side,
+        &dir.path().join("rebuilt-stage.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    // Historical classifier 1 is permitted, but rows still certified by their
+    // unchanged classifier-2 digest cannot be relabeled by changing only state.
+    let connection = Connection::open(&fixed).unwrap();
+    connection
+        .execute(
+            "UPDATE cache_v2_migration_state SET ranker_classifier_version = 1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let error = activate_cache_v2(&request(sha256_file(&side).unwrap())).unwrap_err();
+    assert!(
+        error.to_string().contains("frozen/activity/ranker proof"),
+        "{error}"
+    );
+    finalize_cache_v2(
+        &fixed,
+        &dir.path().join("fixed-rebuilt-stage.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    let stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("accepted-stage.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    assert_no_activity_recollection(&side, &frozen).await;
+    assert_eq!(
+        activate_cache_v2(&request(stage.cache_sha256.clone()))
+            .unwrap()
+            .installed_sha256,
+        stage.cache_sha256
+    );
+}
+
+#[tokio::test]
+async fn refinalization_resumes_after_commit_before_stage_receipt() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    let frozen = retained_classifier_activity(&dir, &side).await;
+    retain_legacy_empty_projection(&side);
+    let retained = retained_activity_rows(&side);
+    let blocked_parent = dir.path().join("stage-parent-is-file");
+    std::fs::write(&blocked_parent, b"blocks stage creation").unwrap();
+    let blocked_stage = blocked_parent.join("stage.json");
+    assert!(finalize_cache_v2(&side, &blocked_stage, CLASSIFIER_FIXED_END + 3).is_err());
+    assert!(!blocked_stage.exists());
+    let connection = Connection::open(&side).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT ranker_classifier_version, ranker_projection_count,
+        phase FROM cache_v2_migration_state",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+        (2, 2, "finalized".to_owned())
+    );
+    drop(connection);
+    let stage_path = dir.path().join("resumed-stage.json");
+    let stage = finalize_cache_v2(&side, &stage_path, CLASSIFIER_FIXED_END + 3).unwrap();
+    assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
+    let receipt: Value = serde_json::from_slice(&std::fs::read(stage_path).unwrap()).unwrap();
+    assert_eq!(receipt["cache_sha256"], stage.cache_sha256);
+    assert_eq!(receipt["ranker_classifier_version"], 2);
+    assert_eq!(retained_activity_rows(&side), retained);
+    assert_no_activity_recollection(&side, &frozen).await;
+}
+
+#[tokio::test]
+async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("fixed.db");
+    let side = dir.path().join("side.db");
+    retained_classifier_activity(&dir, &fixed).await;
+    retain_legacy_empty_projection(&fixed);
+    let prior_hash = sha256_file(&fixed).unwrap();
+    let prior_rows = retained_activity_rows(&fixed);
+    // Upgrade a copy of exactly the same source history through the normal finalizer.
+    std::fs::copy(&fixed, &side).unwrap();
+    let stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("upgraded-stage.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    let request = CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: dir.path().join("prior.db"),
+        expected_side_sha256: stage.cache_sha256.clone(),
+    };
+    let installed = activate_cache_v2(&request).unwrap();
+    assert!(!installed.resumed);
+    assert_eq!(installed.prior_cache_schema, 2);
+    assert_eq!(installed.prior_cache_sha256, prior_hash);
+    assert_eq!(
+        sha256_file(&request.prior_cache_backup_path).unwrap(),
+        prior_hash
+    );
+    assert_eq!(
+        retained_activity_rows(&request.prior_cache_backup_path),
+        prior_rows
+    );
+    let prior = Connection::open(&request.prior_cache_backup_path).unwrap();
+    assert_eq!(
+        prior
+            .query_row(
+                "SELECT ranker_classifier_version FROM cache_v2_migration_state",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(prior);
+    let resumed = activate_cache_v2(&request).unwrap();
+    assert!(resumed.resumed);
+    assert_eq!(resumed.installed_sha256, stage.cache_sha256);
+    assert_eq!(resumed.prior_cache_sha256, prior_hash);
+    assert_eq!(
+        sha256_file(&request.prior_cache_backup_path).unwrap(),
+        prior_hash
     );
 }
 
