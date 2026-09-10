@@ -26,10 +26,16 @@ use pe_bootstrap::cache_migration::{
 };
 use pe_bootstrap::clob::ClobFetcher;
 use pe_bootstrap::pile::SRC_TRADES;
+use pe_core_types::{ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, WalletAddress};
+use pe_position_ledger::{
+    EntryClassification, LedgerMutation, PositionLedger, SecondVerdict,
+    classify_complete_second_legacy,
+};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest,
-    ClobCoveragePage, FixtureFetcher, PageFetcher,
+    ActivityParseContext, ActivityTransport, CLOB_RESOLUTION_PARSER_VERSION,
+    CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest, ClobCoveragePage, FixtureFetcher,
+    PageFetcher, parse_activity_response,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -995,6 +1001,14 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
 const CLASSIFIER_FIXED_END: i64 = 1_800_000_000;
 
 async fn retained_classifier_activity(dir: &TempDir, side: &std::path::Path) -> std::path::PathBuf {
+    retained_classifier_activity_at_version(dir, side, 2).await
+}
+
+async fn retained_classifier_activity_at_version(
+    dir: &TempDir,
+    side: &std::path::Path,
+    classifier_version: u32,
+) -> std::path::PathBuf {
     let fixed_end = CLASSIFIER_FIXED_END;
     drop(seed_v1(side, fixed_end - 10));
     let manifest = write_build_manifest(dir, side);
@@ -1012,16 +1026,19 @@ async fn retained_classifier_activity(dir: &TempDir, side: &std::path::Path) -> 
         row("TRADE", "0xlater-b", "0xlater-b", fixed_end - 1),
         row("TRADE", "0xlater-a", "0xlater-a", fixed_end - 2),
     ];
-    rows.extend(
-        (0..5).map(|index| row("TRADE", &format!("0xwide-{index}"), "0xwide", fixed_end - 3)),
-    );
-    rows.push(row("CONVERSION", "0xzero", "0xconversion", fixed_end - 4));
+    if classifier_version == 2 {
+        rows.extend(
+            (0..5).map(|index| row("TRADE", &format!("0xwide-{index}"), "0xwide", fixed_end - 3)),
+        );
+        rows.push(row("CONVERSION", "0xzero", "0xconversion", fixed_end - 4));
+    }
+    let raw = serde_json::to_vec(&rows).unwrap();
     let url = format!(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={fixed_end}"
     );
     populate_activity_v2(
         side,
-        &FixtureFetcher::new(HashMap::from([(url, serde_json::to_vec(&rows).unwrap())])),
+        &FixtureFetcher::new(HashMap::from([(url, raw.clone())])),
         "https://data.example",
         &frozen,
         fixed_end,
@@ -1049,8 +1066,112 @@ async fn retained_classifier_activity(dir: &TempDir, side: &std::path::Path) -> 
     .fetch_closed_markets(&mut WalletCache::open(side).unwrap())
     .await
     .unwrap();
-    finalize_cache_v2(side, &dir.path().join("initial-stage.json"), fixed_end + 2).unwrap();
+    if classifier_version == 1 {
+        // These two singleton BUY buckets have identical projections in both
+        // generations. Prove the expected source IDs with the retained legacy
+        // classifier before asking the normal finalizer to certify them.
+        let wallet = WalletAddress::from_hex(WALLET).unwrap();
+        let observed = time::OffsetDateTime::from_unix_timestamp(fixed_end + 1).unwrap();
+        let mut aggregates = parse_activity_response(
+            &raw,
+            wallet,
+            &ActivityParseContext {
+                source_id: SourceId("polymarket-data-api".to_owned()),
+                observed_at: SourceTimestamp(observed),
+                received_at: ReceivedAt(observed),
+                transport: ActivityTransport::Rest,
+            },
+        )
+        .unwrap()
+        .aggregates()
+        .unwrap();
+        aggregates.sort_by_key(|aggregate| aggregate.source_time.0);
+        let mut ledger = PositionLedger::new();
+        let mut expected = Vec::new();
+        for aggregate in aggregates {
+            let mutation = LedgerMutation::from_activity(&aggregate).unwrap();
+            let SecondVerdict::OrderIndependent { decisions, .. } =
+                classify_complete_second_legacy(
+                    &ledger,
+                    wallet,
+                    std::slice::from_ref(&mutation),
+                    ReconstructionQuality::new(100).unwrap(),
+                    &Default::default(),
+                    true,
+                    &|_| false,
+                )
+                .unwrap()
+            else {
+                panic!("legacy singleton projection refused");
+            };
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].entry, EntryClassification::Admitted);
+            expected.push((decisions[0].source_trade_id.0.clone(), 7, 1));
+            ledger.apply(&mutation).unwrap();
+        }
+        expected.sort();
+        assert_eq!(expected.len(), 2);
+        let connection = Connection::open(side).unwrap();
+        // Insert classifier-one rows from the outset, before the finalizer
+        // computes their digest. Never relabel an already-built projection.
+        // The state trigger retains the finalizer's real count and digest.
+        connection
+            .execute_batch(
+                "CREATE TRIGGER classifier_one_projection BEFORE INSERT ON ranker_entries_v2
+             WHEN NEW.classifier_version = 2
+             BEGIN
+                 INSERT INTO ranker_entries_v2
+                     (source_trade_id, activity_generation, classifier_version)
+                 VALUES (NEW.source_trade_id, NEW.activity_generation, 1);
+                 SELECT RAISE(IGNORE);
+             END;
+             CREATE TRIGGER classifier_one_state BEFORE UPDATE OF ranker_classifier_version
+             ON cache_v2_migration_state WHEN NEW.ranker_classifier_version = 2
+             BEGIN
+                 UPDATE cache_v2_migration_state SET phase = NEW.phase,
+                     ranker_projection_count = NEW.ranker_projection_count,
+                     ranker_projection_digest = NEW.ranker_projection_digest,
+                     ranker_classifier_version = 1, updated_at_unix = NEW.updated_at_unix
+                 WHERE singleton = NEW.singleton;
+                 SELECT RAISE(IGNORE);
+             END;",
+            )
+            .unwrap();
+        drop(connection);
+        let stage =
+            finalize_cache_v2(side, &dir.path().join("initial-stage.json"), fixed_end + 2).unwrap();
+        assert_eq!(stage.ranker_projection_count, 2);
+        assert_eq!(classifier_projection_rows(side), expected);
+        let connection = Connection::open(side).unwrap();
+        assert_eq!(connection.query_row(
+            "SELECT ranker_classifier_version, ranker_projection_count, ranker_projection_digest
+             FROM cache_v2_migration_state WHERE phase = 'finalized'", [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        ).unwrap(), (1, 2, stage.ranker_projection_digest));
+        connection
+            .execute_batch(
+                "DROP TRIGGER classifier_one_projection;
+             DROP TRIGGER classifier_one_state;",
+            )
+            .unwrap();
+    } else {
+        finalize_cache_v2(side, &dir.path().join("initial-stage.json"), fixed_end + 2).unwrap();
+    }
     frozen
+}
+
+fn classifier_projection_rows(path: &std::path::Path) -> Vec<(String, i64, i64)> {
+    Connection::open(path)
+        .unwrap()
+        .prepare(
+            "SELECT source_trade_id, activity_generation, classifier_version
+         FROM ranker_entries_v2 ORDER BY source_trade_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 fn retained_activity_rows(
@@ -1256,6 +1377,82 @@ async fn stale_classifier_projection_cannot_be_certified() {
 }
 
 #[tokio::test]
+async fn null_classifier_state_cannot_be_certified_with_empty_or_nonempty_projection() {
+    for empty_projection in [true, false] {
+        for historical in [true, false] {
+            let dir = TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+            let fixed = dir.path().join("fixed.db");
+            let side = dir.path().join("side.db");
+            retained_classifier_activity(&dir, &fixed).await;
+            retained_classifier_activity(&dir, &side).await;
+            let target = if historical { &fixed } else { &side };
+            if empty_projection {
+                retain_legacy_empty_projection(target);
+            }
+            let connection = Connection::open(target).unwrap();
+            connection
+                .execute(
+                    "UPDATE cache_v2_migration_state SET ranker_classifier_version = NULL",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(connection.query_row(
+                "SELECT ranker_classifier_version, ranker_projection_count FROM cache_v2_migration_state",
+                [], |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
+            ).unwrap(), (None, if empty_projection { 0 } else { 2 }));
+            drop(connection);
+            assert_eq!(
+                classifier_projection_rows(target).is_empty(),
+                empty_projection
+            );
+            let fixed_hash = sha256_file(&fixed).unwrap();
+            let side_hash = sha256_file(&side).unwrap();
+            let error = activate_cache_v2(&CacheActivationRequest {
+                fixed_path: fixed.clone(),
+                side_path: side.clone(),
+                prior_cache_backup_path: dir.path().join("prior.db"),
+                expected_side_sha256: side_hash.clone(),
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("frozen/activity/ranker proof"),
+                "{error}"
+            );
+            assert_eq!(sha256_file(&fixed).unwrap(), fixed_hash);
+            assert_eq!(sha256_file(&side).unwrap(), side_hash);
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_side_resume_rejects_classifier_one_installed_cache() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("fixed.db");
+    let side = dir.path().join("missing-side.db");
+    let prior = dir.path().join("prior.db");
+    retained_classifier_activity_at_version(&dir, &fixed, 1).await;
+    std::fs::copy(&fixed, &prior).unwrap();
+    assert!(!side.exists());
+    let fixed_hash = sha256_file(&fixed).unwrap();
+    let error = activate_cache_v2(&CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: prior.clone(),
+        expected_side_sha256: fixed_hash.clone(),
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("frozen/activity/ranker proof"),
+        "{error}"
+    );
+    assert_eq!(sha256_file(&fixed).unwrap(), fixed_hash);
+    assert_eq!(sha256_file(&prior).unwrap(), fixed_hash);
+    assert!(!side.exists());
+}
+
+#[tokio::test]
 async fn refinalization_resumes_after_commit_before_stage_receipt() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
@@ -1296,14 +1493,20 @@ async fn refinalization_resumes_after_commit_before_stage_receipt() {
 
 #[tokio::test]
 async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("pe-classifier-upgrade-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
     std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
     let fixed = dir.path().join("fixed.db");
     let side = dir.path().join("side.db");
-    retained_classifier_activity(&dir, &fixed).await;
-    retain_legacy_empty_projection(&fixed);
+    retained_classifier_activity_at_version(&dir, &fixed, 1).await;
     let prior_hash = sha256_file(&fixed).unwrap();
+    let prior_bytes = std::fs::read(&fixed).unwrap();
     let prior_rows = retained_activity_rows(&fixed);
+    let prior_projection = classifier_projection_rows(&fixed);
+    assert_eq!(prior_projection.len(), 2);
+    assert!(prior_projection.iter().all(|row| row.2 == 1));
     // Upgrade a copy of exactly the same source history through the normal finalizer.
     std::fs::copy(&fixed, &side).unwrap();
     let stage = finalize_cache_v2(
@@ -1312,6 +1515,11 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
         CLASSIFIER_FIXED_END + 3,
     )
     .unwrap();
+    assert_eq!(stage.ranker_classifier_version, 2);
+    assert_eq!(stage.ranker_projection_count, 2);
+    let upgraded_bytes = std::fs::read(&side).unwrap();
+    let upgraded_projection = classifier_projection_rows(&side);
+    assert!(upgraded_projection.iter().all(|row| row.2 == 2));
     let request = CacheActivationRequest {
         fixed_path: fixed.clone(),
         side_path: side.clone(),
@@ -1329,6 +1537,14 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     assert_eq!(
         retained_activity_rows(&request.prior_cache_backup_path),
         prior_rows
+    );
+    assert_eq!(
+        classifier_projection_rows(&request.prior_cache_backup_path),
+        prior_projection
+    );
+    assert_eq!(
+        std::fs::read(&request.prior_cache_backup_path).unwrap(),
+        prior_bytes
     );
     let prior = Connection::open(&request.prior_cache_backup_path).unwrap();
     assert_eq!(
@@ -1350,6 +1566,77 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
         sha256_file(&request.prior_cache_backup_path).unwrap(),
         prior_hash
     );
+    let binding = PriorCacheBinding {
+        sha256: installed.prior_cache_sha256,
+        schema_version: installed.prior_cache_schema,
+    };
+    let (publication_request, pending) = write_pending_publication(
+        &dir,
+        "classifier-upgrade",
+        &side,
+        &fixed,
+        &fixed,
+        &request.prior_cache_backup_path,
+    );
+    let displaced = dir.path().join("displaced-classifier-2.db");
+    restore_prior_cache(
+        &fixed,
+        &request.prior_cache_backup_path,
+        &displaced,
+        &binding,
+        &publication_request,
+        &pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sha256_file(&fixed).unwrap(), prior_hash);
+    assert_eq!(std::fs::read(&fixed).unwrap(), prior_bytes);
+    assert_eq!(classifier_projection_rows(&fixed), prior_projection);
+    assert_eq!(retained_activity_rows(&fixed), prior_rows);
+    assert_eq!(
+        Connection::open(&fixed)
+            .unwrap()
+            .query_row(
+                "SELECT ranker_classifier_version FROM cache_v2_migration_state",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(sha256_file(&displaced).unwrap(), stage.cache_sha256);
+    assert_eq!(std::fs::read(&displaced).unwrap(), upgraded_bytes);
+    assert_eq!(classifier_projection_rows(&displaced), upgraded_projection);
+    assert_eq!(retained_activity_rows(&displaced), prior_rows);
+
+    let fresh_side = dir.path().join("fresh-side.db");
+    std::fs::copy(&fixed, &fresh_side).unwrap();
+    let fresh_stage = finalize_cache_v2(
+        &fresh_side,
+        &dir.path().join("fresh-stage.json"),
+        CLASSIFIER_FIXED_END + 4,
+    )
+    .unwrap();
+    assert_eq!(fresh_stage.ranker_classifier_version, 2);
+    let fresh_request = CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: fresh_side,
+        prior_cache_backup_path: dir.path().join("fresh-prior.db"),
+        expected_side_sha256: fresh_stage.cache_sha256.clone(),
+    };
+    let fresh_install = activate_cache_v2(&fresh_request).unwrap();
+    assert!(!fresh_install.resumed);
+    assert_eq!(fresh_install.installed_sha256, fresh_stage.cache_sha256);
+    assert_eq!(fresh_install.prior_cache_sha256, prior_hash);
+    assert_eq!(sha256_file(&fixed).unwrap(), fresh_stage.cache_sha256);
+    assert_eq!(classifier_projection_rows(&fixed), upgraded_projection);
+    assert_eq!(retained_activity_rows(&fixed), prior_rows);
+    assert_eq!(
+        std::fs::read(&fresh_request.prior_cache_backup_path).unwrap(),
+        prior_bytes
+    );
+    assert_eq!(std::fs::read(&displaced).unwrap(), upgraded_bytes);
 }
 
 /// PASS: the activity fan-out reaches but never exceeds 16 in-flight wallets;

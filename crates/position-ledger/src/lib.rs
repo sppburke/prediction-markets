@@ -2020,6 +2020,256 @@ mod tests {
     }
 
     #[test]
+    fn same_side_proof_matches_exhaustive_corrected_five_trade_components() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let verified = MarketOutcomeId::new(market(), OutcomeId(0));
+        let stamped = MarketOutcomeId::new(
+            MarketId(VenueMarketId("0xstamped-market".to_owned())),
+            OutcomeId(1),
+        );
+        for side in [Side::Buy, Side::Sell] {
+            let mut ledger = ledger_with_longs(w, 5, 0);
+            ledger.state_mut(w, &market(), OutcomeId(0)).short_contracts =
+                ShareAmount::from_atomic(7);
+            let before = ledger.snapshots().clone();
+            let plain = same_side_trades(w, side, &[1, 2, 3, 4, 5]);
+            let mut mutations = plain.clone();
+            let LedgerEffect::Trade {
+                market_id,
+                outcome_id,
+                ..
+            } = &mut mutations[4].effect
+            else {
+                panic!("expected ordinary trade");
+            };
+            *market_id = stamped.market().clone();
+            *outcome_id = stamped.outcome();
+            mutations[4] = mutations[4]
+                .clone()
+                .with_verified_identity(verified.clone(), "metadata-page-hash".to_owned());
+            assert_ne!(mutations[4].effect.effective(), &mutations[4].effect);
+            assert_eq!(mutations[4].effect.effective(), &plain[4].effect);
+            assert_eq!(mutations[4].touched_keys(), vec![verified.clone()]);
+            assert_eq!(mutations[4].effect.correction().unwrap().stamped, stamped);
+            let components = mutation_components(&mutations);
+            assert_eq!(components.len(), 1);
+            assert_eq!(components[0].len(), 5);
+            assert_eq!(
+                same_side_component_validity(&ledger, w, &components[0]),
+                Some(Ok(()))
+            );
+            assert_eq!(
+                all_component_orders_match(&ledger, w, &components[0]),
+                Ok(true)
+            );
+            let quality = ReconstructionQuality::new(100).unwrap();
+            let verdict = classify_complete_second(
+                &ledger,
+                w,
+                &mutations,
+                quality,
+                &SignalConfig::default(),
+                true,
+                &|_| false,
+            )
+            .unwrap();
+            let mut expected = classify_complete_second(
+                &ledger,
+                w,
+                &plain,
+                quality,
+                &SignalConfig::default(),
+                true,
+                &|_| false,
+            )
+            .unwrap();
+            let SecondVerdict::OrderIndependent { applied, .. } = &mut expected else {
+                panic!("homogeneous proof refused");
+            };
+            applied[4].effect = mutations[4].effect.clone();
+            assert_eq!(verdict, expected);
+            assert!(matches!(
+                classify_complete_second_legacy(
+                    &ledger,
+                    w,
+                    &mutations,
+                    quality,
+                    &SignalConfig::default(),
+                    true,
+                    &|_| false,
+                )
+                .unwrap(),
+                SecondVerdict::OrderDependent { .. }
+            ));
+            let (expected, _) = ledger.simulate_all_or_none(&plain).unwrap();
+            let mut orders = Vec::new();
+            enumerate_mutation_orders(&mut components[0].clone(), &mut Vec::new(), &mut orders);
+            assert_eq!(orders.len(), 120);
+            for order in orders {
+                let (actual, applied) = ledger.simulate_all_or_none(&order).unwrap();
+                assert_eq!(actual.snapshots(), expected.snapshots());
+                assert!(
+                    applied
+                        .iter()
+                        .all(|effect| effect.clamped_residual.is_none())
+                );
+                let corrected = applied
+                    .iter()
+                    .find(|effect| effect.effect.correction().is_some())
+                    .unwrap();
+                assert_eq!(corrected.effect, mutations[4].effect);
+                assert_eq!(
+                    AppliedEffect::from_document(&corrected.to_document().unwrap()).unwrap(),
+                    *corrected
+                );
+            }
+            assert_eq!(ledger.snapshots(), &before);
+        }
+    }
+
+    #[test]
+    fn source_mapped_zero_trade_does_not_join_same_side_component_or_change_verdict() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let ledger = ledger_with_longs(w, 5, 7);
+        let before = ledger.snapshots().clone();
+        let zero =
+            LedgerMutation::from_activity(&activity_aggregate("TRADE", "0.000000", Some(0), false))
+                .unwrap();
+        assert_eq!(zero.effect, LedgerEffect::RawOnly);
+        assert!(zero.touched_keys().is_empty());
+        for side in [Side::Buy, Side::Sell] {
+            for amounts in [&[1, 2, 3, 4][..], &[1, 2, 3, 4, 5][..]] {
+                let trades = same_side_trades(w, side, amounts);
+                for index in [0, 2, trades.len()] {
+                    let mut bucket = trades.clone();
+                    let mut zero = zero.clone();
+                    zero.source_time = trades[0].source_time.clone();
+                    bucket.insert(index, zero.clone());
+                    let components = mutation_components(&bucket);
+                    assert_eq!(components.len(), 2);
+                    let ordinary = components
+                        .iter()
+                        .find(|component| component.len() > 1)
+                        .unwrap();
+                    let raw_only = components
+                        .iter()
+                        .find(|component| component.len() == 1)
+                        .unwrap();
+                    assert_eq!(ordinary.len(), trades.len());
+                    assert_eq!(raw_only, &vec![&zero]);
+                    assert_eq!(
+                        same_side_component_validity(&ledger, w, ordinary),
+                        Some(Ok(()))
+                    );
+                    assert_eq!(same_side_component_validity(&ledger, w, raw_only), None);
+                    for proof in [SecondProof::Repaired, SecondProof::Legacy] {
+                        assert_eq!(
+                            order_independent_validity(&ledger, w, &bucket, proof),
+                            order_independent_validity(&ledger, w, &trades, proof)
+                        );
+                        let classify = |mutations: &[LedgerMutation]| {
+                            classify_with_second_proof(
+                                proof,
+                                &ledger,
+                                w,
+                                mutations,
+                                ReconstructionQuality::new(100).unwrap(),
+                                &SignalConfig::default(),
+                                true,
+                                &|_| false,
+                            )
+                            .unwrap()
+                        };
+                        let mut actual = classify(&bucket);
+                        if let SecondVerdict::OrderIndependent { applied, .. } = &mut actual {
+                            assert_eq!(
+                                applied.remove(index),
+                                AppliedEffect {
+                                    effect: LedgerEffect::RawOnly,
+                                    clamped_residual: None,
+                                }
+                            );
+                        }
+                        assert_eq!(actual, classify(&trades));
+                    }
+                    let (actual, _) = ledger.simulate_all_or_none(&bucket).unwrap();
+                    let (expected, _) = ledger.simulate_all_or_none(&trades).unwrap();
+                    assert_eq!(actual.snapshots(), expected.snapshots());
+                }
+            }
+        }
+        assert_eq!(ledger.snapshots(), &before);
+    }
+
+    #[test]
+    fn large_sell_component_crosses_long_inventory_into_short() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let ledger = ledger_with_longs(w, 31, 0);
+        let before = ledger.snapshots().clone();
+        let mutations = same_side_trades(w, Side::Sell, &[2; 32]);
+        let classify = |mutations: &[LedgerMutation]| {
+            classify_complete_second(
+                &ledger,
+                w,
+                mutations,
+                ReconstructionQuality::new(100).unwrap(),
+                &SignalConfig::default(),
+                true,
+                &|_| false,
+            )
+            .unwrap()
+        };
+        let SecondVerdict::OrderIndependent {
+            applied,
+            decisions,
+            first_entries,
+        } = classify(&mutations)
+        else {
+            panic!("large SELL component refused");
+        };
+        assert_eq!(applied.len(), 32);
+        assert_eq!(decisions.len(), 32);
+        assert!(first_entries.is_empty());
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.entry == EntryClassification::NotBuy
+                    && decision.action_order_dependent)
+        );
+        assert!(
+            applied
+                .iter()
+                .all(|effect| effect.clamped_residual.is_none())
+        );
+        let (expected, _) = ledger.simulate_all_or_none(&mutations).unwrap();
+        let state = &expected.position(&w).unwrap().positions
+            [&MarketOutcomeId::new(market(), OutcomeId(0))];
+        assert_eq!(state.long_contracts, ShareAmount::ZERO);
+        assert_eq!(state.short_contracts, ShareAmount::from_atomic(33));
+        let reversed = mutations.into_iter().rev().collect::<Vec<_>>();
+        let SecondVerdict::OrderIndependent {
+            applied: reverse_applied,
+            decisions: reverse_decisions,
+            first_entries,
+        } = classify(&reversed)
+        else {
+            panic!("reversed large SELL component refused");
+        };
+        assert_eq!(
+            reverse_applied,
+            applied.into_iter().rev().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reverse_decisions,
+            decisions.into_iter().rev().collect::<Vec<_>>()
+        );
+        assert!(first_entries.is_empty());
+        let (actual, _) = ledger.simulate_all_or_none(&reversed).unwrap();
+        assert_eq!(actual.snapshots(), expected.snapshots());
+        assert_eq!(ledger.snapshots(), &before);
+    }
+
+    #[test]
     fn same_side_proof_accepts_wide_total_after_opposite_inventory_netting() {
         let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         for side in [Side::Buy, Side::Sell] {
@@ -2201,6 +2451,31 @@ mod tests {
             LedgerMutation::from_activity(&activity_aggregate("NEW_TYPE", "0.000000", None, false))
                 .unwrap();
         assert_eq!(unknown.effect, LedgerEffect::UnknownEffect);
+        let w = unknown.wallet;
+        let mut ledger = ledger_with_longs(w, 500, 20);
+        let before = ledger.snapshots().clone();
+        let expected = LedgerError::UnknownEffect {
+            source_trade_id: unknown.source_trade_id.clone(),
+        };
+        assert_eq!(ledger.apply(&unknown), Err(expected.clone()));
+        assert_eq!(ledger.snapshots(), &before);
+        let mut mutations = same_side_trades(w, Side::Buy, &[1, 2, 3, 4, 5]);
+        mutations.push(unknown);
+        assert_eq!(ledger.apply_all_or_none(&mutations), Err(expected.clone()));
+        assert_eq!(ledger.snapshots(), &before);
+        assert_eq!(
+            classify_complete_second(
+                &ledger,
+                w,
+                &mutations,
+                ReconstructionQuality::new(100).unwrap(),
+                &SignalConfig::default(),
+                true,
+                &|_| false,
+            ),
+            Err(expected)
+        );
+        assert_eq!(ledger.snapshots(), &before);
     }
 
     #[test]
