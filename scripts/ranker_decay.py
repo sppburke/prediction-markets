@@ -19,10 +19,11 @@ no decay).
 
 Uniform-weight short-circuit (the `half_life <= 0` flat path, and any set whose
 trades share one timestamp): `weighted_stats` delegates to `np.mean` / `np.std(ddof=1)`
-so the flat path is **bitwise-identical** to the legacy unweighted statistic, not
-merely equal-after-rounding — this keeps a `half_life=0` run byte-for-byte equal to
-the pre-#366 code (pass-1 writes its CSV at full precision) and avoids a candidate
-flip at a `floor_tstat` boundary.
+so ordinary vectors above the dispersion floor remain **bitwise-identical** to the
+legacy unweighted statistic and avoid a candidate flip at a `floor_tstat` boundary.
+Degenerate vectors at or below the shared dispersion floor instead return a NaN
+t-statistic (#588); their reported mean, standard deviation and effective N are
+unchanged.
 """
 from __future__ import annotations
 
@@ -36,6 +37,13 @@ import numpy as np
 DEFAULT_HALF_LIFE_DAYS = 30.0
 DEFAULT_WINDOW_DAYS = 180
 SECS_PER_DAY = 86_400
+
+# Per-position net-edge / CLV dispersion floor (ranker_sd_floor, glossary). A
+# mathematically-constant series can have sd ~1e-16 from mean-rounding float noise,
+# so a bare `sd > 0` admits a spurious t-stat ~1e16. At or below the existing floor,
+# t-statistics are undefined; preserve the reported moments for estimator consumers
+# and diagnostics (#436 A10 follow-up, shared by both ranking passes since #588).
+_SD_FLOOR = 1e-9
 
 
 def decay_weights(entry_ts, as_of: int, half_life_days: float) -> np.ndarray:
@@ -64,16 +72,18 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
     * Kish effective sample size `n_eff = W² / V2`.
     * tstat = wmean / wstd · √n_eff.
 
-    NaN guards mirror the legacy `tstat`: any of `n ≤ 1`, `W ≤ 0`, `W² − V2 ≤ 0`,
-    `wstd ≤ 0`, `n_eff ≤ 1` ⇒ `tstat` is NaN (wmean still returned when defined). `wstd`
-    is NaN in those cases too, EXCEPT the flat zero-variance path, which returns
-    `wstd = 0.0` for bitwise parity with the legacy `np.std(ddof=1)`.
+    Any of `n ≤ 1`, `W ≤ 0`, `W² − V2 ≤ 0`, `n_eff ≤ 1` ⇒ `tstat` is NaN
+    (wmean still returned when defined). Dispersion `wstd ≤ _SD_FLOOR` also makes
+    `tstat` NaN, while preserving mean, standard deviation and effective N. The
+    legacy zero-variance reporting is unchanged: the uniform path returns
+    `wstd = 0.0`; the general weighted path returns NaN for nonpositive variance.
 
     Uniform-weight short-circuit: when every weight is equal (the flat `half_life ≤ 0`
     path, or all trades sharing a timestamp) delegate to `np.mean` / `np.std(ddof=1)`
-    so the result is bitwise-identical to the legacy unweighted statistic. The `W ≤ 0`
-    guard precedes this short-circuit (#445), so an all-zero weight vector — which is
-    also "uniform" — returns NaN rather than a spurious unweighted statistic.
+    so ordinary vectors above the dispersion floor remain bitwise-identical to the
+    legacy unweighted statistic. The `W ≤ 0` guard precedes this short-circuit
+    (#445), so an all-zero weight vector — which is also "uniform" — returns NaN
+    rather than a spurious unweighted statistic.
     """
     v = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
@@ -94,14 +104,14 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
     if big_w <= 0.0:
         return (float("nan"), float("nan"), 0.0, float("nan"))
 
-    # Uniform-weight short-circuit -> bitwise-identical to legacy np.mean/np.std(ddof=1).
+    # Uniform-weight moments retain bitwise parity; the dispersion floor gates only tstat.
     if bool(np.all(w == w[0])):
         wmean = float(v.mean())
         if n <= 1:
             return (wmean, float("nan"), float(n), float("nan"))
         wstd = float(v.std(ddof=1))
         n_eff = float(n)
-        tstat = (wmean / wstd * math.sqrt(n_eff)) if wstd > 0 else float("nan")
+        tstat = (wmean / wstd * math.sqrt(n_eff)) if wstd > _SD_FLOOR else float("nan")
         return (wmean, wstd, n_eff, tstat)
 
     # General reliability-weighted path.
@@ -115,7 +125,7 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
     if not (wvar > 0.0):
         return (wmean, float("nan"), n_eff, float("nan"))
     wstd = math.sqrt(wvar)
-    tstat = wmean / wstd * math.sqrt(n_eff)
+    tstat = (wmean / wstd * math.sqrt(n_eff)) if wstd > _SD_FLOOR else float("nan")
     return (wmean, wstd, n_eff, tstat)
 
 

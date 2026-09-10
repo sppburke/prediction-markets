@@ -36,7 +36,6 @@ from ranker.demotion import EmpiricalBernsteinDemoter  # noqa: E402
 from ranker.estimators import (  # noqa: E402
     _EB_PRIOR_VAR_FLOOR,
     _EB_TAU2_FLOOR_FRAC,
-    _SD_FLOOR,
     _npmle_em,
     _npmle_scores,
     REGISTRY as EST,
@@ -50,7 +49,7 @@ from ranker.oos_validation import (  # noqa: E402
     fcr_selected_ci,
     mrsw_rank_cs,
 )
-from ranker_decay import weighted_stats  # noqa: E402
+from ranker_decay import _SD_FLOOR, decay_weights, weighted_stats  # noqa: E402
 
 try:
     from statsmodels.stats.meta_analysis import combine_effects
@@ -121,6 +120,20 @@ def _c_weighted_stats():
     assert abs(neff2 - neff_ref) < 1e-9 and abs(wstd2 - math.sqrt(var_ref)) < 1e-9
     assert abs(t2 - t_ref2) < 1e-9
     return f"uniform t={tstat:.6f}==scipy; weighted Kish n_eff={neff2:.3f}, t matches hand-derived"
+
+
+@check("weighted_stats rejects constant-return float noise in uniform and weighted paths")
+def _c_weighted_stats_dispersion_floor():
+    # #588: mathematically constant returns have no dispersion; rounding cannot supply evidence.
+    net = (1 - (.20 + .01)) / (.20 + .01)
+    for n in (6, 20):
+        entries = [1_000_000 + 10_000 * i for i in range(n)]
+        for w in (np.ones(n), np.full(n, 0.3), decay_weights(entries, entries[-1], 30)):
+            mean, sd, n_eff, tstat = weighted_stats([net] * n, w)
+            assert 0 < sd < _SD_FLOOR, f"n={n}: reported float noise was lost: sd={sd}"
+            assert math.isnan(tstat), f"n={n}: constant returns produced t={tstat}"
+            assert abs(mean - net) < 1e-12 and 1 < n_eff <= n
+    return "six/twenty constant returns: t=NaN with unit, nonunit equal and unequal decay weights"
 
 
 # --------------------------------------------------------------------------------------------------

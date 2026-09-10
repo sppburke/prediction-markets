@@ -12,16 +12,7 @@ import pandas as pd
 from scipy.special import logsumexp
 from scipy.stats import norm
 
-from ranker_decay import weighted_stats  # reuse #366 weighted statistics — no drift
-
-# Per-position net-edge / CLV dispersion floor (ranker_sd_floor, glossary). np.std(ddof=1) of a
-# mathematically-constant net series is exactly 0.0 at n=5 but ~1e-16 at n>=6 (mean-rounding float
-# error), so a bare `sd > 0` admits a 6/6 win streak with a t-stat ~2e16, ranking it #1. A wallet's
-# genuine per-position dispersion is O(1e-3) or larger (>= one price tick), so 1e-9 cleanly separates
-# float noise from real signal: at or below it a wallet has undefined dispersion and is DROPPED (not
-# scored maximal), extending the deliberate n=5 zero-dispersion drop to the n>=6 float-noise case
-# uniformly across all five estimators (#436 A10 follow-up).
-_SD_FLOOR = 1e-9
+from ranker_decay import _SD_FLOOR, weighted_stats  # reuse #366 weighted statistics — no drift
 
 # Empirical-Bayes prior-variance floors for eb_shrinkage_skill (#436 C1).
 # `ranker_eb_prior_var_floor` is the ABSOLUTE degenerate fallback (a <2-valid-candidate input has an

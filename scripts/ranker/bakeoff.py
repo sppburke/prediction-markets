@@ -69,12 +69,12 @@ import numpy as np
 import pandas as pd
 from scipy.stats import kurtosis, skew
 
-from ranker_decay import weighted_stats  # reuse #366 weighted statistics — gate agrees with ranker
+from ranker_decay import _SD_FLOOR, weighted_stats  # reuse #366 statistics — gate agrees with ranker
 
 from . import Criteria, FollowSet, SuffStats, WalletScores
 from .demotion import EmpiricalBernsteinDemoter
 from .deflation import DeflatedSharpe
-from .estimators import REGISTRY as ESTIMATOR_REGISTRY, _SD_FLOOR, clv_diagnostic
+from .estimators import REGISTRY as ESTIMATOR_REGISTRY, clv_diagnostic
 from .oos_validation import (
     HansenSPA,
     PBO,

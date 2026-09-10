@@ -32,7 +32,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from .estimators import _SD_FLOOR
+from ranker_decay import _SD_FLOOR
 
 BENCH_FAMILIES = ("policy_hybrid_displacement", "policy_online_weighting")
 INELIGIBLE_ESTIMATORS = ("true_clv", "proxy_clv")

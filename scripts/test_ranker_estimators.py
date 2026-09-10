@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ranker.estimators import (  # noqa: E402
     REGISTRY,
-    _SD_FLOOR,
     EBShrinkageSkill,
     GuKoenkerNPMLE,
     ProxyCLV,
@@ -28,7 +27,7 @@ from ranker.estimators import (  # noqa: E402
     _npmle_scores,
     clv_diagnostic,
 )
-from ranker_decay import weighted_stats  # noqa: E402
+from ranker_decay import _SD_FLOOR, decay_weights, weighted_stats  # noqa: E402
 from scipy.stats import norm  # noqa: E402
 
 PRICE = 0.50            # _eff = 0.51 for every synthetic position
@@ -402,6 +401,38 @@ class FloatFragilitySDFloorTest(unittest.TestCase):
                           ("bad", [(0.4, 0.3), (0.4, 0.35), (0.4, 0.31)])], col=col)
             out = est.score(ss, as_of=0, weights=np.ones(len(ss)))
             self.assertNotIn("flat6", out.index, msg=col)   # constant CLV -> undefined t-stat
+
+    def test_estimators_drop_six_position_streak_with_unequal_weights(self) -> None:
+        ss = _suff_stats([("perfect6", 6, 6), ("a", 6, 4), ("b", 6, 2)])
+        entries = [1_000_000 + 86_400 * i for i in range(6)]
+        weights = np.tile(decay_weights(entries, entries[-1], 30), 3)
+        streak = ss[ss["wallet"] == "perfect6"]
+        net = ((streak["payoff"] - streak["_eff"]) / streak["_eff"]).to_numpy()
+        _, sd, _, _ = weighted_stats(net, weights[streak.index.to_numpy()])
+        self.assertGreater(sd, 0.0)
+        self.assertLess(sd, _SD_FLOOR)
+        for est in (TStatBaseline(), GuKoenkerNPMLE(), EBShrinkageSkill()):
+            with self.subTest(estimator=est.name):
+                out = est.score(ss, as_of=entries[-1], weights=weights)
+                self.assertNotIn("perfect6", out.index)
+                self.assertEqual(set(out.index), {"a", "b"})
+
+    def test_clv_estimators_drop_six_position_constant_with_unequal_weights(self) -> None:
+        entries = [1_000_000 + 10_000 * i for i in range(6)]
+        weights = np.tile(decay_weights(entries, entries[-1], 30), 2)
+        for col, est in (("close_proxy", ProxyCLV()), ("true_clv_close", TrueCLV())):
+            with self.subTest(estimator=est.name):
+                ss = _clv_ss([("flat6", [(0.4, 0.6)] * 6),
+                              ("good", [(0.4, 0.6), (0.4, 0.55), (0.4, 0.62)]),
+                              ("bad", [(0.4, 0.3), (0.4, 0.35), (0.4, 0.31)])], col=col)
+                flat = ss[ss["wallet"] == "flat6"]
+                clv = (flat[col] - flat["price"]).to_numpy()
+                _, sd, _, _ = weighted_stats(clv, weights[flat.index.to_numpy()])
+                self.assertGreater(sd, 0.0)
+                self.assertLess(sd, _SD_FLOOR)
+                out = est.score(ss, as_of=entries[-1], weights=weights)
+                self.assertNotIn("flat6", out.index)
+                self.assertEqual(set(out.index), {"good", "bad"})
 
 
 class RegistryTest(unittest.TestCase):

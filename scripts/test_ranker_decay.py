@@ -137,6 +137,41 @@ class WeightedStatsNaNGuardTest(unittest.TestCase):
         self.assertEqual(wstd, 0.0)
         self.assertTrue(math.isnan(tstat))
 
+    def test_constant_return_float_noise_is_nan_uniform_and_weighted(self) -> None:
+        # #588: twenty identical repriced wins previously produced weighted t ~3.69e16.
+        net = (1 - (.20 + .01)) / (.20 + .01)
+        for n in (6, 20):
+            entries = [1_000_000 + 10_000 * i for i in range(n)]
+            for label, weights in (
+                ("uniform", rd.decay_weights(entries, entries[-1], 0)),
+                ("equal_nonunit", np.full(n, 0.3)),
+                ("weighted", rd.decay_weights(entries, entries[-1], 30)),
+            ):
+                with self.subTest(n=n, weights=label):
+                    _, sd, _, tstat = rd.weighted_stats([net] * n, weights)
+                    self.assertGreater(sd, 0.0)  # keep the float noise observable
+                    self.assertLess(sd, rd._SD_FLOOR)
+                    self.assertTrue(math.isnan(tstat))
+
+    def test_dispersion_floor_preserves_reported_moments(self) -> None:
+        # Frozen pre-#588 moments: only tstat changes, including for nonunit equal weights.
+        net = (1 - (.20 + .01)) / (.20 + .01)
+        for n, flat_moments, weighted_moments in (
+            (6, (3.7619047619047623, 4.864753555590494e-16, 6.0),
+             (3.7619047619047614, 4.864763702359062e-16, 5.999874856659355)),
+            (20, (3.7619047619047614, 4.556259157007654e-16, 20.0),
+             (3.7619047619047623, 4.55628766590766e-16, 19.995245790562883)),
+        ):
+            entries = [1_000_000 + 10_000 * i for i in range(n)]
+            for label, weights, expected in (
+                ("uniform", rd.decay_weights(entries, entries[-1], 0), flat_moments),
+                ("equal_nonunit", np.full(n, 0.3), flat_moments),
+                ("weighted", rd.decay_weights(entries, entries[-1], 30), weighted_moments),
+            ):
+                with self.subTest(n=n, weights=label):
+                    mean, sd, n_eff, _ = rd.weighted_stats([net] * n, weights)
+                    self.assertEqual((mean, sd, n_eff), expected)
+
     def test_negative_weight_is_nan(self) -> None:
         # F3 (#436 Phase F): a negative reliability weight is invalid by contract — fail safe to NaN,
         # not a silently corrupted weighted statistic.
