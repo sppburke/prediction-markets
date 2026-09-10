@@ -126,6 +126,8 @@ CREATE TABLE IF NOT EXISTS activity_groups (
     disposition       TEXT    NOT NULL,
     proof_json        TEXT    NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_activity_groups_wallet_epoch_trade
+ON activity_groups(wallet_hex, source_epoch, source_trade_id);
 
 -- Immutable semantic revisions observed for a group. The first row mirrors
 -- `activity_groups`; a later changed revision is retained here while fencing

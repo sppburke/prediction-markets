@@ -185,7 +185,7 @@ pub enum PaperStateError {
 /// Typed no-copy disposition for a stale observation from either transport (#530/#546).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoCopyDisposition {
-    /// `"rest_poll"` or `"activity_ws"` (schema CHECK-enforced).
+    /// `"rest_poll"`, `"activity_ws"`, or `"reconciled_rest"`.
     pub provenance: String,
     /// Observation age at admission (now − trade timestamp), seconds.
     pub age_secs: i64,
@@ -728,6 +728,7 @@ impl PaperStateDb {
             });
         }
         conn.execute_batch(SCHEMA)?;
+        migrate_legacy_no_copy_provenance(&mut conn, false)?;
         if found == LEGACY_EXACT_MIGRATION_VERSION {
             migrate_v2_financial_columns(&mut conn)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -4408,9 +4409,10 @@ fn tx_record_no_copy_disposition(
     d: &NoCopyDisposition,
 ) -> Result<(), PaperStateError> {
     tx.execute(
-        "INSERT OR IGNORE INTO no_copy_dispositions
+        "INSERT INTO no_copy_dispositions
              (source_trade_id, provenance, age_secs, reason, recorded_at_unix)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(source_trade_id) DO NOTHING",
         params![
             source_trade_id.0,
             d.provenance,
@@ -5220,6 +5222,53 @@ fn read_financial_fills_window(
         });
     }
     Ok(result)
+}
+
+/// Repair only the installed two-transport provenance constraint (#588). Current tables, including
+/// tables with unrelated CHECK constraints, keep their original DDL and rows.
+fn migrate_legacy_no_copy_provenance(
+    conn: &mut Connection,
+    fail_before_commit: bool,
+) -> Result<(), PaperStateError> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'no_copy_dispositions'",
+        [],
+        |row| row.get(0),
+    )?;
+    // Installed DDL can vary in whitespace and identifier/value quoting. Match the specific
+    // provenance column and its obsolete value set, never the presence of CHECK alone.
+    let normalized: String = sql
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !matches!(c, '\'' | '"' | '`' | '[' | ']'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if !normalized.contains(",provenancetextnotnullcheck(provenancein(rest_poll,activity_ws))") {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE no_copy_dispositions RENAME TO no_copy_dispositions_legacy_provenance;
+         CREATE TABLE no_copy_dispositions (
+             source_trade_id TEXT PRIMARY KEY NOT NULL,
+             provenance TEXT NOT NULL,
+             age_secs INTEGER NOT NULL,
+             reason TEXT NOT NULL,
+             recorded_at_unix INTEGER NOT NULL
+         );
+         INSERT INTO no_copy_dispositions
+             (source_trade_id, provenance, age_secs, reason, recorded_at_unix)
+         SELECT source_trade_id, provenance, age_secs, reason, recorded_at_unix
+         FROM no_copy_dispositions_legacy_provenance;
+         DROP TABLE no_copy_dispositions_legacy_provenance;",
+    )?;
+    if fail_before_commit {
+        return Err(PaperStateError::Internal(
+            "injected no-copy provenance repair failure before commit".to_owned(),
+        ));
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// One-time, lossless v2 whole-contract financial migration (#545). The legacy columns are read
@@ -6276,6 +6325,173 @@ mod tests {
         assert_eq!(groups[0].proof_json, proof_a);
         assert_eq!(groups[1].proof_json, proof_b);
         assert!(db.activity_groups_after(&wallet, 101).unwrap().is_empty());
+    }
+
+    #[test]
+    fn activity_queries_use_wallet_epoch_index_without_result_changes() {
+        let (dir, db) = db();
+        for (wallet, epoch, suffix) in [
+            (wallet(), 101, 'b'),
+            (other_wallet(), 102, 'd'),
+            (wallet(), 100, 'c'),
+            (wallet(), 101, 'a'),
+            (other_wallet(), 99, 'e'),
+        ] {
+            record_activity_group(
+                &db,
+                wallet,
+                epoch,
+                suffix,
+                &format!("{{\"id\":\"{suffix}\"}}"),
+            );
+        }
+        {
+            let conn = db.lock();
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA index_info('idx_activity_groups_wallet_epoch_trade')")
+                .unwrap()
+                .query_map([], |row| row.get(2))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(columns, ["wallet_hex", "source_epoch", "source_trade_id"]);
+            for (query, parameters, covering) in [
+                (
+                    "EXPLAIN QUERY PLAN \
+                     SELECT MAX(source_epoch) FROM activity_groups WHERE wallet_hex = ?1",
+                    vec![rusqlite::types::Value::Text(wallet().to_string())],
+                    true,
+                ),
+                (
+                    "EXPLAIN QUERY PLAN \
+                     SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json \
+                     FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 \
+                     ORDER BY source_epoch, source_trade_id",
+                    vec![wallet().to_string().into(), 100_i64.into()],
+                    false,
+                ),
+            ] {
+                let plan: Vec<String> = conn
+                    .prepare(query)
+                    .unwrap()
+                    .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().any(|detail| {
+                        detail.contains("idx_activity_groups_wallet_epoch_trade")
+                            && (!covering || detail.contains("COVERING INDEX"))
+                    }),
+                    "activity query must use the wallet/epoch index: {plan:?}"
+                );
+                assert!(
+                    plan.iter()
+                        .all(|detail| !detail.contains("USE TEMP B-TREE")),
+                    "activity order must not require a temporary b-tree: {plan:?}"
+                );
+            }
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+
+        let scratch_path = dir.path().join("without_activity_index.db");
+        std::fs::copy(dir.path().join("paper_state.db"), &scratch_path).unwrap();
+        Connection::open(&scratch_path)
+            .unwrap()
+            .execute_batch("DROP INDEX idx_activity_groups_wallet_epoch_trade")
+            .unwrap();
+        let reference = PaperStateDb::open_read_only(&scratch_path).unwrap();
+        for (wallet, expected_max) in [
+            (wallet(), Some(101)),
+            (other_wallet(), Some(102)),
+            (
+                WalletAddress::from_hex("0xcccccccccccccccccccccccccccccccccccccccc").unwrap(),
+                None,
+            ),
+        ] {
+            assert_eq!(db.last_activity_group_epoch(&wallet).unwrap(), expected_max);
+            assert_eq!(
+                db.last_activity_group_epoch(&wallet).unwrap(),
+                reference.last_activity_group_epoch(&wallet).unwrap()
+            );
+            for cutoff in [98, 99, 100, 101, 102] {
+                assert_eq!(
+                    db.activity_groups_after(&wallet, cutoff).unwrap(),
+                    reference.activity_groups_after(&wallet, cutoff).unwrap(),
+                    "wallet {wallet}, cutoff {cutoff}"
+                );
+            }
+        }
+        let groups = db.activity_groups_after(&wallet(), 100).unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| &group.source_trade_id)
+                .collect::<Vec<_>>(),
+            [&group_id('a'), &group_id('b')]
+        );
+    }
+
+    #[test]
+    fn no_copy_duplicate_is_ignored_but_other_constraints_surface() {
+        let (_dir, db) = db();
+        let original = NoCopyDisposition {
+            provenance: "rest_poll".to_owned(),
+            age_secs: 3,
+            reason: "original".to_owned(),
+            recorded_at_unix: 103,
+        };
+        {
+            let mut conn = db.lock();
+            replace_no_copy_shape(
+                &conn,
+                "provenance TEXT NOT NULL CHECK(provenance = 'rest_poll')",
+            );
+            let tx = conn.transaction().unwrap();
+            tx_record_no_copy_disposition(&tx, &group_id('a'), &original).unwrap();
+            tx_record_no_copy_disposition(
+                &tx,
+                &group_id('a'),
+                &NoCopyDisposition {
+                    age_secs: 4,
+                    reason: "duplicate".to_owned(),
+                    recorded_at_unix: 104,
+                    ..original.clone()
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let before = stored_rows(&db.lock(), "SELECT * FROM no_copy_dispositions");
+        assert_eq!(
+            before,
+            vec![vec![
+                group_id('a').0.into(),
+                original.provenance.clone().into(),
+                original.age_secs.into(),
+                original.reason.clone().into(),
+                original.recorded_at_unix.into(),
+            ]]
+        );
+
+        let mut bucket = activity_bucket(wallet(), 100, &['b', 'c']);
+        bucket.dispositions[0].no_copy = Some(original);
+        // The second group reaches the shared fallback writer with reconciled_rest.
+        bucket.dispositions[1].disposition = "not_copy_eligible".to_owned();
+        assert!(matches!(
+            db.commit_activity_bucket(&bucket),
+            Err(PaperStateError::Sqlite(_))
+        ));
+        for source_trade_id in [group_id('b'), group_id('c')] {
+            assert!(db.activity_group_state(&source_trade_id).unwrap().is_none());
+            assert!(!db.is_seen(&source_trade_id).unwrap());
+        }
+        assert!(stored_rows(&db.lock(), "SELECT * FROM activity_group_revisions").is_empty());
+        assert_eq!(
+            stored_rows(&db.lock(), "SELECT * FROM no_copy_dispositions"),
+            before
+        );
     }
 
     #[test]
@@ -7982,6 +8198,312 @@ mod tests {
             )
             .unwrap();
         path
+    }
+
+    const LEGACY_NO_COPY_PROVENANCE: &str =
+        "provenance       TEXT    NOT NULL CHECK(provenance IN ('rest_poll', 'activity_ws'))";
+
+    fn replace_no_copy_shape(conn: &Connection, provenance_column: &str) {
+        conn.execute_batch(&format!(
+            "DROP TABLE no_copy_dispositions;
+             CREATE TABLE no_copy_dispositions (
+                 source_trade_id TEXT PRIMARY KEY NOT NULL,
+                 {provenance_column},
+                 age_secs INTEGER NOT NULL,
+                 reason TEXT NOT NULL,
+                 recorded_at_unix INTEGER NOT NULL
+             );"
+        ))
+        .unwrap();
+    }
+
+    fn stored_rows(conn: &Connection, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn.prepare(query).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn no_copy_repair_fixture(
+        dir: &Path,
+        version: i64,
+        provenance_column: &str,
+    ) -> std::path::PathBuf {
+        let path = if version == LEGACY_EXACT_MIGRATION_VERSION {
+            installed_schema_two_fixture(dir)
+        } else {
+            let path = dir.join("paper_state.db");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch(
+                "INSERT INTO fills
+                     (idempotency_key, market_id, outcome_id, side, quantity_str, fill_price_str,
+                      principal_str, fee_str, event_seq, prepared_seq)
+                 VALUES ('legacy','m',0,'buy','3','0.25','0.75','0',7,7);
+                 INSERT INTO positions VALUES ('m',0,'3','0');
+                 INSERT INTO settled_markets
+                     (market_id, outcome_prices, credit_applied, settled_at_unix)
+                 VALUES ('settled','[\"1\",\"0\"]','2.5',1700000000);
+                 INSERT INTO meta (key, value) VALUES ('probe', '{\"record\":true}');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            path
+        };
+        let conn = Connection::open(&path).unwrap();
+        replace_no_copy_shape(&conn, provenance_column);
+        for (rowid, suffix, provenance, age, recorded_at) in [
+            (42, 'a', "rest_poll", 0, 1_700_000_000),
+            (99, 'b', "activity_ws", i64::MAX, -1),
+        ] {
+            conn.execute(
+                "INSERT INTO no_copy_dispositions
+                     (rowid, source_trade_id, provenance, age_secs, reason, recorded_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    rowid,
+                    group_id(suffix).0,
+                    provenance,
+                    age,
+                    "  audit\0é\n",
+                    recorded_at
+                ],
+            )
+            .unwrap();
+        }
+        for query in [
+            "INSERT INTO leader_positions VALUES (?1,'m',0,'3.000001','0')",
+            "INSERT INTO wallet_market_history_v2 VALUES (?1,'m',100,'history-id','activity_v2')",
+            "INSERT INTO wallet_history_status_v2 VALUES (?1,1,'{\"history\": true}',101)",
+            "INSERT INTO entry_gate_results VALUES ('history-id',?1,'m',100,'admitted',1)",
+            "INSERT INTO wallet_fences VALUES (?1,'fenced-id','invalid_mapping','{\"fence\": true}',102)",
+            "INSERT INTO decision_pending VALUES
+                 ('pending-id','revision',?1,103,'{\"frozen\": true}','[]','open',NULL,104)",
+            "INSERT INTO poll_cursors VALUES (?1,105,106,99,7,1)",
+            "INSERT INTO position_anchors VALUES (?1,0,107,99,'[]','ledger','{\"anchor\": true}')",
+            "INSERT INTO position_validations VALUES
+                 (?1,'ledger','positions','{}','generation','{\"validation\": true}',107)",
+        ] {
+            conn.execute(query, params![wallet().to_string()]).unwrap();
+        }
+        conn.execute_batch("INSERT INTO bankroll VALUES (0,'123.450000')")
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn legacy_no_copy_shape_is_repaired_without_changing_rows() {
+        for (version, provenance_column, repair) in [
+            (0, "provenance TEXT NOT NULL", false),
+            (2, LEGACY_NO_COPY_PROVENANCE, true),
+            (3, LEGACY_NO_COPY_PROVENANCE, true),
+            (3, "provenance TEXT NOT NULL", false),
+            (
+                3,
+                "[Provenance] text not null cHeCk ( `provenance` IN ( 'rest_poll' , \"activity_ws\" ) )",
+                true,
+            ),
+            (
+                3,
+                "provenance TEXT NOT NULL CHECK(length(provenance) > 0)",
+                false,
+            ),
+            (
+                3,
+                "provenance TEXT NOT NULL CHECK(provenance IN ('rest_poll','activity_ws','reconciled_rest'))",
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = no_copy_repair_fixture(dir.path(), version, provenance_column);
+            let conn = Connection::open(&path).unwrap();
+            let no_copy_query = "SELECT * FROM no_copy_dispositions ORDER BY source_trade_id";
+            let identity_query =
+                "SELECT rowid, * FROM no_copy_dispositions ORDER BY source_trade_id";
+            let schema_query = "SELECT sql FROM sqlite_master WHERE name = 'no_copy_dispositions'";
+            let no_copy = stored_rows(&conn, no_copy_query);
+            let identity = stored_rows(&conn, identity_query);
+            let ddl = stored_rows(&conn, schema_query);
+            let unchanged_queries = [
+                "SELECT * FROM leader_positions",
+                "SELECT * FROM wallet_market_history_v2",
+                "SELECT * FROM wallet_history_status_v2",
+                "SELECT * FROM entry_gate_results",
+                "SELECT * FROM wallet_fences",
+                "SELECT * FROM decision_pending",
+                "SELECT * FROM poll_cursors",
+                "SELECT * FROM position_anchors",
+                "SELECT * FROM position_validations",
+                "SELECT * FROM bankroll",
+                "SELECT * FROM meta",
+                "SELECT market_id, outcome_prices, credit_applied, settled_at_unix FROM settled_markets",
+                "SELECT idempotency_key, market_id, outcome_id, side, fill_price_str, event_seq FROM fills",
+                "SELECT market_id, outcome_id FROM positions",
+            ];
+            let unrelated = unchanged_queries.map(|query| stored_rows(&conn, query));
+            drop(conn);
+
+            let mut repaired_identity = None;
+            for reopen in 0..3 {
+                let db = PaperStateDb::open(&path).unwrap();
+                let conn = db.lock();
+                let version: i64 = conn
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(version, SCHEMA_VERSION);
+                let current_ddl = stored_rows(&conn, schema_query);
+                if repair {
+                    let fresh = Connection::open_in_memory().unwrap();
+                    fresh.execute_batch(SCHEMA).unwrap();
+                    assert_eq!(
+                        stored_rows(&conn, "PRAGMA table_info('no_copy_dispositions')"),
+                        stored_rows(&fresh, "PRAGMA table_info('no_copy_dispositions')")
+                    );
+                    let sql: String = conn.query_row(schema_query, [], |row| row.get(0)).unwrap();
+                    assert!(!sql.to_ascii_lowercase().contains("check"));
+                } else {
+                    assert_eq!(current_ddl, ddl);
+                }
+                let current_identity = stored_rows(&conn, identity_query);
+                if reopen == 0 {
+                    assert_eq!(stored_rows(&conn, no_copy_query), no_copy);
+                    if !repair {
+                        assert_eq!(
+                            current_identity, identity,
+                            "current table must not be rebuilt"
+                        );
+                    }
+                    tx_record_no_copy_disposition(
+                        &conn,
+                        &group_id('c'),
+                        &NoCopyDisposition {
+                            provenance: "reconciled_rest".to_owned(),
+                            age_secs: 0,
+                            reason: "not_copy_eligible".to_owned(),
+                            recorded_at_unix: 108,
+                        },
+                    )
+                    .unwrap();
+                    repaired_identity = Some((current_ddl, stored_rows(&conn, identity_query)));
+                } else {
+                    assert_eq!(Some((current_ddl, current_identity)), repaired_identity);
+                }
+                for (query, expected) in unchanged_queries.iter().zip(&unrelated) {
+                    assert_eq!(
+                        &stored_rows(&conn, query),
+                        expected,
+                        "{query}, reopen {reopen}"
+                    );
+                }
+                assert_eq!(
+                    stored_rows(
+                        &conn,
+                        "SELECT quantity_str, principal_str, fee_str, prepared_seq FROM fills"
+                    ),
+                    vec![vec![
+                        "3".to_owned().into(),
+                        "0.75".to_owned().into(),
+                        "0".to_owned().into(),
+                        7_i64.into()
+                    ]]
+                );
+                assert_eq!(
+                    stored_rows(&conn, "SELECT long_str, short_str FROM positions"),
+                    vec![vec!["3".to_owned().into(), "0".to_owned().into()]]
+                );
+                assert!(
+                    stored_rows(
+                        &conn,
+                        "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+                    )
+                    .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_no_copy_repair_failure_rolls_back_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = no_copy_repair_fixture(dir.path(), SCHEMA_VERSION, LEGACY_NO_COPY_PROVENANCE);
+        let mut conn = Connection::open(&path).unwrap();
+        let rows_query = "SELECT rowid, * FROM no_copy_dispositions ORDER BY source_trade_id";
+        let ddl_query = "SELECT sql FROM sqlite_master WHERE name = 'no_copy_dispositions'";
+        let rows = stored_rows(&conn, rows_query);
+        let ddl = stored_rows(&conn, ddl_query);
+        assert!(matches!(
+            migrate_legacy_no_copy_provenance(&mut conn, true),
+            Err(PaperStateError::Internal(message))
+                if message == "injected no-copy provenance repair failure before commit"
+        ));
+        drop(conn);
+
+        let original = PaperStateDb::open_read_only(&path).unwrap();
+        assert_eq!(stored_rows(&original.lock(), rows_query), rows);
+        assert_eq!(stored_rows(&original.lock(), ddl_query), ddl);
+        assert!(
+            stored_rows(
+                &original.lock(),
+                "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+            )
+            .is_empty()
+        );
+        drop(original);
+        let repaired = PaperStateDb::open(&path).unwrap();
+        assert_ne!(stored_rows(&repaired.lock(), ddl_query), ddl);
+        assert_eq!(
+            stored_rows(
+                &repaired.lock(),
+                "SELECT * FROM no_copy_dispositions ORDER BY source_trade_id"
+            ),
+            rows.into_iter()
+                .map(|row| row.into_iter().skip(1).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            stored_rows(
+                &repaired.lock(),
+                "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_only_openers_leave_legacy_no_copy_shape_unchanged() {
+        for version in [LEGACY_EXACT_MIGRATION_VERSION, SCHEMA_VERSION] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = no_copy_repair_fixture(dir.path(), version, LEGACY_NO_COPY_PROVENANCE);
+            let before = std::fs::read(&path).unwrap();
+            let conn =
+                Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let ddl_query = "SELECT sql FROM sqlite_master WHERE name = 'no_copy_dispositions'";
+            let rows_query = "SELECT rowid, * FROM no_copy_dispositions ORDER BY source_trade_id";
+            let ddl = stored_rows(&conn, ddl_query);
+            let rows = stored_rows(&conn, rows_query);
+            drop(conn);
+            let state = PaperStateDb::open_read_only_allowing_unmigrated(&path).unwrap();
+            assert_eq!(stored_rows(&state.lock(), ddl_query), ddl);
+            assert_eq!(stored_rows(&state.lock(), rows_query), rows);
+            drop(state);
+            let strict = PaperStateDb::open_read_only(&path);
+            if version == SCHEMA_VERSION {
+                let strict = strict.unwrap();
+                assert_eq!(stored_rows(&strict.lock(), ddl_query), ddl);
+                assert_eq!(stored_rows(&strict.lock(), rows_query), rows);
+            } else {
+                assert!(matches!(
+                    strict,
+                    Err(PaperStateError::SchemaVersionMismatch { found: 2, .. })
+                ));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
     }
 
     /// PASS: an installed pre-#545 main (the verbatim checked-in schema at `user_version = 2`) is
