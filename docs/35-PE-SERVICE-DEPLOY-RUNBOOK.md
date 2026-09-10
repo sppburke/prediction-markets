@@ -359,19 +359,29 @@ C-ordered count and SHA-256 receipt after proving unique account IDs and request
 of `off` on every row. The child still receives no service-role credential. Consequently, its fresh
 status must contain the authorization-denied `live` shape: `stale: true` and an empty `accounts`
 list. Any other child shape fails the rehearsal because it is evidence that a privileged credential
-reached the child; the child snapshot is not compared with the privileged census. After the child
-has quiesced and written final status, the descriptor-fed privileged observer takes a second
+reached the child; the child snapshot is not compared with the privileged census. On the
+PASS-candidate path the harness applies the canonical
+[`rehearsal_quiescence`](./_GLOSSARY.md#configuration-defaults--concrete-values) rule: it verifies
+the production unit's stop policy, sends the child SIGINT, requires a clean exit within that unit's
+stop timeout, and refuses a forced or failed shutdown. It then requires the child's post-shutdown
+status with the final-only critical `status_writer` `stopping` marker, every other critical owner
+stopped without failure, and `ws_sink_poisoned=false`. A missing, stale, or malformed final status
+refuses PASS. The descriptor-fed privileged observer then takes a second
 canonical account census. PASS requires both censuses to be safe and identical in count and digest.
 The run stops at the first complete same-invocation proof, the first unsafe observation, process
 exit, or its bound. PASS requires the reviewed revision, a complete ordinary poll after start,
 successful re-anchor, real readiness, healthy critical owners, identical safe
 before/after privileged account censuses, the expected authorization-denied child snapshot, and no
-credit loss, unexpected fence/error, or successful database write. For this rehearsal, an
+credit loss, unexpected fence/error, or successful database write. A nonzero
+`reconciliation_obligations_dropped_total` in any fresh observed status aborts the run; before PASS,
+the handled-shutdown final status is the authoritative last observation and must also report zero.
+Websocket socket recycles (`dropping socket`) are recorded as `drops` and do not fail the run. For
+this rehearsal, an
 unexpected fence is a `wallet_fences` row whose cause is outside the explicit incident-reviewed
 allowlist in `rehearsal545.sh`; membership in `WalletFenceCause` alone does not make a newly
-observed fence expected. Immediately before PASS, the
-harness quiesces the child, synchronously rescans one exact complete service-log prefix, queries the
-current anchor/reanchor/fence database observation, and takes the final privileged account census.
+observed fence expected. Immediately before PASS, the harness synchronously rescans one exact
+complete service-log prefix, validates the final status, queries the current anchor/reanchor/fence
+database observation, and takes the final privileged account census.
 The result binds that prefix's byte length and SHA-256 plus the database and census values; unsafe
 evidence arriving while readiness is in flight therefore fails the same invocation. The harness
 prints `REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
@@ -386,10 +396,21 @@ SHA-256, and safety result plus `account_census_before_after_identical`; the out
 also records `legacy_continuations=N:<digest>`. It counts terminal pre-#545 version-2 continuations
 in the checkpointed copy and hashes their sorted source-trade IDs. The copy is production's state at
 checkpoint time. The financial driver requires this row and carries it into its bound rehearsal
-object. It compares the production identity to `--target-environment`, binds both before entering
-`prepared`, and revalidates them from disk before entering `guarded`. The copy manifest, result
-manifest, and outer JSON use the shared durable atomic-write primitive. It synchronizes the file,
-renames it, and then synchronizes the parent directory.
+object. `harness_bundle_sha256` binds the ordered harness closure (`rehearsal545.sh`,
+`generation_common.sh`, and `rehearsal_preflight.sh`); the driver accepts evidence only from its own
+tree's identical closure. `final_status_sha256` is the SHA-256 of the copied rehearsal generation's
+preserved `$copy_dir/status.json` whenever that file exists and is `absent` only when it does not. On
+an outcome without a validated final observation it identifies only the latest preserved status;
+validity is a separate PASS predicate. Preserve that status file under the fresh rehearsal root with
+the evidence. `unit_kill_signal`, `unit_timeout_stop_secs`, `shutdown_signal_unix`, and
+`shutdown_elapsed_secs` record the observed stop policy, the auditor's final-status freshness
+threshold, and measured shutdown duration. Attempt review must confirm that the harness-bundle digest
+equals the merged tree's bundle, the final-status digest equals the preserved file whose payload has
+`ws_sink_poisoned=false`, shutdown elapsed is within the unit timeout, and `credit_loss=0`. The driver
+compares the production identity to `--target-environment`, binds both before entering `prepared`,
+and revalidates them from disk before entering `guarded`. The copy manifest, result manifest, and
+outer JSON use the shared durable atomic-write primitive. It synchronizes the file, renames it, and
+then synchronizes the parent directory.
 
 The mandatory production rehearsal is the PostgREST-level authorization proof: it runs the real
 service through the target project's PostgREST endpoint with the publishable key in both credential

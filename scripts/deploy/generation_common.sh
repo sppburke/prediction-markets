@@ -63,6 +63,65 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+# Issue #586: bind rehearsal evidence to the complete three-script harness closure. The outer
+# digest is SHA-256 over the newline-joined per-file SHA-256 hex digests in this fixed order.
+harness_bundle_digest() {
+  [[ $# -eq 1 ]] || die "harness_bundle_digest requires the deploy directory"
+  local deploy_dir=$1 rehearsal common preflight
+  rehearsal=$(sha256_file "$deploy_dir/rehearsal545.sh") || return
+  common=$(sha256_file "$deploy_dir/generation_common.sh") || return
+  preflight=$(sha256_file "$deploy_dir/rehearsal_preflight.sh") || return
+  python3 -c 'import hashlib,sys
+print(hashlib.sha256("\n".join(sys.argv[1:]).encode("ascii")).hexdigest())' \
+    "$rehearsal" "$common" "$preflight"
+}
+
+# Issue #586: both the rehearsal and financial-era driver interpret the live systemd stop policy
+# through this owner. Print `<KillSignal|absent> <TimeoutStopSec|absent>` even on malformed input;
+# success means both values parsed, while callers enforce SIGINT, positivity, and persisted equality.
+service_unit_stop_policy() {
+  [[ $# -eq 1 ]] || die "service_unit_stop_policy requires the unit name"
+  local output
+  if ! output=$(systemctl show "$1" -p KillSignal -p TimeoutStopUSec); then
+    printf '%s\n' 'absent absent'
+    return 1
+  fi
+  python3 -c 'import decimal,re,sys
+
+rows={}
+valid=True
+for raw in sys.stdin.read().splitlines():
+    key,separator,value=raw.partition("=")
+    if not separator or key not in {"KillSignal","TimeoutStopUSec"} or key in rows:
+        valid=False
+        continue
+    rows[key]=value
+
+kill=rows.get("KillSignal", "")
+kill_value=kill if re.fullmatch(r"[0-9]+",kill) else "absent"
+if kill_value == "absent": valid=False
+
+units={"us":decimal.Decimal("0.000001"),"ms":decimal.Decimal("0.001"),
+       "s":decimal.Decimal(1),"min":decimal.Decimal(60),
+       "h":decimal.Decimal(3600),"d":decimal.Decimal(86400)}
+duration=rows.get("TimeoutStopUSec", "")
+parts=re.findall(r"([0-9]+(?:[.][0-9]+)?)(us|ms|s|min|h|d)",duration)
+if duration == "0":
+    timeout_value="0"
+elif not parts or " ".join(number+unit for number,unit in parts) != duration:
+    timeout_value="absent"
+    valid=False
+else:
+    seconds=sum((decimal.Decimal(number)*units[unit] for number,unit in parts),decimal.Decimal(0))
+    if seconds != seconds.to_integral_value():
+        timeout_value="absent"
+        valid=False
+    else:
+        timeout_value=str(int(seconds))
+print(kill_value,timeout_value)
+raise SystemExit(0 if valid else 1)' <<< "$output"
+}
+
 # Tier-1 allowlist: the environment names accepted by `crates/service/src/config.rs::load`, plus the
 # two Rust diagnostics. Every service-binary child selects target-file assignments through this one
 # shared owner; callers may then apply fixed, workflow-specific overrides.
