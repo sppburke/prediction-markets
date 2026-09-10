@@ -24,7 +24,7 @@ recaptured page (retained privately, about 19 MB).
 | `derive_summaries.py` | produces the three files above from the private raw captures and the committed bundle files |
 | `forge_ro.py` … `forge_ro7.py` | the read-only host queries (schemas and counts; archive classes; sliding windows; random sample; flagged trade rows; exact CSV intersection; recent-output overlap) |
 | `recapture.py` / `recapture-summary.json` | 13 monthly-anchored 500-trade pages for each of the four never-fetched wallets: identity check, `end` bound check, span, sides, rule outcome, SHA-256 |
-| `tombstone-review.csv` | the September 10 per-wallet review input (historical; its verdict column is superseded by `docs/37` §2) |
+| `tombstone-review.csv` | the September 10 per-wallet review input (historical; its verdict column is superseded by `docs/37` §2); line endings normalized from CRLF to LF for the repository whitespace gate, original CRLF file SHA-256 `4d7f8286619e69415802bf6b06648144110c715203cb66fd7a28d696664cf0bf` |
 | `archive-density.json`, `tombstone-audit-summary.json` | retained bundle summaries: archive oldest/newest-500 spans; Dune first-BUY screen metrics per wallet |
 | `manifest.json` | the retained bundle's file hashes, including every original raw page |
 | `03_tombstoned_history_audit.sql` | the retained Dune first-BUY audit SQL (execution `01M26ASVHBDNGRJ9M7FCY42GA6`) |
@@ -36,9 +36,9 @@ SHA-256 of every committed file:
 | `03_tombstoned_history_audit.sql` | `81909aedca923af979b120287f0e5034b6182249379e4b63c1200017c3b2e4c1` |
 | `aggregates.json` | `90bfb5473f4b048a16d1cebb4092a700b7cdf542c5b702d3255457a40c4b8489` |
 | `archive-density.json` | `c12d25b89ea88105e32d1bd4bb108f88594ea755616aa889d65004dfabaa2ddf` |
-| `cohort_summary.csv` | `2e3ff0cb88c602edc3ea5c7dbd98901b757c1a83c987b439f472b32758ba73fe` |
+| `cohort_summary.csv` | `01a39d0997124a67d643fec187c59b692b3e3931b43defb23c7787526b7bbb99` |
 | `controls.json` | `8193675dd92eb1aa39b6b47d7e466a616f4be39d5730f12dc244fc200fe7ca99` |
-| `derive_summaries.py` | `55b6e68f61f7e7a76689eb685259011af43c3b34d93bd18864a4c15f58aa626e` |
+| `derive_summaries.py` | `9d55c57a65601c3cefa041feecbd79adabc784135d7efb861282bf0ebf5446d6` |
 | `forge_ro.py` | `98d78653b8f7333325329176f6d2f132e1f8cdb7f936a67e7f86b39c9c7c448e` |
 | `forge_ro2.py` | `d8df12aa5d4a8e2c93a9e545a4e460e9e0579e097b925ea594e635b48de26183` |
 | `forge_ro3.py` | `3b9e000c0f55f0182649cdd8db11478273faa225a8b74459c497cf06411e295a` |
@@ -50,4 +50,4 @@ SHA-256 of every committed file:
 | `recapture-summary.json` | `403267795c09c15c377f83f486fe00bcaac9529be903247f7c3cca5ebc2dec0f` |
 | `recapture.py` | `56ea4df95a6a30519c990c1e29bb693bd7133fe182655c6c04b14235e2c50d6a` |
 | `tombstone-audit-summary.json` | `935db6976f2d2c65c8d45fbc79bf74b1a2901d66ddc83c2eb50714e4c3b9c928` |
-| `tombstone-review.csv` | `4d7f8286619e69415802bf6b06648144110c715203cb66fd7a28d696664cf0bf` |
+| `tombstone-review.csv` | `e06e0c7b507c1217ad02604818f8e122047016f3b43e30bb9695ebe6976c9aa2` |

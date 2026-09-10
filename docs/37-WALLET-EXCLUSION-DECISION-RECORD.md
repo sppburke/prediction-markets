@@ -31,17 +31,17 @@ referred to below as `evidence/`; raw captures are retained privately (§8).
 | Verified system addresses | **Retain permanently** (the four exchange contracts; all four are `infra` tombstones). |
 | Proven-loser rule | **Retain**; requalification stays evidence-dependent (leaderboard rediscovery lifts the tombstone; a rerank decides). No cooldown number is introduced. |
 | Reversal path | `clear-infra-exclusion` now removes the infra tombstone **and** a live `wallets.is_infra` flag in one transaction. It still does not recreate or activate a wallet. |
-| Rank/export filtering promise | The documented promise was **not implemented** on any path; the canonical docs now describe the acquisition-gating mechanism. The cross-path filter is deferred to #592. Measured on the ranker host: the last two completed cycles' pass-1 and pass-2 ranking outputs contain zero flagged and zero tombstoned wallets, no pending publication request exists, and every flagged wallet holds zero trade rows (§5). |
+| Rank/export filtering promise | The documented promise was **not implemented** on any path; the canonical docs now describe the acquisition-gating mechanism. The cross-path filter is deferred to #592. Measured on the ranker host: the last two completed cycles' pass-1 and pass-2 ranking outputs contain zero flagged and zero tombstoned wallets, no pending publication request exists, and every flagged wallet checked holds zero trade rows (§5). |
 
 ## 2. Cohort verdicts
 
 Addresses are the identity; profile names are display hints from the retained review CSV.
 "Archived trades" are the rows the July 20, 2026 archive-before-delete kept for the wallet
-(`wallet_cache.purge-archive.db`); those rows come from the pre-import bootstrap era and end at
-the wallet's last fetch, at the latest 2026-05-19, so they are **not** a complete history to the
-purge or to today. "Min 500-trade window" is the smallest `t[i+499] − t[i]` over every consecutive
-500-trade window of the archived rows, with the count of windows under the canonical 3,600 s
-threshold in parentheses. Page hours are the retained September 10 spans of the official
+(`wallet_cache.purge-archive.db`); those rows are legacy history ending 2026-05-17 to 2026-05-19
+(the exact ingestion path and time of those rows is unverified), so they are **not** a complete
+history to the purge or to today. "Min 500-trade window" is the smallest `t[i+499] − t[i]` over every consecutive
+500-trade window of the archived rows, with the count of windows under `infra_probe_span_secs`
+in parentheses. Page hours are the retained September 10 spans of the official
 500-trade activity pages (bounded by the tombstone timestamp, and current). "Sampled N / t-proxy"
 and "both-outcome share" come from the retained Dune first-BUY screen
 (`evidence/tombstone-audit-summary.json`); they describe sampled qualifying conditions, not
@@ -76,8 +76,8 @@ production qualification. Full derived rows: `evidence/cohort_summary.csv`.
 
 Verdict rules applied:
 
-- **Retain with evidence.** The canonical density rule (`infra_probe_span_secs`: 500 trades in
-  under 3,600 s) fires on archived windows. godspeed11 has 30,127 such windows (minimum 696 s);
+- **Retain with evidence.** The canonical density rule (500 trades within
+  `infra_probe_span_secs`) fires on archived windows. godspeed11 has 30,127 such windows (minimum 696 s);
   `0x06dc…4524` has 1,565 (minimum 16 s). Both buy both outcomes on more than 89% of sampled
   conditions. The acquisition exclusion is retained as a workload/copyability exclusion under the
   canonical rule pending any future review; this record asserts no "infrastructure identity".
@@ -92,7 +92,8 @@ Verdict rules applied:
   `0xdb5a…3965`) have no repository history (archive `trades_archived = 0`,
   `last_polymarket_fetch_at IS NULL`). Fifteen sampled pages each (two retained plus 13 recaptured
   monthly anchors, `evidence/recapture-summary.json`; anchors before a wallet's first activity
-  return an empty list) never fire (minimum 1.233 h, nndk at the 2026-08-11 anchor). Sampled pages
+  return an empty list) never fire (minimum 1.138 h, nndk's tombstone-bounded page; recapture
+  minimum 1.233 h, nndk at the 2026-08-11 anchor). Sampled pages
   cannot clear a wallet: on this cohort they missed both retained wallets' dense intervals. Exact
   next check: bounded re-ingestion under the cold probe followed by the window test in
   `evidence/forge_ro3.py`. nndk's 260,473 CSV trades with first public activity in March 2026 and
@@ -123,8 +124,8 @@ recoverable trigger evidence and stays out.
   bit, so `source_bits` does not identify CSV membership; only the address intersection does.
 - All 24 cohort archive rows carry `is_infra = 1`, `is_active = 0`, `discovered_at_unix =
   1778877276` (2026-05-15, the import). They were never activated (activation requires
-  `is_infra = 0`) and therefore never backfilled by the pipeline; 20 had rows from the pre-import
-  bootstrap era, four had none.
+  `is_infra = 0`), so pipeline activation and backfill never fetched them; 20 nevertheless hold
+  archived rows dated up to 2026-05-19 (ingestion path unverified), four hold none.
 - Archive `purge_manifest` says `purged_at_unix = 1784530028` (2026-07-20) for all 24; the live
   tombstone says `1784747039` (2026-07-22) for 16 and 2026-07-20 for eight. Tracked code at
   `76db535` (the July revision) cannot produce that split from a same-archive rerun (`run_infra_purge`
@@ -132,9 +133,11 @@ recoverable trigger evidence and stays out.
   re-archive). **UNKNOWN:** the executing binary, arguments, and archive path of the July 20 and
   July 22 runs. This affects no verdict: both timestamps post-date the import and pre-date any
   rediscovery, and the archived rows carry the import-time state.
-- Live `wallets` rows with `is_infra = 1`: 53 at 21:11 UTC, 56 at 21:52 UTC (three new cold-probe
-  flags by the running loop during the review). Every flagged row holds zero trade rows and no
-  fetch stamp (`evidence/forge_ro5.py`). Zero tombstoned wallets have a `wallets` row.
+- Live `wallets` rows with `is_infra = 1`: 53 at 21:11 UTC (all 53 without a fetch stamp and with
+  `trade_count = 0` at 21:16), 54 at 21:31 UTC (all 54 checked: zero trade rows,
+  `evidence/forge_ro5.py`), 56 at 21:52 UTC (count only; the two newest were not rechecked). The
+  running loop wrote the new cold-probe flags during the review. Zero tombstoned wallets have a
+  `wallets` row.
 
 ## 4. Producer/consumer map of exclusion state (revision `ab120d9`)
 
@@ -179,7 +182,7 @@ export, and publication rely on those upstream facts, not on their own filter.
 | Cost of re-admitting the 24 | 419,864 archived trades = 0.25% of the active universe (279,478 wallets, 167,703,257 trades). | `evidence/aggregates.json` |
 | Cost of bulk-clearing the breadth class | The 8,115 CSV members with archived trades hold 101,986,315 rows (61% of the active universe's count); rejected. | `evidence/aggregates.json` |
 | Effect of an any-window retroactive rule on the live universe | Random 300 of the 44,460 active wallets with ≥500 trades (seed 589): any-window flags 9 (3.0%) holding 18.0% of the sampled trades; the oldest-500 rule flags 0; the newest-500 rule flags 0. | `evidence/aggregates.json` |
-| Do excluded wallets reach ranking outputs today? | Last two completed cycles (`cron-20260909T002836Z`, `cron-20260910T002554Z`): pass-1 outputs (105,325 and 107,364 rows) and pass-2 outputs (1,064 and 1,056 rows) contain 0 flagged and 0 tombstoned wallets; no pending publication request at 21:52 UTC. The cycles' activation batches contain 13, 7, and 3 wallets that were flagged by the probe after activation, as the mechanism predicts. | `evidence/aggregates.json` |
+| Do excluded wallets reach ranking outputs today? | Last two completed cycles (`cron-20260909T002836Z`, `cron-20260910T002554Z`): pass-1 outputs (105,325 and 107,364 rows) and pass-2 outputs (1,064 and 1,056 rows) contain 0 flagged and 0 tombstoned wallets; no pending publication request at 21:52 UTC. The activation batches of those two cycles and of the in-progress `cron-20260910T210538Z` cycle contain 13, 7, and 3 wallets that were flagged by the probe after activation, as the mechanism predicts. | `evidence/aggregates.json` |
 
 Unmeasured: the follower-return effect of any rule change (no ranker run; inputs not
 established), the fetch-workload saved by a probe flag (the discarded page is not recorded), and
@@ -191,10 +194,10 @@ any excluded-wallet overlap in artifacts older than the two cycles checked.
 |---|---|---|---|---|---|---|---|---|
 | Verified system addresses | None today (the four came from the CSV `known:*` rows; importer removed #335) | Contract identity (exchange/neg-risk adapters) | Permanent | None (`infra` tombstones are never lifted by discovery) | n/a | Operator command; not expected | Tombstone row; this record | **Retain.** |
 | Explicit operator exclusions | None today; the shape is an `infra` tombstone or `is_infra` flag written under the cache lock | Written evidence recorded with the action | Until reviewed | None | n/a | `clear-infra-exclusion` | Tombstone/flag row plus the operator's audit file (precedent: `data/eval-results/manual-*` batches) | **Retain the capability; add a repository command only when a second case arises.** |
-| Historical losers (`proven_loser`) | Rule A of `pe-bootstrap purge` (report-only unless armed; not in the wrapper) | `tstat_net <= bootstrap_purge_loser_tstat_max AND mean_net < 0 AND n_eff >= bootstrap_purge_loser_neff_min` on a ranking CSV | Until leaderboard rediscovery; a current rerank then decides | `tombstone_override_sources` (leaderboard) | Activation batch cap | Automatic lift by leaderboard; otherwise a rerank | Tombstone row `INSERT OR REPLACE`; ranking CSV named in the purge report | **Retain.** No cooldown number is introduced; the two counterexamples show recent positive screens on different price evidence, which is not a rerank. |
+| Historical losers (`proven_loser`) | Rule A of `pe-bootstrap purge` (report-only unless armed; not in the wrapper) | Ranking-CSV row with `eligible = true AND tstat_net <= bootstrap_purge_loser_tstat_max AND mean_net < 0 AND n_eff >= bootstrap_purge_loser_neff_min`, intersected with active non-infra wallets (`purge.rs:116,427`) | Until leaderboard rediscovery; a current rerank then decides | `tombstone_override_sources` (leaderboard) | Activation batch cap | Automatic lift by leaderboard; otherwise a rerank | Tombstone row `INSERT OR REPLACE`; ranking CSV named in the purge report | **Retain.** No cooldown number is introduced; the two counterexamples show recent positive screens on different price evidence, which is not a rerank. |
 | Breadth label (`breadth>=2000`) | None (retired #335) | A market-count heuristic; not a density or identity criterion | Legacy labels are reviewable per wallet on evidence | None | Per-wallet review only | `clear-infra-exclusion` per wallet after a recorded verdict | This record; the CSV and archive are the provenance | **Retire the producer (already done); revise legacy handling to per-wallet review; no bulk clearing.** |
-| Density probe (cold, newest page) | Wrapper backfill | `infra_probe_span_secs` on a full 500-row page | Until an operator clears it; the next fetch re-probes | None | The page is discarded; the wallet leaves the backfill queue | `clear-infra-exclusion` (clears the flag; an active wallet becomes due at once) | Flag only; `span_secs` in the backfill log | **Retain** as a workload guard. A flag is not an identity verdict. |
-| Retroactive sweep (oldest 500) | Operator `classify-infra` | Same threshold on cached trades | Operator-run | None | Full `trades` scan | `clear-infra-exclusion` | Flag only | **Retain as-is.** An any-window variant would remove about 3% of active wallets holding about 18% of trades with no fetch-workload benefit (already ingested). |
+| Density probe (cold, newest page) | Wrapper backfill | `infra_probe_span_secs` on a full 500-row page | Until an operator clears it; the next fetch re-probes | None | The page is discarded; the wallet leaves the backfill queue | `clear-infra-exclusion` (clears the flag; an active wallet with no fetch stamp becomes due at once and is probed again; a wallet flagged after ingestion resumes incremental backfill when stale, without a new probe) | Flag only; `span_secs` in the backfill log | **Retain** as a workload guard. A flag is not an identity verdict. |
+| Retroactive sweep (oldest 500) | Operator `classify-infra` | Same threshold on cached trades | Operator-run | None | Full `trades` scan | `clear-infra-exclusion` | Flag only | **Retain as-is.** In the sample, an any-window variant would flag about 3% of active wallets with ≥500 trades, holding about 18% of their trades; their ingestion cost is already incurred and the future refresh work such flags would save was not measured. |
 | Unknown evidence (`0x88ec…`, the 4 non-dense non-CSV tombstones, and the 56 live probe flags with zero trades) | Cold probe (flag-only shape) | None recoverable beyond the log line | Unresolved until a bounded re-ingestion review | None | Per-wallet | `clear-infra-exclusion` after review | Flag/tombstone row only | **Unresolved; retain.** No schema change: the log line plus this review method suffice until an operator needs durable per-flag evidence. |
 
 Leaderboard-only override versus evidence-based requalification: keep the leaderboard-only
@@ -218,11 +221,18 @@ Operator actions the record supports (each is separately authorized, idempotent,
    this change for the flag path; the tombstone path is unchanged.
 2. Return to research either through ordinary rediscovery (leaderboard, datadash, 502-gap, trades)
    or through an audited activation batch (`wallet_activation_batches`, batch id
-   `review-589-<date>`, precedent `data/eval-results/manual-dune-20260910-five-candidates`). The
-   first backfill runs the cold probe on the newest page; a re-flag is evidence, not an error.
+   `review-589-<date>`). Clearing a tombstone-only wallet leaves no `wallets` row, and
+   `activate-next` only selects rows that already exist, so a row must first be created by
+   rediscovery or by an explicit operator insertion under the cache lock that also records the
+   exact cohort in `wallet_activation_batches` / `wallet_activation_batch_wallets` (no repository
+   command takes a named cohort; the September 10 five-candidate insertion on the ranker host,
+   audited under its `data/eval-results/manual-dune-20260910-five-candidates` directory, is the
+   operational precedent). The first backfill of a row with no fetch stamp runs the cold probe on
+   the newest page; a re-flag is evidence, not an error.
 3. For the four unresolved wallets the same path is the density check; run it only if the operator
    wants the answer (bounded to four wallets). The two retained wallets need nothing.
-4. Rollback: revert the PR. A cleared wallet that proves dense is re-flagged by the next fetch;
+4. Rollback: revert the PR. A cleared never-fetched wallet that proves dense is re-flagged by its
+   first fetch;
    one that is not dense but unwanted needs an explicit operator exclusion (row under the lock).
 
 Deferred to #592 (multi-owner behavior change; measured impact today nil, §5): apply one

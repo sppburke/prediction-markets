@@ -117,8 +117,9 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   report-only while `PE_BOOTSTRAP_PURGE_ENABLED=false`. Exceptional reclassification requires
   the explicit operator-only `clear-infra-exclusion --wallet <hex> --confirm` command; it
   removes the infra tombstone and clears a live flag, and does not recreate or activate the
-  wallet. A cleared wallet that is already active becomes due for backfill at once
-  (`last_polymarket_fetch_at` is still NULL) and is probed again on its newest page.
+  wallet. A cleared active wallet with no fetch stamp (the cold-probe shape) becomes due for
+  backfill at once and is probed again on its newest page; a wallet flagged after ingestion
+  resumes incremental backfill once its stamp is stale, without a new probe.
 - **`CacheMutationLock`** is a persistent-inode, kernel-held lock acquired before
   every read-write wallet-cache open. Production coordination follows the sole
   loop → one-shot run → cache order; true read-only probes use

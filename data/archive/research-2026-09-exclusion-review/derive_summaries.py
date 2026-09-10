@@ -93,7 +93,7 @@ for w, r in review.items():
         "follower_eligibility": "not established",
     })
 with open(HERE / "cohort_summary.csv", "w", newline="") as f:
-    wr = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+    wr = csv.DictWriter(f, fieldnames=list(rows[0].keys()), lineterminator="\n")
     wr.writeheader()
     wr.writerows(rows)
 

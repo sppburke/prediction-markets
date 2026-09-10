@@ -3368,8 +3368,9 @@ impl WalletCache {
     /// cold probe writes since purge retirement, #544). Returns `true` when
     /// either existed. This does not recreate or activate the wallet: a
     /// tombstone-only wallet needs a later discovery to re-admit it, and a
-    /// flagged wallet keeps its `is_active` and re-enters the backfill queue,
-    /// where the cold probe classifies it again on its newest page (`docs/37`).
+    /// flagged wallet keeps its `is_active`; an active one with no fetch stamp
+    /// becomes due for backfill at once, where the cold probe classifies it
+    /// again on its newest page (`docs/37`).
     pub fn clear_infra_exclusion(&mut self, wallet_hex: &str) -> Result<bool, BootstrapError> {
         let tx = self.conn.transaction()?;
         let tombstones = tx.execute(
