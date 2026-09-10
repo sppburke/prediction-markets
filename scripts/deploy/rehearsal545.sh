@@ -97,6 +97,8 @@ if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
     exit 1
   fi
 fi
+# Issue #586: the bundle is captured before any copy or preflight work and re-checked at manifest time.
+harness_bundle_sha256=$(harness_bundle_digest "$harness_deploy_dir")
 
 for required in python3 sqlite3 sha256sum od cp grep awk sed flock curl env realpath mktemp systemctl; do
   command -v "$required" >/dev/null 2>&1 || {
@@ -573,6 +575,7 @@ service_log="$root/service-$short.log"
 watch_log="$root/watch-$short.log"
 manifest="$root/manifest-$short.txt"
 status_state="$root/status-$short.state"
+quiesce_flag="$root/quiesce-$short.flag"
 drop_state="$root/drops-$short.state"
 fence_state="$root/fences-$short.state"
 write_state="$root/writes-$short.state"
@@ -586,7 +589,7 @@ service_pid=""
 observer_pids=()
 stop_all() {
   local pid
-  for pid in "${observer_pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in "${observer_pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   if [[ -n "$service_pid" ]]; then
     kill -TERM "$service_pid" 2>/dev/null || true
     for _ in $(seq 1 15); do kill -0 "$service_pid" 2>/dev/null || break; sleep 1; done
@@ -596,34 +599,46 @@ stop_all() {
   for pid in "${observer_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 
+epoch_ms() {
+  local t=${EPOCHREALTIME/./}
+  printf '%s\n' "${t:0:${#t}-3}"
+}
+
 quiesce_service() {
-  local pid service_status elapsed
-  for pid in "${observer_pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  local pid service_status start_ms now_ms elapsed_ms bound_ms
+  # Issue #586: raise the quiesce flag, then stop each observer's whole process group so no
+  # descendant (python3/sqlite3/sleep) can publish state after the signal instant.
+  : > "$quiesce_flag"
+  for pid in "${observer_pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   for pid in "${observer_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
   observer_pids=()
   quiesce_sent_at=$(date +%s)
   shutdown_signal_unix=$quiesce_sent_at
+  start_ms=$(epoch_ms)
+  bound_ms=$((unit_timeout_stop_secs * 1000))
   if ! kill -INT "$service_pid" 2>/dev/null; then
     shutdown_elapsed_secs=0
     return 1
   fi
+  # The whole-second signal instant serves only final-status causality; the bound is enforced on a
+  # subsecond clock and cannot accept an exit observed after it.
   while kill -0 "$service_pid" 2>/dev/null; do
-    elapsed=$(( $(date +%s) - quiesce_sent_at ))
-    if ((elapsed >= unit_timeout_stop_secs)); then
+    now_ms=$(epoch_ms); elapsed_ms=$((now_ms - start_ms))
+    if ((elapsed_ms > bound_ms)); then
       shutdown_elapsed_secs=$unit_timeout_stop_secs
       return 1
     fi
-    sleep 1
+    sleep 0.1
   done
-  elapsed=$(( $(date +%s) - quiesce_sent_at ))
-  shutdown_elapsed_secs=$elapsed
+  now_ms=$(epoch_ms); elapsed_ms=$((now_ms - start_ms))
+  shutdown_elapsed_secs=$((elapsed_ms / 1000))
   if wait "$service_pid"; then
     service_status=0
   else
     service_status=$?
   fi
   service_pid=""
-  ((service_status == 0))
+  ((elapsed_ms <= bound_ms && service_status == 0))
 }
 trap stop_all EXIT TERM INT
 
@@ -740,32 +755,41 @@ printf 'REHEARSAL_START sha=%s activation=%s wallet=%s anchor_before=%s unix=%s\
 status_file_poller() {
   while kill -0 "$service_pid" 2>/dev/null; do
     if [[ -f "$copy_dir/status.json" ]]; then
-      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" <<'PY' || true
+      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" "$quiesce_flag" <<'PY' || true
 import datetime, json, os, sys
-source, started, target, expected_revision = sys.argv[1:]
+source, started, target, expected_revision, quiesce_flag = sys.argv[1:]
 started = int(started)
-with open(source, encoding="utf-8") as handle:
-    value = json.load(handle)
-updated = datetime.datetime.fromisoformat(value["updated_at"].replace("Z", "+00:00")).timestamp()
-fresh = updated >= started
-revision_ok = value.get("revision") == expected_revision
-health = value.get("source_health")
-if not isinstance(health, dict):
-    health = {}
-polled = fresh and health.get("poll_last_round_age_secs") is not None
-credit_loss = health.get("reconciliation_obligations_dropped_total")
-if isinstance(credit_loss, bool) or not isinstance(credit_loss, int) or credit_loss < 0:
+fresh = revision_ok = polled = healthy = child_authorization_denied = False
+credit_loss = 0
+try:
+    with open(source, encoding="utf-8") as handle:
+        value = json.load(handle)
+    updated = datetime.datetime.fromisoformat(value["updated_at"].replace("Z", "+00:00")).timestamp()
+    fresh = updated >= started
+    revision_ok = value.get("revision") == expected_revision
+    health = value.get("source_health")
+    if not isinstance(health, dict):
+        health = {}
+    polled = fresh and health.get("poll_last_round_age_secs") is not None
+    credit_loss = health.get("reconciliation_obligations_dropped_total")
+    # Issue #586: only a fresh observed status can report loss; anything else publishes zero.
+    if not fresh or isinstance(credit_loss, bool) or not isinstance(credit_loss, int) or credit_loss < 0:
+        credit_loss = 0
+    critical = [task for task in (value.get("tasks") or []) if task.get("class") == "critical"]
+    healthy = fresh and bool(critical) and all(task.get("state") == "running" for task in critical)
+    live = value.get("live")
+    accounts = live.get("accounts") if isinstance(live, dict) else None
+    child_authorization_denied = (
+        isinstance(live, dict)
+        and live.get("stale") is True
+        and isinstance(accounts, list)
+        and not accounts
+    )
+except Exception:
+    fresh = revision_ok = polled = healthy = child_authorization_denied = False
     credit_loss = 0
-critical = [task for task in (value.get("tasks") or []) if task.get("class") == "critical"]
-healthy = fresh and bool(critical) and all(task.get("state") == "running" for task in critical)
-live = value.get("live")
-accounts = live.get("accounts") if isinstance(live, dict) else None
-child_authorization_denied = (
-    isinstance(live, dict)
-    and live.get("stale") is True
-    and isinstance(accounts, list)
-    and not accounts
-)
+if os.path.exists(quiesce_flag):
+    raise SystemExit(0)
 temp = target + ".tmp"
 with open(temp, "w", encoding="utf-8") as output:
     output.write(
@@ -827,10 +851,13 @@ write_refusal_counter() {
   done
 }
 
+# Issue #586: job control gives each observer its own process group, so quiescence can reap it whole.
+set -m
 status_file_poller & observer_pids+=("$!")
 reader_drop_classifier & observer_pids+=("$!")
 fence_anchor_census & observer_pids+=("$!")
 write_refusal_counter & observer_pids+=("$!")
+set +m
 
 result=FAIL
 reason=timeout
@@ -849,7 +876,6 @@ unit_kill_signal=absent
 unit_timeout_stop_secs=absent
 shutdown_signal_unix=absent
 shutdown_elapsed_secs=absent
-harness_bundle_sha256=$(harness_bundle_digest "$harness_deploy_dir")
 last="status_fresh=0 endpoint_ready=0 revision_ok=0 polled=0 healthy=0 child_authorization_denied=0 anchored=0 drops=0 credit_loss=0 errors=0 fences=0 refused=0 writes=0"
 while (( $(date +%s) <= deadline )); do
   if ! kill -0 "$service_pid" 2>/dev/null; then reason=process_exited; break; fi
@@ -1003,6 +1029,11 @@ if [[ -f "$copy_dir/status.json" ]]; then
   final_status_sha256=$(sha256_file "$copy_dir/status.json")
 fi
 manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
+# Issue #586: the evidence names the closure that ran; refuse emission if the bundled bytes changed.
+if [[ "$(harness_bundle_digest "$harness_deploy_dir")" != "$harness_bundle_sha256" ]]; then
+  result=FAIL
+  reason=harness_bundle_changed
+fi
 {
   printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nrehearsal_environment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
     "$result" "$reason" "$sha" "$target_revision" "$artifact_blake3" "$artifact_sha256" \

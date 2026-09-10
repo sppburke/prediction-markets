@@ -327,7 +327,19 @@ case "$mode" in
   *) exit 95 ;;
 esac
 SH
-  chmod +x "$bin/systemctl" "$bin/psql" "$bin/curl"
+  # Issue #586 branch review: a sqlite3 wrapper that stalls the fence observer inside its helper when
+  # the slow-observer marker exists, recording its pid so the scenario can prove the observer's
+  # process group was reaped before the child was signalled.
+  cat > "$bin/sqlite3" <<'SH'
+#!/usr/bin/env bash
+state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
+if [[ -f "$state/slow-sqlite" ]]; then
+  echo $$ > "$state/slow-sqlite.pid"
+  sleep 20
+fi
+exec /usr/bin/sqlite3 "$@"
+SH
+  chmod +x "$bin/systemctl" "$bin/psql" "$bin/curl" "$bin/sqlite3"
 }
 
 write_rehearsal_evidence() {
@@ -702,8 +714,9 @@ def interrupt(_signum, _frame):
     elif current == "obligations_dropped":
         final["source_health"]["reconciliation_obligations_dropped_total"]=1
     write_status(final)
-    if current == "delayed_clean_exit":
-        time.sleep(6)
+    delay = {"delayed_clean_exit": 6, "delayed_clean_exit_just_over": 5.05, "clean_exit_inside_bound": 4.5}.get(current)
+    if delay is not None:
+        time.sleep(delay)
     os._exit(0)
 
 signal.signal(signal.SIGTERM, terminate)
@@ -894,6 +907,7 @@ else
           printf '%s\n' '{"level":"WARN","message":"activity ws reader produced no normalized activity row; dropping socket","slot":1,"timeout_secs":30,"last_wire_frame_age_secs":"Some(0)","last_normalized_activity_age_secs":"Some(175)","buffered_frame_processed":true}'
         fi
         ;;
+      slow_observer) : > "$state/slow-sqlite" ;;
       *) : ;;
     esac >> "$rehearsal_root/service-1111111.log"
     : > "$state/injected"
@@ -1489,7 +1503,7 @@ done
 
 # Scenario REHEARSAL-SHUTDOWN-INCOMPLETE-09D: timeout, nonzero exit, and post-bound clean exit all
 # refuse before final-status validation, while cleanup leaves no child behind (#586).
-for shutdown_case in ignore_sigint exit_nonzero_on_sigint delayed_clean_exit; do
+for shutdown_case in ignore_sigint exit_nonzero_on_sigint delayed_clean_exit delayed_clean_exit_just_over; do
   root="$TEST_TMP/rehearsal-shutdown-$shutdown_case"
   setup_rehearsal_fixture "$root" true "$shutdown_case"
   set +e
@@ -1516,6 +1530,41 @@ assert sum(name == "final_status_sha256" for name,_ in raw) == 1
 assert rows["final_status_sha256"] == hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()
 PY
 done
+
+# Scenario REHEARSAL-SHUTDOWN-INSIDE-BOUND-09H: a clean exit just inside the unit timeout still passes,
+# and the recorded elapsed seconds are the floor of the measured shutdown (#586 branch review).
+root="$TEST_TMP/rehearsal-shutdown-inside-bound"
+setup_rehearsal_fixture "$root" true clean_exit_inside_bound
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "clean exit inside the bound did not pass: $output"
+python3 - "$root/rehearsal/evidence.json" <<'PY' || fail "inside-bound shutdown evidence is wrong"
+import json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8"))
+rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+assert rows["shutdown_elapsed_secs"] == "4", rows["shutdown_elapsed_secs"]
+assert rows["unit_timeout_stop_secs"] == "5"
+PY
+
+# Scenario REHEARSAL-OBSERVER-JOIN-09I: an observer stalled inside its sqlite3 helper across quiescence
+# is reaped with its process group before SIGINT, and its state file is not written after the signal
+# instant (#586 branch review).
+root="$TEST_TMP/rehearsal-observer-join"
+setup_rehearsal_fixture "$root" true slow_observer
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "slow observer run did not pass: $output"
+[[ -f "$root/test-state/slow-sqlite.pid" ]] || fail "slow sqlite3 helper never ran"
+helper_pid=$(<"$root/test-state/slow-sqlite.pid")
+[[ ! -d "/proc/$helper_pid" ]] || fail "observer helper $helper_pid survived quiescence"
+python3 - "$root/rehearsal/evidence.json" "$root/rehearsal" <<'PY' || fail "observer state was written after the signal instant"
+import glob,json,os,sys
+e=json.load(open(sys.argv[1],encoding="utf-8"))
+rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+signal_unix=int(rows["shutdown_signal_unix"])
+states=glob.glob(os.path.join(sys.argv[2],"fences-*.state"))
+assert states, "no fence state file"
+for path in states:
+    assert int(os.stat(path).st_mtime) <= signal_unix, (path, os.stat(path).st_mtime, signal_unix)
+PY
 
 # Scenario REHEARSAL-UNIT-STOP-POLICY-09F: invalid production stop policies refuse before SIGINT.
 for policy_case in wrong_signal missing_timeout malformed_timeout zero_timeout; do
