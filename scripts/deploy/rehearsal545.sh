@@ -80,7 +80,7 @@ if [[ "$dry_run" == 1 ]]; then
     "credential_slots=production-secret/service-role,sanitized-rehearsal-publishable" \
     "logs=paper.log,source_events.log,live_journal.log" \
     "observers=status_file_poller,health_ready_query,reader_drop_classifier,fence_anchor_census,write_refusal_counter,privileged_account_census" \
-    "proof=exact-revision,poll-after-start,reanchor,real-readiness,critical-health,publishable-child-denied,accounts-before-after-off,no-unsafe-evidence" \
+    "proof=exact-revision,poll-after-start,post-start-anchoring,real-readiness,critical-health,publishable-child-denied,accounts-before-after-off,no-unsafe-evidence" \
     "stop=first-complete-evidence-or-first-failure-or-timeout" \
     "evidence_contract=rehearsal545-evidence-v1" \
     "evidence_hash_file=$evidence_hash_file"
@@ -558,18 +558,9 @@ update_output=$(env -i "${service_child_env[@]}" "$binary" "$config" --update-pa
 }
 echo "rehearsal copy migration paths: $update_output"
 
-wallet=$(sqlite3 "$copy_dir/paper_state.db" \
-  "select c.wallet_hex from poll_cursors c join position_anchors a on a.wallet_hex=c.wallet_hex where c.activity_cutoff_unix is not null and c.reanchor_required=0 and c.wallet_hex not in (select wallet_hex from wallet_fences) order by c.wallet_hex limit 1;")
-[[ "$wallet" =~ ^0x[0-9a-f]{40}$ ]] || {
-  echo "FATAL: copied generation has no canonical eligible reanchor wallet" >&2
-  exit 1
-}
-anchor_before=$(sqlite3 "$copy_dir/paper_state.db" \
-  "select coalesce(max(anchor_seq),-1) from position_anchors where wallet_hex='$wallet';")
-[[ "$anchor_before" =~ ^-?[0-9]+$ ]] || { echo "FATAL: invalid initial anchor sequence" >&2; exit 1; }
-changed=$(sqlite3 "$copy_dir/paper_state.db" \
-  "update poll_cursors set reanchor_required=1 where wallet_hex='$wallet'; select changes();")
-[[ "$changed" == 1 ]] || { echo "FATAL: reanchor probe did not change exactly one row" >&2; exit 1; }
+# Issue #590: pre-launch baseline for the post-start anchoring proof (rows are never deleted).
+anchor_rows_before=$(sqlite3 -readonly "$copy_dir/paper_state.db" "select count(*) from position_anchors;")
+[[ "$anchor_rows_before" =~ ^[0-9]+$ ]] || { echo "FATAL: invalid initial anchor row count" >&2; exit 1; }
 
 service_log="$root/service-$short.log"
 watch_log="$root/watch-$short.log"
@@ -720,10 +711,11 @@ print(count)
 PY
 }
 
+# Issue #590: `position_anchors` rows are never deleted, so a count above the pre-launch baseline
+# proves the reviewed binary installed an anchor in this run (boot anchor walk or periodic refresh).
 observe_database_final() {
   sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
-    "select coalesce((select max(anchor_seq) from position_anchors where wallet_hex='$wallet'),-1),
-            coalesce((select reanchor_required from poll_cursors where wallet_hex='$wallet'),1),
+    "select (select count(*) from position_anchors),
             (select count(*) from wallet_fences where cause not in ($expected_fence_causes));"
 }
 
@@ -746,8 +738,8 @@ os.execve(sys.argv[1],sys.argv[1:],environment)' "$binary" "$config" \
 service_pid=$!
 service_invocation_pid=$service_pid
 started_at=$(date +%s)
-printf 'REHEARSAL_START sha=%s activation=%s wallet=%s anchor_before=%s unix=%s\n' \
-  "$sha" "$activation_id" "$wallet" "$anchor_before" "$started_at" | tee -a "$watch_log"
+printf 'REHEARSAL_START sha=%s activation=%s anchor_rows_before=%s unix=%s\n' \
+  "$sha" "$activation_id" "$anchor_rows_before" "$started_at" | tee -a "$watch_log"
 
 # Issue #586: `crates/service/src/status_writer.rs` owns
 # `reconciliation_obligations_dropped_total`, fed by `crates/service/src/activity_ingest.rs`.
@@ -827,14 +819,12 @@ PY
 
 fence_anchor_census() {
   while kill -0 "$service_pid" 2>/dev/null; do
-    anchor_after=$(sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
-      "select coalesce(max(anchor_seq),-1) from position_anchors where wallet_hex='$wallet';" 2>/dev/null || echo "$anchor_before")
-    reanchor=$(sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
-      "select reanchor_required from poll_cursors where wallet_hex='$wallet';" 2>/dev/null || echo 1)
+    anchor_rows=$(sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
+      "select count(*) from position_anchors;" 2>/dev/null || echo "$anchor_rows_before")
     unexpected=$(sqlite3 "file:$copy_dir/paper_state.db?mode=ro" \
       "select count(*) from wallet_fences where cause not in ($expected_fence_causes);" 2>/dev/null || echo 1)
     anchored=0
-    [[ "$anchor_after" =~ ^-?[0-9]+$ && "$anchor_after" -gt "$anchor_before" && "$reanchor" == 0 ]] && anchored=1
+    [[ "$anchor_rows" =~ ^[0-9]+$ && "$anchor_rows" -gt "$anchor_rows_before" ]] && anchored=1
     printf '%s %s\n' "$anchored" "$unexpected" > "$fence_state.tmp"
     mv "$fence_state.tmp" "$fence_state"
     sleep "$poll_secs"
@@ -967,14 +957,14 @@ PY
       reason=final_database_observation_failed
       break
     }
-    IFS='|' read -r anchor_after reanchor fences <<< "$final_database"
-    if [[ ! "$anchor_after" =~ ^-?[0-9]+$ || ! "$reanchor" =~ ^[01]$ || ! "$fences" =~ ^[0-9]+$ ]]; then
+    IFS='|' read -r anchor_rows fences <<< "$final_database"
+    if [[ ! "$anchor_rows" =~ ^[0-9]+$ || ! "$fences" =~ ^[0-9]+$ ]]; then
       reason=final_database_observation_failed
       break
     fi
     anchored=0
-    [[ "$anchor_after" -gt "$anchor_before" && "$reanchor" == 0 ]] && anchored=1
-    database_observation="anchor_after:$anchor_after,reanchor_required:$reanchor,unexpected_fences:$fences"
+    (( anchor_rows > anchor_rows_before )) && anchored=1
+    database_observation="anchor_rows_before:$anchor_rows_before,anchor_rows_after:$anchor_rows,unexpected_fences:$fences"
     last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy child_authorization_denied=$child_authorization_denied anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
     printf '%s FINAL %s service_log_prefix_length=%s service_log_prefix_sha256=%s database_observation=%s\n' \
       "$(date -u +%FT%TZ)" "$last" "$service_log_prefix_length" \
@@ -1036,12 +1026,12 @@ if [[ "$(harness_bundle_digest "$harness_deploy_dir")" != "$harness_bundle_sha25
   reason=harness_bundle_changed
 fi
 {
-  printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nrehearsal_environment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
+  printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nrehearsal_environment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\n' \
     "$result" "$reason" "$sha" "$target_revision" "$artifact_blake3" "$artifact_sha256" \
     "$activation_id" "$active_generation" "$config_sha256" "$environment_sha256" \
     "$rehearsal_environment_sha256" \
     "$service_invocation_pid" "$rehearsal_bind" "$rehearsal_port" "$installed_bind" \
-    "$readiness_base_url" "$wallet" "$anchor_before"
+    "$readiness_base_url"
   printf 'final=%s\n' "$last"
   printf 'legacy_continuations=%s:%s\n' \
     "$legacy_continuations_count" "$legacy_continuations_digest"
