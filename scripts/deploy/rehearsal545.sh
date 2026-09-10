@@ -3,8 +3,9 @@
 
 set -euo pipefail
 
+harness_deploy_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=generation_common.sh
-source "$(cd "$(dirname "$0")" && pwd)/generation_common.sh"
+source "$harness_deploy_dir/generation_common.sh"
 
 usage() {
   echo "usage: $0 --dry-run [--target-config PATH --target-environment PATH] 40_HEX_GIT_SHA" >&2
@@ -86,7 +87,20 @@ if [[ "$dry_run" == 1 ]]; then
   exit 0
 fi
 
-for required in python3 sqlite3 sha256sum od cp grep awk sed flock curl env realpath mktemp; do
+# Issue #586: production evidence may only be emitted by the harness in the release tree whose
+# bytes it is rehearsing. The test fixture is the sole intentional cross-tree caller.
+if [[ "${PE_ACTIVATION_TESTING:-0}" != 1 ]]; then
+  harness_tree_root=$(cd "$harness_deploy_dir/../.." && pwd -P)
+  resolved_release_root=$(realpath "$release_root" 2>/dev/null || true)
+  if [[ -z "$resolved_release_root" || "$resolved_release_root" != "$harness_tree_root" ]]; then
+    echo "REHEARSAL545_FAIL reason=release_root_mismatch"
+    exit 1
+  fi
+fi
+# Issue #586: the bundle is captured before any copy or preflight work and re-checked at manifest time.
+harness_bundle_sha256=$(harness_bundle_digest "$harness_deploy_dir")
+
+for required in python3 sqlite3 sha256sum od cp grep awk sed flock curl env realpath mktemp systemctl; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "FATAL: required command is unavailable: $required" >&2
     exit 1
@@ -561,6 +575,7 @@ service_log="$root/service-$short.log"
 watch_log="$root/watch-$short.log"
 manifest="$root/manifest-$short.txt"
 status_state="$root/status-$short.state"
+quiesce_flag="$root/quiesce-$short.flag"
 drop_state="$root/drops-$short.state"
 fence_state="$root/fences-$short.state"
 write_state="$root/writes-$short.state"
@@ -568,13 +583,13 @@ readiness_response="$root/readiness-$short.json"
 : > "$service_log"
 : > "$watch_log"
 rm -f "$status_state" "$drop_state" "$fence_state" "$write_state" \
-  "$readiness_response" "$readiness_response.tmp"
+  "$readiness_response" "$readiness_response.tmp" "$quiesce_flag"
 
 service_pid=""
 observer_pids=()
 stop_all() {
   local pid
-  for pid in "${observer_pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in "${observer_pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   if [[ -n "$service_pid" ]]; then
     kill -TERM "$service_pid" 2>/dev/null || true
     for _ in $(seq 1 15); do kill -0 "$service_pid" 2>/dev/null || break; sleep 1; done
@@ -583,34 +598,60 @@ stop_all() {
   fi
   for pid in "${observer_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
+
+epoch_ms() {
+  local t=${EPOCHREALTIME/./}
+  printf '%s\n' "${t:0:${#t}-3}"
+}
+
+quiesce_service() {
+  local pid service_status start_ms now_ms elapsed_ms bound_ms
+  # Issue #586: raise the quiesce flag, then stop each observer's whole process group so no
+  # descendant (python3/sqlite3/sleep) can publish state after the signal instant.
+  : > "$quiesce_flag"
+  for pid in "${observer_pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in "${observer_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  observer_pids=()
+  quiesce_sent_at=$(date +%s)
+  shutdown_signal_unix=$quiesce_sent_at
+  start_ms=$(epoch_ms)
+  bound_ms=$((unit_timeout_stop_secs * 1000))
+  if ! kill -INT "$service_pid" 2>/dev/null; then
+    shutdown_elapsed_secs=0
+    return 1
+  fi
+  # The whole-second signal instant serves only final-status causality; the bound is enforced on a
+  # subsecond clock and cannot accept an exit observed after it.
+  while kill -0 "$service_pid" 2>/dev/null; do
+    now_ms=$(epoch_ms); elapsed_ms=$((now_ms - start_ms))
+    if ((elapsed_ms > bound_ms)); then
+      shutdown_elapsed_secs=$unit_timeout_stop_secs
+      return 1
+    fi
+    sleep 0.1
+  done
+  now_ms=$(epoch_ms); elapsed_ms=$((now_ms - start_ms))
+  shutdown_elapsed_secs=$((elapsed_ms / 1000))
+  if wait "$service_pid"; then
+    service_status=0
+  else
+    service_status=$?
+  fi
+  service_pid=""
+  ((elapsed_ms <= bound_ms && service_status == 0))
+}
 trap stop_all EXIT TERM INT
 
 scan_service_log_prefix() {
   python3 - "$service_log" <<'PY'
-import hashlib, json, sys
+import hashlib, sys
 
 with open(sys.argv[1], "rb") as source:
     prefix = source.read()
-drops = credit_loss = unexpected_errors = refused = writes = 0
+drops = unexpected_errors = refused = writes = 0
 for line in prefix.decode("utf-8", errors="replace").splitlines():
     if "dropping socket" in line:
         drops += 1
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            credit_loss += 1
-            continue
-        fields = value.get("fields", value)
-        raw = fields.get("last_wire_frame_age_secs")
-        buffered = fields.get("buffered_frame_processed")
-        age = raw if isinstance(raw, int) else None
-        if isinstance(raw, str) and raw.startswith("Some(") and raw.endswith(")"):
-            try:
-                age = int(raw[5:-1])
-            except ValueError:
-                age = None
-        if not (age is not None and age >= 29 and buffered is False):
-            credit_loss += 1
     if '"level":"ERROR"' in line and not any(
         marker in line for marker in ("permission denied", "HTTP 401", "HTTP 403")
     ):
@@ -628,9 +669,54 @@ for line in prefix.decode("utf-8", errors="replace").splitlines():
     )):
         writes += 1
 print(
-    drops, credit_loss, unexpected_errors, refused, writes, len(prefix),
+    drops, unexpected_errors, refused, writes, len(prefix),
     hashlib.sha256(prefix).hexdigest(),
 )
+PY
+}
+
+observe_final_status() {
+  python3 - "$copy_dir/status.json" "$1" <<'PY'
+import datetime, json, sys
+
+path, since = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8") as source:
+        value = json.load(source)
+    if not isinstance(value, dict):
+        raise ValueError("status is not an object")
+    updated = datetime.datetime.fromisoformat(
+        value["updated_at"].replace("Z", "+00:00")
+    ).timestamp()
+    if updated < since:
+        raise ValueError("status predates shutdown signal")
+    tasks = value.get("tasks")
+    if not isinstance(tasks, list) or not all(isinstance(task, dict) for task in tasks):
+        raise ValueError("tasks are malformed")
+    status_writers = [task for task in tasks if task.get("name") == "status_writer"]
+    if len(status_writers) != 1:
+        raise ValueError("status_writer marker is not unique")
+    status_writer = status_writers[0]
+    if (status_writer.get("class") != "critical"
+            or status_writer.get("state") != "stopping"
+            or status_writer.get("failure") is not None):
+        raise ValueError("status_writer final marker is invalid")
+    for task in tasks:
+        if task is status_writer or task.get("class") != "critical":
+            continue
+        if task.get("state") != "stopped" or task.get("failure") is not None:
+            raise ValueError("another critical owner did not stop cleanly")
+    health = value.get("source_health")
+    if not isinstance(health, dict):
+        raise ValueError("source health is absent")
+    count = health.get("reconciliation_obligations_dropped_total")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("reconciliation obligation count is invalid")
+    if health.get("ws_sink_poisoned") is not False:
+        raise ValueError("websocket sink poison state is unsafe")
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+print(count)
 PY
 }
 
@@ -663,35 +749,52 @@ started_at=$(date +%s)
 printf 'REHEARSAL_START sha=%s activation=%s wallet=%s anchor_before=%s unix=%s\n' \
   "$sha" "$activation_id" "$wallet" "$anchor_before" "$started_at" | tee -a "$watch_log"
 
+# Issue #586: `crates/service/src/status_writer.rs` owns
+# `reconciliation_obligations_dropped_total`, fed by `crates/service/src/activity_ingest.rs`.
+# Socket recycles remain recorded as `drops`; they are not inferred to have lost an obligation.
 status_file_poller() {
   while kill -0 "$service_pid" 2>/dev/null; do
     if [[ -f "$copy_dir/status.json" ]]; then
-      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" <<'PY' || true
+      python3 - "$copy_dir/status.json" "$started_at" "$status_state" "$sha" "$quiesce_flag" <<'PY' || true
 import datetime, json, os, sys
-source, started, target, expected_revision = sys.argv[1:]
+source, started, target, expected_revision, quiesce_flag = sys.argv[1:]
 started = int(started)
-with open(source, encoding="utf-8") as handle:
-    value = json.load(handle)
-updated = datetime.datetime.fromisoformat(value["updated_at"].replace("Z", "+00:00")).timestamp()
-fresh = updated >= started
-revision_ok = value.get("revision") == expected_revision
-health = value.get("source_health") or {}
-polled = fresh and health.get("poll_last_round_age_secs") is not None
-critical = [task for task in (value.get("tasks") or []) if task.get("class") == "critical"]
-healthy = fresh and bool(critical) and all(task.get("state") == "running" for task in critical)
-live = value.get("live")
-accounts = live.get("accounts") if isinstance(live, dict) else None
-child_authorization_denied = (
-    isinstance(live, dict)
-    and live.get("stale") is True
-    and isinstance(accounts, list)
-    and not accounts
-)
+fresh = revision_ok = polled = healthy = child_authorization_denied = False
+credit_loss = 0
+try:
+    with open(source, encoding="utf-8") as handle:
+        value = json.load(handle)
+    updated = datetime.datetime.fromisoformat(value["updated_at"].replace("Z", "+00:00")).timestamp()
+    fresh = updated >= started
+    revision_ok = value.get("revision") == expected_revision
+    health = value.get("source_health")
+    if not isinstance(health, dict):
+        health = {}
+    polled = fresh and health.get("poll_last_round_age_secs") is not None
+    credit_loss = health.get("reconciliation_obligations_dropped_total")
+    # Issue #586: only a fresh observed status can report loss; anything else publishes zero.
+    if not fresh or isinstance(credit_loss, bool) or not isinstance(credit_loss, int) or credit_loss < 0:
+        credit_loss = 0
+    critical = [task for task in (value.get("tasks") or []) if task.get("class") == "critical"]
+    healthy = fresh and bool(critical) and all(task.get("state") == "running" for task in critical)
+    live = value.get("live")
+    accounts = live.get("accounts") if isinstance(live, dict) else None
+    child_authorization_denied = (
+        isinstance(live, dict)
+        and live.get("stale") is True
+        and isinstance(accounts, list)
+        and not accounts
+    )
+except Exception:
+    fresh = revision_ok = polled = healthy = child_authorization_denied = False
+    credit_loss = 0
+if os.path.exists(quiesce_flag):
+    raise SystemExit(0)
 temp = target + ".tmp"
 with open(temp, "w", encoding="utf-8") as output:
     output.write(
         f"{int(fresh)} {int(revision_ok)} {int(polled)} {int(healthy)} "
-        f"{int(child_authorization_denied)}\n"
+        f"{int(child_authorization_denied)} {credit_loss}\n"
     )
 os.replace(temp, target)
 PY
@@ -703,32 +806,19 @@ PY
 reader_drop_classifier() {
   while kill -0 "$service_pid" 2>/dev/null; do
     python3 - "$service_log" "$drop_state" <<'PY' || true
-import json, os, sys
-drops = credit_loss = unexpected_errors = 0
+import os, sys
+drops = unexpected_errors = 0
 with open(sys.argv[1], encoding="utf-8", errors="replace") as source:
     for line in source:
         if "dropping socket" in line:
             drops += 1
-            try: value = json.loads(line)
-            except json.JSONDecodeError:
-                credit_loss += 1
-                continue
-            fields = value.get("fields", value)
-            raw = fields.get("last_wire_frame_age_secs")
-            buffered = fields.get("buffered_frame_processed")
-            age = raw if isinstance(raw, int) else None
-            if isinstance(raw, str) and raw.startswith("Some(") and raw.endswith(")"):
-                try: age = int(raw[5:-1])
-                except ValueError: age = None
-            if not (age is not None and age >= 29 and buffered is False):
-                credit_loss += 1
         if '"level":"ERROR"' in line and not any(
             marker in line for marker in ("permission denied", "HTTP 401", "HTTP 403")
         ):
             unexpected_errors += 1
 temp = sys.argv[2] + ".tmp"
 with open(temp, "w", encoding="utf-8") as output:
-    output.write(f"{drops} {credit_loss} {unexpected_errors}\n")
+    output.write(f"{drops} {unexpected_errors}\n")
 os.replace(temp, sys.argv[2])
 PY
     sleep "$poll_secs"
@@ -761,10 +851,13 @@ write_refusal_counter() {
   done
 }
 
+# Issue #586: job control gives each observer its own process group, so quiescence can reap it whole.
+set -m
 status_file_poller & observer_pids+=("$!")
 reader_drop_classifier & observer_pids+=("$!")
 fence_anchor_census & observer_pids+=("$!")
 write_refusal_counter & observer_pids+=("$!")
+set +m
 
 result=FAIL
 reason=timeout
@@ -778,14 +871,19 @@ account_census_after_count=absent
 account_census_after_sha256=absent
 account_census_after_safe=false
 account_census_before_after_identical=false
+final_status_sha256=absent
+unit_kill_signal=absent
+unit_timeout_stop_secs=absent
+shutdown_signal_unix=absent
+shutdown_elapsed_secs=absent
 last="status_fresh=0 endpoint_ready=0 revision_ok=0 polled=0 healthy=0 child_authorization_denied=0 anchored=0 drops=0 credit_loss=0 errors=0 fences=0 refused=0 writes=0"
 while (( $(date +%s) <= deadline )); do
   if ! kill -0 "$service_pid" 2>/dev/null; then reason=process_exited; break; fi
   status_fresh=0; endpoint_ready=0; revision_ok=0; polled=0; healthy=0; child_authorization_denied=0; anchored=0
   drops=0; credit_loss=0; errors=0; fences=0; refused=0; writes=0
   readiness_candidate_sha256=absent
-  [[ ! -f "$status_state" ]] || read -r status_fresh revision_ok polled healthy child_authorization_denied < "$status_state"
-  [[ ! -f "$drop_state" ]] || read -r drops credit_loss errors < "$drop_state"
+  [[ ! -f "$status_state" ]] || read -r status_fresh revision_ok polled healthy child_authorization_denied credit_loss < "$status_state"
+  [[ ! -f "$drop_state" ]] || read -r drops errors < "$drop_state"
   [[ ! -f "$fence_state" ]] || read -r anchored fences < "$fence_state"
   [[ ! -f "$write_state" ]] || read -r refused writes < "$write_state"
   if env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
@@ -808,7 +906,8 @@ PY
   [[ ! -f "$readiness_response.tmp" ]] || mv "$readiness_response.tmp" "$readiness_response"
   last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy child_authorization_denied=$child_authorization_denied anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$last" >> "$watch_log"
-  if (( credit_loss > 0 || errors > 0 || fences > 0 || writes > 0 )); then
+  # Issue #586 review: the counter is canonical decimal text (a u64 can exceed Bash's signed range); compare as text.
+  if [[ "$credit_loss" != 0 ]] || (( errors > 0 || fences > 0 || writes > 0 )); then
     reason=unsafe_evidence
     break
   fi
@@ -834,20 +933,34 @@ PY
       reason=process_executable_unreadable
       break
     fi
-    # Quiesce the exact invocation before the final observation. Its shutdown path is part of the
-    # scanned evidence, and no later service append or database write can race the PASS decision.
-    stop_all
-    service_pid=""
-    observer_pids=()
+    # Issue #586: the service owns SIGINT shutdown. Prove the production unit gives that handled
+    # path its configured stop timeout; the harness owns no independent quiescence number.
+    unit_policy_valid=true
+    if ! unit_policy=$(service_unit_stop_policy pe-service); then unit_policy_valid=false; fi
+    read -r unit_kill_signal unit_timeout_stop_secs <<< "$unit_policy"
+    if [[ "$unit_policy_valid" != true || "$unit_kill_signal" != 2 ||
+          ! "$unit_timeout_stop_secs" =~ ^[1-9][0-9]*$ ]]; then
+      reason=unit_stop_policy_mismatch
+      break
+    fi
+    # Stop continuous observers before SIGINT so their preserved files remain the within-run sample.
+    if ! quiesce_service; then
+      reason=service_shutdown_incomplete
+      break
+    fi
     final_log_scan=$(scan_service_log_prefix) || {
       reason=final_service_log_scan_failed
       break
     }
-    read -r drops credit_loss errors refused writes service_log_prefix_length service_log_prefix_sha256 \
+    read -r drops errors refused writes service_log_prefix_length service_log_prefix_sha256 \
       <<< "$final_log_scan"
-    if [[ ! "$drops $credit_loss $errors $refused $writes $service_log_prefix_length" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ||
+    if [[ ! "$drops $errors $refused $writes $service_log_prefix_length" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ||
           ! "$service_log_prefix_sha256" =~ ^[0-9a-f]{64}$ ]]; then
       reason=final_service_log_scan_failed
+      break
+    fi
+    if ! credit_loss=$(observe_final_status "$quiesce_sent_at"); then
+      reason=final_status_observation_failed
       break
     fi
     final_database=$(observe_database_final) || {
@@ -866,7 +979,7 @@ PY
     printf '%s FINAL %s service_log_prefix_length=%s service_log_prefix_sha256=%s database_observation=%s\n' \
       "$(date -u +%FT%TZ)" "$last" "$service_log_prefix_length" \
       "$service_log_prefix_sha256" "$database_observation" >> "$watch_log"
-    if (( credit_loss > 0 || errors > 0 || fences > 0 || writes > 0 || anchored != 1 )); then
+    if [[ "$credit_loss" != 0 ]] || (( errors > 0 || fences > 0 || writes > 0 || anchored != 1 )); then
       reason=unsafe_evidence
       break
     fi
@@ -911,7 +1024,17 @@ if ((completion_candidate == 1)); then
     reason=unsafe_account_census
   fi
 fi
+# Issue #586: on a refusal this digest identifies the latest preserved status, not a proven final
+# status. Final-status validity remains the independent PASS predicate above.
+if [[ -f "$copy_dir/status.json" ]]; then
+  final_status_sha256=$(sha256_file "$copy_dir/status.json")
+fi
 manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
+# Issue #586: the evidence names the closure that ran; refuse emission if the bundled bytes changed.
+if [[ "$(harness_bundle_digest "$harness_deploy_dir")" != "$harness_bundle_sha256" ]]; then
+  result=FAIL
+  reason=harness_bundle_changed
+fi
 {
   printf 'result=%s\nreason=%s\nsha=%s\ntarget_revision=%s\nartifact_blake3=%s\nartifact_sha256=%s\nactivation_id=%s\ngeneration_dir=%s\nconfig_sha256=%s\nenvironment_sha256=%s\nrehearsal_environment_sha256=%s\nservice_invocation_pid=%s\nrehearsal_bind=%s\nrehearsal_port=%s\ninstalled_bind=%s\nreadiness_base_url=%s\nwallet=%s\nanchor_before=%s\n' \
     "$result" "$reason" "$sha" "$target_revision" "$artifact_blake3" "$artifact_sha256" \
@@ -922,6 +1045,9 @@ manifest_stage=$(mktemp "$root/.manifest-$short.XXXXXX")
   printf 'final=%s\n' "$last"
   printf 'legacy_continuations=%s:%s\n' \
     "$legacy_continuations_count" "$legacy_continuations_digest"
+  printf 'harness_bundle_sha256=%s\nfinal_status_sha256=%s\nunit_kill_signal=%s\nunit_timeout_stop_secs=%s\nshutdown_signal_unix=%s\nshutdown_elapsed_secs=%s\n' \
+    "$harness_bundle_sha256" "$final_status_sha256" "$unit_kill_signal" \
+    "$unit_timeout_stop_secs" "$shutdown_signal_unix" "$shutdown_elapsed_secs"
   printf 'copy_manifest_sha256=%s\naccount_census_before_count=%s\naccount_census_before_sha256=%s\naccount_census_before_safe=true\naccount_census_after_count=%s\naccount_census_after_sha256=%s\naccount_census_after_safe=%s\naccount_census_before_after_identical=%s\nreadiness_sha256=%s\nservice_log_prefix_length=%s\nservice_log_prefix_sha256=%s\ndatabase_observation=%s\nwatch_log_sha256=%s\nservice_log_sha256=%s\n' \
     "$copy_manifest_sha256" \
     "$account_census_before_count" \

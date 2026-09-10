@@ -3,8 +3,9 @@
 
 set -euo pipefail
 
+financial_deploy_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy" && pwd -P)
 # shellcheck source=../deploy/generation_common.sh
-source "$(cd "$(dirname "$0")/../deploy" && pwd)/generation_common.sh"
+source "$financial_deploy_dir/generation_common.sh"
 
 IDENTITY_MANIFEST=$MANIFEST
 MANIFEST="$DEPLOY_HOME/pe-financial-era.json"
@@ -197,8 +198,11 @@ export_financial_config_rows() {
 }
 
 read_rehearsal_evidence() {
+  local expected_harness_bundle
+  expected_harness_bundle=$(harness_bundle_digest "$financial_deploy_dir") ||
+    die "derive the current rehearsal harness bundle"
   python3 -c 'import hashlib,json,os,re,sys
-evidence_path,expected_revision,expected_artifact,expected_artifact_sha,expected_activation,expected_generation,expected_config_sha,expected_environment_sha=sys.argv[1:]
+evidence_path,expected_revision,expected_artifact,expected_artifact_sha,expected_activation,expected_generation,expected_config_sha,expected_environment_sha,expected_harness_bundle=sys.argv[1:]
 def refuse(reason):
     print("REHEARSAL_REFUSAL="+reason,file=sys.stderr)
     raise SystemExit(1)
@@ -228,7 +232,10 @@ try:
             key,separator,value=raw.rstrip("\n").partition("=")
             if not separator or not key: refuse("malformed_result_manifest")
             if key in rows:
-                refuse("malformed_legacy_continuations" if key == "legacy_continuations" else "malformed_result_manifest")
+                if key == "legacy_continuations": refuse("malformed_legacy_continuations")
+                if key == "harness_bundle_sha256": refuse("malformed_harness_bundle_sha256")
+                if key in {"unit_kill_signal","unit_timeout_stop_secs"}: refuse("malformed_unit_policy")
+                refuse("malformed_result_manifest")
             rows[key]=value
 except (OSError,UnicodeError):
     refuse("malformed_result_manifest")
@@ -237,6 +244,19 @@ legacy_continuations=rows.get("legacy_continuations")
 if legacy_continuations is None: refuse("missing_legacy_continuations")
 if re.fullmatch(r"[0-9]+:[0-9a-f]{64}",legacy_continuations) is None:
     refuse("malformed_legacy_continuations")
+# Issue #586: these bindings remain in the hash-bound result manifest so the fixed-shape outer
+# rehearsal-evidence JSON does not change.
+harness_bundle=rows.get("harness_bundle_sha256")
+if harness_bundle is None: refuse("missing_harness_bundle_sha256")
+if re.fullmatch(r"[0-9a-f]{64}",harness_bundle) is None:
+    refuse("malformed_harness_bundle_sha256")
+if harness_bundle != expected_harness_bundle: refuse("harness_bundle_mismatch")
+unit_kill_signal=rows.get("unit_kill_signal")
+unit_timeout_stop_secs=rows.get("unit_timeout_stop_secs")
+if unit_kill_signal is None or unit_timeout_stop_secs is None: refuse("missing_unit_policy")
+if (re.fullmatch(r"[0-9]+",unit_kill_signal) is None
+        or re.fullmatch(r"[0-9]+",unit_timeout_stop_secs) is None):
+    refuse("malformed_unit_policy")
 for key in ("result","target_revision","artifact_blake3","artifact_sha256","activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256","rehearsal_environment_sha256"):
     if rows.get(key) != evidence.get(key): refuse("evidence_identity_mismatch")
 if rows.get("sha") != evidence.get("target_revision"): refuse("reviewed_revision_mismatch")
@@ -269,10 +289,43 @@ bound={
     "environment_sha256":evidence["environment_sha256"],
     "rehearsal_environment_sha256":evidence["rehearsal_environment_sha256"],
     "legacy_continuations":legacy_continuations,
+    "harness_bundle_sha256":harness_bundle,
+    "unit_kill_signal":int(unit_kill_signal),
+    "unit_timeout_stop_secs":int(unit_timeout_stop_secs),
 }
 print(json.dumps(bound,sort_keys=True,separators=(",",":")))' \
     "$rehearsal_evidence" "$target_revision" "$artifact_blake3" "$target_artifact_sha256" \
-    "$activation_id" "$generation" "$(sha256_file "$target_config")" "$(sha256_file "$target_environment")"
+    "$activation_id" "$generation" "$(sha256_file "$target_config")" "$(sha256_file "$target_environment")" \
+    "$expected_harness_bundle"
+}
+
+verify_persisted_financial_guard() {
+  local guard=$1 service_activity=${2:-} current persisted observed policy_valid=true
+  local observed_kill observed_timeout expected_kill expected_timeout
+  case "$guard" in
+    harness_bundle)
+      current=$(harness_bundle_digest "$financial_deploy_dir") ||
+        die "derive the current rehearsal harness bundle"
+      persisted=$(manifest_get rehearsal_evidence.harness_bundle_sha256)
+      if [[ "$current" != "$persisted" ]]; then
+        echo "REHEARSAL_REFUSAL=harness_bundle_mismatch" >&2
+        die "harness_bundle_mismatch"
+      fi
+      ;;
+    unit_stop_policy)
+      if ! observed=$(service_unit_stop_policy pe-service); then policy_valid=false; fi
+      read -r observed_kill observed_timeout <<< "$observed"
+      expected_kill=$(manifest_get rehearsal_evidence.unit_kill_signal)
+      expected_timeout=$(manifest_get rehearsal_evidence.unit_timeout_stop_secs)
+      if [[ "$policy_valid" != true || "$observed_kill" != 2 ||
+            "$observed_kill" != "$expected_kill" || "$observed_timeout" != "$expected_timeout" ]]; then
+        printf 'REHEARSAL_REFUSAL=unit_stop_policy_drift service_active=%s observed_kill_signal=%s observed_timeout_stop_secs=%s\n' \
+          "$service_activity" "$observed_kill" "$observed_timeout" >&2
+        die "unit_stop_policy_drift"
+      fi
+      ;;
+    *) die "unknown persisted financial guard: $guard" ;;
+  esac
 }
 
 file_identity_json() {
@@ -760,13 +813,15 @@ fi
 case "$state" in
   prepared)
     if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); raise SystemExit(0 if v.get("stop_invoked") else 1)' "$MANIFEST"; then
+      current_active=$(systemctl_active_state pe-service)
+      verify_persisted_financial_guard unit_stop_policy "$current_active"
       if ! manifest_flag service_stop_intent; then
-        was_active=$(systemctl_active_state pe-service)
+        was_active=$current_active
         manifest_patch_boundary service-stop-intent "{\"service_stop_intent\":true,\"service_was_active\":$was_active}"
       else
         was_active=$(manifest_get service_was_active)
       fi
-      if [[ "$(systemctl_active_state pe-service)" == true ]]; then
+      if [[ "$current_active" == true ]]; then
         "${SERVICE_MUTATE[@]}" stop pe-service
       fi
       [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service did not become inert"
@@ -804,6 +859,9 @@ esac
 if [[ "$state" == guarded ]]; then
   service_active=$(systemctl_active_state pe-service)
   if [[ "$complete_start" == false ]]; then
+    # Issue #586: guarded entry reuses only persisted bindings; it never reopens rehearsal files.
+    verify_persisted_financial_guard harness_bundle
+    verify_persisted_financial_guard unit_stop_policy "$service_active"
     [[ "$service_active" == false ]] || die "pre-Start guarded activation requires an inert service"
     verify_legacy_service_contract
     if ! python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(0 if value.get("remote_archive_completed") is True else 1)' "$MANIFEST"; then
@@ -820,6 +878,10 @@ if [[ "$state" == guarded ]]; then
     manifest_patch_boundary qualification-started "$(python3 -c 'import json,sys; print(json.dumps({"start_receipt":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$start_receipt")"
   else
     start_receipt=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["receipt"],sort_keys=True,separators=(",",":")))' "$COMPLETE_START_OUTPUT") || die "complete Start receipt is invalid"
+    if [[ "$service_active" == false ]]; then
+      # Catch resume-time policy drift before any remaining roll-forward receipt is written.
+      verify_persisted_financial_guard unit_stop_policy "$service_active"
+    fi
     if [[ "$service_active" == true ]]; then
       [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get target_artifact_sha256)" ]] || die "running post-Start binary is not the reviewed target"
       [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get target_config_sha256)" ]] || die "running post-Start config is not the reviewed target"
@@ -895,6 +957,7 @@ if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise S
   fi
   service_active=$(systemctl_active_state pe-service)
   if [[ "$service_active" == false ]]; then
+    verify_persisted_financial_guard unit_stop_policy "$service_active"
     manifest_flag service_start_intent ||
       manifest_patch_boundary service-start-intent '{"service_start_intent":true}'
     "${SERVICE_MUTATE[@]}" start pe-service

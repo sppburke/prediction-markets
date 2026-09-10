@@ -33,6 +33,9 @@ reject_text() {
 }
 
 bash -n "$DRIVER" "$COMMON" "$GENERATION" "$ROLLBACK" "$REHEARSAL" "$REHEARSAL_PREFLIGHT"
+REPOSITORY_HARNESS_BUNDLE_SHA256=$(bash -c \
+  'source "$1"; harness_bundle_digest "$2"' bash "$COMMON" "$REPO_ROOT/scripts/deploy") ||
+  fail "could not derive the repository rehearsal harness bundle"
 
 for field in activation_id generation_dir copy_manifest_sha256 readiness_sha256 config_sha256 \
   environment_sha256 rehearsal_environment_sha256; do
@@ -180,10 +183,21 @@ case "$1" in
     echo inactive; exit 3
     ;;
   is-enabled) echo enabled ;;
+  show)
+    if [[ -f "$state/unit-stop-policy" ]]; then
+      cat "$state/unit-stop-policy"
+    else
+      printf '%s\n' 'KillSignal=2' 'TimeoutStopUSec=5s'
+    fi
+    ;;
   stop)
     echo false > "$state/service.active"
     count=0; [[ ! -f "$state/stop-count" ]] || count=$(<"$state/stop-count")
     echo $((count + 1)) > "$state/stop-count"
+    if [[ -f "$state/crash-after-stop" ]]; then
+      rm -f "$state/crash-after-stop"
+      exit 86
+    fi
     ;;
   start)
     echo true > "$state/service.active"
@@ -313,18 +327,31 @@ case "$mode" in
   *) exit 95 ;;
 esac
 SH
-  chmod +x "$bin/systemctl" "$bin/psql" "$bin/curl"
+  # Issue #586 branch review: a sqlite3 wrapper that stalls the fence observer inside its helper when
+  # the slow-observer marker exists, recording its pid so the scenario can prove the observer's
+  # process group was reaped before the child was signalled.
+  cat > "$bin/sqlite3" <<'SH'
+#!/usr/bin/env bash
+state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
+if [[ -f "$state/slow-sqlite" ]]; then
+  echo $$ > "$state/slow-sqlite.pid"
+  sleep 20
+fi
+exec /usr/bin/sqlite3 "$@"
+SH
+  chmod +x "$bin/systemctl" "$bin/psql" "$bin/curl" "$bin/sqlite3"
 }
 
 write_rehearsal_evidence() {
   local root=$1
   local artifact_sha256=${2:-$(sha256sum "$root/target/pe-service" | awk '{print $1}')}
   local rehearsal=$root/rehearsal manifest=$root/rehearsal/manifest.txt digest config_sha256 environment_sha256
-  local empty_sha256
+  local empty_sha256 harness_bundle_sha256
   local rehearsal_environment_sha256=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
   config_sha256=$(sha256sum "$root/target/service.toml" | awk '{print $1}')
   environment_sha256=$(sha256sum "$root/target/service.env" | awk '{print $1}')
   empty_sha256=$(printf '' | sha256sum | awk '{print $1}')
+  harness_bundle_sha256=$REPOSITORY_HARNESS_BUNDLE_SHA256
   mkdir -p "$rehearsal"
   printf '%s\n' \
     'result=PASS' \
@@ -337,6 +364,9 @@ write_rehearsal_evidence() {
     "generation_dir=$root/prediction-markets/gen/g557" \
     'copy_manifest_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
     "legacy_continuations=0:$empty_sha256" \
+    "harness_bundle_sha256=$harness_bundle_sha256" \
+    'unit_kill_signal=2' \
+    'unit_timeout_stop_secs=5' \
     'readiness_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
     "config_sha256=$config_sha256" \
     "environment_sha256=$environment_sha256" \
@@ -384,6 +414,52 @@ evidence[key] = replacement
 with open(evidence_path, "w", encoding="utf-8") as output:
     json.dump(evidence, output, sort_keys=True, separators=(",", ":"))
 PY
+}
+
+edit_bound_manifest_row() {
+  local root=$1 key=$2 mode=$3 value=${4:-}
+  python3 - "$root/rehearsal/evidence.json" "$key" "$mode" "$value" <<'PY'
+import hashlib, json, sys
+
+evidence_path, key, mode, replacement = sys.argv[1:]
+evidence=json.load(open(evidence_path,encoding="utf-8"))
+manifest_path=evidence["manifest_path"]
+rows=[]
+found=[]
+for raw in open(manifest_path,encoding="utf-8"):
+    name,separator,value=raw.rstrip("\n").partition("=")
+    if name == key:
+        found.append(raw)
+        if mode == "missing":
+            continue
+        if mode in {"replace","duplicate"}:
+            raw=f"{key}={replacement}\n"
+    rows.append(raw)
+assert len(found) == 1
+if mode == "duplicate":
+    rows.append(f"{key}={replacement}\n")
+with open(manifest_path,"w",encoding="utf-8") as output:
+    output.writelines(rows)
+evidence["evidence_sha256"]=hashlib.sha256(open(manifest_path,"rb").read()).hexdigest()
+with open(evidence_path,"w",encoding="utf-8") as output:
+    json.dump(evidence,output,sort_keys=True,separators=(",",":"))
+PY
+}
+
+setup_hermetic_financial_driver() {
+  local root=$1 copy_root=$root/hermetic-driver
+  mkdir -p "$copy_root/scripts/deploy" "$copy_root/scripts/paper_reset"
+  cp "$DRIVER" "$SCRIPT_DIR/archive_paper_state.sql" "$SCRIPT_DIR/restore_paper_state.sql" \
+    "$copy_root/scripts/paper_reset/"
+  cp "$REHEARSAL" "$COMMON" "$REHEARSAL_PREFLIGHT" "$copy_root/scripts/deploy/"
+  cp "$REPO_ROOT/scripts/migrate_service_config_545.sql" \
+    "$REPO_ROOT/scripts/supabase_paper_state_schema.sql" \
+    "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql" "$copy_root/scripts/"
+  HERMETIC_DRIVER="$copy_root/scripts/paper_reset/activate_financial_era.sh"
+  HERMETIC_PREFLIGHT="$copy_root/scripts/deploy/rehearsal_preflight.sh"
+  HERMETIC_BUNDLE_SHA256=$(bash -c 'source "$1"; harness_bundle_digest "$2"' bash \
+    "$copy_root/scripts/deploy/generation_common.sh" "$copy_root/scripts/deploy")
+  edit_bound_manifest_row "$root" harness_bundle_sha256 replace "$HERMETIC_BUNDLE_SHA256"
 }
 
 setup_fixture() {
@@ -521,10 +597,13 @@ db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.
       echo "rehearsal child started before the copy's migration paths were updated" >&2
       exit 93
     }
-    /usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" \
-      "$fixture_root/test-state/rehearsal-account-status" <<'PY'
-import datetime,json,os,sqlite3,sys
-status,database,scenario_path=sys.argv[1:]
+    exec /usr/bin/python3 - "$PE_STATUS_PATH" "$PE_PAPER_STATE_DB_PATH" \
+      "$fixture_root/test-state/rehearsal-account-status" \
+      "$fixture_root/test-state/injection" \
+      "$fixture_root/test-state/rehearsal-sigint-count" <<'PY'
+import datetime, json, os, signal, sqlite3, sys, time
+
+status, database, scenario_path, injection_path, sigint_marker = sys.argv[1:]
 db=sqlite3.connect(database)
 db.execute("insert into position_anchors values(?,?)",("0x0000000000000000000000000000000000000545",2))
 db.execute("update poll_cursors set reanchor_required=0 where wallet_hex=?",("0x0000000000000000000000000000000000000545",))
@@ -536,12 +615,27 @@ if os.path.exists(fences_path):
             wallet,cause=line.split("|",1)
             db.execute("insert into wallet_fences values(?,?)",(wallet,cause))
 db.commit(); db.close()
-value={
- "revision":"1"*40,"updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
- "tasks":[{"name":"public_activity_poll","state":"running","class":"critical"}],
- "source_health":{"poll_last_round_age_secs":0},
- "live":{"stale":True,"accounts":[]},
-}
+
+def running_status(counter=0, updated_at=None):
+    value={
+     "revision":"1"*40,"updated_at":(updated_at or datetime.datetime.now(datetime.timezone.utc)).isoformat(),
+     "tasks":[{"name":name,"state":"running","class":"critical","failure":None}
+              for name in ("public_activity_poll","status_writer")],
+     "source_health":{"poll_last_round_age_secs":0,
+                      "reconciliation_obligations_dropped_total":counter,
+                      "ws_sink_poisoned":False},
+     "live":{"stale":True,"accounts":[]},
+    }
+    return value
+
+def write_status(value):
+    temporary=status+".service.tmp"
+    with open(temporary,"w",encoding="utf-8") as output:
+        json.dump(value,output)
+    os.replace(temporary,status)
+
+injection=open(injection_path,encoding="utf-8").read().strip()
+value=running_status({"within_run_loss": 1, "within_run_loss_highbit": 9223372036854775808}.get(injection, 0))
 scenario=open(scenario_path,encoding="utf-8").read().strip()
 if scenario == "absent_live": value.pop("live")
 elif scenario == "fresh_empty": value["live"]["stale"] = False
@@ -553,13 +647,89 @@ elif scenario == "fresh_nonempty":
                        "requested_live_mode":"off","effective_live_mode":"off"}]}
 elif scenario != "authorization_denied":
     raise SystemExit("unknown rehearsal account-status scenario")
-temporary=status+".service.tmp"
-with open(temporary,"w",encoding="utf-8") as output: json.dump(value,output)
-os.replace(temporary,status)
+write_status(value)
+
+def terminate(_signum, _frame):
+    os._exit(0)
+
+def interrupt(_signum, _frame):
+    count=0
+    try:
+        count=int(open(sigint_marker,encoding="utf-8").read().strip())
+    except (FileNotFoundError,ValueError):
+        pass
+    with open(sigint_marker,"w",encoding="utf-8") as output:
+        output.write(str(count+1)+"\n")
+    current=open(injection_path,encoding="utf-8").read().strip()
+    if current == "exit_nonzero_on_sigint":
+        os._exit(3)
+    if current == "missing_file":
+        try: os.unlink(status)
+        except FileNotFoundError: pass
+        os._exit(0)
+    if current == "invalid_json":
+        with open(status,"w",encoding="utf-8") as output: output.write("{invalid\n")
+        os._exit(0)
+    if current == "same_second_stale":
+        signal_second=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+        write_status(running_status(updated_at=signal_second))
+        os._exit(0)
+
+    final={
+     "revision":"1"*40,"updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+     "tasks":[
+       {"name":"public_activity_poll","state":"stopped","class":"critical","failure":None},
+       {"name":"status_writer","state":"stopping","class":"critical","failure":None},
+     ],
+     "source_health":{"poll_last_round_age_secs":0,
+                      "reconciliation_obligations_dropped_total":0,
+                      "ws_sink_poisoned":False},
+     "live":{"stale":True,"accounts":[]},
+    }
+    if current == "stale_updated_at":
+        final["updated_at"]=(datetime.datetime.now(datetime.timezone.utc)
+                             - datetime.timedelta(seconds=2)).isoformat()
+    elif current == "no_stopping_marker":
+        final["tasks"][1]["state"]="stopped"
+    elif current == "missing_source_health":
+        final.pop("source_health")
+    elif current == "missing_counter":
+        final["source_health"].pop("reconciliation_obligations_dropped_total")
+    elif current == "negative_counter":
+        final["source_health"]["reconciliation_obligations_dropped_total"]=-1
+    elif current == "boolean_counter":
+        final["source_health"]["reconciliation_obligations_dropped_total"]=True
+    elif current == "string_counter":
+        final["source_health"]["reconciliation_obligations_dropped_total"]="0"
+    elif current == "poisoned_final":
+        final["source_health"]["ws_sink_poisoned"]=True
+    elif current == "poison_flag_missing":
+        final["source_health"].pop("ws_sink_poisoned")
+    elif current == "poison_flag_non_boolean":
+        final["source_health"]["ws_sink_poisoned"]="false"
+    elif current == "failed_critical_owner":
+        final["tasks"][0].update(state="failed",failure={"kind":"fixture"})
+    elif current == "critical_owner_still_running":
+        final["tasks"][0]["state"]="running"
+    elif current == "obligations_dropped":
+        final["source_health"]["reconciliation_obligations_dropped_total"]=1
+    elif current == "obligations_dropped_highbit":
+        final["source_health"]["reconciliation_obligations_dropped_total"]=9223372036854775808
+    write_status(final)
+    delay = {"delayed_clean_exit": 6, "delayed_clean_exit_just_over": 5.05, "clean_exit_inside_bound": 4.5}.get(current)
+    if delay is not None:
+        time.sleep(delay)
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, terminate)
+if injection == "ignore_sigint":
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+else:
+    signal.signal(signal.SIGINT, interrupt)
+print('{"level":"INFO","message":"fake rehearsal service ready"}',flush=True)
+while True:
+    signal.pause()
 PY
-    printf '%s\n' '{"level":"INFO","message":"fake rehearsal service ready"}'
-    trap 'exit 0' TERM INT
-    while :; do /bin/sleep 1; done
     ;;
 esac
 SH
@@ -708,18 +878,20 @@ count=0
 [[ ! -f "$state/curl-count" ]] || count=$(<"$state/curl-count")
 count=$((count + 1))
 printf '%s\n' "$count" > "$state/curl-count"
+injection=$(<"$state/injection")
 observers_ready=false
+expected_drops='0 0'
+if [[ "$injection" == recycle && -f "$state/injected" ]]; then expected_drops='1 0'; fi
 if [[ -f "$rehearsal_root/status-1111111.state" &&
       -f "$rehearsal_root/drops-1111111.state" &&
       -f "$rehearsal_root/fences-1111111.state" &&
       -f "$rehearsal_root/writes-1111111.state" &&
-      $(<"$rehearsal_root/status-1111111.state") == '1 1 1 1 1' &&
-      $(<"$rehearsal_root/drops-1111111.state") == '0 0 0' &&
+      $(<"$rehearsal_root/status-1111111.state") == '1 1 1 1 1 0' &&
+      $(<"$rehearsal_root/drops-1111111.state") == "$expected_drops" &&
       $(<"$rehearsal_root/fences-1111111.state") == '1 0' &&
       $(<"$rehearsal_root/writes-1111111.state") == '0 0' ]]; then
   observers_ready=true
 fi
-injection=$(<"$state/injection")
 if [[ "$observers_ready" != true ]]; then
   printf '%s\n' '{"ready":false,"issues":["observers_pending"]}' > "$output"
 elif [[ "$injection" != none && ! -f "$state/race-armed" ]]; then
@@ -730,9 +902,21 @@ else
     case "$injection" in
       error) printf '%s\n' '{"level":"ERROR","message":"controlled late error"}' ;;
       write) printf '%s\n' '{"level":"INFO","message":"fill committed"}' ;;
-      *) exit 97 ;;
+      recycle)
+        if [[ -f "$state/recycle-log-line" ]]; then
+          cat "$state/recycle-log-line"
+        else
+          printf '%s\n' '{"level":"WARN","message":"activity ws reader produced no normalized activity row; dropping socket","slot":1,"timeout_secs":30,"last_wire_frame_age_secs":"Some(0)","last_normalized_activity_age_secs":"Some(175)","buffered_frame_processed":true}'
+        fi
+        ;;
+      slow_observer) : > "$state/slow-sqlite" ;;
+      *) : ;;
     esac >> "$rehearsal_root/service-1111111.log"
     : > "$state/injected"
+    if [[ "$injection" == recycle ]]; then
+      printf '%s\n' '{"ready":false,"issues":["recycle_observers_pending"]}' > "$output"
+      exit 0
+    fi
   fi
   printf '%s\n' '{"ready":true,"issues":[]}' > "$output"
 fi
@@ -844,9 +1028,10 @@ output=$(run_rehearsal_fixture "$root" 2>&1)
 grep -Fq "PROCESS_EXE expected=$root/rehearsal/artifacts-1111111/pe-service resolved=$root/rehearsal/artifacts-1111111/pe-service matches=true" \
   "$root/rehearsal/watch-1111111.log" ||
   fail "rehearsal watch log did not bind the running private executable"
-python3 -c 'import hashlib,json,os,re,stat,sys
+python3 -c 'import datetime,hashlib,json,os,re,stat,sys
 (evidence_path,activation_path,config,environment,rehearsal_environment,copy_manifest,
- readiness,target_binary,census_before_path,census_after_path,census_query_count_path)=sys.argv[1:]
+ readiness,target_binary,census_before_path,census_after_path,census_query_count_path,
+ final_status_path,expected_bundle)=sys.argv[1:]
 e=json.load(open(evidence_path,encoding="utf-8"))
 a=json.load(open(activation_path,encoding="utf-8"))
 def digest(path): return hashlib.sha256(open(path,"rb").read()).hexdigest()
@@ -871,10 +1056,22 @@ rehearsal_lines=open(rehearsal_environment,encoding="utf-8").readlines()
 assert [line for line in production_lines if not credential.match(line)] == [line for line in rehearsal_lines if not credential.match(line)]
 rehearsal_credentials=[line.rstrip("\n").split("=",1)[1] for line in rehearsal_lines if credential.match(line)]
 assert rehearsal_credentials == ["sb_publishable_rehearsal","sb_publishable_rehearsal"]
-rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+raw_rows=[line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8")]
+rows=dict(raw_rows)
 for key in ("activation_id","generation_dir","copy_manifest_sha256","readiness_sha256","config_sha256","environment_sha256","rehearsal_environment_sha256"):
     assert rows[key]==e[key]
 assert rows["legacy_continuations"] == "0:" + hashlib.sha256(b"").hexdigest()
+for key in ("harness_bundle_sha256","final_status_sha256","unit_kill_signal",
+            "unit_timeout_stop_secs","shutdown_signal_unix","shutdown_elapsed_secs"):
+    assert sum(name == key for name,_ in raw_rows) == 1
+assert rows["harness_bundle_sha256"] == expected_bundle
+assert rows["unit_kill_signal"] == "2" and rows["unit_timeout_stop_secs"] == "5"
+assert rows["shutdown_signal_unix"].isdigit() and rows["shutdown_elapsed_secs"].isdigit()
+assert rows["final_status_sha256"] == digest(final_status_path)
+final_status=json.load(open(final_status_path,encoding="utf-8"))
+updated=datetime.datetime.fromisoformat(final_status["updated_at"].replace("Z","+00:00")).timestamp()
+assert updated >= int(rows["shutdown_signal_unix"])
+assert final_status["source_health"]["ws_sink_poisoned"] is False
 before=open(census_before_path,"rb").read()
 after=open(census_after_path,"rb").read()
 assert rows["account_census_before_count"]==str(len(before.splitlines()))
@@ -894,7 +1091,8 @@ assert rows["database_observation"]=="anchor_after:2,reanchor_required:0,unexpec
   "$root/rehearsal/readiness-1111111.json" "$root/target/pe-service" \
   "$root/test-state/rehearsal-account-census-before" \
   "$root/test-state/rehearsal-account-census-after" \
-  "$root/test-state/rehearsal-account-census-query-count" ||
+  "$root/test-state/rehearsal-account-census-query-count" \
+  "$root/rehearsal/copy/status.json" "$REPOSITORY_HARNESS_BUNDLE_SHA256" ||
   fail "rehearsal evidence bindings are incomplete"
 production_environment_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_sha256"])' \
   "$root/rehearsal/evidence.json")
@@ -909,6 +1107,9 @@ activation=json.load(open(sys.argv[1])); financial=json.load(open(sys.argv[2]));
 rows=dict(line.rstrip("\n").split("=",1) for line in open(evidence["manifest_path"],encoding="utf-8"))
 assert financial["rehearsal_evidence"]["sha256"] == evidence["evidence_sha256"]
 assert financial["rehearsal_evidence"]["legacy_continuations"] == rows["legacy_continuations"]
+assert financial["rehearsal_evidence"]["harness_bundle_sha256"] == rows["harness_bundle_sha256"]
+assert financial["rehearsal_evidence"]["unit_kill_signal"] == 2
+assert financial["rehearsal_evidence"]["unit_timeout_stop_secs"] == 5
 assert financial["target_config_sha256"] == evidence["config_sha256"]
 assert financial["target_environment_sha256"] == evidence["environment_sha256"]
 assert financial["old_artifact_sha256"] == activation["artifacts"]["binary"]["sha256"]
@@ -1157,6 +1358,12 @@ root=$TEST_TMP/rehearsal-disabled-authority
 setup_rehearsal_fixture "$root" false none
 output=$(run_rehearsal_fixture "$root" 2>&1)
 [[ "$output" == *REHEARSAL545_PASS* ]] || fail "authoritative disabled-source rehearsal did not pass: $output"
+# This is an environment-identity fixture: its fake child emits source_health in both websocket
+# modes and deliberately does not model the real websocket-disabled status shape (#586).
+manifest_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_path"])' \
+  "$root/rehearsal/evidence.json")
+grep -Eq '^final=.*credit_loss=0([[:space:]]|$)' "$manifest_path" ||
+  fail "websocket-disabled rehearsal did not retain zero observed credit loss"
 disabled_environment_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment_sha256"])' \
   "$root/rehearsal/evidence.json")
 [[ "$production_environment_sha256" != "$disabled_environment_sha256" ]] ||
@@ -1184,6 +1391,247 @@ assert rows["service_log_prefix_length"].isdigit()
 assert len(rows["service_log_prefix_sha256"])==64' "$root/rehearsal/evidence.json" ||
     fail "late $injection result did not bind the refusing final scan"
 done
+
+# Scenarios REHEARSAL-SOCKET-RECYCLE-09A (two socket paths),
+# REHEARSAL-WITHIN-RUN-LOSS-09E, and REHEARSAL-OBLIGATIONS-DROPPED-09B (#586).
+for recycle_path in buffered_frame control_frame; do
+  root="$TEST_TMP/rehearsal-recycle-$recycle_path"
+  setup_rehearsal_fixture "$root" true recycle
+  if [[ "$recycle_path" == control_frame ]]; then
+    printf '%s\n' '{"level":"WARN","message":"activity ws reader produced no normalized activity row; dropping socket","slot":1,"timeout_secs":30,"last_wire_frame_age_secs":"Some(1)","last_normalized_activity_age_secs":"Some(31)","buffered_frame_processed":false}' \
+      > "$root/test-state/recycle-log-line"
+  fi
+  output=$(run_rehearsal_fixture "$root" 2>&1)
+  [[ "$output" == *REHEARSAL545_PASS* ]] || fail "$recycle_path socket recycle did not pass: $output"
+  [[ $(<"$root/rehearsal/drops-1111111.state") == '1 0' &&
+     $(<"$root/rehearsal/status-1111111.state") == '1 1 1 1 1 0' ]] ||
+    fail "$recycle_path socket recycle did not preserve the two observer contracts"
+  [[ $(<"$root/test-state/rehearsal-sigint-count") == 1 ]] ||
+    fail "$recycle_path socket recycle did not handle SIGINT exactly once"
+  python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" \
+    "$REPOSITORY_HARNESS_BUNDLE_SHA256" <<'PY' || fail "socket recycle evidence bindings are incomplete"
+import datetime, hashlib, json, re, sys
+evidence_path, status_path, expected_bundle = sys.argv[1:]
+evidence=json.load(open(evidence_path,encoding="utf-8"))
+raw=[line.rstrip("\n").split("=",1) for line in open(evidence["manifest_path"],encoding="utf-8")]
+rows=dict(raw)
+assert "drops=1" in rows["final"] and "credit_loss=0" in rows["final"]
+assert rows["harness_bundle_sha256"] == expected_bundle
+assert rows["unit_kill_signal"] == "2" and rows["unit_timeout_stop_secs"] == "5"
+assert rows["shutdown_signal_unix"].isdigit() and rows["shutdown_elapsed_secs"].isdigit()
+assert rows["final_status_sha256"] == hashlib.sha256(open(status_path,"rb").read()).hexdigest()
+status=json.load(open(status_path,encoding="utf-8"))
+updated=datetime.datetime.fromisoformat(status["updated_at"].replace("Z","+00:00")).timestamp()
+assert updated >= int(rows["shutdown_signal_unix"])
+for key in ("harness_bundle_sha256","final_status_sha256","unit_kill_signal",
+            "unit_timeout_stop_secs","shutdown_signal_unix","shutdown_elapsed_secs"):
+    assert sum(name == key for name,_ in raw) == 1
+PY
+done
+
+# The high-bit row is a legal u64 above Bash's signed range (#586 review): the harness compares the
+# canonical decimal text, so it must still refuse.
+for loss_case in "within_run_loss 1" "within_run_loss_highbit 9223372036854775808"; do
+set -- $loss_case; loss_injection=$1; loss_value=$2
+root=$TEST_TMP/rehearsal-$loss_injection
+setup_rehearsal_fixture "$root" true "$loss_injection"
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=unsafe_evidence"* ]] ||
+  fail "$loss_injection obligation loss was not refused: $output"
+[[ $(<"$root/rehearsal/status-1111111.state") == "1 1 1 1 1 $loss_value" &&
+   ! -e "$root/test-state/rehearsal-sigint-count" ]] ||
+  fail "$loss_injection obligation loss did not abort before SIGINT"
+python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" <<'PY' || fail "within-run loss did not bind the preserved status"
+import hashlib,json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8"))
+raw=[line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8")]
+rows=dict(raw)
+assert rows["reason"] == "unsafe_evidence"
+assert rows["final_status_sha256"] == hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()
+for key in ("unit_kill_signal","unit_timeout_stop_secs","shutdown_signal_unix","shutdown_elapsed_secs"):
+    assert sum(name == key for name,_ in raw) == 1 and rows[key] == "absent"
+PY
+done
+
+for loss_case in "obligations_dropped 1" "obligations_dropped_highbit 9223372036854775808"; do
+set -- $loss_case; loss_injection=$1; loss_value=$2
+root=$TEST_TMP/rehearsal-final-$loss_injection
+setup_rehearsal_fixture "$root" true "$loss_injection"
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=unsafe_evidence"* ]] ||
+  fail "$loss_injection final obligation loss was not refused: $output"
+[[ $(<"$root/rehearsal/status-1111111.state") == '1 1 1 1 1 0' &&
+   $(<"$root/test-state/rehearsal-sigint-count") == 1 ]] ||
+  fail "final obligation-loss fixture did not preserve its within-run sample and SIGINT proof"
+python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" "$loss_value" <<'PY' || fail "final obligation loss did not bind the authoritative final status"
+import hashlib,json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8")); rows=dict(
+    line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+assert f"credit_loss={sys.argv[3]}" in rows["final"], rows["final"]
+assert rows["final_status_sha256"] == hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()
+PY
+done
+
+# Scenario REHEARSAL-FINAL-STATUS-INVALID-09C: every malformed, stale, unsafe, or non-final shape
+# refuses PASS independently of the preserved-file digest (#586).
+final_status_cases=(
+  missing_file invalid_json stale_updated_at same_second_stale no_stopping_marker
+  missing_source_health missing_counter negative_counter boolean_counter string_counter
+  poisoned_final poison_flag_missing poison_flag_non_boolean failed_critical_owner
+  critical_owner_still_running
+)
+for final_case in "${final_status_cases[@]}"; do
+  root="$TEST_TMP/rehearsal-final-status-$final_case"
+  setup_rehearsal_fixture "$root" true "$final_case"
+  set +e
+  output=$(run_rehearsal_fixture "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=final_status_observation_failed"* ]] ||
+    fail "$final_case final status was not refused: $output"
+  python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" \
+    "$final_case" <<'PY' || fail "$final_case final-status digest binding is incorrect"
+import hashlib,json,os,sys
+evidence_path,status_path,case=sys.argv[1:]
+e=json.load(open(evidence_path,encoding="utf-8"))
+raw=[line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8")]
+rows=dict(raw)
+assert rows["reason"] == "final_status_observation_failed"
+assert sum(name == "final_status_sha256" for name,_ in raw) == 1
+if case == "missing_file":
+    assert not os.path.exists(status_path) and rows["final_status_sha256"] == "absent"
+else:
+    assert rows["final_status_sha256"] == hashlib.sha256(open(status_path,"rb").read()).hexdigest()
+PY
+done
+
+# Scenario REHEARSAL-SHUTDOWN-INCOMPLETE-09D: timeout, nonzero exit, and post-bound clean exit all
+# refuse before final-status validation, while cleanup leaves no child behind (#586).
+for shutdown_case in ignore_sigint exit_nonzero_on_sigint delayed_clean_exit delayed_clean_exit_just_over; do
+  root="$TEST_TMP/rehearsal-shutdown-$shutdown_case"
+  setup_rehearsal_fixture "$root" true "$shutdown_case"
+  set +e
+  output=$(run_rehearsal_fixture "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=service_shutdown_incomplete"* &&
+     "$output" != *REHEARSAL545_PASS* ]] ||
+    fail "$shutdown_case incomplete shutdown was not refused: $output"
+  child_pid=$(python3 -c 'import json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8")); rows=dict(
+ line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8")); print(rows["service_invocation_pid"])' \
+    "$root/rehearsal/evidence.json")
+  [[ ! -e "$root/proc/$child_pid" || ! -d "/proc/$child_pid" ]] ||
+    fail "$shutdown_case rehearsal child survived cleanup"
+  python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" <<'PY' || fail "incomplete shutdown evidence bindings are incomplete"
+import hashlib,json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8"))
+raw=[line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8")]
+rows=dict(raw)
+assert rows["unit_kill_signal"] == "2" and rows["unit_timeout_stop_secs"] == "5"
+assert rows["shutdown_elapsed_secs"].isdigit()
+assert sum(name == "final_status_sha256" for name,_ in raw) == 1
+assert rows["final_status_sha256"] == hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()
+PY
+done
+
+# Scenario REHEARSAL-SHUTDOWN-INSIDE-BOUND-09H: a clean exit just inside the unit timeout still passes,
+# and the recorded elapsed seconds are the floor of the measured shutdown (#586 branch review).
+root="$TEST_TMP/rehearsal-shutdown-inside-bound"
+setup_rehearsal_fixture "$root" true clean_exit_inside_bound
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "clean exit inside the bound did not pass: $output"
+python3 - "$root/rehearsal/evidence.json" <<'PY' || fail "inside-bound shutdown evidence is wrong"
+import json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8"))
+rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+assert rows["shutdown_elapsed_secs"] == "4", rows["shutdown_elapsed_secs"]
+assert rows["unit_timeout_stop_secs"] == "5"
+PY
+
+# Scenario REHEARSAL-OBSERVER-JOIN-09I: an observer stalled inside its sqlite3 helper across quiescence
+# is reaped with its process group before SIGINT, and its state file is not written after the signal
+# instant (#586 branch review).
+root="$TEST_TMP/rehearsal-observer-join"
+setup_rehearsal_fixture "$root" true slow_observer
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "slow observer run did not pass: $output"
+[[ -f "$root/test-state/slow-sqlite.pid" ]] || fail "slow sqlite3 helper never ran"
+helper_pid=$(<"$root/test-state/slow-sqlite.pid")
+[[ ! -d "/proc/$helper_pid" ]] || fail "observer helper $helper_pid survived quiescence"
+python3 - "$root/rehearsal/evidence.json" "$root/rehearsal" <<'PY' || fail "observer state was written after the signal instant"
+import glob,json,os,sys
+e=json.load(open(sys.argv[1],encoding="utf-8"))
+rows=dict(line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
+signal_unix=int(rows["shutdown_signal_unix"])
+states=glob.glob(os.path.join(sys.argv[2],"fences-*.state"))
+assert states, "no fence state file"
+for path in states:
+    assert int(os.stat(path).st_mtime) <= signal_unix, (path, os.stat(path).st_mtime, signal_unix)
+PY
+
+# Scenario REHEARSAL-STALE-QUIESCE-FLAG-09J: a quiesce flag left by an earlier run in the same root is
+# cleared at startup, so a same-revision rerun still reaches PASS (#586 branch review).
+root="$TEST_TMP/rehearsal-stale-quiesce-flag"
+setup_rehearsal_fixture "$root" true none
+mkdir -p "$root/rehearsal"; : > "$root/rehearsal/quiesce-1111111.flag"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "stale quiesce flag blocked a rerun: $output"
+
+# Scenario REHEARSAL-UNIT-STOP-POLICY-09F: invalid production stop policies refuse before SIGINT.
+for policy_case in wrong_signal missing_timeout malformed_timeout zero_timeout; do
+  root="$TEST_TMP/rehearsal-unit-policy-$policy_case"
+  setup_rehearsal_fixture "$root" true none
+  case "$policy_case" in
+    wrong_signal) printf '%s\n' 'KillSignal=15' 'TimeoutStopUSec=5s' > "$root/test-state/unit-stop-policy" ;;
+    missing_timeout) printf '%s\n' 'KillSignal=2' > "$root/test-state/unit-stop-policy" ;;
+    malformed_timeout) printf '%s\n' 'KillSignal=2' 'TimeoutStopUSec=garbage' > "$root/test-state/unit-stop-policy" ;;
+    zero_timeout) printf '%s\n' 'KillSignal=2' 'TimeoutStopUSec=0' > "$root/test-state/unit-stop-policy" ;;
+  esac
+  set +e
+  output=$(run_rehearsal_fixture "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=unit_stop_policy_mismatch"* &&
+     ! -e "$root/test-state/rehearsal-sigint-count" ]] ||
+    fail "$policy_case unit stop policy was not refused before SIGINT: $output"
+  python3 - "$root/rehearsal/evidence.json" "$policy_case" <<'PY' || fail "$policy_case unit-policy evidence values are incorrect"
+import json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8")); case=sys.argv[2]
+raw=[line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8")]
+rows=dict(raw)
+expected={"wrong_signal":("15","5"),"missing_timeout":("2","absent"),
+          "malformed_timeout":("2","absent"),"zero_timeout":("2","0")}[case]
+assert (rows["unit_kill_signal"],rows["unit_timeout_stop_secs"]) == expected
+for key in ("unit_kill_signal","unit_timeout_stop_secs","shutdown_signal_unix","shutdown_elapsed_secs"):
+    assert sum(name == key for name,_ in raw) == 1
+assert rows["shutdown_signal_unix"] == "absent" and rows["shutdown_elapsed_secs"] == "absent"
+PY
+done
+
+# Scenario REHEARSAL-RELEASE-ROOT-09G: production evidence is tree-local, while dry-run remains
+# deliberately path-independent (#586).
+root=$TEST_TMP/rehearsal-release-root
+mkdir -p "$root/divergent-release"
+set +e
+output=$(env -u PE_ACTIVATION_TESTING PE_REHEARSAL_ROOT="$root/rehearsal" \
+  PE_REHEARSAL_RELEASE_ROOT="$root/divergent-release" "$REHEARSAL" \
+  --target-config "$root/missing.toml" --target-environment "$root/missing.env" \
+  1111111111111111111111111111111111111111 2>&1)
+status=$?
+set -e
+[[ $status -eq 1 && "$output" == *"REHEARSAL545_FAIL reason=release_root_mismatch"* &&
+   ! -e "$root/rehearsal" ]] || fail "divergent production release root was not refused before copy: $output"
+output=$(env -u PE_ACTIVATION_TESTING PE_REHEARSAL_RELEASE_ROOT="$root/divergent-release" \
+  "$REHEARSAL" --dry-run 1111111111111111111111111111111111111111 2>&1)
+[[ "$output" == *REHEARSAL545_DRY_RUN=1* ]] ||
+  fail "dry-run became dependent on the release-root production guard: $output"
 
 # Scenario ENV-DATA-05
 # Preconditions: the reviewed target environment contains a shell command that reads the inherited
@@ -1658,6 +2106,68 @@ PY
     fail "$evidence_case legacy-continuation evidence crossed the prepared boundary"
 done
 
+# Scenarios FE-REHEARSAL-HARNESS-MISSING-01C through FE-REHEARSAL-HARNESS-DUPLICATE-01F
+# and FE-REHEARSAL-UNIT-POLICY-ROWS-01I (#586).
+for harness_case in missing malformed mismatch duplicate; do
+  root="$TEST_TMP/rehearsal-harness-$harness_case"
+  setup_fixture "$root"
+  case "$harness_case" in
+    missing)
+      edit_bound_manifest_row "$root" harness_bundle_sha256 missing
+      expected=missing_harness_bundle_sha256
+      ;;
+    malformed)
+      edit_bound_manifest_row "$root" harness_bundle_sha256 replace not-a-digest
+      expected=malformed_harness_bundle_sha256
+      ;;
+    mismatch)
+      edit_bound_manifest_row "$root" harness_bundle_sha256 replace "$(printf '0%.0s' {1..64})"
+      expected=harness_bundle_mismatch
+      ;;
+    duplicate)
+      edit_bound_manifest_row "$root" harness_bundle_sha256 duplicate "$REPOSITORY_HARNESS_BUNDLE_SHA256"
+      expected=malformed_harness_bundle_sha256
+      ;;
+  esac
+  driver_args "$root"
+  set +e
+  output=$(run_driver "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *"REHEARSAL_REFUSAL=$expected"* ]] ||
+    fail "$harness_case harness-bundle evidence was not typed-refused: $output"
+  [[ ! -e "$root/pe-financial-era.json" && $(<"$root/test-state/service.active") == true &&
+     ! -e "$root/test-state/stop-count" && ! -e "$root/test-state/archive-count" ]] ||
+    fail "$harness_case harness-bundle evidence crossed the prepared boundary"
+done
+
+for unit_field in unit_kill_signal unit_timeout_stop_secs; do
+  for unit_case in missing malformed duplicate; do
+    root="$TEST_TMP/rehearsal-unit-row-$unit_field-$unit_case"
+    setup_fixture "$root"
+    case "$unit_case" in
+      missing) edit_bound_manifest_row "$root" "$unit_field" missing ;;
+      malformed) edit_bound_manifest_row "$root" "$unit_field" replace not-an-integer ;;
+      duplicate)
+        value=2; [[ "$unit_field" != unit_timeout_stop_secs ]] || value=5
+        edit_bound_manifest_row "$root" "$unit_field" duplicate "$value"
+        ;;
+    esac
+    driver_args "$root"
+    set +e
+    output=$(run_driver "$root" 2>&1)
+    status=$?
+    set -e
+    expected=malformed_unit_policy
+    [[ "$unit_case" != missing ]] || expected=missing_unit_policy
+    [[ $status -ne 0 && "$output" == *"REHEARSAL_REFUSAL=$expected"* ]] ||
+      fail "$unit_field $unit_case evidence was not typed-refused: $output"
+    [[ ! -e "$root/pe-financial-era.json" && $(<"$root/test-state/service.active") == true &&
+       ! -e "$root/test-state/stop-count" ]] ||
+      fail "$unit_field $unit_case evidence crossed the prepared boundary"
+  done
+done
+
 # Scenario FE-REHEARSAL-ARTIFACT-02
 # Preconditions: PASS evidence is internally hash-consistent but names a different binary artifact.
 # PASS: the typed artifact refusal occurs before the financial manifest or service mutation exists.
@@ -1764,6 +2274,167 @@ for field in copy_manifest_sha256 readiness_sha256 rehearsal_environment_sha256;
      ! -e "$root/test-state/stop-count" ]] ||
     fail "$field rehearsal substitution crossed the guarded mutation boundary"
 done
+
+root=$TEST_TMP/rehearsal-binding-harness-bundle
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "harness-bundle substitution setup did not reach prepared"
+python3 - "$root/rehearsal/evidence.json" <<'PY'
+import json,sys
+e=json.load(open(sys.argv[1],encoding="utf-8")); path=e["manifest_path"]
+rows=[]
+for raw in open(path,encoding="utf-8"):
+    if raw.startswith("harness_bundle_sha256="):
+        raw="harness_bundle_sha256="+"0"*64+"\n"
+    rows.append(raw)
+with open(path,"w",encoding="utf-8") as output: output.writelines(rows)
+PY
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'REHEARSAL_REFUSAL=evidence_hash_mismatch'* ]] ||
+  fail "hash-unbound harness-bundle substitution was not refused digest-first: $output"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+     "$root/pe-financial-era.json") == prepared &&
+   $(<"$root/test-state/service.active") == true && ! -e "$root/test-state/stop-count" &&
+   ! -e "$root/test-state/archive-count" ]] ||
+  fail "hash-unbound harness-bundle substitution crossed the prepared boundary"
+
+# Scenario FE-REHEARSAL-UNIT-POLICY-DRIFT-01G: every pre-stop, guarded-entry, and pre-start
+# observation refuses drift from the stop policy bound at Prepared (#586).
+for drift_case in prepared_signal prepared_timeout stop_intent stopped_unreceipted \
+  guarded_entry qualification_started service_start_intent; do
+  root="$TEST_TMP/unit-policy-drift-$drift_case"
+  setup_fixture "$root"
+  driver_args "$root"
+  set +e
+  case "$drift_case" in
+    prepared_signal|prepared_timeout)
+      run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1
+      ;;
+    stop_intent)
+      run_driver "$root" --simulate-crash-after service-stop-intent >/dev/null 2>&1
+      ;;
+    stopped_unreceipted)
+      : > "$root/test-state/crash-after-stop"
+      run_driver "$root" >/dev/null 2>&1
+      ;;
+    guarded_entry)
+      run_driver "$root" --simulate-crash-after guarded >/dev/null 2>&1
+      ;;
+    qualification_started)
+      run_driver "$root" --simulate-crash-after qualification-started >/dev/null 2>&1
+      ;;
+    service_start_intent)
+      run_driver "$root" --simulate-crash-after service-start-intent >/dev/null 2>&1
+      ;;
+  esac
+  setup_status=$?
+  set -e
+  [[ $setup_status -eq 86 ]] || fail "$drift_case policy-drift setup returned $setup_status"
+  expected_activity=true
+  case "$drift_case" in
+    stopped_unreceipted|guarded_entry|qualification_started|service_start_intent)
+      expected_activity=false
+      ;;
+  esac
+  if [[ "$drift_case" == prepared_timeout ]]; then
+    printf '%s\n' 'KillSignal=2' 'TimeoutStopUSec=7s' > "$root/test-state/unit-stop-policy"
+  else
+    printf '%s\n' 'KillSignal=15' 'TimeoutStopUSec=5s' > "$root/test-state/unit-stop-policy"
+  fi
+  state_before=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+    "$root/pe-financial-era.json")
+  manifest_before=$(sha256sum "$root/pe-financial-era.json" | awk '{print $1}')
+  set +e
+  output=$(run_driver "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *'REHEARSAL_REFUSAL=unit_stop_policy_drift'* &&
+     "$output" == *"service_active=$expected_activity"* ]] ||
+    fail "$drift_case live unit policy was not refused with observed activity: $output"
+  state_after=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+    "$root/pe-financial-era.json")
+  manifest_after=$(sha256sum "$root/pe-financial-era.json" | awk '{print $1}')
+  [[ "$state_after" == "$state_before" && "$manifest_after" == "$manifest_before" &&
+     $(<"$root/test-state/service.active") == "$expected_activity" ]] ||
+    fail "$drift_case policy refusal changed state or service activity"
+  case "$drift_case" in
+    prepared_signal|prepared_timeout|stop_intent)
+      [[ ! -e "$root/test-state/stop-count" && ! -e "$root/test-state/archive-count" ]] ||
+        fail "$drift_case policy refusal crossed stop or archive"
+      ;;
+    stopped_unreceipted|guarded_entry)
+      [[ $(<"$root/test-state/stop-count") == 1 && ! -e "$root/test-state/archive-count" ]] ||
+        fail "$drift_case policy refusal crossed archive or repeated stop"
+      if [[ "$drift_case" == guarded_entry ]]; then
+        [[ ! -e "$root/test-state/live-schema-count" &&
+           ! -e "$root/test-state/forward-refresh-count" &&
+           ! -e "$root/test-state/start-count" ]] ||
+          fail "guarded-entry policy refusal crossed a post-Start mutation"
+      fi
+      ;;
+    qualification_started|service_start_intent)
+      [[ ! -e "$root/test-state/start-count" ]] ||
+        fail "$drift_case policy refusal started the service"
+      ;;
+  esac
+done
+
+# Scenario FE-REHEARSAL-BUNDLE-RESUME-01H: pre-Start guarded resumes rebind only to the persisted
+# hermetic closure, while a completed Start preserves forced roll-forward (#586).
+root=$TEST_TMP/rehearsal-bundle-resume-pre-start
+setup_fixture "$root"
+setup_hermetic_financial_driver "$root"
+driver_args "$root"
+repository_driver=$DRIVER
+DRIVER=$HERMETIC_DRIVER
+set +e
+run_driver "$root" --simulate-crash-after guarded >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "hermetic bundle resume did not reach guarded"
+cp "$HERMETIC_PREFLIGHT" "$HERMETIC_PREFLIGHT.original"
+printf '%s\n' '# controlled bundle drift' >> "$HERMETIC_PREFLIGHT"
+manifest_before=$(sha256sum "$root/pe-financial-era.json")
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'REHEARSAL_REFUSAL=harness_bundle_mismatch'* ]] ||
+  fail "guarded hermetic bundle drift was not refused: $output"
+manifest_after=$(sha256sum "$root/pe-financial-era.json")
+[[ "$manifest_before" == "$manifest_after" && ! -e "$root/test-state/archive-count" &&
+   $(<"$root/test-state/service.active") == false ]] ||
+  fail "guarded hermetic bundle drift changed state or reached archive"
+cp "$HERMETIC_PREFLIGHT.original" "$HERMETIC_PREFLIGHT"
+drive_to_verified "$root" || fail "restored hermetic bundle did not converge"
+DRIVER=$repository_driver
+
+root=$TEST_TMP/rehearsal-bundle-resume-post-start
+setup_fixture "$root"
+setup_hermetic_financial_driver "$root"
+driver_args "$root"
+repository_driver=$DRIVER
+DRIVER=$HERMETIC_DRIVER
+set +e
+run_driver "$root" --simulate-crash-after qualification-started >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 && -e "$root/test-state/complete-start" ]] ||
+  fail "post-Start hermetic bundle resume did not reach QualificationStarted"
+printf '%s\n' '# post-Start forced-roll-forward drift' >> "$HERMETIC_PREFLIGHT"
+output=$(run_driver "$root" 2>&1) || fail "post-Start bundle drift blocked roll-forward: $output"
+[[ "$output" != *harness_bundle_mismatch* && $(<"$root/test-state/start-count") == 1 &&
+   $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+     "$root/pe-financial-era.json") == started ]] ||
+  fail "post-Start bundle drift did not roll forward exactly once"
+DRIVER=$repository_driver
 
 # Scenario FE-PREP-01
 # Preconditions: active old service; clean paper/source/live logs and local state.
@@ -2105,4 +2776,4 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
 done
 
-echo "PASS: offline environment allowlist/loader refusal, private rehearsal binary proof, FE-DERIVED-IDENTITIES-00, FE-LEGACY-RELEASE-VALID-00A/00B, FE-EMPTY-MEMBERSHIP-FRESH-00F..FE-EMPTY-MEMBERSHIP-ROLLBACK-00I, FE-REHEARSAL-MISSING-01..FE-REHEARSAL-MATCH-03, FE-REHEARSAL-LEGACY-MISSING-01A/FE-REHEARSAL-LEGACY-MALFORMED-01B, REHEARSAL-PATHS-UPDATE-01A, REHEARSAL-FENCES-08A..08D and FE-PREP-01..FE-ROLLBACK-MATRIX-09; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 57 scenario contracts, including rehearsal final-status/shutdown policy and financial-era bundle/policy resume guards; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
