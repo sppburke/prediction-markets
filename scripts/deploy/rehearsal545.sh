@@ -583,7 +583,7 @@ readiness_response="$root/readiness-$short.json"
 : > "$service_log"
 : > "$watch_log"
 rm -f "$status_state" "$drop_state" "$fence_state" "$write_state" \
-  "$readiness_response" "$readiness_response.tmp"
+  "$readiness_response" "$readiness_response.tmp" "$quiesce_flag"
 
 service_pid=""
 observer_pids=()
@@ -906,7 +906,8 @@ PY
   [[ ! -f "$readiness_response.tmp" ]] || mv "$readiness_response.tmp" "$readiness_response"
   last="status_fresh=$status_fresh endpoint_ready=$endpoint_ready revision_ok=$revision_ok polled=$polled healthy=$healthy child_authorization_denied=$child_authorization_denied anchored=$anchored drops=$drops credit_loss=$credit_loss errors=$errors fences=$fences refused=$refused writes=$writes"
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$last" >> "$watch_log"
-  if (( credit_loss > 0 || errors > 0 || fences > 0 || writes > 0 )); then
+  # Issue #586 review: the counter is canonical decimal text (a u64 can exceed Bash's signed range); compare as text.
+  if [[ "$credit_loss" != 0 ]] || (( errors > 0 || fences > 0 || writes > 0 )); then
     reason=unsafe_evidence
     break
   fi
@@ -978,7 +979,7 @@ PY
     printf '%s FINAL %s service_log_prefix_length=%s service_log_prefix_sha256=%s database_observation=%s\n' \
       "$(date -u +%FT%TZ)" "$last" "$service_log_prefix_length" \
       "$service_log_prefix_sha256" "$database_observation" >> "$watch_log"
-    if (( credit_loss > 0 || errors > 0 || fences > 0 || writes > 0 || anchored != 1 )); then
+    if [[ "$credit_loss" != 0 ]] || (( errors > 0 || fences > 0 || writes > 0 || anchored != 1 )); then
       reason=unsafe_evidence
       break
     fi

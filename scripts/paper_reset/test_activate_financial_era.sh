@@ -635,7 +635,7 @@ def write_status(value):
     os.replace(temporary,status)
 
 injection=open(injection_path,encoding="utf-8").read().strip()
-value=running_status(1 if injection == "within_run_loss" else 0)
+value=running_status({"within_run_loss": 1, "within_run_loss_highbit": 9223372036854775808}.get(injection, 0))
 scenario=open(scenario_path,encoding="utf-8").read().strip()
 if scenario == "absent_live": value.pop("live")
 elif scenario == "fresh_empty": value["live"]["stale"] = False
@@ -713,6 +713,8 @@ def interrupt(_signum, _frame):
         final["tasks"][0]["state"]="running"
     elif current == "obligations_dropped":
         final["source_health"]["reconciliation_obligations_dropped_total"]=1
+    elif current == "obligations_dropped_highbit":
+        final["source_health"]["reconciliation_obligations_dropped_total"]=9223372036854775808
     write_status(final)
     delay = {"delayed_clean_exit": 6, "delayed_clean_exit_just_over": 5.05, "clean_exit_inside_bound": 4.5}.get(current)
     if delay is not None:
@@ -1427,17 +1429,21 @@ for key in ("harness_bundle_sha256","final_status_sha256","unit_kill_signal",
 PY
 done
 
-root=$TEST_TMP/rehearsal-within-run-loss
-setup_rehearsal_fixture "$root" true within_run_loss
+# The high-bit row is a legal u64 above Bash's signed range (#586 review): the harness compares the
+# canonical decimal text, so it must still refuse.
+for loss_case in "within_run_loss 1" "within_run_loss_highbit 9223372036854775808"; do
+set -- $loss_case; loss_injection=$1; loss_value=$2
+root=$TEST_TMP/rehearsal-$loss_injection
+setup_rehearsal_fixture "$root" true "$loss_injection"
 set +e
 output=$(run_rehearsal_fixture "$root" 2>&1)
 status=$?
 set -e
 [[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=unsafe_evidence"* ]] ||
-  fail "within-run obligation loss was not refused: $output"
-[[ $(<"$root/rehearsal/status-1111111.state") == '1 1 1 1 1 1' &&
+  fail "$loss_injection obligation loss was not refused: $output"
+[[ $(<"$root/rehearsal/status-1111111.state") == "1 1 1 1 1 $loss_value" &&
    ! -e "$root/test-state/rehearsal-sigint-count" ]] ||
-  fail "within-run obligation loss did not abort before SIGINT"
+  fail "$loss_injection obligation loss did not abort before SIGINT"
 python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" <<'PY' || fail "within-run loss did not bind the preserved status"
 import hashlib,json,sys
 e=json.load(open(sys.argv[1],encoding="utf-8"))
@@ -1448,25 +1454,29 @@ assert rows["final_status_sha256"] == hashlib.sha256(open(sys.argv[2],"rb").read
 for key in ("unit_kill_signal","unit_timeout_stop_secs","shutdown_signal_unix","shutdown_elapsed_secs"):
     assert sum(name == key for name,_ in raw) == 1 and rows[key] == "absent"
 PY
+done
 
-root=$TEST_TMP/rehearsal-final-obligations-dropped
-setup_rehearsal_fixture "$root" true obligations_dropped
+for loss_case in "obligations_dropped 1" "obligations_dropped_highbit 9223372036854775808"; do
+set -- $loss_case; loss_injection=$1; loss_value=$2
+root=$TEST_TMP/rehearsal-final-$loss_injection
+setup_rehearsal_fixture "$root" true "$loss_injection"
 set +e
 output=$(run_rehearsal_fixture "$root" 2>&1)
 status=$?
 set -e
 [[ $status -ne 0 && "$output" == *"REHEARSAL545_FAIL reason=unsafe_evidence"* ]] ||
-  fail "final obligation loss was not refused: $output"
+  fail "$loss_injection final obligation loss was not refused: $output"
 [[ $(<"$root/rehearsal/status-1111111.state") == '1 1 1 1 1 0' &&
    $(<"$root/test-state/rehearsal-sigint-count") == 1 ]] ||
   fail "final obligation-loss fixture did not preserve its within-run sample and SIGINT proof"
-python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" <<'PY' || fail "final obligation loss did not bind the authoritative final status"
+python3 - "$root/rehearsal/evidence.json" "$root/rehearsal/copy/status.json" "$loss_value" <<'PY' || fail "final obligation loss did not bind the authoritative final status"
 import hashlib,json,sys
 e=json.load(open(sys.argv[1],encoding="utf-8")); rows=dict(
     line.rstrip("\n").split("=",1) for line in open(e["manifest_path"],encoding="utf-8"))
-assert "credit_loss=1" in rows["final"]
+assert f"credit_loss={sys.argv[3]}" in rows["final"], rows["final"]
 assert rows["final_status_sha256"] == hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()
 PY
+done
 
 # Scenario REHEARSAL-FINAL-STATUS-INVALID-09C: every malformed, stale, unsafe, or non-final shape
 # refuses PASS independently of the preserved-file digest (#586).
@@ -1565,6 +1575,14 @@ assert states, "no fence state file"
 for path in states:
     assert int(os.stat(path).st_mtime) <= signal_unix, (path, os.stat(path).st_mtime, signal_unix)
 PY
+
+# Scenario REHEARSAL-STALE-QUIESCE-FLAG-09J: a quiesce flag left by an earlier run in the same root is
+# cleared at startup, so a same-revision rerun still reaches PASS (#586 branch review).
+root="$TEST_TMP/rehearsal-stale-quiesce-flag"
+setup_rehearsal_fixture "$root" true none
+mkdir -p "$root/rehearsal"; : > "$root/rehearsal/quiesce-1111111.flag"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "stale quiesce flag blocked a rerun: $output"
 
 # Scenario REHEARSAL-UNIT-STOP-POLICY-09F: invalid production stop policies refuse before SIGINT.
 for policy_case in wrong_signal missing_timeout malformed_timeout zero_timeout; do
