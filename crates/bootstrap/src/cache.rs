@@ -3362,14 +3362,26 @@ impl WalletCache {
         Ok(rows.collect::<Result<std::collections::HashMap<_, _>, _>>()?)
     }
 
-    /// Remove one durable infrastructure exclusion. This does not recreate or
-    /// activate the wallet; a later discovery must re-admit it normally.
+    /// Remove one infrastructure exclusion in both shapes it takes: the durable
+    /// `purged_wallets(reason='infra')` tombstone left by a historical
+    /// `purge-infra`, and a live `wallets.is_infra = 1` flag (the only shape the
+    /// cold probe writes since purge retirement, #544). Returns `true` when
+    /// either existed. This does not recreate or activate the wallet: a
+    /// tombstone-only wallet needs a later discovery to re-admit it, and a
+    /// flagged wallet keeps its `is_active` and re-enters the backfill queue,
+    /// where the cold probe classifies it again on its newest page (`docs/37`).
     pub fn clear_infra_exclusion(&mut self, wallet_hex: &str) -> Result<bool, BootstrapError> {
-        let affected = self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let tombstones = tx.execute(
             "DELETE FROM purged_wallets WHERE wallet_hex = ?1 AND reason = 'infra'",
             params![wallet_hex],
         )?;
-        Ok(affected == 1)
+        let flags = tx.execute(
+            "UPDATE wallets SET is_infra = 0 WHERE wallet_hex = ?1 AND is_infra = 1",
+            params![wallet_hex],
+        )?;
+        tx.commit()?;
+        Ok(tombstones == 1 || flags == 1)
     }
 
     /// Whether a wallet is currently tombstoned (issue #385).

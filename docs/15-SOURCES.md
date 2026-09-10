@@ -151,7 +151,7 @@
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
-| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-02 | 2026-11-01 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-10 | 2026-11-09 |
 | https://clob.polymarket.com/markets?closed=true | 2026-09-01 | 2026-10-31 |
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
@@ -258,6 +258,12 @@ Treat as research inspiration; not a production decision input unless an authori
   Ordinary-live fill finality reads `eth_chainId`, each distinct `eth_getTransactionReceipt`, the
   finalized block, and any required canonical receipt-height block through the configured Polygon
   JSON-RPC endpoint before decoding supported V2 `OrderFilled` logs.
+
+- 2026-09-10: Re-verified the user-activity `end=<unix>` upper bound and fixed `limit=500` page
+  for issue #589 across 52 read-only GETs (four wallets, 13 monthly anchors): every returned row
+  carried the requested `proxyWallet`, every page respected `max(timestamp) <= end`, and pages
+  anchored before a wallet's first activity returned an empty list rather than an error
+  (`data/archive/research-2026-09-exclusion-review/recapture-summary.json`).
 
 - 2026-09-03: Re-verified `/positions` size precision for issue #557 against an incident wallet.
   The current-position size was `34.0795`; the same wallet's incident REDEEM activity size was

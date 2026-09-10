@@ -1,0 +1,893 @@
+[
+  {
+    "wallet": "0x1b912b17581b3d544431d13d5a060155a80127dc",
+    "n": 53,
+    "t_proxy": 5.915816761261018,
+    "mean_proxy": 0.6651977653687526,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 5.4934171907756815,
+    "median_first_fill_usd": 9.999998,
+    "tags": [
+      [
+        "Sports",
+        53
+      ],
+      [
+        "Soccer",
+        53
+      ],
+      [
+        "Games",
+        53
+      ],
+      [
+        "Liga MX",
+        19
+      ],
+      [
+        "MLS",
+        18
+      ]
+    ]
+  },
+  {
+    "wallet": "0xfd8e46519d0a8f9c35e5010ef4e7f56f7583aea4",
+    "n": 885,
+    "t_proxy": 5.5750389659562725,
+    "mean_proxy": 0.09446918812483544,
+    "aggressive_fraction": 0.0,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.8,
+    "avg_scheduled_hours": 25.7193289391086,
+    "median_first_fill_usd": 8.899743,
+    "tags": [
+      [
+        "Weather",
+        885
+      ],
+      [
+        "Recurring",
+        885
+      ],
+      [
+        "Hide From New",
+        885
+      ],
+      [
+        "Daily Temperature",
+        885
+      ],
+      [
+        "Highest temperature",
+        885
+      ]
+    ]
+  },
+  {
+    "wallet": "0x72e1597864456eda62878413cf3e60c332e4a45d",
+    "n": 34,
+    "t_proxy": 4.641707851135215,
+    "mean_proxy": 0.05065220962555863,
+    "aggressive_fraction": 0.6764705882352942,
+    "both_outcomes_fraction": 0.20588235294117646,
+    "any_sell_fraction": 0.14705882352941177,
+    "avg_scheduled_hours": 7.1814542483660135,
+    "median_first_fill_usd": 11.75,
+    "tags": [
+      [
+        "Sports",
+        34
+      ],
+      [
+        "Esports",
+        34
+      ],
+      [
+        "Games",
+        34
+      ],
+      [
+        "Dota 2",
+        23
+      ],
+      [
+        "blast",
+        20
+      ]
+    ]
+  },
+  {
+    "wallet": "0x0bf96a1c55e6f47ea84335bc3fc08a89653efd90",
+    "n": 27,
+    "t_proxy": 4.17770721454009,
+    "mean_proxy": 0.620359927332369,
+    "aggressive_fraction": 0.2962962962962963,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 0.09386831275720164,
+    "median_first_fill_usd": 50.0,
+    "tags": [
+      [
+        "Crypto",
+        27
+      ],
+      [
+        "Bitcoin",
+        27
+      ],
+      [
+        "Crypto Prices",
+        27
+      ],
+      [
+        "Recurring",
+        27
+      ],
+      [
+        "Up or Down",
+        27
+      ]
+    ]
+  },
+  {
+    "wallet": "0x5a3354a0a35d00d2a1dbe6cea0e37e9c30a2ca0d",
+    "n": 176,
+    "t_proxy": 3.0933572577804247,
+    "mean_proxy": 0.2229120790512565,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 13.777118055555555,
+    "median_first_fill_usd": 3.799999,
+    "tags": [
+      [
+        "Weather",
+        176
+      ],
+      [
+        "Recurring",
+        176
+      ],
+      [
+        "Hide From New",
+        176
+      ],
+      [
+        "Daily Temperature",
+        176
+      ],
+      [
+        "Highest temperature",
+        176
+      ]
+    ]
+  },
+  {
+    "wallet": "0xdf6539d1fadb951a02a999d31a72e0cd7fd9c36d",
+    "n": 22,
+    "t_proxy": 3.046267314735377,
+    "mean_proxy": 0.5143624922885395,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.8636363636363636,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 0.08006313131313131,
+    "median_first_fill_usd": 8.55,
+    "tags": [
+      [
+        "Crypto",
+        22
+      ],
+      [
+        "Bitcoin",
+        22
+      ],
+      [
+        "Crypto Prices",
+        22
+      ],
+      [
+        "Recurring",
+        22
+      ],
+      [
+        "Up or Down",
+        22
+      ]
+    ]
+  },
+  {
+    "wallet": "0xb7ab821f037a4c8deb9b23b8001a4be985d116d0",
+    "n": 258,
+    "t_proxy": 2.7942715579996986,
+    "mean_proxy": 0.1649333645481629,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.24806201550387597,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 3.1722523686477175,
+    "median_first_fill_usd": 4.559998,
+    "tags": [
+      [
+        "Sports",
+        258
+      ],
+      [
+        "Esports",
+        258
+      ],
+      [
+        "Games",
+        258
+      ],
+      [
+        "league of legends",
+        130
+      ],
+      [
+        "counter strike 2",
+        82
+      ]
+    ]
+  },
+  {
+    "wallet": "0x057621bea5fc03a53af38530c95b17a510716232",
+    "n": 30,
+    "t_proxy": 2.788600040231386,
+    "mean_proxy": 0.4985634404818594,
+    "aggressive_fraction": 0.8333333333333334,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.26666666666666666,
+    "avg_scheduled_hours": 3.5989907407407404,
+    "median_first_fill_usd": 7.8516,
+    "tags": [
+      [
+        "Sports",
+        30
+      ],
+      [
+        "Games",
+        30
+      ],
+      [
+        "WNBA",
+        21
+      ],
+      [
+        "Basketball",
+        14
+      ],
+      [
+        "UFC",
+        7
+      ]
+    ]
+  },
+  {
+    "wallet": "0xc561b14904d769eda31628082c005362ba60dc22",
+    "n": 22,
+    "t_proxy": 2.604564582873683,
+    "mean_proxy": 0.2612784241237953,
+    "aggressive_fraction": 0.8636363636363636,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 15.511755050505052,
+    "median_first_fill_usd": 21.534,
+    "tags": [
+      [
+        "Sports",
+        14
+      ],
+      [
+        "Games",
+        14
+      ],
+      [
+        "Soccer",
+        9
+      ],
+      [
+        "UCL",
+        7
+      ],
+      [
+        "Politics",
+        6
+      ]
+    ]
+  },
+  {
+    "wallet": "0x9fbfe50bf171adaa347a5cb2b789b4a6e12ef003",
+    "n": 464,
+    "t_proxy": 2.538391349865324,
+    "mean_proxy": 0.12268685657866873,
+    "aggressive_fraction": 0.8491379310344828,
+    "both_outcomes_fraction": 0.0021551724137931034,
+    "any_sell_fraction": 0.015086206896551725,
+    "avg_scheduled_hours": 20.018172892720305,
+    "median_first_fill_usd": 2.7995,
+    "tags": [
+      [
+        "Recurring",
+        464
+      ],
+      [
+        "Hide From New",
+        464
+      ],
+      [
+        "Weather",
+        460
+      ],
+      [
+        "Daily Temperature",
+        460
+      ],
+      [
+        "Highest temperature",
+        460
+      ]
+    ]
+  },
+  {
+    "wallet": "0x31646b754f77b973910e7376b7015cb81fe83c65",
+    "n": 214,
+    "t_proxy": 2.434162389515494,
+    "mean_proxy": 0.0845415429346428,
+    "aggressive_fraction": 0.5981308411214953,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.35046728971962615,
+    "avg_scheduled_hours": 24.063338525441328,
+    "median_first_fill_usd": 4.8,
+    "tags": [
+      [
+        "Weather",
+        214
+      ],
+      [
+        "Recurring",
+        214
+      ],
+      [
+        "Hide From New",
+        214
+      ],
+      [
+        "Daily Temperature",
+        214
+      ],
+      [
+        "Highest temperature",
+        195
+      ]
+    ]
+  },
+  {
+    "wallet": "0x38d812aff0b79f3bf5da2a477f780bcc163eea7c",
+    "n": 141,
+    "t_proxy": 2.410781974102201,
+    "mean_proxy": 0.2660849210419975,
+    "aggressive_fraction": 0.8156028368794326,
+    "both_outcomes_fraction": 0.2978723404255319,
+    "any_sell_fraction": 0.9219858156028369,
+    "avg_scheduled_hours": 16.665204885736802,
+    "median_first_fill_usd": 13.8,
+    "tags": [
+      [
+        "Finance",
+        141
+      ],
+      [
+        "Hide From New",
+        141
+      ],
+      [
+        "Stocks",
+        136
+      ],
+      [
+        "Equities",
+        136
+      ],
+      [
+        "Finance Updown",
+        97
+      ]
+    ]
+  },
+  {
+    "wallet": "0x9c76cdb43fb46454da005fbc82047a64a18ec926",
+    "n": 92,
+    "t_proxy": 2.3960557310212827,
+    "mean_proxy": 0.3086557273202166,
+    "aggressive_fraction": 0.20652173913043478,
+    "both_outcomes_fraction": 0.010869565217391304,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 12.159365942028986,
+    "median_first_fill_usd": 171.542087,
+    "tags": [
+      [
+        "Sports",
+        92
+      ],
+      [
+        "Games",
+        92
+      ],
+      [
+        "Soccer",
+        34
+      ],
+      [
+        "Esports",
+        21
+      ],
+      [
+        "NFL",
+        13
+      ]
+    ]
+  },
+  {
+    "wallet": "0xdc5bd11896bfb0fb335dad88d99a7e9a6bc3f102",
+    "n": 20,
+    "t_proxy": 2.3647817250893,
+    "mean_proxy": 0.2966159185419117,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.3,
+    "avg_scheduled_hours": 7.177513888888889,
+    "median_first_fill_usd": 49.999999,
+    "tags": [
+      [
+        "Sports",
+        20
+      ],
+      [
+        "Games",
+        20
+      ],
+      [
+        "Esports",
+        16
+      ],
+      [
+        "league of legends",
+        8
+      ],
+      [
+        "baseball",
+        4
+      ]
+    ]
+  },
+  {
+    "wallet": "0x330f6bf24e33d8348593bca54017ce83423791b1",
+    "n": 38,
+    "t_proxy": 2.332075629292892,
+    "mean_proxy": 0.3511168589695476,
+    "aggressive_fraction": 0.39473684210526316,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.39473684210526316,
+    "avg_scheduled_hours": 3.4850000000000003,
+    "median_first_fill_usd": 14.999999,
+    "tags": [
+      [
+        "Sports",
+        38
+      ],
+      [
+        "Esports",
+        38
+      ],
+      [
+        "Games",
+        38
+      ],
+      [
+        "league of legends",
+        29
+      ],
+      [
+        "counter strike 2",
+        5
+      ]
+    ]
+  },
+  {
+    "wallet": "0x1f19c48aee80ec95396d91f0d21ac249b8a7f57a",
+    "n": 29,
+    "t_proxy": 2.3195543886388754,
+    "mean_proxy": 0.349799737556986,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.9310344827586207,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 0.09255747126436781,
+    "median_first_fill_usd": 3.25,
+    "tags": [
+      [
+        "Crypto",
+        29
+      ],
+      [
+        "Bitcoin",
+        29
+      ],
+      [
+        "Crypto Prices",
+        29
+      ],
+      [
+        "Recurring",
+        29
+      ],
+      [
+        "Up or Down",
+        29
+      ]
+    ]
+  },
+  {
+    "wallet": "0x06dc51826bc524d9a83770e7de9dd7e005b04524",
+    "n": 396,
+    "t_proxy": 2.3097145931047263,
+    "mean_proxy": 0.16048416720750613,
+    "aggressive_fraction": 0.44696969696969696,
+    "both_outcomes_fraction": 0.8939393939393939,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 16.073364197530864,
+    "median_first_fill_usd": 9.28,
+    "tags": [
+      [
+        "Crypto",
+        396
+      ],
+      [
+        "Crypto Prices",
+        396
+      ],
+      [
+        "Recurring",
+        396
+      ],
+      [
+        "Hide From New",
+        394
+      ],
+      [
+        "Today \ud83d\ude80",
+        288
+      ]
+    ]
+  },
+  {
+    "wallet": "0x88ec5ba618625d744988f87ab577be53b382ec61",
+    "n": 62,
+    "t_proxy": 2.309644455812717,
+    "mean_proxy": 0.28220946104211825,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.8387096774193549,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 0.12407258064516129,
+    "median_first_fill_usd": 3.199999,
+    "tags": [
+      [
+        "Crypto",
+        62
+      ],
+      [
+        "Crypto Prices",
+        62
+      ],
+      [
+        "Recurring",
+        62
+      ],
+      [
+        "Up or Down",
+        62
+      ],
+      [
+        "Hide From New",
+        62
+      ]
+    ]
+  },
+  {
+    "wallet": "0xdfe29d6ef2a44606cf58967e1fd5854d9e594902",
+    "n": 23,
+    "t_proxy": 2.2152210235444216,
+    "mean_proxy": 0.40477084183903184,
+    "aggressive_fraction": 0.0,
+    "both_outcomes_fraction": 0.043478260869565216,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 0.08618357487922705,
+    "median_first_fill_usd": 10.0,
+    "tags": [
+      [
+        "Crypto",
+        23
+      ],
+      [
+        "Bitcoin",
+        23
+      ],
+      [
+        "Crypto Prices",
+        23
+      ],
+      [
+        "Recurring",
+        23
+      ],
+      [
+        "Up or Down",
+        23
+      ]
+    ]
+  },
+  {
+    "wallet": "0xaf17116ae2b1476032785a67bd5b7c8c05905c20",
+    "n": 114,
+    "t_proxy": 2.185258375301265,
+    "mean_proxy": 0.45220776087166614,
+    "aggressive_fraction": 0.8157894736842105,
+    "both_outcomes_fraction": 0.03508771929824561,
+    "any_sell_fraction": 0.39473684210526316,
+    "avg_scheduled_hours": 9.882711988304093,
+    "median_first_fill_usd": 26.3241,
+    "tags": [
+      [
+        "Weather",
+        114
+      ],
+      [
+        "Recurring",
+        112
+      ],
+      [
+        "Hide From New",
+        112
+      ],
+      [
+        "Daily Temperature",
+        112
+      ],
+      [
+        "Highest temperature",
+        110
+      ]
+    ]
+  },
+  {
+    "wallet": "0xc33d6aa3eb972639f31e46a6a02201cece380d40",
+    "n": 63,
+    "t_proxy": 2.125632033143613,
+    "mean_proxy": 0.41232433881169955,
+    "aggressive_fraction": 0.2698412698412698,
+    "both_outcomes_fraction": 0.6825396825396826,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 6.708659611992946,
+    "median_first_fill_usd": 13.5,
+    "tags": [
+      [
+        "Sports",
+        56
+      ],
+      [
+        "Games",
+        55
+      ],
+      [
+        "Esports",
+        48
+      ],
+      [
+        "league of legends",
+        19
+      ],
+      [
+        "counter strike 2",
+        12
+      ]
+    ]
+  },
+  {
+    "wallet": "0xa8ae2fb989de545c42c376d61ec887868ca57f3e",
+    "n": 36,
+    "t_proxy": 2.1062016040816594,
+    "mean_proxy": 0.31180825103667104,
+    "aggressive_fraction": 1.0,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.1111111111111111,
+    "avg_scheduled_hours": 4.249066358024692,
+    "median_first_fill_usd": 3.1557999999999997,
+    "tags": [
+      [
+        "Sports",
+        36
+      ],
+      [
+        "Soccer",
+        36
+      ],
+      [
+        "Games",
+        36
+      ],
+      [
+        "Liga MX",
+        12
+      ],
+      [
+        "Leagues Cup",
+        9
+      ]
+    ]
+  },
+  {
+    "wallet": "0x4e9e342ff236323b43f79c0da642a82bd12f0c30",
+    "n": 20,
+    "t_proxy": 2.098627131660696,
+    "mean_proxy": 0.38913909634503335,
+    "aggressive_fraction": 0.7,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 0.2460138888888889,
+    "median_first_fill_usd": 23.1795,
+    "tags": [
+      [
+        "Crypto",
+        20
+      ],
+      [
+        "Crypto Prices",
+        20
+      ],
+      [
+        "Recurring",
+        20
+      ],
+      [
+        "Up or Down",
+        20
+      ],
+      [
+        "Hide From New",
+        20
+      ]
+    ]
+  },
+  {
+    "wallet": "0xdb5ad26b68d77ae966d29e7180147272ab7a3965",
+    "n": 195,
+    "t_proxy": 2.0964455638839494,
+    "mean_proxy": 0.21915313453783514,
+    "aggressive_fraction": 0.29743589743589743,
+    "both_outcomes_fraction": 0.841025641025641,
+    "any_sell_fraction": 0.958974358974359,
+    "avg_scheduled_hours": 15.745680911680912,
+    "median_first_fill_usd": 10.067142,
+    "tags": [
+      [
+        "Crypto",
+        195
+      ],
+      [
+        "Crypto Prices",
+        195
+      ],
+      [
+        "Recurring",
+        195
+      ],
+      [
+        "Hide From New",
+        194
+      ],
+      [
+        "Weekly",
+        133
+      ]
+    ]
+  },
+  {
+    "wallet": "0x5215b36ebe0f78b3114eb998ca8ade49402ab02f",
+    "n": 27,
+    "t_proxy": 2.059077099598986,
+    "mean_proxy": 0.3776762883136446,
+    "aggressive_fraction": 0.25925925925925924,
+    "both_outcomes_fraction": 0.0,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 0.10755144032921811,
+    "median_first_fill_usd": 11.27,
+    "tags": [
+      [
+        "Crypto",
+        27
+      ],
+      [
+        "Bitcoin",
+        27
+      ],
+      [
+        "Crypto Prices",
+        27
+      ],
+      [
+        "Recurring",
+        27
+      ],
+      [
+        "Up or Down",
+        27
+      ]
+    ]
+  },
+  {
+    "wallet": "0x8f1dfd0868d056f11f84e0233e1b89527c262fb6",
+    "n": 22,
+    "t_proxy": 2.0550796762859718,
+    "mean_proxy": 0.5519910037816796,
+    "aggressive_fraction": 0.0,
+    "both_outcomes_fraction": 0.045454545454545456,
+    "any_sell_fraction": 0.0,
+    "avg_scheduled_hours": 9.69175505050505,
+    "median_first_fill_usd": 60.0,
+    "tags": [
+      [
+        "Sports",
+        22
+      ],
+      [
+        "UFC",
+        22
+      ],
+      [
+        "Games",
+        22
+      ],
+      [
+        "UFC 330",
+        9
+      ],
+      [
+        "UFC: Paris Fight Night",
+        6
+      ]
+    ]
+  },
+  {
+    "wallet": "0xc7d02944a76b9f83b199e9090ecc92c82d241f8a",
+    "n": 224,
+    "t_proxy": 2.020517892360698,
+    "mean_proxy": 0.19603537828694526,
+    "aggressive_fraction": 0.0,
+    "both_outcomes_fraction": 0.4017857142857143,
+    "any_sell_fraction": 0.3705357142857143,
+    "avg_scheduled_hours": 8.463568948412698,
+    "median_first_fill_usd": 9.99,
+    "tags": [
+      [
+        "Sports",
+        122
+      ],
+      [
+        "Games",
+        121
+      ],
+      [
+        "Esports",
+        100
+      ],
+      [
+        "Hide From New",
+        71
+      ],
+      [
+        "Weather",
+        70
+      ]
+    ]
+  }
+]

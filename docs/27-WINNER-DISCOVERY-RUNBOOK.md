@@ -74,8 +74,9 @@ Eight API slices are always fetched per category — `{profit, volume}` ×
 | `volume` | `allTime` |
 
 All slices are deduplicated on `proxyWallet` before upsert.  A wallet already
-in the pile is a no-op (idempotent `INSERT OR IGNORE` on `wallet_hex`); only
-its `source_bits` column is OR-merged to record the new source.
+in the pile keeps its row (`ON CONFLICT(wallet_hex) DO UPDATE`); only its
+`source_bits` column is OR-merged to record the new source, so a repeated
+snapshot changes nothing once its bit is present.
 
 The `SRC_LEADERBOARD` bit (16) bypasses the 100-trade activation gate in
 `pe_bootstrap::pile::apply_activation_rules`, matching the curation-list
@@ -97,7 +98,8 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   backfill in knockout mode; the next batch swap in `full_rerank`) — never directly
   from discovery.
 - **Idempotent.** Re-running with the same leaderboard snapshot is safe:
-  `INSERT OR IGNORE` on `wallet_hex` is a no-op for already-known wallets.
+  the upsert is `ON CONFLICT(wallet_hex) DO UPDATE` and only OR-merges source bits, so a
+  repeated snapshot changes nothing once its bits are present.
 - **Logical-cycle retries reuse activation.** A zero-argument production cycle
   writes `data/eval-results/rank_and_push.cycle` before discovery or activation.
   If a transient pre-publication stage fails, the next zero-argument retry
@@ -107,11 +109,16 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   controlled activation. Backfill launched by the wrapper always defers global
   activation, so no wrapper override can silently activate an unbounded cohort.
 - **Infrastructure exclusions do not require deletion.** Ordinary publication is
-  purge-free and applies durable `reason='infra'` tombstones at rank/export time.
-  Direct `purge-infra` is report-only while `PE_BOOTSTRAP_PURGE_ENABLED=false`.
-  Exceptional reclassification requires the explicit operator-only
-  `clear-infra-exclusion --wallet <hex> --confirm` command; it clears only that
-  exclusion and does not recreate or activate the wallet.
+  purge-free. A cold-probe flag (`is_infra = 1`, no tombstone) and a historical
+  `reason='infra'` tombstone are both enforced at acquisition time: discovery skips a
+  tombstoned wallet, activation requires `is_infra = 0` and no tombstone, and backfill selects
+  through `active_tradeable_wallets`, so an excluded wallet accrues no trades.
+  Rank/export/publication do not consult either (`docs/37`). Direct `purge-infra` is
+  report-only while `PE_BOOTSTRAP_PURGE_ENABLED=false`. Exceptional reclassification requires
+  the explicit operator-only `clear-infra-exclusion --wallet <hex> --confirm` command; it
+  removes the infra tombstone and clears a live flag, and does not recreate or activate the
+  wallet. A cleared wallet that is already active becomes due for backfill at once
+  (`last_polymarket_fetch_at` is still NULL) and is probed again on its newest page.
 - **`CacheMutationLock`** is a persistent-inode, kernel-held lock acquired before
   every read-write wallet-cache open. Production coordination follows the sole
   loop → one-shot run → cache order; true read-only probes use

@@ -55,6 +55,7 @@ paper_state.db-bak
 !/data/archive/
 /data/archive/*
 !/data/archive/research-2026-07-run28/
+!/data/archive/research-2026-09-exclusion-review/
 
 # Operator run output — bake-off results (leaderboard/return_matrix/decision/
 # mtm_coverage/survivorship, pe-backtest ndjson), backfill logs, PID files.
