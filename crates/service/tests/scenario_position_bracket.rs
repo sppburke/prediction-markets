@@ -1,7 +1,7 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-#[path = "scenario_golden_stream_v1.rs"]
+#[path = "support/golden.rs"]
 mod golden;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2861,6 +2861,105 @@ async fn routine_refresh_defers_second_read_entry_until_ordinary_commit() {
 #[tokio::test]
 async fn routine_refresh_defers_final_read_entry_until_ordinary_commit() {
     routine_refresh_defers_read(2).await;
+}
+
+/// PASS: preflight reaches an unseen group after a known post-anchor group, within and across
+/// buckets, at each of the three reads; it writes neither covered history nor the unseen entry.
+#[tokio::test]
+async fn routine_refresh_preflights_every_group_after_known_activity() {
+    for read_index in 0..3 {
+        for same_bucket in [false, true] {
+            let wallet = wallet(0x91);
+            let (_dir, paper, mut engine) = fresh(&[wallet]);
+            install_empty_anchor(&mut engine, &paper, wallet, 0);
+            let known_epoch = if same_bucket { 90 } else { 89 };
+            let first = activity(wallet, 1, "1", "0xfirst", known_epoch);
+            let second = activity(wallet, 2, "1", "0xsecond", 90);
+            // CompleteActivityRead orders equal-second groups by their canonical identity.
+            let (known, unseen) = if same_bucket
+                && aggregate(first.clone(), wallet).group_id.key().0
+                    > aggregate(second.clone(), wallet).group_id.key().0
+            {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            let known_group = aggregate(known.clone(), wallet);
+            let unseen_id = aggregate(unseen.clone(), wallet).group_id.key().clone();
+            engine
+                .commit(
+                    vec![known_group.clone()],
+                    &context(known_epoch),
+                    zero_basis(),
+                )
+                .unwrap();
+            let before = paper
+                .activity_group_state(known_group.group_id.key())
+                .unwrap();
+            let history = paper.gate_history().unwrap();
+            let covered = activity(wallet, 9, "1", "0xcovered", 0);
+            let covered_id = aggregate(covered.clone(), wallet).group_id.key().clone();
+            let mut reads = vec![serde_json::to_vec(&vec![known.clone()]).unwrap(); read_index];
+            reads.push(serde_json::to_vec(&vec![covered, known.clone(), unseen]).unwrap());
+            let held = serde_json::to_vec(&json!([{
+                "proxyWallet": wallet, "asset": known["asset"],
+                "conditionId": known["conditionId"], "size": "1", "outcomeIndex": 0,
+                "negativeRisk": true
+            }]))
+            .unwrap();
+            let fetcher = Arc::new(QueueFetcher::new(HashMap::from([
+                (activity_url(wallet), reads),
+                (
+                    position_url(wallet, PositionPartition::NotRedeemable),
+                    vec![held; 2],
+                ),
+                (
+                    position_url(wallet, PositionPartition::Redeemable),
+                    vec![b"[]".to_vec(); 2],
+                ),
+            ])));
+            let identity = Arc::new(AssetIdentityResolver::new(
+                fetcher.clone(),
+                BASE.to_owned(),
+                GAMMA_BATCH_SIZE,
+                Arc::new(tokio::sync::Mutex::new(
+                    SourceEventSink::open(_dir.path().join("source.log")).unwrap(),
+                )),
+            ));
+            let validator =
+                CausalPositionValidator::new(fetcher.clone(), BASE, "preflight", identity)
+                    .with_clock(Arc::new(|| END));
+            let (tx, rx) = mpsc::channel(2);
+            let actor = spawn_control_actor(rx, engine, paper.clone());
+            let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+            assert_eq!(
+                preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+                AnchorRefreshOutcome::Deferred
+            );
+            assert_eq!(
+                fetcher
+                    .urls()
+                    .iter()
+                    .filter(|url| url.contains("/activity?"))
+                    .count(),
+                read_index + 1
+            );
+            assert_eq!(
+                paper
+                    .activity_group_state(known_group.group_id.key())
+                    .unwrap(),
+                before
+            );
+            assert!(paper.activity_group_state(&unseen_id).unwrap().is_none());
+            assert!(paper.activity_group_state(&covered_id).unwrap().is_none());
+            assert_eq!(paper.gate_history().unwrap(), history);
+            assert!(paper.decision_pending_history().unwrap().is_empty());
+            assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
+            assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+            drop(preparer);
+            actor.await.unwrap();
+        }
+    }
 }
 
 async fn runtime_completion_case(

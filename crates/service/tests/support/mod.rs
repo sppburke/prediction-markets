@@ -536,3 +536,91 @@ pub fn assert_no_continuation_side_effects(
     let records = pe_service::paper_recovery::scan_paper_log(paper_path).unwrap();
     assert_eq!(records.len(), 0, "zero Prepared/Final/order records");
 }
+
+/// Seal a source-census fixture through the public qualification entry point. The fixture owns
+/// no membership or financial mutation; callers assert the exact source-verification outcome.
+pub async fn qualify_source_census(
+    directory: &std::path::Path,
+    source_log: &std::path::Path,
+    paper_state: &std::path::Path,
+    now_unix: i64,
+) -> pe_service::qualification::QualificationReport {
+    use pe_event_log::Scanner;
+    use pe_service::paper_recovery::{
+        PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, QualificationSealed, QualificationStarted,
+        SealReason, TailBinding,
+    };
+    std::fs::create_dir_all(directory).unwrap();
+    let paper_log = directory.join("paper.log");
+    let live_journal = directory.join("live.log");
+    let mut writer = Writer::open(&paper_log).unwrap();
+    drop(pe_execution_core::LiveJournal::open(&live_journal).unwrap());
+    let empty = TailBinding::from(&Scanner::verify(&paper_log).unwrap());
+    // Exact empty membership manifest and binding field order owned by MembershipProofBinding.
+    let manifest = r#"{"membership":[],"proofs":[]}"#;
+    let proof_hash = blake3::hash(manifest.as_bytes()).to_hex().to_string();
+    let start = QualificationStarted {
+        starting_bankroll: pe_core_types::CollateralAmount::ZERO,
+        paper_prefix: empty.clone(),
+        source_prefix: empty.clone(),
+        live_prefix: empty.clone(),
+        artifact_blake3: "scenario".to_owned(),
+        static_config_hash: "scenario".to_owned(),
+        hot_config_hash: "scenario".to_owned(),
+        generation: "scenario".to_owned(),
+        activation_id: "scenario".to_owned(),
+        ranking_batch_id: 1,
+        membership: Vec::new(),
+        membership_proofs_hash: format!(
+            r#"{{"version":1,"proof_hash":"{proof_hash}","manifest":{manifest}}}"#
+        ),
+        schema_version: PAPER_LOG_SCHEMA_VERSION,
+        parser_version: 1,
+        financial_semantic_version: 1,
+    };
+    let envelope = |record: PaperLogRecord| {
+        let timestamp = time::OffsetDateTime::from_unix_timestamp(now_unix).unwrap();
+        EnvelopeIn {
+            source_id: SourceId("pe-service.qualification".to_owned()),
+            schema_version: PAPER_LOG_SCHEMA_VERSION,
+            parser_version: 1,
+            observed_at: SourceTimestamp(timestamp),
+            received_at: ReceivedAt(timestamp),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&record).unwrap(),
+        }
+    };
+    let start_receipt = writer
+        .append_synced(envelope(PaperLogRecord::QualificationStarted(Box::new(
+            start,
+        ))))
+        .unwrap();
+    let financial_prefix = TailBinding::from(&Scanner::verify(&paper_log).unwrap());
+    let seal = QualificationSealed {
+        start_receipt,
+        source_prefix: TailBinding::from(&Scanner::verify(source_log).unwrap()),
+        financial_prefix,
+        live_prefix: empty,
+        decision_evidence_digest: blake3::hash(b"[]").to_hex().to_string(),
+        sealed_cutoff_unix: now_unix,
+        reason: SealReason::Complete,
+    };
+    let seal_receipt = writer
+        .append_synced(envelope(PaperLogRecord::QualificationSealed(Box::new(
+            seal,
+        ))))
+        .unwrap();
+    drop(writer);
+    let output = directory.join("qualification.json");
+    pe_service::qualification::run_qualify(&pe_service::qualification::QualifyOptions {
+        paper_log,
+        source_log: source_log.to_owned(),
+        live_journal: Some(live_journal),
+        paper_state: paper_state.to_owned(),
+        seal_hash: seal_receipt.this_hash.to_hex().to_string(),
+        output: output.clone(),
+    })
+    .await
+    .unwrap();
+    serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap()
+}

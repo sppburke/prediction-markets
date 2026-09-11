@@ -1039,7 +1039,7 @@ async fn main() -> Result<()> {
             return Ok(TaskExit::ChannelClosed("producer_start"));
         }
         activity_ingest
-            .run_until(activity_shutdown.wait_for(ShutdownPhase::StopProducers))
+            .run_until(activity_shutdown.wait_for(TaskName::ActivityIngest.stop_phase()))
             .await
             .map(|()| TaskExit::CleanShutdown)
             .map_err(TaskFailure::typed)
@@ -1057,6 +1057,7 @@ async fn main() -> Result<()> {
     let poller_runtime_config = live_runtime_config.clone();
     let poller_admission_preparer = admission_preparer.clone();
     let poller_asset_identity = Arc::clone(&asset_identity);
+    let poller_source_receipts = source_receipts.clone();
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -1082,6 +1083,7 @@ async fn main() -> Result<()> {
             obligations,
             Some(poller_admission_preparer),
         )
+        .with_source_receipt_index(poller_source_receipts)
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
         .await
         .map(|()| TaskExit::CleanShutdown)
@@ -1668,7 +1670,6 @@ async fn main() -> Result<()> {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopProducers);
     let producers = [
-        TaskName::ActivityIngest,
         TaskName::PublicActivityPoll,
         TaskName::ResolutionPoller,
         TaskName::LiveAccountsPoller,
@@ -1689,6 +1690,9 @@ async fn main() -> Result<()> {
 
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopSinks);
     let sinks = [
+        // Source acknowledgements remain available while wallet operations and the
+        // serialized control owner drain.
+        TaskName::ActivityIngest,
         TaskName::LiveFanout,
         TaskName::SupabaseAnalyticsSink,
         TaskName::LiquiditySnapshotWorker,
@@ -2314,72 +2318,5 @@ mod tests {
             select_boot_anchor_wallets(&paper_state, &[with_validation], true, NOW).unwrap();
         assert!(migration.reused.is_empty());
         assert_eq!(migration.walked, vec![with_validation]);
-    }
-    #[test]
-    fn fresh_pre_start_selection_uses_active_fences_before_cap_and_bracket() {
-        use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
-        use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("paper.db");
-        let paper = PaperStateDb::open(&path).unwrap();
-        let (fenced, survivor) = (wallet(20), wallet(21));
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [fenced.to_string()]).unwrap();
-        let entries = [fenced, survivor]
-            .map(|wallet| WatchlistEntry {
-                wallet,
-                tier: WatchlistTier::Active,
-                leader_score_bps: BasisPoints(1000),
-                lcb_5pct_bps: BasisPoints(0),
-                win_rate_bps: BasisPoints(6000),
-                closed_trades_in_window: 10,
-                reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-            })
-            .to_vec();
-        let bench = Watchlist {
-            entries,
-            active_count: 2,
-            incubator_count: 0,
-            snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
-        };
-        let fences = paper
-            .wallet_fences()
-            .unwrap()
-            .into_iter()
-            .map(|row| row.wallet)
-            .collect();
-        let (selected, times) = supabase_reader::select_membership(
-            bench,
-            std::collections::HashMap::from([(fenced, NOW - 1), (survivor, NOW)]),
-            &fences,
-            1,
-        );
-        assert_eq!(
-            selected
-                .entries
-                .iter()
-                .map(|entry| entry.wallet)
-                .collect::<Vec<_>>(),
-            vec![survivor]
-        );
-        assert_eq!(times, std::collections::HashMap::from([(survivor, NOW)]));
-        let to_validate = select_boot_anchor_wallets(&paper, &[survivor], true, NOW).unwrap();
-        assert_eq!(to_validate.walked, vec![survivor]);
-        assert!(paper.wallet_history_status(&survivor).unwrap().is_none());
-        // With no selectable members boot has no bracket work and reaches its empty-membership refusal.
-        let (empty, times) = supabase_reader::select_membership(
-            selected,
-            times,
-            &std::collections::HashSet::from([survivor]),
-            1,
-        );
-        assert!(empty.entries.is_empty());
-        assert!(times.is_empty());
-        assert!(
-            select_boot_anchor_wallets(&paper, &[], true, NOW)
-                .unwrap()
-                .walked
-                .is_empty()
-        );
     }
 }

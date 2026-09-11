@@ -181,7 +181,7 @@ async fn run_once(
         pe_service::risk_inputs::SourceReceiptIndex::replay(source_log_path).unwrap();
     let ingest = tokio::spawn(
         ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
-            .with_source_receipt_index(source_receipts)
+            .with_source_receipt_index(source_receipts.clone())
             .run(),
     );
     let (control_tx, mut control_rx) = mpsc::channel(2);
@@ -218,10 +218,12 @@ async fn run_once(
             }
         }
     });
-    TradePoller::new(
+    let (progress_tx, mut progress_rx) = mpsc::channel(8);
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let poller = TradePoller::new(
         TradePollerConfig {
             base_url: BASE_URL.to_owned(),
-            poll_interval_secs: 0,
+            poll_interval_secs: 30,
             activity_ws_enabled: true,
             copy_latency_budget_secs: 2,
         },
@@ -242,9 +244,23 @@ async fn run_once(
         obligations,
         None,
     )
+    .with_source_receipt_index(source_receipts)
+    .with_progress(progress_tx)
     .with_clock(Arc::new(move || now))
-    .run()
-    .await;
+    .run_until(async move {
+        let _ = stopped.await;
+    });
+    let poller = tokio::spawn(poller);
+    loop {
+        if matches!(
+            progress_rx.recv().await.unwrap(),
+            pe_service::trade_poller::PollerProgress::RoundCompleted
+        ) {
+            break;
+        }
+    }
+    stop.send(()).unwrap();
+    poller.await.unwrap().unwrap();
     ingest.await.unwrap();
     control.await.unwrap();
 }

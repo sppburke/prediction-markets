@@ -10177,6 +10177,202 @@ mod tests {
         replay_observation_fixture(&prepared, &account_id, &sources, &current).unwrap();
     }
 
+    /// PASS: actual synchronized replacement receipts and rehashed binding preimages reach the
+    /// economic replay owner; every semantic mutation fails and the authentic control recomposes.
+    #[test]
+    fn strict_live_economic_rejects_each_binding_mutation() {
+        use crate::bucket_commit::{
+            ActivityReadCommitmentReceipt, ObservationBinding, PaperFreshnessPolicy,
+        };
+        for (change, expected) in [
+            ("valid", ""),
+            (
+                "bindings",
+                "websocket correction has no verified observation binding",
+            ),
+            ("revision", "binding target revision differs"),
+            ("group", "binding stream group differs from its receipt"),
+            (
+                "stream_receipt",
+                "binding stream has the wrong source contract",
+            ),
+            ("occurrence", "binding target page occurrence differs"),
+            ("metadata", "binding metadata provenance differs"),
+            ("digest", "commitment differs from its frozen proof"),
+            ("schema", "economic commitment source contract differs"),
+            ("parser", "economic commitment source contract differs"),
+            ("version", "commitment differs from its frozen proof"),
+            ("read_proof", "binding commitment read proof is absent"),
+        ] {
+            let (mut prepared, account_id, mut sources, legacy) = observation_replay_fixture();
+            let old_stream = legacy.observed_source_receipt.unwrap();
+            let stream = sources
+                .iter_mut()
+                .find(|(receipt, _)| *receipt == old_stream)
+                .unwrap();
+            let mut payload: serde_json::Value = serde_json::from_slice(&stream.1.payload).unwrap();
+            payload["timestamp"] = serde_json::json!(17);
+            stream.1.payload = serde_json::to_vec(&payload).unwrap();
+            sources.retain(|(receipt, _)| Some(*receipt) != legacy.read_commitment);
+            sources.sort_by_key(|(receipt, _)| receipt.sequence);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("economic-bindings.log");
+            let mut writer = pe_event_log::Writer::open(&path).unwrap();
+            let mut mapped = HashMap::new();
+            for (old, source) in &mut sources {
+                let at = source_time_from_millis(source.received_unix_ms).unwrap();
+                let receipt = writer
+                    .append_synced(pe_event_log::EnvelopeIn {
+                        source_id: SourceId(source.source_id.clone()),
+                        schema_version: source.schema_version,
+                        parser_version: source.parser_version,
+                        observed_at: SourceTimestamp(at),
+                        received_at: ReceivedAt(at),
+                        content_type: source.content_type.clone(),
+                        payload: source.payload.clone(),
+                    })
+                    .unwrap();
+                mapped.insert(old.sequence, receipt);
+                *old = receipt;
+            }
+            let remap = |receipt: AppendReceipt| mapped[&receipt.sequence];
+            let economic = &mut prepared.economic;
+            economic.admission.receipts.gamma = remap(economic.admission.receipts.gamma);
+            economic.admission.receipts.clob_long = remap(economic.admission.receipts.clob_long);
+            economic.admission.receipts.clob_compact =
+                remap(economic.admission.receipts.clob_compact);
+            economic.book_receipt = remap(economic.book_receipt);
+            let observation = economic.observation.as_mut().unwrap();
+            observation.source_receipt = remap(observation.source_receipt);
+            observation.complete_bound_receipt = remap(observation.complete_bound_receipt);
+            let stream_receipt = remap(old_stream);
+            let mut facts = legacy.facts.clone();
+            facts.paper_freshness_policy = Some(PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 2,
+            });
+            let mut occurrences = legacy.page_occurrences.clone();
+            for page in &mut occurrences {
+                page.receipt = remap(page.receipt);
+            }
+            let pages = serde_json::from_value::<
+                Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
+            >(facts.decision_inputs["pages"].clone())
+            .unwrap();
+            let gamma = sources
+                .iter()
+                .find(|(receipt, _)| *receipt == economic.admission.receipts.gamma)
+                .unwrap();
+            let metadata_receipt = gamma.0;
+            let mut bindings = vec![ObservationBinding {
+                stream_group_id: facts.source_trade_id.clone(),
+                stream_receipt,
+                history_group_id: facts.source_trade_id.clone(),
+                semantic_revision: facts.semantic_revision.clone(),
+                page_raw_hash: occurrences[0].raw_hash.clone(),
+                page_occurrence_index: 0,
+                identity_provenance: Some(crate::asset_identity::IdentityProvenance {
+                    asset: economic.market.token_id.clone(),
+                    source_log_sequence: metadata_receipt.sequence.0,
+                    canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(
+                        &gamma.1.payload,
+                    )
+                    .unwrap(),
+                }),
+                identity_receipt: Some(metadata_receipt),
+            }];
+            match change {
+                "bindings" => bindings.clear(),
+                "revision" => bindings[0].semantic_revision = "changed".to_owned(),
+                "group" => bindings[0].stream_group_id = SourceTradeId("g2:changed".to_owned()),
+                "stream_receipt" => bindings[0].stream_receipt = occurrences[0].receipt,
+                "occurrence" => bindings[0].page_occurrence_index = 99,
+                "metadata" => {
+                    bindings[0]
+                        .identity_provenance
+                        .as_mut()
+                        .unwrap()
+                        .source_log_sequence = 99
+                }
+                _ => {}
+            }
+            let mut value: serde_json::Value = serde_json::from_slice(
+                &crate::bucket_commit::activity_read_commitment_payload_v2(
+                    facts.wallet,
+                    facts.decision_inputs["fixed_end"].as_i64().unwrap(),
+                    &occurrences,
+                    &pages,
+                    &bindings,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            match change {
+                "digest" => value["digest"] = serde_json::json!("00".repeat(32)),
+                "version" => value["version"] = serde_json::json!(1),
+                "read_proof" => {
+                    value.as_object_mut().unwrap().remove("read_proof");
+                }
+                _ => {}
+            }
+            let at = source_time_from_millis(20_000).unwrap();
+            let commitment = writer
+                .append_synced(pe_event_log::EnvelopeIn {
+                    source_id: SourceId(
+                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+                    ),
+                    schema_version: if change == "schema" { 1 } else { 2 },
+                    parser_version: if change == "parser" { 2 } else { 1 },
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&value).unwrap(),
+                })
+                .unwrap();
+            drop(writer);
+            let continuation = DecisionContinuationV3::new(
+                facts,
+                Some(stream_receipt),
+                occurrences,
+                Some(ActivityReadCommitmentReceipt::BindingsV2(commitment)),
+            );
+            let index = crate::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+            let source = index.source_envelope(commitment).unwrap();
+            sources.push((
+                commitment,
+                RecordedEconomicSource {
+                    payload: source.payload,
+                    source_id: source.source_id.0,
+                    schema_version: source.schema_version,
+                    parser_version: source.parser_version,
+                    content_type: source.content_type.clone(),
+                    received_unix_ms: 20_000,
+                },
+            ));
+            for (receipt, source) in &sources {
+                assert_eq!(
+                    index.source_envelope(*receipt).unwrap().payload,
+                    source.payload
+                );
+            }
+            let result =
+                replay_observation_fixture(&prepared, &account_id, &sources, &continuation);
+            if change == "valid" {
+                result
+                    .unwrap()
+                    .recompose(
+                        &prepared.economic,
+                        prepared.economic.risk.clone(),
+                        prepared.identity.config_hash.clone(),
+                    )
+                    .unwrap();
+            } else {
+                let error = result.err().unwrap().to_string();
+                assert!(error.contains(expected), "{change}: {error}");
+            }
+        }
+    }
+
     /// PASS: strict live replay loads an engine-recorded A/0-to-B/1 correction from paper state
     /// and accepts B/1; the uncorrected A/0 control passes. Changed frozen, stamped, or verified
     /// identities and uncorrected B/1 all fail.

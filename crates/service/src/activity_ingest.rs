@@ -88,6 +88,8 @@ pub struct ReconciliationTrigger {
 #[derive(Clone)]
 pub struct SourceLogHandle {
     tx: mpsc::Sender<SourceLogRequest>,
+    #[cfg(feature = "scenario")]
+    append_ack_gate: Option<(Arc<Semaphore>, Arc<tokio::sync::Notify>)>,
 }
 
 struct SourceLogRequest {
@@ -109,7 +111,14 @@ impl SourceLogHandle {
     /// Build the bounded external input owned by [`ActivityIngest`].
     pub fn channel(capacity: usize) -> (Self, SourceLogReceiver) {
         let (tx, rx) = mpsc::channel(capacity);
-        (Self { tx }, SourceLogReceiver { rx })
+        (
+            Self {
+                tx,
+                #[cfg(feature = "scenario")]
+                append_ack_gate: None,
+            },
+            SourceLogReceiver { rx },
+        )
     }
 
     /// Record one source page and wait for its durable append acknowledgement.
@@ -122,9 +131,30 @@ impl SourceLogHandle {
             .send(SourceLogRequest { envelope, appended })
             .await
             .map_err(|_| SourceLogHandleError::Closed)?;
-        acknowledgement
+        let receipt = acknowledgement
             .await
-            .map_err(|_| SourceLogHandleError::Closed)
+            .map_err(|_| SourceLogHandleError::Closed)?;
+        #[cfg(feature = "scenario")]
+        if let Some((gate, arrived)) = &self.append_ack_gate {
+            arrived.notify_one();
+            let _permit = gate
+                .acquire()
+                .await
+                .map_err(|_| SourceLogHandleError::Closed)?;
+        }
+        Ok(receipt)
+    }
+
+    /// Hold this producer's acknowledgement after the real coordinator synchronizes its frame.
+    #[cfg(feature = "scenario")]
+    #[must_use]
+    pub fn with_append_ack_gate(
+        mut self,
+        gate: Arc<Semaphore>,
+        arrived: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.append_ack_gate = Some((gate, arrived));
+        self
     }
 }
 
@@ -288,10 +318,12 @@ impl ActivityIngest {
     /// aborted and drained. Dropping this future (external abort) drops the
     /// set, which aborts its children without joining them.
     pub async fn run(self) {
-        let _ = self.run_until(std::future::pending::<()>()).await;
+        let _ = self.run_owned(std::future::pending::<()>(), false).await;
     }
 
     /// Production owner entry point with an explicit coordinated-shutdown branch.
+    /// Trigger closure stops reader delivery while source appends remain available until the
+    /// supplied sink-phase shutdown, after the poller and orchestrator have drained.
     ///
     /// Every nested child is aborted and then joined before this future returns. A reader row
     /// retained only in memory may be dropped on shutdown; a row already appended remains a
@@ -299,6 +331,14 @@ impl ActivityIngest {
     pub async fn run_until(
         self,
         shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), ActivityIngestError> {
+        self.run_owned(shutdown, true).await
+    }
+
+    async fn run_owned(
+        self,
+        shutdown: impl std::future::Future<Output = ()>,
+        drain_sources: bool,
     ) -> Result<(), ActivityIngestError> {
         let (fan_in_tx, fan_in_rx) = mpsc::channel(self.trigger_tx.max_capacity());
         let mut tasks = JoinSet::new();
@@ -341,7 +381,7 @@ impl ActivityIngest {
                 #[cfg(feature = "scenario")]
                 reader_append_gate: self.reader_append_gate,
             }
-            .run()
+            .run_with_source_drain(drain_sources)
             .await;
             ActivityChild::Coordinator
         });
@@ -633,15 +673,38 @@ struct Coordinator {
 impl Coordinator {
     /// Run until every producer is gone or the trigger channel closes — the latter
     /// is noticed immediately, not only at the next delivery.
-    async fn run(mut self) {
+    #[cfg(test)]
+    async fn run(self) {
+        self.run_with_source_drain(false).await;
+    }
+
+    async fn run_with_source_drain(mut self, drain_sources: bool) {
         loop {
+            if drain_sources && self.trigger_tx.is_closed() {
+                // Poller shutdown cannot retire the source owner: the serialized control owner
+                // still records evidence while it drains already accepted wallet operations.
+                while let Some(request) = self.source_rx.recv().await {
+                    let label = SourceTradeId(request.envelope.source_id.0.clone());
+                    let Ok(receipt) = self
+                        .append_with_recovery(request.envelope, &label, None, true)
+                        .await
+                    else {
+                        return;
+                    };
+                    let _ = request.appended.send(receipt);
+                }
+                return;
+            }
             enum Input {
                 Reader(Observation),
                 Source(SourceLogRequest),
             }
             let input = tokio::select! {
                 biased;
-                () = self.trigger_tx.closed() => return,
+                () = self.trigger_tx.closed() => {
+                    if drain_sources { continue; }
+                    return;
+                },
                 input = async {
                     tokio::select! {
                         received = self.fan_in.recv() => received.map(Input::Reader),
@@ -672,7 +735,10 @@ impl Coordinator {
                     };
                     let label = observation.trigger.source_trade_id.clone();
                     let slot = Some(observation.slot);
-                    let receipt = match self.append_with_recovery(envelope, &label, slot).await {
+                    let receipt = match self
+                        .append_with_recovery(envelope, &label, slot, drain_sources)
+                        .await
+                    {
                         Ok(receipt) => receipt,
                         Err(Shutdown) => return,
                     };
@@ -692,13 +758,17 @@ impl Coordinator {
                             self.reconciliation_triggers_dropped
                                 .fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(TrySendError::Closed(_)) => return,
+                        Err(TrySendError::Closed(_)) => {
+                            if !drain_sources {
+                                return;
+                            }
+                        }
                     }
                 }
                 Input::Source(request) => {
                     let label = SourceTradeId("poll-page".to_owned());
                     let seq = match self
-                        .append_with_recovery(request.envelope, &label, None)
+                        .append_with_recovery(request.envelope, &label, None, drain_sources)
                         .await
                     {
                         Ok(seq) => seq,
@@ -719,6 +789,7 @@ impl Coordinator {
         envelope: EnvelopeIn,
         label: &SourceTradeId,
         slot: Option<usize>,
+        drain_sources: bool,
     ) -> Result<AppendReceipt, Shutdown> {
         match self.sink.append_durable(duplicate_envelope(&envelope)) {
             Ok(receipt) => return self.index_synced_append(receipt, &envelope),
@@ -734,7 +805,7 @@ impl Coordinator {
         }
         let mut attempt: u32 = 0;
         loop {
-            if self.trigger_tx.is_closed() {
+            if self.trigger_tx.is_closed() && !drain_sources {
                 return Err(Shutdown);
             }
             tokio::time::sleep(Duration::from_secs(backoff_secs(attempt))).await;
@@ -1151,6 +1222,17 @@ mod tests {
             observation("0xqueued").trigger.source_trade_id
         );
 
+        let recorded = LogReader::replay(dir.path().join("source.log"))
+            .unwrap()
+            .map(|frame| frame.unwrap().1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "dropped wakeups retain raw evidence and do not block a polling page"
+        );
+        assert_eq!(recorded[1].source_id.0, "poll-test");
+
         drop(source_log);
         drop(fan_in_tx);
         task.await.unwrap();
@@ -1281,5 +1363,50 @@ mod tests {
             source_receipts.snapshot(),
             SourceReceiptIndex::replay(&path).unwrap().snapshot()
         );
+    }
+    /// PASS: stopping trigger intake leaves source acknowledgements available to the draining
+    /// orchestrator; the explicit sink shutdown still joins the coordinator.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_source_owner_survives_poller_trigger_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let sink = SourceEventSink::open(&path).unwrap();
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        let (source, receiver) = SourceLogHandle::channel(2);
+        let (triggers, trigger_rx) = mpsc::channel(2);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(
+            ActivityIngest::poll_only(
+                sink,
+                receiver,
+                triggers,
+                new_shared_health_with_ws(false, true, 90),
+            )
+            .with_source_receipt_index(index.clone())
+            .run_until(async move {
+                let _ = stopped.await;
+            }),
+        );
+        drop(trigger_rx);
+        let row = observation("draining-control");
+        let receipt = source
+            .append(EnvelopeIn {
+                source_id: SourceId("draining-control".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(row.trigger.source_time),
+                received_at: ReceivedAt(row.trigger.received_at),
+                content_type: ContentType::Json,
+                payload: row.payload,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            index.source_envelope(receipt).unwrap().source_id.0,
+            "draining-control"
+        );
+        assert!(!owner.is_finished());
+        stop.send(()).unwrap();
+        owner.await.unwrap().unwrap();
     }
 }

@@ -535,6 +535,7 @@ impl Harness {
     async fn poll(&self, recorded: &Recorded) {
         let now = OffsetDateTime::from_unix_timestamp(recorded.epoch).unwrap();
         let (_trigger, receiver) = mpsc::channel(1);
+        let (progress, mut completed) = mpsc::channel(8);
         TradePoller::new(
             TradePollerConfig {
                 base_url: "fixture://activity".to_owned(),
@@ -560,8 +561,19 @@ impl Harness {
             ReconciliationObligations::default(),
             None,
         )
+        .with_source_receipt_index(self.index.clone())
+        .with_progress(progress)
         .with_clock(Arc::new(move || now))
-        .run_until(async {})
+        .run_until(async move {
+            while let Some(progress) = completed.recv().await {
+                if matches!(
+                    progress,
+                    pe_service::trade_poller::PollerProgress::RoundCompleted
+                ) {
+                    break;
+                }
+            }
+        })
         .await
         .unwrap();
     }

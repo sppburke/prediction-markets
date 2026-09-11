@@ -238,6 +238,7 @@ fn validator(responses: HashMap<String, Vec<Vec<u8>>>) -> CausalPositionValidato
 }
 
 struct PollerHarness {
+    poll_fetcher: Arc<PollFetcher>,
     poller: TradePoller,
     ingest: tokio::task::JoinHandle<()>,
     actor: tokio::task::JoinHandle<()>,
@@ -280,7 +281,7 @@ fn poller_harness(
         tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
     let (control_tx, mut control_rx) = mpsc::channel(4);
     let actor_paper = Arc::clone(&paper);
-    let poll_fetcher = Arc::new(PollFetcher::empty_pages(wallets.len() * rounds));
+    let poll_fetcher = Arc::new(PollFetcher::empty_pages(wallets.len() * (rounds + 1)));
     let actor_poll_fetcher = Arc::clone(&poll_fetcher);
     let actor_installed = Arc::clone(&installed);
     let actor = tokio::spawn(async move {
@@ -299,13 +300,17 @@ fn poller_harness(
                 } => {
                     let _ = committed.send(
                         engine
-                            .commit(
+                            .commit_with_freshness_policy(
                                 aggregates,
                                 context.as_ref(),
                                 FrozenDecisionBasis {
                                     win_rate_p: pe_core_types::Probability::ZERO,
                                     bankroll: rust_decimal::Decimal::ZERO,
                                 },
+                                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                                    activity_ws_enabled: false,
+                                    copy_latency_budget_secs: 2,
+                                }),
                             )
                             .map_err(|error| error.to_string()),
                     );
@@ -360,7 +365,7 @@ fn poller_harness(
             copy_latency_budget_secs: 2,
         },
         live_watchlist(wallets),
-        poll_fetcher,
+        poll_fetcher.clone(),
         asset_identity,
         source_log,
         trigger_rx,
@@ -378,6 +383,7 @@ fn poller_harness(
         OffsetDateTime::from_unix_timestamp(NOW).unwrap()
     }));
     PollerHarness {
+        poll_fetcher,
         poller,
         ingest,
         actor,
@@ -476,6 +482,7 @@ async fn refreshes_at_most_one_due_wallet_per_round_in_round_robin_order() {
         ingest,
         actor,
         preparer,
+        ..
     } = harness;
     let result = poller
         .run_until(async {
@@ -583,29 +590,35 @@ async fn contended_mutex_rereads_fresh_anchor_before_refreshing() {
     actor.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deferred_refresh_continues_the_poller() {
     let wallet = wallet(0x44);
     let (dir, paper) = paper(&[wallet]);
-    let mut responses = HashMap::new();
-    responses.insert(activity_url(wallet), vec![b"[]".to_vec()]);
-    responses.insert(
-        position_url(wallet, PositionPartition::NotRedeemable),
-        vec![
-            serde_json::to_vec(&vec![json!({
-                "proxyWallet": wallet,
-                "asset": "unmapped",
-                "conditionId": "condition",
-                "size": "1",
-                "outcomeIndex": 0
-            })])
-            .unwrap(),
-        ],
-    );
-    responses.insert(
-        position_url(wallet, PositionPartition::Redeemable),
-        vec![b"[]".to_vec()],
-    );
+    paper.set_cursor(&wallet, 0).unwrap();
+    paper
+        .install_anchors(&[AnchorInstallRecord {
+            history_status: None,
+            wallet,
+            balances: Vec::new(),
+            activity_cutoff_unix: 0,
+            anchored_at_unix: NOW - 3_601,
+            ledger_hash_after: "old-anchor".to_owned(),
+            positions_proof_hash: "old-positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: NOW - 3_601,
+        }])
+        .unwrap();
+    let mut responses = stable_bracket_responses(&[wallet]);
+    let ordinary_page = responses[&activity_url(wallet)][0].clone();
+    // The first bracket sees an unseen post-anchor entry. Its preflight defers before writes;
+    // the remaining three reads belong to the retry after urgent ordinary reconciliation.
+    responses
+        .get_mut(&activity_url(wallet))
+        .unwrap()
+        .insert(0, ordinary_page.clone());
+    let (shutdown, stopped) = oneshot::channel();
     let installed = Arc::new(Mutex::new(Vec::new()));
     let harness = poller_harness(
         &dir,
@@ -615,17 +628,60 @@ async fn deferred_refresh_continues_the_poller() {
         1,
         false,
         Arc::clone(&installed),
-        None,
+        Some(shutdown),
     );
+    harness.poll_fetcher.pages.lock().unwrap()[1] = ordinary_page;
     let PollerHarness {
         poller,
         ingest,
         actor,
         preparer,
+        poll_fetcher,
     } = harness;
-    assert!(poller.run_until(async {}).await.is_ok());
-    assert!(installed.lock().unwrap().is_empty());
-    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    let (progress, mut completed) = mpsc::channel(8);
+    assert!(
+        poller
+            .with_progress(progress)
+            .run_until(async move {
+                let _ = stopped.await;
+            })
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        *installed.lock().unwrap(),
+        vec![(wallet, 2)],
+        "the urgent reconciliation precedes the bracket retry"
+    );
+    assert_eq!(
+        poll_fetcher.calls.load(Ordering::SeqCst),
+        2,
+        "one backstop plus one urgent read"
+    );
+    let mut starts = Vec::new();
+    while let Ok(progress) = completed.try_recv() {
+        if let pe_service::trade_poller::PollerProgress::Started {
+            wallet: started,
+            urgent,
+            ..
+        } = progress
+        {
+            assert_eq!(started, wallet);
+            starts.push(urgent);
+        }
+    }
+    assert_eq!(starts, vec![false, true]);
+    assert_eq!(
+        paper.decision_pending_history().unwrap().len(),
+        1,
+        "the deferred bracket must leave copying to the ordinary owner"
+    );
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 2);
+    assert_eq!(
+        paper.activity_groups_after(&wallet, 0).unwrap().len(),
+        1,
+        "ordinary reconciliation consumed the unseen activity before retrying the bracket"
+    );
     finish_harness(ingest, actor, preparer).await;
 }
 
@@ -674,6 +730,7 @@ async fn real_transaction_failure_terminates_the_poller_without_swapping() {
         ingest,
         actor,
         preparer,
+        ..
     } = harness;
     let result = poller.run_until(std::future::pending::<()>()).await;
     assert!(matches!(
