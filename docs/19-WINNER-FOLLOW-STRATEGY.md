@@ -414,7 +414,16 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 | C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | admission's recorded CLOB-long `scheduled_end_unix` | Too far out locks capital for months; too soon (< 60 s) cannot be filled and held (`docs/29` copy floor). The same admission read supplies the horizon and economic evidence; the dashboard market-end cache is not consulted by this path. Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). |
 | D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Paper and ordinary live use the same signed principal, minimum shares, fee schedule, and all-in price. Gamma mid is liveness/mark evidence only. The upper boundary skips and the lower boundary fills. |
 
-**Copy-latency budget (both provenances).** In websocket-primary mode the orchestrator applies `copy_latency_budget_secs` (`_GLOSSARY.md`) to every observation — REST poll or activity websocket — before gate B and again immediately before dispatch staging: an observation older than the budget is admitted for seen/leader bookkeeping with a typed no-copy disposition and stages no copy (#530/#546).
+**Copy-latency budget (both provenances).** REST poll and activity-websocket observations pass an
+early freshness gate and the shared pre-dispatch gate. In websocket-primary mode, expiry at either
+gate records a typed no-copy disposition and stages no copy. Continuation 5 freezes its freshness
+policy at bucket commit and adds a final paper-only freshness decision at the Prepared boundary,
+after awaited evidence and recovery work. Its precise `paper_prepared_staleness_gate` clock binds
+that decision; expiry records `paper_stale_before_prepared`, consumes the entry, and releases
+already-staged live targets with a no-fill paper outcome. The budget, frozen policy, source-time
+rule, and version compatibility are canonical in the glossary's
+[`copy_latency_budget_secs`](_GLOSSARY.md#polymarket-public-source-pollingconfig) and
+[continuation contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
 **Fail posture (gate B history unknown).** Missing or incomplete reconciled history fails closed: the wallet cannot be published into membership, and any attempted entry receives the typed `wallet_history_incomplete` disposition. Version-two paper-state records are the authority. The captured legacy history file is a one-time migration input only: a valid import is a conservative seed and remains incomplete until a reconciled-history proof is durably recorded (#544).
 

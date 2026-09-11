@@ -554,8 +554,9 @@ After Start, retained pre-#545 version-2 continuation records survive the financ
 remain boot inputs of this generation. Every binary started against it after Start, including any
 rollback target, must carry the pre-#545 version-2 continuation decoder (issue #584). The durable
 `target_revision` in `/home/sean/pe-financial-era.json` is the first post-Start compatible revision.
-Recovery binaries must be that revision or reviewed descendants that retain the decoder. A post-#565
-artifact without it fails boot with `verify terminal pending …: missing field era`.
+Recovery binaries must be that revision or reviewed descendants that retain the decoder and satisfy
+the later [rollback compatibility prerequisites](#rollback). A post-#565 artifact without the decoder
+fails boot with `verify terminal pending …: missing field era`.
 
 The driver invokes these early-dispatch service commands; they accept either `--name=value` or
 `--name value` spellings:
@@ -635,10 +636,16 @@ unit's `Restart=on-failure` policy repeats the failed start until the row is dia
 repeats the same way until storage works; preserve the era and the pending rows and diagnose
 storage. The ordinary [rollback](#rollback) to a pre-#565 binary is available only
 before the first synchronized schema-3 reconciliation page. After that boundary, preserve all state
-and use a binary retaining schema-3 page and V4 continuation compatibility; never delete records or
-rewrite rows to make an older reader accept them.
+and use a binary retaining schema-3 page and V4 continuation compatibility plus any later durable
+contracts below; never delete records or rewrite rows to make an older reader accept them.
 
-<!-- #588 compatibility boundary: filled by the docs phase -->
+**#588 compatibility boundary.** Before the first durable continuation-5 write and before the
+first `history_only_bracket` disposition write, rollback still requires a reader compatible with
+the existing financial era and schemas described here and in [Rollback](#rollback). Either write requires
+a reader retaining the new versions and disposition; recovery then follows the roll-forward
+route. The disposition can cross this boundary before any continuation-5 write. Preserve all old
+source records, recorded effects, fences, financial records, and publication artifacts. See the
+[canonical continuation and commitment contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
 Required release evidence for the first-activation/ordinary-update distinction:
 
@@ -991,17 +998,24 @@ change, or a hash mismatch.
 schema-3 reconciliation page has become durable in the source log (the first successor poll page
 crosses that boundary, before any commitment or version-4 continuation exists). After it, preserve
 all state and roll forward with an executable that retains schema-3 page and version-4 continuation
-compatibility; see the [open-continuation census](#565-open-continuation-census-before-deployment). Never delete
-records or rewrite rows to make an older reader accept them.
+compatibility plus any later durable contracts below; see the
+[open-continuation census](#565-open-continuation-census-before-deployment). Never delete records or
+rewrite rows to make an older reader accept them.
 
 **Financial-era compatibility prerequisite (#584):** every ordinary rollback after Start must retain
 the pre-#545 version-2 continuation decoder. Those records survive the financial-era reset and remain
 boot inputs of the generation. The durable `target_revision` in
 `/home/sean/pe-financial-era.json` is the first compatible revision. The rollback target must be that
-revision or a reviewed descendant that retains the decoder. A post-#565 artifact without it fails
-boot with `verify terminal pending …: missing field era`.
+revision or a reviewed descendant that retains the decoder and every later durable contract below.
+A post-#565 artifact without the decoder fails boot with `verify terminal pending …: missing field era`.
 
-<!-- #588 compatibility boundary: filled by the docs phase -->
+**#588 compatibility prerequisite:** before the first durable continuation-5 write and before
+the first `history_only_bracket` disposition write, the financial/schema reader prerequisites
+above still apply. After either write, use a reader retaining the new versions and disposition
+and roll forward; an older reader lacking either contract is no longer a rollback target.
+Preserve all old source records, recorded effects, fences, financial records, and publication
+artifacts. Continuation 5 and terminal-evidence version 5 are distinct contracts; use the
+[glossary compatibility table](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
 ```bash
 cp -p target/release/pe-service.bak-<prior-sha12> /tmp/pe-service.rollback.<prior-sha12>
