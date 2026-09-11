@@ -2152,7 +2152,7 @@ mod paper_log_tests {
         );
         let preparer = AdmissionPreparer::new(control_tx, paper_state);
         preparer
-            .publish_membership(change, replacements)
+            .publish_membership(change, replacements, Default::default())
             .await
             .unwrap();
         drop(preparer);
@@ -2320,6 +2320,7 @@ mod paper_log_tests {
                             evidence,
                         },
                         candidates.clone(),
+                        Default::default(),
                     )
                     .await
                     .unwrap();

@@ -3517,6 +3517,219 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
     }
 }
 
+async fn queued_bucket_before_membership(invalidate_admission: bool) {
+    let (incumbent, newcomer) = (wallet(0x91), wallet(0x92));
+    let (dir, paper, mut engine) = fresh(&[incumbent]);
+    install_empty_anchor(&mut engine, &paper, incumbent, 0);
+    drop(engine);
+    let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[incumbent]).await;
+    let preparer = financial_preparer(
+        &h,
+        &paper,
+        Arc::new(QueueFetcher::new(stable_responses(&[(newcomer, 1, "1")]))),
+    );
+    preparer.prepare(&[newcomer]).await.unwrap();
+    assert!(paper.position_validation_current(&newcomer).unwrap());
+    drop(preparer);
+
+    // This bounded relay is the publication barrier: maintenance has computed its exact
+    // mutation, and its acknowledgement stays pending while we queue the bucket first.
+    let (publication_tx, mut publication_rx) = mpsc::channel(1);
+    let publisher =
+        AdmissionPreparer::new(publication_tx, paper.clone()).with_source_log(h.source.clone());
+    let live = h.live.clone();
+    let writer_lock = h.writer_lock.clone();
+    let publication = tokio::spawn(async move {
+        publisher
+            .scenario_publish_ranking(
+                &live,
+                &writer_lock,
+                golden::BracketFinancialHarness::entries(&[newcomer]),
+                &HashMap::from([(newcomer, 10)]),
+                1,
+            )
+            .await
+    });
+    let message = publication_rx.recv().await.unwrap();
+    let OrchestratorControl::PublishMembership {
+        change,
+        replacements,
+        checks,
+        acknowledged: maintenance_ack,
+    } = message
+    else {
+        unreachable!("the publication barrier received an unrelated control");
+    };
+    let expected_record = serde_json::to_vec(&change.clone().into_record()).unwrap();
+    let bucket_wallet = if invalidate_admission {
+        newcomer
+    } else {
+        incumbent
+    };
+    let mut bucket_ack = h.queue_entry(bucket_wallet, END + 1).await;
+    let (acknowledged, publication_ack) = tokio::sync::oneshot::channel();
+    h.control
+        .send(OrchestratorControl::PublishMembership {
+            change,
+            replacements,
+            checks,
+            acknowledged,
+        })
+        .await
+        .unwrap();
+    let result = publication_ack.await.unwrap();
+    // The serialized owner must acknowledge the earlier bucket before this publication.
+    let bucket = bucket_ack.try_recv().unwrap().unwrap();
+    assert_eq!(bucket.wallet, bucket_wallet);
+    assert!(!bucket.already_committed);
+    assert!(!paper.position_validation_current(&bucket_wallet).unwrap());
+    let membership_records = Reader::replay(&h.paper_path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, envelope)| envelope.payload == expected_record)
+        .collect::<Vec<_>>();
+    if invalidate_admission {
+        let expected =
+            format!("newly admitted wallet {newcomer} lacks a current causal position validation");
+        assert_eq!(result.as_ref().unwrap_err(), &expected);
+        assert_eq!(h.live.snapshot().entries[0].wallet, incumbent);
+        assert!(membership_records.is_empty());
+    } else {
+        let receipt = result.as_ref().unwrap();
+        assert_eq!(h.live.snapshot().entries[0].wallet, newcomer);
+        assert!(paper.cursor(&newcomer).unwrap().is_some());
+        assert_eq!(membership_records.len(), 1);
+        assert_eq!(membership_records[0].0, receipt.sequence);
+    }
+    maintenance_ack.send(result).unwrap();
+    let result = publication.await.unwrap();
+    if invalidate_admission {
+        assert!(result.unwrap_err().to_string().contains(
+            "orchestrator rejected structural membership publication: newly admitted wallet"
+        ));
+    } else {
+        result.unwrap();
+    }
+    h.shutdown().await;
+}
+
+/// PASS: the earlier bucket is acknowledged before maintenance publishes with the writer lock
+/// enabled, and the durable record retains the exact MembershipChange bytes.
+#[tokio::test]
+async fn queued_bucket_before_membership_publishes_without_writer_deadlock() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        queued_bucket_before_membership(false),
+    )
+    .await
+    .expect("bucket/publication lock cycle stalled");
+}
+
+/// PASS: a queued bucket invalidates the admitted wallet's bracket before the final recheck;
+/// publication returns the existing rejection text and preserves the incumbent and paper log.
+#[tokio::test]
+async fn queued_bucket_before_membership_rejects_invalidated_bracket() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        queued_bucket_before_membership(true),
+    )
+    .await
+    .expect("bucket/publication lock cycle stalled");
+}
+
+/// PASS: only the current request commits its capacity epoch before acknowledgement;
+/// superseded requests and old maintenance epochs append no record and leave membership intact.
+#[tokio::test]
+async fn membership_handler_rechecks_capacity_and_commits_epoch_before_ack() {
+    use pe_service::config_poller::capacity_request_channel;
+    use pe_service::paper_recovery::{MembershipChange, MembershipReason};
+    use pe_service::runtime_config::AppliedWatchlistCapacity;
+    use pe_service::watchlist_maintenance::{MembershipCapacityCheck, MembershipCommit};
+
+    let incumbent = wallet(0x93);
+    let (dir, paper, mut engine) = fresh(&[incumbent]);
+    install_empty_anchor(&mut engine, &paper, incumbent, 0);
+    drop(engine);
+    let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[incumbent]).await;
+    let publisher = AdmissionPreparer::new(h.control.clone(), paper);
+    let applied = AppliedWatchlistCapacity::new(1);
+    let original = applied.load();
+    let (requests, desired) = capacity_request_channel(1, h.writer_lock.clone());
+    let request = requests.request(2).await;
+    let newer = requests.request(3).await;
+    let record_count = || Reader::replay(&h.paper_path).unwrap().count();
+    let before = record_count();
+    for attempted in [request, newer] {
+        let result = publisher
+            .publish_membership(
+                MembershipChange {
+                    reason: MembershipReason::CapacityChange,
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                    capacity: attempted.target,
+                    ranking_batch_id: None,
+                    evidence: json!({"scenario": "capacity-publication"}),
+                },
+                h.initial.entries.clone(),
+                MembershipCommit {
+                    seeds: Vec::new(),
+                    capacity: Some(MembershipCapacityCheck::Transition {
+                        applied: applied.clone(),
+                        desired: desired.clone(),
+                        request: attempted,
+                    }),
+                },
+            )
+            .await;
+        if attempted == request {
+            assert!(
+                matches!(&result, Err(AdmissionError::PublicationRejected(message))
+                if message.contains("capacity request was superseded before membership commit"))
+            );
+            assert_eq!(applied.load(), original);
+            assert_eq!(record_count(), before);
+        } else {
+            result.unwrap();
+            assert_eq!(applied.load(), newer);
+            assert_eq!(record_count(), before + 1);
+        }
+    }
+    let result = publisher
+        .publish_membership(
+            MembershipChange {
+                reason: MembershipReason::FullRerank,
+                removed: vec![incumbent],
+                added: Vec::new(),
+                capacity: original.target,
+                ranking_batch_id: Some(546),
+                evidence: json!({"scenario": "stale-maintenance"}),
+            },
+            Vec::new(),
+            MembershipCommit {
+                seeds: Vec::new(),
+                capacity: Some(MembershipCapacityCheck::Unchanged {
+                    applied: applied.clone(),
+                    expected: original,
+                }),
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(AdmissionError::PublicationRejected(message))
+        if message.contains("stale watchlist capacity plan"))
+    );
+    assert_eq!(
+        serde_json::to_value(&h.live.snapshot().entries).unwrap(),
+        serde_json::to_value(&h.initial.entries).unwrap(),
+    );
+    assert_eq!(applied.load(), newer);
+    assert_eq!(record_count(), before + 1);
+    drop(publisher);
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn fence_after_prepare_invalidates_selected_vector() {
     let (incumbent, selected, survivor) = (wallet(0x87), wallet(0x88), wallet(0x89));
@@ -3546,7 +3759,12 @@ async fn fence_after_prepare_invalidates_selected_vector() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, pe_service::watchlist_maintenance::MembershipApplyError::FencedAdmission { wallet } if wallet == selected)
+        matches!(
+            &error,
+            pe_service::watchlist_maintenance::MembershipApplyError::Publication(_)
+        ) && error.to_string().contains(&format!(
+            "newly admitted wallet {selected} is durably fenced"
+        ))
     );
     assert_eq!(h.live.snapshot().entries[0].wallet, incumbent);
     let mut bench = h.initial.clone();

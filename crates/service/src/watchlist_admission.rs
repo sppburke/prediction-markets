@@ -26,6 +26,7 @@ use crate::position_seeder::{
     AnchorInstall, CausalPositionError, CausalPositionValidator, ValidationPurpose,
     is_deferred_causal_position_error,
 };
+use crate::watchlist_maintenance::MembershipCommit;
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
 pub(crate) const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
@@ -89,7 +90,7 @@ pub fn anchor_refresh_due(coverage: &WalletCoverage, now_unix: i64, refresh_secs
 }
 
 /// Shared serialized admission coordinator. Its durable checks are repeated by
-/// the membership writer while holding the publication lock.
+/// the orchestrator while holding the publication lock.
 #[derive(Clone)]
 pub struct AdmissionPreparer {
     inner: Arc<Preparer>,
@@ -162,11 +163,13 @@ impl AdmissionPreparer {
         self.check_prerequisites(additions)
     }
 
-    /// Synchronize one structural membership record, then publish its exact replacement entries.
+    /// Recheck, seed, synchronize one structural record, then publish its exact entries.
+    /// Callers release the writer lock before sending or awaiting this control message.
     pub async fn publish_membership(
         &self,
         change: MembershipChange,
         replacements: Vec<WatchlistEntry>,
+        checks: MembershipCommit,
     ) -> Result<AppendReceipt, AdmissionError> {
         let (acknowledged, received) = oneshot::channel();
         self.inner
@@ -174,6 +177,7 @@ impl AdmissionPreparer {
             .send(OrchestratorControl::PublishMembership {
                 change,
                 replacements,
+                checks,
                 acknowledged,
             })
             .await
@@ -479,6 +483,8 @@ impl AdmissionPreparer {
             &entries,
             last_trade,
             cap,
+            _writer,
+            None,
         )
         .await?;
         Ok(())

@@ -1439,14 +1439,30 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             OrchestratorControl::PublishMembership {
                 change,
                 replacements,
+                checks,
                 acknowledged,
             } => {
+                let writer_lock = self.watchlist_writer_lock.clone();
+                let _writer = match &writer_lock {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                };
+                if let Err(error) = checks.recheck_and_seed(
+                    &self.paper_state,
+                    &self.live_watchlist,
+                    &change,
+                    &replacements,
+                ) {
+                    let _ = acknowledged.send(Err(error.to_string()));
+                    return;
+                }
                 let removed = change.removed.iter().copied().collect::<HashSet<_>>();
                 let capacity = change.capacity;
                 let receipt = self.append_paper_record(&change.into_record());
                 if receipt.is_ok() {
                     self.live_watchlist
                         .replace(&removed, &replacements, capacity);
+                    checks.commit_capacity();
                 }
                 let result = receipt;
                 let _ = acknowledged.send(result);
