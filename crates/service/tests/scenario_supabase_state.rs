@@ -1149,3 +1149,144 @@ async fn prepared_authority_changed_field_conflict_matrix() {
     }
     assert_eq!(authority.prepared_mutations(), 2);
 }
+
+/// PASS: actual financial recovery of generations 2/3/4 consumes historical checkpoints and
+/// emits the legacy terminal wire bytes without adding precision or a Prepared freshness gate.
+#[tokio::test]
+async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
+    for version in [2, 3, 4] {
+        for checkpoint_version in [2, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            let paper_log = dir.path().join("paper.log");
+            let source_log = dir.path().join("source.log");
+            let mut source_writer = Writer::open(&source_log).unwrap();
+            let source_receipt = append_source_observation(&mut source_writer);
+            drop(source_writer);
+            let mut writer = Writer::open(&paper_log).unwrap();
+            let start = append_active_record(&mut writer, &active_start_record());
+            let state_path = dir.path().join("paper.db");
+            let state = PaperStateDb::open(&state_path).unwrap();
+            state
+                .reset_financial_era(
+                    start,
+                    CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                )
+                .unwrap();
+            let mut wire = support::legacy_continuation_wire(version);
+            wire["source_trade_id"] = "g2:checkpoint".into();
+            let original =
+                include_str!("fixtures/decision_replay_origin_main_v2_checkpoint.json").trim();
+            let (body, _) = original.rsplit_once(",\"document_blake3\":").unwrap();
+            let body = format!("{body}}}").replacen(
+                "\"version\":2",
+                &format!("\"version\":{checkpoint_version}"),
+                1,
+            );
+            let checkpoint = if checkpoint_version == 2 {
+                original.to_owned()
+            } else {
+                let hash = blake3::hash(format!("[1,{body}]").as_bytes())
+                    .to_hex()
+                    .to_string();
+                format!(
+                    "{},\"financial_semantic_version\":1,\"document_blake3\":\"{hash}\"}}",
+                    body.strip_suffix('}').unwrap()
+                )
+            };
+            rusqlite::Connection::open(&state_path).unwrap().execute(
+                "INSERT INTO decision_pending (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, post_commit_inputs_json, state, updated_at_unix) VALUES ('g2:checkpoint', 'semantic-v2', ?1, 1700000000, ?2, ?3, 'open', 1700000000)",
+                rusqlite::params![wallet_hex(), wire.to_string(), checkpoint],
+            ).unwrap();
+            let operation = PaperFillOperationIdentity {
+                leader_wallet: WalletAddress::from_hex(wallet_hex()).unwrap(),
+                source_trade_id: SourceTradeId("g2:checkpoint".to_owned()),
+                observed_at_bucket: 1_700_000_000,
+            };
+            let expected_authority = ExpectedAuthority {
+                qualification_start_receipt: start,
+                prior_completed_prepared_sequence: None,
+            };
+            let economic = active_economic(source_receipt, start);
+            let prepared = append_active_record(
+                &mut writer,
+                &PaperLogRecord::FinancialPrepared {
+                    expected_authority: expected_authority.clone(),
+                    payload: FinancialPayload::Fill {
+                        operation: operation.clone(),
+                        economic: economic.clone(),
+                    },
+                },
+            );
+            let authority = FakeSupabaseState::prepared(dec!(10), start);
+            let request = PreparedFillRequest::from_prepared(
+                expected_authority,
+                prepared,
+                &operation,
+                &economic,
+            );
+            let canonical = authority.commit_prepared_fill(&request).await.unwrap();
+            let final_receipt = append_active_record(
+                &mut writer,
+                &PaperLogRecord::FinancialFinal {
+                    prepared_receipt: prepared,
+                    result: FinancialResult::Fill { canonical },
+                },
+            );
+            assert_eq!(
+                state
+                    .decision_pending_for(&operation.source_trade_id)
+                    .unwrap()
+                    .unwrap()
+                    .post_commit_inputs_json,
+                checkpoint
+            );
+            let legacy_body = body.replace("1700000000125}]", "1700000000125},{\"purpose\":\"terminal_transition\",\"unix_millis\":1800000000000}]").replacen(
+                &format!("\"version\":{checkpoint_version}"),
+                "\"version\":5",
+                1,
+            );
+            let final_json = serde_json::to_string(&final_receipt).unwrap();
+            let terminal_body = format!(
+                "{},\"authority\":{{\"kind\":\"commit_fill_v2\",\"outcome\":\"applied\",\"bankroll\":\"9\"}},\"terminal\":{{\"disposition\":\"fill\",\"reason\":\"paper_fill_committed\",\"fill\":null,\"dispatch_id\":null,\"final_receipt\":{final_json}}}}}",
+                legacy_body.strip_suffix('}').unwrap()
+            );
+            let hash = blake3::hash(format!("[1,{terminal_body}]").as_bytes())
+                .to_hex()
+                .to_string();
+            let expected = format!(
+                "{},\"financial_semantic_version\":1,\"document_blake3\":\"{hash}\"}}",
+                terminal_body.strip_suffix('}').unwrap()
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+                        .scope(
+                            OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+                            reconcile_active_financial_frames(
+                                &authority,
+                                &state,
+                                &paper_log,
+                                SourceEvidence::Log(&source_log),
+                                &mut writer,
+                            ),
+                        )
+                        .await
+                        .unwrap(),
+                    0
+                );
+                let row = state
+                    .decision_pending_for(&operation.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    row.post_commit_inputs_json, expected,
+                    "continuation {version}, checkpoint {checkpoint_version}"
+                );
+                let replayed = pe_service::decision_replay::replay_decision_pending(&row).unwrap();
+                assert_eq!(replayed.continuation.version(), version);
+                assert_eq!(state.list_fills().unwrap().len(), 1);
+                assert_eq!(authority.prepared_mutations(), 1);
+            }
+        }
+    }
+}

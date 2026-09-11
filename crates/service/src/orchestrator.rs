@@ -160,11 +160,22 @@ pub(crate) fn render_pending_evidence(
     let Some(evidence) = evidence else {
         return Ok(None);
     };
+    #[cfg(feature = "scenario")]
+    let terminal_at = SCENARIO_TERMINAL_CLOCK
+        .try_with(|at| *at)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
+    #[cfg(not(feature = "scenario"))]
     let terminal_at = OffsetDateTime::now_utc();
     let mut complete = evidence.clone();
     complete.record_clock("terminal_transition", unix_millis(terminal_at));
     let json = complete.render(authority, terminal)?;
     Ok(Some((json, terminal_at.unix_timestamp())))
+}
+
+#[cfg(feature = "scenario")]
+tokio::task_local! {
+    /// Fixed terminal clock shared by orchestrator and recovery byte-compatibility scenarios.
+    pub static SCENARIO_TERMINAL_CLOCK: OffsetDateTime;
 }
 
 pub(crate) fn pending_terminal(value: &(String, i64)) -> PendingTerminalEvidence<'_> {
@@ -3448,10 +3459,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 return;
             }
         };
-        if let Err(e) = self.paper_state.commit_seen_no_copy_with_pending(
+        let outcome = format!("no_fill:{}", disposition.reason);
+        let flip = evidence
+            .and_then(DecisionEvidenceAccumulator::staged_dispatch_id)
+            .map(|dispatch_id| pe_paper_state::DispatchFlip {
+                dispatch_id,
+                paper_outcome: &outcome,
+            });
+        if let Err(e) = self.paper_state.commit_seen_no_copy_with_flip_pending(
             &trade.source_trade_id,
             leader,
             disposition,
+            flip,
             pending.as_ref().map(pending_terminal),
         ) {
             error!(error = %e, trade = %trade.source_trade_id,

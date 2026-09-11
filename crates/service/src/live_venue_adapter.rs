@@ -854,6 +854,8 @@ pub struct LiveAdmissionBuilder {
     gamma_base_url: String,
     clob_base_url: String,
     source_log: SourceLogHandle,
+    #[cfg(any(test, feature = "scenario"))]
+    clock: Option<std::sync::Arc<dyn Fn() -> OffsetDateTime + Send + Sync>>,
 }
 
 impl LiveAdmissionBuilder {
@@ -868,6 +870,8 @@ impl LiveAdmissionBuilder {
             gamma_base_url: gamma_base_url.into().trim_end_matches('/').to_owned(),
             clob_base_url: clob_base_url.into().trim_end_matches('/').to_owned(),
             source_log,
+            #[cfg(any(test, feature = "scenario"))]
+            clock: None,
         }
     }
 
@@ -975,6 +979,12 @@ impl LiveAdmissionBuilder {
             .await
             .map(|bytes| bytes.to_vec())
             .map_err(|error| LiveVenueAdapterError::MarketTransport(error.to_string()))?;
+        #[cfg(any(test, feature = "scenario"))]
+        let received_at = self
+            .clock
+            .as_ref()
+            .map_or_else(OffsetDateTime::now_utc, |clock| clock());
+        #[cfg(not(any(test, feature = "scenario")))]
         let received_at = OffsetDateTime::now_utc();
         let receipt = self
             .source_log
@@ -993,6 +1003,17 @@ impl LiveAdmissionBuilder {
             return Err(LiveVenueAdapterError::MarketStatus(status.as_u16()));
         }
         Ok((body, receipt, received_at))
+    }
+
+    /// Fixed receipt clock for deterministic admission and financial replay scenarios.
+    #[cfg(any(test, feature = "scenario"))]
+    #[must_use]
+    pub fn with_clock(
+        mut self,
+        clock: std::sync::Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    ) -> Self {
+        self.clock = Some(clock);
+        self
     }
 }
 
