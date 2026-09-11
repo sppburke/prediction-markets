@@ -59,7 +59,7 @@ use time::OffsetDateTime;
 #[cfg(feature = "scenario")]
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -212,6 +212,8 @@ pub struct ActivityIngest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ActivityIngestError {
+    #[error("activity reader producer start channel closed")]
+    ProducerStartClosed,
     #[error("activity reader slot {slot} exited")]
     ReaderExited { slot: usize },
     #[error("activity source-log coordinator exited")]
@@ -222,6 +224,7 @@ pub enum ActivityIngestError {
 
 #[derive(Debug, Clone, Copy)]
 enum ActivityChild {
+    ProducerStartClosed,
     Reader(usize),
     Coordinator,
 }
@@ -229,6 +232,7 @@ enum ActivityChild {
 struct ReaderConfig {
     live_watchlist: LiveWatchlist,
     dialer: Dialer,
+    start: Option<watch::Receiver<bool>>,
 }
 
 impl ActivityIngest {
@@ -243,6 +247,7 @@ impl ActivityIngest {
             reader: Some(ReaderConfig {
                 live_watchlist,
                 dialer: Arc::new(|_slot| Box::pin(ActivityWsStream::connect_and_subscribe())),
+                start: None,
             }),
             sink,
             source_rx,
@@ -290,6 +295,7 @@ impl ActivityIngest {
             reader: Some(ReaderConfig {
                 live_watchlist,
                 dialer,
+                start: None,
             }),
             sink,
             source_rx,
@@ -299,6 +305,16 @@ impl ActivityIngest {
             source_receipts: SourceReceiptIndex::default(),
             reader_append_gate: None,
         }
+    }
+
+    /// Hold websocket readers before their first dial while the coordinator serves boot recovery.
+    /// Poll-only mode has no readers and does not retain the gate.
+    #[must_use]
+    pub fn with_reader_start_gate(mut self, start: watch::Receiver<bool>) -> Self {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.start = Some(start);
+        }
+        self
     }
 
     /// Install the verified boot projection extended by this ingest's synchronized appends.
@@ -360,7 +376,13 @@ impl ActivityIngest {
                 let live_watchlist = reader.live_watchlist.clone();
                 let reader_health = health.clone();
                 let fan_in = fan_in_tx.clone();
+                let mut start = reader.start.clone();
                 tasks.spawn(async move {
+                    if let Some(start) = start.as_mut()
+                        && start.wait_for(|started| *started).await.is_err()
+                    {
+                        return ActivityChild::ProducerStartClosed;
+                    }
                     Reader {
                         slot,
                         dialer,
@@ -416,6 +438,9 @@ impl ActivityIngest {
         }
         match exit {
             None => Ok(()),
+            Some(Some(Ok(ActivityChild::ProducerStartClosed))) => {
+                Err(ActivityIngestError::ProducerStartClosed)
+            }
             Some(Some(Ok(ActivityChild::Reader(slot)))) => {
                 Err(ActivityIngestError::ReaderExited { slot })
             }
