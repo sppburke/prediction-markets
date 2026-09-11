@@ -268,6 +268,7 @@ pub(crate) fn synthetic_legacy17_runtime_config() -> RuntimeConfig {
 }
 
 /// One source-log activity page resolved by its frozen V3 receipt.
+#[derive(Clone)]
 pub(crate) struct CompleteActivityPage {
     pub(crate) payload: Vec<u8>,
     pub(crate) observed_at: SourceTimestamp,
@@ -310,6 +311,47 @@ struct CompleteActivityReadWire {
 struct CompleteActivitySegment {
     rows: Vec<pe_source_polymarket_public::NormalizedActivity>,
     children: Vec<(Option<i64>, i64)>,
+}
+
+// Retained only for one observation operation or shared read.
+struct VerifiedActivityRead {
+    aggregates: Vec<ActivityAggregate>,
+    commitment: Option<ActivityReadCommitment>,
+    bindings: VerifiedObservationBindings,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VerifiedObservationBindings {
+    observations: BTreeMap<
+        pe_core_types::EventSeq,
+        (
+            AppendReceipt,
+            pe_source_polymarket_public::ActivityTradeObservation,
+        ),
+    >,
+    identities: HashMap<SourceTradeId, MarketOutcomeId>,
+}
+
+impl VerifiedObservationBindings {
+    // Frozen facts are the effective identity; the durable effect comparator separately
+    // binds them to the recorded raw-to-effective correction. Check every shared-read row.
+    pub(crate) fn verify_facts(
+        &self,
+        facts: &DecisionContinuationFacts,
+    ) -> Result<(), CompleteActivityReadError> {
+        if self
+            .identities
+            .get(&facts.source_trade_id)
+            .is_some_and(|identity| {
+                identity.market() != &facts.market_id || identity.outcome() != facts.outcome_id
+            })
+        {
+            return Err(complete_activity_read_error(
+                "binding metadata differs from the effective target identity",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DecisionContinuationV3 {
@@ -415,6 +457,31 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.reconstruct_verified_activity_read(lookup)
+            .map(|read| read.aggregates)
+    }
+
+    /// Retain authenticated bindings so qualification can check every sibling in one read.
+    pub(crate) fn reconstruct_complete_activity_read_with_bindings<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<(Vec<ActivityAggregate>, VerifiedObservationBindings), CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        self.reconstruct_verified_activity_read(lookup)
+            .map(|read| (read.aggregates, read.bindings))
+    }
+
+    fn reconstruct_verified_activity_read<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<VerifiedActivityRead, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
         let wire: CompleteActivityReadWire =
             serde_json::from_value(self.facts.decision_inputs.clone()).map_err(|error| {
                 complete_activity_read_error(format!(
@@ -426,18 +493,8 @@ impl DecisionContinuationV3 {
                 "decision complete activity read proof is partial",
             ));
         }
-        let rows = match (wire.fixed_end, wire.pages.as_deref()) {
-            (Some(fixed_end), Some(pages)) => {
-                let commitment = self.verify_read_commitment(fixed_end, pages, lookup)?;
-                let rows = self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?;
-                if let Some(commitment) = commitment {
-                    let aggregates = aggregate_activity_rows(&rows).map_err(|error| {
-                        complete_activity_read_error(format!("activity aggregate failed: {error}"))
-                    })?;
-                    self.verify_observation_bindings(&commitment, &aggregates, lookup)?;
-                }
-                rows
-            }
+        let (fixed_end, pages) = match (wire.fixed_end, wire.pages.as_deref()) {
+            (Some(fixed_end), Some(pages)) => (fixed_end, pages),
             (None, None) => {
                 return Err(complete_activity_read_error(
                     "decision continuation is missing its complete activity read proof",
@@ -449,10 +506,50 @@ impl DecisionContinuationV3 {
                 ));
             }
         };
-        aggregate_activity_rows(&rows).map_err(|error| {
+        let commitment = self.verify_read_commitment(fixed_end, pages, lookup)?;
+        self.reconstruct_verified_activity_read_parts(fixed_end, pages, commitment, lookup)
+    }
+
+    fn reconstruct_verified_activity_read_parts<L, E>(
+        &self,
+        fixed_end: i64,
+        pages: &[ReconciliationPageEvidence],
+        commitment: Option<ActivityReadCommitment>,
+        lookup: &mut L,
+    ) -> Result<VerifiedActivityRead, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let mut sources =
+            HashMap::<(pe_core_types::EventSeq, blake3::Hash), CompleteActivityPage>::new();
+        let mut cached_lookup = |receipt: AppendReceipt| {
+            let key = (receipt.sequence, receipt.this_hash);
+            if let Some(source) = sources.get(&key) {
+                return Ok::<CompleteActivityPage, CompleteActivityReadError>(source.clone());
+            }
+            let source =
+                lookup(receipt).map_err(|error| complete_activity_read_error(error.to_string()))?;
+            sources.insert(key, source.clone());
+            Ok(source)
+        };
+        let lookup = &mut cached_lookup;
+        let rows = self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?;
+        let aggregates = aggregate_activity_rows(&rows).map_err(|error| {
             complete_activity_read_error(format!(
                 "complete activity read aggregate failed: {error}"
             ))
+        })?;
+        let bindings = if let Some(commitment) = &commitment {
+            self.verify_observation_bindings(commitment, &aggregates, lookup)?
+        } else {
+            VerifiedObservationBindings::default()
+        };
+        bindings.verify_facts(&self.facts)?;
+        Ok(VerifiedActivityRead {
+            aggregates,
+            commitment,
+            bindings,
         })
     }
 
@@ -525,7 +622,7 @@ impl DecisionContinuationV3 {
             ));
         }
         let commitment: ActivityReadCommitment =
-            serde_json::from_value(value.clone()).map_err(|error| {
+            serde_json::from_slice(&source.payload).map_err(|error| {
                 complete_activity_read_error(format!(
                     "complete activity read commitment is invalid: {error}"
                 ))
@@ -576,13 +673,15 @@ impl DecisionContinuationV3 {
         commitment: &ActivityReadCommitment,
         aggregates: &[ActivityAggregate],
         lookup: &mut L,
-    ) -> Result<(), CompleteActivityReadError>
+    ) -> Result<VerifiedObservationBindings, CompleteActivityReadError>
     where
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        let mut verified = VerifiedObservationBindings::default();
+        let mut identities = HashMap::new();
         let Some(bindings) = &commitment.bindings else {
-            return Ok(());
+            return Ok(verified);
         };
         let commitment_receipt = self
             .read_commitment
@@ -701,12 +800,38 @@ impl DecisionContinuationV3 {
                             "binding metadata provenance differs",
                         ));
                     }
-                    let metadata = lookup(receipt).map_err(|error| {
-                        complete_activity_read_error(format!(
-                            "binding metadata receipt lookup failed: {error}"
-                        ))
-                    })?;
-                    verify_binding_identity(&metadata, provenance)?;
+                    let identity_key = (
+                        receipt.sequence,
+                        receipt.this_hash,
+                        provenance.asset.clone(),
+                        provenance.canonical_page_hash.clone(),
+                    );
+                    let identity = match identities.entry(identity_key) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let metadata = lookup(receipt).map_err(|error| {
+                                complete_activity_read_error(format!(
+                                    "binding metadata receipt lookup failed: {error}"
+                                ))
+                            })?;
+                            entry.insert(verify_binding_identity(&metadata, provenance)?)
+                        }
+                    };
+                    let target_identity = MarketOutcomeId::new(
+                        MarketId(pe_core_types::VenueMarketId(
+                            identity.condition_id.0.clone(),
+                        )),
+                        identity.outcome,
+                    );
+                    if verified
+                        .identities
+                        .insert(target.group_id.key().clone(), target_identity.clone())
+                        .is_some_and(|previous| previous != target_identity)
+                    {
+                        return Err(complete_activity_read_error(
+                            "binding metadata disagrees about the effective target identity",
+                        ));
+                    }
                 }
                 _ => {
                     return Err(complete_activity_read_error(
@@ -714,8 +839,12 @@ impl DecisionContinuationV3 {
                     ));
                 }
             }
+            verified.observations.insert(
+                binding.stream_receipt.sequence,
+                (binding.stream_receipt, observation),
+            );
         }
-        Ok(())
+        Ok(verified)
     }
 
     /// Authenticate a stream receipt and its target, returning the earliest recorded source clock.
@@ -730,10 +859,44 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        if self.version == 5 {
+            let read = self.reconstruct_verified_activity_read(lookup)?;
+            return self.verify_stream_binding_in_read(target_id, receipt, &read, lookup);
+        }
         let source = lookup(receipt).map_err(|error| {
             complete_activity_read_error(format!("stream receipt lookup failed: {error}"))
         })?;
         let observation = verified_stream_observation(&source, self.facts.wallet)?;
+        if observation.group_id.key() != target_id {
+            return Err(complete_activity_read_error(
+                "websocket differs from the reconciled trade",
+            ));
+        }
+        Ok(observation.source_time)
+    }
+
+    fn verify_stream_binding_in_read<L, E>(
+        &self,
+        target_id: &SourceTradeId,
+        receipt: AppendReceipt,
+        read: &VerifiedActivityRead,
+        lookup: &mut L,
+    ) -> Result<SourceTimestamp, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let observation = if let Some((known, observation)) =
+            read.bindings.observations.get(&receipt.sequence)
+            && *known == receipt
+        {
+            observation.clone()
+        } else {
+            let source = lookup(receipt).map_err(|error| {
+                complete_activity_read_error(format!("stream receipt lookup failed: {error}"))
+            })?;
+            verified_stream_observation(&source, self.facts.wallet)?
+        };
         if self.version != 5 {
             if observation.group_id.key() != target_id {
                 return Err(complete_activity_read_error(
@@ -742,40 +905,31 @@ impl DecisionContinuationV3 {
             }
             return Ok(observation.source_time);
         }
-        let aggregates = self.reconstruct_complete_activity_read(lookup)?;
-        let target = aggregates
+        let target = read
+            .aggregates
             .iter()
             .find(|aggregate| aggregate.group_id.key() == target_id)
             .ok_or_else(|| {
                 complete_activity_read_error("stream target is absent from its complete read")
             })?;
-        if observation.group_id != target.group_id || observation.source_time != target.source_time
-        {
-            let wire: CompleteActivityReadWire =
-                serde_json::from_value(self.facts.decision_inputs.clone())
-                    .map_err(|error| complete_activity_read_error(error.to_string()))?;
-            let commitment = self
-                .verify_read_commitment(
-                    wire.fixed_end
-                        .ok_or_else(|| complete_activity_read_error("read end missing"))?,
-                    wire.pages
-                        .as_deref()
-                        .ok_or_else(|| complete_activity_read_error("read pages missing"))?,
-                    lookup,
-                )?
-                .ok_or_else(|| complete_activity_read_error("binding commitment is absent"))?;
-            if commitment.bindings.as_deref().is_none_or(|bindings| {
-                !bindings.iter().any(|binding| {
-                    binding.stream_receipt == receipt
-                        && binding.stream_group_id == *observation.group_id.key()
-                        && binding.history_group_id == *target_id
-                        && binding.semantic_revision == target.semantic_revision.as_str()
+        if (observation.group_id != target.group_id
+            || observation.source_time != target.source_time)
+            && read
+                .commitment
+                .as_ref()
+                .and_then(|commitment| commitment.bindings.as_deref())
+                .is_none_or(|bindings| {
+                    !bindings.iter().any(|binding| {
+                        binding.stream_receipt == receipt
+                            && binding.stream_group_id == *observation.group_id.key()
+                            && binding.history_group_id == *target_id
+                            && binding.semantic_revision == target.semantic_revision.as_str()
+                    })
                 })
-            }) {
-                return Err(complete_activity_read_error(
-                    "websocket correction has no verified observation binding",
-                ));
-            }
+        {
+            return Err(complete_activity_read_error(
+                "websocket correction has no verified observation binding",
+            ));
         }
         Ok(SourceTimestamp(
             observation.source_time.0.min(target.source_time.0),
@@ -967,6 +1121,70 @@ impl DecisionContinuationV3 {
         let Some(selected) = self.observation_receipt() else {
             return Ok(None);
         };
+        if self.version == 5 {
+            let mut lookup = |receipt| {
+                #[cfg(test)]
+                continuation_validation_tests::LOOKUPS.with(|count| count.set(count.get() + 1));
+                source_receipts
+                    .source_envelope(receipt)
+                    .map(CompleteActivityPage::from)
+            };
+            let proof: CompleteActivityReadWire =
+                serde_json::from_value(self.facts.decision_inputs.clone())?;
+            let (Some(fixed_end), Some(pages)) = (proof.fixed_end, proof.pages) else {
+                return Err(DecisionContinuationError::DurableMismatch);
+            };
+            let mismatch = || DecisionContinuationError::SourceReceiptMismatch {
+                sequence: selected.sequence.0,
+            };
+            let commitment = self
+                .verify_read_commitment(fixed_end, &pages, &mut lookup)
+                .map_err(|_| mismatch())?;
+            if self.observed_source_receipt.is_some()
+                || commitment
+                    .as_ref()
+                    .and_then(|commitment| commitment.bindings.as_ref())
+                    .is_some_and(|bindings| !bindings.is_empty())
+            {
+                let read = self
+                    .reconstruct_verified_activity_read_parts(
+                        fixed_end,
+                        &pages,
+                        commitment,
+                        &mut lookup,
+                    )
+                    .map_err(|_| mismatch())?;
+                if let Some(websocket) = self.observed_source_receipt {
+                    self.verify_stream_binding_in_read(
+                        &self.facts.source_trade_id,
+                        websocket,
+                        &read,
+                        &mut lookup,
+                    )
+                    .map_err(|_| {
+                        DecisionContinuationError::SourceReceiptMismatch {
+                            sequence: websocket.sequence.0,
+                        }
+                    })?;
+                }
+            } else {
+                // Preserve the poll-only empty-binding fast path: boot/qualification own
+                // aggregate reconstruction, while observation authenticates exact receipts.
+                for page in &self.page_occurrences {
+                    complete_activity_page(page, self.version, &mut lookup).map_err(|_| {
+                        DecisionContinuationError::SourceReceiptMismatch {
+                            sequence: page.receipt.sequence.0,
+                        }
+                    })?;
+                }
+            }
+            return self
+                .observation_at(source_receipts.received_millis(selected)?)
+                .ok_or(DecisionContinuationError::SourceReceiptMismatch {
+                    sequence: selected.sequence.0,
+                })
+                .map(Some);
+        }
         for page in &self.page_occurrences {
             let envelope = source_receipts.source_envelope(page.receipt)?;
             if !activity_page_generation(
@@ -1451,7 +1669,10 @@ fn verified_stream_observation(
 fn verify_binding_identity(
     source: &CompleteActivityPage,
     provenance: &crate::asset_identity::IdentityProvenance,
-) -> Result<(), CompleteActivityReadError> {
+) -> Result<
+    pe_source_polymarket_public::gamma_markets::VerifiedTokenIdentity,
+    CompleteActivityReadError,
+> {
     use pe_source_polymarket_public::{
         GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
         MetadataPageEvidence,
@@ -1477,16 +1698,16 @@ fn verify_binding_identity(
         schema_version: source.schema_version,
         parser_version: source.parser_version,
     };
-    let identities = pe_source_polymarket_public::gamma_markets::verify_token_identities(
+    let mut identities = pe_source_polymarket_public::gamma_markets::verify_token_identities(
         std::slice::from_ref(&provenance.asset),
         &[(evidence, source.payload.clone())],
     );
-    if !identities.get(&provenance.asset).is_some_and(Result::is_ok) {
-        return Err(complete_activity_read_error(
-            "binding token identity is unverified or ambiguous",
-        ));
-    }
-    Ok(())
+    identities
+        .remove(&provenance.asset)
+        .and_then(Result::ok)
+        .ok_or_else(|| {
+            complete_activity_read_error("binding token identity is unverified or ambiguous")
+        })
 }
 
 fn parse_complete_activity_page(
@@ -1721,9 +1942,6 @@ pub fn validate_open_continuations(
                 "open decision continuation has no receipt-bearing activity read".to_owned(),
             ));
         }
-        continuation
-            .verify_websocket_receipt(source_receipts)
-            .map_err(|error| fail(error.to_string()))?;
         let shared_read = continuation
             .page_occurrences()
             .iter()
@@ -1761,8 +1979,8 @@ pub fn validate_open_continuations(
                     content_type: envelope.content_type,
                 })
         };
-        let aggregates = continuation
-            .reconstruct_complete_activity_read(&mut lookup)
+        let read = continuation
+            .reconstruct_verified_activity_read(&mut lookup)
             .map_err(|error| ContinuationValidationError {
                 source_trade_id: Some(continuation.facts.source_trade_id.clone()),
                 cause: error.to_string(),
@@ -1773,7 +1991,21 @@ pub fn validate_open_continuations(
                 source_trade_id: Some(facts.source_trade_id.clone()),
                 cause,
             };
-            let mut matching = aggregates
+            read.bindings
+                .verify_facts(facts)
+                .map_err(|error| fail(error.to_string()))?;
+            if let Some(websocket) = continuation.observed_source_receipt {
+                continuation
+                    .verify_stream_binding_in_read(
+                        &facts.source_trade_id,
+                        websocket,
+                        &read,
+                        &mut lookup,
+                    )
+                    .map_err(|error| fail(error.to_string()))?;
+            }
+            let mut matching = read
+                .aggregates
                 .iter()
                 .filter(|aggregate| aggregate.group_id.key() == &facts.source_trade_id);
             let aggregate = matching.next().ok_or_else(|| {
@@ -3489,7 +3721,7 @@ fn touched_leader_rows(
 }
 
 #[cfg(test)]
-mod continuation_v3_tests {
+pub(crate) mod continuation_v3_tests {
     #![allow(clippy::unwrap_used)]
 
     use std::fs::OpenOptions;
@@ -4446,10 +4678,299 @@ mod continuation_v3_tests {
         assert!(encode(&[first.clone(), first]).is_err());
     }
 
+    pub(crate) struct BindingFixture {
+        pub(crate) dir: tempfile::TempDir,
+        pub(crate) continuation: DecisionContinuationV3,
+        pub(crate) index: SourceReceiptIndex,
+        pub(crate) aggregate: ActivityAggregate,
+        pub(crate) metadata_receipt: AppendReceipt,
+    }
+
+    pub(crate) fn binding_fixture(case: &str) -> BindingFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let (continuation, aggregate, metadata_receipt) = append_binding_read(case, &mut writer);
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        BindingFixture {
+            dir,
+            continuation,
+            index,
+            aggregate,
+            metadata_receipt,
+        }
+    }
+
+    pub(crate) fn append_binding_read(
+        case: &str,
+        writer: &mut Writer,
+    ) -> (DecisionContinuationV3, ActivityAggregate, AppendReceipt) {
+        let condition = match case {
+            "recorded_correction" | "shared_recorded_correction" => "stamped",
+            "other_target" => "other",
+            _ => "new",
+        };
+        let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+        let append = |writer: &mut Writer, source: &str, schema, parser, payload: Vec<u8>| {
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(source.to_owned()),
+                    schema_version: schema,
+                    parser_version: parser,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .unwrap()
+        };
+        let stream_payload = serde_json::to_vec(
+            &json!({"proxyWallet":"0x1111111111111111111111111111111111111111",
+        "conditionId":"old", "asset":"123", "side":"BUY", "size":1, "price":0.5,
+        "timestamp":99, "transactionHash":"tx", "outcomeIndex":1}),
+        )
+        .unwrap();
+        let stream = parse_activity_trade_observation(&stream_payload).unwrap();
+        let stream_receipt = append(
+            writer,
+            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            2,
+            2,
+            stream_payload.clone(),
+        );
+        let second_stream = (case == "conflicting_metadata").then(|| {
+            append(
+                writer,
+                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+                2,
+                2,
+                stream_payload,
+            )
+        });
+        let mut rows = json!([{"proxyWallet":"0x1111111111111111111111111111111111111111",
+            "type":"TRADE", "conditionId": condition,
+            "asset":"123", "side":"BUY", "size":"1", "usdcSize":"0.5", "price":"0.5",
+            "timestamp":100, "transactionHash":"tx", "outcomeIndex":0}]);
+        if matches!(
+            case,
+            "ambiguous_history" | "distinct_legs" | "shared_read" | "shared_recorded_correction"
+        ) {
+            let mut leg = rows[0].clone();
+            leg["conditionId"] = json!("other");
+            if case != "ambiguous_history" {
+                leg["asset"] = json!("456");
+            }
+            rows.as_array_mut().unwrap().push(leg);
+            if case == "distinct_legs" {
+                let mut leg = rows[0].clone();
+                leg["side"] = json!("SELL");
+                rows.as_array_mut().unwrap().push(leg);
+            }
+        }
+        let raw = serde_json::to_vec(&rows).unwrap();
+        let page_receipt = append(
+            writer,
+            crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+            3,
+            2,
+            raw.clone(),
+        );
+        let (page, evidence) = activity_page_fixture(&raw, None, 100, 0, page_receipt);
+        let aggregate = parse_complete_activity_page(
+            &activity_page(&raw),
+            WalletAddress([0x11; 20]),
+            "fixture",
+        )
+        .unwrap()
+        .aggregates()
+        .unwrap()
+        .into_iter()
+        .find(|aggregate| {
+            let components = aggregate.group_id.components();
+            components.condition_id.as_ref().is_some_and(|condition| {
+                condition.0
+                    == match case {
+                        "recorded_correction" | "shared_recorded_correction" => "stamped",
+                        "other_target" => "other",
+                        _ => "new",
+                    }
+            }) && components
+                .asset
+                .as_ref()
+                .is_some_and(|asset| asset.0 == "123")
+                && components.side == Some(Side::Buy)
+        })
+        .unwrap();
+        let metadata = serde_json::to_vec(&json!([{
+            "conditionId": if matches!(case, "metadata_wrong_condition" | "other_target") { "other" } else { "new" },
+            "clobTokenIds": match case {
+                "metadata_unverified" => "[\"456\"]",
+                "metadata_wrong_outcome" => "[\"456\",\"123\"]",
+                _ => "[\"123\",\"456\"]",
+            }
+        }]))
+        .unwrap();
+        let metadata_receipt = append(
+            writer,
+            if case == "metadata_source" {
+                "unrelated.source"
+            } else {
+                pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID
+            },
+            if case == "metadata_schema" { 2 } else { 1 },
+            if case == "metadata_parser" { 2 } else { 1 },
+            metadata.clone(),
+        );
+        let mut binding = ObservationBinding {
+            stream_group_id: stream.group_id.key().clone(),
+            stream_receipt,
+            history_group_id: aggregate.group_id.key().clone(),
+            semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
+            page_raw_hash: page.raw_hash.clone(),
+            page_occurrence_index: 0,
+            identity_provenance: Some(crate::asset_identity::IdentityProvenance {
+                asset: pe_core_types::PolymarketTokenId("123".to_owned()),
+                source_log_sequence: metadata_receipt.sequence.0,
+                canonical_page_hash: canonical_page_hash(&metadata).unwrap(),
+            }),
+            identity_receipt: Some(metadata_receipt),
+        };
+        match case {
+            "absent_history" => {
+                binding.history_group_id = SourceTradeId(format!("g2:{}", "f".repeat(64)))
+            }
+            "revision" => binding.semantic_revision = "00".repeat(32),
+            "page_hash" => binding.page_raw_hash = "00".repeat(32),
+            "occurrence" => binding.page_occurrence_index = 1,
+            "stream_group" => binding.stream_group_id = aggregate.group_id.key().clone(),
+            "stream_receipt" => binding.stream_receipt = page_receipt,
+            "metadata_hash" => {
+                binding
+                    .identity_provenance
+                    .as_mut()
+                    .unwrap()
+                    .canonical_page_hash = "00".repeat(32)
+            }
+            "metadata_sequence" => {
+                binding
+                    .identity_provenance
+                    .as_mut()
+                    .unwrap()
+                    .source_log_sequence = 0
+            }
+            "metadata_missing" => binding.identity_receipt = None,
+            "future_receipt" => binding.stream_receipt = receipt(100),
+            _ => {}
+        }
+        let mut bindings = if case == "poll_only" {
+            Vec::new()
+        } else {
+            vec![binding]
+        };
+        if let Some(stream_receipt) = second_stream {
+            let metadata = br#"[{"conditionId":"other","clobTokenIds":["123","456"]}]"#.to_vec();
+            let identity_receipt = append(
+                writer,
+                pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID,
+                1,
+                1,
+                metadata.clone(),
+            );
+            let mut binding = bindings[0].clone();
+            binding.stream_receipt = stream_receipt;
+            binding.identity_receipt = Some(identity_receipt);
+            let provenance = binding.identity_provenance.as_mut().unwrap();
+            provenance.source_log_sequence = identity_receipt.sequence.0;
+            provenance.canonical_page_hash = canonical_page_hash(&metadata).unwrap();
+            bindings.push(binding);
+        }
+        let mut payload = activity_read_commitment_payload_v2(
+            WalletAddress([0x11; 20]),
+            100,
+            std::slice::from_ref(&page),
+            std::slice::from_ref(&evidence),
+            &bindings,
+        )
+        .unwrap();
+        if case == "duplicate_member" {
+            payload = String::from_utf8(payload)
+                .unwrap()
+                .replacen(
+                    "\"page_occurrence_index\":0",
+                    "\"page_occurrence_index\":1,\"page_occurrence_index\":0",
+                    1,
+                )
+                .into_bytes();
+        }
+        if case == "duplicate_receipt" {
+            let mut value: Value = serde_json::from_slice(&payload).unwrap();
+            let binding = value["bindings"][0].clone();
+            value["bindings"].as_array_mut().unwrap().push(binding);
+            // Authenticate the exact malformed preimage; rejection must be the binding contract.
+            let mut preimage = serde_json::to_value(ActivityReadPreimage {
+                wallet: WalletAddress([0x11; 20]),
+                fixed_end: 100,
+                pages: joined_read_pages(
+                    std::slice::from_ref(&page),
+                    std::slice::from_ref(&evidence),
+                )
+                .unwrap(),
+            })
+            .unwrap();
+            preimage["bindings"] = value["bindings"].clone();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(ACTIVITY_READ_COMMITMENT_DOMAIN);
+            hasher.update(&serde_json::to_vec(&preimage).unwrap());
+            value["digest"] = json!(hasher.finalize().to_hex().to_string());
+            payload = serde_json::to_vec(&value).unwrap();
+        }
+        if matches!(case, "digest" | "unknown_field") {
+            let mut value: Value = serde_json::from_slice(&payload).unwrap();
+            if case == "digest" {
+                value["bindings"][0]["semantic_revision"] = json!("changed");
+            } else {
+                value["bindings"][0]["unexpected"] = json!(true);
+            }
+            payload = serde_json::to_vec(&value).unwrap();
+        }
+        let commitment = append(writer, ACTIVITY_READ_COMMITMENT_SOURCE_ID, 2, 1, payload);
+        let mut frozen = facts(complete_read_inputs(100, &[evidence]));
+        frozen.source_trade_id = aggregate.group_id.key().clone();
+        frozen.semantic_revision = aggregate.semantic_revision.as_str().to_owned();
+        frozen.source_epoch = 100;
+        frozen.transaction_hash = "tx".to_owned();
+        frozen.market_id = MarketId(pe_core_types::VenueMarketId(
+            if case == "other_target" {
+                "other"
+            } else {
+                "new"
+            }
+            .to_owned(),
+        ));
+        frozen.provenance = if case == "poll_only" {
+            TradeProvenance::RestPoll
+        } else {
+            TradeProvenance::ActivityWs
+        };
+        frozen.paper_freshness_policy = Some(PaperFreshnessPolicy {
+            activity_ws_enabled: true,
+            copy_latency_budget_secs: 2,
+        });
+        let continuation = DecisionContinuationV3::new(
+            frozen,
+            (case != "poll_only").then_some(stream_receipt),
+            vec![page],
+            Some(ActivityReadCommitmentReceipt::BindingsV2(commitment)),
+        );
+        (continuation, aggregate, metadata_receipt)
+    }
+
     /// PASS: raw stream/history/metadata evidence authenticates a correction and its oldest clock;
     /// altered binding fields or missing, early, and out-of-prefix receipts fail closed.
     #[test]
     fn observation_bindings_verify_recorded_raw_evidence() {
+        let mut accepted_invalid = Vec::new();
         for case in [
             "valid",
             "revision",
@@ -4461,151 +4982,34 @@ mod continuation_v3_tests {
             "metadata_sequence",
             "metadata_missing",
             "metadata_unverified",
+            "metadata_wrong_condition",
+            "metadata_wrong_outcome",
+            "conflicting_metadata",
+            "metadata_source",
+            "metadata_schema",
+            "metadata_parser",
+            "absent_history",
+            "ambiguous_history",
+            "duplicate_receipt",
+            "duplicate_member",
+            "recorded_correction",
+            "distinct_legs",
             "future_receipt",
             "digest",
             "unknown_field",
             "prefix",
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("binding.log");
-            let mut writer = Writer::open(&path).unwrap();
-            let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
-            let append = |writer: &mut Writer, source: &str, schema, parser, payload: Vec<u8>| {
-                writer
-                    .append_synced(EnvelopeIn {
-                        source_id: SourceId(source.to_owned()),
-                        schema_version: schema,
-                        parser_version: parser,
-                        observed_at: SourceTimestamp(at),
-                        received_at: ReceivedAt(at),
-                        content_type: ContentType::Json,
-                        payload,
-                    })
-                    .unwrap()
-            };
-            let stream_payload = serde_json::to_vec(
-                &json!({"proxyWallet":"0x1111111111111111111111111111111111111111",
-                "conditionId":"old", "asset":"123", "side":"BUY", "size":1, "price":0.5,
-                "timestamp":99, "transactionHash":"tx", "outcomeIndex":1}),
-            )
-            .unwrap();
-            let stream = parse_activity_trade_observation(&stream_payload).unwrap();
-            let stream_receipt = append(
-                &mut writer,
-                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
-                2,
-                2,
-                stream_payload,
-            );
-            let raw = serde_json::to_vec(&json!([{"proxyWallet":"0x1111111111111111111111111111111111111111",
-                "type":"TRADE", "conditionId":"new", "asset":"123", "side":"BUY", "size":"1", "usdcSize":"0.5", "price":"0.5",
-                "timestamp":100, "transactionHash":"tx", "outcomeIndex":0}])).unwrap();
-            let page_receipt = append(
-                &mut writer,
-                crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
-                3,
-                2,
-                raw.clone(),
-            );
-            let (page, evidence) = activity_page_fixture(&raw, None, 100, 0, page_receipt);
-            let aggregate = parse_complete_activity_page(
-                &activity_page(&raw),
-                WalletAddress([0x11; 20]),
-                "fixture",
-            )
-            .unwrap()
-            .aggregates()
-            .unwrap()
-            .remove(0);
-            let metadata = serde_json::to_vec(&json!([{"conditionId":"new", "clobTokenIds": if case == "metadata_unverified" { "[\"456\"]" } else { "[\"123\",\"456\"]" }}])).unwrap();
-            let metadata_receipt = append(
-                &mut writer,
-                pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID,
-                1,
-                1,
-                metadata.clone(),
-            );
-            let mut binding = ObservationBinding {
-                stream_group_id: stream.group_id.key().clone(),
-                stream_receipt,
-                history_group_id: aggregate.group_id.key().clone(),
-                semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
-                page_raw_hash: page.raw_hash.clone(),
-                page_occurrence_index: 0,
-                identity_provenance: Some(crate::asset_identity::IdentityProvenance {
-                    asset: pe_core_types::PolymarketTokenId("123".to_owned()),
-                    source_log_sequence: metadata_receipt.sequence.0,
-                    canonical_page_hash: canonical_page_hash(&metadata).unwrap(),
-                }),
-                identity_receipt: Some(metadata_receipt),
-            };
-            match case {
-                "revision" => binding.semantic_revision = "00".repeat(32),
-                "page_hash" => binding.page_raw_hash = "00".repeat(32),
-                "occurrence" => binding.page_occurrence_index = 1,
-                "stream_group" => binding.stream_group_id = aggregate.group_id.key().clone(),
-                "stream_receipt" => binding.stream_receipt = page_receipt,
-                "metadata_hash" => {
-                    binding
-                        .identity_provenance
-                        .as_mut()
-                        .unwrap()
-                        .canonical_page_hash = "00".repeat(32)
-                }
-                "metadata_sequence" => {
-                    binding
-                        .identity_provenance
-                        .as_mut()
-                        .unwrap()
-                        .source_log_sequence = 0
-                }
-                "metadata_missing" => binding.identity_receipt = None,
-                "future_receipt" => binding.stream_receipt = receipt(100),
-                _ => {}
-            }
-            let mut payload = activity_read_commitment_payload_v2(
-                WalletAddress([0x11; 20]),
-                100,
-                std::slice::from_ref(&page),
-                std::slice::from_ref(&evidence),
-                &[binding],
-            )
-            .unwrap();
-            if matches!(case, "digest" | "unknown_field") {
-                let mut value: Value = serde_json::from_slice(&payload).unwrap();
-                if case == "digest" {
-                    value["bindings"][0]["semantic_revision"] = json!("changed");
-                } else {
-                    value["bindings"][0]["unexpected"] = json!(true);
-                }
-                payload = serde_json::to_vec(&value).unwrap();
-            }
-            let commitment = append(
-                &mut writer,
-                ACTIVITY_READ_COMMITMENT_SOURCE_ID,
-                2,
-                1,
-                payload,
-            );
-            drop(writer);
-            let index = SourceReceiptIndex::replay(&path).unwrap();
-            let mut frozen = facts(complete_read_inputs(100, &[evidence]));
-            frozen.source_trade_id = aggregate.group_id.key().clone();
-            frozen.semantic_revision = aggregate.semantic_revision.as_str().to_owned();
-            frozen.source_epoch = 100;
-            frozen.provenance = TradeProvenance::ActivityWs;
-            frozen.paper_freshness_policy = Some(PaperFreshnessPolicy {
-                activity_ws_enabled: true,
-                copy_latency_budget_secs: 2,
-            });
-            let continuation = DecisionContinuationV3::new(
-                frozen,
-                Some(stream_receipt),
-                vec![page],
-                Some(ActivityReadCommitmentReceipt::BindingsV2(commitment)),
-            );
+            let fixture = binding_fixture(case);
+            let BindingFixture {
+                continuation,
+                index,
+                aggregate,
+                metadata_receipt,
+                ..
+            } = &fixture;
+            let stream_receipt = continuation.observed_source_receipt.unwrap();
             let result = continuation.reconstruct_complete_activity_read(&mut |receipt| {
-                if case == "prefix" && receipt == metadata_receipt {
+                if case == "prefix" && receipt == *metadata_receipt {
                     return Err("outside prefix".to_owned());
                 }
                 index
@@ -4613,9 +5017,14 @@ mod continuation_v3_tests {
                     .map(CompleteActivityPage::from)
                     .map_err(|error| error.to_string())
             });
-            if case == "valid" {
-                assert_eq!(result.unwrap(), vec![aggregate]);
-                continuation.observation_from_receipt_index(&index).unwrap();
+            if matches!(case, "valid" | "recorded_correction" | "distinct_legs") {
+                let aggregates = result.unwrap();
+                assert_eq!(
+                    aggregates.len(),
+                    if case == "distinct_legs" { 3 } else { 1 }
+                );
+                assert!(aggregates.contains(aggregate));
+                continuation.observation_from_receipt_index(index).unwrap();
                 let time = continuation
                     .verify_stream_binding(
                         &continuation.facts.source_trade_id,
@@ -4628,28 +5037,451 @@ mod continuation_v3_tests {
                     )
                     .unwrap();
                 assert_eq!(time.0.unix_timestamp(), 99);
-                let source_time = continuation
-                    .verified_source_time(&mut |receipt| {
-                        index
-                            .source_envelope(receipt)
-                            .map(CompleteActivityPage::from)
-                    })
-                    .unwrap();
-                assert_eq!(source_time.0.unix_timestamp(), 99);
-                let mut without_selected_stream = continuation.clone();
-                without_selected_stream.observed_source_receipt = None;
-                assert_eq!(
-                    without_selected_stream
-                        .verified_source_time(&mut |receipt| {
-                            index
-                                .source_envelope(receipt)
-                                .map(CompleteActivityPage::from)
-                        })
+            } else if result.is_ok() {
+                accepted_invalid.push(case);
+            }
+        }
+        assert!(
+            accepted_invalid.is_empty(),
+            "accepted invalid bindings: {accepted_invalid:?}"
+        );
+    }
+
+    /// PASS: literal pre-#588 v1 bytes and digest remain exact and reconstruct successfully.
+    #[test]
+    fn parent_v1_commitment_bytes_and_digest_are_unchanged() {
+        let (continuation, payload) = committed_empty_read();
+        let expected = include_bytes!("../tests/fixtures/activity_read_commitment_v1.json");
+        let preimage =
+            include_bytes!("../tests/fixtures/activity_read_commitment_v1_preimage.json");
+        let digest = include_str!("../tests/fixtures/activity_read_commitment_v1.digest");
+        // Parent ab120d9997f216a27dfdb0199739df695a65c9ac hashes the v1 domain followed
+        // by sorted-key JSON of wallet/fixed_end/joined page pairs, without bindings.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"prediction-edge/activity-read-commitment/v1");
+        hasher.update(preimage);
+        assert_eq!(hasher.finalize().to_hex().as_str(), digest);
+        assert_eq!(payload, expected);
+        let pages: Vec<ReconciliationPageEvidence> =
+            serde_json::from_value(continuation.facts.decision_inputs["pages"].clone()).unwrap();
+        assert_eq!(
+            canonical_json(&ActivityReadPreimage {
+                wallet: continuation.facts.wallet,
+                fixed_end: 100,
+                pages: joined_read_pages(&continuation.page_occurrences, &pages).unwrap(),
+            })
+            .unwrap(),
+            preimage
+        );
+        assert_eq!(
+            activity_read_digest(
+                continuation.facts.wallet,
+                100,
+                &continuation.page_occurrences,
+                &pages
+            )
+            .unwrap()
+            .to_hex()
+            .as_str(),
+            digest
+        );
+        assert!(
+            continuation
+                .reconstruct_complete_activity_read(&mut |receipt| committed_lookup(
+                    receipt, expected
+                ))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// PASS: a nested duplicate binding member is rejected from authentic raw source bytes.
+    #[test]
+    fn commitment_v2_rejects_duplicate_binding_member() {
+        let fixture = binding_fixture("duplicate_member");
+        let error = fixture
+            .continuation
+            .reconstruct_complete_activity_read(&mut |receipt| {
+                fixture
+                    .index
+                    .source_envelope(receipt)
+                    .map(CompleteActivityPage::from)
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate field `page_occurrence_index`"),
+            "{error}"
+        );
+    }
+
+    /// PASS: the historical typed decoder rejects duplicate digest members, including a correct last digest.
+    #[test]
+    fn commitment_v1_rejects_duplicate_member() {
+        let (continuation, payload) = committed_empty_read();
+        let duplicate = String::from_utf8(payload.clone())
+            .unwrap()
+            .replacen("{", "{\"digest\":\"invalid\",", 1)
+            .into_bytes();
+        let error = continuation
+            .reconstruct_complete_activity_read(&mut |receipt| {
+                let mut source = committed_lookup(receipt, &payload)?;
+                if receipt.sequence.0 == 3 {
+                    source.payload = duplicate.clone();
+                }
+                Ok::<_, String>(source)
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate field `digest`"),
+            "{error}"
+        );
+    }
+
+    /// PASS: a bound v5 observation reads each of its four authenticated source frames once.
+    #[test]
+    fn observation_shared_read_is_reconstructed_once() {
+        let fixture = binding_fixture("valid");
+        super::continuation_validation_tests::LOOKUPS.with(|count| count.set(0));
+        fixture
+            .continuation
+            .observation_from_receipt_index(&fixture.index)
+            .unwrap();
+        assert_eq!(
+            super::continuation_validation_tests::LOOKUPS.with(std::cell::Cell::get),
+            4
+        );
+        let mut counts = HashMap::new();
+        fixture
+            .continuation
+            .verify_stream_binding(
+                &fixture.continuation.facts.source_trade_id,
+                fixture.continuation.observed_source_receipt.unwrap(),
+                &mut |receipt| {
+                    *counts.entry(receipt.sequence).or_insert(0) += 1;
+                    fixture
+                        .index
+                        .source_envelope(receipt)
+                        .map(CompleteActivityPage::from)
+                },
+            )
+            .unwrap();
+        assert_eq!(counts.len(), 4);
+        assert!(counts.values().all(|count| *count == 1));
+        let poll = binding_fixture("poll_only");
+        super::continuation_validation_tests::LOOKUPS.with(|count| count.set(0));
+        poll.continuation
+            .observation_from_receipt_index(&poll.index)
+            .unwrap();
+        assert_eq!(
+            super::continuation_validation_tests::LOOKUPS.with(std::cell::Cell::get),
+            2
+        );
+    }
+
+    pub(crate) fn binding_state(fixture: &BindingFixture) -> Arc<PaperStateDb> {
+        let state = Arc::new(PaperStateDb::open(&fixture.dir.path().join("paper.db")).unwrap());
+        let continuation = &fixture.continuation;
+        let wallet = continuation.facts.wallet;
+        state.set_cursor(&wallet, 0).unwrap();
+        state
+            .install_anchors(&[AnchorInstallRecord {
+                wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: 0,
+                anchored_at_unix: 0,
+                ledger_hash_after: "empty".to_owned(),
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "binding-fixture".to_owned(),
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 0,
+            }])
+            .unwrap();
+        let aggregates = parse_complete_activity_page(
+            &CompleteActivityPage::from(
+                fixture
+                    .index
+                    .source_envelope(continuation.page_occurrences[0].receipt)
+                    .unwrap(),
+            ),
+            wallet,
+            "fixture",
+        )
+        .unwrap()
+        .aggregates()
+        .unwrap();
+        let context = BucketDecisionContext {
+            applied_configuration: continuation.facts.applied_configuration.clone(),
+            decision_inputs_json: continuation.facts.decision_inputs.to_string(),
+            page_occurrences: continuation.page_occurrences.clone(),
+            observed_source_receipts: HashMap::from([(
+                continuation.facts.source_trade_id.clone(),
+                continuation.observed_source_receipt.unwrap(),
+            )]),
+            read_commitment: continuation
+                .read_commitment
+                .map(ActivityReadCommitmentReceipt::BindingsV2),
+            reconstruction_quality: continuation.facts.reconstruction_quality,
+            signal_config: SignalConfig::default(),
+            copy_eligible: true,
+            bracket_commit: false,
+            recorded_at_unix: 100,
+            observation_provenance: HashMap::from([(
+                continuation.facts.source_trade_id.clone(),
+                TradeProvenance::ActivityWs,
+            )]),
+            no_copy_dispositions: HashMap::new(),
+            identity_overrides: if fixture
+                .aggregate
+                .group_id
+                .components()
+                .condition_id
+                .as_ref()
+                .is_some_and(|condition| condition.0 != continuation.facts.market_id.0.0)
+            {
+                HashMap::from([(
+                    continuation.facts.source_trade_id.clone(),
+                    IdentityOverride {
+                        verified: MarketOutcomeId::new(
+                            continuation.facts.market_id.clone(),
+                            continuation.facts.outcome_id,
+                        ),
+                        evidence_hash: canonical_page_hash(
+                            &fixture
+                                .index
+                                .source_envelope(fixture.metadata_receipt)
+                                .unwrap()
+                                .payload,
+                        )
                         .unwrap(),
-                    source_time
-                );
+                    },
+                )])
             } else {
-                assert!(result.is_err(), "{case}");
+                HashMap::new()
+            },
+            identity_unresolved: HashSet::new(),
+            history_status: Some(WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 100,
+            }),
+        };
+        let result = BucketCommitEngine::load(state.clone(), PositionLedger::new())
+            .unwrap()
+            .commit_with_freshness_policy(
+                aggregates,
+                &context,
+                continuation.facts.frozen_basis,
+                continuation.facts.paper_freshness_policy,
+            )
+            .unwrap();
+        assert!(!result.pending.is_empty());
+        state
+    }
+
+    /// PASS: boot shares one authenticated v5 read across a stream decision and a poll decision.
+    #[test]
+    fn boot_bound_shared_read_is_reconstructed_once() {
+        for case in ["shared_read", "shared_recorded_correction"] {
+            let fixture = binding_fixture(case);
+            let state = binding_state(&fixture);
+            super::continuation_validation_tests::LOOKUPS.with(|count| count.set(0));
+            assert_eq!(
+                validate_open_continuations(&state, &fixture.index).unwrap(),
+                2
+            );
+            assert_eq!(
+                super::continuation_validation_tests::LOOKUPS.with(std::cell::Cell::get),
+                4
+            );
+        }
+    }
+
+    /// PASS: even a matching durable correction cannot substitute an identity absent from shared-read metadata.
+    #[test]
+    fn boot_shared_binding_authenticates_each_effective_identity() {
+        let fixture = binding_fixture("shared_read");
+        let state = binding_state(&fixture);
+        validate_open_continuations(&state, &fixture.index).unwrap();
+        let id = &fixture.continuation.facts.source_trade_id;
+        let row = state.decision_pending_for(id).unwrap().unwrap();
+        let mut continuation = DecisionContinuationV3::from_durable(&row).unwrap();
+        continuation.facts.market_id = MarketId(pe_core_types::VenueMarketId("unbound".to_owned()));
+        let mutation = LedgerMutation::from_activity(&fixture.aggregate)
+            .unwrap()
+            .with_verified_identity(
+                MarketOutcomeId::new(
+                    continuation.facts.market_id.clone(),
+                    continuation.facts.outcome_id,
+                ),
+                canonical_page_hash(
+                    &fixture
+                        .index
+                        .source_envelope(fixture.metadata_receipt)
+                        .unwrap()
+                        .payload,
+                )
+                .unwrap(),
+            );
+        let proof = AppliedEffect {
+            effect: mutation.effect,
+            clamped_residual: None,
+        }
+        .to_document()
+        .unwrap();
+        let conn = rusqlite::Connection::open(fixture.dir.path().join("paper.db")).unwrap();
+        conn.execute(
+            "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![serde_json::to_string(&continuation).unwrap(), id.0],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE activity_groups SET proof_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![proof, id.0],
+        )
+        .unwrap();
+        let error = validate_open_continuations(&state, &fixture.index).unwrap_err();
+        assert_eq!(error.source_trade_id.as_ref(), Some(id));
+        assert!(
+            error
+                .cause
+                .contains("binding metadata differs from the effective target identity"),
+            "{error}"
+        );
+    }
+
+    /// PASS: generation substitutions fail at boot and the indexed observation owner used on resume.
+    #[test]
+    fn boot_and_resume_refuse_v5_downgrade_and_substitution() {
+        for case in ["v4", "v3", "substitute_receipt"] {
+            let fixture = binding_fixture("valid");
+            let state = binding_state(&fixture);
+            assert_eq!(
+                validate_open_continuations(&state, &fixture.index).unwrap(),
+                1
+            );
+            let mut continuation =
+                DecisionContinuationV3::from_durable(&state.open_decision_pending().unwrap()[0])
+                    .unwrap();
+            match case {
+                "v4" => {
+                    continuation.version = 4;
+                    continuation.facts.paper_freshness_policy = None;
+                }
+                "v3" => {
+                    continuation.version = 3;
+                    continuation.facts.paper_freshness_policy = None;
+                    continuation.read_commitment = None;
+                }
+                "substitute_receipt" => {
+                    continuation.read_commitment = Some(fixture.metadata_receipt)
+                }
+                _ => {}
+            }
+            let frozen = serde_json::to_string(&continuation).unwrap();
+            rusqlite::Connection::open(fixture.dir.path().join("paper.db"))
+                .unwrap()
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                    [frozen],
+                )
+                .unwrap();
+            assert!(
+                validate_open_continuations(&state, &fixture.index).is_err(),
+                "{case}"
+            );
+            assert!(
+                continuation
+                    .observation_from_receipt_index(&fixture.index)
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(state.open_decision_pending().unwrap().len(), 1);
+        }
+    }
+
+    /// PASS: authentic v5 policy survives checkpoint/terminal replay; malformed policy and any v2 policy fail both owners.
+    #[test]
+    fn freshness_policy_is_checked_by_checkpoint_restore_and_row_replay() {
+        use crate::decision_replay::{
+            AuthorityEvidence, DecisionEvidenceAccumulator, TerminalDispositionEvidence,
+            replay_decision_pending,
+        };
+        let fixture = binding_fixture("valid");
+        fixture
+            .continuation
+            .observation_from_receipt_index(&fixture.index)
+            .unwrap();
+        let current = durable(&fixture.continuation);
+        let mut legacy = durable(&fixture.continuation);
+        let facts = with_legacy17(fixture.continuation.facts.clone());
+        let mut legacy_facts = facts.clone();
+        legacy_facts.paper_freshness_policy = None;
+        legacy.frozen_inputs_json = legacy_v2_json(&legacy_facts);
+        assert_eq!(
+            DecisionContinuationV3::from_durable(&legacy)
+                .unwrap()
+                .version(),
+            2
+        );
+        for base in [current, legacy] {
+            let continuation = DecisionContinuationV3::from_durable(&base).unwrap();
+            let evidence = DecisionEvidenceAccumulator::new(&continuation.facts);
+            let mut valid = base.clone();
+            valid.post_commit_inputs_json = evidence.checkpoint_json().unwrap();
+            DecisionEvidenceAccumulator::from_pending_checkpoint(&valid).unwrap();
+            let terminal = evidence
+                .render(
+                    AuthorityEvidence::not_read("fixture"),
+                    TerminalDispositionEvidence::no_copy("fixture"),
+                )
+                .unwrap();
+            valid.state = DecisionPendingState::Terminal;
+            valid.terminal_disposition = Some("no_copy:fixture".to_owned());
+            valid.post_commit_inputs_json = terminal.clone();
+            replay_decision_pending(&valid).unwrap();
+            for policy in [
+                None,
+                Some(Value::Null),
+                Some(json!({})),
+                Some(json!({"activity_ws_enabled":true,"copy_latency_budget_secs":0})),
+                Some(json!({"activity_ws_enabled":true,"copy_latency_budget_secs":3601})),
+                Some(json!({"activity_ws_enabled":"true","copy_latency_budget_secs":2})),
+                Some(json!({"activity_ws_enabled":true,"copy_latency_budget_secs":"2"})),
+                Some(json!({"activity_ws_enabled":true,"copy_latency_budget_secs":-1})),
+                Some(
+                    json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2,"extra":false}),
+                ),
+                Some(json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2})),
+            ] {
+                if (continuation.version() == 5
+                    && policy
+                        == Some(json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2})))
+                    || (continuation.version() == 2 && policy.is_none())
+                {
+                    continue;
+                }
+                let mut value: Value = serde_json::from_str(&base.frozen_inputs_json).unwrap();
+                match policy {
+                    Some(policy) => value["paper_freshness_policy"] = policy,
+                    None => {
+                        value
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("paper_freshness_policy");
+                    }
+                }
+                let mut changed = base.clone();
+                changed.frozen_inputs_json = value.to_string();
+                changed.post_commit_inputs_json = evidence.checkpoint_json().unwrap();
+                assert!(DecisionEvidenceAccumulator::from_pending_checkpoint(&changed).is_err());
+                changed.state = DecisionPendingState::Terminal;
+                changed.terminal_disposition = Some("no_copy:fixture".to_owned());
+                changed.post_commit_inputs_json = terminal.clone();
+                assert!(replay_decision_pending(&changed).is_err());
             }
         }
     }

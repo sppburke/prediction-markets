@@ -65,6 +65,7 @@ use time::OffsetDateTime;
 use crate::bucket_commit::PageOccurrence;
 use crate::bucket_commit::{
     CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3,
+    VerifiedObservationBindings,
 };
 use crate::config::ServiceConfig;
 use crate::decision_replay::{
@@ -2197,6 +2198,7 @@ fn decision_rows_from_sealed_source(
 struct CompleteActivityReadScope {
     continuation: DecisionContinuationV3,
     aggregates: Vec<pe_source_polymarket_public::ActivityAggregate>,
+    bindings: VerifiedObservationBindings,
     decisions: HashMap<pe_core_types::SourceTradeId, Option<AppendReceipt>>,
 }
 
@@ -2235,6 +2237,12 @@ fn complete_activity_read_scopes(
                 );
             }
         }
+        let invalid_read = |error| {
+            QualificationError::InsufficientEvidence(format!(
+                "source-log trade {} has no reconstructable receipt-bearing decision: {error}",
+                row.source_trade_id
+            ))
+        };
         if let Some(existing) = reads
             .iter_mut()
             .find(|read| read.continuation.page_occurrences() == continuation.page_occurrences())
@@ -2244,6 +2252,10 @@ fn complete_activity_read_scopes(
                     "decision continuations disagree about one complete activity read",
                 );
             }
+            existing
+                .bindings
+                .verify_facts(&continuation.facts)
+                .map_err(invalid_read)?;
             if existing
                 .decisions
                 .insert(
@@ -2278,18 +2290,14 @@ fn complete_activity_read_scopes(
                 content_type: observation.content_type,
             })
         };
-        let aggregates = continuation
-            .reconstruct_complete_activity_read(&mut lookup)
-            .map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "source-log trade {} has no reconstructable receipt-bearing decision: {error}",
-                    row.source_trade_id
-                ))
-            })?;
+        let (aggregates, bindings) = continuation
+            .reconstruct_complete_activity_read_with_bindings(&mut lookup)
+            .map_err(invalid_read)?;
         let observed_source_receipt = continuation.observed_source_receipt;
         reads.push(CompleteActivityReadScope {
             continuation,
             aggregates,
+            bindings,
             decisions: HashMap::from([(row.source_trade_id.clone(), observed_source_receipt)]),
         });
     }
@@ -5879,8 +5887,11 @@ mod tests {
             .into_iter()
             .map(|(occurrence, _)| occurrence)
             .collect();
-        let aggregates = continuation
-            .reconstruct_complete_activity_read(&mut |receipt| -> Result<_, QualificationError> {
+        let (aggregates, bindings) = continuation
+            .reconstruct_complete_activity_read_with_bindings(&mut |receipt| -> Result<
+                _,
+                QualificationError,
+            > {
                 let source = decision_source_receipt(observations, receipt)?;
                 Ok(CompleteActivityPage {
                     payload: source.payload.clone(),
@@ -5896,6 +5907,7 @@ mod tests {
         CompleteActivityReadScope {
             continuation,
             aggregates,
+            bindings,
             decisions: decisions.into_iter().map(|id| (id, None)).collect(),
         }
     }
@@ -11438,6 +11450,70 @@ mod tests {
     /// FAIL: service membership disagrees with atomic sealing or erased receipts establish a pre-Start exclusion.
     #[test]
     fn service_and_transactional_sealer_agree_across_read_generations() {
+        for generation in [3, 4] {
+            let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture(
+                "shared_recorded_correction",
+            );
+            let state = crate::bucket_commit::continuation_v3_tests::binding_state(&fixture);
+            let source_path = fixture.dir.path().join("binding.log");
+            let mut observations = source_observations(
+                &source_path,
+                &TailBinding::from(&Scanner::verify(&source_path).unwrap()),
+            )
+            .unwrap();
+            observations.retain(|_, source| {
+                source.source_id == crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+            });
+            for source in observations.values_mut() {
+                source.schema_version = pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION;
+            }
+            let connection =
+                rusqlite::Connection::open(fixture.dir.path().join("paper.db")).unwrap();
+            for row in state.open_decision_pending().unwrap() {
+                let original = DecisionContinuationV3::from_durable(&row).unwrap();
+                let mut facts = original.facts;
+                facts.paper_freshness_policy = None;
+                facts.provenance = pe_copy_signal_engine::TradeProvenance::RestPoll;
+                let mut continuation =
+                    DecisionContinuationV3::new(facts, None, original.page_occurrences, None);
+                if generation == 4 {
+                    commit_read_fixture(&mut continuation, &mut observations);
+                }
+                connection.execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                    rusqlite::params![serde_json::to_string(&continuation).unwrap(), row.source_trade_id.0],
+                ).unwrap();
+                state
+                    .close_decision_pending(&row.source_trade_id, "{}", "no_fill", 100)
+                    .unwrap();
+            }
+            let sealed = prefix_at(observations.last_key_value().map(|(sequence, _)| *sequence));
+            let reads = complete_activity_read_scopes(
+                &state.decision_pending_history().unwrap(),
+                sealed.last_sequence.unwrap(),
+                SealedSource::Map(&observations),
+            )
+            .unwrap();
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].decisions.len(), 2);
+            assert_eq!(reads[0].continuation.version(), generation);
+            let selected = decision_rows_from_source_observations(
+                &state,
+                &prefix_at(None),
+                &sealed,
+                &observations,
+            )
+            .unwrap();
+            assert_eq!(selected.rows.len(), 2);
+            assert_eq!(selected.in_prefix.len(), 2);
+            state
+                .seal_decision_evidence_for_source_prefix(
+                    &selected.in_prefix,
+                    &selected.in_prefix,
+                    sealed.last_sequence,
+                )
+                .unwrap();
+        }
         for generation in [3, 4, 5] {
             let committed = generation >= 4;
             for pre_start_ws in [false, true] {
@@ -11877,6 +11953,426 @@ mod tests {
             }
         }
     }
+    /// PASS: an authentic nonempty binding selects identically through map/index and transactional sealing,
+    /// including a pre-Start stream with post-Start history and a recorded history identity correction.
+    #[test]
+    fn corrected_binding_selection_and_sealing_agree_through_both_adapters() {
+        for case in [
+            "valid",
+            "recorded_correction",
+            "shared_read",
+            "shared_recorded_correction",
+        ] {
+            for pre_start_stream in [false, true] {
+                let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture(case);
+                let continuation = &fixture.continuation;
+                let state = crate::bucket_commit::continuation_v3_tests::binding_state(&fixture);
+                for row in state.open_decision_pending().unwrap() {
+                    state
+                        .close_decision_pending(&row.source_trade_id, "{}", "no_fill", 100)
+                        .unwrap();
+                }
+                let source_path = fixture.dir.path().join("binding.log");
+                let candidate = Scanner::verify(&source_path).unwrap();
+                let sealed = TailBinding::from(&candidate);
+                let start = prefix_at(pre_start_stream.then_some(0));
+                let map =
+                    decision_rows_for_source_prefix(&state, &source_path, &start, &sealed).unwrap();
+                let (indexed, binding) = decision_rows_for_indexed_source_prefix(
+                    &state,
+                    &fixture.index,
+                    &candidate,
+                    &start,
+                )
+                .unwrap();
+                assert_eq!(map.rows, indexed.rows);
+                assert_eq!(map.in_prefix, indexed.in_prefix);
+                assert_eq!(binding, sealed);
+                let decisions = if case.starts_with("shared_") { 2 } else { 1 };
+                assert_eq!(map.rows.len(), decisions - usize::from(pre_start_stream));
+                assert_eq!(map.in_prefix.len(), decisions);
+                let keys = map
+                    .rows
+                    .iter()
+                    .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
+                    .collect::<Vec<_>>();
+                state
+                    .seal_decision_evidence_for_source_prefix(
+                        &keys,
+                        &map.in_prefix,
+                        sealed.last_sequence,
+                    )
+                    .unwrap();
+                let observations = source_observations(&source_path, &sealed).unwrap();
+                verify_decision_source_inputs(
+                    &state,
+                    &replayed_no_copy_decision(continuation),
+                    &observations,
+                )
+                .unwrap();
+                // The same recorded correction cannot authorize an unrelated frozen target.
+                let mut altered = continuation.clone();
+                altered.facts.market_id = MarketId(VenueMarketId("unbound".to_owned()));
+                assert!(
+                    verify_decision_source_inputs(
+                        &state,
+                        &replayed_no_copy_decision(&altered),
+                        &observations
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    /// PASS: both selectors authenticate a bound sibling before transactional sealing, even
+    /// when its altered effective identity agrees with a tampered durable correction.
+    /// FAIL: an authentic representative lets a sibling's unsupported condition/outcome seal.
+    #[test]
+    fn shared_read_sibling_identity_is_authenticated_before_selection_and_sealing() {
+        for field in ["condition", "outcome"] {
+            let mut fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture(
+                "shared_recorded_correction",
+            );
+            let source_path = fixture.dir.path().join("binding.log");
+            let aggregate = fixture
+                .continuation
+                .reconstruct_complete_activity_read(&mut |receipt| {
+                    fixture
+                        .index
+                        .source_envelope(receipt)
+                        .map(CompleteActivityPage::from)
+                })
+                .unwrap()
+                .into_iter()
+                .find(|aggregate| {
+                    aggregate.group_id.key() != &fixture.continuation.facts.source_trade_id
+                })
+                .unwrap();
+            let mut commitment: crate::bucket_commit::ActivityReadCommitment =
+                serde_json::from_slice(
+                    &fixture
+                        .index
+                        .source_envelope(fixture.continuation.read_commitment.unwrap())
+                        .unwrap()
+                        .payload,
+                )
+                .unwrap();
+            // Bind the second history leg too; the original fixture's bound leg sorts first.
+            let stream_payload = serde_json::to_vec(&serde_json::json!({
+                "proxyWallet": fixture.continuation.facts.wallet.to_string(),
+                "conditionId": "other", "asset": "456", "side": "BUY", "size": 1,
+                "price": 0.5, "timestamp": 99, "transactionHash": "tx", "outcomeIndex": 0
+            }))
+            .unwrap();
+            let stream = parse_activity_trade_observation(&stream_payload).unwrap();
+            let metadata = br#"[{"conditionId":"other","clobTokenIds":["456","789"]}]"#.to_vec();
+            let metadata_hash =
+                pe_source_polymarket_public::canonical_page_hash(&metadata).unwrap();
+            let at = OffsetDateTime::from_unix_timestamp(100).unwrap();
+            let mut writer = Writer::open(&source_path).unwrap();
+            let mut append = |source: &str, schema, parser, payload| {
+                writer
+                    .append_synced(EnvelopeIn {
+                        source_id: SourceId(source.to_owned()),
+                        schema_version: schema,
+                        parser_version: parser,
+                        observed_at: SourceTimestamp(at),
+                        received_at: ReceivedAt(at),
+                        content_type: ContentType::Json,
+                        payload,
+                    })
+                    .unwrap()
+            };
+            let stream_receipt = append(
+                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+                2,
+                2,
+                stream_payload,
+            );
+            let metadata_receipt = append(
+                GAMMA_MARKETS_SOURCE_ID,
+                GAMMA_MARKETS_SCHEMA_VERSION,
+                GAMMA_MARKETS_PARSER_VERSION,
+                metadata,
+            );
+            commitment
+                .bindings
+                .as_mut()
+                .unwrap()
+                .push(crate::bucket_commit::ObservationBinding {
+                    stream_group_id: stream.group_id.key().clone(),
+                    stream_receipt,
+                    history_group_id: aggregate.group_id.key().clone(),
+                    semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
+                    page_raw_hash: fixture.continuation.page_occurrences()[0].raw_hash.clone(),
+                    page_occurrence_index: 0,
+                    identity_provenance: Some(crate::asset_identity::IdentityProvenance {
+                        asset: pe_core_types::PolymarketTokenId("456".to_owned()),
+                        source_log_sequence: metadata_receipt.sequence.0,
+                        canonical_page_hash: metadata_hash.clone(),
+                    }),
+                    identity_receipt: Some(metadata_receipt),
+                });
+            let payload = crate::bucket_commit::activity_read_commitment_payload_v2(
+                fixture.continuation.facts.wallet,
+                100,
+                fixture.continuation.page_occurrences(),
+                &serde_json::from_value::<Vec<ReconciliationPageEvidence>>(
+                    fixture.continuation.facts.decision_inputs["pages"].clone(),
+                )
+                .unwrap(),
+                commitment.bindings.as_ref().unwrap(),
+            )
+            .unwrap();
+            fixture.continuation.read_commitment = Some(append(
+                crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+                crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                payload,
+            ));
+            drop(writer);
+            fixture.index = SourceReceiptIndex::replay(&source_path).unwrap();
+            let state = crate::bucket_commit::continuation_v3_tests::binding_state(&fixture);
+            for row in state.open_decision_pending().unwrap() {
+                state
+                    .close_decision_pending(&row.source_trade_id, "{}", "no_fill", 100)
+                    .unwrap();
+            }
+            let rows = state.decision_pending_history().unwrap();
+            assert_eq!(rows.len(), 2);
+            let id = aggregate.group_id.key();
+            assert_eq!(
+                &rows[1].source_trade_id, id,
+                "bound row must be the sibling"
+            );
+            let representative = rows[0].clone();
+            let candidate = Scanner::verify(&source_path).unwrap();
+            let sealed = TailBinding::from(&candidate);
+            let start = prefix_at(None);
+            let select = |indexed| {
+                if indexed {
+                    decision_rows_for_indexed_source_prefix(
+                        &state,
+                        &fixture.index,
+                        &candidate,
+                        &start,
+                    )
+                    .map(|(selected, binding)| {
+                        assert_eq!(binding, sealed);
+                        selected
+                    })
+                } else {
+                    decision_rows_for_source_prefix(&state, &source_path, &start, &sealed)
+                }
+            };
+            let seal = |selected: SelectedDecisionRows| -> Result<_, QualificationError> {
+                assert_eq!(selected.rows.len(), 2);
+                assert_eq!(selected.in_prefix.len(), 2);
+                let keys = selected
+                    .rows
+                    .iter()
+                    .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
+                    .collect::<Vec<_>>();
+                Ok(state.seal_decision_evidence_for_source_prefix(
+                    &keys,
+                    &selected.in_prefix,
+                    sealed.last_sequence,
+                )?)
+            };
+            let authentic = select(false).and_then(seal).unwrap();
+            assert_eq!(authentic, select(true).and_then(seal).unwrap());
+
+            let mut continuation = DecisionContinuationV3::from_durable(&rows[1]).unwrap();
+            if field == "condition" {
+                continuation.facts.market_id = MarketId(VenueMarketId("unbound".to_owned()));
+            } else {
+                continuation.facts.outcome_id = OutcomeId(1);
+            }
+            let mutation = LedgerMutation::from_activity(&aggregate)
+                .unwrap()
+                .with_verified_identity(
+                    MarketOutcomeId::new(
+                        continuation.facts.market_id.clone(),
+                        continuation.facts.outcome_id,
+                    ),
+                    metadata_hash,
+                );
+            verify_decision_continuation_facts(
+                &aggregate,
+                &continuation.facts,
+                mutation.effect.correction(),
+            )
+            .unwrap();
+            let proof = AppliedEffect {
+                effect: mutation.effect,
+                clamped_residual: None,
+            }
+            .to_document()
+            .unwrap();
+            let connection =
+                rusqlite::Connection::open(fixture.dir.path().join("paper.db")).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                        rusqlite::params![serde_json::to_string(&continuation).unwrap(), id.0],
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE activity_groups SET proof_json = ?1 WHERE source_trade_id = ?2",
+                        rusqlite::params![proof, id.0],
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(state.decision_pending_history().unwrap()[0], representative);
+            for indexed in [false, true] {
+                let result = select(indexed).and_then(seal);
+                assert!(
+                    result.is_err(),
+                    "{field}, indexed={indexed}: tampered sibling reached transactional sealing"
+                );
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(&error, QualificationError::InsufficientEvidence(message)
+                        if message.contains("binding metadata differs from the effective target identity")),
+                    "{field}, indexed={indexed}: {error}"
+                );
+            }
+        }
+    }
+
+    /// PASS: two authentic reads cannot redirect the same stream group to conflicting history targets.
+    #[test]
+    fn corrected_binding_selection_rejects_conflicting_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let (first, _, _) =
+            crate::bucket_commit::continuation_v3_tests::append_binding_read("valid", &mut writer);
+        let (second, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+            "other_target",
+            &mut writer,
+        );
+        assert_ne!(first.facts.source_trade_id, second.facts.source_trade_id);
+        drop(writer);
+        let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+        store_read_decision(&state, &first, "decision_pending", true);
+        store_read_decision(&state, &second, "decision_pending", true);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        for continuation in [&first, &second] {
+            continuation.observation_from_receipt_index(&index).unwrap();
+        }
+        let candidate = Scanner::verify(&source_path).unwrap();
+        let sealed = TailBinding::from(&candidate);
+        let map = decision_rows_for_source_prefix(&state, &source_path, &prefix_at(None), &sealed)
+            .unwrap_err();
+        let indexed =
+            decision_rows_for_indexed_source_prefix(&state, &index, &candidate, &prefix_at(None))
+                .unwrap_err();
+        assert!(
+            map.to_string()
+                .contains("disagree about an observation binding target"),
+            "{map}"
+        );
+        assert_eq!(map.to_string(), indexed.to_string());
+    }
+
+    /// PASS: malformed v5 policy and a valid policy substituted into authentic v2 bytes fail both selectors.
+    #[test]
+    fn bound_selection_rejects_malformed_freshness_policy() {
+        for legacy in [false, true] {
+            let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture("valid");
+            let path = fixture.dir.path().join("selection.db");
+            let state = PaperStateDb::open(&path).unwrap();
+            store_read_decision(&state, &fixture.continuation, "decision_pending", true);
+            let source_path = fixture.dir.path().join("binding.log");
+            let candidate = Scanner::verify(&source_path).unwrap();
+            let sealed = TailBinding::from(&candidate);
+            let original = if legacy {
+                let mut facts = fixture.continuation.facts.clone();
+                facts.paper_freshness_policy = None;
+                facts.applied_configuration =
+                    crate::bucket_commit::synthetic_legacy17_runtime_config();
+                facts.applied_configuration_hash = facts.applied_configuration.canonical_hash();
+                crate::bucket_commit::pre_545_frozen_inputs(&facts)
+            } else {
+                serde_json::to_string(&fixture.continuation).unwrap()
+            };
+            let original: serde_json::Value = serde_json::from_str(&original).unwrap();
+            for policy in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!({})),
+                Some(serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":0})),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":3601}),
+                ),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":"true","copy_latency_budget_secs":2}),
+                ),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":"2"}),
+                ),
+                Some(serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":-1})),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2,"extra":false}),
+                ),
+                Some(serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2})),
+            ] {
+                if (legacy && policy.is_none())
+                    || (!legacy
+                        && policy
+                            == Some(
+                                serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2}),
+                            ))
+                {
+                    continue;
+                }
+                let mut value = original.clone();
+                match policy {
+                    Some(policy) => value["paper_freshness_policy"] = policy,
+                    None => {
+                        value
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("paper_freshness_policy");
+                    }
+                }
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                        [value.to_string()],
+                    )
+                    .unwrap();
+                assert!(
+                    decision_rows_for_source_prefix(
+                        &state,
+                        &source_path,
+                        &prefix_at(None),
+                        &sealed
+                    )
+                    .is_err()
+                );
+                assert!(
+                    decision_rows_for_indexed_source_prefix(
+                        &state,
+                        &fixture.index,
+                        &candidate,
+                        &prefix_at(None)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
     /// PASS: source verification loads the recorded A/0-to-B/1 correction and accepts B/1;
     /// without a correction it accepts A/0. All three identity mutations and uncorrected B/1
     /// return InsufficientEvidence.
