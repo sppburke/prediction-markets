@@ -601,17 +601,34 @@ fn golden_watchlist(wallets: &[WalletAddress]) -> Watchlist {
 /// (`condition_ids=A&condition_ids=B&…`) with every requested market it knows, in request order.
 struct GoldenGammaFetcher {
     markets: HashMap<String, serde_json::Value>,
+    gate: Option<Arc<support::PriceGate>>,
 }
 
 impl PageFetcher for GoldenGammaFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+        if let Some(gate) = &self.gate
+            && gate
+                .market
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|market| url.contains(&format!("condition_ids={market}")))
+            && gate
+                .blocked
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
         let query = url.split_once('?').map_or("", |(_, query)| query);
         let markets = query
             .split('&')
             .filter_map(|pair| pair.strip_prefix("condition_ids="))
             .filter_map(|condition| self.markets.get(condition).cloned())
             .flat_map(|market| {
-                if market["conditionId"] == format!("0x{:064x}", HELD_COPY + 1) {
+                if self.gate.is_none()
+                    && market["conditionId"] == format!("0x{:064x}", HELD_COPY + 1)
+                {
                     let mut conflicting = market.clone();
                     conflicting["outcomePrices"] = "[\"0.60\",\"0.40\"]".into();
                     vec![market, conflicting]
@@ -635,7 +652,13 @@ fn golden_mid_cache(anchor_cutoff: i64) -> MidPriceCache<GoldenGammaFetcher> {
             (bodies.condition.0.clone(), gamma[0].take())
         })
         .collect();
-    MidPriceCache::with_fetcher(GoldenGammaFetcher { markets }, BASE.to_owned())
+    MidPriceCache::with_fetcher(
+        GoldenGammaFetcher {
+            markets,
+            gate: None,
+        },
+        BASE.to_owned(),
+    )
 }
 
 struct GoldenLiveVenue;
@@ -2855,6 +2878,9 @@ pub(crate) struct BracketFinancialHarness {
     pub(crate) source_path: std::path::PathBuf,
     pub(crate) initial: Watchlist,
     runtime: RuntimeConfig,
+    receipts: SourceReceiptIndex,
+    accounts: pe_service::live_accounts::LiveAccounts,
+    price_gate: Arc<support::PriceGate>,
     hooks: Arc<ScenarioHooks>,
     books: Arc<GoldenBookFetcher>,
     authority: GoldenAuthority,
@@ -2870,6 +2896,20 @@ impl BracketFinancialHarness {
         paper: Arc<PaperStateDb>,
         initial_wallets: &[WalletAddress],
     ) -> Self {
+        Self::new_with_deployed_flow(dir, paper, initial_wallets, false).await
+    }
+
+    async fn new_with_deployed_flow(
+        dir: &std::path::Path,
+        paper: Arc<PaperStateDb>,
+        initial_wallets: &[WalletAddress],
+        deployed: bool,
+    ) -> Self {
+        let start_unix = if deployed {
+            FIXED_UNIX - FIXED_UNIX.rem_euclid(DAY_SECS) - 1
+        } else {
+            1
+        };
         let paper_path = dir.join("paper.log");
         let source_path = dir.join("source.log");
         let live_path = dir.join("live_journal.log");
@@ -2892,12 +2932,12 @@ impl BracketFinancialHarness {
             &source_path,
             &live_path,
             &dir.join("paper.db"),
-            1,
+            start_unix,
             initial_wallets,
             &runtime,
         );
         let mut writer = Writer::open(&paper_path).unwrap();
-        let start = append_qualification_start(&mut writer, &preparation.start, 1);
+        let start = append_qualification_start(&mut writer, &preparation.start, start_unix);
         drop(writer);
         paper
             .reset_financial_era(
@@ -2919,6 +2959,28 @@ impl BracketFinancialHarness {
             .with_source_receipt_index(receipts.clone())
             .run(),
         );
+        let accounts = pe_service::live_accounts::LiveAccounts::new(Default::default());
+        let price_gate = Arc::new(support::PriceGate::default());
+        let mut prices = golden_mid_cache(0);
+        if deployed {
+            let markets = (0..TOTAL_DECISIONS)
+                .map(|index| {
+                    let bodies =
+                        golden_trade_bodies(index, golden_source_unix(start_unix + 1, index));
+                    let mut rows: serde_json::Value =
+                        serde_json::from_slice(&bodies.gamma).unwrap();
+                    rows[0]["outcomePrices"] = "[\"0.50\",\"0.50\"]".into();
+                    (bodies.condition.0, rows[0].take())
+                })
+                .collect();
+            prices = MidPriceCache::with_fetcher(
+                GoldenGammaFetcher {
+                    markets,
+                    gate: Some(price_gate.clone()),
+                },
+                "fixture://gamma".to_owned(),
+            );
+        }
         let hooks = Arc::new(ScenarioHooks::default());
         hooks
             .financial_clock_unix
@@ -2941,8 +3003,8 @@ impl BracketFinancialHarness {
                 price_impact_cap_bps: 300,
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
-                live_accounts: None,
-                activity_ws_enabled: false,
+                live_accounts: deployed.then(|| accounts.clone()),
+                activity_ws_enabled: deployed,
                 copy_latency_budget_secs: 2,
                 watchlist_writer_lock: Some(writer_lock.clone()),
             },
@@ -2951,19 +3013,17 @@ impl BracketFinancialHarness {
             paper.clone(),
             pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
             new_shared_health_with_ws(false, true, 90),
-            golden_mid_cache(0)
-                .with_source_log(source.clone())
-                .with_clock({
-                    let hooks = hooks.clone();
-                    Arc::new(move || {
-                        OffsetDateTime::from_unix_timestamp(
-                            hooks
-                                .financial_clock_unix
-                                .load(std::sync::atomic::Ordering::SeqCst),
-                        )
-                        .unwrap()
-                    })
-                }),
+            prices.with_source_log(source.clone()).with_clock({
+                let hooks = hooks.clone();
+                Arc::new(move || {
+                    OffsetDateTime::from_unix_timestamp(
+                        hooks
+                            .financial_clock_unix
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                    .unwrap()
+                })
+            }),
             control_rx,
             None,
             authority.clone(),
@@ -2986,7 +3046,7 @@ impl BracketFinancialHarness {
                     "http://unused.invalid",
                     source.clone(),
                 )),
-                receipts,
+                receipts.clone(),
             )
             .unwrap();
         let actor = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
@@ -2999,6 +3059,9 @@ impl BracketFinancialHarness {
             source_path,
             initial,
             runtime,
+            receipts,
+            accounts,
+            price_gate,
             hooks,
             books,
             authority,
@@ -3029,59 +3092,7 @@ impl BracketFinancialHarness {
         epoch: i64,
     ) -> pe_service::bucket_commit::BucketCommitResult {
         let bodies = golden_trade_bodies(1, epoch);
-        let gamma = append_source_at(
-            &self.source,
-            "polymarket.gamma.markets",
-            &bodies.gamma,
-            epoch,
-        )
-        .await;
-        let clob_long = append_source_at(
-            &self.source,
-            "polymarket.clob.markets",
-            &bodies.clob_long,
-            epoch,
-        )
-        .await;
-        let clob_compact = append_source_at(
-            &self.source,
-            "polymarket.clob.compact-market",
-            &bodies.compact,
-            epoch,
-        )
-        .await;
-        let book_receipt =
-            append_source_at(&self.source, "polymarket.clob.book", &bodies.book, epoch).await;
-        let (admission, mut book) = admission_and_book(
-            &bodies.condition,
-            epoch,
-            GoldenAdmissionBodies {
-                gamma: &bodies.gamma,
-                clob: &bodies.clob_long,
-                compact: &bodies.compact,
-                book: &bodies.book,
-            },
-            AdmissionReceipts {
-                gamma,
-                clob_long,
-                clob_compact,
-            },
-            book_receipt,
-        );
-        // The admission clock and book snapshot share the fixed scenario epoch.
-        book.fetched_at_ms = u64::try_from(epoch * 1_000).unwrap();
-        self.books.insert(
-            admission.market.ordered_outcome_token_ids[0].to_string(),
-            book,
-        );
-        self.hooks
-            .admission_artifacts
-            .lock()
-            .unwrap()
-            .push_back(admission);
-        self.hooks
-            .financial_clock_unix
-            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+        self.record_entry_admission(&bodies, epoch).await;
         let payload = Self::entry_payload(wallet, epoch);
         let page = append_source_at(&self.source, ACTIVITY_POLL_SOURCE_ID, &payload, epoch).await;
         let read = support::producer_shaped_read_v2(wallet, &payload, epoch, epoch, page);
@@ -3196,4 +3207,740 @@ fn qualification_replays_source_age_and_seal_binds_policy_and_clock(
             ),
         );
     }
+}
+
+// Use the existing golden corpus with a single runtime newcomer and distinct first-entry markets.
+fn deployed_trade(index: usize, epoch: i64, corrected: bool) -> GoldenTradeBodies {
+    let mut bodies = golden_trade_bodies(index, epoch);
+    bodies.wallet = WalletAddress::from_hex(WALLET).unwrap();
+    let mut activity: serde_json::Value = serde_json::from_slice(&bodies.activity).unwrap();
+    activity[0]["proxyWallet"] = WALLET.into();
+    activity[0]["timestamp"] = epoch.into();
+    bodies.activity = serde_json::to_vec(&activity).unwrap();
+    let mut stream: serde_json::Value = serde_json::from_slice(&bodies.websocket).unwrap();
+    stream["proxyWallet"] = WALLET.into();
+    stream["timestamp"] = epoch.to_string().into();
+    if corrected {
+        stream["conditionId"] = format!("0x{:064x}", 999_999).into();
+        stream["outcomeIndex"] = "1".into();
+    }
+    bodies.websocket = serde_json::to_vec(&stream).unwrap();
+    bodies
+}
+
+impl BracketFinancialHarness {
+    async fn record_entry_admission(&self, bodies: &GoldenTradeBodies, epoch: i64) {
+        let receipts = AdmissionReceipts {
+            gamma: append_source_at(
+                &self.source,
+                "polymarket.gamma.markets",
+                &bodies.gamma,
+                epoch,
+            )
+            .await,
+            clob_long: append_source_at(
+                &self.source,
+                "polymarket.clob.markets",
+                &bodies.clob_long,
+                epoch,
+            )
+            .await,
+            clob_compact: append_source_at(
+                &self.source,
+                "polymarket.clob.compact-market",
+                &bodies.compact,
+                epoch,
+            )
+            .await,
+        };
+        let book_receipt =
+            append_source_at(&self.source, "polymarket.clob.book", &bodies.book, epoch).await;
+        let (admission, mut book) = admission_and_book(
+            &bodies.condition,
+            epoch,
+            GoldenAdmissionBodies {
+                gamma: &bodies.gamma,
+                clob: &bodies.clob_long,
+                compact: &bodies.compact,
+                book: &bodies.book,
+            },
+            receipts,
+            book_receipt,
+        );
+        book.fetched_at_ms = u64::try_from(epoch * 1_000).unwrap();
+        self.books.insert(
+            admission.market.ordered_outcome_token_ids[0].to_string(),
+            book,
+        );
+        self.hooks
+            .admission_artifacts
+            .lock()
+            .unwrap()
+            .push_back(admission);
+        self.hooks
+            .financial_clock_unix
+            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn deployed_boundary(&self, cutoff: i64) {
+        self.hooks
+            .financial_clock_unix
+            .store(cutoff, std::sync::atomic::Ordering::SeqCst);
+        let receipt = append_source_at(
+            &self.source,
+            "pe-service.boundary",
+            &serde_json::to_vec(&serde_json::json!({
+                "kind": "daily_boundary", "cutoff_unix": cutoff,
+            }))
+            .unwrap(),
+            cutoff,
+        )
+        .await;
+        let (acknowledged, ack) = oneshot::channel();
+        self.control
+            .send(OrchestratorControl::DailyBoundary {
+                cutoff_unix: cutoff,
+                boundary_receipt: receipt,
+                acknowledged,
+            })
+            .await
+            .unwrap();
+        ack.await.unwrap().unwrap();
+    }
+
+    async fn deployed_prepare_membership(
+        &self,
+        paper: &Arc<PaperStateDb>,
+        wallets: &[WalletAddress],
+        epoch: i64,
+    ) {
+        use pe_service::asset_identity::AssetIdentityResolver;
+        use pe_service::position_seeder::CausalPositionValidator;
+        use pe_service::watchlist_admission::AdmissionPreparer;
+        use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, ReconciliationFetcher};
+        for wallet in wallets {
+            assert!(paper.wallet_history_status(wallet).unwrap().is_none());
+            assert!(paper.cursor(wallet).unwrap().is_none());
+        }
+        let history = golden_trade_bodies(TOTAL_DECISIONS + 1, epoch - 1);
+        let (requests, mut requested) = mpsc::channel(8);
+        let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(support::GatedFetcher { requests });
+        let identity = Arc::new(AssetIdentityResolver::new_runtime(
+            fetcher.clone(),
+            "fixture://gamma".to_owned(),
+            GAMMA_BATCH_SIZE,
+            self.source.clone(),
+        ));
+        let preparer = AdmissionPreparer::with_validator(
+            self.control.clone(),
+            paper.clone(),
+            CausalPositionValidator::new(
+                fetcher,
+                "fixture://activity",
+                "golden-stream-v1",
+                identity,
+            )
+            .with_clock(Arc::new(move || epoch)),
+        )
+        .with_source_log(self.source.clone());
+        let preparing = preparer.prepare(wallets);
+        tokio::pin!(preparing);
+        loop {
+            tokio::select! {
+                result = &mut preparing => { result.unwrap(); break; }
+                request = requested.recv() => {
+                    let request = request.unwrap();
+                    let payload = if request.url.contains("/markets?") {
+                        history.gamma.clone()
+                    } else {
+                        let wallet = wallets.iter().find(|wallet| request.url.contains(&wallet.to_string())).unwrap();
+                        let mut rows: serde_json::Value = serde_json::from_slice(&history.activity).unwrap();
+                        rows[0]["proxyWallet"] = wallet.to_string().into();
+                        if request.url.contains("/activity?") {
+                            assert!(!request.url.contains("start="), "runtime validation requires full history");
+                            serde_json::to_vec(&rows).unwrap()
+                        } else {
+                            assert!(request.url.contains("/positions?"), "{}", request.url);
+                            if request.url.contains("redeemable=true") { b"[]".to_vec() } else {
+                                serde_json::to_vec(&serde_json::json!([{
+                                    "proxyWallet": wallet, "asset": rows[0]["asset"],
+                                    "conditionId": history.condition.0, "size": "5", "outcomeIndex": 0,
+                                    "negativeRisk": false,
+                                }])).unwrap()
+                            }
+                        }
+                    };
+                    request.respond.send(payload).unwrap();
+                }
+            }
+        }
+        assert!(
+            self.live.snapshot().entries.is_empty(),
+            "validation must precede publication"
+        );
+        assert!(paper.decision_pending_history().unwrap().is_empty());
+        for wallet in wallets {
+            let status = paper.wallet_history_status(wallet).unwrap().unwrap();
+            assert!(status.complete);
+            assert_eq!(
+                status.proof_json,
+                paper
+                    .position_validation(wallet)
+                    .unwrap()
+                    .unwrap()
+                    .proof_json
+            );
+            let proof: serde_json::Value = serde_json::from_str(&status.proof_json).unwrap();
+            assert_eq!(proof["activity_walks"].as_array().unwrap().len(), 3);
+            assert!(
+                paper.gate_history().unwrap()[wallet].contains(&pe_core_types::MarketId(
+                    pe_core_types::VenueMarketId(history.condition.0.clone())
+                ))
+            );
+        }
+        preparer
+            .scenario_publish_ranking(
+                &self.live,
+                &self.writer_lock,
+                golden_watchlist(wallets).entries,
+                &wallets.iter().map(|wallet| (*wallet, epoch - 1)).collect(),
+                wallets.len(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            self.live
+                .snapshot()
+                .entries
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<Vec<_>>(),
+            wallets
+        );
+    }
+
+    // Reuse S1's held response barriers. The background slot stays occupied until the urgent
+    // wallet has a durable terminal; all source pages and commitments are authored by TradePoller.
+    async fn deployed_poll(
+        &self,
+        paper: Arc<PaperStateDb>,
+        bodies: &GoldenTradeBodies,
+        epoch: i64,
+    ) -> pe_paper_state::DecisionPendingRow {
+        use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger};
+        use pe_service::asset_identity::AssetIdentityResolver;
+        use pe_service::trade_poller::{
+            PollerProgress, ReconciliationObligations, TRADE_RECONCILIATION_CONCURRENCY,
+            TradePoller, TradePollerConfig,
+        };
+        use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, parse_activity_trade_observation};
+        let observation = parse_activity_trade_observation(&bodies.websocket).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+        let receipt = append_source_at(
+            &self.source,
+            ACTIVITY_WS_SOURCE_ID,
+            &bodies.websocket,
+            epoch,
+        )
+        .await;
+        let (triggers, receiver) = mpsc::channel(8);
+        triggers
+            .send(ReconciliationTrigger {
+                wallet: bodies.wallet,
+                source_time: observation.source_time.0,
+                source_trade_id: observation.group_id.key().clone(),
+                provenance: TradeProvenance::ActivityWs,
+                received_at: now,
+                receipt,
+            })
+            .await
+            .unwrap();
+        let (requests, mut requested) = mpsc::channel(8);
+        let (progress, mut progressed) = mpsc::channel(16);
+        let (stop, stopped) = oneshot::channel();
+        let poller = TradePoller::new(
+            TradePollerConfig {
+                base_url: "fixture://activity".to_owned(),
+                poll_interval_secs: 30,
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 2,
+            },
+            self.live.clone(),
+            Arc::new(support::GatedFetcher { requests }),
+            Arc::new(AssetIdentityResolver::new_runtime(
+                Arc::new(support::Page(bodies.gamma.clone())),
+                "fixture://gamma".to_owned(),
+                GAMMA_BATCH_SIZE,
+                self.source.clone(),
+            )),
+            self.source.clone(),
+            receiver,
+            self.control.clone(),
+            paper.clone(),
+            new_shared_health_with_ws(false, true, 90),
+            SignalConfig::default(),
+            pe_service::runtime_config::LiveRuntimeConfig::new(self.runtime.clone()),
+            ReconciliationObligations::default(),
+            None,
+        )
+        .with_source_receipt_index(self.receipts.clone())
+        .with_progress(progress)
+        .with_clock(Arc::new(move || now));
+        let task = tokio::spawn(poller.run_until(async {
+            let _ = stopped.await;
+        }));
+        let mut background = None;
+        let mut urgent = None;
+        for _ in 0..TRADE_RECONCILIATION_CONCURRENCY {
+            let request = requested.recv().await.unwrap();
+            assert!(
+                request.url.contains(&format!("end={epoch}")),
+                "{}",
+                request.url
+            );
+            if request.url.contains(WALLET) {
+                urgent = Some(request);
+            } else {
+                background = Some(request);
+            }
+        }
+        urgent
+            .unwrap()
+            .respond
+            .send(bodies.activity.clone())
+            .unwrap();
+        let mut active = std::collections::HashSet::new();
+        let mut maximum = 0;
+        loop {
+            let progress = progressed.recv().await.unwrap();
+            match progress {
+                PollerProgress::Started { wallet, .. } => {
+                    assert!(active.insert(wallet));
+                    maximum = maximum.max(active.len());
+                    assert!(active.len() <= TRADE_RECONCILIATION_CONCURRENCY);
+                }
+                PollerProgress::Completed { wallet, selected } => {
+                    assert!(active.remove(&wallet));
+                    assert_eq!(
+                        wallet, bodies.wallet,
+                        "held background read cannot complete"
+                    );
+                    assert_eq!(selected, vec![receipt]);
+                    break;
+                }
+                PollerProgress::RoundCompleted => {
+                    panic!("round finished with held background response")
+                }
+            }
+        }
+        assert_eq!(maximum, TRADE_RECONCILIATION_CONCURRENCY);
+        assert!(
+            matches!(requested.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "no third operation"
+        );
+        let row = paper
+            .decision_pending_history()
+            .unwrap()
+            .into_iter()
+            .find(|row| {
+                let continuation = DecisionContinuationV3::from_durable(row).unwrap();
+                continuation.facts.source_epoch == observation.source_time.0.unix_timestamp()
+            })
+            .unwrap();
+        assert_eq!(row.state, pe_paper_state::DecisionPendingState::Terminal);
+        let replay = replay_decision_pending(&row).unwrap();
+        assert_eq!(replay.continuation.version(), 5);
+        assert_eq!(
+            replay.continuation.facts.provenance,
+            TradeProvenance::ActivityWs
+        );
+        assert_eq!(
+            replay.continuation.facts.market_id.to_string(),
+            bodies.condition.0
+        );
+        assert_eq!(replay.continuation.facts.outcome_id, OutcomeId(0));
+        assert_eq!(replay.continuation.observed_source_receipt, Some(receipt));
+        assert!(
+            replay
+                .continuation
+                .observation_from_receipt_index(&self.receipts)
+                .unwrap()
+                .is_some()
+        );
+        let policy = replay.continuation.facts.paper_freshness_policy.unwrap();
+        assert!(policy.activity_ws_enabled);
+        assert_eq!(policy.copy_latency_budget_secs, 2);
+        let commitment = replay.continuation.read_commitment.unwrap();
+        let envelope = Reader::replay(&self.source_path)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|(_, envelope)| envelope)
+            .find(|envelope| envelope.seq == commitment.sequence)
+            .unwrap();
+        assert_eq!(envelope.this_hash, commitment.this_hash);
+        assert_eq!((envelope.schema_version, envelope.parser_version), (2, 1));
+        let bound: ActivityReadCommitment = serde_json::from_slice(&envelope.payload).unwrap();
+        assert_eq!(bound.version, 2);
+        let stream: serde_json::Value = serde_json::from_slice(&bodies.websocket).unwrap();
+        if stream["conditionId"] != bodies.condition.0 {
+            assert_ne!(observation.group_id.key(), &row.source_trade_id);
+            let bindings = bound.bindings.as_ref().unwrap();
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].stream_receipt, receipt);
+            assert_eq!(&bindings[0].stream_group_id, observation.group_id.key());
+            assert_eq!(bindings[0].history_group_id, row.source_trade_id);
+        } else {
+            assert_eq!(observation.group_id.key(), &row.source_trade_id);
+        }
+        stop.send(()).unwrap();
+        background.unwrap().respond.send(b"[]".to_vec()).unwrap();
+        task.await.unwrap().unwrap();
+        row
+    }
+}
+
+/// One real deployed path with fresh/corrected fills, a cold-portfolio expiry, restart, and sealed Pass.
+pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("paper.db");
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    let newcomer = WalletAddress::from_hex(WALLET).unwrap();
+    let background = WalletAddress([0xbb; 20]);
+    let h =
+        BracketFinancialHarness::new_with_deployed_flow(dir.path(), paper.clone(), &[], true).await;
+    let cutoff = FIXED_UNIX - FIXED_UNIX.rem_euclid(DAY_SECS);
+    h.hooks.financial_clock_unix.store(cutoff, Ordering::SeqCst);
+    h.deployed_prepare_membership(&paper, &[newcomer, background], cutoff)
+        .await;
+    let completion = paper.wallet_history_status(&newcomer).unwrap();
+    h.deployed_boundary(cutoff).await;
+    let shares = ShareAmount::from_decimal_exact(dec!(5.04)).unwrap();
+    let credit = CollateralAmount::from_decimal_exact(dec!(5.04)).unwrap();
+    let mut expected = Vec::new();
+    let mut expired_id = None;
+    for day in 0..QUALIFICATION_DAYS {
+        for within_day in 0..COPIES_PER_DAY {
+            let ordinal = day * COPIES_PER_DAY + within_day;
+            let epoch =
+                golden_source_unix(cutoff, ordinal) + i64::try_from(within_day).unwrap() * 180;
+            if within_day == 0 {
+                eprintln!("deployed flow day={day}");
+            }
+            let bodies = deployed_trade(ordinal, epoch, ordinal == 1);
+            h.record_entry_admission(&bodies, epoch).await;
+            h.hooks
+                .age_clock
+                .lock()
+                .unwrap()
+                .extend(std::iter::repeat_n(
+                    OffsetDateTime::from_unix_timestamp(epoch).unwrap(),
+                    3,
+                ));
+            let row = h.deployed_poll(paper.clone(), &bodies, epoch).await;
+            let replay = replay_decision_pending(&row).unwrap();
+            assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+            assert_eq!(
+                replay.post_boundary.body.terminal.reason,
+                "paper_fill_committed"
+            );
+            let final_receipt = replay.post_boundary.body.terminal.final_receipt.unwrap();
+            let frames = scan_paper_log(&h.paper_path).unwrap();
+            let finals = frames
+                .iter()
+                .filter(|frame| frame.receipt == final_receipt)
+                .collect::<Vec<_>>();
+            assert_eq!(finals.len(), 1);
+            assert!(matches!(
+                finals[0].frame,
+                PaperLogFrame::Record(PaperLogRecord::FinancialFinal { .. })
+            ));
+            let prepared = frames
+                .iter()
+                .filter_map(|frame| match &frame.frame {
+                    PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                        payload:
+                            pe_service::paper_recovery::FinancialPayload::Fill {
+                                operation,
+                                economic,
+                            },
+                        ..
+                    }) if operation.source_trade_id == row.source_trade_id => {
+                        Some((frame.receipt, economic))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(prepared.len(), 1);
+            assert_eq!(
+                prepared[0].1.sizing.minimum_shares,
+                ShareAmount::from_whole(5).unwrap()
+            );
+            assert_eq!(
+                prepared[0].1.all_in_debit().unwrap().to_decimal(),
+                dec!(2.55)
+            );
+            let PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                prepared_receipt, ..
+            }) = &finals[0].frame
+            else {
+                panic!("fill terminal does not reference a FinancialFinal");
+            };
+            assert_eq!(*prepared_receipt, prepared[0].0);
+            assert_eq!(
+                replay
+                    .post_boundary
+                    .body
+                    .clocks
+                    .iter()
+                    .filter(|clock| clock.purpose == "paper_prepared_staleness_gate")
+                    .collect::<Vec<_>>(),
+                vec![
+                    &pe_service::decision_replay::DecisionClockEvidence::precise(
+                        "paper_prepared_staleness_gate",
+                        OffsetDateTime::from_unix_timestamp(epoch)
+                            .unwrap()
+                            .unix_timestamp_nanos()
+                    )
+                    .unwrap()
+                ]
+            );
+            expected.push((
+                row.source_trade_id.clone(),
+                prepared[0].0,
+                final_receipt,
+                prepared[0].1.core_hash().unwrap().to_string(),
+            ));
+            assert_eq!(paper.wallet_history_status(&newcomer).unwrap(), completion);
+            if ordinal == 0 {
+                // A later fresh observation encounters an aged portfolio cache, then its
+                // held response consumes the copy budget while the first position remains open.
+                let expiry_epoch = epoch + 120;
+                let expired = deployed_trade(PRICE_CONFLICT_DECISION, expiry_epoch, false);
+                h.accounts
+                    .store(pe_service::live_accounts::LiveAccountsSnapshot {
+                        accounts: vec![pe_service::live_accounts::AccountContext {
+                            account_id: AccountId::new("stored-target").unwrap(),
+                            is_primary: true,
+                            enabled: true,
+                            execution_order: 0,
+                            requested_live_mode: "live_tiny".to_owned(),
+                            effective_live_mode: "live_tiny".to_owned(),
+                            live_price_impact_cap_bps: 100,
+                            custody_wallet_address: None,
+                            custody_wallet_kind: None,
+                            credential_binding: Some((7, "stored-key".to_owned())),
+                        }],
+                        fetched_at_unix: Some(expiry_epoch),
+                    });
+                h.record_entry_admission(&expired, expiry_epoch).await;
+                let start = OffsetDateTime::from_unix_timestamp(expiry_epoch).unwrap();
+                h.hooks.age_clock.lock().unwrap().extend([
+                    start,
+                    start,
+                    start + time::Duration::seconds(2) + time::Duration::nanoseconds(1),
+                ]);
+                *h.price_gate.market.lock().unwrap() = Some(bodies.condition.0.clone());
+                h.price_gate.blocked.store(true, Ordering::SeqCst);
+                let before = paper.financial_snapshot(expiry_epoch).unwrap();
+                let mutations = h.mutations();
+                let attempt = h.deployed_poll(paper.clone(), &expired, expiry_epoch);
+                tokio::pin!(attempt);
+                tokio::select! { biased;
+                    _ = h.price_gate.started.notified() => {},
+                    row = &mut attempt => panic!("attempt bypassed cold portfolio price read: {:?}", replay_decision_pending(&row).unwrap()),
+                }
+                let seeds = paper.pending_dispatch_seeds().unwrap();
+                assert_eq!(seeds.len(), 1);
+                let targets = paper.dispatch_targets(&seeds[0].dispatch_id).unwrap();
+                assert_eq!(targets.len(), 1);
+                eprintln!("deployed flow releasing portfolio price");
+                h.price_gate.release.notify_one();
+                let expired_row = attempt.await;
+                let replay = replay_decision_pending(&expired_row).unwrap();
+                assert_eq!(
+                    replay.post_boundary.body.terminal.reason,
+                    "paper_stale_before_prepared"
+                );
+                assert_eq!(expired_row.terminal_disposition.as_deref(), Some("no_fill"));
+                assert_eq!(
+                    replay
+                        .post_boundary
+                        .body
+                        .clocks
+                        .iter()
+                        .filter(|clock| clock.purpose == "paper_prepared_staleness_gate")
+                        .collect::<Vec<_>>(),
+                    vec![
+                        &pe_service::decision_replay::DecisionClockEvidence::precise(
+                            "paper_prepared_staleness_gate",
+                            (start + time::Duration::seconds(2) + time::Duration::nanoseconds(1))
+                                .unix_timestamp_nanos()
+                        )
+                        .unwrap()
+                    ]
+                );
+                assert!(scan_paper_log(&h.paper_path).unwrap().iter().all(|frame| !matches!(&frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { payload: pe_service::paper_recovery::FinancialPayload::Fill { operation, .. }, .. }) if operation.source_trade_id == expired_row.source_trade_id
+                )));
+                assert!(replay.post_boundary.body.terminal.final_receipt.is_none());
+                assert_eq!(paper.financial_snapshot(expiry_epoch).unwrap(), before);
+                assert_eq!(h.mutations(), mutations);
+                let ready = paper.dispatch_seed(&seeds[0].dispatch_id).unwrap().unwrap();
+                assert_eq!(ready.state, "ready");
+                assert_eq!(
+                    ready.paper_outcome.as_deref(),
+                    Some("no_fill:paper_stale_before_prepared")
+                );
+                assert_eq!(paper.dispatch_targets(&ready.dispatch_id).unwrap(), targets);
+                assert!(paper.gate_history().unwrap()[&newcomer].contains(
+                    &pe_core_types::MarketId(pe_core_types::VenueMarketId(
+                        expired.condition.0.clone()
+                    ))
+                ));
+                expired_id = Some(expired_row.source_trade_id);
+                h.accounts.store(Default::default());
+            }
+            let resolution_epoch = epoch + if ordinal == 0 { 125 } else { 5 };
+            let resolution = append_source_at(
+                &h.source,
+                "polymarket.clob.market",
+                &bodies.resolution,
+                resolution_epoch,
+            )
+            .await;
+            resolve_golden_trade(
+                &h.control,
+                &h.hooks,
+                &bodies,
+                resolution,
+                shares,
+                credit,
+                resolution_epoch,
+            )
+            .await;
+        }
+        h.deployed_boundary(cutoff + i64::try_from(day + 1).unwrap() * DAY_SECS)
+            .await;
+    }
+    eprintln!("deployed flow sealed; reopening");
+    let paths = (h.paper_path.clone(), h.source_path.clone());
+    let initial = h.initial.clone();
+    let membership = serde_json::to_vec(&h.live.snapshot().entries).unwrap();
+    let history = paper.gate_history().unwrap();
+    let rows = paper.decision_pending_history().unwrap();
+    let financial = paper
+        .financial_snapshot(cutoff + i64::try_from(QUALIFICATION_DAYS).unwrap() * DAY_SECS)
+        .unwrap();
+    let authority = h.authority.clone();
+    h.shutdown().await;
+    drop(paper);
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    let index = SourceReceiptIndex::replay(&paths.1).unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+        0
+    );
+    let before_recovery = std::fs::read(&paths.0).unwrap();
+    let mutations = authority.mutations();
+    for _ in 0..2 {
+        let mut writer = Writer::open(&paths.0).unwrap();
+        assert_eq!(
+            pe_service::supabase_state::reconcile_active_financial_frames(
+                &authority,
+                &paper,
+                &paths.0,
+                pe_service::supabase_state::SourceEvidence::Index(&index),
+                &mut writer,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
+    assert_eq!(authority.mutations(), mutations);
+    assert_eq!(std::fs::read(&paths.0).unwrap(), before_recovery);
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(&paths.1, &paper)
+            .unwrap()
+            .is_empty()
+    );
+    let ledger = pe_service::paper_recovery::build_leader_ledger(&paper).unwrap();
+    let replayed_ledger =
+        pe_service::paper_recovery::replay_wallet_ledger(&paper, newcomer).unwrap();
+    assert_eq!(
+        ledger_capture(&ledger, &paper, newcomer).unwrap().hash,
+        ledger_capture(&replayed_ledger, &paper, newcomer)
+            .unwrap()
+            .hash
+    );
+    let engine = BucketCommitEngine::load(paper.clone(), ledger).unwrap();
+    assert!(engine.history_complete(&newcomer));
+    assert_eq!(paper.gate_history().unwrap(), history);
+    assert_eq!(paper.wallet_history_status(&newcomer).unwrap(), completion);
+    assert_eq!(paper.decision_pending_history().unwrap(), rows);
+    assert_eq!(
+        paper
+            .financial_snapshot(cutoff + i64::try_from(QUALIFICATION_DAYS).unwrap() * DAY_SECS)
+            .unwrap(),
+        financial
+    );
+    let era = paper_era(scan_paper_log(&paths.0).unwrap());
+    let restored = pe_service::paper_recovery::replay_membership(&era, initial, &paths.1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored.watchlist.entries).unwrap(),
+        membership
+    );
+    let seal = era
+        .frames
+        .iter()
+        .find(|frame| {
+            matches!(
+                frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+            )
+        })
+        .unwrap();
+    let output_path = dir.path().join("deployed-qualification.json");
+    let output = run_qualify_cli(
+        &paths.0,
+        &paths.1,
+        &dir.path().join("live_journal.log"),
+        &state_path,
+        seal.receipt,
+        &output_path,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: QualificationReport =
+        serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(
+        report.verdict,
+        QualificationVerdict::Pass,
+        "{:?}",
+        report.reasons
+    );
+    assert!(report.replay.exact);
+    assert_eq!(report.replay.fills, ORIGINAL_COPIES);
+    assert_eq!(report.replay.financial_prepared, ORIGINAL_COPIES * 2);
+    assert_eq!(report.replay.financial_final, ORIGINAL_COPIES * 2);
+    assert_eq!(report.replay.no_fills, 1);
+    assert_eq!(report.replay.membership_changes, 1);
+    assert_eq!(
+        report.evidence.economic_core_hashes,
+        expected
+            .iter()
+            .map(|(_, _, _, hash)| hash.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        expected
+            .iter()
+            .all(|(id, _, _, _)| Some(id) != expired_id.as_ref())
+    );
 }

@@ -3,8 +3,15 @@
 
 #![allow(dead_code)]
 
+use pe_source_core::SourceError;
+use pe_source_polymarket_public::{PageFetcher, ReconciliationFetcher};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
@@ -685,4 +692,99 @@ pub fn install_verified_empty_anchor(
             history_status: None,
         }])
         .unwrap();
+}
+
+// Explicit response barriers shared by the poller and deployed-flow scenarios.
+pub struct RequestedPage {
+    pub url: String,
+    pub respond: PageResponse,
+}
+
+pub struct PageResponse(oneshot::Sender<Result<Vec<u8>, SourceError>>);
+
+impl PageResponse {
+    pub fn send(self, payload: Vec<u8>) -> Result<(), Result<Vec<u8>, SourceError>> {
+        self.0.send(Ok(payload))
+    }
+
+    pub fn fail(self) {
+        self.0
+            .send(Err(SourceError::Transient {
+                message: "injected retryable read failure".to_owned(),
+            }))
+            .unwrap();
+    }
+}
+
+pub struct GatedFetcher {
+    pub requests: mpsc::Sender<RequestedPage>,
+}
+
+impl ReconciliationFetcher for GatedFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let (respond, response) = oneshot::channel();
+            self.requests
+                .send(RequestedPage {
+                    url: url.to_owned(),
+                    respond: PageResponse(respond),
+                })
+                .await
+                .map_err(|_| SourceError::Fatal {
+                    message: "request barrier closed".to_owned(),
+                })?;
+            response.await.map_err(|_| SourceError::Fatal {
+                message: "response barrier closed".to_owned(),
+            })?
+        })
+    }
+}
+
+// The cold portfolio-price barrier used by the final paper freshness scenarios.
+#[derive(Default)]
+pub struct PriceGate {
+    pub blocked: AtomicBool,
+    pub market: Mutex<Option<String>>,
+    pub started: Notify,
+    pub release: Notify,
+}
+#[derive(Clone)]
+pub struct Prices {
+    pub gate: Arc<PriceGate>,
+    pub markets: Arc<Mutex<HashMap<String, Value>>>,
+}
+impl PageFetcher for Prices {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if self
+            .gate
+            .market
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|market| url.contains(&format!("condition_ids={market}")))
+            && self.gate.blocked.swap(false, Ordering::SeqCst)
+        {
+            self.gate.started.notify_one();
+            self.gate.release.notified().await;
+        }
+        let markets = self.markets.lock().unwrap();
+        let rows = url
+            .split(['?', '&'])
+            .filter_map(|part| part.strip_prefix("condition_ids="))
+            .filter_map(|condition| markets.get(condition).cloned())
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_vec(&rows).unwrap())
+    }
+}
+pub struct Page(pub Vec<u8>);
+impl ReconciliationFetcher for Page {
+    fn fetch<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
 }
