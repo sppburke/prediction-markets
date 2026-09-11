@@ -499,14 +499,60 @@ impl Harness {
             .push_back(recorded.admission.clone());
     }
     async fn poll(&self, recorded: &Recorded) {
-        let now = OffsetDateTime::from_unix_timestamp(recorded.epoch).unwrap();
-        let (_trigger, receiver) = mpsc::channel(1);
+        self.poll_source(
+            recorded,
+            None,
+            OffsetDateTime::from_unix_timestamp(recorded.epoch).unwrap(),
+        )
+        .await;
+    }
+    async fn poll_source(
+        &self,
+        recorded: &Recorded,
+        stream_epoch: Option<i64>,
+        now: OffsetDateTime,
+    ) {
+        let (trigger, receiver) = mpsc::channel(1);
+        if let Some(epoch) = stream_epoch {
+            let mut stream: Value = serde_json::from_slice(&recorded.activity).unwrap();
+            let row = &mut stream[0];
+            row["timestamp"] = epoch.into();
+            let payload = serde_json::to_vec(row).unwrap();
+            let observation =
+                pe_source_polymarket_public::parse_activity_trade_observation(&payload).unwrap();
+            let receipt = self
+                .source
+                .append(EnvelopeIn {
+                    source_id: SourceId(
+                        pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned(),
+                    ),
+                    schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                    parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                    observed_at: SourceTimestamp(now),
+                    received_at: ReceivedAt(now),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .await
+                .unwrap();
+            trigger
+                .send(pe_service::activity_ingest::ReconciliationTrigger {
+                    wallet: wallet(),
+                    source_time: observation.source_time.0,
+                    source_trade_id: observation.group_id.key().clone(),
+                    provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
+                    received_at: now,
+                    receipt,
+                })
+                .await
+                .unwrap();
+        }
         let (progress, mut completed) = mpsc::channel(8);
         TradePoller::new(
             TradePollerConfig {
                 base_url: "fixture://activity".to_owned(),
                 poll_interval_secs: 30,
-                activity_ws_enabled: false,
+                activity_ws_enabled: stream_epoch.is_some(),
                 copy_latency_budget_secs: 2,
             },
             watchlist(),
@@ -687,6 +733,307 @@ impl Drop for Harness {
             task.abort();
         }
         self.coordinator.abort();
+    }
+}
+
+fn assert_shared_stale(
+    h: &Harness,
+    recorded: &Recorded,
+    initial_at: OffsetDateTime,
+    dispatch_at: Option<OffsetDateTime>,
+) {
+    let row = h.terminal(recorded);
+    let replayed = replay_decision_pending(&row).unwrap();
+    let body = &replayed.post_boundary.body;
+    assert_eq!(row.state, DecisionPendingState::Terminal);
+    assert_eq!(
+        row.terminal_disposition.as_deref(),
+        Some("no_copy:stale_activity_ws_past_copy_budget")
+    );
+    assert_eq!(body.terminal.reason, "stale_activity_ws_past_copy_budget");
+    assert!(body.terminal.dispatch_id.is_none());
+    assert_eq!(body.authority.kind, "not_read");
+    assert_eq!(body.authority.outcome, "terminal_before_fill_authority");
+    let mut expected = vec![("initial_staleness_gate", initial_at)];
+    if let Some(dispatch_at) = dispatch_at {
+        expected.push(("pre_dispatch_staleness_gate", dispatch_at));
+    }
+    expected.push(("terminal_transition", at()));
+    let clocks = body
+        .clocks
+        .iter()
+        .filter(|clock| clock.purpose != "book_staleness_check")
+        .map(|clock| {
+            assert_eq!(clock.submillisecond_nanos, None);
+            (clock.purpose.as_str(), clock.unix_millis)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        clocks,
+        expected
+            .into_iter()
+            .map(|(purpose, time)| (
+                purpose,
+                i64::try_from(time.unix_timestamp_nanos() / 1_000_000).unwrap()
+            ))
+            .collect::<Vec<_>>()
+    );
+    let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+    let disposition: (String, i64, String, i64) = connection
+        .query_row(
+            "SELECT provenance, age_secs, reason, recorded_at_unix FROM no_copy_dispositions WHERE source_trade_id = ?1",
+            [&recorded.id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        disposition,
+        (
+            "activity_ws".to_owned(),
+            2,
+            "stale_activity_ws_past_copy_budget".to_owned(),
+            dispatch_at.unwrap_or(initial_at).unix_timestamp()
+        )
+    );
+    let seeds: usize = connection
+        .query_row("SELECT count(*) FROM dispatch_seeds", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(seeds, 0);
+    assert_eq!(h.prepared_count(), 0);
+    assert!(h.authority.inner.lock().unwrap().fills.is_empty());
+    assert!(h.paper.list_fills().unwrap().is_empty());
+    assert_eq!(h.paper.bankroll().unwrap(), Some(CASH));
+    assert!(
+        h.paper.gate_history().unwrap()[&wallet()].contains(&pe_core_types::MarketId(
+            pe_core_types::VenueMarketId(recorded.admission.market.condition_id.0.clone())
+        ))
+    );
+}
+
+fn assert_bound_clocks(h: &Harness, recorded: &Recorded, stream_epoch: i64) {
+    let row = h.terminal(recorded);
+    let continuation =
+        pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
+    assert_eq!(continuation.version(), 5);
+    assert_eq!(continuation.facts.source_epoch, recorded.epoch);
+    assert_eq!(
+        continuation
+            .incoming_trade()
+            .unwrap()
+            .observed_at
+            .unix_timestamp(),
+        recorded.epoch
+    );
+    let receipt = continuation.observed_source_receipt.unwrap();
+    let stream = source_envelope(h, receipt);
+    let observation =
+        pe_source_polymarket_public::parse_activity_trade_observation(&stream.payload).unwrap();
+    assert_eq!(observation.source_time.0.unix_timestamp(), stream_epoch);
+    let commitment = source_envelope(h, continuation.read_commitment.unwrap());
+    let commitment: pe_service::bucket_commit::ActivityReadCommitment =
+        serde_json::from_slice(&commitment.payload).unwrap();
+    let bindings = commitment.bindings.unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].stream_receipt, receipt);
+    assert_eq!(bindings[0].history_group_id, recorded.id);
+    assert_eq!(bindings[0].semantic_revision, row.semantic_revision);
+}
+
+/// PASS: a missing authenticated page fails before either shared gate or admission, leaves
+/// the exact open continuation unchanged, and stops boot recovery without financial effects.
+#[tokio::test]
+async fn bound_source_clock_reconstruction_failure_stops_before_admission() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    h.freeze(&recorded, true).await;
+    let open = h.terminal(&recorded);
+    let empty_path = h.dir.path().join("empty-source.log");
+    drop(SourceEventSink::open(&empty_path).unwrap());
+    h.index = SourceReceiptIndex::replay(&empty_path).unwrap();
+    h.attempt(&recorded, at());
+    h.arm();
+    h.start(true);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), h.task.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, Err(pe_service::orchestrator::OrchestratorRunError::PendingRecovery(ref reason))
+        if reason == "paper durability became uncertain while resuming decision_pending")
+    );
+    assert_eq!(h.terminal(&recorded), open);
+    assert_eq!(h.hooks.admission_artifacts.lock().unwrap().len(), 1);
+    assert_eq!(h.hooks.age_clock.lock().unwrap().len(), 3);
+    assert!(h.paper.pending_dispatch_seeds().unwrap().is_empty());
+    assert_eq!(h.prepared_count(), 0);
+    assert!(h.authority.inner.lock().unwrap().fills.is_empty());
+}
+
+/// PASS: an earlier bound stream clock expires shared admission after a held price GET,
+/// both immediately after bucket commit and after restarting that open continuation.
+#[tokio::test]
+async fn bound_source_clock_expires_shared_dispatch_on_first_pass_and_restart() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(2).await; // history T+1, stream T
+        let initial_at = at() + time::Duration::milliseconds(1500);
+        let dispatch_at = at() + time::Duration::milliseconds(2500);
+        h.arm();
+        h.hooks.age_clock.lock().unwrap().push_back(initial_at);
+        h.hooks
+            .admission_artifacts
+            .lock()
+            .unwrap()
+            .push_back(recorded.admission.clone());
+        *h.prices.gate.market.lock().unwrap() =
+            Some(recorded.admission.market.condition_id.0.clone());
+        h.prices.gate.blocked.store(true, Ordering::SeqCst);
+        let gate = h.prices.gate.clone();
+        h.start(true);
+        {
+            let pending = h.poll_source(&recorded, Some(EPOCH), initial_at);
+            tokio::pin!(pending);
+            tokio::select! {
+                _ = gate.started.notified() => {},
+                _ = &mut pending => panic!("decision completed before price barrier"),
+            }
+            assert_bound_clocks(&h, &recorded, EPOCH);
+            assert_eq!(h.terminal(&recorded).state, DecisionPendingState::Open);
+            assert_eq!(h.prepared_count(), 0);
+            if !restart {
+                h.hooks.age_clock.lock().unwrap().push_back(dispatch_at);
+                gate.release.notify_one();
+                pending.await;
+            }
+        }
+        if restart {
+            h.stop().await;
+            h.index = SourceReceiptIndex::replay(&h.dir.path().join("source.log")).unwrap();
+            h.hooks.age_clock.lock().unwrap().push_back(initial_at);
+            h.hooks
+                .admission_artifacts
+                .lock()
+                .unwrap()
+                .push_back(recorded.admission.clone());
+            gate.blocked.store(true, Ordering::SeqCst);
+            h.start(false); // The committed generation-five policy remains enabled.
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
+                .await
+                .unwrap();
+            h.hooks.age_clock.lock().unwrap().push_back(dispatch_at);
+            gate.release.notify_one();
+            h.boot_barrier().await;
+        }
+        assert_shared_stale(&h, &recorded, initial_at, Some(dispatch_at));
+    }
+}
+
+/// PASS: initial admission uses the authenticated stream clock before consuming an admission
+/// artifact, with no dispatch seed, Prepared, or authority call.
+#[tokio::test]
+async fn bound_source_clock_expires_initial_shared_gate() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(2).await;
+    let initial_at = at() + time::Duration::milliseconds(2500);
+    h.arm();
+    h.hooks.age_clock.lock().unwrap().push_back(initial_at);
+    h.hooks
+        .admission_artifacts
+        .lock()
+        .unwrap()
+        .push_back(recorded.admission.clone());
+    h.start(true);
+    h.poll_source(
+        &recorded,
+        Some(EPOCH),
+        at() + time::Duration::milliseconds(1500),
+    )
+    .await;
+    assert_bound_clocks(&h, &recorded, EPOCH);
+    assert_shared_stale(&h, &recorded, initial_at, None);
+    assert_eq!(h.hooks.admission_artifacts.lock().unwrap().len(), 1);
+}
+
+/// PASS: either direction of the source-second correction admits exactly at the earliest
+/// source deadline and refuses at deadline +1 ns; accepted operation identity stays historical.
+#[tokio::test]
+async fn bound_source_clock_shared_gate_exact_boundary_in_both_directions() {
+    for initial_gate in [false, true] {
+        for history_later in [false, true] {
+            for expired in [false, true] {
+                let mut h = Harness::new().await;
+                let recorded = h.record(if history_later { 2 } else { 1 }).await;
+                let stream_epoch = if history_later { EPOCH } else { EPOCH + 1 };
+                let reconciled_at = at() + time::Duration::milliseconds(1500);
+                let deadline = at() + time::Duration::seconds(2);
+                let dispatch_at = deadline + time::Duration::nanoseconds(i64::from(expired));
+                let initial_at = if initial_gate {
+                    dispatch_at
+                } else {
+                    reconciled_at
+                };
+                h.arm();
+                h.hooks
+                    .age_clock
+                    .lock()
+                    .unwrap()
+                    .extend([initial_at, dispatch_at, dispatch_at]);
+                h.hooks
+                    .admission_artifacts
+                    .lock()
+                    .unwrap()
+                    .push_back(recorded.admission.clone());
+                h.start(true);
+                h.poll_source(&recorded, Some(stream_epoch), reconciled_at)
+                    .await;
+                assert_bound_clocks(&h, &recorded, stream_epoch);
+                if expired {
+                    assert_shared_stale(
+                        &h,
+                        &recorded,
+                        initial_at,
+                        (!initial_gate).then_some(dispatch_at),
+                    );
+                } else {
+                    let row = h.terminal(&recorded);
+                    let replayed = replay_decision_pending(&row).unwrap();
+                    assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+                    assert_eq!(h.prepared_count(), 1);
+                    assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
+                    assert_eq!(h.paper.list_fills().unwrap().len(), 1);
+                    let frames = scan_paper_log(&h.dir.path().join("paper.log")).unwrap();
+                    let operation_epoch = frames
+                        .iter()
+                        .find_map(|frame| match &frame.frame {
+                            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                                payload:
+                                    pe_service::paper_recovery::FinancialPayload::Fill {
+                                        operation, ..
+                                    },
+                                ..
+                            }) => Some(operation.observed_at_bucket),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(operation_epoch, recorded.epoch);
+                    let clock = replayed
+                        .post_boundary
+                        .body
+                        .clocks
+                        .iter()
+                        .find(|clock| clock.purpose == "paper_prepared_staleness_gate")
+                        .unwrap();
+                    assert_eq!(
+                        *clock,
+                        DecisionClockEvidence::precise(
+                            "paper_prepared_staleness_gate",
+                            deadline.unix_timestamp_nanos()
+                        )
+                        .unwrap()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1869,22 +2216,25 @@ impl Harness {
     }
 }
 
-/// PASS: three real GETs overlap and complete compact/long/Gamma; the resulting named receipts
-/// flow through the orchestrator's financial fill and exact sealed qualification replay.
-#[tokio::test]
-async fn reverse_completion_admission_executes_and_qualifies_exactly() {
-    let mut h = Harness::new().await;
-    let recorded = h.record(1).await;
+async fn hold_admission_responses(
+    h: &mut Harness,
+    recorded: &Recorded,
+    source: SourceLogHandle,
+) -> (
+    Arc<AdmissionResponses>,
+    mpsc::Receiver<usize>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let (started, mut requests) = mpsc::channel(3);
+    let (started, requests) = mpsc::channel(3);
     let responses = Arc::new(AdmissionResponses {
         bodies: [
             recorded.admission.receipts.gamma,
             recorded.admission.receipts.clob_long,
             recorded.admission.receipts.clob_compact,
         ]
-        .map(|receipt| source_envelope(&h, receipt).payload),
+        .map(|receipt| source_envelope(h, receipt).payload),
         started,
         release: std::array::from_fn(|_| tokio::sync::Semaphore::new(0)),
     });
@@ -1895,9 +2245,60 @@ async fn reverse_completion_admission_executes_and_qualifies_exactly() {
         axum::serve(listener, router).await.unwrap();
     });
     h.admission_builder = Some(
-        LiveAdmissionBuilder::new(reqwest::Client::new(), &base, &base, h.source.clone())
+        LiveAdmissionBuilder::new(reqwest::Client::new(), &base, &base, source)
             .with_clock(Arc::new(at)),
     );
+    (responses, requests, server)
+}
+
+/// PASS: a real admission GET held from T+1.5 to T+2.5 cannot stage a live target when
+/// history T+1 is bound to stream T, and the terminal retains the shared stale clocks.
+#[tokio::test]
+async fn bound_source_clock_held_admission_get_expires_shared_dispatch() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(2).await;
+    let source = h.source.clone();
+    let (responses, mut requests, server) =
+        hold_admission_responses(&mut h, &recorded, source).await;
+    let initial_at = at() + time::Duration::milliseconds(1500);
+    let dispatch_at = at() + time::Duration::milliseconds(2500);
+    h.arm();
+    h.hooks.age_clock.lock().unwrap().push_back(initial_at);
+    h.start(true);
+    {
+        let pending = h.poll_source(&recorded, Some(EPOCH), initial_at);
+        tokio::pin!(pending);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            tokio::select! {
+                request = requests.recv() => { seen.insert(request.unwrap()); },
+                _ = &mut pending => panic!("decision completed before admission barrier"),
+            }
+        }
+        assert_eq!(seen, std::collections::BTreeSet::from([0, 1, 2]));
+        assert_bound_clocks(&h, &recorded, EPOCH);
+        assert_eq!(h.prepared_count(), 0);
+        assert!(h.paper.pending_dispatch_seeds().unwrap().is_empty());
+        h.hooks.age_clock.lock().unwrap().push_back(dispatch_at);
+        for release in &responses.release {
+            release.add_permits(1);
+        }
+        pending.await;
+    }
+    server.abort();
+    let _ = server.await;
+    assert_shared_stale(&h, &recorded, initial_at, Some(dispatch_at));
+}
+
+/// PASS: three real GETs overlap and complete compact/long/Gamma; the resulting named receipts
+/// flow through the orchestrator's financial fill and exact sealed qualification replay.
+#[tokio::test]
+async fn reverse_completion_admission_executes_and_qualifies_exactly() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    let (admission_source, mut captures) = SourceLogHandle::channel(3);
+    let (responses, mut requests, server) =
+        hold_admission_responses(&mut h, &recorded, admission_source).await;
     h.hooks.age_clock.lock().unwrap().extend([at(); 3]);
     assert!(h.hooks.admission_artifacts.lock().unwrap().is_empty());
     h.start(true);
@@ -1913,30 +2314,25 @@ async fn reverse_completion_admission_executes_and_qualifies_exactly() {
         }
         assert_eq!(seen, std::collections::BTreeSet::from([0, 1, 2]));
         let mut receipts = Vec::new();
-        let mut next = EventSeq(0);
-        while h.index.receipt_at(next).unwrap().is_some() {
-            next.0 += 1;
-        }
         for (request, source) in [
             (2, "polymarket.clob.compact-market"),
             (1, "polymarket.clob.markets"),
             (0, "polymarket.gamma.markets"),
         ] {
             responses.release[request].add_permits(1);
-            let receipt = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if let Some((receipt, _)) = h.index.receipt_at(next).unwrap() {
-                        break receipt;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .unwrap();
-            let envelope = source_envelope(&h, receipt);
+            let (envelope, acknowledged) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), captures.recv_for_test())
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!(envelope.source_id.0, source);
             assert_eq!(envelope.payload, responses.bodies[request]);
-            next.0 += 1;
+            let receipt = h.source.append(envelope).await.unwrap();
+            assert_eq!(
+                source_envelope(&h, receipt).payload,
+                responses.bodies[request]
+            );
+            acknowledged.send(receipt).unwrap();
             receipts.push(receipt);
         }
         pending.await;

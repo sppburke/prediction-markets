@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
-use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3};
+use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3, PaperFreshnessPolicy};
 use crate::clob_book::ClobBookFetcher;
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
@@ -799,7 +799,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         trade: &IncomingTrade,
         economic: pe_execution_core::EconomicPrepared,
         dispatch_id: Option<&str>,
-        continuation: Option<&DecisionContinuationV3>,
+        paper_freshness: Option<&(PaperFreshnessPolicy, SourceTimestamp)>,
         evidence: &mut Option<DecisionEvidenceAccumulator>,
     ) -> Result<ActiveFinancialFill, String> {
         if economic.market.outcome_index > 1 {
@@ -854,23 +854,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             },
             economic,
         };
-        if let Some(continuation) = continuation.filter(|continuation| continuation.version() == 5)
-        {
-            let policy = continuation
-                .facts
-                .paper_freshness_policy
-                .ok_or_else(|| "paper freshness policy is missing".to_owned())?;
-            let source_receipts = self
-                .source_receipts
-                .as_ref()
-                .ok_or_else(|| "paper source receipt index is missing".to_owned())?;
-            let source_time = continuation
-                .verified_source_time(&mut |receipt| {
-                    source_receipts
-                        .source_envelope(receipt)
-                        .map(crate::bucket_commit::CompleteActivityPage::from)
-                })
-                .map_err(|error| error.to_string())?;
+        if let Some((policy, source_time)) = paper_freshness {
             let admission_at = self.admission_now();
             let evidence = evidence
                 .as_mut()
@@ -878,7 +862,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             evidence
                 .record_precise_clock("paper_prepared_staleness_gate", admission_at)
                 .map_err(|error| error.to_string())?;
-            if policy.expired(source_time, admission_at) {
+            if policy.expired(source_time.clone(), admission_at) {
                 return Ok(ActiveFinancialFill::Expired);
             }
             evidence.record_clock("paper_dispatch", unix_millis(admission_at));
@@ -2439,6 +2423,39 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             },
             None => None,
         };
+        // Authenticate once for every generation-five attempt, including the first resume
+        // immediately after bucket commit. Keep the history epoch on the trade for identity.
+        let paper_freshness = pending
+            .as_ref()
+            .and_then(|continuation| {
+                continuation
+                    .facts
+                    .paper_freshness_policy
+                    .map(|policy| (continuation, policy))
+            })
+            .map(|(continuation, policy)| {
+                let source_receipts = self
+                    .source_receipts
+                    .as_ref()
+                    .ok_or_else(|| "paper source receipt index is missing".to_owned())?;
+                continuation
+                    .verified_source_time(&mut |receipt| {
+                        source_receipts
+                            .source_envelope(receipt)
+                            .map(crate::bucket_commit::CompleteActivityPage::from)
+                    })
+                    .map(|source_time| (policy, source_time))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose();
+        let paper_freshness = match paper_freshness {
+            Ok(freshness) => freshness,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "authenticate paper source clock failed; stopping producer intake");
+                self.intake_stopped = true;
+                return;
+            }
+        };
         let mut decision_evidence = pending
             .as_ref()
             .map(|continuation| DecisionEvidenceAccumulator::new(&continuation.facts));
@@ -2737,7 +2754,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             record_clock(&mut decision_evidence, "initial_staleness_gate", stale_at);
             if !already_staged
                 && let Some(disposition) =
-                    self.continuation_stale_no_copy(&trade, stale_at, pending.as_ref())
+                    self.continuation_stale_no_copy(&trade, stale_at, paper_freshness.as_ref())
             {
                 self.commit_no_copy_or_rollback(
                     &trade,
@@ -3132,7 +3149,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // paper-only freshness outcome belongs to the final Prepared boundary on resume.
         if !already_staged
             && let Some(disposition) =
-                self.continuation_stale_no_copy(&trade, dispatch_stale_at, pending.as_ref())
+                self.continuation_stale_no_copy(&trade, dispatch_stale_at, paper_freshness.as_ref())
         {
             self.commit_no_copy_or_rollback(
                 &trade,
@@ -3338,7 +3355,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         &trade,
                         economic,
                         dispatch_id.as_deref(),
-                        pending.as_ref(),
+                        paper_freshness.as_ref(),
                         &mut decision_evidence,
                     )
                     .await
@@ -3702,14 +3719,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         &self,
         trade: &IncomingTrade,
         now: OffsetDateTime,
-        continuation: Option<&DecisionContinuationV3>,
+        paper_freshness: Option<&(PaperFreshnessPolicy, SourceTimestamp)>,
     ) -> Option<pe_paper_state::NoCopyDisposition> {
-        let Some(policy) =
-            continuation.and_then(|continuation| continuation.facts.paper_freshness_policy)
-        else {
+        let Some((policy, source_time)) = paper_freshness else {
             return self.stale_no_copy(trade, now);
         };
-        if !policy.expired(SourceTimestamp(trade.observed_at), now) {
+        if !policy.expired(source_time.clone(), now) {
             return None;
         }
         let (provenance, reason) = match trade.provenance {
@@ -3718,7 +3733,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         };
         Some(pe_paper_state::NoCopyDisposition {
             provenance: provenance.to_owned(),
-            age_secs: (now - trade.observed_at).whole_seconds(),
+            age_secs: (now - source_time.0).whole_seconds(),
             reason: reason.to_owned(),
             recorded_at_unix: now.unix_timestamp(),
         })
