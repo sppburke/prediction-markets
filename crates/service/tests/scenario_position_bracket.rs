@@ -25,7 +25,8 @@ use pe_service::source_event_sink::SourceEventSink;
 use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer, AnchorRefreshOutcome};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityReadError, ActivityTransport, GAMMA_BATCH_SIZE,
+    ActivityIdentityError, ActivityParseContext, ActivityParseError, ActivityReadError,
+    ActivityTransport, ActivityValidationError, ActivityWindowInvalidation, GAMMA_BATCH_SIZE,
     GAMMA_MARKETS_SOURCE_ID, PageFetcher, PolymarketEndpoint, PositionPartition, PositionReadError,
     ReconciliationFetcher, aggregate_activity_rows, parse_activity_response,
 };
@@ -2418,6 +2419,17 @@ fn deferred_position_predicate_is_exact() {
                 offset: 3_000,
             },
         },
+        // Issue #594: the observed venue row (price 3.1968021978) defers only that wallet.
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                row_index: 419,
+                source: ActivityValidationError::InvalidPrice {
+                    value: rust_decimal::Decimal::from_str_exact("3.1968021978").unwrap(),
+                    reason: "Price value out of range".to_owned(),
+                },
+            }),
+        },
         CausalPositionError::Activity {
             wallet,
             source: ActivityReadError::Fetch {
@@ -2511,6 +2523,39 @@ fn deferred_position_predicate_is_exact() {
                     message: "fatal".to_owned(),
                 },
             },
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Parse(ActivityParseError::Json {
+                message: "truncated".to_owned(),
+            }),
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Parse(ActivityParseError::WindowInvalidated(
+                ActivityWindowInvalidation::MissingWallet { row_index: 0 },
+            )),
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                row_index: 1,
+                source: ActivityValidationError::InvalidActivityType {
+                    value: "MYSTERY".to_owned(),
+                },
+            }),
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Aggregate(
+                pe_source_polymarket_public::activity::ActivityAggregationError::Identity(
+                    ActivityIdentityError::ComponentTooLong,
+                ),
+            ),
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Identity(ActivityIdentityError::ComponentTooLong),
         },
         CausalPositionError::Positions {
             wallet,
@@ -2652,4 +2697,63 @@ async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
     assert!(paper.is_wallet_fenced(&fenced_wallet).unwrap());
     assert!(paper.position_validation(&fenced_wallet).unwrap().is_none());
     assert!(paper.position_validation(&healthy).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn unparseable_venue_row_defers_only_that_wallet_at_boot() {
+    // Issue #594: rehearsal attempt 9 aborted the whole boot on one wallet's venue TRADE row with
+    // price 3.1968021978. Boot leaves that wallet unvalidated and anchors the others.
+    let healthy = wallet(0x74);
+    let corrupt = wallet(0x75);
+    let (_dir, paper, mut engine) = fresh(&[healthy, corrupt]);
+    let mut responses = stable_responses(&[(healthy, 1, "1.000000"), (corrupt, 2, "1.000000")]);
+    let mut row = activity(corrupt, 2, "0.91", "0xcorrupt", 10);
+    row["side"] = json!("SELL");
+    row["price"] = json!("3.1968021978");
+    row["usdcSize"] = json!("2.909090");
+    let page = serde_json::to_vec(&vec![row]).unwrap();
+    responses.insert(
+        activity_url(corrupt),
+        vec![page.clone(), page.clone(), page],
+    );
+
+    let installs = validator(responses)
+        .validate_direct(&[healthy, corrupt], &mut engine, &paper)
+        .await
+        .unwrap();
+
+    assert_eq!(installs.len(), 1);
+    assert_eq!(installs[0].wallet, healthy);
+    assert!(paper.position_validation(&healthy).unwrap().is_some());
+    assert!(paper.position_validation(&corrupt).unwrap().is_none());
+    assert!(paper.position_anchors(&corrupt).unwrap().is_empty());
+    assert!(!paper.is_wallet_fenced(&corrupt).unwrap());
+}
+
+#[tokio::test]
+async fn periodic_refresh_defers_a_wallet_with_an_unparseable_venue_row() {
+    // Issue #594: once such a wallet is live, the hourly anchor refresh must report `Deferred`
+    // instead of surfacing an error that would end the poll round.
+    let wallet = wallet(0x77);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let mut responses = stable_responses(&[(wallet, 1, "1.000000")]);
+    let mut row = activity(wallet, 1, "0.91", "0xcorrupt", 10);
+    row["side"] = json!("SELL");
+    row["price"] = json!("3.1968021978");
+    row["usdcSize"] = json!("2.909090");
+    let page = serde_json::to_vec(&vec![row]).unwrap();
+    responses.insert(activity_url(wallet), vec![page.clone(), page.clone(), page]);
+    let preparer =
+        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
+
+    assert_eq!(
+        preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+        AnchorRefreshOutcome::Deferred
+    );
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    drop(preparer);
+    actor.await.unwrap();
 }
