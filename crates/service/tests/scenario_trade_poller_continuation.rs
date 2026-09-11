@@ -929,7 +929,8 @@ fn start_recorded_poller_with_anchors(
             wallet(),
             real_rx,
             support::continuation_hooks(EPOCH),
-        );
+        )
+        .with_source_receipt_index(receipts.clone());
         tokio::spawn(orchestrator.run(std::future::pending::<()>()))
     });
     let control = tokio::spawn(async move {

@@ -1401,7 +1401,8 @@ async fn main() -> Result<()> {
         supabase_state.clone(),
         book_fetcher,
     )
-    .context("build orchestrator")?;
+    .context("build orchestrator")?
+    .with_source_receipt_index(source_receipts.clone());
     if financial_start.is_some() {
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),

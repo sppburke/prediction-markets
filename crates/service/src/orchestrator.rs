@@ -1682,6 +1682,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         })
     }
 
+    /// Share the process source receipt index. Every generation-5 attempt authenticates its
+    /// earliest bound source time through it before the shared admission gates, in every
+    /// financial posture; the Start-bound protocol installs the same index again with its logs.
+    #[must_use]
+    pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
+        self.source_receipts = Some(source_receipts);
+        self
+    }
+
     /// Install the verified log pair used by the Start-bound financial protocol.
     pub fn configure_financial_log_paths(
         &mut self,
