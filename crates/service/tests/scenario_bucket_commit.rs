@@ -2582,47 +2582,14 @@ fn online_snapshot_does_not_cover_later_continuation() {
 /// PASS: newer invalid evidence fails before owner construction; all pending state stays unchanged.
 #[tokio::test]
 async fn post_snapshot_invalid_continuation_blocks_boot_resume() {
-    let (dir, paper, mut engine) = fresh_anchored();
-    let (read, receipt) = committed_source_read(
-        &dir,
-        &[position_row(
-            "TRADE",
-            "0xboot-captured",
-            MARKET_A,
-            0,
-            "BUY",
-            "2",
-            "0.4",
-            910,
-        )],
+    let (dir, paper, engine) = fresh();
+    drop(engine);
+    let (state, source, id) = support::post_snapshot_invalid_continuation(
+        &paper,
+        &dir.path().join("paper.db"),
+        &dir.path().join("source.log"),
+        wallet(),
     );
-    commit_open_source_read(&mut engine, &read, receipt, HashMap::new());
-    let (state, source) = online_census_copy(&dir);
-    let (later, receipt) = committed_source_read(
-        &dir,
-        &[position_row(
-            "TRADE",
-            "0xboot-newer",
-            MARKET_B,
-            0,
-            "BUY",
-            "3",
-            "0.6",
-            911,
-        )],
-    );
-    commit_open_source_read(&mut engine, &later, receipt, HashMap::new());
-    let id = later.aggregates[0].group_id.key();
-    let row = paper.decision_pending_for(id).unwrap().unwrap();
-    let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
-    frozen["price"] = json!("0.7");
-    rusqlite::Connection::open(dir.path().join("paper.db"))
-        .unwrap()
-        .execute(
-            "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
-            rusqlite::params![frozen.to_string(), id.0],
-        )
-        .unwrap();
     let pending = paper.open_decision_pending().unwrap();
     let positions = paper.leader_positions().unwrap();
     let history = paper.gate_history().unwrap();
@@ -2638,7 +2605,6 @@ async fn post_snapshot_invalid_continuation_blocks_boot_resume() {
         String::from_utf8(offline.stdout).unwrap(),
         "open_rows=1 validated=1\n"
     );
-    drop(engine);
     let hooks = support::continuation_hooks(920);
     let paper_path = dir.path().join("paper.log");
     drop(pe_event_log::Writer::open(&paper_path).unwrap());
@@ -2660,7 +2626,7 @@ async fn post_snapshot_invalid_continuation_blocks_boot_resume() {
         Ok::<_, pe_service::bucket_commit::ContinuationValidationError>(count)
     }
     .await;
-    assert_eq!(result.unwrap_err().source_trade_id.as_ref(), Some(id));
+    assert_eq!(result.unwrap_err().source_trade_id.as_ref(), Some(&id));
     assert_eq!(resumes, 0);
     assert_eq!(paper.open_decision_pending().unwrap(), pending);
     assert_eq!(paper.leader_positions().unwrap(), positions);

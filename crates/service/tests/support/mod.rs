@@ -230,6 +230,103 @@ pub fn append_committed_read_v2(
     (read, commitment)
 }
 
+/// Capture one valid continuation, then alter the price of a newer continuation outside the copy.
+pub fn post_snapshot_invalid_continuation(
+    paper: &Arc<pe_paper_state::PaperStateDb>,
+    state_path: &std::path::Path,
+    source_path: &std::path::Path,
+    wallet: WalletAddress,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    pe_core_types::SourceTradeId,
+) {
+    install_verified_empty_anchor(paper, wallet, 0);
+    paper
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet,
+            complete: true,
+            proof_json: "{\"fixed_end_walk\":\"complete\"}".to_owned(),
+            updated_at_unix: 900,
+        })
+        .unwrap();
+    let mut engine = pe_service::bucket_commit::BucketCommitEngine::load(
+        paper.clone(),
+        pe_service::paper_recovery::build_leader_ledger(paper).unwrap(),
+    )
+    .unwrap();
+    let snapshot_state = state_path.with_file_name("snapshot.db");
+    let snapshot_source = source_path.with_file_name("snapshot-source.log");
+    let connection = rusqlite::Connection::open(state_path).unwrap();
+    let mut newer_id = None;
+    for (epoch, market, size, price) in [
+        (910, "0xcondition-a", "2", "0.4"),
+        (911, "0xcondition-b", "3", "0.6"),
+    ] {
+        let payload = serde_json::to_vec(&serde_json::json!([{
+            "proxyWallet": wallet, "timestamp": epoch, "conditionId": market,
+            "type": "TRADE", "size": size, "usdcSize": "999999.000000",
+            "transactionHash": format!("0xboot-{epoch}"), "price": price,
+            "asset": "asset-0", "side": "BUY", "outcomeIndex": 0,
+            "outcome": "Yes", "isCombo": false,
+        }]))
+        .unwrap();
+        let mut writer = Writer::open(source_path).unwrap();
+        let (read, receipt) =
+            append_committed_read_v2(&mut writer, wallet, &payload, epoch + 10, epoch + 11);
+        drop(writer);
+        let context = read_context(&read, receipt, epoch + 20);
+        let committed = engine
+            .commit_with_freshness_policy(
+                read.aggregates,
+                &context,
+                pe_service::bucket_commit::FrozenDecisionBasis {
+                    win_rate_p: pe_core_types::Probability::ZERO,
+                    bankroll: rust_decimal::Decimal::ZERO,
+                },
+                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                    activity_ws_enabled: true,
+                    copy_latency_budget_secs: 2,
+                }),
+            )
+            .unwrap();
+        assert_eq!(committed.pending.len(), 1);
+        let id = committed.pending[0].clone();
+        let row = paper.decision_pending_for(&id).unwrap().unwrap();
+        assert_eq!(
+            pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row)
+                .unwrap()
+                .version(),
+            5
+        );
+        let index = pe_service::risk_inputs::SourceReceiptIndex::replay(source_path).unwrap();
+        assert_eq!(
+            pe_service::bucket_commit::validate_open_continuations(paper, &index).unwrap(),
+            if epoch == 910 { 1 } else { 2 }
+        );
+        if epoch == 910 {
+            connection
+                .execute("VACUUM INTO ?1", [snapshot_state.to_str().unwrap()])
+                .unwrap();
+            std::fs::copy(source_path, &snapshot_source).unwrap();
+        } else {
+            let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+            frozen["price"] = serde_json::json!("0.7");
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                        rusqlite::params![frozen.to_string(), id.0],
+                    )
+                    .unwrap(),
+                1
+            );
+            newer_id = Some(id);
+        }
+    }
+    (snapshot_state, snapshot_source, newer_id.unwrap())
+}
+
 pub fn install_empty_anchor(
     paper_state: &pe_paper_state::PaperStateDb,
     wallet: pe_core_types::WalletAddress,

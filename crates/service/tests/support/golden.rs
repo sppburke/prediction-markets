@@ -2885,6 +2885,7 @@ pub(crate) struct BracketFinancialHarness {
     hooks: Arc<ScenarioHooks>,
     books: Arc<GoldenBookFetcher>,
     authority: GoldenAuthority,
+    terminal_at: OffsetDateTime,
     actor: tokio::task::JoinHandle<()>,
     coordinator: tokio::task::JoinHandle<()>,
     _triggers: mpsc::Receiver<pe_service::activity_ingest::ReconciliationTrigger>,
@@ -3050,7 +3051,19 @@ impl BracketFinancialHarness {
                 receipts.clone(),
             )
             .unwrap();
-        let actor = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+        // One fixed terminal instant at the end of the recorded financial window; the short
+        // bracket cases use their existing financial clock. Admission/Prepared clocks remain
+        // independently controlled by each attempt's hooks.
+        let terminal_at = OffsetDateTime::from_unix_timestamp(if deployed {
+            start_unix + 1 + i64::try_from(QUALIFICATION_DAYS).unwrap() * DAY_SECS
+        } else {
+            100
+        })
+        .unwrap();
+        let actor = tokio::spawn(
+            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+                .scope(terminal_at, orchestrator.run(std::future::pending::<()>())),
+        );
         Self {
             control,
             source,
@@ -3066,6 +3079,7 @@ impl BracketFinancialHarness {
             hooks,
             books,
             authority,
+            terminal_at,
             actor,
             coordinator,
             _triggers: trigger_rx,
@@ -3563,6 +3577,21 @@ impl BracketFinancialHarness {
         assert_eq!(row.state, pe_paper_state::DecisionPendingState::Terminal);
         let replay = replay_decision_pending(&row).unwrap();
         assert_eq!(replay.continuation.version(), 5);
+        assert_eq!(row.updated_at_unix, self.terminal_at.unix_timestamp());
+        assert_eq!(
+            replay
+                .post_boundary
+                .body
+                .clocks
+                .iter()
+                .filter(|clock| clock.purpose == "terminal_transition")
+                .collect::<Vec<_>>(),
+            vec![&pe_service::decision_replay::DecisionClockEvidence {
+                purpose: "terminal_transition".to_owned(),
+                unix_millis: self.terminal_at.unix_timestamp() * 1_000,
+                submillisecond_nanos: None,
+            }]
+        );
         assert_eq!(
             replay.continuation.facts.provenance,
             TradeProvenance::ActivityWs
@@ -3612,7 +3641,28 @@ impl BracketFinancialHarness {
     }
 }
 
-/// One real deployed path with fresh/corrected fills, a cold-portfolio expiry, restart, and sealed Pass.
+/// Composed recorded-policy proof: runtime full-history bracket validation/publication, stream
+/// observation through the real two-slot poller, orchestrator gates, fresh/corrected paper fills,
+/// cold-portfolio expiry with staged-target release, completed-state restart, and sealed CLI replay.
+/// Uses the golden corpus's 2030 end dates, disabled min/max resolution horizons, impact cap 300,
+/// and recorded admission artifacts queued through scenario hooks. The poller has no admission
+/// preparer; runtime bracket preparation completes separately before polling. No fanout consumer
+/// runs: dispatch proof ends at durable readiness with the stored target unchanged.
+///
+/// Related `scenario_execution_gates` fixtures run before Start with horizons disabled and zero
+/// book requests in the mandatory-cap case; they do not prove unchanged-policy horizon/impact
+/// admission. Pure horizon boundaries have `orchestrator::tests::{rejects_too_far_out,
+/// rejects_too_soon, bounds_are_inclusive_at_edges}` coverage. Real `LiveAdmissionBuilder` over
+/// mocked HTTP is covered by `scenario_paper_prepared_freshness`'s
+/// `reverse_completion_admission_executes_and_qualifies_exactly` and `scenario_boot_order`'s
+/// `staged_recovery_records_admission_before_observation_producers_start`; released-target
+/// consumption by `live_fanout::tests::ordered_execution_is_primary_first_and_next_waits_for_terminal`.
+/// A naturally eligible production opportunity remains operator acceptance under issue #588 and
+/// the identifier-bound check in `docs/35-PE-SERVICE-DEPLOY-RUNBOOK.md`, step 6.
+///
+/// Terminal clocks are fixed and asserted for fills and expiry. Equality is same-run replay:
+/// `AdmissionPreparer::record_artifact` still stamps membership source envelopes with wall time,
+/// so source receipts, membership bindings and sealed digests are not cross-run byte fixtures.
 pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
     use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir().unwrap();

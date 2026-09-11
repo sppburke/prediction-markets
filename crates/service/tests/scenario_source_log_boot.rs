@@ -905,7 +905,7 @@ fn installed_boot_binding_requires_its_durable_target() {
 
 /// Exercise the actual binary, including migration-selected state, rather than assembling its
 /// selection helpers in the test. The server advances the batch when it returns the marker.
-async fn pre_start_boot_membership_case(empty: bool) {
+async fn pre_start_boot_membership_case(case: PreStartBootCase) {
     use axum::{Json, Router, extract::State, http::Uri, routing::get};
     use std::sync::{
         Mutex,
@@ -1019,7 +1019,7 @@ async fn pre_start_boot_membership_case(empty: bool) {
             [fenced.to_string()],
         )
         .unwrap();
-    if empty {
+    if matches!(case, PreStartBootCase::Empty) {
         active.execute("INSERT INTO wallet_fences VALUES (?1, 'active-selected', 'invalid_mapping', '{}', 1)", [selected.to_string()]).unwrap();
     }
     drop(active);
@@ -1032,7 +1032,9 @@ async fn pre_start_boot_membership_case(empty: bool) {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = Router::new().fallback(get(respond)).with_state(source);
+    let router = Router::new()
+        .fallback(get(respond))
+        .with_state(source.clone());
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -1043,6 +1045,7 @@ async fn pre_start_boot_membership_case(empty: bool) {
             .unwrap();
     });
     let cfg = pe_service::config::ServiceConfig {
+        bind: "127.0.0.1:0".to_owned(),
         paper_state_db_path: paths.fixed_main.clone(),
         source_event_log_path: paths.source_log.clone(),
         event_log_path: paths.paper_log.clone(),
@@ -1061,24 +1064,11 @@ async fn pre_start_boot_membership_case(empty: bool) {
     };
     let config_path = dir.path().join("service.toml");
     std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
-    let cwd = dir.path().to_owned();
-    let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"))
-            .env_clear()
-            .current_dir(cwd)
-            .arg(config_path)
-            .arg("--exit-after-anchors")
-            .output()
-            .unwrap()
-    })
-    .await
-    .unwrap();
-    stop.send(()).unwrap();
-    server.await.unwrap();
+    let output = boot_binary(&config_path, true).await;
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let requests = requests.lock().unwrap();
+    let boot_requests = requests.lock().unwrap().clone();
     assert_eq!(
-        requests
+        boot_requests
             .iter()
             .filter(|uri| uri.path() == "/rest/v1/ranking_batches")
             .count(),
@@ -1086,18 +1076,18 @@ async fn pre_start_boot_membership_case(empty: bool) {
         "{stderr}"
     );
     assert_eq!(
-        requests
+        boot_requests
             .iter()
             .filter(|uri| uri.path() == "/rest/v1/ranking_entries")
             .count(),
         1,
         "{stderr}"
     );
-    let brackets = requests
+    let brackets = boot_requests
         .iter()
         .filter(|uri| uri.path() == "/activity")
         .collect::<Vec<_>>();
-    if empty {
+    if matches!(case, PreStartBootCase::Empty) {
         assert!(!output.status.success());
         assert!(
             stderr.contains("no wallets eligible after durable fence/history/acceptance filtering"),
@@ -1118,14 +1108,174 @@ async fn pre_start_boot_membership_case(empty: bool) {
         assert!(paper.is_wallet_fenced(&fenced).unwrap());
         assert!(!paper.is_wallet_fenced(&selected).unwrap());
     }
+    if matches!(case, PreStartBootCase::InvalidContinuation) {
+        // The completed anchor boot supplies an installed generation and a reusable selected
+        // wallet. Keep the newer pending wallet outside that bracket so boot cannot overwrite
+        // its evidence before the all-wallet continuation census.
+        let paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+        let (snapshot_state, snapshot_source, id) = support::post_snapshot_invalid_continuation(
+            &paper,
+            &paths.fixed_main,
+            &paths.source_log,
+            WalletAddress([0xcc; 20]),
+        );
+        let offline = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"))
+            .env_clear()
+            .arg("--validate-open-continuations")
+            .arg("--paper-state")
+            .arg(snapshot_state)
+            .arg("--source-log")
+            .arg(snapshot_source)
+            .output()
+            .unwrap();
+        assert!(offline.status.success(), "{offline:?}");
+        assert_eq!(offline.stdout, b"open_rows=1 validated=1\n");
+        // Compare raw SQLite values, including the exact JSON strings, without decoding or
+        // re-encoding the rows. Include all wallets and all cursor/history columns.
+        let capture = || {
+            let connection = Connection::open(&paths.fixed_main).unwrap();
+            [
+                "decision_pending",
+                "leader_positions",
+                "wallet_market_history_v2",
+                "entry_gate_results",
+                "wallet_history_status_v2",
+                "poll_cursors",
+                "activity_groups",
+                "activity_group_revisions",
+            ]
+            .map(|table| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                (table, rows)
+            })
+        };
+        let before = capture();
+        let paper_log = std::fs::read(&paths.paper_log).unwrap();
+        let live_log = std::fs::read(&paths.live_journal).unwrap();
+        let source_log = std::fs::read(&paths.source_log).unwrap();
+        assert!(!cfg.status_path.exists());
+        requests.lock().unwrap().clear();
+        source.batch.store(8, Ordering::SeqCst);
+        let output = boot_binary(&config_path, false).await;
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("validate open decision continuations before resume"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("open decision continuation {id}:")),
+            "{stderr}"
+        );
+        assert_eq!(capture(), before);
+        assert_eq!(std::fs::read(&paths.paper_log).unwrap(), paper_log);
+        assert_eq!(std::fs::read(&paths.live_journal).unwrap(), live_log);
+        assert_eq!(std::fs::read(&paths.source_log).unwrap(), source_log);
+        assert!(!cfg.status_path.exists());
+        for message in ["pe-service listening", "service_config poll loop started"] {
+            assert!(!stdout.contains(message), "{stdout}");
+            assert!(!stderr.contains(message), "{stderr}");
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|uri| uri.path().to_owned())
+                .collect::<Vec<_>>(),
+            [
+                "/rest/v1/service_config",
+                "/rest/v1/ranking_batches",
+                "/rest/v1/ranking_entries",
+                "/rest/v1/paper_bankroll",
+                "/rest/v1/paper_positions",
+            ],
+            "only boot reads; no producer requests"
+        );
+    }
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+enum PreStartBootCase {
+    Selected,
+    Empty,
+    InvalidContinuation,
+}
+
+async fn boot_binary(config_path: &Path, exit_after_anchors: bool) -> std::process::Output {
+    fn read_pipe(mut pipe: impl std::io::Read) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .current_dir(config_path.parent().unwrap())
+        .arg(config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if exit_after_anchors {
+        command.arg("--exit-after-anchors");
+    }
+    let mut child = command.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut stdout = tokio::task::spawn_blocking(move || read_pipe(stdout));
+    let mut stderr = tokio::task::spawn_blocking(move || read_pipe(stderr));
+    // EOF signals process completion. A regression that starts serving must fail within a
+    // bound, killing and reaping this child rather than leaving the test waiting for shutdown.
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(&mut stdout, &mut stderr)
+    })
+    .await;
+    let timed_out = completed.is_err();
+    let (stdout, stderr) = match completed {
+        Ok(output) => output,
+        Err(_) => {
+            child.kill().unwrap();
+            tokio::join!(stdout, stderr)
+        }
+    };
+    let output = std::process::Output {
+        status: tokio::task::spawn_blocking(move || child.wait().unwrap())
+            .await
+            .unwrap(),
+        stdout: stdout.unwrap(),
+        stderr: stderr.unwrap(),
+    };
+    assert!(!timed_out, "boot exceeded its failure bound: {output:?}");
+    output
 }
 
 #[tokio::test]
 async fn fresh_pre_start_boot_pins_batch_and_brackets_active_main_survivors() {
-    pre_start_boot_membership_case(false).await;
+    pre_start_boot_membership_case(PreStartBootCase::Selected).await;
 }
 
 #[tokio::test]
 async fn fresh_pre_start_boot_refuses_empty_active_main_selection() {
-    pre_start_boot_membership_case(true).await;
+    pre_start_boot_membership_case(PreStartBootCase::Empty).await;
+}
+
+/// PASS: the real binary rejects the altered post-snapshot continuation by ID before resume,
+/// producer requests, HTTP serving or status publication, preserving every pending/ledger/gate/
+/// cursor/group value and both financial logs. The older offline census still passes.
+#[tokio::test]
+async fn post_snapshot_invalid_continuation_refuses_real_binary_boot() {
+    pre_start_boot_membership_case(PreStartBootCase::InvalidContinuation).await;
 }
