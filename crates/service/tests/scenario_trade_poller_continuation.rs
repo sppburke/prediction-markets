@@ -2171,9 +2171,13 @@ async fn binding_tamper_and_generation_substitution_are_rejected() {
 }
 
 /// PASS: shutdown leaves a held wallet operation alive through its page append and bucket ack;
-/// queued work never starts after shutdown, and every task joins.
-#[tokio::test(start_paused = true)]
-async fn shutdown_drains_started_wallet_operations() {
+/// PASS (issue #599 contract on the two-slot scheduler): a shutdown requested while a wallet
+/// operation is parked on a held durable acknowledgement ends the owner promptly without waiting
+/// for that acknowledgement; nothing partial is applied (no activity group, no bucket commit) and
+/// the durable prefix stays intact so the observation is rebuilt as outstanding at the next boot.
+/// FAIL: the owner keeps running until the acknowledgement is released, or a partial effect lands.
+#[tokio::test]
+async fn shutdown_cancels_started_wallet_operations_and_keeps_the_durable_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
     let request = running.requests.recv().await.unwrap();
@@ -2192,8 +2196,6 @@ async fn shutdown_drains_started_wallet_operations() {
         .acquire_owned()
         .await
         .unwrap();
-    running.stop.send(()).unwrap();
-    assert!(!running.poller.is_finished());
     let history = stream_row(wallet(), "started-before-stop", EPOCH);
     request
         .respond
@@ -2202,40 +2204,41 @@ async fn shutdown_drains_started_wallet_operations() {
     running.append_ack_arrived.notified().await;
     assert!(
         !running.poller.is_finished(),
-        "the durable page acknowledgement is still held"
+        "the operation is parked on the held durable page acknowledgement"
     );
+    running.stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
+        .await
+        .expect("shutdown must not wait for the held acknowledgement")
+        .unwrap()
+        .unwrap();
     assert!(
         paper
             .activity_groups_after(&wallet(), EPOCH - 1)
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "no partial bucket application"
     );
-    drop(held_append);
-    loop {
-        if matches!(
-            running.controls.recv().await.unwrap(),
-            ControlCompletion::BucketCommitted
-        ) {
-            break;
-        }
-    }
-    assert!(
-        !running.poller.is_finished(),
-        "the durable bucket acknowledgement is still held"
-    );
-    drop(held_bucket);
-    running.poller.await.unwrap().unwrap();
     assert!(running.requests.try_recv().is_err());
+    drop(held_append);
+    drop(held_bucket);
     drop(running.source);
     drop(running.triggers);
     running.ingest.await.unwrap();
-    assert_eq!(running.control.await.unwrap().len(), 1);
     assert_eq!(
-        paper
-            .activity_groups_after(&wallet(), EPOCH - 1)
+        running.control.await.unwrap().len(),
+        0,
+        "no bucket reached the serialized owner"
+    );
+    let rebuilt =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+            .unwrap();
+    assert!(
+        rebuilt
+            .receipt_at(pe_core_types::EventSeq(0))
             .unwrap()
-            .len(),
-        1
+            .is_some(),
+        "the durable source prefix survives the cancellation"
     );
 }
 

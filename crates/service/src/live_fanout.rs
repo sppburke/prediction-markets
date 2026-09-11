@@ -148,7 +148,10 @@ pub struct LiveFanoutConfig {
     /// Boot-verified, append-extended source receipt and evidence projection.
     pub source_receipts: SourceReceiptIndex,
     pub paper_log_path: PathBuf,
-    pub orchestrator_control: tokio::sync::mpsc::Sender<OrchestratorControl>,
+    /// Issue #599: the fanout outlives the orchestrator drain, so it must not keep the
+    /// control channel open; it upgrades per send and, once the orchestrator is gone, the sync
+    /// fails closed with the same error a closed channel produced.
+    pub orchestrator_control: tokio::sync::mpsc::WeakSender<OrchestratorControl>,
     pub http: reqwest::Client,
     pub polygon_receipt_rpc_url: String,
     pub supabase_url: String,
@@ -2856,9 +2859,13 @@ async fn sync_live_risk_halts(
             continue;
         }
         let (acknowledged, receipt) = tokio::sync::oneshot::channel();
-        state
-            .config
-            .orchestrator_control
+        // Issue #599: the fanout holds a weak sender so it cannot keep the orchestrator drain
+        // open; once the orchestrator is gone the sync fails closed exactly as a closed channel.
+        // The upgraded sender lives only for the send itself, never across the acknowledgement.
+        let Some(orchestrator_control) = state.config.orchestrator_control.upgrade() else {
+            return Err(FanoutError::Signal("risk halt control closed".to_owned()));
+        };
+        let sent = orchestrator_control
             .send(OrchestratorControl::RiskHaltChange {
                 owner: owner.clone(),
                 cause,
@@ -2873,8 +2880,9 @@ async fn sync_live_risk_halts(
                 }),
                 acknowledged,
             })
-            .await
-            .map_err(|_| FanoutError::Signal("risk halt control closed".to_owned()))?;
+            .await;
+        drop(orchestrator_control);
+        sent.map_err(|_| FanoutError::Signal("risk halt control closed".to_owned()))?;
         receipt
             .await
             .map_err(|_| FanoutError::Signal("risk halt acknowledgement dropped".to_owned()))?
@@ -16999,6 +17007,10 @@ mod tests {
         let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move { while trigger_rx.recv().await.is_some() {} });
         let (orchestrator_control, _orchestrator_control_rx) = tokio::sync::mpsc::channel(1);
+        let orchestrator_control_weak = orchestrator_control.downgrade();
+        // Keep the strong sender alive for the fixture's lifetime so an upgrade succeeds and a
+        // send observes the dropped receiver exactly as before (#599).
+        std::mem::forget(orchestrator_control);
         let source_health = crate::health::new_shared_health_with_ws(false, true, 90);
         tokio::spawn(
             crate::activity_ingest::ActivityIngest::poll_only(
@@ -17040,7 +17052,7 @@ mod tests {
                 source_log: source_log.clone(),
                 source_receipts,
                 paper_log_path,
-                orchestrator_control,
+                orchestrator_control: orchestrator_control_weak,
                 http: http.clone(),
                 polygon_receipt_rpc_url: "http://127.0.0.1:9".to_owned(),
                 supabase_url: supabase_url.to_owned(),

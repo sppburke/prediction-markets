@@ -879,8 +879,14 @@ impl TradePoller {
         let _ = self.run_until(std::future::pending::<()>()).await;
     }
 
-    /// Receive triggers throughout reads. Shutdown stops admission and drains every started
-    /// operation while the source coordinator and serialized control owner remain available.
+    /// Receive triggers throughout reads. A shutdown request stops admission and cancels every
+    /// started operation at its next await (issue #599): the unit stop deadline is honored even
+    /// when a read is parked on a slow venue. Every source page, commitment and bucket the
+    /// orchestrator already accepted stays durable; an acknowledgement dropped by the cancellation
+    /// does not undo an accepted effect, and an obligation whose target was not disposed is
+    /// rebuilt from the source log at the next boot. A boundary or anchor refresh not yet handed
+    /// over is dropped with its operation and re-derived from the anchor at the next boot. A
+    /// failed operation still terminates the owner after the remaining started operations finish.
     pub async fn run_until(
         mut self,
         shutdown: impl Future<Output = ()>,
@@ -1162,7 +1168,10 @@ impl TradePoller {
             }
             tokio::select! {
                 biased;
-                () = &mut shutdown, if !stopping => stopping = true,
+                () = &mut shutdown, if !stopping => {
+                    stopping = true;
+                    tasks.abort_all();
+                }
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     match completed {
                         Some(Ok(Completion::Reconciled { wallet, urgent, selected, result })) => {
@@ -1247,6 +1256,8 @@ impl TradePoller {
                                 Err(error) => { self.obligations.install_boundary(boundary); failure = Some(error); }
                             }
                         }
+                        // Cancelled by shutdown: the operation's durable prefix stands on its own.
+                        Some(Err(error)) if error.is_cancelled() => {}
                         Some(Err(error)) => failure = Some(TradePollerOwnerError::Reconciliation(error.to_string())),
                         None => {}
                     }
