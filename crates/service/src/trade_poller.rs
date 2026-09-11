@@ -911,11 +911,17 @@ impl TradePoller {
         let mut round = BackstopRound::new(&self);
         let mut cadence = tokio::time::Instant::now();
         let mut stopping = false;
+        let mut shutdown_requested = false;
         let mut failure = None;
         loop {
             // Poll shutdown before admitting work, including at startup.
-            if !stopping && shutdown.as_mut().now_or_never().is_some() {
+            // A stop seen here (between two select polls) cancels started operations exactly
+            // like the select arm below, and a stop that arrives after a failure-initiated stop
+            // still cancels whatever is left.
+            if !shutdown_requested && shutdown.as_mut().now_or_never().is_some() {
+                shutdown_requested = true;
                 stopping = true;
+                tasks.abort_all();
             }
             if !stopping {
                 self.drain_triggers();
@@ -1168,7 +1174,8 @@ impl TradePoller {
             }
             tokio::select! {
                 biased;
-                () = &mut shutdown, if !stopping => {
+                () = &mut shutdown, if !shutdown_requested => {
+                    shutdown_requested = true;
                     stopping = true;
                     tasks.abort_all();
                 }

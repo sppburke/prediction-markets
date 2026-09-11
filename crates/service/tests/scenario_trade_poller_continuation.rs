@@ -2170,7 +2170,6 @@ async fn binding_tamper_and_generation_substitution_are_rejected() {
     }
 }
 
-/// PASS: shutdown leaves a held wallet operation alive through its page append and bucket ack;
 /// PASS (issue #599 contract on the two-slot scheduler): a shutdown requested while a wallet
 /// operation is parked on a held durable acknowledgement ends the owner promptly without waiting
 /// for that acknowledgement; nothing partial is applied (no activity group, no bucket commit) and

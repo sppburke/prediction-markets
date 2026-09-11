@@ -1681,6 +1681,10 @@ async fn main() -> Result<()> {
         TaskName::RuntimeConfigPoller,
     ];
     let mut shutdown_timed_out = !join_named_until(&mut supervisor, &producers, deadline).await;
+    // Publish the drain phase while main still holds a strong control sender: the orchestrator
+    // observes `draining` before its control receiver can return `None`, so the closure below is
+    // a clean drain end rather than a premature-closure failure.
+    advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
     drop(producer_start_tx);
     drop(admission_preparer);
     drop(control_tx);
@@ -1688,8 +1692,6 @@ async fn main() -> Result<()> {
     // seal handles below were cloned into producers that have joined, so main's originals go too.
     drop(risk_halt_release);
     drop(qualification_seal);
-
-    advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
     shutdown_timed_out |=
         !join_named_until(&mut supervisor, &[TaskName::Orchestrator], deadline).await;
     drop(sink_handle);
