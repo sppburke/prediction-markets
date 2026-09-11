@@ -682,6 +682,7 @@ pub fn install_verified_empty_anchor(
                 anchor_seq: captured.anchor_seq,
                 coverage_generation: captured.coverage_generation,
             },
+            history_status: None,
         }])
         .unwrap();
 }
