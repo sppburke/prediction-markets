@@ -659,8 +659,31 @@ impl TradePoller {
         let _ = self.run_until(std::future::pending::<()>()).await;
     }
 
-    /// Production entry point. A shutdown request is honored only between complete fixed-end
-    /// reconciliation rounds, so a partially applied wallet round is never manufactured.
+    /// Scenario seam (issue #599): run exactly one reconciliation round. A stop that is already
+    /// requested when `run_until` begins no longer runs a round first, so the continuation
+    /// scenarios drive their single round through this hook.
+    #[cfg(feature = "scenario")]
+    pub async fn poll_round_once(mut self) -> Result<(), TradePollerOwnerError> {
+        {
+            let mut health = self
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            health.poll_started_at = Some(OffsetDateTime::now_utc());
+        }
+        self.drain_triggers();
+        self.poll_round().await
+    }
+
+    /// Production entry point. A shutdown request cancels an in-flight round at its next await
+    /// (issue #599): every wallet epoch-second already committed stays durable, and an
+    /// acknowledgement dropped by the cancellation does not undo an effect the orchestrator has
+    /// already accepted (a bucket commit, an anchor install, or a daily boundary handed over
+    /// before the cancellation, which may still be marked durably). A ready boundary not yet
+    /// handed over is dropped with the round and re-derived from the anchor at the next boot. A
+    /// round that fails on its own still terminates the owner; the only residual is a round
+    /// error that becomes ready in the same poll as the shutdown, which the biased select reports
+    /// as a clean stop.
     pub async fn run_until(
         mut self,
         shutdown: impl Future<Output = ()>,
@@ -675,7 +698,15 @@ impl TradePoller {
         tokio::pin!(shutdown);
         loop {
             self.drain_triggers();
-            self.poll_round().await?;
+            // Issue #599: the shutdown branch is polled first, so a stop requested during a
+            // round cancels the round instead of waiting for it (minutes on production data).
+            // A round error that is ready in the very same poll is not observed; this is the
+            // reviewed trade-off against classifying shutdown-caused closures by error type.
+            tokio::select! {
+                biased;
+                () = &mut shutdown => return Ok(()),
+                result = self.poll_round() => result?,
+            }
             if self.config.poll_interval_secs == 0 {
                 return Err(TradePollerOwnerError::ZeroPollInterval);
             }

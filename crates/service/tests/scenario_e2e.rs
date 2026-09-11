@@ -265,8 +265,15 @@ async fn scenario_graceful_shutdown() {
     send_trade_bucket(&control_tx, make_trade(wallet)).await;
     send_trade_bucket(&control_tx, make_trade(wallet)).await;
     shutdown_tx.send(()).unwrap();
+    // Issue #599: a weak holder (the live fanout in production) must not keep the drain open.
+    let weak_holder = control_tx.downgrade();
     drop(control_tx);
-    run.await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("orchestrator drain must finish once every strong control sender is dropped")
+        .unwrap()
+        .unwrap();
+    assert!(weak_holder.upgrade().is_none());
 
     // Executor was initialised; orchestrator exited cleanly without hanging.
     let log_path = dir.path().join("paper.log");

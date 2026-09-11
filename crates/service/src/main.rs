@@ -1323,7 +1323,7 @@ async fn main() -> Result<()> {
             source_log: resolution_source_log.clone(),
             source_receipts: source_receipts.clone(),
             paper_log_path: cfg.event_log_path.clone(),
-            orchestrator_control: control_tx.clone(),
+            orchestrator_control: control_tx.downgrade(),
             http: live_http_client,
             polygon_receipt_rpc_url: cfg.polygon_receipt_rpc_url.clone(),
             supabase_url: cfg.supabase_url.clone(),
@@ -1671,6 +1671,10 @@ async fn main() -> Result<()> {
     drop(producer_start_tx);
     drop(admission_preparer);
     drop(control_tx);
+    // Issue #599: the orchestrator drains until every control sender is gone; the release and
+    // seal handles below were cloned into producers that have joined, so main's originals go too.
+    drop(risk_halt_release);
+    drop(qualification_seal);
 
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
     shutdown_timed_out |=

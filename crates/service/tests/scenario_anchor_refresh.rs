@@ -40,6 +40,9 @@ const NOW: i64 = 100;
 struct PollFetcher {
     pages: Mutex<VecDeque<Vec<u8>>>,
     calls: AtomicUsize,
+    /// Issue #599: park every fetch forever (a round that never completes); the sender fires
+    /// when the first fetch is entered so a test can order shutdown after the round started.
+    parked: Option<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl PollFetcher {
@@ -47,6 +50,14 @@ impl PollFetcher {
         Self {
             pages: Mutex::new((0..count).map(|_| b"[]".to_vec()).collect()),
             calls: AtomicUsize::new(0),
+            parked: None,
+        }
+    }
+
+    fn parked(started: oneshot::Sender<()>) -> Self {
+        Self {
+            parked: Some(Mutex::new(Some(started))),
+            ..Self::empty_pages(0)
         }
     }
 }
@@ -58,6 +69,16 @@ impl ReconciliationFetcher for PollFetcher {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = &self.parked {
+                if let Some(started) = started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = started.send(());
+                }
+                std::future::pending::<()>().await;
+            }
             self.pages
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -255,6 +276,32 @@ fn poller_harness(
     installed: Arc<Mutex<Vec<(WalletAddress, usize)>>>,
     shutdown: Option<oneshot::Sender<()>>,
 ) -> PollerHarness {
+    let poll_fetcher = Arc::new(PollFetcher::empty_pages(wallets.len() * rounds));
+    poller_harness_with_fetcher(
+        dir,
+        paper,
+        wallets,
+        bracket_responses,
+        rounds,
+        fail_install_transaction,
+        installed,
+        shutdown,
+        poll_fetcher,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poller_harness_with_fetcher(
+    dir: &tempfile::TempDir,
+    paper: Arc<PaperStateDb>,
+    wallets: &[WalletAddress],
+    bracket_responses: HashMap<String, Vec<Vec<u8>>>,
+    rounds: usize,
+    fail_install_transaction: bool,
+    installed: Arc<Mutex<Vec<(WalletAddress, usize)>>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    poll_fetcher: Arc<PollFetcher>,
+) -> PollerHarness {
     if fail_install_transaction {
         rusqlite::Connection::open(dir.path().join("paper.db"))
             .unwrap()
@@ -280,7 +327,6 @@ fn poller_harness(
         tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
     let (control_tx, mut control_rx) = mpsc::channel(4);
     let actor_paper = Arc::clone(&paper);
-    let poll_fetcher = Arc::new(PollFetcher::empty_pages(wallets.len() * rounds));
     let actor_poll_fetcher = Arc::clone(&poll_fetcher);
     let actor_installed = Arc::clone(&installed);
     let actor = tokio::spawn(async move {
@@ -680,5 +726,52 @@ async fn real_transaction_failure_terminates_the_poller_without_swapping() {
     ));
     assert!(paper.position_anchors(&wallet).unwrap().is_empty());
     assert!(paper.leader_positions().unwrap().is_empty());
+    finish_harness(ingest, actor, preparer).await;
+}
+
+// Issue #599: rehearsal attempt 10 could not stop within the unit deadline because the poller
+// honored shutdown only between rounds and a round on production data runs for minutes.
+#[tokio::test]
+async fn shutdown_mid_round_cancels_the_round_and_exits_cleanly() {
+    let wallets = [wallet(0x81)];
+    let (dir, paper) = paper(&wallets);
+    let installed = Arc::new(Mutex::new(Vec::new()));
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let harness = poller_harness_with_fetcher(
+        &dir,
+        Arc::clone(&paper),
+        &wallets,
+        stable_bracket_responses(&wallets),
+        1,
+        false,
+        installed,
+        None,
+        Arc::new(PollFetcher::parked(started_tx)),
+    );
+    let PollerHarness {
+        poller,
+        ingest,
+        actor,
+        preparer,
+    } = harness;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        // Shutdown fires only once the round has entered its parked fetch.
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .expect("the round must start its first fetch")
+            .unwrap();
+        let _ = shutdown_tx.send(());
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        poller.run_until(async {
+            let _ = shutdown_rx.await;
+        }),
+    )
+    .await
+    .expect("a parked round must be cancelled by shutdown");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(paper.position_anchors(&wallets[0]).unwrap().is_empty());
     finish_harness(ingest, actor, preparer).await;
 }
