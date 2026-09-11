@@ -776,8 +776,9 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
       # Start may commit only into WAL, leaving either main-file hash unchanged. A durable
       # restore intent plus backup equality AND absent sidecars certifies helper completion.
       if { manifest_flag qualification_start_intent && ! manifest_flag local_restore_intent; } ||
-         [[ "$current_local_sha" != "$(manifest_get backup.sha256)" ||
-            -e "$paper_state-wal" || -e "$paper_state-shm" ]]; then
+         [[ "$current_local_sha" != "$(manifest_get backup.sha256)" ]] ||
+         { [[ -e "$paper_state-wal" || -e "$paper_state-shm" ]] &&
+           { manifest_flag qualification_start_intent || manifest_flag local_restore_intent; }; }; then
         manifest_patch_boundary rollback-local-restore-intent \
           '{"local_restore_intent":true,"local_restore_skipped":false}'
         restore_sqlite_backup "$backup_path" "$paper_state"
