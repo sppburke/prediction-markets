@@ -302,15 +302,15 @@ struct CompleteActivitySegment {
     children: Vec<(Option<i64>, i64)>,
 }
 
-// Retained only for one observation operation or shared boot read.
+// Retained only for one observation operation or shared read.
 struct VerifiedActivityRead {
     aggregates: Vec<ActivityAggregate>,
     commitment: Option<ActivityReadCommitment>,
     bindings: VerifiedObservationBindings,
 }
 
-#[derive(Default)]
-struct VerifiedObservationBindings {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VerifiedObservationBindings {
     observations: BTreeMap<
         pe_core_types::EventSeq,
         (
@@ -324,7 +324,7 @@ struct VerifiedObservationBindings {
 impl VerifiedObservationBindings {
     // Frozen facts are the effective identity; the durable effect comparator separately
     // binds them to the recorded raw-to-effective correction. Check every shared-read row.
-    fn verify_facts(
+    pub(crate) fn verify_facts(
         &self,
         facts: &DecisionContinuationFacts,
     ) -> Result<(), CompleteActivityReadError> {
@@ -448,6 +448,19 @@ impl DecisionContinuationV3 {
     {
         self.reconstruct_verified_activity_read(lookup)
             .map(|read| read.aggregates)
+    }
+
+    /// Retain authenticated bindings so qualification can check every sibling in one read.
+    pub(crate) fn reconstruct_complete_activity_read_with_bindings<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<(Vec<ActivityAggregate>, VerifiedObservationBindings), CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        self.reconstruct_verified_activity_read(lookup)
+            .map(|read| (read.aggregates, read.bindings))
     }
 
     fn reconstruct_verified_activity_read<L, E>(
