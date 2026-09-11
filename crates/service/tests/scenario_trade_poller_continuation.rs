@@ -866,8 +866,29 @@ fn start_recorded_poller_with_anchors(
     anchors: bool,
     boundary_anchor: Option<i64>,
 ) -> (RunningPoll, Arc<PaperStateDb>) {
-    let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
-    for wallet in wallets {
+    start_recorded_poller_with_completion_stop(
+        dir,
+        wallets,
+        real_owner,
+        anchors,
+        boundary_anchor,
+        None,
+    )
+}
+
+fn start_recorded_poller_with_completion_stop(
+    dir: &tempfile::TempDir,
+    wallets: &[WalletAddress],
+    real_owner: bool,
+    anchors: bool,
+    boundary_anchor: Option<i64>,
+    stop_after_completion: Option<WalletAddress>,
+) -> (RunningPoll, Arc<PaperStateDb>) {
+    let paper_path = dir.path().join("paper.db");
+    let restarting = paper_path.exists();
+    let paper = Arc::new(PaperStateDb::open(&paper_path).unwrap());
+    // Reopening a cancelled run must preserve its cursor, anchors and applied ledger effects.
+    for wallet in wallets.iter().filter(|_| !restarting) {
         paper.set_cursor(wallet, EPOCH - 10).unwrap();
         paper
             .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -1022,6 +1043,7 @@ fn start_recorded_poller_with_anchors(
     });
     let (requests_tx, requests) = mpsc::channel(8);
     let (progress_tx, progress) = mpsc::channel(64);
+    let (completion_tx, mut completions) = mpsc::channel(64);
     let (wait_tx, waits) = mpsc::channel(64);
     let (stop, stopped) = oneshot::channel();
     let now = Arc::new(std::sync::atomic::AtomicI64::new(EPOCH));
@@ -1052,7 +1074,8 @@ fn start_recorded_poller_with_anchors(
             .with_clock(Arc::new(|| EPOCH)),
         )
     });
-    let mut obligations = ReconciliationObligations::default();
+    let mut obligations =
+        pe_service::trade_poller::rebuild_reconciliation_obligations(&source_path, &paper).unwrap();
     if let Some(anchor) =
         boundary_anchor.or_else(|| anchors.then_some(EPOCH.div_euclid(86_400) * 86_400 - 86_400))
     {
@@ -1086,10 +1109,28 @@ fn start_recorded_poller_with_anchors(
     .with_clock(Arc::new(move || {
         OffsetDateTime::from_unix_timestamp(clock.load(Ordering::SeqCst)).unwrap()
     }))
-    .with_progress(progress_tx)
+    .with_progress(if stop_after_completion.is_some() {
+        completion_tx
+    } else {
+        progress_tx
+    })
     .with_wait_observer(wait_tx);
     let poller = tokio::spawn(poller.run_until(async move {
-        let _ = stopped.await;
+        if let Some(target) = stop_after_completion {
+            // Completed is emitted synchronously inside the join arm, after the select's
+            // shutdown poll returned Pending. Only the next loop-top poll can observe it.
+            while let Some(progress) = completions.recv().await {
+                if matches!(progress, pe_service::trade_poller::PollerProgress::Completed {
+                    wallet, ..
+                } if wallet == target)
+                {
+                    return;
+                }
+            }
+            unreachable!("completion shutdown channel closed");
+        } else {
+            let _ = stopped.await;
+        }
     }));
     (
         RunningPoll {
@@ -2170,19 +2211,16 @@ async fn binding_tamper_and_generation_substitution_are_rejected() {
     }
 }
 
-/// PASS (issue #599 contract on the two-slot scheduler): a shutdown requested while a wallet
-/// operation is parked on a held durable acknowledgement ends the owner promptly without waiting
-/// for that acknowledgement; nothing partial is applied (no activity group, no bucket commit) and
-/// the durable prefix stays intact so the observation is rebuilt as outstanding at the next boot.
-/// FAIL: the owner keeps running until the acknowledgement is released, or a partial effect lands.
-#[tokio::test]
+/// PASS: select-arm shutdown cancels a held page acknowledgement; boot reconstructs the exact
+/// outstanding receipt and the real poller/orchestrator apply and terminalize its trade once.
+/// FAIL: shutdown waits for the gate, reconstruction loses the receipt, or restart duplicates it.
+#[tokio::test(start_paused = true)]
 async fn shutdown_cancels_started_wallet_operations_and_keeps_the_durable_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
     let request = running.requests.recv().await.unwrap();
-    running
-        .observe(stream_row(wallet(), "queued-at-stop", EPOCH))
-        .await;
+    let history = stream_row(wallet(), "queued-at-stop", EPOCH);
+    let receipt = running.observe(history.clone()).await;
     let held_append = running
         .append_ack_gate
         .clone()
@@ -2195,16 +2233,22 @@ async fn shutdown_cancels_started_wallet_operations_and_keeps_the_durable_prefix
         .acquire_owned()
         .await
         .unwrap();
-    let history = stream_row(wallet(), "started-before-stop", EPOCH);
     request
         .respond
-        .send(serde_json::to_vec(&[history]).unwrap())
+        .send(serde_json::to_vec(std::slice::from_ref(&history)).unwrap())
         .unwrap();
     running.append_ack_arrived.notified().await;
     assert!(
         !running.poller.is_finished(),
         "the operation is parked on the held durable page acknowledgement"
     );
+    // The owner has consumed the only trigger and reached its select with A still parked.
+    // On this current-thread runtime no completion can intervene before the stop is sent.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.waiting().await.obligations.is_empty() {}
+    })
+    .await
+    .expect("the owner must observe the durable trigger before shutdown");
     running.stop.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
         .await
@@ -2229,15 +2273,274 @@ async fn shutdown_cancels_started_wallet_operations_and_keeps_the_durable_prefix
         0,
         "no bucket reached the serialized owner"
     );
-    let rebuilt =
-        pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
-            .unwrap();
+    drop(paper);
+    let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    let rebuilt = pe_service::trade_poller::rebuild_reconciliation_obligations(
+        &dir.path().join("source.log"),
+        &paper,
+    )
+    .unwrap();
+    assert_eq!(
+        rebuilt.migration_evidence(),
+        json!([{
+            "wallet": wallet().to_string(),
+            "source_epoch": EPOCH,
+            "source_trade_id": aggregate(history.clone()).group_id.key().0,
+            "received_at_unix": EPOCH,
+            "receipt": receipt,
+        }]),
+        "boot retains exactly the cancelled observation's group, sequence and hash"
+    );
+    drop(paper);
+    let (mut resumed, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
+    resumed
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&history)).unwrap())
+        .unwrap();
+    assert_eq!(resumed.completed(wallet()).await, vec![receipt]);
+    let commits = resumed.finish().await;
+    assert_eq!(commits.len(), 1, "one control reaches the real owner");
+    assert!(!commits[0].2.already_committed);
+    assert_single_cancelled_trade(&dir, &paper, &history);
+}
+
+fn assert_single_cancelled_trade(dir: &tempfile::TempDir, paper: &PaperStateDb, row: &Value) {
+    let target = aggregate(row.clone());
+    let groups = paper.activity_groups_after(&wallet(), EPOCH - 1).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(&groups[0].source_trade_id, target.group_id.key());
+    assert_eq!(
+        groups[0].semantic_revision,
+        target.semantic_revision.as_str()
+    );
+    let ledger = build_leader_ledger(paper).unwrap();
+    let positions = &ledger.position(&wallet()).unwrap().positions;
+    assert_eq!(positions.len(), 1);
+    assert_eq!(
+        positions[&MarketOutcomeId::new(market(MARKET_B), OutcomeId(0))].long_contracts,
+        ShareAmount::from_whole(1).unwrap()
+    );
+    let rows = paper.decision_pending_history().unwrap();
+    assert_eq!(rows.len(), 1, "one continuation and terminal outcome");
+    assert_eq!(
+        rows[0].state,
+        pe_paper_state::DecisionPendingState::Terminal
+    );
+    assert_eq!(rows[0].terminal_disposition.as_deref(), Some("no_fill"));
+    let evidence: pe_service::decision_replay::DecisionPostBoundaryEvidence =
+        serde_json::from_str(&rows[0].post_commit_inputs_json).unwrap();
+    assert_eq!(evidence.body.terminal.reason, "financial_era_not_started");
+    assert_eq!(paper.fills_count().unwrap(), 0);
+    pe_service::decision_replay::replay_decision_pending(&rows[0]).unwrap();
     assert!(
-        rebuilt
-            .receipt_at(pe_core_types::EventSeq(0))
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+/// PASS: a fatal B completion stops admission; a later shutdown cancels A without releasing
+/// its page acknowledgement and returns that original fatal error within five seconds.
+/// FAIL: failure disables shutdown observation or the owner waits for A's acknowledgement.
+#[tokio::test(start_paused = true)]
+async fn shutdown_after_failure_cancels_held_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet(), other]);
+    let parked = running.requests.recv().await.unwrap();
+    assert!(parked.url.contains(&wallet().to_string()));
+    running
+        .observe(stream_row(other, "fatal-at-stop", EPOCH))
+        .await;
+    let failing = running.requests.recv().await.unwrap();
+    assert!(failing.url.contains(&other.to_string()));
+    let held = running
+        .append_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    parked.respond.send(b"[]".to_vec()).unwrap();
+    running.append_ack_arrived.notified().await;
+    running.clear_waits();
+    // A source-coordinator closure is fatal to the owner (venue read failures are retryable).
+    // Join its cancellation before releasing B, while A retains its already-durable page ack.
+    running.ingest.abort();
+    assert!((&mut running.ingest).await.unwrap_err().is_cancelled());
+    failing.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(other).await;
+    running.waiting().await;
+    assert!(!running.poller.is_finished());
+    running.stop.send(()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
+        .await
+        .expect("failure must not disable cancellation of the held operation")
+        .unwrap();
+    assert!(
+        matches!(result, Err(pe_service::trade_poller::TradePollerOwnerError::Reconciliation(ref error))
+        if error == "source-log coordinator closed"),
+        "{result:?}"
+    );
+    assert_eq!(running.append_ack_gate.available_permits(), 0);
+    drop(held);
+    drop(running.source);
+    drop(running.triggers);
+    assert!(running.control.await.unwrap().is_empty());
+}
+
+/// PASS: B's Completed event makes shutdown ready inside the join arm; the next loop-top
+/// poll cancels A's held bucket acknowledgement without needing the select shutdown arm.
+/// FAIL: the owner waits for A, or returns an error after cancellation.
+#[tokio::test(start_paused = true)]
+async fn completion_ready_shutdown_cancels_at_loop_top() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let (mut running, _) = start_recorded_poller_with_completion_stop(
+        &dir,
+        &[wallet(), other],
+        false,
+        false,
+        None,
+        Some(other),
+    );
+    let held = running
+        .bucket_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[stream_row(wallet(), "held-at-loop-top", EPOCH)]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await,
+        Some(ControlCompletion::BucketCommitted)
+    ));
+    running
+        .observe(stream_row(other, "complete-at-stop", EPOCH))
+        .await;
+    let completing = running.requests.recv().await.unwrap();
+    assert!(completing.url.contains(&other.to_string()));
+    completing.respond.send(b"[]".to_vec()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
+        .await
+        .expect("loop-top shutdown must cancel the held bucket acknowledgement")
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.bucket_ack_gate.available_permits(), 0);
+    drop(held);
+    drop(running.source);
+    drop(running.triggers);
+    running.ingest.await.unwrap();
+    assert_eq!(running.control.await.unwrap().len(), 1);
+}
+
+/// PASS: cancellation after the real owner commits but before poller acknowledgement preserves
+/// one ledger effect and terminal continuation; restart's overlapping read is already_committed.
+/// FAIL: restart duplicates the effect/outcome or rebuilds an already-disposed obligation.
+#[tokio::test(start_paused = true)]
+async fn shutdown_after_bucket_commit_restarts_without_double_application() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let row = stream_row(wallet(), "committed-before-stop", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    let held = running
+        .bucket_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&row)).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await,
+        Some(ControlCompletion::BucketCommitted)
+    ));
+    assert_single_cancelled_trade(&dir, &paper, &row);
+    let groups = paper.activity_groups_after(&wallet(), EPOCH - 1).unwrap();
+    let rows = paper.decision_pending_history().unwrap();
+    let positions = paper.leader_positions().unwrap();
+    let financial_log = std::fs::read(dir.path().join("paper.log")).unwrap();
+    running.stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
+        .await
+        .expect("shutdown must not wait for the committed bucket acknowledgement")
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.bucket_ack_gate.available_permits(), 0);
+    drop(held);
+    drop(running.source);
+    drop(running.triggers);
+    running.ingest.await.unwrap();
+    let first = running.control.await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].2.already_committed);
+    assert_eq!(first[0].2.pending.len(), 1);
+    let continuation =
+        pe_service::bucket_commit::DecisionContinuationV3::from_durable(&rows[0]).unwrap();
+    let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+        .unwrap();
+    assert_eq!(
+        continuation
+            .observation_from_receipt_index(&index)
             .unwrap()
-            .is_some(),
-        "the durable source prefix survives the cancellation"
+            .unwrap()
+            .source_receipt,
+        receipt
+    );
+    drop(paper);
+    let (mut resumed, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
+    assert_single_cancelled_trade(&dir, &paper, &row);
+    resumed
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&row)).unwrap())
+        .unwrap();
+    assert!(resumed.completed(wallet()).await.is_empty());
+    let repeated = resumed.finish().await;
+    assert_eq!(repeated.len(), 1);
+    assert!(repeated[0].2.already_committed);
+    assert!(repeated[0].2.pending.is_empty());
+    assert_single_cancelled_trade(&dir, &paper, &row);
+    assert_eq!(
+        paper.activity_groups_after(&wallet(), EPOCH - 1).unwrap(),
+        groups
+    );
+    assert_eq!(paper.leader_positions().unwrap(), positions);
+    assert_eq!(paper.decision_pending_history().unwrap(), rows);
+    assert_eq!(
+        std::fs::read(dir.path().join("paper.log")).unwrap(),
+        financial_log
     );
 }
 
