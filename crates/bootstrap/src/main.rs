@@ -1018,14 +1018,14 @@ async fn main() {
                     Ok(true) => {
                         tracing::warn!(
                             wallet = normalized,
-                            "clear-infra-exclusion: exclusion cleared"
+                            "clear-infra-exclusion: exclusion cleared (infra tombstone and/or live is_infra flag)"
                         );
                         0
                     }
                     Ok(false) => {
                         tracing::error!(
                             wallet = normalized,
-                            "clear-infra-exclusion: matching infra exclusion not found"
+                            "clear-infra-exclusion: no infra tombstone or live is_infra flag for wallet"
                         );
                         1
                     }

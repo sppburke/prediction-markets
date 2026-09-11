@@ -1,0 +1,1383 @@
+{
+ "exchange_contracts": {
+  "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e": [
+   "infra",
+   1784530028
+  ],
+  "0xc5d563a36ae78145c45a50134d48a1215220f80a": [
+   "infra",
+   1784747039
+  ],
+  "0xe111180000d2663c0091e4f400237545b87b996b": [
+   "infra",
+   1784747039
+  ],
+  "0xe2222d279d744050d28e00520010520000310f59": [
+   "infra",
+   1784747039
+  ]
+ },
+ "biggest_csv_members_by_archived_trades": [
+  {
+   "wallet": "0x4133bcbad1d9c41de776646696f41c34d0a65e70",
+   "trades_archived": 1055353,
+   "n": 1055353,
+   "min_window_span": 24,
+   "dense_windows": 668576,
+   "first_ts": 1761927178,
+   "last_ts": 1776851494
+  },
+  {
+   "wallet": "0xf8e35e78265c83de7e18204502b3842710bcfd17",
+   "trades_archived": 172555,
+   "n": 172555,
+   "min_window_span": 266,
+   "dense_windows": 152425,
+   "first_ts": 1762146081,
+   "last_ts": 1779100420
+  },
+  {
+   "wallet": "0x3b5a5271122cab38828140c815df362409d5b293",
+   "trades_archived": 156103,
+   "n": 156103,
+   "min_window_span": 202,
+   "dense_windows": 58584,
+   "first_ts": 1764141503,
+   "last_ts": 1779092267
+  },
+  {
+   "wallet": "0x129b7597d55236654aad74de9a3139253b259274",
+   "trades_archived": 152125,
+   "n": 152125,
+   "min_window_span": 174,
+   "dense_windows": 98817,
+   "first_ts": 1775527783,
+   "last_ts": 1778330975
+  },
+  {
+   "wallet": "0x5bc331ff6a2f3a679f0c98cca0d92cdda5c47a59",
+   "trades_archived": 148064,
+   "n": 148064,
+   "min_window_span": 714,
+   "dense_windows": 110774,
+   "first_ts": 1771486874,
+   "last_ts": 1779105807
+  }
+ ],
+ "probe_flagged_non_csv_examples": {
+  "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3": {
+   "n": 94055,
+   "windows": 93556,
+   "min_window_span": 1513,
+   "min_window_start_ts": 1783177783,
+   "dense_windows": 1004,
+   "oldest500_span": 11041356,
+   "newest500_span": 9769,
+   "first_ts": 1770172224,
+   "last_ts": 1783516283
+  },
+  "0xcd99b83f8c92669f908f14610f67e251cf7b83cc": {
+   "n": 7532,
+   "windows": 7033,
+   "min_window_span": 1553,
+   "min_window_start_ts": 1779183195,
+   "dense_windows": 2370,
+   "oldest500_span": 2471,
+   "newest500_span": 1779,
+   "first_ts": 1779090176,
+   "last_ts": 1779185092
+  },
+  "0xbf6755d00d146b95374e6b950b274bd81d7bfe3d": {
+   "n": 613,
+   "windows": 114,
+   "min_window_span": 212449,
+   "min_window_start_ts": 1783604917,
+   "dense_windows": 0,
+   "oldest500_span": 443454,
+   "newest500_span": 212449,
+   "first_ts": 1783373822,
+   "last_ts": 1783817366
+  },
+  "0x4133bcbad1d9c41de776646696f41c34d0a65e70": {
+   "n": 1055353,
+   "windows": 1054854,
+   "min_window_span": 24,
+   "min_window_start_ts": 1775421513,
+   "dense_windows": 668576,
+   "oldest500_span": 266759,
+   "newest500_span": 131618,
+   "first_ts": 1761927178,
+   "last_ts": 1776851494
+  },
+  "0xb41ac4e8907de5460e2dac0a98df8d1530d33a25": {
+   "n": 371572,
+   "windows": 371073,
+   "min_window_span": 672,
+   "min_window_start_ts": 1761446841,
+   "dense_windows": 103502,
+   "oldest500_span": 2216,
+   "newest500_span": 11869340,
+   "first_ts": 1734947723,
+   "last_ts": 1777843972
+  },
+  "0xbefbdd434fc8d99da3e37c20cb0f088ec3168a78": {
+   "n": 284971,
+   "windows": 284472,
+   "min_window_span": 384,
+   "min_window_start_ts": 1763710281,
+   "dense_windows": 195291,
+   "oldest500_span": 3250,
+   "newest500_span": 1892,
+   "first_ts": 1763552725,
+   "last_ts": 1765390488
+  },
+  "0xe0317ff8baff05a02a302b9848a470efec4c5c08": {
+   "n": 227391,
+   "windows": 226892,
+   "min_window_span": 358,
+   "min_window_start_ts": 1774986905,
+   "dense_windows": 105061,
+   "oldest500_span": 3232,
+   "newest500_span": 9700,
+   "first_ts": 1774968313,
+   "last_ts": 1778868241
+  },
+  "0x542b546f49025e5e1a76350df7b6fb9f0cd3a0eb": {
+   "n": 185326,
+   "windows": 184827,
+   "min_window_span": 476,
+   "min_window_start_ts": 1773207297,
+   "dense_windows": 177166,
+   "oldest500_span": 2054,
+   "newest500_span": 1392,
+   "first_ts": 1773152773,
+   "last_ts": 1773923423
+  }
+ },
+ "non_csv_infra_with_archived_trades": [
+  {
+   "wallet": "0x008b7114ead7fda2c7c4b1d2cb75f427cef8e4af",
+   "trades_archived": 13854,
+   "n": 13854,
+   "min_window_span": 846,
+   "dense_windows": 9798,
+   "first_ts": 1774193909,
+   "last_ts": 1778686710
+  },
+  {
+   "wallet": "0x0109fd145a8bfc646ecc82194106fd9f7da67d9b",
+   "trades_archived": 29239,
+   "n": 29239,
+   "min_window_span": 76,
+   "dense_windows": 23367,
+   "first_ts": 1774222669,
+   "last_ts": 1777950704
+  },
+  {
+   "wallet": "0x0235760c4c57a0e82152eadc6f2f2fd21fbd34c8",
+   "trades_archived": 25751,
+   "n": 25751,
+   "min_window_span": 1340,
+   "dense_windows": 9453,
+   "first_ts": 1778344025,
+   "last_ts": 1778879259
+  },
+  {
+   "wallet": "0x031789cd73fa81ba3f2dd2f48385b21fa715e9b6",
+   "trades_archived": 2623,
+   "n": 2623,
+   "min_window_span": 26,
+   "dense_windows": 1716,
+   "first_ts": 1774492169,
+   "last_ts": 1776566500
+  },
+  {
+   "wallet": "0x046e6a6957d2a46a16cb76efe0ea09c54a861e4e",
+   "trades_archived": 6480,
+   "n": 6480,
+   "min_window_span": 990,
+   "dense_windows": 5481,
+   "first_ts": 1769962898,
+   "last_ts": 1779180878
+  },
+  {
+   "wallet": "0x0484e64092ba4108c2786b61e6fc052d3bf41b1a",
+   "trades_archived": 26207,
+   "n": 26207,
+   "min_window_span": 1074,
+   "dense_windows": 6684,
+   "first_ts": 1776927932,
+   "last_ts": 1779124320
+  },
+  {
+   "wallet": "0x04f6ec011120ffd7a9e4f2f14452f795e590186e",
+   "trades_archived": 3236,
+   "n": 3236,
+   "min_window_span": 434,
+   "dense_windows": 1882,
+   "first_ts": 1769385940,
+   "last_ts": 1769653774
+  },
+  {
+   "wallet": "0x0594a2863e3c5aaf291afbbf459758c9d1d036b2",
+   "trades_archived": 2009,
+   "n": 2009,
+   "min_window_span": 1564,
+   "dense_windows": 1006,
+   "first_ts": 1735268209,
+   "last_ts": 1735280831
+  },
+  {
+   "wallet": "0x06d1ebc97509e91e89b2be7f006bbaa3a65d118d",
+   "trades_archived": 2988,
+   "n": 2988,
+   "min_window_span": 2790,
+   "dense_windows": 351,
+   "first_ts": 1745237323,
+   "last_ts": 1745856546
+  },
+  {
+   "wallet": "0x09c3cc358c072cfd57166f2aedd18a0e91a8df76",
+   "trades_archived": 23289,
+   "n": 23289,
+   "min_window_span": 424,
+   "dense_windows": 15427,
+   "first_ts": 1775032209,
+   "last_ts": 1779129509
+  },
+  {
+   "wallet": "0x0e718fc84f9aba5e28ed649199513dccdadf4d4a",
+   "trades_archived": 23247,
+   "n": 23247,
+   "min_window_span": 2090,
+   "dense_windows": 4231,
+   "first_ts": 1778344025,
+   "last_ts": 1778896587
+  },
+  {
+   "wallet": "0x0e9413ac17b3912539e5926f4304195a31004d79",
+   "trades_archived": 5367,
+   "n": 5367,
+   "min_window_span": 338,
+   "dense_windows": 4369,
+   "first_ts": 1772750197,
+   "last_ts": 1772768657
+  },
+  {
+   "wallet": "0x0f432c82fd395eb24f94cbebb709473259779319",
+   "trades_archived": 3661,
+   "n": 3661,
+   "min_window_span": 1488,
+   "dense_windows": 372,
+   "first_ts": 1771472564,
+   "last_ts": 1779183848
+  },
+  {
+   "wallet": "0x0fa2acffbe702f19ae04cc90a8237f6423f94cea",
+   "trades_archived": 9670,
+   "n": 9670,
+   "min_window_span": 1430,
+   "dense_windows": 4834,
+   "first_ts": 1776002435,
+   "last_ts": 1778930427
+  },
+  {
+   "wallet": "0x15e830871ede5dd839eb5e46041665b993594091",
+   "trades_archived": 2278,
+   "n": 2278,
+   "min_window_span": 1286,
+   "dense_windows": 1318,
+   "first_ts": 1775582693,
+   "last_ts": 1775956421
+  },
+  {
+   "wallet": "0x16f91db2592924cfed6e03b7e5cb5bb1e32299e3",
+   "trades_archived": 6001,
+   "n": 6001,
+   "min_window_span": 552,
+   "dense_windows": 1720,
+   "first_ts": 1729760447,
+   "last_ts": 1730474371
+  },
+  {
+   "wallet": "0x1868b2b85b32d2a8f58e44705629859e72062223",
+   "trades_archived": 6039,
+   "n": 6039,
+   "min_window_span": 1141,
+   "dense_windows": 2630,
+   "first_ts": 1778226371,
+   "last_ts": 1778308526
+  },
+  {
+   "wallet": "0x187852036adf96b74fbf1445f1b21e82414685e2",
+   "trades_archived": 12285,
+   "n": 12285,
+   "min_window_span": 220,
+   "dense_windows": 6136,
+   "first_ts": 1772005596,
+   "last_ts": 1779091651
+  },
+  {
+   "wallet": "0x1cdb4cac9d2428094058b60a0284c2c177dceb5c",
+   "trades_archived": 2108,
+   "n": 2108,
+   "min_window_span": 362,
+   "dense_windows": 1609,
+   "first_ts": 1772576245,
+   "last_ts": 1772582077
+  },
+  {
+   "wallet": "0x1d49642bd509dab3841104657fdff52813d87cc0",
+   "trades_archived": 7403,
+   "n": 7403,
+   "min_window_span": 340,
+   "dense_windows": 2187,
+   "first_ts": 1777747060,
+   "last_ts": 1779133495
+  },
+  {
+   "wallet": "0x1eda9a5cdaddd0a996c6f804c4697b1d2bdc9c47",
+   "trades_archived": 35484,
+   "n": 35484,
+   "min_window_span": 230,
+   "dense_windows": 19791,
+   "first_ts": 1771296903,
+   "last_ts": 1777939704
+  },
+  {
+   "wallet": "0x23786fdad0073692157c6d7dc81f281843a35fcb",
+   "trades_archived": 11138,
+   "n": 11138,
+   "min_window_span": 318,
+   "dense_windows": 4243,
+   "first_ts": 1730237921,
+   "last_ts": 1730864505
+  },
+  {
+   "wallet": "0x23f544a1f92150f25ebafae0e40f5db448b37a6e",
+   "trades_archived": 48212,
+   "n": 48212,
+   "min_window_span": 304,
+   "dense_windows": 15546,
+   "first_ts": 1776725770,
+   "last_ts": 1779164253
+  },
+  {
+   "wallet": "0x25b6d17246d5e1c0d6e91ed3fe2af038d4b85bc6",
+   "trades_archived": 681,
+   "n": 681,
+   "min_window_span": 2832,
+   "dense_windows": 85,
+   "first_ts": 1730493930,
+   "last_ts": 1777319208
+  },
+  {
+   "wallet": "0x28c090de0fa57a9e7cb8fd27e73c1d33413efaa1",
+   "trades_archived": 4073,
+   "n": 4073,
+   "min_window_span": 926,
+   "dense_windows": 1194,
+   "first_ts": 1771164593,
+   "last_ts": 1771204201
+  },
+  {
+   "wallet": "0x2a612ac0b181a4991f33ff087086717c3bdb2ca6",
+   "trades_archived": 105995,
+   "n": 105995,
+   "min_window_span": 282,
+   "dense_windows": 79418,
+   "first_ts": 1774047913,
+   "last_ts": 1777725316
+  },
+  {
+   "wallet": "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
+   "trades_archived": 94055,
+   "n": 94055,
+   "min_window_span": 1513,
+   "dense_windows": 1004,
+   "first_ts": 1770172224,
+   "last_ts": 1783516283
+  },
+  {
+   "wallet": "0x36946572d760b5b1a50cfcd213ba901f1cd4c5ae",
+   "trades_archived": 3192,
+   "n": 3192,
+   "min_window_span": 468,
+   "dense_windows": 1160,
+   "first_ts": 1772669303,
+   "last_ts": 1772765075
+  },
+  {
+   "wallet": "0x38973f5b3abbbcbed16ee15c2baa5a3f16b843ab",
+   "trades_archived": 4461,
+   "n": 4461,
+   "min_window_span": 412,
+   "dense_windows": 3461,
+   "first_ts": 1768623970,
+   "last_ts": 1768877828
+  },
+  {
+   "wallet": "0x3b918573b00aa85bb8bbcb6e0bbfc6c55c73990c",
+   "trades_archived": 4816,
+   "n": 4816,
+   "min_window_span": 1916,
+   "dense_windows": 1089,
+   "first_ts": 1771856022,
+   "last_ts": 1773838247
+  },
+  {
+   "wallet": "0x3c27b6ef2d914abbc3c96948a942e295b2d11b56",
+   "trades_archived": 12862,
+   "n": 12862,
+   "min_window_span": 114,
+   "dense_windows": 7648,
+   "first_ts": 1768883158,
+   "last_ts": 1769658956
+  },
+  {
+   "wallet": "0x3c614d3a0fa683765b704514238c4ff1acb10aac",
+   "trades_archived": 73914,
+   "n": 73914,
+   "min_window_span": 816,
+   "dense_windows": 54195,
+   "first_ts": 1777444922,
+   "last_ts": 1778063484
+  },
+  {
+   "wallet": "0x3fe40b498f14760ffd592a75eb94995b533566b3",
+   "trades_archived": 1572,
+   "n": 1572,
+   "min_window_span": 1738,
+   "dense_windows": 182,
+   "first_ts": 1771292289,
+   "last_ts": 1778515611
+  },
+  {
+   "wallet": "0x4180b7b15ebcdbbb4863bbde855a3826a82ffb3c",
+   "trades_archived": 6291,
+   "n": 6291,
+   "min_window_span": 992,
+   "dense_windows": 4270,
+   "first_ts": 1777726020,
+   "last_ts": 1777896090
+  },
+  {
+   "wallet": "0x48ac725cae99c545c2676b4bf03493f039b45e03",
+   "trades_archived": 10422,
+   "n": 10422,
+   "min_window_span": 24,
+   "dense_windows": 7741,
+   "first_ts": 1772965069,
+   "last_ts": 1773175109
+  },
+  {
+   "wallet": "0x4d2b54d32f0f420f4442f755cb882e6d8f835271",
+   "trades_archived": 11176,
+   "n": 11176,
+   "min_window_span": 124,
+   "dense_windows": 6357,
+   "first_ts": 1775414435,
+   "last_ts": 1778788672
+  },
+  {
+   "wallet": "0x511e5c7b146d861a66b29f8ba891e143306d1a69",
+   "trades_archived": 9144,
+   "n": 9144,
+   "min_window_span": 48,
+   "dense_windows": 7553,
+   "first_ts": 1772515841,
+   "last_ts": 1772582365
+  },
+  {
+   "wallet": "0x512130e466ab56e29e98cccc1a5f1c7e75974aca",
+   "trades_archived": 34062,
+   "n": 34062,
+   "min_window_span": 116,
+   "dense_windows": 32507,
+   "first_ts": 1729818463,
+   "last_ts": 1729915773
+  },
+  {
+   "wallet": "0x5357f2705562cf8dcb9df553b776f0309c45a8f8",
+   "trades_archived": 11457,
+   "n": 11457,
+   "min_window_span": 1428,
+   "dense_windows": 1920,
+   "first_ts": 1768449926,
+   "last_ts": 1774014437
+  },
+  {
+   "wallet": "0x542b546f49025e5e1a76350df7b6fb9f0cd3a0eb",
+   "trades_archived": 185326,
+   "n": 185326,
+   "min_window_span": 476,
+   "dense_windows": 177166,
+   "first_ts": 1773152773,
+   "last_ts": 1773923423
+  },
+  {
+   "wallet": "0x5557f74a8b21634d2daa199b6364cef137276f2c",
+   "trades_archived": 4275,
+   "n": 4275,
+   "min_window_span": 333,
+   "dense_windows": 2622,
+   "first_ts": 1730230920,
+   "last_ts": 1730867661
+  },
+  {
+   "wallet": "0x562463dbda0fad24395bd2380d37f2295a4e6d4d",
+   "trades_archived": 112596,
+   "n": 112596,
+   "min_window_span": 858,
+   "dense_windows": 92909,
+   "first_ts": 1776778640,
+   "last_ts": 1779187681
+  },
+  {
+   "wallet": "0x5b528a640796cb4e4da6089c7f09e3c69df6a5a4",
+   "trades_archived": 799,
+   "n": 799,
+   "min_window_span": 890,
+   "dense_windows": 297,
+   "first_ts": 1776293848,
+   "last_ts": 1776298858
+  },
+  {
+   "wallet": "0x5c8b9b702d4cc07cfa55bb9661064b4899bf3793",
+   "trades_archived": 48019,
+   "n": 48019,
+   "min_window_span": 80,
+   "dense_windows": 46305,
+   "first_ts": 1730186021,
+   "last_ts": 1730294562
+  },
+  {
+   "wallet": "0x5cc1fdcbee78c3c55d310cf50a69d97adbb96ca9",
+   "trades_archived": 3171,
+   "n": 3171,
+   "min_window_span": 1284,
+   "dense_windows": 2661,
+   "first_ts": 1774778422,
+   "last_ts": 1778408719
+  },
+  {
+   "wallet": "0x5ebcb864ac87f644a14ee85f782ddf89fb6b5692",
+   "trades_archived": 60667,
+   "n": 60667,
+   "min_window_span": 462,
+   "dense_windows": 52959,
+   "first_ts": 1777770614,
+   "last_ts": 1779123522
+  },
+  {
+   "wallet": "0x5f75864578509732f13cb6b12336c3581b157441",
+   "trades_archived": 27266,
+   "n": 27266,
+   "min_window_span": 156,
+   "dense_windows": 26740,
+   "first_ts": 1729908105,
+   "last_ts": 1729985617
+  },
+  {
+   "wallet": "0x6136e86071f27eb91d7568d0a33abb4460695850",
+   "trades_archived": 1975,
+   "n": 1975,
+   "min_window_span": 2443,
+   "dense_windows": 501,
+   "first_ts": 1744774379,
+   "last_ts": 1745236539
+  },
+  {
+   "wallet": "0x627717105a280219686924288274b3b56d660327",
+   "trades_archived": 3442,
+   "n": 3442,
+   "min_window_span": 1322,
+   "dense_windows": 1742,
+   "first_ts": 1772003308,
+   "last_ts": 1779095261
+  },
+  {
+   "wallet": "0x63fba516244a9d412fafd108966d9bc1271aaa53",
+   "trades_archived": 157006,
+   "n": 157006,
+   "min_window_span": 1038,
+   "dense_windows": 128660,
+   "first_ts": 1767860225,
+   "last_ts": 1769220660
+  },
+  {
+   "wallet": "0x64fc4db453860005f13f8f53c179746185dee1c5",
+   "trades_archived": 2122,
+   "n": 2122,
+   "min_window_span": 2714,
+   "dense_windows": 191,
+   "first_ts": 1767998270,
+   "last_ts": 1778390092
+  },
+  {
+   "wallet": "0x658d9a7687625ed2053f119c2764c34da5337003",
+   "trades_archived": 4404,
+   "n": 4404,
+   "min_window_span": 314,
+   "dense_windows": 363,
+   "first_ts": 1774054513,
+   "last_ts": 1778786029
+  },
+  {
+   "wallet": "0x683a1b9966af05467ce87a6af003e3544c13792c",
+   "trades_archived": 791,
+   "n": 791,
+   "min_window_span": 1346,
+   "dense_windows": 292,
+   "first_ts": 1730869563,
+   "last_ts": 1730872743
+  },
+  {
+   "wallet": "0x6fdb989f612dca6040311f809fe4e08fd18f090e",
+   "trades_archived": 7284,
+   "n": 7284,
+   "min_window_span": 642,
+   "dense_windows": 3456,
+   "first_ts": 1776345012,
+   "last_ts": 1778339685
+  },
+  {
+   "wallet": "0x753e554feb327f9d4f7bff8a6ebdced98fbd2046",
+   "trades_archived": 167844,
+   "n": 167844,
+   "min_window_span": 74,
+   "dense_windows": 148988,
+   "first_ts": 1770264019,
+   "last_ts": 1772450469
+  },
+  {
+   "wallet": "0x76a427ef4a62c36f7a5d644df0eefe21fa526f3a",
+   "trades_archived": 1552,
+   "n": 1552,
+   "min_window_span": 2284,
+   "dense_windows": 169,
+   "first_ts": 1777750440,
+   "last_ts": 1778322164
+  },
+  {
+   "wallet": "0x76b8007b407fa14c650138b25fb25e22ac149a33",
+   "trades_archived": 875,
+   "n": 875,
+   "min_window_span": 2436,
+   "dense_windows": 113,
+   "first_ts": 1777420488,
+   "last_ts": 1777441160
+  },
+  {
+   "wallet": "0x7d6fa306427338176c06c21efd53459cdd3a7514",
+   "trades_archived": 10839,
+   "n": 10839,
+   "min_window_span": 522,
+   "dense_windows": 6435,
+   "first_ts": 1774479189,
+   "last_ts": 1778486491
+  },
+  {
+   "wallet": "0x7d99b600b74e32e97daf3e5e8f2d0e652970da63",
+   "trades_archived": 2228,
+   "n": 2228,
+   "min_window_span": 1174,
+   "dense_windows": 1654,
+   "first_ts": 1772672843,
+   "last_ts": 1778990524
+  },
+  {
+   "wallet": "0x7eb846920c5481420a1b0e55efee26316a2e2524",
+   "trades_archived": 1608,
+   "n": 1608,
+   "min_window_span": 582,
+   "dense_windows": 380,
+   "first_ts": 1772278467,
+   "last_ts": 1776290780
+  },
+  {
+   "wallet": "0x809205fb1c91f746b9703ca412c4fdd0435db8a2",
+   "trades_archived": 20616,
+   "n": 20616,
+   "min_window_span": 910,
+   "dense_windows": 10017,
+   "first_ts": 1765926433,
+   "last_ts": 1779101402
+  },
+  {
+   "wallet": "0x832aaf3042b03fd43576f45bfa14fbca319adb9d",
+   "trades_archived": 1169,
+   "n": 1169,
+   "min_window_span": 1242,
+   "dense_windows": 209,
+   "first_ts": 1769760176,
+   "last_ts": 1778750520
+  },
+  {
+   "wallet": "0x862488769cd5a7de75a16b277985544b83dbfbe6",
+   "trades_archived": 1569,
+   "n": 1569,
+   "min_window_span": 3214,
+   "dense_windows": 74,
+   "first_ts": 1769167946,
+   "last_ts": 1779179907
+  },
+  {
+   "wallet": "0x86b32df484bc6cfa72046ae9a62d3737d7b683b6",
+   "trades_archived": 2765,
+   "n": 2765,
+   "min_window_span": 564,
+   "dense_windows": 1002,
+   "first_ts": 1768502488,
+   "last_ts": 1768870722
+  },
+  {
+   "wallet": "0x876426b52898c295848f56760dd24b55eda2604a",
+   "trades_archived": 7856,
+   "n": 7856,
+   "min_window_span": 1190,
+   "dense_windows": 2372,
+   "first_ts": 1770664223,
+   "last_ts": 1770947271
+  },
+  {
+   "wallet": "0x8c34f33896afefa902688a093cbe1659457c2d7d",
+   "trades_archived": 7743,
+   "n": 7743,
+   "min_window_span": 1712,
+   "dense_windows": 443,
+   "first_ts": 1771140823,
+   "last_ts": 1777558168
+  },
+  {
+   "wallet": "0x8e433d051bfb5cc6a1f7e5a0452029b7ffb4a3cd",
+   "trades_archived": 32699,
+   "n": 32699,
+   "min_window_span": 560,
+   "dense_windows": 4915,
+   "first_ts": 1771519998,
+   "last_ts": 1775783831
+  },
+  {
+   "wallet": "0x8f6fd27c897b5442e7f5e67d52ef80bccc4f0cf2",
+   "trades_archived": 2401,
+   "n": 2401,
+   "min_window_span": 1946,
+   "dense_windows": 754,
+   "first_ts": 1777580894,
+   "last_ts": 1777646380
+  },
+  {
+   "wallet": "0x965d0b754328692a1ceae77ca9219347dc353a0a",
+   "trades_archived": 52133,
+   "n": 52133,
+   "min_window_span": 418,
+   "dense_windows": 1533,
+   "first_ts": 1772381729,
+   "last_ts": 1774873110
+  },
+  {
+   "wallet": "0x99eccf7c575974bdfa801f0ef262889191e121dd",
+   "trades_archived": 5087,
+   "n": 5087,
+   "min_window_span": 634,
+   "dense_windows": 2248,
+   "first_ts": 1771694666,
+   "last_ts": 1771782300
+  },
+  {
+   "wallet": "0x9adff33e757c0987015353863a98d1ecc524f6c0",
+   "trades_archived": 3142,
+   "n": 3142,
+   "min_window_span": 354,
+   "dense_windows": 1575,
+   "first_ts": 1771630480,
+   "last_ts": 1771674164
+  },
+  {
+   "wallet": "0x9e2fed2ff6a3500691f4fa702713e34c88da2403",
+   "trades_archived": 7783,
+   "n": 7783,
+   "min_window_span": 2704,
+   "dense_windows": 1095,
+   "first_ts": 1776981322,
+   "last_ts": 1778853441
+  },
+  {
+   "wallet": "0x9fb88fb696ddb50bdb887097298d2b89e1fe0ea5",
+   "trades_archived": 6815,
+   "n": 6815,
+   "min_window_span": 198,
+   "dense_windows": 5876,
+   "first_ts": 1772091056,
+   "last_ts": 1778746037
+  },
+  {
+   "wallet": "0xa217bf045d0fcf621ecd1876e445b694ddc85396",
+   "trades_archived": 870,
+   "n": 870,
+   "min_window_span": 1738,
+   "dense_windows": 74,
+   "first_ts": 1730479366,
+   "last_ts": 1778470536
+  },
+  {
+   "wallet": "0xa3803fb09f22623f9fe64fc83dd25df0cbee08a4",
+   "trades_archived": 1656,
+   "n": 1656,
+   "min_window_span": 904,
+   "dense_windows": 216,
+   "first_ts": 1768326887,
+   "last_ts": 1778035324
+  },
+  {
+   "wallet": "0xa5e83423126dbc6cdb34f10f37f5d27668ab95f5",
+   "trades_archived": 20225,
+   "n": 20225,
+   "min_window_span": 198,
+   "dense_windows": 16773,
+   "first_ts": 1768954860,
+   "last_ts": 1771115665
+  },
+  {
+   "wallet": "0xa6ee41b52d95508b8ce3241fc2c6c487dfd97bd7",
+   "trades_archived": 2265,
+   "n": 2265,
+   "min_window_span": 784,
+   "dense_windows": 536,
+   "first_ts": 1775250957,
+   "last_ts": 1775297393
+  },
+  {
+   "wallet": "0xa9ae84ee529dbec0c6634b08cd97d3f13f7d74f5",
+   "trades_archived": 16714,
+   "n": 16714,
+   "min_window_span": 16,
+   "dense_windows": 14678,
+   "first_ts": 1772382145,
+   "last_ts": 1772575787
+  },
+  {
+   "wallet": "0xac593dc9c4dadd7556b5579703c32911d5233877",
+   "trades_archived": 4207,
+   "n": 4207,
+   "min_window_span": 1858,
+   "dense_windows": 1137,
+   "first_ts": 1772629011,
+   "last_ts": 1779194304
+  },
+  {
+   "wallet": "0xad1332b3ed3215e51971c1eaa6f53d68fc916274",
+   "trades_archived": 914,
+   "n": 914,
+   "min_window_span": 1538,
+   "dense_windows": 415,
+   "first_ts": 1777778174,
+   "last_ts": 1777782184
+  },
+  {
+   "wallet": "0xad1754ffaf858dd79bf7657c1f5935f40e5e752b",
+   "trades_archived": 13827,
+   "n": 13827,
+   "min_window_span": 980,
+   "dense_windows": 9020,
+   "first_ts": 1769642064,
+   "last_ts": 1778787993
+  },
+  {
+   "wallet": "0xad76a5b726e31d1a0803a11457db9477ec8493fe",
+   "trades_archived": 2382,
+   "n": 2382,
+   "min_window_span": 898,
+   "dense_windows": 495,
+   "first_ts": 1777827384,
+   "last_ts": 1778025932
+  },
+  {
+   "wallet": "0xadb65251c8ede47f65cf80616d6dede0671bd200",
+   "trades_archived": 5209,
+   "n": 5209,
+   "min_window_span": 2232,
+   "dense_windows": 554,
+   "first_ts": 1770845073,
+   "last_ts": 1779029913
+  },
+  {
+   "wallet": "0xaef3ae87d47e4f54850054a3e73752320ce69f90",
+   "trades_archived": 5740,
+   "n": 5740,
+   "min_window_span": 238,
+   "dense_windows": 4077,
+   "first_ts": 1773150255,
+   "last_ts": 1779128749
+  },
+  {
+   "wallet": "0xb084f3b34c8dd4f43a5bfb97c27765def2329764",
+   "trades_archived": 517,
+   "n": 517,
+   "min_window_span": 2650,
+   "dense_windows": 18,
+   "first_ts": 1778671399,
+   "last_ts": 1778674463
+  },
+  {
+   "wallet": "0xb2873f3469db073b34b1f5e2f87222ad3ec7d82c",
+   "trades_archived": 4928,
+   "n": 4928,
+   "min_window_span": 3372,
+   "dense_windows": 42,
+   "first_ts": 1773305685,
+   "last_ts": 1779093431
+  },
+  {
+   "wallet": "0xb41ac4e8907de5460e2dac0a98df8d1530d33a25",
+   "trades_archived": 371572,
+   "n": 371572,
+   "min_window_span": 672,
+   "dense_windows": 103502,
+   "first_ts": 1734947723,
+   "last_ts": 1777843972
+  },
+  {
+   "wallet": "0xb581c2eebcbc6df696623f6912a34d3fed58d599",
+   "trades_archived": 4735,
+   "n": 4735,
+   "min_window_span": 1698,
+   "dense_windows": 1386,
+   "first_ts": 1771485738,
+   "last_ts": 1778577384
+  },
+  {
+   "wallet": "0xb91115b26124cd814f28d534bff4965e460d7935",
+   "trades_archived": 24861,
+   "n": 24861,
+   "min_window_span": 132,
+   "dense_windows": 18513,
+   "first_ts": 1730271704,
+   "last_ts": 1730696166
+  },
+  {
+   "wallet": "0xb96903067a7129d14931c5a7e82b1a7c8a3c66a1",
+   "trades_archived": 3760,
+   "n": 3760,
+   "min_window_span": 864,
+   "dense_windows": 2280,
+   "first_ts": 1771680566,
+   "last_ts": 1771721644
+  },
+  {
+   "wallet": "0xbaa56ef13e2a76a276675c3fcf2a5b912cbd8e90",
+   "trades_archived": 1910,
+   "n": 1910,
+   "min_window_span": 506,
+   "dense_windows": 786,
+   "first_ts": 1776279918,
+   "last_ts": 1777494718
+  },
+  {
+   "wallet": "0xbbe5806feb262f4c87db6ccd0ce0be2e0cb718cf",
+   "trades_archived": 155103,
+   "n": 155103,
+   "min_window_span": 372,
+   "dense_windows": 151508,
+   "first_ts": 1770264327,
+   "last_ts": 1771110441
+  },
+  {
+   "wallet": "0xbd2df3387fa0274e50530b662b7cf7621df7b40f",
+   "trades_archived": 2609,
+   "n": 2609,
+   "min_window_span": 786,
+   "dense_windows": 862,
+   "first_ts": 1777420426,
+   "last_ts": 1778218019
+  },
+  {
+   "wallet": "0xbd6ddd90a7c66c0f7110d2c97cc6701ba18e30b0",
+   "trades_archived": 2613,
+   "n": 2613,
+   "min_window_span": 316,
+   "dense_windows": 774,
+   "first_ts": 1774745978,
+   "last_ts": 1775259297
+  },
+  {
+   "wallet": "0xbe166171e7855cca88c8f4790867477938d2d380",
+   "trades_archived": 2173,
+   "n": 2173,
+   "min_window_span": 806,
+   "dense_windows": 653,
+   "first_ts": 1772081676,
+   "last_ts": 1778598125
+  },
+  {
+   "wallet": "0xbefbdd434fc8d99da3e37c20cb0f088ec3168a78",
+   "trades_archived": 284971,
+   "n": 284971,
+   "min_window_span": 384,
+   "dense_windows": 195291,
+   "first_ts": 1763552725,
+   "last_ts": 1765390488
+  },
+  {
+   "wallet": "0xbf16449cc4f6c2cfe2722319d8ff934b0abd2266",
+   "trades_archived": 650,
+   "n": 650,
+   "min_window_span": 520,
+   "dense_windows": 129,
+   "first_ts": 1774771854,
+   "last_ts": 1776154007
+  },
+  {
+   "wallet": "0xc0c9c5b5da21305d9713029f7ad3f058b97ff28a",
+   "trades_archived": 1752,
+   "n": 1752,
+   "min_window_span": 46,
+   "dense_windows": 417,
+   "first_ts": 1776679834,
+   "last_ts": 1778352890
+  },
+  {
+   "wallet": "0xc31f7231ced7e42fa939dad03d24a256c847bdd0",
+   "trades_archived": 4518,
+   "n": 4518,
+   "min_window_span": 2076,
+   "dense_windows": 2309,
+   "first_ts": 1776819524,
+   "last_ts": 1778725348
+  },
+  {
+   "wallet": "0xc453f25c338ee34b9fd53c7ec798ab76c6fab2ec",
+   "trades_archived": 2526,
+   "n": 2526,
+   "min_window_span": 308,
+   "dense_windows": 1746,
+   "first_ts": 1776652462,
+   "last_ts": 1776666500
+  },
+  {
+   "wallet": "0xcc553b67cfa321f74c56515727ebe16dcb137cb3",
+   "trades_archived": 22099,
+   "n": 22099,
+   "min_window_span": 56,
+   "dense_windows": 19793,
+   "first_ts": 1768363378,
+   "last_ts": 1768522290
+  },
+  {
+   "wallet": "0xcd99b83f8c92669f908f14610f67e251cf7b83cc",
+   "trades_archived": 7532,
+   "n": 7532,
+   "min_window_span": 1553,
+   "dense_windows": 2370,
+   "first_ts": 1779090176,
+   "last_ts": 1779185092
+  },
+  {
+   "wallet": "0xcf88863efd5af1d3a818083fac1629b1a2712fbf",
+   "trades_archived": 1063,
+   "n": 1063,
+   "min_window_span": 2214,
+   "dense_windows": 65,
+   "first_ts": 1774152487,
+   "last_ts": 1774160285
+  },
+  {
+   "wallet": "0xd32c2cec7cdc9ad6fff14f9b0fb348962cc7f93a",
+   "trades_archived": 21876,
+   "n": 21876,
+   "min_window_span": 357,
+   "dense_windows": 7834,
+   "first_ts": 1778294955,
+   "last_ts": 1779111069
+  },
+  {
+   "wallet": "0xd3f49be294e5dfca74978d00928e16cfc16016f3",
+   "trades_archived": 1581,
+   "n": 1581,
+   "min_window_span": 1756,
+   "dense_windows": 35,
+   "first_ts": 1773162505,
+   "last_ts": 1779173198
+  },
+  {
+   "wallet": "0xd7c626093f28383612363889ad811fc736d3706f",
+   "trades_archived": 89873,
+   "n": 89873,
+   "min_window_span": 658,
+   "dense_windows": 79980,
+   "first_ts": 1776316220,
+   "last_ts": 1778158505
+  },
+  {
+   "wallet": "0xd81c600543c217d1340bcad635cade18b917539b",
+   "trades_archived": 5453,
+   "n": 5453,
+   "min_window_span": 298,
+   "dense_windows": 3956,
+   "first_ts": 1774995561,
+   "last_ts": 1775020331
+  },
+  {
+   "wallet": "0xd81c7fc989feb683574883e85d93bf0ffabf1a98",
+   "trades_archived": 102486,
+   "n": 102486,
+   "min_window_span": 952,
+   "dense_windows": 97129,
+   "first_ts": 1770263811,
+   "last_ts": 1771078457
+  },
+  {
+   "wallet": "0xdae4dc5f027a6c58a043483429a5f4bac4b5f1fc",
+   "trades_archived": 2532,
+   "n": 2532,
+   "min_window_span": 858,
+   "dense_windows": 545,
+   "first_ts": 1772144114,
+   "last_ts": 1775329925
+  },
+  {
+   "wallet": "0xdcdef208c7bbbbd3423ca01d4df654ddc9437960",
+   "trades_archived": 4731,
+   "n": 4731,
+   "min_window_span": 110,
+   "dense_windows": 1838,
+   "first_ts": 1775464483,
+   "last_ts": 1779159094
+  },
+  {
+   "wallet": "0xdcf93f3863564d89739e7df937a260ae30ad4cfd",
+   "trades_archived": 17550,
+   "n": 17550,
+   "min_window_span": 610,
+   "dense_windows": 11427,
+   "first_ts": 1768132636,
+   "last_ts": 1778170174
+  },
+  {
+   "wallet": "0xddb46d5be3ee57c2cdfe539ce3f6d4b8b78a5d26",
+   "trades_archived": 8999,
+   "n": 8999,
+   "min_window_span": 292,
+   "dense_windows": 2286,
+   "first_ts": 1774676579,
+   "last_ts": 1775087217
+  },
+  {
+   "wallet": "0xde17f7144fbd0eddb2679132c10ff5e74b120988",
+   "trades_archived": 153074,
+   "n": 153074,
+   "min_window_span": 76,
+   "dense_windows": 47342,
+   "first_ts": 1772373345,
+   "last_ts": 1774872630
+  },
+  {
+   "wallet": "0xdfa96eb4f330257534111fbd51d510f4872dfce3",
+   "trades_archived": 17984,
+   "n": 17984,
+   "min_window_span": 1904,
+   "dense_windows": 3304,
+   "first_ts": 1778345540,
+   "last_ts": 1778579129
+  },
+  {
+   "wallet": "0xe0317ff8baff05a02a302b9848a470efec4c5c08",
+   "trades_archived": 227391,
+   "n": 227391,
+   "min_window_span": 358,
+   "dense_windows": 105061,
+   "first_ts": 1774968313,
+   "last_ts": 1778868241
+  },
+  {
+   "wallet": "0xe248f81022491c06e2d1b9a6b604d75946869116",
+   "trades_archived": 4833,
+   "n": 4833,
+   "min_window_span": 1230,
+   "dense_windows": 3373,
+   "first_ts": 1774090965,
+   "last_ts": 1777468926
+  },
+  {
+   "wallet": "0xe280dc6b40997333826894e0f51ceddc9ebbdafb",
+   "trades_archived": 1004,
+   "n": 1004,
+   "min_window_span": 2668,
+   "dense_windows": 167,
+   "first_ts": 1774977639,
+   "last_ts": 1775509829
+  },
+  {
+   "wallet": "0xe2cd2aea8e0b02d04d0733868c88273278b73897",
+   "trades_archived": 14047,
+   "n": 14047,
+   "min_window_span": 106,
+   "dense_windows": 11941,
+   "first_ts": 1770538507,
+   "last_ts": 1778522052
+  },
+  {
+   "wallet": "0xe3d29b67455bc78e2a12c1821c33ebc6e347adbb",
+   "trades_archived": 1524,
+   "n": 1524,
+   "min_window_span": 340,
+   "dense_windows": 526,
+   "first_ts": 1774592677,
+   "last_ts": 1774650895
+  },
+  {
+   "wallet": "0xe522d2fe71d3db6b4efb7bc3059f26ab899cb700",
+   "trades_archived": 50472,
+   "n": 50472,
+   "min_window_span": 1507,
+   "dense_windows": 13485,
+   "first_ts": 1776745744,
+   "last_ts": 1779171411
+  },
+  {
+   "wallet": "0xeb63789fd5d4052c3a20880c4563db770cdef6a4",
+   "trades_archived": 2157,
+   "n": 2157,
+   "min_window_span": 1774,
+   "dense_windows": 1607,
+   "first_ts": 1774378279,
+   "last_ts": 1777233212
+  },
+  {
+   "wallet": "0xecb184f430b72fe02a36384c554e97beffe4cee0",
+   "trades_archived": 5311,
+   "n": 5311,
+   "min_window_span": 2724,
+   "dense_windows": 1363,
+   "first_ts": 1772147904,
+   "last_ts": 1779183848
+  },
+  {
+   "wallet": "0xf15ce80e309b1e83c4c00c30e2e9ef2d857478cc",
+   "trades_archived": 1503,
+   "n": 1503,
+   "min_window_span": 2966,
+   "dense_windows": 65,
+   "first_ts": 1768257333,
+   "last_ts": 1777967154
+  },
+  {
+   "wallet": "0xf1bb842abe5723be4d2643ab1720d962d115c2da",
+   "trades_archived": 5928,
+   "n": 5928,
+   "min_window_span": 250,
+   "dense_windows": 3815,
+   "first_ts": 1774840434,
+   "last_ts": 1774941901
+  },
+  {
+   "wallet": "0xf3efd184c2ae596e966754ae44ac93c0e25bec86",
+   "trades_archived": 7421,
+   "n": 7421,
+   "min_window_span": 868,
+   "dense_windows": 4663,
+   "first_ts": 1772748907,
+   "last_ts": 1778677470
+  },
+  {
+   "wallet": "0xf8001e720d275dcdc69adf94e5047f88f67524eb",
+   "trades_archived": 1475,
+   "n": 1475,
+   "min_window_span": 1794,
+   "dense_windows": 97,
+   "first_ts": 1770462873,
+   "last_ts": 1770684279
+  },
+  {
+   "wallet": "0xf8b70410718b7938d2029fe79758ab782b4d262e",
+   "trades_archived": 2580,
+   "n": 2580,
+   "min_window_span": 772,
+   "dense_windows": 1292,
+   "first_ts": 1775917371,
+   "last_ts": 1777472736
+  },
+  {
+   "wallet": "0xfc8dce60c93690dd7a22b0024693294f0afe55c5",
+   "trades_archived": 48609,
+   "n": 48609,
+   "min_window_span": 50,
+   "dense_windows": 42348,
+   "first_ts": 1769771856,
+   "last_ts": 1777281882
+  },
+  {
+   "wallet": "0xfd9157825cf0319ec610970cf156ec4bb5008fe9",
+   "trades_archived": 3652,
+   "n": 3652,
+   "min_window_span": 2002,
+   "dense_windows": 2493,
+   "first_ts": 1745808109,
+   "last_ts": 1746516248
+  },
+  {
+   "wallet": "0xfeb682f4218342c1fe436ce581cd57dd9ce6e49e",
+   "trades_archived": 1135,
+   "n": 1135,
+   "min_window_span": 2550,
+   "dense_windows": 541,
+   "first_ts": 1777648552,
+   "last_ts": 1778150245
+  },
+  {
+   "wallet": "0xfec31920efa8605c1dba8c8afd4c42a3fdadfef1",
+   "trades_archived": 781,
+   "n": 781,
+   "min_window_span": 210,
+   "dense_windows": 5,
+   "first_ts": 1776743738,
+   "last_ts": 1777608872
+  },
+  {
+   "wallet": "0xbf6755d00d146b95374e6b950b274bd81d7bfe3d",
+   "trades_archived": 613,
+   "n": 613,
+   "min_window_span": 212449,
+   "dense_windows": 0,
+   "first_ts": 1783373822,
+   "last_ts": 1783817366
+  },
+  {
+   "wallet": "0xd1c537b2a7cba8d365e111bffb9de7b205e2cbd0",
+   "trades_archived": 2611,
+   "n": 2611,
+   "min_window_span": 103776,
+   "dense_windows": 0,
+   "first_ts": 1778671625,
+   "last_ts": 1783818496
+  },
+  {
+   "wallet": "0x068162f52e8534620c419c174be1aa5337dff713",
+   "trades_archived": 5519,
+   "n": 5519,
+   "min_window_span": 54658,
+   "dense_windows": 0,
+   "first_ts": 1732189464,
+   "last_ts": 1784309314
+  },
+  {
+   "wallet": "0x65503c7f9e142ac88b1ce09df3363ff77f188451",
+   "trades_archived": 23618,
+   "n": 23618,
+   "min_window_span": 1484,
+   "dense_windows": 460,
+   "first_ts": 1776146357,
+   "last_ts": 1784495593
+  },
+  {
+   "wallet": "0x8b5a7da2fdf239b51b9c68a2a1a35bb156d200f2",
+   "trades_archived": 13568,
+   "n": 13568,
+   "min_window_span": 27670,
+   "dense_windows": 0,
+   "first_ts": 1716953624,
+   "last_ts": 1784487141
+  }
+ ]
+}

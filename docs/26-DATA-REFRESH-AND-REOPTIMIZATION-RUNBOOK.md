@@ -200,8 +200,9 @@ In order it runs: **Step 0** data refresh — `winner-discovery
 --defer-activation` (leaderboard + datadash ingest) → one transactionally
 audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`) →
 `backfill --defer-activation` (trades only) → `events` → `resolutions` →
-The production wrapper performs no infrastructure or ordinary purge; rank/export applies
-infrastructure, tombstone, wallet-fence, and current-eligibility filters without deleting history.
+The production wrapper performs no infrastructure or ordinary purge; exclusions gate
+acquisition (discovery, activation, and backfill), and rank/export applies only trade-recency and
+current-eligibility filters without deleting history (`docs/37`).
 `resolutions` performs a full CLOB closed-market re-walk, backfills missing
 schedule `end_date`s, then audits and repairs every traded, scheduled past-end
 market still missing a terminal row. The subcommand runs the full

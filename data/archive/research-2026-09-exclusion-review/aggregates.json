@@ -1,0 +1,203 @@
+{
+ "observed_at": {
+  "ro": "2026-09-10T21:11:29Z",
+  "ro2": "2026-09-10T21:16:32Z",
+  "ro3": "2026-09-10T21:19:00Z",
+  "ro4": "2026-09-10T21:28:20Z",
+  "ro5": "2026-09-10T21:31:29Z",
+  "ro6": "2026-09-10T21:48:44Z",
+  "ro7": "2026-09-10T21:52:14Z"
+ },
+ "live_schema_user_version": 1,
+ "live_tombstones_by_reason": [
+  {
+   "reason": "infra",
+   "n": 14900,
+   "mn": 1784530028,
+   "mx": 1788182247
+  },
+  {
+   "reason": "proven_loser",
+   "n": 10468,
+   "mn": 1781996428,
+   "mx": 1788184618
+  }
+ ],
+ "live_wallet_rows_by_flags": [
+  {
+   "is_infra": 0,
+   "is_active": 0,
+   "n": 1274380
+  },
+  {
+   "is_infra": 0,
+   "is_active": 1,
+   "n": 279478
+  },
+  {
+   "is_infra": 1,
+   "is_active": 1,
+   "n": 53
+  }
+ ],
+ "live_tombstone_and_wallet_row_overlap": 0,
+ "live_flagged_wallets": {
+  "at_ro": 53,
+  "at_ro5": 54,
+  "at_ro6": 55,
+  "at_ro7": 56,
+  "trade_rows_held_at_ro5": 0
+ },
+ "cohort_live_state": {
+  "tombstones": 27,
+  "wallet_rows": 0,
+  "trade_groups": 0
+ },
+ "active_universe": {
+  "n": 279478,
+  "trades": 167703257
+ },
+ "archive_manifest_by_reason": [
+  {
+   "reason": "dead_weight",
+   "n": 1062637,
+   "trades": 75975622,
+   "mn": 1783382809,
+   "mx": 1788184618
+  },
+  {
+   "reason": "infra",
+   "n": 14900,
+   "trades": 105464716,
+   "mn": 1784530028,
+   "mx": 1788182247
+  },
+  {
+   "reason": "proven_loser",
+   "n": 6705,
+   "trades": 10694980,
+   "mn": 1783382809,
+   "mx": 1788184618
+  }
+ ],
+ "csv_intersection": {
+  "csv_addr_count": 14422,
+  "csv_tombstoned": 14422,
+  "csv_tombstoned_by_reason": {
+   "infra": 14422
+  },
+  "csv_not_tombstoned": 0,
+  "infra_tombstones_total": 14900,
+  "infra_tombstones_outside_csv": 478,
+  "exchange_tombstones": {
+   "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e": [
+    "infra",
+    1784530028
+   ],
+   "0xc5d563a36ae78145c45a50134d48a1215220f80a": [
+    "infra",
+    1784747039
+   ],
+   "0xe111180000d2663c0091e4f400237545b87b996b": [
+    "infra",
+    1784747039
+   ],
+   "0xe2222d279d744050d28e00520010520000310f59": [
+    "infra",
+    1784747039
+   ]
+  },
+  "archive_infra_csv_members": {
+   "n": 14422,
+   "with_trades": 8115,
+   "trades": 101986315,
+   "zero_trades": 6307
+  },
+  "archive_infra_non_csv": {
+   "n": 478,
+   "with_trades": 136,
+   "trades": 3478401
+  }
+ },
+ "cohort_archived_trades_total": 419864,
+ "cohort_verdicts": {
+  "recommend reclassification for requalification": 18,
+  "retain with evidence": 2,
+  "unresolved: never ingested": 4
+ },
+ "any_window_sample": {
+  "seed": 589,
+  "population": 44460,
+  "sampled": 300,
+  "with_500_trades": 300,
+  "any_window_dense": 9,
+  "oldest500_fires": 0,
+  "newest500_fires": 0,
+  "sampled_trades": 920773,
+  "dense_wallets_trades": 165893,
+  "median_trades": 1482.0
+ },
+ "non_csv_infra_with_archived_trades": {
+  "n": 136,
+  "with_dense_window": 132,
+  "without_dense_window": 4,
+  "under_500_trades": 0
+ },
+ "pending_publication_marker_exists": false,
+ "recent_ranking_csv_overlap": [
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260909T002836Z/activated_wallets.csv",
+   "rows": 20000,
+   "flagged_overlap": 13,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260909T002836Z/latency_shift_ranked.csv",
+   "rows": 1064,
+   "flagged_overlap": 0,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260909T002836Z/oracle_outcomes.csv",
+   "rows": 382382,
+   "flagged_overlap": 0,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260909T002836Z/ranked_72hr_buyandhold.csv",
+   "rows": 105325,
+   "flagged_overlap": 0,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260910T002554Z/activated_wallets.csv",
+   "rows": 20000,
+   "flagged_overlap": 7,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260910T002554Z/latency_shift_ranked.csv",
+   "rows": 1056,
+   "flagged_overlap": 0,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260910T002554Z/oracle_outcomes.csv",
+   "rows": 381334,
+   "flagged_overlap": 0,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260910T002554Z/ranked_72hr_buyandhold.csv",
+   "rows": 107364,
+   "flagged_overlap": 0,
+   "tombstone_overlap": 0
+  },
+  {
+   "file": "/home/pi/prediction-markets/data/eval-results/cron-20260910T210538Z/activated_wallets.csv",
+   "rows": 20000,
+   "flagged_overlap": 3,
+   "tombstone_overlap": 0
+  }
+ ]
+}
