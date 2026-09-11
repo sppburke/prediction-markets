@@ -604,6 +604,16 @@ impl ActivityReadVerification<'_> {
                 "complete activity read commitment differs from its frozen proof",
             ));
         }
+        if commitment
+            .bindings
+            .as_ref()
+            .is_some_and(|bindings| !bindings.is_empty())
+            && commitment.read_proof.is_none()
+        {
+            return Err(complete_activity_read_error(
+                "binding commitment read proof is absent",
+            ));
+        }
         if let Some(proof) = &commitment.read_proof
             && (self.version != 5
                 || proof.page_occurrences != self.page_occurrences

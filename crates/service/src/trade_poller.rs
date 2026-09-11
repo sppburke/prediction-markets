@@ -5,7 +5,8 @@
 //! reader to a fixed end, and sends only complete epoch-second buckets to the
 //! orchestrator's single [`crate::bucket_commit::BucketCommitEngine`] owner.
 //! A websocket observation remains an obligation, derived from the source log
-//! on restart, until its group has a durable terminal/apply record.
+//! on restart, until its target has a durable terminal/apply record or its
+//! wallet has a permanent fence and the observation cannot be bound to a target.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -258,29 +259,41 @@ impl ActivityCandidates {
         paper_state: &PaperStateDb,
         source_receipts: &SourceReceiptIndex,
     ) -> Result<ReconciliationObligations, ObligationRebuildError> {
-        let mut bindings = Vec::new();
+        let mut bindings = HashMap::<_, Vec<ObservationBinding>>::new();
         for receipt in self.binding_commitments {
-            bindings.extend(
+            for binding in
                 crate::bucket_commit::verified_commitment_bindings(receipt, source_receipts)
-                    .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?,
-            );
+                    .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?
+            {
+                bindings
+                    .entry((
+                        binding.stream_group_id.clone(),
+                        binding.stream_receipt.sequence,
+                        binding.stream_receipt.this_hash,
+                    ))
+                    .or_default()
+                    .push(binding);
+            }
         }
         let mut obligations = ReconciliationObligations::default();
         for (wallet, epochs) in self.by_wallet {
+            let fenced = paper_state.is_wallet_fenced(&wallet)?;
             for (epoch, groups) in epochs {
                 for obligation in groups.into_values() {
                     let candidates = bindings
-                        .iter()
-                        .filter(|binding| {
-                            binding.stream_group_id == obligation.group_id
-                                && binding.stream_receipt == obligation.receipt
-                        })
-                        .collect::<Vec<_>>();
+                        .get(&(
+                            obligation.group_id.clone(),
+                            obligation.receipt.sequence,
+                            obligation.receipt.this_hash,
+                        ))
+                        .map_or(&[][..], Vec::as_slice);
                     let disposed = if candidates.is_empty() {
                         // Historical exact-ID receipts retain their existing acknowledgement contract.
-                        paper_state
-                            .activity_group_state(&obligation.group_id)?
-                            .is_some()
+                        // A permanent fence also refuses original observations without a binding.
+                        fenced
+                            || paper_state
+                                .activity_group_state(&obligation.group_id)?
+                                .is_some()
                     } else {
                         let mut disposed = false;
                         for binding in candidates {
@@ -288,7 +301,7 @@ impl ActivityCandidates {
                         }
                         disposed
                     };
-                    if !disposed && !invalid_mapping_disposed(paper_state, wallet, &obligation)? {
+                    if !disposed {
                         insert_coalesced_obligation(
                             &mut obligations.by_wallet,
                             wallet,
@@ -898,7 +911,7 @@ impl TradePoller {
                     && round.stage == RoundStage::Refresh
                     && round.refresh_wallet.is_none()
                 {
-                    match self.select_refresh_wallet(&round.live_wallets, &HashSet::new()) {
+                    match self.select_refresh_wallet(&round.live_wallets) {
                         Ok(wallet) => round.refresh_wallet = wallet,
                         Err(error) => {
                             failure = Some(error);
@@ -1164,6 +1177,9 @@ impl TradePoller {
                                 }
                                 Err(error) if error.retryable() => {
                                     if counts_round { round.failures += 1; }
+                                    if attempts.get(&wallet).is_some_and(|attempt| attempt.selected.is_empty()) {
+                                        attempts.remove(&wallet);
+                                    }
                                     warn!(wallet = %wallet, error = %error, "fixed-end activity reconciliation will retry");
                                 }
                                 Err(error) => failure = Some(TradePollerOwnerError::Reconciliation(error.to_string())),
@@ -1343,7 +1359,6 @@ impl TradePoller {
     fn select_refresh_wallet(
         &mut self,
         wallets: &[WalletAddress],
-        busy: &HashSet<WalletAddress>,
     ) -> Result<Option<WalletAddress>, TradePollerOwnerError> {
         if self.admission_preparer.is_none() {
             return Ok(None);
@@ -1357,9 +1372,6 @@ impl TradePoller {
         for offset in 0..wallets.len() {
             let index = self.refresh_cursor.saturating_add(offset) % wallets.len();
             let wallet = wallets[index];
-            if busy.contains(&wallet) {
-                continue;
-            }
             let coverage = self
                 .paper_state
                 .wallet_coverage(&wallet)
@@ -1518,7 +1530,18 @@ impl WalletOperation {
         let page_occurrences = recording.join_occurrences(&activity.pages)?;
         let buckets = activity.buckets()?;
         if buckets.is_empty() {
-            return Ok(Vec::new());
+            return Ok(if self.paper_state.is_wallet_fenced(&wallet)? {
+                selected
+                    .iter()
+                    .flat_map(|(epoch, groups)| {
+                        groups
+                            .values()
+                            .map(|obligation| (*epoch, obligation.clone()))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            });
         }
         // Resolve every required token and record its metadata before freezing the read commitment.
         let mut identities = Vec::with_capacity(buckets.len());
@@ -1596,15 +1619,23 @@ impl WalletOperation {
             }
         }
         let mut resolved = Vec::new();
-        for matched in correlation.matched {
+        for matched in &correlation.matched {
             if binding_target_disposed(&self.paper_state, &matched.binding)? {
-                resolved.push((matched.epoch, matched.obligation));
+                resolved.push((matched.epoch, matched.obligation.clone()));
             }
         }
-        for (epoch, groups) in selected {
-            for obligation in groups.values() {
-                if invalid_mapping_disposed(&self.paper_state, wallet, obligation)? {
-                    resolved.push((*epoch, obligation.clone()));
+        // A permanent wallet fence is the durable refusal for observations without a target.
+        // Bound observations still require their exact target revision's disposition.
+        if self.paper_state.is_wallet_fenced(&wallet)? {
+            for (epoch, groups) in selected {
+                for obligation in groups.values() {
+                    if !correlation
+                        .matched
+                        .iter()
+                        .any(|matched| matched.epoch == *epoch && matched.obligation == *obligation)
+                    {
+                        resolved.push((*epoch, obligation.clone()));
+                    }
                 }
             }
         }
@@ -1983,29 +2014,6 @@ fn binding_target_disposed(
     binding: &ObservationBinding,
 ) -> Result<bool, pe_paper_state::PaperStateError> {
     paper_state.activity_revision_disposed(&binding.history_group_id, &binding.semantic_revision)
-}
-
-fn invalid_mapping_disposed(
-    paper_state: &PaperStateDb,
-    wallet: WalletAddress,
-    obligation: &Obligation,
-) -> Result<bool, pe_paper_state::PaperStateError> {
-    for fence in paper_state.wallet_fences()? {
-        if fence.wallet != wallet || fence.cause != "invalid_mapping" {
-            continue;
-        }
-        let proof: serde_json::Value = serde_json::from_str(&fence.proof_json)?;
-        if let Some(value) = proof.get("invalid_mapping_observations") {
-            let observations: Vec<(SourceTradeId, AppendReceipt)> =
-                serde_json::from_value(value.clone())?;
-            if observations.iter().any(|(group, receipt)| {
-                *group == obligation.group_id && *receipt == obligation.receipt
-            }) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 fn select_refresh_candidate(

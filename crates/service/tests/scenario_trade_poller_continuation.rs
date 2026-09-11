@@ -725,7 +725,23 @@ async fn poller_multipage_commitment_survives_restart() {
 // response and completion is explicitly released; paused time never schedules a wallet read.
 struct RequestedPage {
     url: String,
-    respond: oneshot::Sender<Vec<u8>>,
+    respond: PageResponse,
+}
+
+struct PageResponse(oneshot::Sender<Result<Vec<u8>, SourceError>>);
+
+impl PageResponse {
+    fn send(self, payload: Vec<u8>) -> Result<(), Result<Vec<u8>, SourceError>> {
+        self.0.send(Ok(payload))
+    }
+
+    fn fail(self) {
+        self.0
+            .send(Err(SourceError::Transient {
+                message: "injected retryable read failure".to_owned(),
+            }))
+            .unwrap();
+    }
 }
 
 struct GatedFetcher {
@@ -742,7 +758,7 @@ impl ReconciliationFetcher for GatedFetcher {
             self.requests
                 .send(RequestedPage {
                     url: url.to_owned(),
-                    respond,
+                    respond: PageResponse(respond),
                 })
                 .await
                 .map_err(|_| SourceError::Fatal {
@@ -750,7 +766,7 @@ impl ReconciliationFetcher for GatedFetcher {
                 })?;
             response.await.map_err(|_| SourceError::Fatal {
                 message: "response barrier closed".to_owned(),
-            })
+            })?
         })
     }
 }
@@ -775,9 +791,24 @@ struct RunningPoll {
     ingest: tokio::task::JoinHandle<()>,
     control: tokio::task::JoinHandle<Vec<RecordedBucket>>,
     now: Arc<std::sync::atomic::AtomicI64>,
+    active: std::collections::HashSet<WalletAddress>,
+    max_active: usize,
 }
 
 impl RunningPoll {
+    fn track(&mut self, progress: &pe_service::trade_poller::PollerProgress) {
+        use pe_service::trade_poller::{PollerProgress, TRADE_RECONCILIATION_CONCURRENCY};
+        match progress {
+            PollerProgress::Started { wallet, .. } => {
+                assert!(self.active.insert(*wallet), "only one operation per wallet");
+                self.max_active = self.max_active.max(self.active.len());
+                assert!(self.active.len() <= TRADE_RECONCILIATION_CONCURRENCY);
+            }
+            PollerProgress::Completed { wallet, .. } => assert!(self.active.remove(wallet)),
+            PollerProgress::RoundCompleted => {}
+        }
+    }
+
     async fn observe(&self, row: Value) -> pe_event_log::AppendReceipt {
         use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger};
         let payload = serde_json::to_vec(&row).unwrap();
@@ -814,6 +845,7 @@ impl RunningPoll {
 
     async fn completed(&mut self, target: WalletAddress) -> Vec<pe_event_log::AppendReceipt> {
         while let Some(progress) = self.progress.recv().await {
+            self.track(&progress);
             if let pe_service::trade_poller::PollerProgress::Completed { wallet, selected } =
                 progress
                 && wallet == target
@@ -826,6 +858,7 @@ impl RunningPoll {
 
     async fn round_completed(&mut self) {
         while let Some(progress) = self.progress.recv().await {
+            self.track(&progress);
             if matches!(
                 progress,
                 pe_service::trade_poller::PollerProgress::RoundCompleted
@@ -858,7 +891,7 @@ fn start_recorded_poller_with_owner(
     wallets: &[WalletAddress],
     real_owner: bool,
 ) -> (RunningPoll, Arc<PaperStateDb>) {
-    start_recorded_poller_with_anchors(dir, wallets, real_owner, false)
+    start_recorded_poller_with_anchors(dir, wallets, real_owner, false, None)
 }
 
 fn start_recorded_poller_with_anchors(
@@ -866,6 +899,7 @@ fn start_recorded_poller_with_anchors(
     wallets: &[WalletAddress],
     real_owner: bool,
     anchors: bool,
+    boundary_anchor: Option<i64>,
 ) -> (RunningPoll, Arc<PaperStateDb>) {
     let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
     for wallet in wallets {
@@ -1048,8 +1082,10 @@ fn start_recorded_poller_with_anchors(
         )
     });
     let mut obligations = ReconciliationObligations::default();
-    if anchors {
-        obligations.set_boundary_anchor(EPOCH.div_euclid(86_400) * 86_400 - 86_400);
+    if let Some(anchor) =
+        boundary_anchor.or_else(|| anchors.then_some(EPOCH.div_euclid(86_400) * 86_400 - 86_400))
+    {
+        obligations.set_boundary_anchor(anchor);
     }
     let poller = TradePoller::new(
         TradePollerConfig {
@@ -1098,6 +1134,8 @@ fn start_recorded_poller_with_anchors(
             ingest,
             control,
             now,
+            active: Default::default(),
+            max_active: 0,
         },
         paper,
     )
@@ -1691,12 +1729,12 @@ async fn binding_restart_requires_durable_target_revision() {
     }
 }
 
-/// PASS: altered bindings, digest inputs and commitment generations are rejected by boot, and
-/// a continuation cannot substitute the tampered commitment receipt.
+/// PASS: authentic enclosing receipts and recomputed digests reach raw binding validation;
+/// boot and continuation reconstruction reject semantic mutations and missing nonempty read proofs.
 #[tokio::test(start_paused = true)]
 async fn binding_tamper_and_generation_substitution_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    let (mut running, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
     running
         .requests
         .recv()
@@ -1720,35 +1758,60 @@ async fn binding_tamper_and_generation_substitution_are_rejected() {
     running.completed(wallet()).await;
     running.finish().await;
     let original = source_frames(&dir.path().join("source.log"));
-    let pending = paper.open_decision_pending().unwrap().remove(0);
+    let pending = paper.decision_pending_history().unwrap().remove(0);
     let continuation =
         pe_service::bucket_commit::DecisionContinuationV3::from_durable(&pending).unwrap();
-    for change in [
-        "bindings",
-        "revision",
-        "group",
-        "stream_receipt",
-        "occurrence",
-        "metadata",
-        "digest",
-        "schema",
-        "parser",
-        "version",
-        "read_proof",
+    let original_index =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+            .unwrap();
+    assert!(
+        continuation
+            .observation_from_receipt_index(&original_index)
+            .unwrap()
+            .is_some()
+    );
+    pe_service::decision_replay::replay_decision_pending(&pending).unwrap();
+    let commitment_frame = original
+        .iter()
+        .find(|frame| {
+            frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        })
+        .unwrap();
+    let original_commitment: pe_service::bucket_commit::ActivityReadCommitment =
+        serde_json::from_slice(&commitment_frame.payload).unwrap();
+    let proof = original_commitment.read_proof.as_ref().unwrap();
+    for (change, expected) in [
+        (
+            "bindings",
+            "websocket correction has no verified observation binding",
+        ),
+        ("revision", "binding target revision differs"),
+        ("group", "binding stream group differs from its receipt"),
+        (
+            "stream_receipt",
+            "binding stream has the wrong source contract",
+        ),
+        ("occurrence", "binding target page occurrence differs"),
+        ("metadata", "binding metadata provenance differs"),
+        ("digest", "commitment differs from its frozen proof"),
+        ("schema", "commitment has the wrong source contract"),
+        ("parser", "commitment has the wrong source contract"),
+        ("version", "commitment differs from its frozen proof"),
+        ("read_proof", "binding commitment read proof is absent"),
     ] {
         let mut frames = original.clone();
         let frame = frames
             .iter_mut()
-            .find(|frame| {
-                frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
-            })
+            .find(|frame| frame.seq == commitment_frame.seq)
             .unwrap();
         let mut value: Value = serde_json::from_slice(&frame.payload).unwrap();
         match change {
             "bindings" => value["bindings"] = json!([]),
             "revision" => value["bindings"][0]["semantic_revision"] = json!("changed"),
             "group" => value["bindings"][0]["stream_group_id"] = json!("g2:changed"),
-            "stream_receipt" => value["bindings"][0]["stream_receipt"]["sequence"] = json!(0),
+            "stream_receipt" => {
+                value["bindings"][0]["stream_receipt"] = json!(proof.page_occurrences[0].receipt)
+            }
             "occurrence" => value["bindings"][0]["page_occurrence_index"] = json!(99),
             "metadata" => {
                 value["bindings"][0]["identity_provenance"]["source_log_sequence"] = json!(0)
@@ -1762,18 +1825,84 @@ async fn binding_tamper_and_generation_substitution_are_rejected() {
             }
             _ => unreachable!(),
         }
+        if change != "digest" {
+            let bindings = serde_json::from_value::<
+                Vec<pe_service::bucket_commit::ObservationBinding>,
+            >(value["bindings"].clone())
+            .unwrap();
+            let recomputed: Value = serde_json::from_slice(
+                &pe_service::bucket_commit::activity_read_commitment_payload_v2(
+                    original_commitment.wallet,
+                    original_commitment.fixed_end,
+                    &proof.page_occurrences,
+                    &proof.pages,
+                    &bindings,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            value["digest"] = recomputed["digest"].clone();
+        }
         frame.payload = serde_json::to_vec(&value).unwrap();
         let path = dir.path().join(format!("{change}.log"));
         write_source_prefix(&path, &frames);
-        assert!(
-            pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &paper).is_err(),
-            "{change}"
-        );
+        let rebuilt = pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &paper);
+        if change == "bindings" {
+            assert_eq!(
+                rebuilt.unwrap().len(),
+                1,
+                "an empty commitment cannot discharge a corrected observation"
+            );
+        } else {
+            let error = rebuilt.unwrap_err().to_string();
+            if !matches!(change, "schema" | "parser" | "version") {
+                assert!(error.contains(expected), "{change}: {error}");
+            }
+        }
         let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+        let receipt = index.receipt_at(commitment_frame.seq).unwrap().unwrap().0;
+        // Rebind to the actual synchronized replacement, so receipt authentication succeeds.
+        let mut changed = continuation.clone();
+        changed.read_commitment = Some(receipt);
+        for receipt in changed
+            .page_occurrences
+            .iter()
+            .map(|page| page.receipt)
+            .chain(changed.observed_source_receipt)
+            .chain(changed.read_commitment)
+        {
+            assert_eq!(
+                index.receipt_at(receipt.sequence).unwrap().unwrap().0,
+                receipt
+            );
+        }
         assert!(
-            continuation.observation_from_receipt_index(&index).is_err(),
+            changed.observation_from_receipt_index(&index).is_err(),
             "{change}"
         );
+        rusqlite::Connection::open(dir.path().join("paper.db"))
+            .unwrap()
+            .execute(
+                "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&changed).unwrap(),
+                    pending.source_trade_id.0
+                ],
+            )
+            .unwrap();
+        let report = support::qualify_source_census(
+            &dir.path().join(format!("qualify-{change}")),
+            &path,
+            &dir.path().join("paper.db"),
+            EPOCH,
+        )
+        .await;
+        assert_eq!(
+            report.verdict,
+            pe_service::qualification::QualificationVerdict::InsufficientEvidence
+        );
+        let reason = report.reasons.join("; ");
+        assert!(reason.contains(expected), "{change}: {reason}");
     }
 }
 
@@ -1853,7 +1982,7 @@ async fn urgent_load_preserves_backstop_anchor_and_boundary_progress() {
     let dir = tempfile::tempdir().unwrap();
     let age_due = WalletAddress([0xbb; 20]);
     let (mut running, paper) =
-        start_recorded_poller_with_anchors(&dir, &[wallet(), age_due], false, true);
+        start_recorded_poller_with_anchors(&dir, &[wallet(), age_due], false, true, None);
     rusqlite::Connection::open(dir.path().join("paper.db"))
         .unwrap()
         .execute(
@@ -1922,5 +2051,654 @@ async fn urgent_load_preserves_backstop_anchor_and_boundary_progress() {
         )
         .unwrap();
     running.completed(second_urgent).await;
+    running.finish().await;
+}
+
+/// PASS: a failed empty backstop releases ownership before a fresh urgent trigger, with no tick.
+#[tokio::test(start_paused = true)]
+async fn retryable_empty_backstop_does_not_delay_fresh_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    let clock = tokio::time::Instant::now();
+    running.requests.recv().await.unwrap().respond.fail();
+    assert!(running.completed(wallet()).await.is_empty());
+    running.round_completed().await;
+    let row = stream_row(wallet(), "after-empty-failure", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    let request = running.requests.recv().await.unwrap();
+    assert_eq!(tokio::time::Instant::now(), clock);
+    request
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    running.finish().await;
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+/// PASS: arrivals during read failure and bucket acknowledgment stay outside the frozen retry;
+/// an unrelated operation occupies the other slot throughout, with no third or duplicate wallet.
+#[tokio::test(start_paused = true)]
+async fn arrivals_during_failure_and_ack_delay_preserve_frontier_and_two_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet(), other]);
+    let blocked = running.requests.recv().await.unwrap();
+    assert!(blocked.url.contains(&wallet().to_string()));
+    let first_row = stream_row(other, "frozen-before-failure", EPOCH);
+    let first = running.observe(first_row.clone()).await;
+    let failing = running.requests.recv().await.unwrap();
+    let later_row = stream_row(other, "during-failure", EPOCH);
+    let later = running.observe(later_row.clone()).await;
+    failing.respond.fail();
+    assert_eq!(running.completed(other).await, vec![first]);
+    assert!(running.requests.try_recv().is_err());
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let retry = running.requests.recv().await.unwrap();
+    let gate = running.bucket_ack_gate.clone();
+    let held = gate.acquire().await.unwrap();
+    retry
+        .respond
+        .send(serde_json::to_vec(&[first_row]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+    let newest_row = stream_row(other, "during-ack-delay", EPOCH + 1);
+    let newest = running.observe(newest_row.clone()).await;
+    assert!(running.requests.try_recv().is_err());
+    drop(held);
+    assert_eq!(running.completed(other).await, vec![first]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[later_row, newest_row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(other).await, vec![later, newest]);
+    assert_eq!(running.max_active, 2);
+    assert!(running.requests.try_recv().is_err());
+    running.stop.send(()).unwrap();
+    blocked.respond.send(b"[]".to_vec()).unwrap();
+    running.poller.await.unwrap().unwrap();
+    drop(running.source);
+    drop(running.triggers);
+    running.ingest.await.unwrap();
+    running.control.await.unwrap();
+}
+
+/// PASS: a pre-boundary ambiguity after a permanent fence holds publication until its operation
+/// acknowledges, then releases the boundary, frontier and old read start without replacing the fence.
+#[tokio::test(start_paused = true)]
+async fn existing_fence_discharges_new_ambiguity_and_releases_oldest_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = (EPOCH.div_euclid(86_400) + 1) * 86_400;
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, false, Some(cutoff - 86_400));
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let mut first = stream_row(wallet(), "first-ambiguity", EPOCH);
+    first["conditionId"] = json!("incorrect-stamp");
+    running.observe(first).await;
+    let left = stream_row(wallet(), "first-ambiguity", EPOCH);
+    let mut right = left.clone();
+    right["outcomeIndex"] = json!(1);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[left, right]).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    let fence = paper.wallet_fences().unwrap();
+    assert_eq!(fence.len(), 1);
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+
+    running.now.store(cutoff - 1, Ordering::SeqCst);
+    let mut second = stream_row(wallet(), "new-ambiguity", cutoff - 1);
+    second["conditionId"] = json!("another-incorrect-stamp");
+    let second_receipt = running.observe(second).await;
+    let held = running.requests.recv().await.unwrap();
+    running.now.store(cutoff, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    running.round_completed().await;
+    assert!(
+        running.controls.try_recv().is_err(),
+        "qualifying observation holds the boundary"
+    );
+    let frames = source_frames(&dir.path().join("source.log"));
+    let boundary = frames
+        .iter()
+        .find(|frame| frame.source_id.0 == pe_service::trade_poller::DAILY_BOUNDARY_SOURCE_ID)
+        .unwrap();
+    assert!(second_receipt.sequence < boundary.seq);
+    // A restart can already use the existing permanent fence, even before another commitment.
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+
+    let gate = running.bucket_ack_gate.clone();
+    let held_ack = gate.acquire().await.unwrap();
+    let left = stream_row(wallet(), "new-ambiguity", cutoff - 1);
+    let mut right = left.clone();
+    right["outcomeIndex"] = json!(1);
+    held.respond
+        .send(serde_json::to_vec(&[left, right]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+    assert!(
+        running.controls.try_recv().is_err(),
+        "publication also waits for acknowledgment"
+    );
+    drop(held_ack);
+    assert_eq!(running.completed(wallet()).await, vec![second_receipt]);
+    assert!(
+        matches!(running.controls.recv().await.unwrap(), ControlCompletion::Boundary(value) if value == cutoff)
+    );
+    assert_eq!(paper.wallet_fences().unwrap(), fence);
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+
+    // No old frontier owns a later trigger, even while the cadence remains paused.
+    let fresh = stream_row(wallet(), "after-discharge", cutoff);
+    let fresh_receipt = running.observe(fresh.clone()).await;
+    let request = running.requests.recv().await.unwrap();
+    assert!(
+        request.url.contains(&format!("start={}", cutoff - 1)),
+        "{}",
+        request.url
+    );
+    request
+        .respond
+        .send(serde_json::to_vec(&[fresh]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![fresh_receipt]);
+    let absent = running
+        .observe(stream_row(
+            wallet(),
+            "fenced-with-no-history-target",
+            cutoff,
+        ))
+        .await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![absent]);
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper,
+        )
+        .unwrap()
+        .is_empty()
+    );
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let backstop = running.requests.recv().await.unwrap();
+    assert!(
+        backstop.url.contains(&format!("start={cutoff}")),
+        "{}",
+        backstop.url
+    );
+    backstop.respond.send(b"[]".to_vec()).unwrap();
+    assert!(running.completed(wallet()).await.is_empty());
+    let commits = running.finish().await;
+    assert!(
+        commits
+            .iter()
+            .all(|(_, _, result)| result.pending.is_empty())
+    );
+    assert_eq!(paper.wallet_fences().unwrap(), fence);
+}
+
+/// PASS: changing any required correlation field alone leaves the original receipt outstanding;
+/// the different-wallet response is refused by the complete reader before correlation.
+#[tokio::test(start_paused = true)]
+async fn differing_correlation_fields_never_bind_an_original() {
+    for field in ["transactionHash", "proxyWallet", "type", "asset", "side"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        let mut stream = stream_row(wallet(), "negative-correlation", EPOCH);
+        stream["conditionId"] = json!("incorrect-stream-stamp");
+        let receipt = running.observe(stream).await;
+        let mut history = stream_row(wallet(), "negative-correlation", EPOCH);
+        history[field] = match field {
+            "transactionHash" => json!("different-transaction"),
+            "proxyWallet" => json!(WalletAddress([0xbb; 20]).to_string()),
+            "type" => json!("SPLIT"),
+            "asset" => json!("different-asset"),
+            "side" => json!("SELL"),
+            _ => unreachable!(),
+        };
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(&[history]).unwrap())
+            .unwrap();
+        assert_eq!(running.completed(wallet()).await, vec![receipt], "{field}");
+        let commits = running.finish().await;
+        assert!(commits.is_empty(), "{field}");
+        assert!(paper.wallet_fences().unwrap().is_empty(), "{field}");
+        let path = dir.path().join("source.log");
+        let obligations =
+            pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &paper).unwrap();
+        assert_eq!(obligations.len(), 1, "{field}");
+        assert_eq!(
+            obligations.migration_evidence()[0]["receipt"],
+            json!(receipt)
+        );
+        for frame in source_frames(&path).into_iter().filter(|frame| {
+            frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        }) {
+            let value: pe_service::bucket_commit::ActivityReadCommitment =
+                serde_json::from_slice(&frame.payload).unwrap();
+            assert_eq!(value.bindings, Some(Vec::new()), "{field}");
+        }
+    }
+}
+
+/// PASS: an exact leg and a corrected leg in one transaction retain separate raw groups,
+/// revisions, receipts and metadata requirements, with aggregate multiplicity unchanged.
+#[tokio::test(start_paused = true)]
+async fn mixed_exact_and_corrected_legs_keep_individual_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    let held = running.requests.recv().await.unwrap();
+    let exact = stream_row(wallet(), "mixed-legs", EPOCH);
+    let exact_receipt = running.observe(exact.clone()).await;
+    let mut corrected = exact.clone();
+    corrected["side"] = json!("SELL");
+    corrected["conditionId"] = json!("incorrect-stamp");
+    let corrected_id = aggregate(corrected.clone()).group_id.key().clone();
+    let corrected_receipt = running.observe(corrected).await;
+    held.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
+    let mut sell = exact.clone();
+    sell["side"] = json!("SELL");
+    let exact_target = aggregate(exact.clone());
+    let corrected_target = aggregate(sell.clone());
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[exact, sell]).unwrap())
+        .unwrap();
+    assert_eq!(
+        running.completed(wallet()).await,
+        vec![exact_receipt, corrected_receipt]
+    );
+    let commits = running.finish().await;
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].0.len(), 2);
+    let path = dir.path().join("source.log");
+    let frame = source_frames(&path)
+        .into_iter()
+        .find(|frame| {
+            frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        })
+        .unwrap();
+    let value: pe_service::bucket_commit::ActivityReadCommitment =
+        serde_json::from_slice(&frame.payload).unwrap();
+    let bindings = value.bindings.unwrap();
+    assert_eq!(bindings.len(), 2);
+    let exact_binding = bindings
+        .iter()
+        .find(|binding| binding.stream_receipt == exact_receipt)
+        .unwrap();
+    assert_eq!(&exact_binding.stream_group_id, exact_target.group_id.key());
+    assert_eq!(&exact_binding.history_group_id, exact_target.group_id.key());
+    assert_eq!(
+        exact_binding.semantic_revision,
+        exact_target.semantic_revision.as_str()
+    );
+    assert!(exact_binding.identity_receipt.is_none());
+    assert!(exact_binding.identity_provenance.is_none());
+    let corrected_binding = bindings
+        .iter()
+        .find(|binding| binding.stream_receipt == corrected_receipt)
+        .unwrap();
+    assert_eq!(corrected_binding.stream_group_id, corrected_id);
+    assert_eq!(
+        &corrected_binding.history_group_id,
+        corrected_target.group_id.key()
+    );
+    assert_eq!(
+        corrected_binding.semantic_revision,
+        corrected_target.semantic_revision.as_str()
+    );
+    assert!(corrected_binding.identity_receipt.is_some());
+    assert!(corrected_binding.identity_provenance.is_some());
+    assert_eq!(exact_binding.page_raw_hash, corrected_binding.page_raw_hash);
+    assert_eq!(
+        exact_binding.page_occurrence_index,
+        corrected_binding.page_occurrence_index
+    );
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &paper)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// PASS: a crash after the fence witness but before the revision transaction keeps the fence
+/// and discharges the ambiguous original on reopen; retry preserves the original economic effect.
+#[tokio::test(start_paused = true)]
+async fn restart_between_fence_witness_and_revision_keeps_ambiguity_discharged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
+    let original = stream_row(wallet(), "witness-revision", EPOCH);
+    let original_aggregate = aggregate(original.clone());
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&original)).unwrap())
+        .unwrap();
+    running.round_completed().await;
+    let before = dir.path().join("before-revision.db");
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute("VACUUM INTO ?1", [before.to_str().unwrap()])
+        .unwrap();
+    let mut stream = original.clone();
+    stream["conditionId"] = json!("incorrect-stamp");
+    running.observe(stream).await;
+    let mut revision = original;
+    revision["size"] = json!("2");
+    let mut other_leg = revision.clone();
+    other_leg["outcomeIndex"] = json!(1);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[revision, other_leg]).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    let commits = running.finish().await;
+    let (aggregates, context, _) = commits.last().unwrap();
+    let paper = Arc::new(PaperStateDb::open(&before).unwrap());
+    let original_state = paper
+        .activity_group_state(original_aggregate.group_id.key())
+        .unwrap()
+        .unwrap();
+    let conn = rusqlite::Connection::open(&before).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_revision BEFORE INSERT ON activity_group_revisions BEGIN SELECT RAISE(FAIL, 'injected revision transaction failure'); END;").unwrap();
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    let error = engine
+        .commit(aggregates.clone(), context, zero_basis())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("injected revision transaction failure"),
+        "{error}"
+    );
+    assert_eq!(
+        paper.wallet_fences().unwrap().len(),
+        1,
+        "the first transaction committed"
+    );
+    let changed = aggregates
+        .iter()
+        .find(|item| item.group_id == original_aggregate.group_id)
+        .unwrap();
+    assert!(
+        !paper
+            .activity_revision_disposed(changed.group_id.key(), changed.semantic_revision.as_str())
+            .unwrap()
+    );
+    drop(engine);
+    drop(paper);
+    let paper = Arc::new(PaperStateDb::open(&before).unwrap());
+    let fence = paper.wallet_fences().unwrap();
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(
+        paper
+            .activity_group_state(original_aggregate.group_id.key())
+            .unwrap()
+            .unwrap(),
+        original_state
+    );
+    conn.execute_batch("DROP TRIGGER fail_revision;").unwrap();
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    engine
+        .commit(aggregates.clone(), context, zero_basis())
+        .unwrap();
+    assert_eq!(paper.wallet_fences().unwrap(), fence);
+    assert!(
+        paper
+            .activity_revision_disposed(changed.group_id.key(), changed.semantic_revision.as_str())
+            .unwrap()
+    );
+    assert_eq!(
+        paper
+            .activity_group_state(original_aggregate.group_id.key())
+            .unwrap()
+            .unwrap(),
+        original_state
+    );
+}
+
+/// PASS: boot keeps all authenticated candidate revisions for one original group/receipt;
+/// a later undisposed revision cannot overwrite an earlier durably disposed candidate.
+#[tokio::test(start_paused = true)]
+async fn boot_binding_index_preserves_every_target_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let mut stream = stream_row(wallet(), "indexed-revisions", EPOCH);
+    stream["conditionId"] = json!("incorrect-stamp");
+    running.observe(stream).await;
+    let mut history = stream_row(wallet(), "indexed-revisions", EPOCH);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&history)).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.finish().await;
+    let path = dir.path().join("source.log");
+    let frame = source_frames(&path)
+        .into_iter()
+        .find(|frame| {
+            frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        })
+        .unwrap();
+    let first: pe_service::bucket_commit::ActivityReadCommitment =
+        serde_json::from_slice(&frame.payload).unwrap();
+    let mut binding = first.bindings.unwrap().remove(0);
+    history["size"] = json!("2");
+    let payload = serde_json::to_vec(&[history]).unwrap();
+    let now = OffsetDateTime::from_unix_timestamp(EPOCH + 1).unwrap();
+    let mut writer = pe_event_log::Writer::open(&path).unwrap();
+    let receipt = writer
+        .append_synced(pe_event_log::EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_service::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(now),
+            received_at: ReceivedAt(now),
+            content_type: pe_event_log::ContentType::Json,
+            payload: payload.clone(),
+        })
+        .unwrap();
+    let read = support::producer_shaped_read_v2(wallet(), &payload, EPOCH + 1, EPOCH + 1, receipt);
+    binding.semantic_revision = read.aggregates[0].semantic_revision.as_str().to_owned();
+    binding.page_occurrence_index = 0;
+    binding.page_raw_hash = read.page.raw_hash.clone();
+    assert!(
+        !paper
+            .activity_revision_disposed(&binding.history_group_id, &binding.semantic_revision)
+            .unwrap()
+    );
+    let inputs: Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
+    let pages: Vec<pe_source_polymarket_public::ReconciliationPageEvidence> =
+        serde_json::from_value(inputs["pages"].clone()).unwrap();
+    let payload = pe_service::bucket_commit::activity_read_commitment_payload_v2(
+        wallet(),
+        EPOCH + 1,
+        &[read.page],
+        &pages,
+        &[binding],
+    )
+    .unwrap();
+    writer
+        .append_synced(pe_event_log::EnvelopeIn {
+            source_id: SourceId(
+                pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+            ),
+            schema_version: pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+            parser_version: pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+            observed_at: SourceTimestamp(now),
+            received_at: ReceivedAt(now),
+            content_type: pe_event_log::ContentType::Json,
+            payload,
+        })
+        .unwrap();
+    drop(writer);
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &paper)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// PASS: a qualifying pre-midnight observation blocks the oldest boundary until its durable
+/// bucket acknowledgment, while the backstop round completes independently.
+#[tokio::test(start_paused = true)]
+async fn qualifying_obligation_holds_boundary_until_durable_acknowledgment() {
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = (EPOCH.div_euclid(86_400) + 1) * 86_400;
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, false, Some(cutoff - 86_400));
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    running.now.store(cutoff - 1, Ordering::SeqCst);
+    let row = stream_row(wallet(), "qualifying-boundary", cutoff - 1);
+    let receipt = running.observe(row.clone()).await;
+    let request = running.requests.recv().await.unwrap();
+    running.now.store(cutoff, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    running.round_completed().await;
+    assert!(running.controls.try_recv().is_err());
+    let obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
+        &dir.path().join("source.log"),
+        &paper,
+    )
+    .unwrap();
+    assert_eq!(obligations.len(), 1);
+    let boundary = source_frames(&dir.path().join("source.log"))
+        .into_iter()
+        .find(|frame| frame.source_id.0 == pe_service::trade_poller::DAILY_BOUNDARY_SOURCE_ID)
+        .unwrap();
+    assert!(boundary.seq > receipt.sequence);
+    assert!(
+        obligations.migration_evidence()[0]["received_at_unix"]
+            .as_i64()
+            .unwrap()
+            < cutoff
+    );
+    let gate = running.bucket_ack_gate.clone();
+    let held = gate.acquire().await.unwrap();
+    request
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+    assert!(running.controls.try_recv().is_err());
+    drop(held);
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    assert!(
+        matches!(running.controls.recv().await.unwrap(), ControlCompletion::Boundary(value) if value == cutoff)
+    );
+    assert!(paper.wallet_fences().unwrap().is_empty());
     running.finish().await;
 }

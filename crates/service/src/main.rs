@@ -1029,7 +1029,7 @@ async fn main() -> Result<()> {
             return Ok(TaskExit::ChannelClosed("producer_start"));
         }
         activity_ingest
-            .run_until(activity_shutdown.wait_for(ShutdownPhase::StopSinks))
+            .run_until(activity_shutdown.wait_for(TaskName::ActivityIngest.stop_phase()))
             .await
             .map(|()| TaskExit::CleanShutdown)
             .map_err(TaskFailure::typed)
