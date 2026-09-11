@@ -158,8 +158,8 @@ impl LiveWatchlist {
     /// the result to at most `cap` entries, then publish; returns the new total count.
     ///
     /// This is the eviction+backfill primitive for the maintenance tick (issue #350 WS1).
-    /// The caller over-fetches bench candidates (`freed + bench_overfetch`) and supplies
-    /// them rank-sorted in `replacements`; `replace` trims them to the working set.
+    /// The caller reads the latest ranking batch (bounded by `MAX_ACTIVE_WATCHLIST_SIZE`) and
+    /// supplies it rank-sorted in `replacements`; `replace` trims them to the working set.
     ///
     /// Semantics (all unit-tested):
     /// - **evict**: every wallet in `removed` is dropped from the live set (evicting a

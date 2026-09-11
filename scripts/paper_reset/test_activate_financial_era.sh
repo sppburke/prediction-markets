@@ -173,6 +173,37 @@ trap 'rm -rf "$TEST_TMP"' EXIT
 write_shims() {
   local root=$1 bin=$root/bin
   mkdir -p "$bin"
+  # Observe the real restore helper without replacing its SQLite/file operations. The crash
+  # seams leave the replacement main in place with the old WAL/shm or only shm beside it.
+  cat > "$bin/python3" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+state=${PE_ACTIVATION_TEST_ROOT:-}/test-state
+if [[ "${1-}" == -c && "${2-}" == *'shutil.copyfile(source,tmp)'* ]]; then
+  /usr/bin/python3 - "$state" <<'PY'
+import json, pathlib, sys
+state=pathlib.Path(sys.argv[1])
+manifest=json.loads((state.parent/"pe-financial-era.json").read_text())
+assert manifest["local_restore_intent"] is True
+assert manifest.get("local_restore_skipped") is not True
+assert (state/"service.active").read_text().strip() == "false"
+count=state/"local-restore-count"
+count.write_text(str(int(count.read_text())+1 if count.exists() else 1)+"\n")
+PY
+  if [[ -f "$state/crash-after-local-replace" ]]; then
+    rm "$state/crash-after-local-replace"
+    script=${2/'os.replace(tmp,destination)'/$'os.replace(tmp,destination)\nos._exit(86)'}
+    shift 2
+    exec /usr/bin/python3 -c "$script" "$@"
+  elif [[ -f "$state/crash-after-local-wal-removal" ]]; then
+    rm "$state/crash-after-local-wal-removal"
+    script=${2/'    except FileNotFoundError: pass'/$'    except FileNotFoundError: pass\n    if suffix == "-wal": os._exit(86)'}
+    shift 2
+    exec /usr/bin/python3 -c "$script" "$@"
+  fi
+fi
+exec /usr/bin/python3 "$@"
+SH
   cat > "$bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -339,7 +370,7 @@ if [[ -f "$state/slow-sqlite" ]]; then
 fi
 exec /usr/bin/sqlite3 "$@"
 SH
-  chmod +x "$bin/systemctl" "$bin/psql" "$bin/curl" "$bin/sqlite3"
+  chmod +x "$bin/python3" "$bin/systemctl" "$bin/psql" "$bin/curl" "$bin/sqlite3"
 }
 
 write_rehearsal_evidence() {
@@ -464,6 +495,7 @@ setup_hermetic_financial_driver() {
 
 setup_fixture() {
   local root=$1 service=$root/prediction-markets target=$root/target state=$root/test-state staged=$root/staged-557
+  local journal_mode=${2:-delete}
   mkdir -p "$service/target/release" "$service/smoke-test" "$service/gen/g557" "$target" "$state" "$staged"
   : > "$root/.pe-deploy.lock"
   echo true > "$state/service.active"
@@ -483,9 +515,12 @@ ENV
   printf 'EDGE\001source-before\n' > "$service/gen/g557/source_events.log"
   printf 'EDGE\001live-before\n' > "$service/gen/g557/live_journal.log"
   printf '%s\n' '{}' > "$service/gen/g557/wallet_market_history.json"
-  python3 -c 'import sqlite3,sys
-db=sqlite3.connect(sys.argv[1]); db.executescript("""
+  python3 -c 'import json,sqlite3,sys
+db=sqlite3.connect(sys.argv[1]); db.execute("pragma journal_mode="+sys.argv[2])
+db.executescript("""
+pragma user_version=2;
 create table durable(value text); insert into durable values ("before");
+create index durable_value on durable(value);
 create table fills(value text); create table positions(value text);
 create table settled_markets(value text); create table fill_market_snapshots(value text);
 create table bankroll(id integer primary key, bankroll_str text not null);
@@ -498,8 +533,12 @@ terminal_disposition text, updated_at_unix integer);
 create table wallet_fences(wallet_hex text,cause text);
 insert into poll_cursors values("0x0000000000000000000000000000000000000545",1,0);
 insert into position_anchors values("0x0000000000000000000000000000000000000545",1);
-"""); db.commit(); db.close()' \
-    "$service/gen/g557/paper_state.db"
+"""); db.commit()
+json.dump({"schema":db.execute("select type,name,sql from sqlite_schema order by type,name").fetchall(),
+           "dump":list(db.iterdump()),"version":db.execute("pragma user_version").fetchone()[0]},
+          open(sys.argv[3],"w"))
+db.close()' \
+    "$service/gen/g557/paper_state.db" "$journal_mode" "$state/original-sqlite.json"
   cat > "$target/pe-service" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -531,13 +570,25 @@ JSON
     ;;
   *--financial-era=start*)
     record_offline_environment start
-    python3 -c 'import sqlite3,sys
+    python3 -c 'import os,sqlite3,sys
 db=sqlite3.connect(sys.argv[1]);
+wal_crash=os.path.exists(sys.argv[2]+"/start-wal-crash")
+if wal_crash:
+    assert db.execute("pragma journal_mode").fetchone() == ("wal",)
+    db.execute("pragma wal_autocheckpoint=0")
 for table in ("fills","positions","settled_markets","fill_market_snapshots"): db.execute("delete from "+table)
 db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"10000\")")
 db.execute("delete from meta"); db.execute("insert into meta values(\"financial_start_seq\",\"1\")")
-db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,)); db.commit(); db.close()' \
-      "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/paper_state.db"
+db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,))
+if wal_crash:
+    db.execute("drop index durable_value")
+    db.execute("alter table durable add column reset_only text")
+    db.execute("update durable set value=\"reset\"")
+    db.execute("pragma user_version=3")
+db.commit()
+if wal_crash: os._exit(86)
+db.close()' \
+      "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/paper_state.db" "$state"
     : > "$state/complete-start"
     if [[ -f "$state/replace-target-binary-after-start" ]]; then
       mv "$PE_ACTIVATION_TEST_ROOT/target/pe-service.next" \
@@ -784,6 +835,70 @@ run_driver() {
   local root=$1; shift
   PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$root" SUPABASE_DB_URL=postgres://harness:harness@127.0.0.1:1/harness \
     PATH="$root/bin:$PATH" "$DRIVER" "${DRIVER_ARGS[@]}" "$@"
+}
+
+assert_restored_sqlite() {
+  local root=$1 database=$root/prediction-markets/gen/g557/paper_state.db backup
+  backup=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backup"]["path"])' \
+    "$root/pe-financial-era.json")
+  # Opening a WAL-mode database can create sidecars, so inspect physical completion first.
+  [[ ! -e "$database-wal" && ! -e "$database-shm" ]] || fail "$root retained SQLite sidecars"
+  cmp -s "$database" "$backup" || fail "$root main bytes differ from the complete backup"
+  python3 - "$database" "$root/test-state/original-sqlite.json" <<'PY' || fail "$root old-reader SQL reopen failed"
+import json, sqlite3, sys
+original=json.load(open(sys.argv[2]))
+db=sqlite3.connect(sys.argv[1])
+assert db.execute("pragma integrity_check").fetchone() == ("ok",)
+assert db.execute("pragma user_version").fetchone()[0] == original["version"]
+assert [list(row) for row in db.execute("select type,name,sql from sqlite_schema order by type,name")] == original["schema"]
+assert list(db.iterdump()) == original["dump"]
+assert db.execute("select value from durable indexed by durable_value").fetchall() == [("before",)]
+assert db.execute("select bankroll_str from bankroll where id=0").fetchone() == ("10000",)
+assert db.execute("select value from meta where key='financial_start_seq'").fetchone() is None
+db.close()
+PY
+}
+
+drive_to_wal_reset() {
+  local root=$1 active=${2:-true} status output
+  setup_fixture "$root" wal
+  driver_args "$root"
+  echo "$active" > "$root/test-state/service.active"
+  touch "$root/test-state/start-wal-crash"
+  set +e
+  output=$(run_driver "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *'offline financial-era Start failed'* ]] ||
+    fail "WAL-only reset did not interrupt Start: $output"
+  python3 - "$root" <<'PY' || fail "$root did not retain the WAL-only reset"
+import hashlib, json, os, pathlib, sqlite3, sys
+root=pathlib.Path(sys.argv[1]); manifest=json.loads((root/"pe-financial-era.json").read_text())
+database=pathlib.Path(manifest["paths"]["paper_state"])
+assert manifest["qualification_start_intent"] is True and manifest["state"] == "guarded"
+assert not (root/"test-state/complete-start").exists()
+assert hashlib.sha256(database.read_bytes()).hexdigest() == manifest["guarded_paper_state_sha256"]
+assert pathlib.Path(str(database)+"-wal").stat().st_size > 0
+db=sqlite3.connect("file:"+str(database)+"?mode=ro",uri=True)
+assert db.execute("select value,reset_only from durable").fetchall() == [("reset",None)]
+assert db.execute("pragma user_version").fetchone() == (3,)
+assert db.execute("select value from meta where key='financial_start_seq'").fetchone() == ("1",)
+os._exit(0)  # Leave the crash's WAL intact; a graceful last close may checkpoint it.
+PY
+}
+
+rollback_snapshot() {
+  python3 - "$1" <<'PY'
+import hashlib, json, pathlib, sys
+root=pathlib.Path(sys.argv[1]); generation=root/"prediction-markets/gen/g557"
+paths=[root/"pe-financial-era.json"]
+paths += [generation/name for name in ("paper_state.db","paper_state.db-wal","paper_state.db-shm",
+                                     "paper.log","source_events.log","live_journal.log")]
+paths += [root/"test-state"/name for name in ("archive-count","restore-count","local-restore-count",
+                                           "start-count","stop-count","service.active")]
+print(json.dumps({str(path):hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+                  for path in paths},sort_keys=True))
+PY
 }
 
 drive_to_verified() {
@@ -2551,6 +2666,66 @@ value=json.load(open(sys.argv[1])); assert value["local_restore_skipped"] is Tru
   "$root/pe-financial-era.json" || fail "unchanged local state was restored without a mutation receipt"
 run_driver "$root" --rollback-before-start >/dev/null
 [[ $(<"$root/test-state/restore-count") -eq 1 ]] || fail "rolled-back rerun restored twice"
+[[ ! -e "$root/test-state/local-restore-count" ]] || fail "no-Start shortcut invoked local restore"
+# Terminal rollback is immutable even if later writes leave SQLite sidecars.
+printf 'terminal-wal\n' > "$root/prediction-markets/gen/g557/paper_state.db-wal"
+printf 'terminal-shm\n' > "$root/prediction-markets/gen/g557/paper_state.db-shm"
+terminal_before=$(rollback_snapshot "$root")
+run_driver "$root" --rollback-before-start >/dev/null
+[[ "$(rollback_snapshot "$root")" == "$terminal_before" ]] || fail "terminal rollback changed state"
+
+# Scenario FE-ROLLBACK-NO-START-SIDECARS-14
+# Preconditions: no Start/restore intent, unrestored local main equals backup but not guarded,
+# WAL present, archive already restored, and inert old service.
+# PASS: missing-intent refusal preserves local bytes/sidecars and records no restore intent.
+# FAIL: local restoration or old start occurs, or a restore intent is recorded.
+root=$TEST_TMP/rollback-no-start-sidecars
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after remote-archived >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "no-Start sidecar setup did not reach the archive"
+set +e
+run_driver "$root" --rollback-before-start \
+  --simulate-crash-after rollback-wallet-live-stats-refreshed >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 ]] || fail "no-Start sidecar setup did not restore the archive"
+python3 - "$root" <<'PY' || fail "no-Start sidecar fixture does not match the refusal state"
+import hashlib, json, pathlib, shutil, sys
+root=pathlib.Path(sys.argv[1]); value=json.loads((root/"pe-financial-era.json").read_text())
+assert value["state"] == "rolling_back" and value["archive_restored"] is True
+assert not value.get("qualification_start_intent",False)
+assert not value.get("local_restored",False)
+assert "local_restore_intent" not in value
+assert not value.get("old_service_start_intent",False)
+assert (root/"test-state/service.active").read_text().strip() == "false"
+database=pathlib.Path(value["paths"]["paper_state"])
+shutil.copyfile(value["backup"]["path"],database)
+assert hashlib.sha256(database.read_bytes()).hexdigest() == value["backup"]["sha256"]
+assert value["backup"]["sha256"] != value["guarded_paper_state_sha256"]
+pathlib.Path(str(database)+"-wal").write_bytes(b"unexplained-wal\n")
+PY
+refusal_before=$(rollback_snapshot "$root")
+set +e
+output=$(run_driver "$root" --rollback-before-start 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'local state equals the backup without a durable restore intent'* ]] ||
+  fail "no-Start sidecars did not retain the missing-intent refusal: $output"
+[[ ! -e "$root/test-state/local-restore-count" && ! -e "$root/test-state/start-count" ]] ||
+  fail "no-Start sidecars authorized local restoration or old start"
+python3 - "$root/pe-financial-era.json" "$refusal_before" "$(rollback_snapshot "$root")" <<'PY' || fail "no-Start refusal changed local state or recorded a restore intent"
+import json, sys
+value=json.load(open(sys.argv[1]))
+assert "local_restore_intent" not in value and not value.get("local_restored",False)
+before,after=map(json.loads,sys.argv[2:])
+for snapshot in (before,after): del snapshot[sys.argv[1]]
+assert before == after
+PY
+echo 'PASS: FE-ROLLBACK-NO-START-SIDECARS-14'
 
 # Scenario FE-START-FORWARD-05
 # Preconditions: physical Start exists while the shell manifest still says guarded.
@@ -2773,6 +2948,200 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
   [[ $(<"$root/test-state/start-count") -eq 1 ]] || fail "$boundary started the old service more than once"
   [[ -f "$root/test-state/rollback-refresh-count" && $(<"$root/test-state/rollback-refresh-count") -ge 1 ]] ||
     fail "$boundary did not refresh the restored public projection"
+  [[ $(<"$root/test-state/local-restore-count") -eq 1 ]] || fail "$boundary repeated local restoration"
+  assert_restored_sqlite "$root"
 done
 
-echo "PASS: 57 scenario contracts, including rehearsal final-status/shutdown policy and financial-era bundle/policy resume guards; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; PostgreSQL execution remains shimmed"
+# Scenario FE-ROLLBACK-WAL-ONLY-10
+# PASS: unchanged guarded main plus committed reset WAL restores exact backup/schema/content,
+# removes sidecars before reopening, and starts the old service once. FAIL: hash-only certification.
+root=$TEST_TMP/rollback-wal-only
+drive_to_wal_reset "$root"
+run_driver "$root" --rollback-before-start >/dev/null
+assert_restored_sqlite "$root"
+[[ $(<"$root/test-state/local-restore-count") -eq 1 &&
+   $(<"$root/test-state/restore-count") -eq 1 && $(<"$root/test-state/start-count") -eq 1 ]] ||
+  fail "WAL-only rollback did not restore/start exactly once"
+echo 'PASS: FE-ROLLBACK-WAL-ONLY-10'
+
+# Scenario FE-ROLLBACK-STALE-RECEIPTS-11
+# PASS: skipped/restored receipts never bypass physical restore, including a backup-equal main
+# with stale WAL and a main with no sidecars but no restore intent; a clean main with restore intent
+# certifies without re-restoring and clears skipped. FAIL: old start precedes physical certification.
+for stale in skipped skipped-restored restored main-equal-with-stale-wal main-equal-clean \
+  main-equal-clean-restore-intent; do
+  root=$TEST_TMP/rollback-stale-$stale
+  drive_to_wal_reset "$root"
+  expected_restores=1
+  if [[ "$stale" == main-equal-clean-restore-intent ]]; then
+    expected_restores=0
+    echo 0 > "$root/test-state/local-restore-count"
+  fi
+  python3 - "$root" "$stale" <<'PY'
+import json, pathlib, shutil, sys
+root=pathlib.Path(sys.argv[1]); path=root/"pe-financial-era.json"; value=json.loads(path.read_text())
+value["state"]="rolling_back"
+value["local_restore_skipped"]=sys.argv[2] != "restored"
+value["local_restored"]=sys.argv[2] != "skipped"
+if sys.argv[2].startswith("main-equal"):
+    shutil.copyfile(value["backup"]["path"],value["paths"]["paper_state"])
+if sys.argv[2].startswith("main-equal-clean"):
+    for suffix in ("-wal","-shm"): pathlib.Path(value["paths"]["paper_state"]+suffix).unlink()
+if sys.argv[2] == "main-equal-clean-restore-intent": value["local_restore_intent"]=True
+path.write_text(json.dumps(value,sort_keys=True,separators=(",",":")))
+PY
+  set +e
+  run_driver "$root" --rollback-before-start --simulate-crash-after local-restored >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ $status -eq 86 ]] || fail "$stale missed local-restored crash: $status"
+  [[ ! -e "$root/test-state/start-count" && $(<"$root/test-state/local-restore-count") -eq $expected_restores ]] ||
+    fail "$stale started before certification or repeated physical restoration"
+  assert_restored_sqlite "$root"
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["local_restore_intent"] and v["local_restored"] and not v["local_restore_skipped"]' \
+    "$root/pe-financial-era.json" || fail "$stale retained obsolete skipped receipt"
+  run_driver "$root" --rollback-before-start >/dev/null
+  [[ $(<"$root/test-state/local-restore-count") -eq $expected_restores &&
+     $(<"$root/test-state/restore-count") -eq 1 && $(<"$root/test-state/start-count") -eq 1 ]] ||
+    fail "$stale repeated restoration or old start"
+  echo "PASS: FE-ROLLBACK-STALE-RECEIPTS-11/$stale"
+done
+echo 'PASS: FE-ROLLBACK-STALE-RECEIPTS-11'
+
+# Scenario FE-ROLLBACK-RESTORE-RETRY-12
+# PASS: every restore receipt boundary, replacement-before-sidecar-cleanup and SHM-only interruption
+# converges without duplicate archive restoration or old start. FAIL: stale WAL certifies completion.
+wal_restore_boundaries=(replacement-before-sidecar-cleanup wal-removed-before-shm-cleanup)
+for receipt in rollback-local-restore-intent local-restored; do
+  wal_restore_boundaries+=("before-manifest-$receipt" "$receipt" "after-manifest-$receipt")
+done
+for boundary in "${wal_restore_boundaries[@]}"; do
+  root=$TEST_TMP/rollback-wal-$boundary
+  drive_to_wal_reset "$root"
+  crash_args=(--simulate-crash-after "$boundary")
+  expected_restores=1
+  if [[ "$boundary" == replacement-before-sidecar-cleanup ]]; then
+    touch "$root/test-state/crash-after-local-replace"
+    crash_args=()
+    expected_restores=2
+  elif [[ "$boundary" == wal-removed-before-shm-cleanup ]]; then
+    touch "$root/test-state/crash-after-local-wal-removal"
+    crash_args=()
+    expected_restores=2
+  fi
+  set +e
+  output=$(run_driver "$root" --rollback-before-start "${crash_args[@]}" 2>&1)
+  status=$?
+  set -e
+  [[ $status -eq 86 ]] || fail "$boundary missed restore crash: $status: $output"
+  if [[ "$boundary" == replacement-before-sidecar-cleanup || "$boundary" == wal-removed-before-shm-cleanup ]]; then
+    database=$root/prediction-markets/gen/g557/paper_state.db
+    cmp -s "$database" "$root/prediction-markets/financial-era-act-545-paper-state.db" ||
+      fail "interrupted replacement main differs from backup"
+    [[ -e "$database-shm" ]] || fail "interrupted helper lost its SHM"
+    if [[ "$boundary" == wal-removed-before-shm-cleanup ]]; then
+      [[ ! -e "$database-wal" ]] || fail "interrupted helper retained its WAL"
+    else
+      [[ -s "$database-wal" ]] || fail "interrupted helper lost its WAL"
+    fi
+  fi
+  run_driver "$root" --rollback-before-start >/dev/null
+  assert_restored_sqlite "$root"
+  terminal_before=$(rollback_snapshot "$root")
+  run_driver "$root" --rollback-before-start >/dev/null
+  [[ "$(rollback_snapshot "$root")" == "$terminal_before" ]] || fail "$boundary changed terminal rollback"
+  [[ $(<"$root/test-state/local-restore-count") -eq $expected_restores &&
+     $(<"$root/test-state/restore-count") -eq 1 && $(<"$root/test-state/start-count") -eq 1 ]] ||
+    fail "$boundary repeated restoration or old start"
+  echo "PASS: FE-ROLLBACK-RESTORE-RETRY-12/$boundary"
+done
+echo 'PASS: FE-ROLLBACK-RESTORE-RETRY-12'
+
+# Scenario FE-ROLLBACK-RESUMED-WRITES-13
+# PASS: active old service retains legitimate WAL/log suffix writes with or without a completed
+# start receipt; pre-systemctl start-intent retry accepts only an untouched restored image;
+# inactive ambiguous resumption fails closed, and originally inactive stays inactive.
+# FAIL: restore overwrites later writes, ambiguity succeeds, or a duplicate start occurs.
+for resumption in start-inflight started ambiguous-main ambiguous-wal ambiguous-log inactive \
+  start-intent-untouched start-intent-changed; do
+  root=$TEST_TMP/rollback-resumed-$resumption
+  if [[ "$resumption" == inactive ]]; then
+    drive_to_wal_reset "$root" false
+    run_driver "$root" --rollback-before-start >/dev/null
+    assert_restored_sqlite "$root"
+    [[ ! -e "$root/test-state/start-count" && $(<"$root/test-state/service.active") == false ]] ||
+      fail "originally inactive service was started"
+  else
+    drive_to_wal_reset "$root"
+    boundary=before-manifest-old-service-started
+    [[ "$resumption" != started ]] || boundary=old-service-started
+    if [[ "$resumption" == start-intent-* ]]; then boundary=rollback-old-service-start-intent; fi
+    set +e
+    run_driver "$root" --rollback-before-start --simulate-crash-after "$boundary" >/dev/null 2>&1
+    status=$?
+    set -e
+    [[ $status -eq 86 ]] || fail "$resumption did not reach old-service start"
+    if [[ "$resumption" == start-intent-* ]]; then
+      [[ ! -e "$root/test-state/start-count" && $(<"$root/test-state/service.active") == false ]] ||
+        fail "$resumption crossed systemctl start before the interruption"
+      python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+assert v["qualification_start_intent"] and v["local_restore_intent"] and v["local_restored"]
+assert v["old_service_start_intent"] and not v.get("old_service_started",False)' \
+        "$root/pe-financial-era.json" || fail "$resumption lacks the pre-systemctl start receipts"
+    fi
+    python3 - "$root/prediction-markets/gen/g557" "$resumption" <<'PY'
+import os, pathlib, sqlite3, sys
+generation=pathlib.Path(sys.argv[1]); mode=sys.argv[2]
+if mode == "start-intent-changed": original=(generation/"paper_state.db").read_bytes()
+if mode not in ("ambiguous-log","start-intent-untouched"):
+    db=sqlite3.connect(str(generation/"paper_state.db"))
+    db.execute("pragma wal_autocheckpoint=0")
+    db.execute("insert into durable values('legitimate-resumed-write')")
+    db.commit()
+    if mode in ("ambiguous-main","start-intent-changed"): db.close()
+if mode == "start-intent-changed":
+    assert (generation/"paper_state.db").read_bytes() != original
+    assert not (generation/"paper_state.db-wal").exists()
+    assert not (generation/"paper_state.db-shm").exists()
+if mode not in ("ambiguous-main","ambiguous-wal","start-intent-untouched","start-intent-changed"):
+    for name in ("paper.log","source_events.log","live_journal.log"):
+        with (generation/name).open("ab") as output: output.write(b"legitimate-resumed-suffix\n")
+os._exit(0)
+PY
+    if [[ "$resumption" == ambiguous-* ]]; then echo false > "$root/test-state/service.active"; fi
+  fi
+  resumed_before=$(rollback_snapshot "$root")
+  set +e
+  output=$(run_driver "$root" --rollback-before-start 2>&1)
+  status=$?
+  set -e
+  if [[ "$resumption" == ambiguous-* || "$resumption" == start-intent-changed ]]; then
+    [[ $status -ne 0 && ( "$output" == *'old-service resumption is ambiguous'* ||
+                         "$output" == *'guarded paper/source/live log identity changed'* ) ]] ||
+      fail "$resumption did not fail closed: $output"
+  else
+    [[ $status -eq 0 && "$output" == *state=rolled_back* ]] || fail "$resumption failed: $output"
+  fi
+  resumed_after=$(rollback_snapshot "$root")
+  python3 - "$resumed_before" "$resumed_after" "$resumption" <<'PY' || fail "$resumption overwrote resumed state"
+import json, sys
+before,after=map(json.loads,sys.argv[1:3])
+if sys.argv[3] in ("start-inflight","started","start-intent-untouched"):
+    for values in (before,after):
+        for key in list(values):
+            if key.endswith("/pe-financial-era.json") or (sys.argv[3] == "start-intent-untouched" and
+                    key.endswith(("/start-count","/service.active"))): del values[key]
+assert before == after
+PY
+  if [[ "$resumption" == start-intent-untouched ]]; then
+    [[ $(<"$root/test-state/start-count") -eq 1 && $(<"$root/test-state/service.active") == true &&
+       $(<"$root/test-state/local-restore-count") -eq 1 && $(<"$root/test-state/restore-count") -eq 1 ]] ||
+      fail "untouched start-intent retry repeated restoration or did not start exactly once"
+    assert_restored_sqlite "$root"
+  fi
+  echo "PASS: FE-ROLLBACK-RESUMED-WRITES-13/$resumption"
+done
+echo 'PASS: FE-ROLLBACK-RESUMED-WRITES-13'
+
+echo "PASS: 62 scenario contracts, including WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"

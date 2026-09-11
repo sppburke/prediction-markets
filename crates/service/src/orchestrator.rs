@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
-use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3};
+use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3, PaperFreshnessPolicy};
 use crate::clob_book::ClobBookFetcher;
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
@@ -137,6 +137,11 @@ fn unix_millis(instant: OffsetDateTime) -> i64 {
     i64::try_from(instant.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
 }
 
+enum ActiveFinancialFill {
+    Committed(pe_event_log::AppendReceipt),
+    Expired,
+}
+
 fn record_clock(
     evidence: &mut Option<DecisionEvidenceAccumulator>,
     purpose: &str,
@@ -155,11 +160,22 @@ pub(crate) fn render_pending_evidence(
     let Some(evidence) = evidence else {
         return Ok(None);
     };
+    #[cfg(feature = "scenario")]
+    let terminal_at = SCENARIO_TERMINAL_CLOCK
+        .try_with(|at| *at)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
+    #[cfg(not(feature = "scenario"))]
     let terminal_at = OffsetDateTime::now_utc();
     let mut complete = evidence.clone();
     complete.record_clock("terminal_transition", unix_millis(terminal_at));
     let json = complete.render(authority, terminal)?;
     Ok(Some((json, terminal_at.unix_timestamp())))
+}
+
+#[cfg(feature = "scenario")]
+tokio::task_local! {
+    /// Fixed terminal clock shared by orchestrator and recovery byte-compatibility scenarios.
+    pub static SCENARIO_TERMINAL_CLOCK: OffsetDateTime;
 }
 
 pub(crate) fn pending_terminal(value: &(String, i64)) -> PendingTerminalEvidence<'_> {
@@ -262,6 +278,8 @@ pub struct ScenarioHooks {
     pub fail_next_no_copy_commit: std::sync::atomic::AtomicBool,
     /// One-shot fault standing in for a failed `RiskHaltChanged` append.
     pub fail_next_halt_append: std::sync::atomic::AtomicBool,
+    /// Stop after the accepted checkpoint, before any new FinancialPrepared is durable.
+    pub fail_next_prepared_append: std::sync::atomic::AtomicBool,
 }
 
 pub struct Orchestrator<
@@ -781,7 +799,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         trade: &IncomingTrade,
         economic: pe_execution_core::EconomicPrepared,
         dispatch_id: Option<&str>,
-    ) -> Result<pe_event_log::AppendReceipt, String> {
+        paper_freshness: Option<&(PaperFreshnessPolicy, SourceTimestamp)>,
+        evidence: &mut Option<DecisionEvidenceAccumulator>,
+    ) -> Result<ActiveFinancialFill, String> {
         if economic.market.outcome_index > 1 {
             return Err(format!(
                 "active paper fill outcome {} is not binary",
@@ -834,6 +854,32 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             },
             economic,
         };
+        if let Some((policy, source_time)) = paper_freshness {
+            let admission_at = self.admission_now();
+            let evidence = evidence
+                .as_mut()
+                .ok_or_else(|| "paper decision evidence is missing".to_owned())?;
+            evidence
+                .record_precise_clock("paper_prepared_staleness_gate", admission_at)
+                .map_err(|error| error.to_string())?;
+            if policy.expired(source_time.clone(), admission_at) {
+                return Ok(ActiveFinancialFill::Expired);
+            }
+            evidence.record_clock("paper_dispatch", unix_millis(admission_at));
+            self.paper_state
+                .checkpoint_decision_pending(
+                    &trade.source_trade_id,
+                    &evidence
+                        .checkpoint_json()
+                        .map_err(|error| error.to_string())?,
+                    admission_at.unix_timestamp(),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        #[cfg(feature = "scenario")]
+        if self.take_scenario_fault(|hooks| &hooks.fail_next_prepared_append) {
+            return Err("injected failure after checkpoint before Prepared".to_owned());
+        }
         let prepared_receipt = self.append_paper_record(&PaperLogRecord::FinancialPrepared {
             expected_authority: expected.clone(),
             payload: payload.clone(),
@@ -881,7 +927,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return Err("internal fill Final kind mismatch".to_owned());
         };
         self.bankroll = canonical.bankroll;
-        Ok(final_receipt)
+        Ok(ActiveFinancialFill::Committed(final_receipt))
     }
 
     /// Build the paper owner's coherent risk snapshot from the active financial prefix.
@@ -1313,10 +1359,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     // (#544 review round 3): capture is linearized against a
                     // concurrent refresh, and later watchlist/bankroll moves
                     // cannot change what a resumed continuation decides.
-                    let frozen_basis = self.freeze_decision_basis(&aggregates);
-                    let result =
-                        self.bucket_engine
-                            .commit(aggregates, context.as_ref(), frozen_basis);
+                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates);
+                    let result = self.bucket_engine.commit_with_freshness_policy(
+                        aggregates,
+                        context.as_ref(),
+                        frozen_basis,
+                        Some(policy),
+                    );
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {
@@ -1331,10 +1380,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     // Scenario/unit construction may omit the production writer lock;
                     // those harnesses have no competing membership writer to
                     // linearize the basis capture against.
-                    let frozen_basis = self.freeze_decision_basis(&aggregates);
-                    let result =
-                        self.bucket_engine
-                            .commit(aggregates, context.as_ref(), frozen_basis);
+                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates);
+                    let result = self.bucket_engine.commit_with_freshness_policy(
+                        aggregates,
+                        context.as_ref(),
+                        frozen_basis,
+                        Some(policy),
+                    );
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {
@@ -1371,14 +1423,30 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             OrchestratorControl::PublishMembership {
                 change,
                 replacements,
+                checks,
                 acknowledged,
             } => {
+                let writer_lock = self.watchlist_writer_lock.clone();
+                let _writer = match &writer_lock {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                };
+                if let Err(error) = checks.recheck_and_seed(
+                    &self.paper_state,
+                    &self.live_watchlist,
+                    &change,
+                    &replacements,
+                ) {
+                    let _ = acknowledged.send(Err(error.to_string()));
+                    return;
+                }
                 let removed = change.removed.iter().copied().collect::<HashSet<_>>();
                 let capacity = change.capacity;
                 let receipt = self.append_paper_record(&change.into_record());
                 if receipt.is_ok() {
                     self.live_watchlist
                         .replace(&removed, &replacements, capacity);
+                    checks.commit_capacity();
                 }
                 let result = receipt;
                 let _ = acknowledged.send(result);
@@ -1612,6 +1680,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             boundary_mark_fetcher: None,
             active_risk_halts: HashSet::new(),
         })
+    }
+
+    /// Share the process source receipt index. Every generation-5 attempt authenticates its
+    /// earliest bound source time through it before the shared admission gates, in every
+    /// financial posture; the Start-bound protocol installs the same index again with its logs.
+    #[must_use]
+    pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
+        self.source_receipts = Some(source_receipts);
+        self
     }
 
     /// Install the verified log pair used by the Start-bound financial protocol.
@@ -1923,6 +2000,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 checked_at_unix_ms: None,
             });
         };
+        #[cfg(feature = "scenario")]
+        let checked_at_unix_ms = u64::try_from(unix_millis(self.financial_now())).unwrap_or(0);
+        #[cfg(not(feature = "scenario"))]
         let checked_at_unix_ms = crate::clob_book::now_unix_ms();
         if ladder_is_stale(checked_at_unix_ms, book.fetched_at_ms) {
             return Err(GatePlanFailure {
@@ -2131,23 +2211,45 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 })
             }
             Err(
-                LadderError::Amount
-                | LadderError::BelowMinimum
+                decline @ (LadderError::BelowMinimum
                 | LadderError::CapExceeded
-                | LadderError::NoEdge
-                | LadderError::KellySizing
-                | LadderError::Fee(_),
-            ) => Err(GatePlanFailure {
-                reason: "price-impact ladder arithmetic failed (fail closed)",
-                book: Box::new(book_failure(
-                    Some(&token_id),
-                    "arithmetic_failure",
-                    Some(&book.response_blake3),
-                    Some(book.fetched_at_ms),
-                    "ladder arithmetic failed",
-                )),
-                checked_at_unix_ms: Some(checked_at_unix_ms),
-            }),
+                | LadderError::NoEdge),
+            ) => {
+                let (outcome, reason) = match decline {
+                    LadderError::BelowMinimum => (
+                        "below_minimum",
+                        "ladder quantity is below the venue minimum",
+                    ),
+                    LadderError::CapExceeded => {
+                        ("cap_exceeded", "ladder debit exceeds the monetary cap")
+                    }
+                    _ => ("no_edge", "ladder sizing produced no allocation"),
+                };
+                Err(GatePlanFailure {
+                    reason,
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        outcome,
+                        Some(&book.response_blake3),
+                        Some(book.fetched_at_ms),
+                        reason,
+                    )),
+                    checked_at_unix_ms: Some(checked_at_unix_ms),
+                })
+            }
+            Err(LadderError::Amount | LadderError::KellySizing | LadderError::Fee(_)) => {
+                Err(GatePlanFailure {
+                    reason: "price-impact ladder arithmetic failed (fail closed)",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "arithmetic_failure",
+                        Some(&book.response_blake3),
+                        Some(book.fetched_at_ms),
+                        "ladder arithmetic failed",
+                    )),
+                    checked_at_unix_ms: Some(checked_at_unix_ms),
+                })
+            }
         }
     }
 
@@ -2162,7 +2264,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         signal: &LeaderSignal,
         observation: &pe_execution_core::ObservationEvidence,
         evidence: &mut Option<DecisionEvidenceAccumulator>,
+        continuation_version: u16,
     ) -> Result<Option<String>, ()> {
+        if let Some(dispatch_id) = evidence
+            .as_ref()
+            .and_then(DecisionEvidenceAccumulator::staged_dispatch_id)
+        {
+            return Ok(Some(dispatch_id.to_owned()));
+        }
         let Some(live) = self.live_accounts.as_ref() else {
             return Ok(None);
         };
@@ -2170,6 +2279,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // #514: no NEW live aggregates while blind — a stale/never-successful accounts
         // snapshot stages nothing. Paper execution proceeds unchanged; in-flight recovery
         // and redemption reconciliation do not gate on freshness.
+        #[cfg(feature = "scenario")]
+        let accounts_at = self.financial_now();
+        #[cfg(not(feature = "scenario"))]
         let accounts_at = OffsetDateTime::now_utc();
         record_clock(evidence, "live_accounts_freshness", accounts_at);
         if !snapshot.is_fresh(accounts_at.unix_timestamp()) {
@@ -2219,20 +2331,45 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "scenario fault: dispatch seed staging failed; abandoning the trade unseen");
             return Err(());
         }
-        let pending = match render_pending_evidence(
-            evidence.as_ref(),
-            AuthorityEvidence::not_read("dispatch_staged_before_fill_authority"),
-            TerminalDispositionEvidence::dispatch_staged(dispatch_id.clone()),
-        ) {
+        let checkpoint = continuation_version == 5;
+        let pending = if checkpoint {
+            if let Some(evidence) = evidence.as_mut() {
+                evidence.record_staged_dispatch(dispatch_id.clone());
+            }
+            evidence
+                .as_ref()
+                .map(|evidence| {
+                    evidence
+                        .checkpoint_json()
+                        .map(|json| (json, staged_at.unix_timestamp()))
+                })
+                .transpose()
+        } else {
+            render_pending_evidence(
+                evidence.as_ref(),
+                AuthorityEvidence::not_read("dispatch_staged_before_fill_authority"),
+                TerminalDispositionEvidence::dispatch_staged(dispatch_id.clone()),
+            )
+        };
+        let pending = match pending {
             Ok(value) => value,
             Err(error) => {
                 error!(%error, dispatch_id = %dispatch_id, "encode dispatch decision evidence failed");
                 return Err(());
             }
         };
+        let staging = pending.as_ref().map(|pending| {
+            if checkpoint {
+                pe_paper_state::DispatchStagingEvidence::PaperOutcomeCheckpoint(pending_terminal(
+                    pending,
+                ))
+            } else {
+                pe_paper_state::DispatchStagingEvidence::LegacyTerminal(pending_terminal(pending))
+            }
+        });
         match self
             .paper_state
-            .stage_dispatch_seed_pending(&record, pending.as_ref().map(pending_terminal))
+            .stage_dispatch_seed_pending(&record, staging)
         {
             Ok(_staged_or_reused) => Ok(Some(dispatch_id)),
             Err(e) => {
@@ -2311,9 +2448,72 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             },
             None => None,
         };
+        // Authenticate once for every generation-five attempt, including the first resume
+        // immediately after bucket commit. Keep the history epoch on the trade for identity.
+        let paper_freshness = pending
+            .as_ref()
+            .and_then(|continuation| {
+                continuation
+                    .facts
+                    .paper_freshness_policy
+                    .map(|policy| (continuation, policy))
+            })
+            .map(|(continuation, policy)| {
+                let source_receipts = self
+                    .source_receipts
+                    .as_ref()
+                    .ok_or_else(|| "paper source receipt index is missing".to_owned())?;
+                continuation
+                    .verified_source_time(&mut |receipt| {
+                        source_receipts
+                            .source_envelope(receipt)
+                            .map(crate::bucket_commit::CompleteActivityPage::from)
+                    })
+                    .map(|source_time| (policy, source_time))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose();
+        let paper_freshness = match paper_freshness {
+            Ok(freshness) => freshness,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "authenticate paper source clock failed; stopping producer intake");
+                self.intake_stopped = true;
+                return;
+            }
+        };
         let mut decision_evidence = pending
             .as_ref()
             .map(|continuation| DecisionEvidenceAccumulator::new(&continuation.facts));
+        if pending
+            .as_ref()
+            .is_some_and(|continuation| continuation.version() == 5)
+        {
+            let restored = self
+                .paper_state
+                .decision_pending_for(&trade.source_trade_id)
+                .map_err(|error| error.to_string())
+                .and_then(|row| {
+                    row.filter(|row| row.post_commit_inputs_json != "[]")
+                        .map(|row| {
+                            DecisionEvidenceAccumulator::resume_staging_checkpoint(&row)
+                                .map_err(|error| error.to_string())
+                        })
+                        .transpose()
+                });
+            match restored {
+                Ok(Some(evidence)) => decision_evidence = Some(evidence),
+                Ok(None) => {}
+                Err(error) => {
+                    error!(%error, trade = %trade.source_trade_id, "restore dispatch checkpoint failed");
+                    self.intake_stopped = true;
+                    return;
+                }
+            }
+        }
+        let already_staged = decision_evidence
+            .as_ref()
+            .and_then(DecisionEvidenceAccumulator::staged_dispatch_id)
+            .is_some();
         // New decisions use the current hot snapshot. A committed continuation instead
         // reinstalls its complete frozen 17-key snapshot before any post-boundary read.
         let applied_runtime = pending
@@ -2577,7 +2777,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         if pending.is_some() {
             let stale_at = self.admission_now();
             record_clock(&mut decision_evidence, "initial_staleness_gate", stale_at);
-            if let Some(disposition) = self.stale_no_copy(&trade, stale_at) {
+            if !already_staged
+                && let Some(disposition) =
+                    self.continuation_stale_no_copy(&trade, stale_at, paper_freshness.as_ref())
+            {
                 self.commit_no_copy_or_rollback(
                     &trade,
                     &leader_row,
@@ -2967,7 +3170,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             "pre_dispatch_staleness_gate",
             dispatch_stale_at,
         );
-        if let Some(disposition) = self.stale_no_copy(&trade, dispatch_stale_at) {
+        // A staged generation-five decision has already passed shared admission. Its
+        // paper-only freshness outcome belongs to the final Prepared boundary on resume.
+        if !already_staged
+            && let Some(disposition) =
+                self.continuation_stale_no_copy(&trade, dispatch_stale_at, paper_freshness.as_ref())
+        {
             self.commit_no_copy_or_rollback(
                 &trade,
                 &leader_row,
@@ -2979,16 +3187,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return;
         }
 
-        let dispatch_id =
-            match self.stage_dispatch_if_targeted(&signal, &observation, &mut decision_evidence) {
-                Ok(id) => id,
-                Err(()) => {
-                    // Staging failed: abandoned unseen. #511: exact in-memory rollback so
-                    // the held-cursor redelivery re-admits byte-identically.
-                    self.rollback_admission(&rb, Some(&signal.market_id));
-                    return;
-                }
-            };
+        let dispatch_id = match self.stage_dispatch_if_targeted(
+            &signal,
+            &observation,
+            &mut decision_evidence,
+            continuation.version(),
+        ) {
+            Ok(id) => id,
+            Err(()) => {
+                // Staging failed: abandoned unseen. #511: exact in-memory rollback so
+                // the held-cursor redelivery re-admits byte-identically.
+                self.rollback_admission(&rb, Some(&signal.market_id));
+                return;
+            }
+        };
 
         // Relocated hold/already-filled gate (#508; historically pre-first-BUY): a paper
         // position we already hold skips the PAPER order only — live targets in the staged
@@ -3135,34 +3347,45 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 .await;
             }
             Ok(intent) => {
-                let execution_at = OffsetDateTime::now_utc();
-                record_clock(&mut decision_evidence, "paper_dispatch", execution_at);
-                if let Some(evidence) = decision_evidence.as_ref() {
-                    let checkpoint = match evidence.checkpoint_json() {
-                        Ok(checkpoint) => checkpoint,
-                        Err(error) => {
-                            error!(%error, trade = %trade.source_trade_id,
+                if pending
+                    .as_ref()
+                    .is_none_or(|continuation| continuation.version() != 5)
+                {
+                    let execution_at = OffsetDateTime::now_utc();
+                    record_clock(&mut decision_evidence, "paper_dispatch", execution_at);
+                    if let Some(evidence) = decision_evidence.as_ref() {
+                        let checkpoint = match evidence.checkpoint_json() {
+                            Ok(checkpoint) => checkpoint,
+                            Err(error) => {
+                                error!(%error, trade = %trade.source_trade_id,
                                 "encode pre-dispatch decision evidence failed; stopping producer intake");
+                                self.intake_stopped = true;
+                                return;
+                            }
+                        };
+                        if let Err(error) = self.paper_state.checkpoint_decision_pending(
+                            &trade.source_trade_id,
+                            &checkpoint,
+                            execution_at.unix_timestamp(),
+                        ) {
+                            error!(%error, trade = %trade.source_trade_id,
+                            "persist pre-dispatch decision evidence failed; stopping producer intake");
                             self.intake_stopped = true;
                             return;
                         }
-                    };
-                    if let Err(error) = self.paper_state.checkpoint_decision_pending(
-                        &trade.source_trade_id,
-                        &checkpoint,
-                        execution_at.unix_timestamp(),
-                    ) {
-                        error!(%error, trade = %trade.source_trade_id,
-                            "persist pre-dispatch decision evidence failed; stopping producer intake");
-                        self.intake_stopped = true;
-                        return;
                     }
                 }
                 match self
-                    .apply_active_financial_fill(&trade, economic, dispatch_id.as_deref())
+                    .apply_active_financial_fill(
+                        &trade,
+                        economic,
+                        dispatch_id.as_deref(),
+                        paper_freshness.as_ref(),
+                        &mut decision_evidence,
+                    )
                     .await
                 {
-                    Ok(final_receipt) => {
+                    Ok(ActiveFinancialFill::Committed(final_receipt)) => {
                         self.filled_positions.insert(MarketOutcomeId::new(
                             signal.market_id.clone(),
                             signal.outcome_id,
@@ -3181,6 +3404,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                             market = %intent.market_id,
                             "paper fill committed"
                         );
+                    }
+                    Ok(ActiveFinancialFill::Expired) => {
+                        self.no_fill_or_rollback(
+                            &trade,
+                            &leader_row,
+                            dispatch_id.as_deref(),
+                            "paper_stale_before_prepared",
+                            &rb,
+                            Some(&signal.market_id),
+                            decision_evidence.as_ref(),
+                        )
+                        .await;
                     }
                     Err(error) => {
                         error!(%error, trade = %trade.source_trade_id, "active paper financial transition is uncertain");
@@ -3266,10 +3501,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 return;
             }
         };
-        if let Err(e) = self.paper_state.commit_seen_no_copy_with_pending(
+        let outcome = format!("no_fill:{}", disposition.reason);
+        let flip = evidence
+            .and_then(DecisionEvidenceAccumulator::staged_dispatch_id)
+            .map(|dispatch_id| pe_paper_state::DispatchFlip {
+                dispatch_id,
+                paper_outcome: &outcome,
+            });
+        if let Err(e) = self.paper_state.commit_seen_no_copy_with_flip_pending(
             &trade.source_trade_id,
             leader,
             disposition,
+            flip,
             pending.as_ref().map(pending_terminal),
         ) {
             error!(error = %e, trade = %trade.source_trade_id,
@@ -3303,9 +3546,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         }
     }
 
-    /// Terminal no-fill that STAYS terminal only if the seen-commit lands (#511): on
-    /// commit failure the trade is abandoned unseen, so the in-memory admission effects
-    /// are rolled back — the held cursor redelivers into a fresh identical admission.
+    /// Terminal no-fill commits atomically with its staged dispatch handoff. Failed legacy
+    /// admission rolls back; durable continuations retain consumed state for restart recovery.
     #[allow(clippy::too_many_arguments)]
     async fn no_fill_or_rollback(
         &mut self,
@@ -3411,6 +3653,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             }
         };
         let outcome = format!("no_fill:{no_fill_reason}");
+        let dispatch_id = dispatch_id
+            .or_else(|| evidence.and_then(DecisionEvidenceAccumulator::staged_dispatch_id));
         let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
             dispatch_id: id,
             paper_outcome: &outcome,
@@ -3435,9 +3679,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     error!(
                         error = %e,
                         dispatch_id = ?dispatch_id,
-                        "paper-state no-fill commit failed after in-process retries; the \
-                         trade is abandoned UNSEEN (#511: the caller rolls back the \
-                         in-memory admission and the held cursor redelivers it)"
+                        "paper-state no-fill terminalization failed after in-process retries; \
+                         durable continuations remain pending for restart recovery, while \
+                         legacy admission rolls back for redelivery"
                     );
                 }
             }
@@ -3461,17 +3705,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn freeze_decision_basis(
         &self,
         aggregates: &[pe_source_polymarket_public::ActivityAggregate],
-    ) -> crate::bucket_commit::FrozenDecisionBasis {
+    ) -> (
+        crate::bucket_commit::FrozenDecisionBasis,
+        crate::bucket_commit::PaperFreshnessPolicy,
+    ) {
         let watchlist = self.live_watchlist.snapshot();
         let leader = aggregates
             .first()
             .map(|aggregate| TraderId(aggregate.group_id.components().wallet));
-        crate::bucket_commit::FrozenDecisionBasis {
-            win_rate_p: leader
-                .map(|leader| self.win_rate_p_for(&watchlist, &leader))
-                .unwrap_or(Probability::ZERO),
-            bankroll: self.bankroll,
-        }
+        (
+            crate::bucket_commit::FrozenDecisionBasis {
+                win_rate_p: leader
+                    .map(|leader| self.win_rate_p_for(&watchlist, &leader))
+                    .unwrap_or(Probability::ZERO),
+                bankroll: self.bankroll,
+            },
+            crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: self.activity_ws_enabled,
+                copy_latency_budget_secs: self.copy_latency_budget_secs,
+            },
+        )
     }
 
     fn win_rate_p_for(&self, watchlist: &Watchlist, leader: &TraderId) -> Probability {
@@ -3485,6 +3738,30 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let p_raw = Decimal::from(bps) / Decimal::from(10_000i32);
         // Infallible after clamping to [0, 10_000]: p_raw is in [0, 1].
         Probability::new(p_raw).unwrap_or(Probability::ZERO)
+    }
+
+    fn continuation_stale_no_copy(
+        &self,
+        trade: &IncomingTrade,
+        now: OffsetDateTime,
+        paper_freshness: Option<&(PaperFreshnessPolicy, SourceTimestamp)>,
+    ) -> Option<pe_paper_state::NoCopyDisposition> {
+        let Some((policy, source_time)) = paper_freshness else {
+            return self.stale_no_copy(trade, now);
+        };
+        if !policy.expired(source_time.clone(), now) {
+            return None;
+        }
+        let (provenance, reason) = match trade.provenance {
+            TradeProvenance::RestPoll => ("rest_poll", "stale_fallback_past_copy_budget"),
+            TradeProvenance::ActivityWs => ("activity_ws", "stale_activity_ws_past_copy_budget"),
+        };
+        Some(pe_paper_state::NoCopyDisposition {
+            provenance: provenance.to_owned(),
+            age_secs: (now - source_time.0).whole_seconds(),
+            reason: reason.to_owned(),
+            recorded_at_unix: now.unix_timestamp(),
+        })
     }
 }
 

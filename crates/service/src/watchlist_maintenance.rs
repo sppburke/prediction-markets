@@ -19,7 +19,7 @@
 //! to "now" rather than being read as inactive-forever, until the poller writes its real last trade.
 //!
 //! Freed slots are atomically backfilled via [`LiveWatchlist::replace`] from the top of
-//! `latest_ranking`, excluding the live ∪ evicted sets. The refresh loop and this tick are
+//! the batch-pinned survivor bench, excluding the live ∪ evicted sets. The refresh loop and this tick are
 //! serialized by a shared [`tokio::sync::Mutex`] writer lock; readers stay lock-free. The
 //! realized-edge series both triggers consume comes from the authoritative local `paper_state.db`
 //! (`list_fills` + in-process [`ResolutionStore`]), never the best-effort Supabase mirror.
@@ -59,7 +59,7 @@ use pe_paper_state::{FillRow, PaperStateDb, PaperStateError};
 use pe_trader_index::{Watchlist, WatchlistEntry};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard, watch};
 use tracing::{info, warn};
 
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
@@ -69,7 +69,9 @@ use crate::paper_recovery::{
     KnockoutCausalArtifact, KnockoutFillArtifact, KnockoutSettlementArtifact, MembershipChange,
     MembershipReason, SealedMembershipEvidence,
 };
-use crate::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
+use crate::runtime_config::{
+    AppliedWatchlistCapacity, MAX_ACTIVE_WATCHLIST_SIZE, WatchlistCapacityEpoch,
+};
 use crate::supabase_reader;
 use crate::watchlist_admission::AdmissionPreparer;
 
@@ -116,8 +118,6 @@ pub struct MaintenanceConfig {
     /// Trailing window (seconds) for the demotion realized-P&L conjunct
     /// (`WalletEdgeStats::windowed_pnl`).
     pub demotion_pnl_window_secs: u64,
-    /// Extra bench candidates fetched beyond the freed-slot count.
-    pub bench_overfetch: usize,
     /// Who owns membership between ranking batches (module docs; run28 cutover).
     pub membership_mode: MembershipMode,
 }
@@ -163,6 +163,93 @@ pub struct MembershipPublication {
     pub evidence: serde_json::Value,
 }
 
+/// Process-local checks carried to the single-owner publication boundary; never serialized.
+#[derive(Debug, Default)]
+pub struct MembershipCommit {
+    pub seeds: Vec<(WalletAddress, i64)>,
+    pub capacity: Option<MembershipCapacityCheck>,
+}
+
+#[derive(Debug)]
+pub enum MembershipCapacityCheck {
+    Unchanged {
+        applied: AppliedWatchlistCapacity,
+        expected: WatchlistCapacityEpoch,
+    },
+    Transition {
+        applied: AppliedWatchlistCapacity,
+        desired: watch::Receiver<WatchlistCapacityEpoch>,
+        request: WatchlistCapacityEpoch,
+    },
+}
+
+impl MembershipCommit {
+    /// Called under the writer lock immediately before appending the membership record.
+    pub fn recheck_and_seed(
+        &self,
+        paper_state: &PaperStateDb,
+        live: &LiveWatchlist,
+        change: &MembershipChange,
+        replacements: &[WatchlistEntry],
+    ) -> Result<(), MembershipApplyError> {
+        match &self.capacity {
+            Some(MembershipCapacityCheck::Unchanged { applied, expected }) => {
+                let current = applied.load();
+                if current != *expected {
+                    return Err(stale_capacity_error(*expected, current));
+                }
+            }
+            Some(MembershipCapacityCheck::Transition {
+                desired, request, ..
+            }) if *desired.borrow() != *request => {
+                return Err(MembershipApplyError::Publication(
+                    "capacity request was superseded before membership commit".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        recheck_admissions(paper_state, &change.added)?;
+        let current = live.snapshot();
+        let (removed, added) = match change.reason {
+            MembershipReason::FullRerank | MembershipReason::CapacityChange => {
+                ranked_membership_change(&current.entries, replacements, change.capacity)
+            }
+            _ => {
+                let removed: HashSet<_> = change.removed.iter().copied().collect();
+                let added =
+                    planned_admissions(&current.entries, &removed, replacements, change.capacity);
+                let removed = current
+                    .entries
+                    .iter()
+                    .filter_map(|entry| removed.contains(&entry.wallet).then_some(entry.wallet))
+                    .collect();
+                (removed, added)
+            }
+        };
+        let same_wallets = |left: &[WalletAddress], right: &[WalletAddress]| {
+            left.iter().copied().collect::<HashSet<_>>()
+                == right.iter().copied().collect::<HashSet<_>>()
+        };
+        if !same_wallets(&removed, &change.removed) || !same_wallets(&added, &change.added) {
+            return Err(MembershipApplyError::EvidenceMutation);
+        }
+        recheck_publication_evidence(&change.evidence, &change.removed, &change.added)?;
+        // #511: insert-only — never jump an existing (possibly HELD) delivery cursor.
+        paper_state.seed_cursors_if_absent(&self.seeds)?;
+        Ok(())
+    }
+
+    /// Commit the capacity epoch with the successful live replacement under the writer lock.
+    pub fn commit_capacity(&self) {
+        if let Some(MembershipCapacityCheck::Transition {
+            applied, request, ..
+        }) = &self.capacity
+        {
+            applied.store(*request);
+        }
+    }
+}
+
 fn remove_loaded_fences(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
@@ -195,7 +282,7 @@ fn recheck_admissions(
 }
 
 fn recheck_publication_evidence(
-    publication: &MembershipPublication,
+    publication_evidence: &serde_json::Value,
     removed: &[WalletAddress],
     added: &[WalletAddress],
 ) -> Result<(), MembershipApplyError> {
@@ -203,7 +290,7 @@ fn recheck_publication_evidence(
     // scenario callers with documentary JSON. Production publishers always construct this enum;
     // qualification independently rejects an untyped durable record.
     let Ok(evidence) =
-        serde_json::from_value::<SealedMembershipEvidence>(publication.evidence.clone())
+        serde_json::from_value::<SealedMembershipEvidence>(publication_evidence.clone())
     else {
         return Ok(());
     };
@@ -546,12 +633,8 @@ pub async fn apply_evictions_and_backfill(
     if actual_removed.is_empty() && admissions.is_empty() {
         return Ok(current.entries.len());
     }
-    recheck_admissions(paper_state, &admissions)?;
-    recheck_publication_evidence(&publication, &actual_removed, &admissions)?;
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
-    // #511: insert-only — an existing (possibly HELD) delivery cursor is already a valid
-    // lower bound and must never be jumped by a re-admission seed; activity MAX-seeds.
-    paper_state.seed_cursors_if_absent(&seeds)?;
+    drop(_guard);
     publisher
         .publish_membership(
             MembershipChange {
@@ -563,16 +646,25 @@ pub async fn apply_evictions_and_backfill(
                 evidence: publication.evidence,
             },
             candidates.to_vec(),
+            MembershipCommit {
+                seeds,
+                capacity: Some(MembershipCapacityCheck::Unchanged {
+                    applied: applied_capacity.clone(),
+                    expected: expected_capacity,
+                }),
+            },
         )
         .await
         .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
     Ok(live.snapshot().entries.len())
 }
 
-/// Apply an exact ranked membership while the caller holds the structural-writer mutex.
+/// Compute an exact ranked membership under the caller's structural-writer mutex, then release
+/// it before awaiting the orchestrator's final recheck, cursor persistence and publication.
 ///
 /// Used by both same-cap full reranks and runtime capacity transitions. Cursor persistence is a
 /// fail-closed prerequisite to ArcSwap publication.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_ranked_membership_locked(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
@@ -581,6 +673,8 @@ pub(crate) async fn apply_ranked_membership_locked(
     incoming: &[WatchlistEntry],
     incoming_last_trade: &HashMap<WalletAddress, i64>,
     cap: usize,
+    writer_guard: MutexGuard<'_, ()>,
+    capacity: Option<MembershipCapacityCheck>,
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
     remove_loaded_fences(live, paper_state)?;
     let current = live.snapshot();
@@ -591,11 +685,8 @@ pub(crate) async fn apply_ranked_membership_locked(
     {
         return Ok((current.entries.len(), dropped));
     }
-    recheck_admissions(paper_state, &admissions)?;
-    recheck_publication_evidence(&publication, &dropped, &admissions)?;
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
-    // #511: insert-only (see membership admission above).
-    paper_state.seed_cursors_if_absent(&seeds)?;
+    drop(writer_guard);
     publisher
         .publish_membership(
             MembershipChange {
@@ -607,6 +698,7 @@ pub(crate) async fn apply_ranked_membership_locked(
                 evidence: publication.evidence,
             },
             incoming.to_vec(),
+            MembershipCommit { seeds, capacity },
         )
         .await
         .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
@@ -641,6 +733,11 @@ pub async fn apply_full_rerank_swap(
         incoming,
         incoming_last_trade,
         expected_capacity.target,
+        _guard,
+        Some(MembershipCapacityCheck::Unchanged {
+            applied: applied_capacity.clone(),
+            expected: expected_capacity,
+        }),
     )
     .await
 }
@@ -817,11 +914,32 @@ async fn maintenance_tick(
                     && (latest != sync.marker || capacity_changed)
                 {
                     match supabase_reader::fetch_batch(
-                        client, base_url, anon_key, secret_key, batch_id, cap,
+                        client,
+                        base_url,
+                        anon_key,
+                        secret_key,
+                        batch_id,
+                        MAX_ACTIVE_WATCHLIST_SIZE,
                     )
                     .await
                     {
-                        Ok((incoming, incoming_last_trade)) => {
+                        Ok((incoming, incoming_last_trade)) => 'replacement: {
+                            let fenced = match paper_state.wallet_fences() {
+                                Ok(records) => {
+                                    records.into_iter().map(|record| record.wallet).collect()
+                                }
+                                Err(error) => {
+                                    warn!(%error, "full_rerank: fence read failed; keeping batch marker for retry");
+                                    break 'replacement;
+                                }
+                            };
+                            let (incoming, incoming_last_trade) =
+                                supabase_reader::select_membership(
+                                    incoming,
+                                    incoming_last_trade,
+                                    &fenced,
+                                    cap,
+                                );
                             let (_, additions) = ranked_membership_change(
                                 &live.snapshot().entries,
                                 &incoming.entries,
@@ -830,7 +948,7 @@ async fn maintenance_tick(
                             if let Err(error) = preparer.prepare(&additions).await {
                                 warn!(%error, batch_id,
                                     "full_rerank: admission preparation failed; keeping membership and batch marker for retry");
-                                return;
+                                break 'replacement;
                             }
                             let ranking_receipt = match preparer
                                 .record_ranking_membership(Some(batch_id), incoming.entries.clone())
@@ -840,7 +958,7 @@ async fn maintenance_tick(
                                 Err(error) => {
                                     warn!(%error,
                                         "full_rerank: ranking evidence recording failed; keeping membership and batch marker for retry");
-                                    return;
+                                    break 'replacement;
                                 }
                             };
                             let admission_receipts = match preparer
@@ -851,7 +969,7 @@ async fn maintenance_tick(
                                 Err(error) => {
                                     warn!(%error,
                                         "full_rerank: admission evidence recording failed; keeping membership and batch marker for retry");
-                                    return;
+                                    break 'replacement;
                                 }
                             };
                             let evidence = match SealedMembershipEvidence::full_rerank(
@@ -862,7 +980,7 @@ async fn maintenance_tick(
                                 Err(error) => {
                                     warn!(%error,
                                         "full_rerank: membership evidence encoding failed; keeping membership and batch marker for retry");
-                                    return;
+                                    break 'replacement;
                                 }
                             };
                             let (live_total, dropped) = match apply_full_rerank_swap(
@@ -886,7 +1004,7 @@ async fn maintenance_tick(
                                 Err(error) => {
                                     warn!(%error,
                                         "full_rerank: structural apply failed; keeping membership and batch marker for retry");
-                                    return;
+                                    break 'replacement;
                                 }
                             };
                             let audit_stats = load_edge_stats(paper_state, cfg, now_unix);
@@ -997,7 +1115,9 @@ async fn maintenance_tick(
     // 6. Fetch bench candidates for freed slots, excluding (live ∪ evicted), then atomic replace.
     let survivors = live_wallets.len().saturating_sub(evictions.len());
     let freed = cap.saturating_sub(survivors);
-    let (candidates, candidate_last_trade) = if freed > 0 {
+    let (candidates, candidate_last_trade) = if let Some(batch_id) = sync.marker
+        && freed > 0
+    {
         let exclude: Vec<WalletAddress> = live_wallets
             .iter()
             .copied()
@@ -1008,8 +1128,9 @@ async fn maintenance_tick(
             base_url,
             anon_key,
             secret_key,
+            batch_id,
             &exclude,
-            freed + cfg.bench_overfetch,
+            MAX_ACTIVE_WATCHLIST_SIZE,
             now_unix,
         )
         .await
@@ -1017,6 +1138,16 @@ async fn maintenance_tick(
             // The candidate last-trade side-map (#357) seeds each admitted wallet's poll cursor
             // (its inactivity clock) from the wallet's real last trade in the apply step.
             Ok((w, candidate_last_trade)) => {
+                let mut excluded: HashSet<_> = exclude.into_iter().collect();
+                match paper_state.wallet_fences() {
+                    Ok(records) => excluded.extend(records.into_iter().map(|record| record.wallet)),
+                    Err(error) => {
+                        warn!(%error, "maintenance: fence read failed; keeping membership for retry");
+                        return;
+                    }
+                }
+                let (w, candidate_last_trade) =
+                    supabase_reader::select_membership(w, candidate_last_trade, &excluded, freed);
                 if w.entries.is_empty() {
                     // Expected steady state after #518: the bench is survivor-filtered, and
                     // every survivor is already live, so there is normally nobody left to
@@ -1202,7 +1333,6 @@ mod tests {
             demotion_min_trades: 10,
             demotion_cb_alpha: dec!(0.10),
             demotion_pnl_window_secs: 2_592_000, // 30 d
-            bench_overfetch: 10,
             membership_mode: MembershipMode::default(),
         }
     }
@@ -1339,7 +1469,7 @@ mod tests {
             acknowledged.send(result).unwrap();
         });
         AdmissionPreparer::new(control_tx, paper_state)
-            .publish_membership(change, replacements)
+            .publish_membership(change, replacements, Default::default())
             .await
             .unwrap();
         control.await.unwrap();
@@ -1625,6 +1755,7 @@ mod tests {
                 "ls_tstat": "2.0",
                 "n_trades": 10,
                 "last_trade_unix": NOW - 60,
+                "survives": true,
             })
         }
 
@@ -1656,13 +1787,14 @@ mod tests {
         }
 
         /// Fake Supabase + Polymarket. `ranking_entries` is served filtered by the `batch_id`
-        /// query the pinned read sends; `latest_ranking` serves the knockout bench.
+        /// query the pinned read sends; candidate queries also enforce exclusions and freshness.
         #[derive(Clone)]
         struct Fake {
             latest_batch: Option<i64>,
             ranking_entries: Vec<serde_json::Value>,
             latest_ranking: Vec<serde_json::Value>,
             history_ok: bool,
+            failure: Option<&'static str>,
             activity_hits: Arc<AtomicUsize>,
             position_hits: Arc<AtomicUsize>,
         }
@@ -1674,12 +1806,59 @@ mod tests {
                     ranking_entries: Vec::new(),
                     latest_ranking: Vec::new(),
                     history_ok: true,
+                    failure: None,
                     activity_hits: Arc::new(AtomicUsize::new(0)),
                     position_hits: Arc::new(AtomicUsize::new(0)),
                 }
             }
 
-            async fn serve(self) -> String {
+            async fn serve(mut self) -> String {
+                if self.ranking_entries.is_empty() {
+                    self.ranking_entries = self.latest_ranking.clone();
+                }
+                fn selected(
+                    rows: &[serde_json::Value],
+                    q: &HashMap<String, String>,
+                ) -> Vec<serde_json::Value> {
+                    assert_eq!(q.get("survives").map(String::as_str), Some("is.true"));
+                    assert_eq!(q.get("order").map(String::as_str), Some("rank"));
+                    let limit = q["limit"].parse::<usize>().unwrap();
+                    let batch = q
+                        .get("batch_id")
+                        .map(|value| value.strip_prefix("eq.").unwrap().parse::<i64>().unwrap());
+                    let cutoff = q
+                        .get("last_trade_unix")
+                        .map(|value| value.strip_prefix("gte.").unwrap().parse::<i64>().unwrap());
+                    let excluded = q
+                        .get("wallet_hex")
+                        .map(|value| {
+                            value
+                                .strip_prefix("not.in.(")
+                                .unwrap()
+                                .strip_suffix(')')
+                                .unwrap()
+                                .split(',')
+                                .collect::<HashSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    let mut selected = rows
+                        .iter()
+                        .filter(|row| {
+                            row["survives"] == true
+                                && batch.is_none_or(|batch| row["batch_id"].as_i64() == Some(batch))
+                                && cutoff.is_none_or(|cutoff| {
+                                    row["last_trade_unix"]
+                                        .as_i64()
+                                        .is_some_and(|time| time >= cutoff)
+                                })
+                                && !excluded.contains(row["wallet_hex"].as_str().unwrap())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    selected.sort_by_key(|row| row["rank"].as_i64().unwrap());
+                    selected.truncate(limit);
+                    selected
+                }
                 async fn batches(State(fake): State<Fake>) -> Json<serde_json::Value> {
                     Json(match fake.latest_batch {
                         Some(id) => serde_json::json!([{ "batch_id": id }]),
@@ -1695,16 +1874,14 @@ mod tests {
                         .and_then(|v| v.strip_prefix("eq."))
                         .and_then(|v| v.parse::<i64>().ok())
                         .expect("pinned read must carry batch_id=eq.N");
-                    Json(
-                        fake.ranking_entries
-                            .iter()
-                            .filter(|r| r["batch_id"].as_i64() == Some(pinned))
-                            .cloned()
-                            .collect(),
-                    )
+                    assert!(pinned >= 0);
+                    Json(selected(&fake.ranking_entries, &q))
                 }
-                async fn latest(State(fake): State<Fake>) -> Json<Vec<serde_json::Value>> {
-                    Json(fake.latest_ranking.clone())
+                async fn latest(
+                    State(fake): State<Fake>,
+                    Query(q): Query<HashMap<String, String>>,
+                ) -> Json<Vec<serde_json::Value>> {
+                    Json(selected(&fake.latest_ranking, &q))
                 }
                 async fn activity(
                     State(fake): State<Fake>,
@@ -1773,6 +1950,7 @@ mod tests {
                 .filter_map(|hex| WalletAddress::from_hex(hex).ok())
                 .filter(|wallet| fake.history_ok || initial.contains(wallet))
                 .collect();
+            let failure = fake.failure;
             let base_url = fake.serve().await;
             let temp = TempDir::new().unwrap();
             let source_log = temp.path().join("source.log");
@@ -1803,6 +1981,7 @@ mod tests {
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
             let fake_paper_state = Arc::clone(&paper_state);
             let verifier_source_log = source_log.clone();
+            let state_path = temp.path().join("paper.db");
             std::mem::drop(tokio::spawn(async move {
                 while let Some(message) = control_rx.recv().await {
                     match message {
@@ -1826,6 +2005,7 @@ mod tests {
                             let installs: Vec<pe_paper_state::AnchorInstallRecord> = wallets
                                 .iter()
                                 .map(|wallet| pe_paper_state::AnchorInstallRecord {
+                                    history_status: None,
                                     wallet: *wallet,
                                     balances: Vec::new(),
                                     activity_cutoff_unix: NOW - 60,
@@ -1839,6 +2019,11 @@ mod tests {
                                 })
                                 .collect();
                             fake_paper_state.install_anchors(&installs).unwrap();
+                            if failure == Some("artifact") {
+                                let conn = rusqlite::Connection::open(&state_path).unwrap();
+                                conn.execute("DELETE FROM position_validations", [])
+                                    .unwrap();
+                            }
                             control_log
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1855,8 +2040,29 @@ mod tests {
                         OrchestratorControl::PublishMembership {
                             change,
                             replacements,
+                            checks,
                             acknowledged,
                         } => {
+                            if let Err(error) = checks.recheck_and_seed(
+                                &fake_paper_state,
+                                &control_live,
+                                &change,
+                                &replacements,
+                            ) {
+                                acknowledged.send(Err(error.to_string())).unwrap();
+                                continue;
+                            }
+
+                            if failure == Some("structural")
+                                && change.reason == MembershipReason::FullRerank
+                            {
+                                acknowledged
+                                    .send(
+                                        Err("injected replacement publication failure".to_owned()),
+                                    )
+                                    .unwrap();
+                                continue;
+                            }
                             if let Err(error) =
                                 crate::qualification::verify_published_membership_change(
                                     &change.clone().into_record(),
@@ -1874,6 +2080,7 @@ mod tests {
                             }
                             let removed = change.removed.into_iter().collect::<HashSet<_>>();
                             control_live.replace(&removed, &replacements, change.capacity);
+                            checks.commit_capacity();
                             acknowledged
                                 .send(Ok(pe_event_log::AppendReceipt {
                                     sequence: pe_core_types::EventSeq(1),
@@ -2058,9 +2265,18 @@ mod tests {
             // and the marker names the batch whose rows were applied.
             let (a, b, c) = (wallet(1), wallet(2), wallet(3));
             let mut fake = Fake::new(Some(2));
-            fake.ranking_entries = vec![row(2, 1, b), row(3, 1, c)];
+            let fenced = [wallet(4), wallet(5), wallet(6)];
+            fake.ranking_entries = fenced
+                .iter()
+                .enumerate()
+                .map(|(i, wallet)| row(2, i64::try_from(i + 1).unwrap(), *wallet))
+                .collect();
+            fake.ranking_entries.extend([row(2, 4, b), row(3, 1, c)]);
             fake.latest_ranking = vec![row(3, 1, c)];
             let h = harness(fake, &[a]).await;
+            for wallet in fenced {
+                fence(&h, wallet);
+            }
             let (mut evicted, mut marker) = (HashSet::new(), Some(1));
 
             h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
@@ -2222,6 +2438,98 @@ mod tests {
             assert!(members(&h.live).is_empty());
             assert_eq!(activity_hits.load(Ordering::SeqCst), 0);
             assert_eq!(position_hits.load(Ordering::SeqCst), 0);
+        }
+        fn fence(h: &Harness, wallet: WalletAddress) {
+            let conn = rusqlite::Connection::open(h._temp.path().join("paper.db")).unwrap();
+            conn.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [wallet.to_string()]).unwrap();
+        }
+
+        #[tokio::test]
+        async fn failed_full_rerank_still_applies_due_demotion() {
+            for failure in ["preparation", "artifact", "structural"] {
+                let (idle, candidate) = (wallet(21), wallet(22));
+                let mut fake = Fake::new(Some(2));
+                fake.ranking_entries = vec![row(2, 1, candidate)];
+                fake.history_ok = failure != "preparation";
+                fake.failure = Some(failure);
+                let h = harness(fake, &[idle]).await;
+                h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+                let remembered = wallet(23);
+                let (mut evicted, mut marker) = (set(&[remembered]), Some(1));
+                h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                    .await;
+                assert!(
+                    members(&h.live).is_empty(),
+                    "{failure}: independently due demotion was skipped"
+                );
+                assert_eq!(marker, Some(1), "{failure}: unapplied marker advanced");
+                assert!(evicted.contains(&idle));
+                assert!(
+                    evicted.contains(&remembered),
+                    "{failure}: eviction memory was cleared"
+                );
+                assert!(!evicted.contains(&candidate));
+            }
+        }
+
+        #[tokio::test]
+        async fn knockout_selection_preserves_inactivity_and_eviction_exclusions() {
+            let (idle, live, remembered, fenced, stale, missing, eligible, newer) = (
+                wallet(31),
+                wallet(32),
+                wallet(33),
+                wallet(34),
+                wallet(35),
+                wallet(36),
+                wallet(37),
+                wallet(38),
+            );
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![
+                row(1, 1, idle),
+                row(1, 2, live),
+                row(1, 3, remembered),
+                row(1, 4, fenced),
+                row(1, 5, stale),
+                row(1, 6, missing),
+                row(1, 7, eligible),
+                row(2, 1, newer),
+            ];
+            fake.ranking_entries[4]["last_trade_unix"] =
+                serde_json::json!(NOW - supabase_reader::ACTIVE_WINDOW_HOURS * 3600 - 1);
+            fake.ranking_entries[5]["last_trade_unix"] = serde_json::Value::Null;
+            fake.latest_ranking = vec![row(2, 1, newer)];
+            let h = harness(fake, &[idle, live]).await;
+            fence(&h, fenced);
+            h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+            h.paper_state.set_cursor(&live, NOW - 1).unwrap();
+            let (mut evicted, mut marker) = (set(&[remembered]), Some(1));
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(members(&h.live), set(&[live, eligible]));
+            assert_eq!(marker, Some(1));
+            assert_eq!(evicted, set(&[remembered, idle]));
+            assert_eq!(h.paper_state.cursor(&eligible).unwrap(), Some(NOW - 60));
+        }
+        #[tokio::test]
+        async fn empty_selection_preserves_each_consumer_failure_contract() {
+            for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
+                let (idle, fenced) = (wallet(41), wallet(42));
+                let mut fake = Fake::new(Some(2));
+                fake.ranking_entries = vec![row(2, 1, fenced)];
+                let activity_hits = fake.activity_hits.clone();
+                let h = harness(fake, &[idle]).await;
+                fence(&h, fenced);
+                h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+                let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+                h.tick(mode, &mut evicted, &mut marker).await;
+                assert!(members(&h.live).is_empty(), "{mode:?}");
+                assert_eq!(marker, Some(2));
+                assert!(h.controls().is_empty());
+                assert_eq!(activity_hits.load(Ordering::SeqCst), 0);
+                assert_eq!(evicted.contains(&idle), mode == MembershipMode::Knockout);
+                assert!(h.paper_state.cursor(&fenced).unwrap().is_none());
+            }
         }
     }
 }

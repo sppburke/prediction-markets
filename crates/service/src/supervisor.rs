@@ -85,8 +85,7 @@ impl TaskName {
     #[must_use]
     pub const fn stop_phase(self) -> ShutdownPhase {
         match self {
-            Self::ActivityIngest
-            | Self::PublicActivityPoll
+            Self::PublicActivityPoll
             | Self::ResolutionPoller
             | Self::LiveAccountsPoller
             | Self::WatchlistRefresh
@@ -94,9 +93,10 @@ impl TaskName {
             | Self::CapacityWorker
             | Self::RuntimeConfigPoller => ShutdownPhase::StopProducers,
             Self::Orchestrator => ShutdownPhase::DrainOrchestrator,
-            Self::LiveFanout | Self::SupabaseAnalyticsSink | Self::LiquiditySnapshotWorker => {
-                ShutdownPhase::StopSinks
-            }
+            Self::ActivityIngest
+            | Self::LiveFanout
+            | Self::SupabaseAnalyticsSink
+            | Self::LiquiditySnapshotWorker => ShutdownPhase::StopSinks,
             Self::HttpServer => ShutdownPhase::StopHttp,
             Self::StatusWriter => ShutdownPhase::FinalStatus,
             Self::JsonTracingFullAppender | Self::JsonTracingErrorAppender => {

@@ -15,7 +15,7 @@ use pe_core_types::{
     ShareAmount, SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
-use pe_paper_state::{NoCopyDisposition, PaperStateDb};
+use pe_paper_state::{NoCopyDisposition, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
@@ -44,9 +44,18 @@ type AnchorInstallHook = Arc<dyn Fn(&[AnchorInstall]) + Send + Sync>;
 
 pub const BRACKET_CONCURRENCY: usize = 4;
 
+/// Routine refresh yields unseen post-anchor activity to ordinary reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationPurpose {
+    CatchUp,
+    RoutineRefresh { cutoff: i64 },
+}
+
 /// A venue-authoritative balance snapshot waiting for the single-owner install.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorInstall {
+    /// Runtime acceptance completes history in the anchor transaction; direct boot leaves this absent.
+    pub history_status: Option<WalletHistoryStatusRecord>,
     pub wallet: WalletAddress,
     pub balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
     pub cutoff: i64,
@@ -292,12 +301,13 @@ impl CausalPositionValidator {
         wallets: &[WalletAddress],
         control_tx: &mpsc::Sender<OrchestratorControl>,
         paper_state: &PaperStateDb,
+        purpose: ValidationPurpose,
     ) -> Result<Vec<AnchorInstall>, CausalPositionError> {
         let mut completed = futures::stream::iter(wallets.iter().copied().enumerate())
             .map(|(index, wallet)| async move {
                 (
                     index,
-                    self.validate_control_with_retry(wallet, control_tx, paper_state)
+                    self.validate_control_with_retry(wallet, control_tx, paper_state, purpose)
                         .await,
                 )
             })
@@ -391,13 +401,34 @@ impl CausalPositionValidator {
         wallet: WalletAddress,
         control_tx: &mpsc::Sender<OrchestratorControl>,
         paper_state: &PaperStateDb,
+        purpose: ValidationPurpose,
     ) -> Result<AnchorInstall, CausalPositionError> {
-        let first = self.validate_one_control(wallet, control_tx).await;
+        let mut ordinary_reconciliation_needed = false;
+        let first = self
+            .validate_one_control(
+                wallet,
+                control_tx,
+                paper_state,
+                purpose,
+                &mut ordinary_reconciliation_needed,
+            )
+            .await;
+        if ordinary_reconciliation_needed {
+            return first;
+        }
         if first.as_ref().is_err_and(is_bounded_retry_error) {
             if paper_state.is_wallet_fenced(&wallet)? {
                 return Err(CausalPositionError::Fenced { wallet });
             }
-            return self.validate_one_control(wallet, control_tx).await;
+            return self
+                .validate_one_control(
+                    wallet,
+                    control_tx,
+                    paper_state,
+                    purpose,
+                    &mut ordinary_reconciliation_needed,
+                )
+                .await;
         }
         first
     }
@@ -422,10 +453,20 @@ impl CausalPositionValidator {
         &self,
         wallet: WalletAddress,
         control_tx: &mpsc::Sender<OrchestratorControl>,
+        paper_state: &PaperStateDb,
+        purpose: ValidationPurpose,
+        ordinary_reconciliation_needed: &mut bool,
     ) -> Result<AnchorInstall, CausalPositionError> {
         let mut metadata_reads = BTreeMap::new();
         let mut unresolved_assets = BTreeMap::new();
         let first_activity = self.activity(wallet).await?;
+        self.preflight_control_read(
+            wallet,
+            &first_activity,
+            paper_state,
+            purpose,
+            ordinary_reconciliation_needed,
+        )?;
         let first_prepared = self.prepare_activity(wallet, &first_activity).await?;
         metadata_reads.extend(first_prepared.metadata_reads.clone());
         unresolved_assets.extend(first_prepared.unresolved_assets.clone());
@@ -436,6 +477,13 @@ impl CausalPositionValidator {
         let first_activity = ActivityEvidence::from(first_activity);
 
         let second_activity = self.activity(wallet).await?;
+        self.preflight_control_read(
+            wallet,
+            &second_activity,
+            paper_state,
+            purpose,
+            ordinary_reconciliation_needed,
+        )?;
         let second_prepared = self.prepare_activity(wallet, &second_activity).await?;
         metadata_reads.extend(second_prepared.metadata_reads.clone());
         unresolved_assets.extend(second_prepared.unresolved_assets.clone());
@@ -450,6 +498,13 @@ impl CausalPositionValidator {
         let second_activity = ActivityEvidence::from(second_activity);
 
         let final_activity = self.activity(wallet).await?;
+        self.preflight_control_read(
+            wallet,
+            &final_activity,
+            paper_state,
+            purpose,
+            ordinary_reconciliation_needed,
+        )?;
         let final_prepared = self.prepare_activity(wallet, &final_activity).await?;
         unresolved_assets.extend(final_prepared.unresolved_assets.clone());
         metadata_reads.extend(final_prepared.metadata_reads.clone());
@@ -461,7 +516,7 @@ impl CausalPositionValidator {
         }
         let final_ledger = capture_control(wallet, control_tx).await?;
         let final_activity = ActivityEvidence::from(final_activity);
-        let install = self.finish(
+        let mut install = self.finish(
             wallet,
             [&first_activity, &second_activity, &final_activity],
             [&first_ledger, &second_ledger, &final_ledger],
@@ -470,6 +525,12 @@ impl CausalPositionValidator {
             metadata_reads.into_values().collect(),
         )?;
         log_unresolved_activity_assets(wallet, &unresolved_assets);
+        install.history_status = Some(WalletHistoryStatusRecord {
+            wallet,
+            complete: true,
+            proof_json: install.proof.document.clone(),
+            updated_at_unix: install.proof.recorded_at_unix,
+        });
         Ok(install)
     }
 
@@ -710,6 +771,34 @@ impl CausalPositionValidator {
             .map_err(|source| CausalPositionError::Positions { wallet, source })
     }
 
+    fn preflight_control_read(
+        &self,
+        wallet: WalletAddress,
+        activity: &CompleteActivityRead,
+        paper_state: &PaperStateDb,
+        purpose: ValidationPurpose,
+        ordinary_reconciliation_needed: &mut bool,
+    ) -> Result<(), CausalPositionError> {
+        if let ValidationPurpose::RoutineRefresh { cutoff } = purpose {
+            for bucket in activity
+                .buckets()
+                .map_err(|source| CausalPositionError::Activity { wallet, source })?
+            {
+                for aggregate in bucket {
+                    if aggregate.source_time.0.unix_timestamp() > cutoff
+                        && paper_state
+                            .activity_group_state(aggregate.group_id.key())?
+                            .is_none()
+                    {
+                        *ordinary_reconciliation_needed = true;
+                        return Err(CausalPositionError::InterveningActivity { wallet });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn commit_control(
         &self,
         wallet: WalletAddress,
@@ -813,6 +902,7 @@ impl CausalPositionValidator {
             ],
         });
         Ok(AnchorInstall {
+            history_status: None,
             wallet,
             balances,
             cutoff: activities[1].fixed_end,
@@ -1322,6 +1412,7 @@ mod tests {
         let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
         engine
             .install_anchors(&[AnchorInstall {
+                history_status: None,
                 wallet,
                 balances: Vec::new(),
                 cutoff: 0,

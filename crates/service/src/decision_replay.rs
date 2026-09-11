@@ -49,6 +49,44 @@ pub struct BookEvidence {
 pub struct DecisionClockEvidence {
     pub purpose: String,
     pub unix_millis: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submillisecond_nanos: Option<u32>,
+}
+
+impl DecisionClockEvidence {
+    /// Encode an exact Unix instant with Euclidean milliseconds and a nonnegative remainder.
+    pub fn precise(purpose: &str, unix_nanos: i128) -> Result<Self, ReplayDecisionError> {
+        Ok(Self {
+            purpose: purpose.to_owned(),
+            unix_millis: i64::try_from(unix_nanos.div_euclid(1_000_000))
+                .map_err(|_| ReplayDecisionError::ClockPrecision)?,
+            submillisecond_nanos: Some(
+                u32::try_from(unix_nanos.rem_euclid(1_000_000))
+                    .map_err(|_| ReplayDecisionError::ClockPrecision)?,
+            ),
+        })
+    }
+
+    pub(crate) fn precise_instant(&self) -> Result<time::OffsetDateTime, ReplayDecisionError> {
+        self.validate_precision()?;
+        let remainder = self
+            .submillisecond_nanos
+            .ok_or(ReplayDecisionError::ClockPrecision)?;
+        time::OffsetDateTime::from_unix_timestamp_nanos(
+            i128::from(self.unix_millis) * 1_000_000 + i128::from(remainder),
+        )
+        .map_err(|_| ReplayDecisionError::ClockPrecision)
+    }
+
+    fn validate_precision(&self) -> Result<(), ReplayDecisionError> {
+        if self
+            .submillisecond_nanos
+            .is_some_and(|value| value > 999_999)
+        {
+            return Err(ReplayDecisionError::ClockPrecision);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +380,8 @@ struct DecisionEvidenceCheckpointBody {
     market_price: Option<MarketPriceEvidence>,
     book: Option<BookEvidence>,
     clocks: Vec<DecisionClockEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +440,7 @@ fn decode_decision_evidence(json: &str) -> Result<DecodedDecisionEvidence, Repla
         (LEGACY_POST_BOUNDARY_EVIDENCE_VERSION, false) => {
             let legacy: LegacyDecisionPostBoundaryEvidence = serde_json::from_str(json)?;
             legacy.validate_hash()?;
+            validate_clock_precision(&legacy.body.clocks)?;
             Ok(DecodedDecisionEvidence {
                 evidence: legacy.into_current(),
                 legacy: true,
@@ -408,6 +449,7 @@ fn decode_decision_evidence(json: &str) -> Result<DecodedDecisionEvidence, Repla
         (POST_BOUNDARY_EVIDENCE_VERSION | TERMINAL_EVIDENCE_VERSION, true) => {
             let current: DecisionPostBoundaryEvidence = serde_json::from_str(json)?;
             current.validate_hash()?;
+            validate_clock_precision(&current.body.clocks)?;
             Ok(DecodedDecisionEvidence {
                 evidence: current,
                 legacy: false,
@@ -433,6 +475,7 @@ fn decode_checkpoint(json: &str) -> Result<DecodedCheckpoint, ReplayDecisionErro
     match (version, has_financial_semantic_version) {
         (LEGACY_POST_BOUNDARY_EVIDENCE_VERSION, false) => {
             let legacy: LegacyDecisionEvidenceCheckpoint = serde_json::from_str(json)?;
+            validate_clock_precision(&legacy.body.clocks)?;
             let actual = legacy_checkpoint_hash(&legacy.body)?;
             if actual != legacy.document_blake3 {
                 return Err(ReplayDecisionError::DocumentHash {
@@ -447,6 +490,7 @@ fn decode_checkpoint(json: &str) -> Result<DecodedCheckpoint, ReplayDecisionErro
         }
         (POST_BOUNDARY_EVIDENCE_VERSION, true) => {
             let current: DecisionEvidenceCheckpoint = serde_json::from_str(json)?;
+            validate_clock_precision(&current.body.clocks)?;
             let actual = checkpoint_hash(&current.body, current.financial_semantic_version)?;
             if actual != current.document_blake3 {
                 return Err(ReplayDecisionError::DocumentHash {
@@ -474,6 +518,7 @@ pub struct DecisionEvidenceAccumulator {
     market_price: Option<MarketPriceEvidence>,
     book: Option<BookEvidence>,
     clocks: Vec<DecisionClockEvidence>,
+    dispatch_id: Option<String>,
 }
 
 impl DecisionEvidenceAccumulator {
@@ -485,6 +530,7 @@ impl DecisionEvidenceAccumulator {
             market_price: None,
             book: None,
             clocks: Vec::new(),
+            dispatch_id: None,
         }
     }
 
@@ -492,6 +538,7 @@ impl DecisionEvidenceAccumulator {
         self.clocks.push(DecisionClockEvidence {
             purpose: purpose.to_owned(),
             unix_millis,
+            submillisecond_nanos: None,
         });
     }
 
@@ -510,8 +557,11 @@ impl DecisionEvidenceAccumulator {
     pub(crate) fn render(
         &self,
         authority: AuthorityEvidence,
-        terminal: TerminalDispositionEvidence,
+        mut terminal: TerminalDispositionEvidence,
     ) -> Result<String, serde_json::Error> {
+        if let Some(dispatch_id) = &self.dispatch_id {
+            terminal.dispatch_id = Some(dispatch_id.clone());
+        }
         let version = if terminal.decline.is_some() || terminal.final_receipt.is_some() {
             TERMINAL_EVIDENCE_VERSION
         } else {
@@ -545,6 +595,7 @@ impl DecisionEvidenceAccumulator {
             market_price: self.market_price.clone(),
             book: self.book.clone(),
             clocks: self.clocks.clone(),
+            dispatch_id: self.dispatch_id.clone(),
         };
         let financial_semantic_version = crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION;
         let document_blake3 = checkpoint_hash(&body, financial_semantic_version)?;
@@ -558,6 +609,15 @@ impl DecisionEvidenceAccumulator {
     pub(crate) fn from_pending_checkpoint(
         row: &DecisionPendingRow,
     ) -> Result<Self, ReplayDecisionError> {
+        let evidence = Self::from_checkpoint(row)?;
+        if DecisionContinuationV3::from_durable(row)?.version() == 5 {
+            paper_prepared_gate_clock(&evidence.clocks)?
+                .ok_or(ReplayDecisionError::PaperPreparedClock)?;
+        }
+        Ok(evidence)
+    }
+
+    fn from_checkpoint(row: &DecisionPendingRow) -> Result<Self, ReplayDecisionError> {
         let continuation = DecisionContinuationV3::from_durable(row)?;
         let frozen = &continuation.facts;
         let checkpoint = decode_checkpoint(&row.post_commit_inputs_json)?;
@@ -577,6 +637,13 @@ impl DecisionEvidenceAccumulator {
         {
             return Err(ReplayDecisionError::FrozenMismatch);
         }
+        if continuation.version() == 5 {
+            validate_staged_dispatch(
+                &continuation,
+                &checkpoint.body.clocks,
+                checkpoint.body.dispatch_id.as_deref(),
+            )?;
+        }
         Ok(Self {
             source_trade_id: checkpoint.body.source_trade_id,
             applied_configuration_hash: checkpoint.body.applied_configuration_hash,
@@ -584,8 +651,96 @@ impl DecisionEvidenceAccumulator {
             market_price: checkpoint.body.market_price,
             book: checkpoint.body.book,
             clocks: checkpoint.body.clocks,
+            dispatch_id: checkpoint.body.dispatch_id,
         })
     }
+
+    pub(crate) fn record_staged_dispatch(&mut self, dispatch_id: String) {
+        self.dispatch_id = Some(dispatch_id);
+    }
+
+    pub(crate) fn staged_dispatch_id(&self) -> Option<&str> {
+        self.dispatch_id.as_deref()
+    }
+
+    /// Resume only staging ownership; inputs and admission clocks are sampled again before
+    /// a new Prepared. Recovery of an existing Prepared uses `from_pending_checkpoint`.
+    pub(crate) fn resume_staging_checkpoint(
+        row: &DecisionPendingRow,
+    ) -> Result<Self, ReplayDecisionError> {
+        let mut evidence = Self::from_checkpoint(row)?;
+        evidence.market_end = None;
+        evidence.market_price = None;
+        evidence.book = None;
+        evidence
+            .clocks
+            .retain(|clock| clock.purpose == "dispatch_seed_created");
+        Ok(evidence)
+    }
+
+    pub(crate) fn record_precise_clock(
+        &mut self,
+        purpose: &str,
+        instant: time::OffsetDateTime,
+    ) -> Result<(), ReplayDecisionError> {
+        self.clocks.push(DecisionClockEvidence::precise(
+            purpose,
+            instant.unix_timestamp_nanos(),
+        )?);
+        Ok(())
+    }
+}
+
+fn validate_clock_precision(clocks: &[DecisionClockEvidence]) -> Result<(), ReplayDecisionError> {
+    for clock in clocks {
+        clock.validate_precision()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn paper_prepared_gate_clock(
+    clocks: &[DecisionClockEvidence],
+) -> Result<Option<time::OffsetDateTime>, ReplayDecisionError> {
+    let mut gates = clocks
+        .iter()
+        .filter(|clock| clock.purpose == "paper_prepared_staleness_gate");
+    let instant = gates
+        .next()
+        .map(DecisionClockEvidence::precise_instant)
+        .transpose()?;
+    if gates.next().is_some() {
+        return Err(ReplayDecisionError::PaperPreparedClock);
+    }
+    Ok(instant)
+}
+
+fn validate_staged_dispatch(
+    continuation: &DecisionContinuationV3,
+    clocks: &[DecisionClockEvidence],
+    dispatch_id: Option<&str>,
+) -> Result<(), ReplayDecisionError> {
+    let staging_clocks = clocks
+        .iter()
+        .filter(|clock| clock.purpose == "dispatch_seed_created")
+        .count();
+    if staging_clocks != usize::from(dispatch_id.is_some()) {
+        return Err(ReplayDecisionError::ContinuationBinding);
+    }
+    if let Some(dispatch_id) = dispatch_id {
+        let frozen = &continuation.facts;
+        let expected = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+            &pe_core_types::TraderId(frozen.wallet).to_string(),
+            &frozen.source_trade_id.0,
+            &frozen.market_id.0.0,
+            frozen.outcome_id.0,
+            frozen.side,
+            frozen.source_epoch,
+        );
+        if dispatch_id != expected {
+            return Err(ReplayDecisionError::ContinuationBinding);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn ladder_plan_blake3(plan: &LadderPlan) -> String {
@@ -640,6 +795,10 @@ pub enum ReplayDecisionError {
     FrozenMismatch,
     #[error("post-boundary terminal transition does not match the durable row")]
     TerminalMismatch,
+    #[error("decision clock has invalid or missing exact precision")]
+    ClockPrecision,
+    #[error("paper Prepared gate clock contradicts the continuation or terminal shape")]
+    PaperPreparedClock,
     #[error("post-boundary document hash mismatch: expected {expected}, actual {actual}")]
     DocumentHash { expected: String, actual: String },
 }
@@ -693,6 +852,38 @@ pub fn replay_decision_pending(
     }
     let disposition = post_boundary.body.terminal.disposition.as_str();
     let terminal = &post_boundary.body.terminal;
+    if continuation.version() == 5 {
+        if disposition == "dispatch_staged" {
+            return Err(ReplayDecisionError::TerminalEvidenceBinding);
+        }
+        validate_staged_dispatch(
+            &continuation,
+            &post_boundary.body.clocks,
+            terminal.dispatch_id.as_deref(),
+        )?;
+        let gate = paper_prepared_gate_clock(&post_boundary.body.clocks)?;
+        let final_fill = terminal.disposition == "fill"
+            && terminal.final_receipt.is_some()
+            && terminal.fill.is_none()
+            && terminal.decline.is_none();
+        let expired = terminal.reason == "paper_stale_before_prepared";
+        if expired
+            && post_boundary.body.authority
+                != AuthorityEvidence::not_read("terminal_before_fill_authority")
+        {
+            return Err(ReplayDecisionError::AuthorityBinding);
+        }
+        if gate.is_some() != (final_fill || expired)
+            || (terminal.disposition == "fill" && !final_fill)
+            || (expired
+                && (terminal.disposition != "no_fill"
+                    || terminal.fill.is_some()
+                    || terminal.final_receipt.is_some()
+                    || terminal.decline.is_some()))
+        {
+            return Err(ReplayDecisionError::PaperPreparedClock);
+        }
+    }
     if post_boundary.body.version == TERMINAL_EVIDENCE_VERSION {
         let typed_decline = terminal.decline.is_some()
             && terminal.disposition == "no_fill"
@@ -803,6 +994,48 @@ mod tests {
     const ORIGIN_MAIN_CHECKPOINT: &str =
         include_str!("../tests/fixtures/decision_replay_origin_main_v2_checkpoint.json");
 
+    /// PASS: exact clocks round-trip before and after the epoch, and both decoders reject an
+    /// out-of-range remainder even when the evidence hash has been recomputed.
+    #[test]
+    fn precise_clocks_use_euclidean_milliseconds_and_validate_both_decoders() {
+        for nanos in [-1, 0, 2_000_000_000, 2_000_000_001] {
+            let clock =
+                DecisionClockEvidence::precise("paper_prepared_staleness_gate", nanos).unwrap();
+            assert_eq!(
+                clock.precise_instant().unwrap().unix_timestamp_nanos(),
+                nanos
+            );
+            if nanos == -1 {
+                assert_eq!(clock.unix_millis, -1);
+                assert_eq!(clock.submillisecond_nanos, Some(999_999));
+            }
+        }
+        assert!(DecisionClockEvidence::precise("overflow", i128::MAX).is_err());
+        let mut accumulator = DecisionEvidenceAccumulator::new(&legacy17_continuation(
+            &SourceTradeId("g2:precision".to_owned()),
+        ));
+        accumulator.clocks.push(DecisionClockEvidence {
+            purpose: "paper_prepared_staleness_gate".to_owned(),
+            unix_millis: 0,
+            submillisecond_nanos: Some(1_000_000),
+        });
+        assert!(matches!(
+            decode_checkpoint(&accumulator.checkpoint_json().unwrap()),
+            Err(ReplayDecisionError::ClockPrecision)
+        ));
+        assert!(matches!(
+            decode_decision_evidence(
+                &accumulator
+                    .render(
+                        AuthorityEvidence::not_read("terminal_before_fill_authority"),
+                        TerminalDispositionEvidence::no_fill("paper_stale_before_prepared"),
+                    )
+                    .unwrap()
+            ),
+            Err(ReplayDecisionError::ClockPrecision)
+        ));
+    }
+
     fn wallet() -> WalletAddress {
         serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
     }
@@ -816,6 +1049,7 @@ mod tests {
         applied_configuration: RuntimeConfig,
     ) -> DecisionContinuationFacts {
         DecisionContinuationFacts {
+            paper_freshness_policy: None,
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v2".to_owned(),
             transaction_hash: "0xtransaction".to_owned(),
@@ -1085,6 +1319,14 @@ mod tests {
             LEGACY_FINANCIAL_SEMANTIC_VERSION
         );
         assert_eq!(replayed.recorded_decision_json, ORIGIN_MAIN_TERMINAL);
+        assert!(
+            replayed
+                .post_boundary
+                .body
+                .clocks
+                .iter()
+                .all(|clock| clock.submillisecond_nanos.is_none())
+        );
 
         let mut document: serde_json::Value = serde_json::from_str(ORIGIN_MAIN_TERMINAL).unwrap();
         document["terminal"]["fill"]["contracts"] = json!(11);
@@ -1106,6 +1348,18 @@ mod tests {
             None,
         );
         let recovered = DecisionEvidenceAccumulator::from_pending_checkpoint(&row).unwrap();
+        assert!(
+            recovered
+                .clocks
+                .iter()
+                .all(|clock| clock.submillisecond_nanos.is_none())
+        );
+        assert!(
+            !recovered
+                .checkpoint_json()
+                .unwrap()
+                .contains("submillisecond_nanos")
+        );
         assert_eq!(
             recovered
                 .book
@@ -1120,6 +1374,96 @@ mod tests {
             upgraded["financial_semantic_version"],
             json!(crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
         );
+    }
+
+    /// PASS: continuation generations four and five retain their exact fixture bytes; four
+    /// replays the legacy terminal, while five requires its precise final-gate evidence.
+    #[test]
+    fn continuation_four_and_five_byte_fixtures_replay_unchanged() {
+        use crate::bucket_commit::{
+            ActivityReadCommitmentReceipt, PageOccurrence, PaperFreshnessPolicy,
+        };
+        use pe_source_polymarket_public::{ActivityRequestBounds, ReconciliationPageEvidence};
+        for version in [4, 5] {
+            let mut row = origin_main_row(
+                SourceTradeId("g2:fill".to_owned()),
+                ORIGIN_MAIN_TERMINAL,
+                DecisionPendingState::Terminal,
+                Some("fill"),
+            );
+            let mut facts = legacy17_continuation(&row.source_trade_id);
+            facts.paper_freshness_policy = (version == 5).then_some(PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 2,
+            });
+            let receipt = AppendReceipt {
+                sequence: EventSeq(2),
+                this_hash: blake3::Hash::from_bytes([2; 32]),
+            };
+            let commitment = AppendReceipt {
+                sequence: EventSeq(3),
+                this_hash: blake3::Hash::from_bytes([3; 32]),
+            };
+            let page = PageOccurrence {
+                request_url: "https://data-api.polymarket.com/activity?fixture=byte-compatibility"
+                    .to_owned(),
+                raw_hash: blake3::hash(b"[]").to_hex().to_string(),
+                receipt,
+            };
+            let evidence = ReconciliationPageEvidence {
+                request_url: page.request_url.clone(),
+                bounds: Some(ActivityRequestBounds {
+                    start: None,
+                    end: 1_700_000_010,
+                }),
+                partition: None,
+                offset: 0,
+                row_count: 0,
+                canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(b"[]")
+                    .unwrap(),
+                raw_page_hash: page.raw_hash.clone(),
+                received_at: pe_core_types::ReceivedAt(
+                    time::OffsetDateTime::from_unix_timestamp(1_700_000_010).unwrap(),
+                ),
+                schema_version: 2,
+                parser_version: 2,
+            };
+            facts.decision_inputs = json!({"fixed_end":1700000010,"pages":[evidence]});
+            let continuation = DecisionContinuationV3::new(
+                facts,
+                None,
+                vec![page],
+                Some(if version == 5 {
+                    ActivityReadCommitmentReceipt::BindingsV2(commitment)
+                } else {
+                    ActivityReadCommitmentReceipt::LegacyV1(commitment)
+                }),
+            );
+            row.frozen_inputs_json = serde_json::to_string(&continuation).unwrap();
+            let expected = if version == 5 {
+                include_str!("../tests/fixtures/decision_continuation_v5.json")
+            } else {
+                include_str!("../tests/fixtures/decision_continuation_v4.json")
+            };
+            assert_eq!(row.frozen_inputs_json.as_bytes(), expected.as_bytes());
+            row.frozen_inputs_json = expected.to_owned();
+            if version == 5 {
+                assert!(matches!(
+                    replay_decision_pending(&row),
+                    Err(ReplayDecisionError::PaperPreparedClock)
+                ));
+                let decoded = DecisionContinuationV3::from_durable(&row).unwrap();
+                assert_eq!(serde_json::to_string(&decoded).unwrap(), expected);
+                continue;
+            }
+            let replayed = replay_decision_pending(&row).unwrap();
+            assert_eq!(replayed.continuation.version(), version);
+            assert_eq!(replayed.recorded_decision_json, ORIGIN_MAIN_TERMINAL);
+            assert_eq!(
+                serde_json::to_string(&replayed.continuation).unwrap(),
+                row.frozen_inputs_json
+            );
+        }
     }
 
     /// PASS: a current typed terminal that lost its financial semantic field is rejected as
@@ -1274,5 +1618,16 @@ mod tests {
             DecisionEvidenceAccumulator::from_pending_checkpoint(&row),
             Err(ReplayDecisionError::DocumentHash { .. })
         ));
+    }
+
+    /// PASS: the generation-five authority restriction does not change legacy reason validation.
+    #[test]
+    fn legacy_expiry_reason_keeps_existing_authority_contract() {
+        let row = terminal_row(
+            "legacy-expiry",
+            AuthorityEvidence::commit_fill_v2("settled_refusal", dec!(99)),
+            TerminalDispositionEvidence::no_fill("paper_stale_before_prepared"),
+        );
+        assert_byte_exact_replay(&row);
     }
 }

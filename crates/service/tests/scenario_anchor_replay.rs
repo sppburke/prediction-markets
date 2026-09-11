@@ -156,6 +156,7 @@ fn install(
     let captured = ledger_capture(engine.ledger(), paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            history_status: None,
             wallet: wallet(),
             balances,
             cutoff,
@@ -374,6 +375,112 @@ fn equal_cutoff_is_covered_and_legacy_prefix_is_skipped() {
     );
 }
 
+#[test]
+fn legacy_fences_and_zero_conversion_documents_replay_without_reclassification() {
+    for conversion in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        paper.set_cursor(&wallet(), 0).unwrap();
+        let mut engine =
+            BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
+        install(&mut engine, &paper, 100, Vec::new());
+        let groups = if conversion {
+            vec![non_trade_aggregate(
+                "CONVERSION",
+                "0xlegacy-zero",
+                "market-a",
+                "0",
+                110,
+            )]
+        } else {
+            (0..5)
+                .map(|index| {
+                    aggregate(
+                        &format!("0xlegacy-wide-{index}"),
+                        "market-a",
+                        0,
+                        "BUY",
+                        "1",
+                        110,
+                    )
+                })
+                .collect()
+        };
+        let mutations = groups
+            .iter()
+            .map(pe_position_ledger::LedgerMutation::from_activity)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(matches!(
+            pe_position_ledger::classify_complete_historical_second(
+                engine.ledger(),
+                wallet(),
+                &mutations,
+                ReconstructionQuality::new(100).unwrap(),
+                &|_| false,
+            )
+            .unwrap(),
+            pe_position_ledger::SecondVerdict::OrderIndependent { .. }
+        ));
+        let cause = if conversion {
+            "conversion_unknown_conditions"
+        } else {
+            "order_dependent_equal_second"
+        };
+        let fence = pe_paper_state::WalletFenceRecord {
+            wallet: wallet(),
+            source_trade_id: groups[0].group_id.key().clone(),
+            cause: cause.to_owned(),
+            proof_json: "{}".to_owned(),
+            fenced_at_unix: 110,
+        };
+        let records = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| ActivityDispositionRecord {
+                source_trade_id: group.group_id.key().clone(),
+                transaction_hash: group.group_id.components().transaction_hash.clone(),
+                wallet: wallet(),
+                source_epoch: 110,
+                semantic_revision: group.semantic_revision.as_str().to_owned(),
+                activity_type: if conversion { "CONVERSION" } else { "TRADE" }.to_owned(),
+                disposition: if index == 0 { cause } else { "wallet_fenced" }.to_owned(),
+                // Frozen old mapping: zero conversion was a refused conversion effect.
+                proof_json: if conversion {
+                    r#"{"effect":{"kind":"conversion"},"version":1}"#.to_owned()
+                } else {
+                    mutations[index].effect.to_document().unwrap()
+                },
+                no_copy: None,
+            })
+            .collect();
+        paper
+            .commit_activity_bucket(&ActivityBucketCommit {
+                wallet: wallet(),
+                source_epoch: 110,
+                dispositions: records,
+                leader_positions: Vec::new(),
+                gate_results: Vec::new(),
+                history_effects: Vec::new(),
+                history_status: None,
+                pending: Vec::new(),
+                fence: Some(fence.clone()),
+                reanchor: None,
+                advance_cursor: true,
+            })
+            .unwrap();
+        let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+        let mirrored = build_leader_ledger(&paper).unwrap();
+        assert_eq!(
+            ledger_capture(&replayed, &paper, wallet()).unwrap().hash,
+            ledger_capture(&mirrored, &paper, wallet()).unwrap().hash
+        );
+        assert_eq!(paper.wallet_fences().unwrap(), vec![fence]);
+        assert!(paper.gate_history().unwrap().is_empty());
+        assert!(paper.open_decision_pending().unwrap().is_empty());
+    }
+}
+
 fn replay_with_document(document: &str) -> WalletLedgerReplayError {
     let dir = tempfile::tempdir().unwrap();
     let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
@@ -468,5 +575,69 @@ fn unknown_disposition_version_is_a_typed_replay_failure() {
         replay,
         Err(WalletLedgerReplayError::UnknownDisposition { disposition, .. })
             if disposition == "wallet_fenced_v2"
+    ));
+}
+
+#[test]
+fn history_only_bracket_disposition_replays_as_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("paper.db");
+    let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+    paper.set_cursor(&wallet(), 0).unwrap();
+    let mut engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+    install(&mut engine, &paper, 0, Vec::new());
+    let first = aggregate("0xbracket", "market-bracket", 0, "BUY", "2", 10);
+    let id = first.group_id.key().clone();
+    let mut bracket = context(20);
+    bracket.bracket_commit = true;
+    let result = engine.commit(vec![first], &bracket, zero_basis()).unwrap();
+    assert_eq!(
+        result.dispositions[&id.0],
+        pe_service::bucket_commit::HISTORY_ONLY_BRACKET
+    );
+    assert!(result.pending.is_empty());
+    let no_copy = paper.no_copy_disposition(&id).unwrap().unwrap();
+    assert_eq!(no_copy.2, pe_service::bucket_commit::HISTORY_ONLY_BRACKET);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT recorded_at_unix FROM no_copy_dispositions WHERE source_trade_id = ?1",
+            [&id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 20);
+    assert_eq!(no_copy.1, 10);
+    assert_eq!(no_copy.0, "reconciled_rest");
+    let legacy = aggregate("0xlegacy", "market-legacy", 0, "BUY", "3", 11);
+    engine
+        .commit(vec![legacy], &context(20), zero_basis())
+        .unwrap();
+    let expected = ledger_capture(engine.ledger(), &paper, wallet())
+        .unwrap()
+        .hash;
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    assert_eq!(
+        ledger_capture(&replayed, &paper, wallet()).unwrap().hash,
+        expected
+    );
+    drop(engine);
+    drop(paper);
+    let reopened = PaperStateDb::open(&path).unwrap();
+    assert_eq!(
+        ledger_capture(
+            &replay_wallet_ledger(&reopened, wallet()).unwrap(),
+            &reopened,
+            wallet()
+        )
+        .unwrap()
+        .hash,
+        expected
+    );
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE activity_groups SET disposition = 'unknown_bracket_reason' WHERE source_trade_id = ?1", [&id.0]).unwrap();
+    assert!(matches!(
+        replay_wallet_ledger(&reopened, wallet()),
+        Err(WalletLedgerReplayError::UnknownDisposition { .. })
     ));
 }

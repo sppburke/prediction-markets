@@ -186,7 +186,7 @@ fn pending_read(market_id: &str, source_epoch: i64) -> support::ProducerShapedRe
         "isCombo": false,
     }]))
     .unwrap();
-    support::producer_shaped_read(
+    support::producer_shaped_read_v1(
         leader_wallet(),
         &body,
         source_epoch + 10,
@@ -449,6 +449,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     paper_state.set_cursor(&leader_wallet(), 0).unwrap();
     paper_state
         .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            history_status: None,
             wallet: leader_wallet(),
             balances: Vec::new(),
             activity_cutoff_unix: SOURCE_EPOCH - 1,
@@ -882,7 +883,7 @@ fn producer_shaped_read_keeps_payload_receipts_and_receive_time_together() {
     .unwrap();
     let mut writer = Writer::open(&source_path).unwrap();
     let (read, commitment) =
-        support::append_committed_read(&mut writer, leader_wallet(), &payload, 110, 120);
+        support::append_committed_read_v1(&mut writer, leader_wallet(), &payload, 110, 120);
     drop(writer);
     let frames: Vec<_> = Reader::replay(&source_path)
         .unwrap()
@@ -901,7 +902,7 @@ fn producer_shaped_read_keeps_payload_receipts_and_receive_time_together() {
         serde_json::from_value(proof["pages"].clone()).unwrap();
     assert_eq!(pages[0].received_at.0.unix_timestamp(), 120);
     assert_eq!(pages[0].raw_page_hash, read.page.raw_hash);
-    let reparsed = support::producer_shaped_read(
+    let reparsed = support::producer_shaped_read_v1(
         leader_wallet(),
         &frames[0].payload,
         110,

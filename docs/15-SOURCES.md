@@ -115,6 +115,18 @@
 > `redeemable` partitions with `sizeThreshold=0&includeArchived=true`, reports the wallet's true
 > current balances and is the authority for absolute balances at an anchor (issue #555).
 
+> **Data API v2 captured official contracts (2026-09-10, issue #588).** The
+> [account activity feed](https://docs.polymarket.com/api-reference/feeds/list-account-activity)
+> uses keyset pagination on `(block_timestamp, sequence_id)`.
+> [Data freshness](https://docs.polymarket.com/api-reference/service/get-data-freshness)
+> is served from a background-refreshed snapshot; `computed_at` and `age_seconds` expose the
+> snapshot's age, and the endpoint returns `503` before its first refresh. The
+> [migration guide](https://docs.polymarket.com/api-reference/data-api/migrating-from-v1)
+> says the original routes remain available and this Data API migration is unrelated to CLOB V2.
+> Neither the activity nor freshness page establishes immutable bucket closure or two-second
+> execution. The service retains its existing `/activity` interface. Captured pages:
+> `/home/sean/reports/issue-588-plan-2026-09-10/review/{list-account-activity,get-data-freshness,migrating-from-v1}.md`.
+
 > **Gamma `/markets?clob_token_ids=` is the asset identity authority (2026-09-02, issue #555 addendum, live probes).** The venue's activity feed mis-stamps individual rows: on wallet `0x0857…` / market `0xba9968…` six TRADE rows carried asset `9361629…` as `outcomeIndex 0` ("Yes") and one row carried the same asset as `outcomeIndex 1` while still labeled "Yes". Gamma resolves the token unambiguously (`clobTokenIds[0]` = that asset on a binary market), so a token's `(conditionId, outcome index)` comes from the market's `clobTokenIds` array position, never from activity rows alone. Query form: repeat-key `clob_token_ids=A&clob_token_ids=B…` (comma-joined ids are a validation error, `{"type":"validation error","error":"invalid clob token ids"}`); the plain query returned nothing for the sampled closed tokens and `&closed=true` returned their markets, so the open variant is tried first and the closed variant for leftovers. Gamma carries no combo classification: `Ordinary|Combo` stays activity-derived and must be unanimous per asset, and a position-only asset (never in activity) is deferred, not guessed. Every fetched metadata page is recorded through the source log before its identities are used.
 
 > **Gamma `/markets?condition_ids=` + CLOB `/markets?closed=true` — UA blocklist & repeat-key batching (2026-06-20, issue #382 Phase-0 live probe `scripts/probe_gamma_ua.py`).** The `&closed=true` 403 is triggered by the literal `Python-urllib/*` default User-Agent (an anti-bot blocklist), **not** by a missing browser UA: both endpoints return **200** for a headerless request (a bare `reqwest::Client` = the shipped Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and **403 only** for `Python-urllib/3.11`. The shipped UA-less clients therefore do not 403, but this transport health did not prevent the 2026-06-24 through 2026-08-21 persisted-terminator cursor wedge from stopping repeat resolution ingestion. Repeat-key batching (`?condition_ids=A&condition_ids=B…&limit=500`) works for **both** the plain (open) and `&closed=true` Gamma variants — 50/50 and 100/100 returned, demux-by-`conditionId` clean, no cross-market leak; comma-separated joining returns 0 (repeat-key mandatory); observed batch cap ≥ 100 (kept at `gamma_batch_size`=50). This supersedes the stale `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" claim for the repeat-key form.
@@ -152,6 +164,9 @@
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
 | https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-10 | 2026-11-09 |
+| https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
+| https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
+| https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |
 | https://clob.polymarket.com/markets?closed=true | 2026-09-01 | 2026-10-31 |
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |

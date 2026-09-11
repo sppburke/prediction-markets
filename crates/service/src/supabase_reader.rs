@@ -544,6 +544,30 @@ fn to_watchlist(rows: &[RankingRow]) -> (Watchlist, HashMap<WalletAddress, i64>)
     (watchlist, last_trade)
 }
 
+/// Select eligible ranked rows before applying the requested membership cap.
+/// Counts and activity timestamps describe only the selected wallets.
+#[must_use]
+pub fn select_membership(
+    mut watchlist: Watchlist,
+    mut last_trade: HashMap<WalletAddress, i64>,
+    excluded: &HashSet<WalletAddress>,
+    cap: usize,
+) -> (Watchlist, HashMap<WalletAddress, i64>) {
+    watchlist
+        .entries
+        .retain(|entry| !excluded.contains(&entry.wallet));
+    watchlist.entries.truncate(cap);
+    watchlist.active_count = watchlist
+        .entries
+        .iter()
+        .filter(|entry| entry.tier == WatchlistTier::Active)
+        .count();
+    watchlist.incubator_count = watchlist.entries.len() - watchlist.active_count;
+    let selected: HashSet<_> = watchlist.entries.iter().map(|entry| entry.wallet).collect();
+    last_trade.retain(|wallet, _| selected.contains(wallet));
+    (watchlist, last_trade)
+}
+
 /// Select the single API token to send in BOTH the `apikey` and `Authorization: Bearer`
 /// headers.
 ///
@@ -653,7 +677,7 @@ pub async fn fetch(
 }
 
 /// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` SURVIVING
-/// `latest_ranking` rows ([`RANKING_SURVIVOR_FILTER`], #518; with the
+/// batch-pinned `ranking_entries` rows ([`RANKING_SURVIVOR_FILTER`], #518; with the
 /// [`RANKING_EXACT_SELECT`] score aliases, #514) excluding `exclude`,
 /// optionally freshness-filtered, ordered by rank. Pure (no network)
 /// so the `not.in.` and `gte` filters are unit-testable. Excluded wallets render as canonical
@@ -664,10 +688,16 @@ pub async fn fetch(
 /// `freshness_cutoff` (#357), when `Some(cutoff)`, appends `last_trade_unix=gte.{cutoff}` so
 /// only wallets that traded at/after `cutoff` are returned. NULL `last_trade_unix` fails `gte`
 /// and is excluded — a not-yet-populated bench pauses backfill, it never empties the live set.
-fn candidates_query(exclude: &[WalletAddress], n: usize, freshness_cutoff: Option<i64>) -> String {
+fn candidates_query(
+    exclude: &[WalletAddress],
+    n: usize,
+    freshness_cutoff: Option<i64>,
+    batch_id: i64,
+) -> String {
     let mut filters: Vec<String> = vec![
         format!("select={RANKING_EXACT_SELECT}"),
         RANKING_SURVIVOR_FILTER.to_string(),
+        format!("batch_id=eq.{batch_id}"),
     ];
     if !exclude.is_empty() {
         let mut hexes: Vec<String> = exclude.iter().map(ToString::to_string).collect();
@@ -682,14 +712,14 @@ fn candidates_query(exclude: &[WalletAddress], n: usize, freshness_cutoff: Optio
     filters.join("&")
 }
 
-/// Fetch the top-`n` on-deck candidate wallets from `latest_ranking`, excluding any wallet in
+/// Fetch the top-`n` on-deck candidates from the recorded `batch_id`, excluding any wallet in
 /// `exclude` (the current live ∪ evicted set), ordered by rank. Used by the maintenance tick
 /// (issue #350 WS1 PR-D) to backfill freed live slots from the Supabase bench.
 ///
-/// `GET {base_url}/rest/v1/latest_ranking?select=<exact-aliases>&wallet_hex=not.in.(<exclude>)&last_trade_unix=gte.<cutoff>&order=rank&limit={n}`
+/// `GET {base_url}/rest/v1/ranking_entries?select=<exact-aliases>&batch_id=eq.<batch>&wallet_hex=not.in.(<exclude>)&last_trade_unix=gte.<cutoff>&order=rank&limit={n}`
 /// with the same token in both headers (see [`auth_token`]). The server-side `not.in.` filter
 /// is an over-fetch optimisation, not a correctness boundary: it is matched case-sensitively
-/// against `latest_ranking.wallet_hex` (canonical lowercase), and
+/// against `ranking_entries.wallet_hex` (canonical lowercase), and
 /// [`crate::live_watchlist::LiveWatchlist::replace`] independently dedups the results against
 /// the live and evicted sets by byte-equality, so a casing miss cannot re-admit a wallet.
 ///
@@ -697,22 +727,33 @@ fn candidates_query(exclude: &[WalletAddress], n: usize, freshness_cutoff: Optio
 /// real last trade is within [`ACTIVE_WINDOW_HOURS`] of `now_unix` are returned, so a stale
 /// bench wallet is never backfilled into the live set. Returns the [`Watchlist`] plus the
 /// last-trade side-map (consumed by the PR-3 admission cursor-seed).
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_candidates(
     client: &reqwest::Client,
     base_url: &str,
     anon_key: &str,
     secret_key: &str,
+    batch_id: i64,
     exclude: &[WalletAddress],
     n: usize,
     now_unix: i64,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
     let freshness_cutoff = now_unix - ACTIVE_WINDOW_HOURS * 3600;
     let url = format!(
-        "{}/rest/v1/latest_ranking?{}",
+        "{}/rest/v1/ranking_entries?{}",
         base_url.trim_end_matches('/'),
-        candidates_query(exclude, n, Some(freshness_cutoff))
+        candidates_query(exclude, n, Some(freshness_cutoff), batch_id)
     );
-    get_ranking(client, &url, auth_token(anon_key, secret_key)).await
+    let rows = get_ranking_rows(client, &url, auth_token(anon_key, secret_key)).await?;
+    for row in &rows {
+        if row.batch_id != Some(batch_id) {
+            return Err(SupabaseError::BatchMismatch {
+                expected: batch_id,
+                found: row.batch_id,
+            });
+        }
+    }
+    Ok(to_watchlist(&rows))
 }
 
 /// Fetch the current (max) `batch_id` from `ranking_batches`, or `None` when no batch exists.
@@ -932,8 +973,8 @@ mod tests {
     fn candidates_query_empty_exclude_omits_filter() {
         // PostgREST rejects an empty `in.()`; with nothing to exclude this is a plain top-n.
         assert_eq!(
-            candidates_query(&[], 5, None),
-            format!("{EXACT_SELECT_SURVIVORS}&order=rank&limit=5")
+            candidates_query(&[], 5, None, 7),
+            format!("{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&order=rank&limit=5")
         );
     }
 
@@ -942,11 +983,11 @@ mod tests {
         let a = WalletAddress::from_hex("0x00000000000000000000000000000000000000AA").unwrap();
         let b = WalletAddress::from_hex("0x0000000000000000000000000000000000000001").unwrap();
         // Out of order + a duplicate + upper-case input -> sorted, deduped, lowercase output.
-        let q = candidates_query(&[a, b, a], 3, None);
+        let q = candidates_query(&[a, b, a], 3, None, 7);
         assert_eq!(
             q,
             format!(
-                "{EXACT_SELECT_SURVIVORS}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
+                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
                  0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
             )
         );
@@ -956,8 +997,10 @@ mod tests {
     fn candidates_query_appends_freshness_filter() {
         // No exclude + a cutoff -> the gte filter precedes order/limit (#357).
         assert_eq!(
-            candidates_query(&[], 5, Some(1_000)),
-            format!("{EXACT_SELECT_SURVIVORS}&last_trade_unix=gte.1000&order=rank&limit=5")
+            candidates_query(&[], 5, Some(1_000), 7),
+            format!(
+                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=gte.1000&order=rank&limit=5"
+            )
         );
     }
 
@@ -965,9 +1008,9 @@ mod tests {
     fn candidates_query_combines_exclude_and_freshness() {
         let a = WalletAddress::from_hex(HEX_A).unwrap();
         assert_eq!(
-            candidates_query(&[a], 3, Some(1_000)),
+            candidates_query(&[a], 3, Some(1_000), 7),
             format!(
-                "{EXACT_SELECT_SURVIVORS}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
+                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
                  &last_trade_unix=gte.1000&order=rank&limit=3"
             )
         );
@@ -984,7 +1027,7 @@ mod tests {
                  ?{EXACT_SELECT_SURVIVORS}&order=rank&limit=25"
             )
         );
-        assert!(candidates_query(&[], 5, None).starts_with(EXACT_SELECT));
+        assert!(candidates_query(&[], 5, None, 7).starts_with(EXACT_SELECT));
     }
 
     #[test]
@@ -1331,5 +1374,39 @@ mod tests {
         assert_eq!(failure.path, "/rest/v1/latest_ranking");
         assert_eq!(failure.attempt_ordinal, 1);
         assert!(failure.received_at >= failure.observed_at);
+    }
+    #[test]
+    fn selection_filters_fences_before_cap_in_every_consumer() {
+        let a = WalletAddress::from_hex(HEX_A).unwrap();
+        let b = WalletAddress::from_hex(HEX_B).unwrap();
+        let c = WalletAddress([3; 20]);
+        let (mut bench, _) = to_watchlist(&[
+            row(HEX_A, json!("0.6"), json!("3"), Some(10)),
+            row(HEX_B, json!("0.6"), json!("2"), Some(10)),
+            row(&c.to_string(), json!("0.6"), json!("1"), Some(10)),
+        ]);
+        bench.entries[2].tier = WatchlistTier::Incubator;
+        let timestamp = bench.snapshot_at.clone();
+        let (selected, times) = select_membership(
+            bench,
+            HashMap::from([(a, 10), (b, 20), (c, 30)]),
+            &HashSet::from([a]),
+            2,
+        );
+        assert_eq!(
+            selected
+                .entries
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<Vec<_>>(),
+            vec![b, c]
+        );
+        assert_eq!((selected.active_count, selected.incubator_count), (1, 1));
+        assert_eq!(selected.snapshot_at, timestamp);
+        assert_eq!(times, HashMap::from([(b, 20), (c, 30)]));
+        let (empty, times) = select_membership(selected, times, &HashSet::from([b, c]), 1);
+        assert!(empty.entries.is_empty());
+        assert_eq!((empty.active_count, empty.incubator_count), (0, 0));
+        assert!(times.is_empty());
     }
 }

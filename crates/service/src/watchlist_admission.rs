@@ -23,8 +23,10 @@ use crate::paper_recovery::{
     RankingMembershipArtifact, SealedKnockoutEvidence,
 };
 use crate::position_seeder::{
-    AnchorInstall, CausalPositionError, CausalPositionValidator, is_deferred_causal_position_error,
+    AnchorInstall, CausalPositionError, CausalPositionValidator, ValidationPurpose,
+    is_deferred_causal_position_error,
 };
+use crate::watchlist_maintenance::MembershipCommit;
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
 pub(crate) const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
@@ -88,7 +90,7 @@ pub fn anchor_refresh_due(coverage: &WalletCoverage, now_unix: i64, refresh_secs
 }
 
 /// Shared serialized admission coordinator. Its durable checks are repeated by
-/// the membership writer while holding the publication lock.
+/// the orchestrator while holding the publication lock.
 #[derive(Clone)]
 pub struct AdmissionPreparer {
     inner: Arc<Preparer>,
@@ -143,9 +145,9 @@ impl AdmissionPreparer {
         self
     }
 
-    /// Prove Lane C's durable prerequisites, then hand ownership to the
-    /// orchestrator. `#544 Lane D integration`: complete the causal positions
-    /// bracket before sending this acknowledgement-bearing command.
+    /// Reject fences before validation and require complete history after the accepted
+    /// anchor installation is acknowledged. Validator-free callers require complete
+    /// history before handing preparation to the orchestrator.
     pub async fn prepare(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {
         if additions.is_empty() {
             return Ok(());
@@ -153,15 +155,21 @@ impl AdmissionPreparer {
         let preparer = &self.inner;
         let _attempt = preparer.attempt.lock().await;
 
-        self.check_prerequisites(additions)?;
-        self.prepare_locked(additions).await
+        self.check_fences(additions)?;
+        if preparer.validator.is_none() {
+            self.check_prerequisites(additions)?;
+        }
+        self.prepare_locked(additions).await?;
+        self.check_prerequisites(additions)
     }
 
-    /// Synchronize one structural membership record, then publish its exact replacement entries.
+    /// Recheck, seed, synchronize one structural record, then publish its exact entries.
+    /// Callers release the writer lock before sending or awaiting this control message.
     pub async fn publish_membership(
         &self,
         change: MembershipChange,
         replacements: Vec<WatchlistEntry>,
+        checks: MembershipCommit,
     ) -> Result<AppendReceipt, AdmissionError> {
         let (acknowledged, received) = oneshot::channel();
         self.inner
@@ -169,6 +177,7 @@ impl AdmissionPreparer {
             .send(OrchestratorControl::PublishMembership {
                 change,
                 replacements,
+                checks,
                 acknowledged,
             })
             .await
@@ -311,8 +320,23 @@ impl AdmissionPreparer {
             .validator
             .as_ref()
             .ok_or(AdmissionError::PositionValidatorUnavailable)?;
+        let purpose = match coverage.activity_cutoff_unix {
+            Some(cutoff)
+                if !coverage.reanchor_required
+                    && coverage.anchor_seq.is_some()
+                    && preparer.paper_state.cursor(&wallet)?.is_some() =>
+            {
+                ValidationPurpose::RoutineRefresh { cutoff }
+            }
+            _ => ValidationPurpose::CatchUp,
+        };
         let installs = match validator
-            .validate_via_control(&[wallet], &preparer.control_tx, &preparer.paper_state)
+            .validate_via_control(
+                &[wallet],
+                &preparer.control_tx,
+                &preparer.paper_state,
+                purpose,
+            )
             .await
         {
             Ok(installs) => installs,
@@ -332,21 +356,27 @@ impl AdmissionPreparer {
         }
     }
 
-    fn check_prerequisites(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {
-        let preparer = &self.inner;
-
+    fn check_fences(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {
         let mut fenced = 0usize;
-        let mut missing = 0usize;
         for wallet in additions {
-            if preparer.paper_state.is_wallet_fenced(wallet)? {
+            if self.inner.paper_state.is_wallet_fenced(wallet)? {
                 fenced = fenced.saturating_add(1);
-            }
-            if !preparer.paper_state.wallet_history_complete(wallet)? {
-                missing = missing.saturating_add(1);
             }
         }
         if fenced > 0 {
             return Err(AdmissionError::Fenced { fenced });
+        }
+        Ok(())
+    }
+
+    fn check_prerequisites(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {
+        self.check_fences(additions)?;
+        let preparer = &self.inner;
+        let mut missing = 0usize;
+        for wallet in additions {
+            if !preparer.paper_state.wallet_history_complete(wallet)? {
+                missing = missing.saturating_add(1);
+            }
         }
         if missing > 0 {
             return Err(AdmissionError::MissingHistory { missing });
@@ -358,7 +388,12 @@ impl AdmissionPreparer {
         let preparer = &self.inner;
         if let Some(validator) = &preparer.validator {
             let installs = validator
-                .validate_via_control(additions, &preparer.control_tx, &preparer.paper_state)
+                .validate_via_control(
+                    additions,
+                    &preparer.control_tx,
+                    &preparer.paper_state,
+                    ValidationPurpose::CatchUp,
+                )
                 .await
                 .map_err(AdmissionError::PositionValidation)?;
             return self.install_anchors(installs).await;
@@ -408,5 +443,50 @@ impl AdmissionPreparer {
             AnchorInstallError::Durability(message) => AdmissionError::ValidationInstall(message),
             rejection => AdmissionError::ValidationRejected(rejection),
         })
+    }
+    /// Exercise production artifact capture and locked publication from scenario harnesses.
+    #[cfg(feature = "scenario")]
+    pub async fn scenario_publish_ranking(
+        &self,
+        live: &crate::live_watchlist::LiveWatchlist,
+        writer_lock: &Mutex<()>,
+        entries: Vec<WatchlistEntry>,
+        last_trade: &std::collections::HashMap<WalletAddress, i64>,
+        cap: usize,
+    ) -> Result<(), crate::watchlist_maintenance::MembershipApplyError> {
+        use crate::paper_recovery::SealedMembershipEvidence;
+        use crate::watchlist_maintenance::{
+            MembershipApplyError, MembershipPublication, apply_ranked_membership_locked,
+            ranked_membership_change,
+        };
+        let (_, additions) = ranked_membership_change(&live.snapshot().entries, &entries, cap);
+        let ranking = self
+            .record_ranking_membership(Some(546), entries.clone())
+            .await
+            .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
+        let admissions = self
+            .record_admission_proofs(&additions)
+            .await
+            .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
+        let evidence = SealedMembershipEvidence::full_rerank(ranking, admissions)
+            .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
+        let _writer = writer_lock.lock().await;
+        apply_ranked_membership_locked(
+            live,
+            &self.inner.paper_state,
+            self,
+            MembershipPublication {
+                reason: MembershipReason::FullRerank,
+                ranking_batch_id: Some(546),
+                evidence,
+            },
+            &entries,
+            last_trade,
+            cap,
+            _writer,
+            None,
+        )
+        .await?;
+        Ok(())
     }
 }

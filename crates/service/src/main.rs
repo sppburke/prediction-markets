@@ -447,9 +447,7 @@ async fn main() -> Result<()> {
             Some(replayed.last_ranking_batch_id),
         )
     } else {
-        // Before a financial Start, `latest_ranking` remains the boot owner. Read its marker first
-        // so a batch landing between the two reads is applied on the first maintenance tick. A
-        // failed marker read becomes `None`, which also forces the first full-rerank tick (#542).
+        // Bind the fresh survivor bench to the marker before loading the active state.
         let marker = supabase_reader::fetch_latest_batch_id(
             &ranking_client,
             &cfg.supabase_url,
@@ -457,17 +455,19 @@ async fn main() -> Result<()> {
             &cfg.supabase_secret_key,
         )
         .await
-        .unwrap_or_default();
-        let (watchlist, last_trade) = supabase_reader::fetch(
+        .context("fetch pre-Start ranking batch")?
+        .context("no pre-Start ranking batch")?;
+        let (watchlist, last_trade) = supabase_reader::fetch_batch(
             &ranking_client,
             &cfg.supabase_url,
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
-            initial_watchlist_size,
+            marker,
+            MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await
         .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;
-        (watchlist, last_trade, marker)
+        (watchlist, last_trade, Some(marker))
     };
     info!(
         active = initial_watchlist.active_count,
@@ -478,7 +478,7 @@ async fn main() -> Result<()> {
     );
 
     // Fail fast if the selected Supabase batch returned no durable members — there is no fallback
-    // source (#370). Both the pre-Start moving read and the Start-pinned read are survivor-filtered
+    // source (#370). Both the pre-Start batch read and the Start-pinned read are survivor-filtered
     // (#518), so a batch with no surviving rows fails closed rather than running an empty set.
     anyhow::ensure!(
         !initial_watchlist.entries.is_empty(),
@@ -486,8 +486,6 @@ async fn main() -> Result<()> {
     );
 
     let (projection_dirty, projection_dirty_rx) = projection_dirty_channel();
-    let live_watchlist =
-        LiveWatchlist::new_with_projection(initial_watchlist, projection_dirty.clone());
     let projection_status = WatchlistProjectionStatus::default();
 
     // Shared writer mutex (#350 WS1 PR-D): serializes the score-update refresh loop and the
@@ -682,6 +680,18 @@ async fn main() -> Result<()> {
         .into_iter()
         .map(|fence| fence.wallet)
         .collect();
+    let (initial_watchlist, bootstrap_last_trade) = if financial_start_record.is_none() {
+        supabase_reader::select_membership(
+            initial_watchlist,
+            bootstrap_last_trade,
+            &fenced,
+            initial_watchlist_size,
+        )
+    } else {
+        (initial_watchlist, bootstrap_last_trade)
+    };
+    let live_watchlist =
+        LiveWatchlist::new_with_projection(initial_watchlist, projection_dirty.clone());
     live_watchlist.remove_fenced(&fenced);
 
     // Validate the initial evaluation universe before any producer can observe it.
@@ -999,7 +1009,6 @@ async fn main() -> Result<()> {
         _ => anyhow::bail!("boot source-log recorder and walk state disagree at the handoff"),
     };
     let (trigger_tx, trigger_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
-    let mut start = producer_start_rx.clone();
     let activity_watchlist = live_watchlist.clone();
     let activity_health = health.clone();
     let activity_ws_enabled = cfg.polymarket_activity_ws_enabled;
@@ -1012,6 +1021,7 @@ async fn main() -> Result<()> {
             trigger_tx,
             activity_health,
         )
+        .with_reader_start_gate(producer_start_rx.clone())
         .with_source_receipt_index(source_receipts.clone())
     } else {
         pe_service::activity_ingest::ActivityIngest::poll_only(
@@ -1025,14 +1035,17 @@ async fn main() -> Result<()> {
     let reconciliation_obligations_dropped =
         activity_ingest.reconciliation_triggers_dropped_counter();
     supervisor.spawn(TaskName::ActivityIngest, async move {
-        if start.wait_for(|started| *started).await.is_err() {
-            return Ok(TaskExit::ChannelClosed("producer_start"));
-        }
-        activity_ingest
-            .run_until(activity_shutdown.wait_for(ShutdownPhase::StopProducers))
+        // Recovery may append admission evidence before observation producers start.
+        match activity_ingest
+            .run_until(activity_shutdown.wait_for(TaskName::ActivityIngest.stop_phase()))
             .await
-            .map(|()| TaskExit::CleanShutdown)
-            .map_err(TaskFailure::typed)
+        {
+            Ok(()) => Ok(TaskExit::CleanShutdown),
+            Err(pe_service::activity_ingest::ActivityIngestError::ProducerStartClosed) => {
+                Ok(TaskExit::ChannelClosed("producer_start"))
+            }
+            Err(error) => Err(TaskFailure::typed(error)),
+        }
     });
 
     // Polymarket trade poller task. Reads the live wallet set per poll round (#339).
@@ -1047,6 +1060,7 @@ async fn main() -> Result<()> {
     let poller_runtime_config = live_runtime_config.clone();
     let poller_admission_preparer = admission_preparer.clone();
     let poller_asset_identity = Arc::clone(&asset_identity);
+    let poller_source_receipts = source_receipts.clone();
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -1072,6 +1086,7 @@ async fn main() -> Result<()> {
             obligations,
             Some(poller_admission_preparer),
         )
+        .with_source_receipt_index(poller_source_receipts)
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
         .await
         .map(|()| TaskExit::CleanShutdown)
@@ -1386,7 +1401,8 @@ async fn main() -> Result<()> {
         supabase_state.clone(),
         book_fetcher,
     )
-    .context("build orchestrator")?;
+    .context("build orchestrator")?
+    .with_source_receipt_index(source_receipts.clone());
     if financial_start.is_some() {
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),
@@ -1457,7 +1473,6 @@ async fn main() -> Result<()> {
         cfg.supabase_url.clone(),
         cfg.supabase_anon_key.clone(),
         cfg.supabase_secret_key.clone(),
-        applied_watchlist_capacity.clone(),
         cfg.supabase_refresh_interval_secs,
         watchlist_writer_lock.clone(),
         projection_dirty_rx,
@@ -1487,7 +1502,6 @@ async fn main() -> Result<()> {
             demotion_min_trades: cfg.demotion_min_trades,
             demotion_cb_alpha,
             demotion_pnl_window_secs: cfg.demotion_pnl_window_secs,
-            bench_overfetch: cfg.bench_overfetch,
             membership_mode,
         };
         let maintenance = run_maintenance_loop(
@@ -1658,7 +1672,6 @@ async fn main() -> Result<()> {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopProducers);
     let producers = [
-        TaskName::ActivityIngest,
         TaskName::PublicActivityPoll,
         TaskName::ResolutionPoller,
         TaskName::LiveAccountsPoller,
@@ -1668,6 +1681,10 @@ async fn main() -> Result<()> {
         TaskName::RuntimeConfigPoller,
     ];
     let mut shutdown_timed_out = !join_named_until(&mut supervisor, &producers, deadline).await;
+    // Publish the drain phase while main still holds a strong control sender: the orchestrator
+    // observes `draining` before its control receiver can return `None`, so the closure below is
+    // a clean drain end rather than a premature-closure failure.
+    advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
     drop(producer_start_tx);
     drop(admission_preparer);
     drop(control_tx);
@@ -1675,14 +1692,15 @@ async fn main() -> Result<()> {
     // seal handles below were cloned into producers that have joined, so main's originals go too.
     drop(risk_halt_release);
     drop(qualification_seal);
-
-    advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
     shutdown_timed_out |=
         !join_named_until(&mut supervisor, &[TaskName::Orchestrator], deadline).await;
     drop(sink_handle);
 
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopSinks);
     let sinks = [
+        // Source acknowledgements remain available while wallet operations and the
+        // serialized control owner drain.
+        TaskName::ActivityIngest,
         TaskName::LiveFanout,
         TaskName::SupabaseAnalyticsSink,
         TaskName::LiquiditySnapshotWorker,
@@ -2197,6 +2215,7 @@ mod tests {
         paper_state.set_cursor(&wallet, 9_000).unwrap();
         paper_state
             .install_anchors(&[AnchorInstallRecord {
+                history_status: None,
                 wallet,
                 balances: Vec::new(),
                 activity_cutoff_unix: 9_000,

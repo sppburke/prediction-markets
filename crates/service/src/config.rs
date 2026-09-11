@@ -256,9 +256,10 @@ pub struct ServiceConfig {
     #[serde(default = "default_inactivity_hard_cap_secs")]
     pub inactivity_hard_cap_secs: u64,
 
-    /// Extra bench candidates fetched beyond the freed-slot count when backfilling, so a
-    /// server-side casing/dedup miss still leaves enough rows to refill the set. Default:
-    /// 10. See `docs/_GLOSSARY.md`: `bench_overfetch`.
+    /// Accepted for configuration compatibility only. Since #588 it has no runtime effect:
+    /// membership maintenance reads the latest ranking batch bounded by
+    /// `MAX_ACTIVE_WATCHLIST_SIZE` instead of over-fetching freed slots. Default: 10. See
+    /// `docs/_GLOSSARY.md`: `bench_overfetch`.
     #[serde(default = "default_bench_overfetch")]
     pub bench_overfetch: usize,
 
@@ -575,13 +576,19 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
     // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
     // value is a config error, not a posture. One hour is far beyond any honest
     // calibration (the ranker's latency shift is 2s).
-    if cfg.copy_latency_budget_secs == 0 || cfg.copy_latency_budget_secs > 3_600 {
+    if !valid_copy_latency_budget_secs(cfg.copy_latency_budget_secs) {
         return Err(ServiceConfigError::Invalid(format!(
             "copy_latency_budget_secs must be in 1..=3600, got {}",
             cfg.copy_latency_budget_secs
         )));
     }
     Ok(cfg)
+}
+
+/// Shared bound for boot configuration and frozen paper freshness evidence.
+#[must_use]
+pub fn valid_copy_latency_budget_secs(seconds: u64) -> bool {
+    (1..=3_600).contains(&seconds)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

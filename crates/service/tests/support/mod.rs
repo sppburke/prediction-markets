@@ -3,8 +3,15 @@
 
 #![allow(dead_code)]
 
+use pe_source_core::SourceError;
+use pe_source_polymarket_public::{PageFetcher, ReconciliationFetcher};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
@@ -13,9 +20,9 @@ use pe_core_types::{
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
 use pe_service::bucket_commit::{
-    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-    ACTIVITY_READ_COMMITMENT_SOURCE_ID, BucketDecisionContext, PageOccurrence,
-    activity_read_commitment_payload,
+    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+    ACTIVITY_READ_COMMITMENT_V1_SCHEMA_VERSION, BucketDecisionContext, PageOccurrence,
+    activity_read_commitment_payload_v1,
 };
 use pe_service::config::ServiceConfig;
 use pe_service::orchestrator_control::OrchestratorControl;
@@ -52,10 +59,11 @@ pub struct ProducerShapedRead {
     pub decision_inputs_json: String,
     pub page: PageOccurrence,
     pub commitment_payload: Vec<u8>,
+    pub commitment_version: u16,
 }
 
 /// Parse a short offset-zero page with no lower bound. Receive time is independent of the end.
-pub fn producer_shaped_read(
+pub fn producer_shaped_read_v1(
     wallet: WalletAddress,
     payload: &[u8],
     fixed_end: i64,
@@ -104,7 +112,7 @@ pub fn producer_shaped_read(
         raw_hash,
         receipt: page_receipt,
     };
-    let commitment_payload = activity_read_commitment_payload(
+    let commitment_payload = activity_read_commitment_payload_v1(
         wallet,
         fixed_end,
         std::slice::from_ref(&page),
@@ -117,7 +125,31 @@ pub fn producer_shaped_read(
             .to_string(),
         page,
         commitment_payload,
+        commitment_version: 1,
     }
+}
+
+/// Current v2 read with an explicit empty binding list; pair with continuation five.
+pub fn producer_shaped_read_v2(
+    wallet: WalletAddress,
+    payload: &[u8],
+    fixed_end: i64,
+    received_unix: i64,
+    page_receipt: AppendReceipt,
+) -> ProducerShapedRead {
+    let mut read = producer_shaped_read_v1(wallet, payload, fixed_end, received_unix, page_receipt);
+    let proof: serde_json::Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
+    let pages =
+        serde_json::from_value::<Vec<ReconciliationPageEvidence>>(proof["pages"].clone()).unwrap();
+    read.commitment_payload = pe_service::bucket_commit::activity_read_commitment_payload(
+        wallet,
+        fixed_end,
+        std::slice::from_ref(&read.page),
+        &pages,
+    )
+    .unwrap();
+    read.commitment_version = 2;
+    read
 }
 
 /// Synthetic receipt for scenarios that exercise the engine without a source log.
@@ -129,7 +161,7 @@ pub fn scenario_receipt(sequence: u64) -> AppendReceipt {
 }
 
 /// Append a successor-generation page and its genuine commitment to a real source log.
-pub fn append_committed_read(
+pub fn append_committed_read_v1(
     writer: &mut Writer,
     wallet: WalletAddress,
     payload: &[u8],
@@ -148,11 +180,11 @@ pub fn append_committed_read(
             payload: payload.to_vec(),
         })
         .unwrap();
-    let read = producer_shaped_read(wallet, payload, fixed_end, received_unix, page_receipt);
+    let read = producer_shaped_read_v1(wallet, payload, fixed_end, received_unix, page_receipt);
     let commitment = writer
         .append_synced(EnvelopeIn {
             source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
-            schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+            schema_version: ACTIVITY_READ_COMMITMENT_V1_SCHEMA_VERSION,
             parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
             observed_at: SourceTimestamp(received_at.0),
             received_at: received_at.clone(),
@@ -161,6 +193,138 @@ pub fn append_committed_read(
         })
         .unwrap();
     (read, commitment)
+}
+
+/// Append current page and commitment v2 receipts for a continuation-five fixture.
+pub fn append_committed_read_v2(
+    writer: &mut Writer,
+    wallet: WalletAddress,
+    payload: &[u8],
+    fixed_end: i64,
+    received_unix: i64,
+) -> (ProducerShapedRead, AppendReceipt) {
+    let received_at = ReceivedAt(time::OffsetDateTime::from_unix_timestamp(received_unix).unwrap());
+    let page_receipt = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_service::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(received_at.0),
+            received_at: received_at.clone(),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        })
+        .unwrap();
+    let read = producer_shaped_read_v2(wallet, payload, fixed_end, received_unix, page_receipt);
+    let commitment = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
+            schema_version: pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+            parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+            observed_at: SourceTimestamp(received_at.0),
+            received_at: received_at.clone(),
+            content_type: ContentType::Json,
+            payload: read.commitment_payload.clone(),
+        })
+        .unwrap();
+    (read, commitment)
+}
+
+/// Capture one valid continuation, then alter the price of a newer continuation outside the copy.
+pub fn post_snapshot_invalid_continuation(
+    paper: &Arc<pe_paper_state::PaperStateDb>,
+    state_path: &std::path::Path,
+    source_path: &std::path::Path,
+    wallet: WalletAddress,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    pe_core_types::SourceTradeId,
+) {
+    install_verified_empty_anchor(paper, wallet, 0);
+    paper
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet,
+            complete: true,
+            proof_json: "{\"fixed_end_walk\":\"complete\"}".to_owned(),
+            updated_at_unix: 900,
+        })
+        .unwrap();
+    let mut engine = pe_service::bucket_commit::BucketCommitEngine::load(
+        paper.clone(),
+        pe_service::paper_recovery::build_leader_ledger(paper).unwrap(),
+    )
+    .unwrap();
+    let snapshot_state = state_path.with_file_name("snapshot.db");
+    let snapshot_source = source_path.with_file_name("snapshot-source.log");
+    let connection = rusqlite::Connection::open(state_path).unwrap();
+    let mut newer_id = None;
+    for (epoch, market, size, price) in [
+        (910, "0xcondition-a", "2", "0.4"),
+        (911, "0xcondition-b", "3", "0.6"),
+    ] {
+        let payload = serde_json::to_vec(&serde_json::json!([{
+            "proxyWallet": wallet, "timestamp": epoch, "conditionId": market,
+            "type": "TRADE", "size": size, "usdcSize": "999999.000000",
+            "transactionHash": format!("0xboot-{epoch}"), "price": price,
+            "asset": "asset-0", "side": "BUY", "outcomeIndex": 0,
+            "outcome": "Yes", "isCombo": false,
+        }]))
+        .unwrap();
+        let mut writer = Writer::open(source_path).unwrap();
+        let (read, receipt) =
+            append_committed_read_v2(&mut writer, wallet, &payload, epoch + 10, epoch + 11);
+        drop(writer);
+        let context = read_context(&read, receipt, epoch + 20);
+        let committed = engine
+            .commit_with_freshness_policy(
+                read.aggregates,
+                &context,
+                pe_service::bucket_commit::FrozenDecisionBasis {
+                    win_rate_p: pe_core_types::Probability::ZERO,
+                    bankroll: rust_decimal::Decimal::ZERO,
+                },
+                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                    activity_ws_enabled: true,
+                    copy_latency_budget_secs: 2,
+                }),
+            )
+            .unwrap();
+        assert_eq!(committed.pending.len(), 1);
+        let id = committed.pending[0].clone();
+        let row = paper.decision_pending_for(&id).unwrap().unwrap();
+        assert_eq!(
+            pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row)
+                .unwrap()
+                .version(),
+            5
+        );
+        let index = pe_service::risk_inputs::SourceReceiptIndex::replay(source_path).unwrap();
+        assert_eq!(
+            pe_service::bucket_commit::validate_open_continuations(paper, &index).unwrap(),
+            if epoch == 910 { 1 } else { 2 }
+        );
+        if epoch == 910 {
+            connection
+                .execute("VACUUM INTO ?1", [snapshot_state.to_str().unwrap()])
+                .unwrap();
+            std::fs::copy(source_path, &snapshot_source).unwrap();
+        } else {
+            let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+            frozen["price"] = serde_json::json!("0.7");
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                        rusqlite::params![frozen.to_string(), id.0],
+                    )
+                    .unwrap(),
+                1
+            );
+            newer_id = Some(id);
+        }
+    }
+    (snapshot_state, snapshot_source, newer_id.unwrap())
 }
 
 pub fn install_empty_anchor(
@@ -180,6 +344,7 @@ pub fn install_empty_anchor(
     paper_state.set_cursor(&wallet, cutoff_unix).unwrap();
     paper_state
         .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            history_status: None,
             wallet,
             balances: Vec::new(),
             activity_cutoff_unix: cutoff_unix,
@@ -255,7 +420,7 @@ pub async fn send_trade_bucket_with_config(
     applied_configuration: RuntimeConfig,
 ) {
     let body = activity_body(&trade);
-    let read = producer_shaped_read(
+    let read = producer_shaped_read_v1(
         trade.wallet,
         &body,
         trade.observed_at.unix_timestamp(),
@@ -305,7 +470,11 @@ pub fn read_context(
         applied_configuration: RuntimeConfig::from_service_config(&ServiceConfig::default()),
         decision_inputs_json: read.decision_inputs_json.clone(),
         page_occurrences: vec![read.page.clone()],
-        read_commitment: Some(commitment),
+        read_commitment: Some(if read.commitment_version == 2 {
+            pe_service::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(commitment)
+        } else {
+            pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(commitment)
+        }),
         observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: SignalConfig::default(),
@@ -470,4 +639,249 @@ pub fn assert_no_continuation_side_effects(
     assert_eq!(paper.fills_count().unwrap(), 0, "zero paper orders/fills");
     let records = pe_service::paper_recovery::scan_paper_log(paper_path).unwrap();
     assert_eq!(records.len(), 0, "zero Prepared/Final/order records");
+}
+
+/// Seal a source-census fixture through the public qualification entry point. The fixture owns
+/// no membership or financial mutation; callers assert the exact source-verification outcome.
+pub async fn qualify_source_census(
+    directory: &std::path::Path,
+    source_log: &std::path::Path,
+    paper_state: &std::path::Path,
+    now_unix: i64,
+) -> pe_service::qualification::QualificationReport {
+    use pe_event_log::Scanner;
+    use pe_service::paper_recovery::{
+        PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, QualificationSealed, QualificationStarted,
+        SealReason, TailBinding,
+    };
+    std::fs::create_dir_all(directory).unwrap();
+    let paper_log = directory.join("paper.log");
+    let live_journal = directory.join("live.log");
+    let mut writer = Writer::open(&paper_log).unwrap();
+    drop(pe_execution_core::LiveJournal::open(&live_journal).unwrap());
+    let empty = TailBinding::from(&Scanner::verify(&paper_log).unwrap());
+    // Exact empty membership manifest and binding field order owned by MembershipProofBinding.
+    let manifest = r#"{"membership":[],"proofs":[]}"#;
+    let proof_hash = blake3::hash(manifest.as_bytes()).to_hex().to_string();
+    let start = QualificationStarted {
+        starting_bankroll: pe_core_types::CollateralAmount::ZERO,
+        paper_prefix: empty.clone(),
+        source_prefix: empty.clone(),
+        live_prefix: empty.clone(),
+        artifact_blake3: "scenario".to_owned(),
+        static_config_hash: "scenario".to_owned(),
+        hot_config_hash: "scenario".to_owned(),
+        generation: "scenario".to_owned(),
+        activation_id: "scenario".to_owned(),
+        ranking_batch_id: 1,
+        membership: Vec::new(),
+        membership_proofs_hash: format!(
+            r#"{{"version":1,"proof_hash":"{proof_hash}","manifest":{manifest}}}"#
+        ),
+        schema_version: PAPER_LOG_SCHEMA_VERSION,
+        parser_version: 1,
+        financial_semantic_version: 1,
+    };
+    let envelope = |record: PaperLogRecord| {
+        let timestamp = time::OffsetDateTime::from_unix_timestamp(now_unix).unwrap();
+        EnvelopeIn {
+            source_id: SourceId("pe-service.qualification".to_owned()),
+            schema_version: PAPER_LOG_SCHEMA_VERSION,
+            parser_version: 1,
+            observed_at: SourceTimestamp(timestamp),
+            received_at: ReceivedAt(timestamp),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&record).unwrap(),
+        }
+    };
+    let start_receipt = writer
+        .append_synced(envelope(PaperLogRecord::QualificationStarted(Box::new(
+            start,
+        ))))
+        .unwrap();
+    let financial_prefix = TailBinding::from(&Scanner::verify(&paper_log).unwrap());
+    let seal = QualificationSealed {
+        start_receipt,
+        source_prefix: TailBinding::from(&Scanner::verify(source_log).unwrap()),
+        financial_prefix,
+        live_prefix: empty,
+        decision_evidence_digest: blake3::hash(b"[]").to_hex().to_string(),
+        sealed_cutoff_unix: now_unix,
+        reason: SealReason::Complete,
+    };
+    let seal_receipt = writer
+        .append_synced(envelope(PaperLogRecord::QualificationSealed(Box::new(
+            seal,
+        ))))
+        .unwrap();
+    drop(writer);
+    let output = directory.join("qualification.json");
+    pe_service::qualification::run_qualify(&pe_service::qualification::QualifyOptions {
+        paper_log,
+        source_log: source_log.to_owned(),
+        live_journal: Some(live_journal),
+        paper_state: paper_state.to_owned(),
+        seal_hash: seal_receipt.this_hash.to_hex().to_string(),
+        output: output.clone(),
+    })
+    .await
+    .unwrap();
+    serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap()
+}
+
+/// Retained generation-four facts in each historical continuation wire encoding.
+pub fn legacy_continuation_wire(version: u16) -> serde_json::Value {
+    let mut wire: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/decision_continuation_v4.json")).unwrap();
+    wire["version"] = version.into();
+    if version < 4 {
+        wire.as_object_mut().unwrap().remove("read_commitment");
+    }
+    if version == 2 {
+        wire.as_object_mut().unwrap().remove("page_occurrences");
+        wire.as_object_mut()
+            .unwrap()
+            .remove("observed_source_receipt");
+        let config = wire["applied_configuration"].as_object_mut().unwrap();
+        assert_eq!(config.remove("era").unwrap(), "legacy17");
+        let compatibility = config.remove("legacy_compatibility").unwrap();
+        for (key, value) in compatibility.as_object().unwrap() {
+            config.insert(key.clone(), value.clone());
+        }
+    }
+    wire
+}
+
+/// Install an empty anchor through the bucket owner so qualification can verify its balance hash.
+pub fn install_verified_empty_anchor(
+    paper: &Arc<pe_paper_state::PaperStateDb>,
+    wallet: WalletAddress,
+    cutoff: i64,
+) {
+    paper.set_cursor(&wallet, cutoff).unwrap();
+    use pe_service::position_seeder::{
+        AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture,
+    };
+    let mut engine = pe_service::bucket_commit::BucketCommitEngine::load(
+        paper.clone(),
+        pe_service::paper_recovery::build_leader_ledger(paper).unwrap(),
+    )
+    .unwrap();
+    let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
+    engine
+        .install_anchors(&[AnchorInstall {
+            wallet,
+            balances: Vec::new(),
+            cutoff,
+            proof: AnchorProof {
+                positions_proof_hash: "scenario-positions".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: cutoff,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+            history_status: None,
+        }])
+        .unwrap();
+}
+
+// Explicit response barriers shared by the poller and deployed-flow scenarios.
+pub struct RequestedPage {
+    pub url: String,
+    pub respond: PageResponse,
+}
+
+pub struct PageResponse(oneshot::Sender<Result<Vec<u8>, SourceError>>);
+
+impl PageResponse {
+    pub fn send(self, payload: Vec<u8>) -> Result<(), Result<Vec<u8>, SourceError>> {
+        self.0.send(Ok(payload))
+    }
+
+    pub fn fail(self) {
+        self.0
+            .send(Err(SourceError::Transient {
+                message: "injected retryable read failure".to_owned(),
+            }))
+            .unwrap();
+    }
+}
+
+pub struct GatedFetcher {
+    pub requests: mpsc::Sender<RequestedPage>,
+}
+
+impl ReconciliationFetcher for GatedFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let (respond, response) = oneshot::channel();
+            self.requests
+                .send(RequestedPage {
+                    url: url.to_owned(),
+                    respond: PageResponse(respond),
+                })
+                .await
+                .map_err(|_| SourceError::Fatal {
+                    message: "request barrier closed".to_owned(),
+                })?;
+            response.await.map_err(|_| SourceError::Fatal {
+                message: "response barrier closed".to_owned(),
+            })?
+        })
+    }
+}
+
+// The cold portfolio-price barrier used by the final paper freshness scenarios.
+#[derive(Default)]
+pub struct PriceGate {
+    pub blocked: AtomicBool,
+    pub market: Mutex<Option<String>>,
+    pub started: Notify,
+    pub release: Notify,
+}
+#[derive(Clone)]
+pub struct Prices {
+    pub gate: Arc<PriceGate>,
+    pub markets: Arc<Mutex<HashMap<String, Value>>>,
+}
+impl PageFetcher for Prices {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if self
+            .gate
+            .market
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|market| url.contains(&format!("condition_ids={market}")))
+            && self.gate.blocked.swap(false, Ordering::SeqCst)
+        {
+            self.gate.started.notify_one();
+            self.gate.release.notified().await;
+        }
+        let markets = self.markets.lock().unwrap();
+        let rows = url
+            .split(['?', '&'])
+            .filter_map(|part| part.strip_prefix("condition_ids="))
+            .filter_map(|condition| markets.get(condition).cloned())
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_vec(&rows).unwrap())
+    }
+}
+pub struct Page(pub Vec<u8>);
+impl ReconciliationFetcher for Page {
+    fn fetch<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
 }

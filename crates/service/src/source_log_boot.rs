@@ -249,7 +249,7 @@ impl SourceLogBoot {
         );
         let activity = std::mem::take(&mut self.reducers.activity);
         let mut obligations = activity
-            .into_obligations(paper_state)
+            .into_obligations(paper_state, &self.receipt_index)
             .context("rebuild durable activity reconciliation obligations")?;
         if let Some(candidates) = self.reducers.daily_boundary.take()
             && let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, &mut obligations)

@@ -21,7 +21,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::live_watchlist::LiveWatchlist;
-use crate::runtime_config::AppliedWatchlistCapacity;
+use crate::runtime_config::MAX_ACTIVE_WATCHLIST_SIZE;
 use crate::supabase_reader::{self, SupabaseError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -397,7 +397,6 @@ pub async fn run_supabase_refresh_loop(
     base_url: String,
     anon_key: String,
     secret_key: String,
-    applied_capacity: AppliedWatchlistCapacity,
     interval_secs: u64,
     writer_lock: Arc<Mutex<()>>,
     mut dirty: watch::Receiver<u64>,
@@ -450,7 +449,7 @@ pub async fn run_supabase_refresh_loop(
             _ = ticker.tick() => {
                 let mut next_projection = retry_projection;
                 if refresh_enabled {
-                    let fetch_limit = applied_capacity.load().target;
+                    let fetch_limit = MAX_ACTIVE_WATCHLIST_SIZE;
                     match supabase_reader::fetch(
                         &client,
                         &base_url,
@@ -532,5 +531,71 @@ mod tests {
         assert!(applied.last_error.is_none());
         assert_eq!(applied.applied.as_ref().unwrap().token, "new-token");
         assert_eq!(applied.applied.as_ref().unwrap().count, 2);
+    }
+    #[tokio::test]
+    async fn score_refresh_fetches_the_survivor_bench_without_changing_membership() {
+        use crate::live_watchlist::projection_dirty_channel;
+        use axum::{Json, Router, extract::Query, routing::get};
+        use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
+        use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+        let retained = WalletAddress([3; 20]);
+        let app = Router::new().route("/rest/v1/latest_ranking", get(move |Query(query): Query<std::collections::HashMap<String, String>>| async move {
+            assert_eq!(query["limit"], MAX_ACTIVE_WATCHLIST_SIZE.to_string());
+            assert_eq!(query["survives"], "is.true");
+            let rows = [WalletAddress([1; 20]), WalletAddress([2; 20]), retained].map(|wallet| serde_json::json!({
+                "wallet_hex": wallet.to_string(), "hit_rate_text": "0.6", "ls_tstat_text": "2", "n_trades": 10,
+            }));
+            Json(rows.into_iter().take(query["limit"].parse::<usize>().unwrap()).collect::<Vec<_>>())
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (dirty, rx) = projection_dirty_channel();
+        let mut observed = rx.clone();
+        let live = LiveWatchlist::new_with_projection(
+            Watchlist {
+                entries: vec![WatchlistEntry {
+                    wallet: retained,
+                    tier: WatchlistTier::Active,
+                    leader_score_bps: BasisPoints(0),
+                    lcb_5pct_bps: BasisPoints(0),
+                    win_rate_bps: BasisPoints(0),
+                    closed_trades_in_window: 0,
+                    reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                }],
+                snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                active_count: 1,
+                incubator_count: 0,
+            },
+            dirty,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let task = tokio::spawn(run_supabase_refresh_loop(
+            live.clone(),
+            paper,
+            reqwest::Client::new(),
+            base,
+            "anon".to_owned(),
+            String::new(),
+            1,
+            Arc::new(Mutex::new(())),
+            rx,
+            WatchlistProjectionStatus::default(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), observed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.snapshot().entries.len(), 1);
+        assert_eq!(live.snapshot().entries[0].wallet, retained);
+        assert_eq!(
+            live.snapshot().entries[0].leader_score_bps,
+            BasisPoints(2_000)
+        );
+        task.abort();
+        server.abort();
     }
 }

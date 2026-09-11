@@ -60,7 +60,7 @@ fn aggregate_rows_for_wallet(wallet_hex: &str, mut rows: Vec<Value>) -> FixtureA
     for row in &mut rows {
         row["proxyWallet"] = json!(wallet_hex);
     }
-    let read = support::producer_shaped_read(
+    let read = support::producer_shaped_read_v1(
         WalletAddress::from_hex(wallet_hex).unwrap(),
         &serde_json::to_vec(&rows).unwrap(),
         epoch,
@@ -104,7 +104,7 @@ impl CommitFixtureRead for BucketCommitEngine {
             .max()
             .unwrap();
         let rows: Vec<_> = groups.iter().flat_map(|group| group.rows.iter()).collect();
-        let read = support::producer_shaped_read(
+        let read = support::producer_shaped_read_v1(
             wallet,
             &serde_json::to_vec(&rows).unwrap(),
             fixed_end,
@@ -126,7 +126,11 @@ impl CommitFixtureRead for BucketCommitEngine {
             })
             .collect();
         let mut context = template.clone();
-        context.read_commitment = Some(support::scenario_receipt(read.page.receipt.sequence.0 + 1));
+        context.read_commitment = Some(
+            pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(
+                support::scenario_receipt(read.page.receipt.sequence.0 + 1),
+            ),
+        );
         context.decision_inputs_json = read.decision_inputs_json;
         context.page_occurrences = vec![read.page];
         self.commit(aggregates, &context, basis)
@@ -317,6 +321,7 @@ fn install_anchor_for_wallet(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            history_status: None,
             wallet,
             balances,
             cutoff,
@@ -640,6 +645,7 @@ fn bracket_unverified_covered_group_is_raw_only_without_reanchor_then_anchors() 
     let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            history_status: None,
             wallet: wallet(),
             balances: Vec::new(),
             cutoff: 92,
@@ -1210,6 +1216,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         first_size: &str,
         second_size: &str,
         reverse: bool,
+        extra: usize,
     ) -> (
         std::collections::BTreeMap<String, String>,
         Vec<pe_paper_state::LeaderPositionRow>,
@@ -1227,11 +1234,22 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
             "0.79",
             200,
         );
-        let groups = if reverse {
-            vec![second, first]
-        } else {
-            vec![first, second]
-        };
+        let mut groups = vec![first, second];
+        groups.extend((0..extra).map(|index| {
+            position_row(
+                "TRADE",
+                &format!("0xextra-{index}"),
+                MARKET_A,
+                0,
+                "BUY",
+                "1",
+                "0.5",
+                200,
+            )
+        }));
+        if reverse {
+            groups.reverse();
+        }
         let result = engine
             .commit_read(groups, &context(200, true), zero_basis())
             .unwrap();
@@ -1253,15 +1271,31 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         )
     }
 
-    let left = run("1.125000", "2.875000", false);
-    let right = run("2.875000", "1.125000", true);
+    let left = run("1.125000", "2.875000", false, 0);
+    let right = run("2.875000", "1.125000", true, 0);
     assert_eq!(left, right, "g2 order/economics cannot select a winner");
 
+    assert_eq!(
+        run("1.125000", "2.875000", false, 6),
+        run("1.125000", "2.875000", true, 6)
+    );
+
     let (dir, paper, mut engine) = fresh_anchored();
-    let groups = vec![
-        position_row("TRADE", "0x31", MARKET_A, 0, "BUY", "1", "0.4", 210),
-        position_row("TRADE", "0x32", MARKET_A, 0, "BUY", "2", "0.6", 210),
-    ];
+    let groups = (0..8)
+        .rev()
+        .map(|index| {
+            position_row(
+                "TRADE",
+                &format!("0xrestart-{index}"),
+                MARKET_A,
+                0,
+                "BUY",
+                "1",
+                "0.4",
+                210,
+            )
+        })
+        .collect();
     engine
         .commit_read(groups, &context(210, true), zero_basis())
         .unwrap();
@@ -1386,6 +1420,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             clocks: vec![DecisionClockEvidence {
                 purpose: "terminal_transition".to_owned(),
                 unix_millis: 301_000,
+                submillisecond_nanos: None,
             }],
             authority: AuthorityEvidence {
                 kind: "not_read".to_owned(),
@@ -1455,6 +1490,7 @@ fn terminal_decision_pending_retains_financial_final_receipt() {
         clocks: vec![DecisionClockEvidence {
             purpose: "financial_final".to_owned(),
             unix_millis: 302_001,
+            submillisecond_nanos: None,
         }],
         authority: AuthorityEvidence {
             kind: "commit_fill_v2".to_owned(),
@@ -1969,6 +2005,65 @@ fn already_fenced_commit_serializes_only_clamped_redeems_as_version_three() {
 }
 
 #[test]
+fn homogeneous_five_buys_apply_and_allow_later_independent_entry() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let five_connected = (0..5)
+        .map(|ordinal| {
+            position_row(
+                "TRADE",
+                &format!("0xwide-{ordinal}"),
+                MARKET_A,
+                0,
+                "BUY",
+                "0.000001",
+                "0.5",
+                592,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = engine
+        .commit_read(five_connected, &context(592, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.newly_fenced, None);
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 5);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    assert!(result.pending.is_empty());
+    assert_eq!(result.dispositions.len(), 5);
+    assert!(
+        result
+            .dispositions
+            .values()
+            .all(|value| value == "ambiguous_first_entry_same_second")
+    );
+    assert!(
+        paper.gate_history().unwrap()[&wallet()]
+            .contains(&MarketId(VenueMarketId(MARKET_A.to_owned())))
+    );
+    let later = engine
+        .commit_read(
+            vec![position_row(
+                "TRADE",
+                "0xwide-later",
+                MARKET_B,
+                0,
+                "BUY",
+                "1",
+                "0.5",
+                593,
+            )],
+            &context(593, true),
+            zero_basis(),
+        )
+        .unwrap();
+    assert_eq!(later.pending.len(), 1);
+    assert_eq!(later.newly_fenced, None);
+    assert_eq!(
+        state(&engine, MARKET_B, 0),
+        ShareAmount::from_whole(1).unwrap()
+    );
+}
+
+#[test]
 fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() {
     let (_dir, paper, mut engine) = fresh();
     paper.set_cursor(&wallet(), 0).unwrap();
@@ -2033,11 +2128,11 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
     assert_eq!(state(&engine, MARKET_A, 1), ShareAmount::ZERO);
 
     let (_dir, paper, mut engine) = fresh_anchored();
-    let five_connected = (0..5)
+    let mut mixed = (0..4)
         .map(|ordinal| {
             position_row(
                 "TRADE",
-                &format!("0xwide-{ordinal}"),
+                &format!("0xwide-mixed-{ordinal}"),
                 MARKET_A,
                 0,
                 "BUY",
@@ -2047,8 +2142,15 @@ fn equal_second_components_reject_stacking_cross_effects_and_undecidable_size() 
             )
         })
         .collect::<Vec<_>>();
+    mixed.push(pair_effect(
+        "SPLIT",
+        "0xwide-mixed-split",
+        MARKET_A,
+        "0.000001",
+        592,
+    ));
     let result = engine
-        .commit_read(five_connected, &context(592, true), zero_basis())
+        .commit_read(mixed, &context(592, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -2355,7 +2457,7 @@ fn committed_source_read(
         .max()
         .unwrap();
     let mut writer = pe_event_log::Writer::open(dir.path().join("source.log")).unwrap();
-    support::append_committed_read(
+    support::append_committed_read_v1(
         &mut writer,
         wallet(),
         &serde_json::to_vec(&rows).unwrap(),
@@ -2374,12 +2476,213 @@ fn commit_open_source_read(
     let mut context = context(epoch, true);
     context.decision_inputs_json = read.decision_inputs_json.clone();
     context.page_occurrences = vec![read.page.clone()];
-    context.read_commitment = Some(receipt);
+    context.read_commitment =
+        Some(pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(receipt));
     context.identity_overrides = overrides;
     let committed = engine
         .commit(read.aggregates.clone(), &context, zero_basis())
         .unwrap();
     assert_eq!(committed.pending.len(), read.aggregates.len());
+}
+
+fn online_census_copy(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let state = dir.path().join("snapshot.db");
+    let source = dir.path().join("snapshot-source.log");
+    // SQLite's online backup captures committed WAL pages while the live owner stays open.
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    connection
+        .execute("VACUUM INTO ?1", [state.to_str().unwrap()])
+        .unwrap();
+    std::fs::copy(dir.path().join("source.log"), &source).unwrap();
+    (state, source)
+}
+
+fn census_cli(state: &std::path::Path, source: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"))
+        .arg("--validate-open-continuations")
+        .arg("--paper-state")
+        .arg(state)
+        .arg("--source-log")
+        .arg(source)
+        .output()
+        .unwrap()
+}
+
+/// PASS: a live post-backup continuation is outside the offline census, but in the boot census.
+#[test]
+fn online_snapshot_does_not_cover_later_continuation() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let (read, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xsnapshot-first",
+            MARKET_A,
+            0,
+            "BUY",
+            "2",
+            "0.4",
+            910,
+        )],
+    );
+    commit_open_source_read(&mut engine, &read, receipt, HashMap::new());
+    let captured = paper.open_decision_pending().unwrap();
+    let (state, source) = online_census_copy(&dir);
+    let (later, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xsnapshot-later",
+            MARKET_B,
+            0,
+            "BUY",
+            "3",
+            "0.6",
+            911,
+        )],
+    );
+    commit_open_source_read(&mut engine, &later, receipt, HashMap::new());
+    let offline = PaperStateDb::open_read_only(&state).unwrap();
+    let offline_index = pe_service::risk_inputs::SourceReceiptIndex::replay(&source).unwrap();
+    assert_eq!(offline.open_decision_pending().unwrap(), captured);
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&offline, &offline_index).unwrap(),
+        1
+    );
+    let current_index =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+            .unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper, &current_index).unwrap(),
+        2
+    );
+    assert!(
+        paper
+            .is_decision_pending_open(later.aggregates[0].group_id.key())
+            .unwrap()
+    );
+    for (state, source, expected) in [
+        (state, source, "open_rows=1 validated=1\n"),
+        (
+            dir.path().join("paper.db"),
+            dir.path().join("source.log"),
+            "open_rows=2 validated=2\n",
+        ),
+    ] {
+        let output = census_cli(&state, &source);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+/// PASS: newer invalid evidence fails before owner construction; all pending state stays unchanged.
+#[tokio::test]
+async fn post_snapshot_invalid_continuation_blocks_boot_resume() {
+    let (dir, paper, engine) = fresh();
+    drop(engine);
+    let (state, source, id) = support::post_snapshot_invalid_continuation(
+        &paper,
+        &dir.path().join("paper.db"),
+        &dir.path().join("source.log"),
+        wallet(),
+    );
+    let pending = paper.open_decision_pending().unwrap();
+    let positions = paper.leader_positions().unwrap();
+    let history = paper.gate_history().unwrap();
+    let cursor = paper.cursor(&wallet()).unwrap();
+    let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+    let offline = census_cli(&state, &source);
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(offline.stdout).unwrap(),
+        "open_rows=1 validated=1\n"
+    );
+    let hooks = support::continuation_hooks(920);
+    let paper_path = dir.path().join("paper.log");
+    drop(pe_event_log::Writer::open(&paper_path).unwrap());
+    let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+        .unwrap();
+    let mut resumes = 0;
+    let result = async {
+        let count = pe_service::bucket_commit::validate_open_continuations(&paper, &index)?;
+        let (_control, receiver) = tokio::sync::mpsc::channel(4);
+        let mut owner = support::continuation_orchestrator(
+            paper.clone(),
+            &paper_path,
+            wallet(),
+            receiver,
+            hooks.clone(),
+        );
+        resumes += count;
+        owner.resume_pending_before_producers().await.unwrap();
+        Ok::<_, pe_service::bucket_commit::ContinuationValidationError>(count)
+    }
+    .await;
+    assert_eq!(result.unwrap_err().source_trade_id.as_ref(), Some(&id));
+    assert_eq!(resumes, 0);
+    assert_eq!(paper.open_decision_pending().unwrap(), pending);
+    assert_eq!(paper.leader_positions().unwrap(), positions);
+    assert_eq!(paper.gate_history().unwrap(), history);
+    assert_eq!(paper.cursor(&wallet()).unwrap(), cursor);
+    assert_eq!(paper.activity_groups_after(&wallet(), 0).unwrap(), groups);
+    support::assert_no_continuation_side_effects(
+        &paper,
+        &dir.path().join("paper.db"),
+        &paper_path,
+        &hooks,
+    );
+}
+
+/// PASS: the actual offline command rejects a fixed torn frame and never repairs either input.
+#[test]
+fn offline_census_rejects_torn_source_copy_without_repair() {
+    let (dir, _paper, mut engine) = fresh_anchored();
+    let (read, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xtorn-copy",
+            MARKET_A,
+            0,
+            "BUY",
+            "2",
+            "0.4",
+            910,
+        )],
+    );
+    commit_open_source_read(&mut engine, &read, receipt, HashMap::new());
+    let (state, source) = online_census_copy(&dir);
+    // Keep the five-byte file header and one byte of the first frame length.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_len(6)
+        .unwrap();
+    assert!(matches!(
+        pe_event_log::Reader::replay(&source),
+        Err(pe_event_log::LogError::Truncated { .. })
+    ));
+    let before_state = std::fs::read(&state).unwrap();
+    let before_source = std::fs::read(&source).unwrap();
+    let output = census_cli(&state, &source);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("build verified source receipt index for open-continuation census"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), before_state);
+    assert_eq!(std::fs::read(&source).unwrap(), before_source);
 }
 
 /// PASS: the fact-altered row is named and validation stops before any resume, admission,

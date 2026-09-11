@@ -213,18 +213,32 @@ async fn scenario_e2e_clean_exit() {
 
 // ── Scenario 2: graceful_shutdown ────────────────────────────────────────────
 //
-// PASS: two trades are buffered in the channel when shutdown fires; both are
-//       drained before the orchestrator exits (no hang, no panic).
-//       paper.log has the 5-byte header written at executor init.
-// FAIL: orchestrator hangs (test timeout) or panics.
+// PASS: DrainOrchestrator is observed while a strong sender remains, then dropping the
+//       last strong sender exits Ok even while a weak holder remains.
+// FAIL: orchestrator hangs or treats the ordered closure as premature.
 
 #[tokio::test]
 async fn scenario_graceful_shutdown() {
+    assert_orchestrator_drain_order(true).await;
+}
+
+// PASS: input closure is processed before the drain phase and returns PrematureInputClosure.
+// FAIL: uncoordinated closure succeeds or waits for a later phase publication.
+#[tokio::test]
+async fn scenario_control_closure_before_drain_is_premature() {
+    assert_orchestrator_drain_order(false).await;
+}
+
+async fn assert_orchestrator_drain_order(drain_first: bool) {
+    use pe_service::orchestrator::OrchestratorRunError;
+    use pe_service::supervisor::{ShutdownController, ShutdownPhase};
+
     let dir = TempDir::new().unwrap();
     let wallet = wallet_a();
 
     let (control_tx, control_rx) = mpsc::channel(16);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown, shutdown_rx) = ShutdownController::new();
+    let (draining_tx, draining_rx) = tokio::sync::oneshot::channel();
 
     let orch = Orchestrator::new(
         LiveWatchlist::new(make_watchlist(wallet)),
@@ -259,23 +273,48 @@ async fn scenario_graceful_shutdown() {
     )
     .unwrap();
 
-    let run = tokio::spawn(orch.run_coordinated(async {
-        shutdown_rx.await.ok();
+    let run = tokio::spawn(orch.run_coordinated(async move {
+        shutdown_rx.wait_for(ShutdownPhase::DrainOrchestrator).await;
+        draining_tx.send(()).unwrap();
     }));
     send_trade_bucket(&control_tx, make_trade(wallet)).await;
     send_trade_bucket(&control_tx, make_trade(wallet)).await;
-    shutdown_tx.send(()).unwrap();
+    if drain_first {
+        // Production publishes the phase before releasing main's strong handles. The
+        // acknowledgement forces the owner to observe that phase before channel closure.
+        assert_eq!(control_tx.strong_count(), 1);
+        shutdown.advance(ShutdownPhase::DrainOrchestrator);
+        tokio::time::timeout(std::time::Duration::from_secs(5), draining_rx)
+            .await
+            .expect("the retained sender must not block phase observation")
+            .unwrap();
+    }
     // Issue #599: a weak holder (the live fanout in production) must not keep the drain open.
     let weak_holder = control_tx.downgrade();
     drop(control_tx);
-    tokio::time::timeout(std::time::Duration::from_secs(5), run)
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
         .await
         .expect("orchestrator drain must finish once every strong control sender is dropped")
-        .unwrap()
         .unwrap();
+    if drain_first {
+        result.unwrap();
+    } else {
+        assert_eq!(shutdown.phase(), ShutdownPhase::Running);
+        assert!(
+            matches!(
+                result,
+                Err(OrchestratorRunError::PrematureInputClosure {
+                    channel: "orchestrator_control",
+                })
+            ),
+            "{result:?}"
+        );
+        // Joining the failed owner is the barrier: closure was consumed before publication.
+        shutdown.advance(ShutdownPhase::DrainOrchestrator);
+    }
     assert!(weak_holder.upgrade().is_none());
 
-    // Executor was initialised; orchestrator exited cleanly without hanging.
+    // Both orderings initialized the executor and joined the owner.
     let log_path = dir.path().join("paper.log");
     let len = std::fs::metadata(&log_path).unwrap().len();
     assert!(

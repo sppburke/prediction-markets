@@ -1375,6 +1375,7 @@ mod paper_log_tests {
             "f602cee694f90f8e48cdd43e70d6d9398879a9991662492af82ec4f7df31b222"
         );
         let facts = DecisionContinuationFacts {
+            paper_freshness_policy: None,
             source_trade_id: SourceTradeId("g2:fill".to_owned()),
             semantic_revision: "semantic-v2".to_owned(),
             transaction_hash: "0xtransaction".to_owned(),
@@ -2048,6 +2049,46 @@ mod paper_log_tests {
         assert_eq!(replayed.watchlist.entries[0].wallet, first);
     }
 
+    fn spawn_membership_orchestrator(
+        live: LiveWatchlist,
+        paper_writer: Writer,
+        paper_state: Arc<PaperStateDb>,
+        control_rx: mpsc::Receiver<crate::orchestrator_control::OrchestratorControl>,
+    ) -> tokio::task::JoinHandle<()> {
+        let orchestrator = Orchestrator::new(
+            live.clone(),
+            OrchestratorConfig {
+                bankroll: dec!(100),
+                mode: ExecutionMode::Paper,
+                signal_config: SignalConfig::default(),
+                max_resolution_horizon_secs: 0,
+                min_resolution_horizon_secs: 0,
+                max_fill_price: Decimal::ZERO,
+                min_fill_price: Decimal::ZERO,
+                price_impact_cap_bps: 100,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+                watchlist_writer_lock: None,
+                entry_gate_config: CopyEntryGateConfig,
+                runtime_config: None,
+                live_accounts: None,
+            },
+            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+            paper_writer,
+            paper_state.clone(),
+            PositionLedger::new(),
+            new_shared_health(false),
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new()),
+            control_rx,
+            None,
+            None,
+            None,
+            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        )
+        .unwrap();
+        tokio::spawn(orchestrator.run(std::future::pending::<()>()))
+    }
+
     /// PASS: a structural change published by the runtime orchestrator and replayed from that
     /// same paper log produces byte-for-byte-equivalent watchlist entries;
     /// FAIL: runtime and boot differ in survivor fields, ordering, deduplication, or capping.
@@ -2103,41 +2144,15 @@ mod paper_log_tests {
 
         let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let (control_tx, control_rx) = mpsc::channel(1);
-        let orchestrator = Orchestrator::new(
+        let runtime = spawn_membership_orchestrator(
             live.clone(),
-            OrchestratorConfig {
-                bankroll: dec!(100),
-                mode: ExecutionMode::Paper,
-                signal_config: SignalConfig::default(),
-                max_resolution_horizon_secs: 0,
-                min_resolution_horizon_secs: 0,
-                max_fill_price: Decimal::ZERO,
-                min_fill_price: Decimal::ZERO,
-                price_impact_cap_bps: 100,
-                activity_ws_enabled: false,
-                copy_latency_budget_secs: 2,
-                watchlist_writer_lock: None,
-                entry_gate_config: CopyEntryGateConfig,
-                runtime_config: None,
-                live_accounts: None,
-            },
-            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
             paper_writer,
             paper_state.clone(),
-            PositionLedger::new(),
-            new_shared_health(false),
-            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new()),
             control_rx,
-            None,
-            None,
-            None,
-            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
-        )
-        .unwrap();
-        let runtime = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+        );
         let preparer = AdmissionPreparer::new(control_tx, paper_state);
         preparer
-            .publish_membership(change, replacements)
+            .publish_membership(change, replacements, Default::default())
             .await
             .unwrap();
         drop(preparer);
@@ -2152,6 +2167,278 @@ mod paper_log_tests {
             serde_json::to_vec(&replayed.watchlist.entries).unwrap(),
             serde_json::to_vec(&runtime_entries).unwrap()
         );
+    }
+
+    /// PASS: a retained overfetched legacy artifact and a newly selected, proof-bearing knockout
+    /// publication replay their distinct exact memberships; batch, vector, and receipt edits fail.
+    #[tokio::test]
+    async fn knockout_legacy_and_repaired_publications_replay_exactly() {
+        use crate::activity_ingest::{ActivityIngest, SourceLogHandle};
+        use crate::runtime_config::AppliedWatchlistCapacity;
+        use crate::source_event_sink::SourceEventSink;
+        use crate::watchlist_maintenance::{MembershipPublication, apply_evictions_and_backfill};
+        for legacy in [true, false] {
+            let dir = tempdir().unwrap();
+            let paper_path = dir.path().join("paper.log");
+            let source_path = dir.path().join("source.log");
+            let initial = wallet();
+            let excluded = WalletAddress([2; 20]);
+            let survivor = WalletAddress([3; 20]);
+            let selected = if legacy { excluded } else { survivor };
+            let artifact: RankingMembershipArtifact = serde_json::from_slice(include_bytes!(
+                "../tests/fixtures/legacy_knockout_candidates.json"
+            ))
+            .unwrap();
+            assert_eq!(artifact.entries.len(), 2);
+            let candidates = if legacy {
+                artifact.entries.clone()
+            } else {
+                crate::supabase_reader::select_membership(
+                    watchlist(artifact.entries.clone()),
+                    HashMap::new(),
+                    &HashSet::from([excluded]),
+                    1,
+                )
+                .0
+                .entries
+            };
+            assert_eq!(candidates.len(), if legacy { 2 } else { 1 });
+            assert_eq!(candidates[0].wallet, selected);
+            let initial_entries = vec![watchlist_entry(initial, 500)];
+            let live = LiveWatchlist::new(watchlist(initial_entries.clone()));
+            let mut paper_writer = Writer::open(&paper_path).unwrap();
+            append(
+                &mut paper_writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &PaperLogRecord::QualificationStarted(Box::new(start("knockout"))),
+            );
+            let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            state
+                .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                    wallet: selected,
+                    complete: true,
+                    proof_json: "{\"complete\":true}".to_owned(),
+                    updated_at_unix: 10,
+                })
+                .unwrap();
+            state.set_cursor(&selected, 10).unwrap();
+            state
+                .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                    history_status: None,
+                    wallet: selected,
+                    balances: Vec::new(),
+                    activity_cutoff_unix: 10,
+                    anchored_at_unix: 10,
+                    ledger_hash_after: "empty".to_owned(),
+                    positions_proof_hash: "empty".to_owned(),
+                    activity_bounds_json: "[]".to_owned(),
+                    source_log_generation: "knockout".to_owned(),
+                    proof_json: "{}".to_owned(),
+                    recorded_at_unix: 10,
+                }])
+                .unwrap();
+            if !legacy {
+                rusqlite::Connection::open(dir.path().join("paper.db")).unwrap().execute(
+                    "INSERT INTO wallet_fences VALUES (?1, 'excluded', 'invalid_mapping', '{}', 1)", [excluded.to_string()]
+                ).unwrap();
+            }
+            let (source, rx) = SourceLogHandle::channel(4);
+            let (trigger, _triggers) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    rx,
+                    trigger,
+                    new_shared_health(false),
+                )
+                .run(),
+            );
+            let (tx, rx) = mpsc::channel(1);
+            let runtime =
+                spawn_membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
+            let preparer =
+                AdmissionPreparer::new(tx, state.clone()).with_source_log(source.clone());
+            let ranking = if legacy {
+                let at = OffsetDateTime::from_unix_timestamp(10).unwrap();
+                source
+                    .append(EnvelopeIn {
+                        source_id: SourceId(RANKING_MEMBERSHIP_SOURCE_ID.to_owned()),
+                        schema_version: MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+                        parser_version: MEMBERSHIP_ARTIFACT_PARSER_VERSION,
+                        observed_at: SourceTimestamp(at),
+                        received_at: ReceivedAt(at),
+                        content_type: ContentType::Json,
+                        payload: include_bytes!(
+                            "../tests/fixtures/legacy_knockout_candidates.json"
+                        )
+                        .to_vec(),
+                    })
+                    .await
+                    .unwrap()
+            } else {
+                preparer
+                    .record_ranking_membership(Some(8), candidates.clone())
+                    .await
+                    .unwrap()
+            };
+            let admissions = preparer.record_admission_proofs(&[selected]).await.unwrap();
+            assert_eq!(admissions.len(), 1);
+            let evictions = preparer
+                .record_knockout_inputs(vec![(
+                    MembershipReason::KnockoutInactivity,
+                    KnockoutCausalArtifact {
+                        wallet: initial,
+                        evaluated_at_unix: 259_200,
+                        last_trade_unix: Some(0),
+                        inactivity_threshold_secs: 259_200,
+                        inactivity_hard_cap_secs: 604_800,
+                        demotion_min_trades: 10,
+                        demotion_cb_alpha: dec!(0.10),
+                        demotion_pnl_window_secs: 2_592_000,
+                        fills: Vec::new(),
+                        settlements: Vec::new(),
+                    },
+                )])
+                .await
+                .unwrap();
+            let evidence = SealedMembershipEvidence::knockout_backfill(
+                evictions,
+                Some(ranking),
+                admissions.clone(),
+            )
+            .unwrap();
+            if legacy {
+                // Historical artifact retains the full overfetch even though only one slot opens.
+                preparer
+                    .publish_membership(
+                        MembershipChange {
+                            reason: MembershipReason::KnockoutInactivity,
+                            removed: vec![initial],
+                            added: vec![selected],
+                            capacity: 1,
+                            ranking_batch_id: Some(8),
+                            evidence,
+                        },
+                        candidates.clone(),
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let capacity = AppliedWatchlistCapacity::new(1);
+                apply_evictions_and_backfill(
+                    &live,
+                    &state,
+                    &tokio::sync::Mutex::new(()),
+                    &preparer,
+                    MembershipPublication {
+                        reason: MembershipReason::KnockoutInactivity,
+                        ranking_batch_id: Some(8),
+                        evidence,
+                    },
+                    &capacity,
+                    capacity.load(),
+                    &HashSet::from([initial]),
+                    &candidates,
+                    &HashMap::from([(selected, 10)]),
+                )
+                .await
+                .unwrap();
+            }
+            let era = paper_era(scan_paper_log(&paper_path).unwrap());
+            let replayed =
+                replay_membership(&era, watchlist(initial_entries.clone()), &source_path)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(replayed.last_ranking_batch_id, 8);
+            assert_eq!(replayed.watchlist.entries[0].wallet, selected);
+            assert_eq!(
+                serde_json::to_vec(&replayed.watchlist.entries).unwrap(),
+                serde_json::to_vec(&live.snapshot().entries).unwrap()
+            );
+            let indexed = crate::qualification::PublishedMembershipSource::from_index(
+                crate::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap(),
+            );
+            assert_eq!(
+                serde_json::to_vec(
+                    &replay_membership_with_source(
+                        &era,
+                        watchlist(initial_entries.clone()),
+                        &indexed
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .watchlist
+                    .entries
+                )
+                .unwrap(),
+                serde_json::to_vec(&replayed.watchlist.entries).unwrap()
+            );
+            for (change, expected) in [
+                ("batch", "different batch"),
+                ("candidates", "disagrees with its additions"),
+                ("admission", "wrong envelope identity"),
+            ] {
+                let replacement = match change {
+                    "batch" => preparer
+                        .record_ranking_membership(Some(9), candidates.clone())
+                        .await
+                        .unwrap(),
+                    "candidates" => preparer
+                        .record_ranking_membership(
+                            Some(8),
+                            vec![watchlist_entry(WalletAddress([4; 20]), 1000)],
+                        )
+                        .await
+                        .unwrap(),
+                    _ => ranking,
+                };
+                let mut changed = paper_era(scan_paper_log(&paper_path).unwrap());
+                let frame = changed
+                    .frames
+                    .iter_mut()
+                    .find(|frame| {
+                        matches!(
+                            frame.frame,
+                            PaperLogFrame::Record(PaperLogRecord::MembershipChanged { .. })
+                        )
+                    })
+                    .unwrap();
+                let PaperLogFrame::Record(PaperLogRecord::MembershipChanged { evidence, .. }) =
+                    &mut frame.frame
+                else {
+                    unreachable!()
+                };
+                let mut typed: SealedMembershipEvidence =
+                    serde_json::from_value(evidence.clone()).unwrap();
+                let SealedMembershipEvidence::KnockoutBackfill {
+                    ranking_receipt,
+                    admission_receipts,
+                    ..
+                } = &mut typed
+                else {
+                    unreachable!()
+                };
+                if change == "admission" {
+                    admission_receipts[0].receipt = replacement;
+                } else {
+                    *ranking_receipt = Some(replacement);
+                }
+                *evidence = serde_json::to_value(typed).unwrap();
+                let error =
+                    replay_membership(&changed, watchlist(initial_entries.clone()), &source_path)
+                        .unwrap_err()
+                        .to_string();
+                assert!(
+                    error.contains(expected),
+                    "legacy={legacy} {change}: {error}"
+                );
+            }
+            drop(preparer);
+            runtime.await.unwrap();
+            drop(source);
+            ingest.await.unwrap();
+        }
     }
 
     /// PASS: a crash before the new MembershipChanged record leaves boot on Start's A/N;
@@ -2790,6 +3077,7 @@ fn applied_disposition(
         "applied"
             | "wallet_fenced_applied"
             | "decision_pending"
+            | crate::bucket_commit::HISTORY_ONLY_BRACKET
             | "not_copy_eligible"
             | "not_an_entry"
             | "not_first_entry"

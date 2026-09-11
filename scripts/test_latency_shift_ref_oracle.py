@@ -103,21 +103,21 @@ class RefOracleScenario(unittest.TestCase):
     def tearDown(self):
         self.dir.cleanup()
 
-    def add_points(self, rows):
+    def add_points(self, rows, token_id="TOK"):
         con = sqlite3.connect(self.db)
         for t, price in rows:
             con.execute(
-                "INSERT INTO ranker_price_points VALUES ('TOK', ?, ?, 1)", (t, price))
+                "INSERT INTO ranker_price_points VALUES (?, ?, ?, 1)", (token_id, t, price))
         con.commit()
         con.close()
 
-    def add_full_coverage(self):
-        lo = ENTRIES[0] + SHIFT - WINDOW - 1
-        hi = ENTRIES[-1] + SHIFT + 1
+    def add_full_coverage(self, entries=ENTRIES, token_id="TOK"):
+        lo = entries[0] + SHIFT - WINDOW - 1
+        hi = entries[-1] + SHIFT + 1
         con = sqlite3.connect(self.db)
         con.execute(
-            "INSERT INTO ranker_price_pages VALUES ('TOK', ?, ?, 1, 'complete', 1, "
-            "'00', 'test', 1, 1, 1, 1, 'url')", (lo, hi))
+            "INSERT INTO ranker_price_pages VALUES (?, ?, ?, 1, 'complete', 1, "
+            "'00', 'test', 1, 1, 1, 1, 'url')", (token_id, lo, hi))
         con.commit()
         con.close()
 
@@ -197,6 +197,52 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(row["survives"], "False")
         print("PASS: unmapped pair → all positions not repriced, never a crash")
 
+    def test_constant_return_cohort_does_not_survive(self):
+        entries = [1_000_000 + 10_000 * i for i in range(20)]
+        net = (1 - (.20 + .01)) / (.20 + .01)
+        con = sqlite3.connect(self.db)
+        for i in range(20):
+            con.execute("INSERT INTO token_conditions VALUES (?, ?, 1, 0)",
+                        (f"TOK{i:02}", f"0xm{i:02}"))
+        con.commit()
+        con.close()
+        with open(self.positions, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(POSITIONS_HEADER)
+            for i, entry in enumerate(entries):
+                writer.writerow([W1, f"0xm{i:02}", 0, entry, 3600, 0.20, 10, 1.0,
+                                 4.0, net, entry + 3600])
+        for i, entry in enumerate(entries):
+            self.add_points([(entry + SHIFT, "0.20")], token_id=f"TOK{i:02}")
+            self.add_full_coverage(entries=[entry], token_id=f"TOK{i:02}")
+
+        outcomes = []
+        for half_life, n_eff in ((0, "20.0"), (30, "19.9952")):
+            with self.subTest(half_life=half_life):
+                r, out = self.run_pass2("--half-life-days", str(half_life), "--min-trl", "20")
+                self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+                self.assertIn("reference coverage terminal for all 20 candidate pairs", r.stdout)
+                row = self.read_row(out)
+                self.assertEqual((row["n_total"], row["n_filled"]), ("20", "20"))
+                self.assertEqual((row["fill_rate"], row["hit_rate"]), ("1.0", "1.0"))
+                self.assertEqual(row["eligible"], "True")
+                self.assertEqual(row["mean_net_ls"], "3.761905")
+                self.assertEqual(row["n_eff"], n_eff)
+                self.assertEqual(row["tstat_net_ls"], "")
+                self.assertEqual(row["survives"], "False")
+                with open(out / "oracle_outcomes.csv", newline="") as f:
+                    recs = list(csv.DictReader(f))
+                self.assertEqual(len(recs), 20)
+                self.assertTrue(all(x["outcome"] == "repriced" for x in recs))
+                outcomes.append((out / "oracle_outcomes.csv").read_bytes())
+                manifest = json.loads((out / "oracle_manifest.json").read_text())
+                self.assertEqual(manifest["as_of"], entries[-1])
+                self.assertEqual(manifest["half_life_days"], half_life)
+                self.assertEqual(manifest["oracle_version"], 2)
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(outcomes[0], outcomes[1])
+        print("PASS: twenty covered/repriced constant returns have no score and never survive")
+
     def test_outcomes_artifact_regenerates_published_aggregates(self):
         self.add_points([
             (ENTRIES[0] + SHIFT - 30, "0.40"),
@@ -233,6 +279,7 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(man["versions"]["clob_resolution_parser"], 2)
         self.assertEqual(man["versions"]["clob_resolution_schema"], 2)
         self.assertEqual(man["versions"]["ranker"], 2)
+        self.assertEqual(man["oracle_version"], 2)
         self.assertEqual(man["versions"]["configuration"], 1)
         print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
 
@@ -297,6 +344,12 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(first, (out / "before_after_diff.json").read_bytes())
         manifest = json.loads((out / "oracle_manifest.json").read_text())
         import hashlib
+        self.assertEqual(manifest["oracle_version"], 2)
+        self.assertEqual(manifest["versions"]["ranker"], 2)
+        for name, key in (("latency_shift_ranked.csv", "latency_shift_ranked_sha256"),
+                          ("oracle_outcomes.csv", "oracle_outcomes_sha256")):
+            self.assertEqual(manifest["outputs"][key],
+                             hashlib.sha256((out / name).read_bytes()).hexdigest(), name)
         self.assertEqual(
             manifest["outputs"]["before_after_diff_sha256"],
             hashlib.sha256(first).hexdigest(),
