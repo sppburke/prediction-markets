@@ -812,8 +812,12 @@ async fn active_fill_crash_matrix_converges_once() {
         let operation = PaperFillOperationIdentity {
             leader_wallet: WalletAddress::from_hex(wallet_hex()).unwrap(),
             source_trade_id: SourceTradeId("g2:golden-fill".to_owned()),
-            observed_at_bucket: 1_800_000_000,
+            observed_at_bucket: 1_700_000_000,
         };
+        let gate = install_aged_continuation_five_checkpoint(
+            &dir.path().join("active-paper.db"),
+            &operation,
+        );
         let payload = FinancialPayload::Fill {
             operation: operation.clone(),
             economic: active_economic(source_receipt, start),
@@ -928,7 +932,80 @@ async fn active_fill_crash_matrix_converges_once() {
             0
         );
         assert_eq!(authority.prepared_mutations(), 1);
+        let terminal = state
+            .decision_pending_for(&operation.source_trade_id)
+            .unwrap()
+            .unwrap();
+        let replayed = pe_service::decision_replay::replay_decision_pending(&terminal).unwrap();
+        assert_eq!(replayed.post_boundary.body.terminal.disposition, "fill");
+        assert_eq!(
+            replayed
+                .post_boundary
+                .body
+                .clocks
+                .iter()
+                .filter(|clock| clock.purpose == "paper_prepared_staleness_gate")
+                .collect::<Vec<_>>(),
+            vec![&gate]
+        );
     }
+}
+
+/// The already-prepared crash matrix needs a stored checkpoint, not a new admission attempt.
+/// Keep the v5 wire fixture and checkpoint serializer's field order explicit in this fixture.
+fn install_aged_continuation_five_checkpoint(
+    state_path: &std::path::Path,
+    operation: &PaperFillOperationIdentity,
+) -> pe_service::decision_replay::DecisionClockEvidence {
+    use pe_service::decision_replay::DecisionClockEvidence;
+    #[derive(serde::Serialize)]
+    struct CheckpointBody<'a> {
+        version: u16,
+        owners: [&'static str; 2],
+        source_trade_id: &'a SourceTradeId,
+        applied_configuration_hash: &'a str,
+        market_end: Option<()>,
+        market_price: Option<()>,
+        book: Option<()>,
+        clocks: Vec<DecisionClockEvidence>,
+    }
+    let mut continuation: pe_service::bucket_commit::DecisionContinuationV3 =
+        serde_json::from_str(include_str!("fixtures/decision_continuation_v5.json")).unwrap();
+    continuation.facts.source_trade_id = operation.source_trade_id.clone();
+    continuation.facts.wallet = operation.leader_wallet;
+    // Recovery runs at the matrix's much later financial time, but must retain this accepted gate.
+    continuation.facts.source_epoch = operation.observed_at_bucket;
+    let gate =
+        DecisionClockEvidence::precise("paper_prepared_staleness_gate", 1_700_000_002_000_000_000)
+            .unwrap();
+    let body = CheckpointBody {
+        version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,
+        owners: ["source_log", "paper_log"],
+        source_trade_id: &operation.source_trade_id,
+        applied_configuration_hash: &continuation.facts.applied_configuration_hash,
+        market_end: None,
+        market_price: None,
+        book: None,
+        clocks: vec![
+            gate.clone(),
+            DecisionClockEvidence {
+                purpose: "paper_dispatch".to_owned(),
+                unix_millis: gate.unix_millis,
+                submillisecond_nanos: None,
+            },
+        ],
+    };
+    let hash = blake3::hash(&serde_json::to_vec(&(1_u32, &body)).unwrap())
+        .to_hex()
+        .to_string();
+    let mut document = serde_json::to_value(body).unwrap();
+    document["financial_semantic_version"] = serde_json::json!(1);
+    document["document_blake3"] = serde_json::json!(hash);
+    rusqlite::Connection::open(state_path).unwrap().execute(
+        "INSERT INTO decision_pending (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, updated_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, ?4)",
+        rusqlite::params![operation.source_trade_id.0, continuation.facts.semantic_revision, operation.leader_wallet.to_string(), continuation.facts.source_epoch, serde_json::to_string(&continuation).unwrap(), document.to_string()],
+    ).unwrap();
+    gate
 }
 
 fn assert_authority_conflict<T>(result: Result<T, SupabaseStateError>, field: &str) {

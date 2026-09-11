@@ -1420,6 +1420,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             clocks: vec![DecisionClockEvidence {
                 purpose: "terminal_transition".to_owned(),
                 unix_millis: 301_000,
+                submillisecond_nanos: None,
             }],
             authority: AuthorityEvidence {
                 kind: "not_read".to_owned(),
@@ -1489,6 +1490,7 @@ fn terminal_decision_pending_retains_financial_final_receipt() {
         clocks: vec![DecisionClockEvidence {
             purpose: "financial_final".to_owned(),
             unix_millis: 302_001,
+            submillisecond_nanos: None,
         }],
         authority: AuthorityEvidence {
             kind: "commit_fill_v2".to_owned(),

@@ -3,6 +3,9 @@
 //! A crash can leave a seed `pending_paper` in three distinct situations, each with its own
 //! resume rule:
 //!
+//! An open decision continuation owns its paper outcome and seed flip; leave that seed
+//! pending for continuation resume before applying the legacy rules below.
+//!
 //! 1. **A durable paper fill frame exists** for the seed's `dispatch_id` (crash between the
 //!    event-log `sync()` and the local flip transaction): the paper outcome IS durable, so
 //!    the seed flips `ready` with outcome `fill`.
@@ -22,7 +25,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use pe_core_types::WalletAddress;
+use pe_core_types::{SourceTradeId, WalletAddress};
 use pe_paper_state::PaperStateDb;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -61,7 +64,7 @@ pub struct DispatchResume {
     pub flipped_fill: usize,
     /// Stuck seeds finalized `ready` with the typed boot no-fill outcome.
     pub finalized_stuck: usize,
-    /// Seeds left `pending_paper` awaiting a possible redelivery.
+    /// Seeds left `pending_paper` awaiting continuation resume or a possible redelivery.
     pub left_pending: usize,
 }
 
@@ -139,6 +142,13 @@ pub fn resume_dispatch_seeds(
         .context("read last_applied")?;
 
     for seed in pending {
+        if paper_state
+            .is_decision_pending_open(&SourceTradeId(seed.source_trade_id.clone()))
+            .context("check dispatch decision continuation owner")?
+        {
+            out.left_pending += 1;
+            continue;
+        }
         if let Some(&frame_seq) = logged_keys.get(&seed.dispatch_id) {
             // Rule 1 (#511 disposition-aware): the frame is durable — flip by its
             // DISPOSITION, not by mere existence. A fills row = the fill applied; a

@@ -790,6 +790,7 @@ async fn verify_qualification(
     let mut decision_observations = HashMap::new();
     for decision in &replayed_decisions {
         let observation = verify_decision_source_inputs(&state, decision, &source_observations)?;
+        verify_paper_prepared_freshness(decision, &source_observations)?;
         verify_decision_classification(&state, decision)?;
         if decision_observations
             .insert(
@@ -5456,6 +5457,53 @@ fn start_envelope(
             start.clone(),
         )))?,
     })
+}
+
+fn verify_paper_prepared_freshness(
+    decision: &crate::decision_replay::ReplayedDecision,
+    source: &BTreeMap<u64, SourceObservation>,
+) -> Result<(), QualificationError> {
+    if decision.continuation.version() != 5 {
+        return Ok(());
+    }
+    let Some(now) =
+        crate::decision_replay::paper_prepared_gate_clock(&decision.post_boundary.body.clocks)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    let policy = decision
+        .continuation
+        .facts
+        .paper_freshness_policy
+        .ok_or_else(|| {
+            QualificationError::InsufficientEvidence("paper freshness policy is missing".to_owned())
+        })?;
+    let source_time = decision
+        .continuation
+        .verified_source_time(&mut |receipt| {
+            let source = decision_source_receipt(source, receipt)?;
+            Ok::<_, QualificationError>(CompleteActivityPage {
+                payload: source.payload.clone(),
+                observed_at: source.observed_at.clone(),
+                received_at: source.received_at.clone(),
+                source_id: source.source_id.clone(),
+                schema_version: source.schema_version,
+                parser_version: source.parser_version,
+                content_type: source.content_type.clone(),
+            })
+        })
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let terminal = &decision.post_boundary.body.terminal;
+    let expired = policy.expired(source_time, now);
+    if expired != (terminal.reason == "paper_stale_before_prepared")
+        || (!expired && terminal.disposition != "fill")
+    {
+        return insufficient(
+            "paper Prepared freshness predicate contradicts the terminal disposition",
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -12062,6 +12110,114 @@ mod tests {
                 },
             );
             assert_eq!(result.is_ok(), mutation == "none", "{mutation}: {result:?}");
+
+    /// PASS: row-only checks admit a structurally valid terminal, while source-backed replay
+    /// rejects a contradictory age; the receive clock remains the copy-delay clock.
+    #[test]
+    fn qualification_replays_source_age_and_frozen_policy() {
+        use crate::decision_replay::{
+            AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
+            TerminalDispositionEvidence,
+        };
+        let (mut continuation, mut source) = single_read_fixture(2, "0xclock", "BUY", false);
+        commit_read_fixture_v2(&mut continuation, &mut source);
+        continuation
+            .facts
+            .paper_freshness_policy
+            .as_mut()
+            .unwrap()
+            .activity_ws_enabled = true;
+        let dir = tempfile::tempdir().unwrap();
+        let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+        store_read_decision(&state, &continuation, "decision_pending", true);
+        for (nanos, expired, enabled, staged) in [
+            (102_000_000_000, false, true, false),
+            (102_000_000_001, true, true, false),
+            (103_000_000_000, false, false, false),
+            (102_000_000_000, false, true, true),
+            (102_000_000_001, true, true, true),
+            (103_000_000_000, false, false, true),
+        ] {
+            let mut current = continuation.clone();
+            current
+                .facts
+                .paper_freshness_policy
+                .as_mut()
+                .unwrap()
+                .activity_ws_enabled = enabled;
+            let mut decision = replayed_no_copy_decision(&current);
+            let body = &mut decision.post_boundary.body;
+            body.clocks = vec![
+                DecisionClockEvidence::precise("paper_prepared_staleness_gate", nanos).unwrap(),
+            ];
+            body.terminal = if expired {
+                TerminalDispositionEvidence::no_fill("paper_stale_before_prepared")
+            } else {
+                TerminalDispositionEvidence::final_fill(test_receipt(99))
+            };
+            if staged {
+                body.clocks.push(DecisionClockEvidence {
+                    purpose: "dispatch_seed_created".to_owned(),
+                    unix_millis: 101_000,
+                    submillisecond_nanos: None,
+                });
+                let frozen = &current.facts;
+                body.terminal.dispatch_id = Some(
+                    pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                        &pe_core_types::TraderId(frozen.wallet).to_string(),
+                        &frozen.source_trade_id.0,
+                        &frozen.market_id.0.0,
+                        frozen.outcome_id.0,
+                        frozen.side,
+                        frozen.source_epoch,
+                    ),
+                );
+            }
+            body.version = if expired {
+                crate::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION
+            } else {
+                crate::decision_replay::TERMINAL_EVIDENCE_VERSION
+            };
+            body.authority = if expired {
+                AuthorityEvidence::not_read("terminal_before_fill_authority")
+            } else {
+                AuthorityEvidence::commit_fill_v2("applied", dec!(99))
+            };
+            decision.post_boundary =
+                DecisionPostBoundaryEvidence::from_body(decision.post_boundary.body).unwrap();
+            let mut row = state
+                .decision_pending_for(&current.facts.source_trade_id)
+                .unwrap()
+                .unwrap();
+            row.frozen_inputs_json = serde_json::to_string(&current).unwrap();
+            row.state = pe_paper_state::DecisionPendingState::Terminal;
+            row.terminal_disposition =
+                Some(decision.post_boundary.body.terminal.disposition.clone());
+            row.post_commit_inputs_json = serde_json::to_string(&decision.post_boundary).unwrap();
+            let mut decision = crate::decision_replay::replay_decision_pending(&row).unwrap();
+            let observation = verify_decision_source_inputs(&state, &decision, &source).unwrap();
+            assert_eq!(observation.observed_unix_ms, 1_700_000_100_000);
+            verify_paper_prepared_freshness(&decision, &source).unwrap();
+            if enabled {
+                let clock = &mut decision.post_boundary.body.clocks[0];
+                *clock = DecisionClockEvidence::precise(
+                    "paper_prepared_staleness_gate",
+                    if expired {
+                        102_000_000_000
+                    } else {
+                        102_000_000_001
+                    },
+                )
+                .unwrap();
+                decision.post_boundary =
+                    DecisionPostBoundaryEvidence::from_body(decision.post_boundary.body).unwrap();
+                assert!(verify_paper_prepared_freshness(&decision, &source).is_err());
+            } else {
+                decision.post_boundary.body.clocks[0].submillisecond_nanos = Some(1);
+                decision.post_boundary =
+                    DecisionPostBoundaryEvidence::from_body(decision.post_boundary.body).unwrap();
+                verify_paper_prepared_freshness(&decision, &source).unwrap();
+            }
         }
     }
 }

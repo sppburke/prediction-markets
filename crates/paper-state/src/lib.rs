@@ -498,6 +498,13 @@ pub struct PendingTerminalEvidence<'a> {
     pub updated_at_unix: i64,
 }
 
+/// Staging closes legacy decisions; generation five retains an open paper-outcome owner.
+#[derive(Debug, Clone, Copy)]
+pub enum DispatchStagingEvidence<'a> {
+    LegacyTerminal(PendingTerminalEvidence<'a>),
+    PaperOutcomeCheckpoint(PendingTerminalEvidence<'a>),
+}
+
 /// Monotonic durable wallet fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletFenceRecord {
@@ -2736,7 +2743,7 @@ impl PaperStateDb {
     pub fn stage_dispatch_seed_pending(
         &self,
         seed: &DispatchSeedRecord,
-        pending: Option<PendingTerminalEvidence<'_>>,
+        pending: Option<DispatchStagingEvidence<'_>>,
     ) -> Result<bool, PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -2772,12 +2779,43 @@ impl PaperStateDb {
                 )?;
             }
         }
-        tx_terminalize_pending(
-            &tx,
-            &SourceTradeId(seed.source_trade_id.clone()),
-            "dispatch_staged",
-            pending,
-        )?;
+        match pending {
+            Some(DispatchStagingEvidence::PaperOutcomeCheckpoint(evidence)) => {
+                if inserted {
+                    serde_json::from_str::<serde_json::Value>(evidence.post_commit_inputs_json)?;
+                    let updated = tx.execute(
+                        "UPDATE decision_pending SET post_commit_inputs_json = ?2, \
+                             updated_at_unix = ?3 WHERE source_trade_id = ?1 AND state = 'open'",
+                        params![
+                            seed.source_trade_id,
+                            evidence.post_commit_inputs_json,
+                            evidence.updated_at_unix
+                        ],
+                    )?;
+                    if updated != 1 {
+                        return Err(PaperStateError::DecisionPendingConflict(
+                            seed.source_trade_id.clone(),
+                        ));
+                    }
+                }
+            }
+            Some(DispatchStagingEvidence::LegacyTerminal(evidence)) => {
+                tx_terminalize_pending(
+                    &tx,
+                    &SourceTradeId(seed.source_trade_id.clone()),
+                    "dispatch_staged",
+                    Some(evidence),
+                )?;
+            }
+            None => {
+                tx_terminalize_pending(
+                    &tx,
+                    &SourceTradeId(seed.source_trade_id.clone()),
+                    "dispatch_staged",
+                    None,
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(inserted)
     }
@@ -8704,5 +8742,95 @@ mod tests {
             PaperStateDb::open_read_only(&path),
             Err(PaperStateError::SchemaVersionMismatch { found: 999, .. })
         ));
+    }
+
+    #[test]
+    fn staged_paper_outcome_checkpoint_is_atomic_and_reused_without_closing() {
+        let (_dir, db) = db();
+        let staged = seed("generation-five", &["primary", "partner"]);
+        let source = SourceTradeId(staged.source_trade_id.clone());
+        db.lock()
+            .execute(
+                "INSERT INTO decision_pending \
+                 (source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+                  frozen_inputs_json, post_commit_inputs_json, state, updated_at_unix) \
+             VALUES (?1, 'revision', ?2, 1, '{}', '[]', 'open', 1)",
+                params![source.0, wallet().to_string()],
+            )
+            .unwrap();
+        let checkpoint = DispatchStagingEvidence::PaperOutcomeCheckpoint(PendingTerminalEvidence {
+            post_commit_inputs_json: "{\"dispatch_id\":\"generation-five\",\"clocks\":[]}",
+            updated_at_unix: 2,
+        });
+        db.lock().execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON decision_pending BEGIN SELECT RAISE(FAIL, 'checkpoint failed'); END;").unwrap();
+        assert!(
+            db.stage_dispatch_seed_pending(&staged, Some(checkpoint))
+                .is_err()
+        );
+        assert!(db.dispatch_seed(&staged.dispatch_id).unwrap().is_none());
+        assert!(db.dispatch_targets(&staged.dispatch_id).unwrap().is_empty());
+        assert_eq!(
+            db.decision_pending_for(&source)
+                .unwrap()
+                .unwrap()
+                .post_commit_inputs_json,
+            "[]"
+        );
+        db.lock()
+            .execute_batch("DROP TRIGGER fail_checkpoint;")
+            .unwrap();
+        assert!(
+            db.stage_dispatch_seed_pending(&staged, Some(checkpoint))
+                .unwrap()
+        );
+        let open = db.decision_pending_for(&source).unwrap().unwrap();
+        assert_eq!(open.state, DecisionPendingState::Open);
+        assert!(open.terminal_disposition.is_none());
+        assert_eq!(open.updated_at_unix, 2);
+        let targets = db.dispatch_targets(&staged.dispatch_id).unwrap();
+        let retry = seed("generation-five", &["replacement"]);
+        assert!(
+            !db.stage_dispatch_seed_pending(
+                &retry,
+                Some(DispatchStagingEvidence::PaperOutcomeCheckpoint(
+                    PendingTerminalEvidence {
+                        post_commit_inputs_json: "{\"changed\":true}",
+                        updated_at_unix: 3,
+                    }
+                ))
+            )
+            .unwrap()
+        );
+        assert_eq!(db.decision_pending_for(&source).unwrap().unwrap(), open);
+        assert_eq!(db.dispatch_targets(&staged.dispatch_id).unwrap(), targets);
+        db.commit_seen_no_fill_with_flip_pending(
+            &source,
+            &leader(0, 0),
+            Some(DispatchFlip {
+                dispatch_id: &staged.dispatch_id,
+                paper_outcome: "no_fill:paper_stale_before_prepared",
+            }),
+            Some(PendingTerminalEvidence {
+                post_commit_inputs_json: "{\"terminal\":true}",
+                updated_at_unix: 4,
+            }),
+        )
+        .unwrap();
+        let terminal = db.decision_pending_for(&source).unwrap().unwrap();
+        assert_eq!(terminal.terminal_disposition.as_deref(), Some("no_fill"));
+        assert_eq!(
+            db.dispatch_seed(&staged.dispatch_id)
+                .unwrap()
+                .unwrap()
+                .paper_outcome
+                .as_deref(),
+            Some("no_fill:paper_stale_before_prepared")
+        );
+        assert!(
+            !db.stage_dispatch_seed_pending(&retry, Some(checkpoint))
+                .unwrap()
+        );
+        assert_eq!(db.decision_pending_for(&source).unwrap().unwrap(), terminal);
+        assert_eq!(db.dispatch_targets(&staged.dispatch_id).unwrap(), targets);
     }
 }

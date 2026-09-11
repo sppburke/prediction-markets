@@ -79,7 +79,15 @@ pub struct PaperFreshnessPolicy {
 
 impl PaperFreshnessPolicy {
     pub(crate) fn valid(self) -> bool {
-        (1..=3_600).contains(&self.copy_latency_budget_secs)
+        crate::config::valid_copy_latency_budget_secs(self.copy_latency_budget_secs)
+    }
+
+    /// Strict source-age comparison, retaining the full precision of both instants.
+    #[must_use]
+    pub(crate) fn expired(self, source_time: SourceTimestamp, now: time::OffsetDateTime) -> bool {
+        self.activity_ws_enabled
+            && (now - source_time.0).whole_nanoseconds()
+                > i128::from(self.copy_latency_budget_secs) * 1_000_000_000
     }
 }
 
@@ -1038,6 +1046,56 @@ impl DecisionContinuationV3 {
             sequence: websocket.sequence.0,
         })?;
         Ok(())
+    }
+
+    /// Verify the complete history and its bindings before selecting the earliest source clock.
+    /// Receive timestamps remain separate evidence for copy-delay measurement.
+    pub(crate) fn verified_source_time<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<SourceTimestamp, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let aggregates = self.reconstruct_complete_activity_read(lookup)?;
+        let target = aggregates
+            .iter()
+            .find(|aggregate| aggregate.group_id.key() == &self.facts.source_trade_id)
+            .filter(|aggregate| {
+                aggregate.semantic_revision.as_str() == self.facts.semantic_revision
+                    && aggregate.source_time.0.unix_timestamp() == self.facts.source_epoch
+            })
+            .ok_or_else(|| {
+                complete_activity_read_error("source clock target differs from continuation")
+            })?;
+        let mut earliest = target.source_time.clone();
+        if self.version == 5 {
+            let wire: CompleteActivityReadWire =
+                serde_json::from_value(self.facts.decision_inputs.clone())
+                    .map_err(|error| complete_activity_read_error(error.to_string()))?;
+            let commitment = self
+                .verify_read_commitment(
+                    wire.fixed_end
+                        .ok_or_else(|| complete_activity_read_error("read end missing"))?,
+                    wire.pages
+                        .as_deref()
+                        .ok_or_else(|| complete_activity_read_error("read pages missing"))?,
+                    lookup,
+                )?
+                .ok_or_else(|| complete_activity_read_error("binding commitment is absent"))?;
+            for binding in commitment.bindings.iter().flatten().filter(|binding| {
+                binding.history_group_id == self.facts.source_trade_id
+                    && binding.semantic_revision == self.facts.semantic_revision
+            }) {
+                let source = lookup(binding.stream_receipt).map_err(|error| {
+                    complete_activity_read_error(format!("stream receipt lookup failed: {error}"))
+                })?;
+                let observation = verified_stream_observation(&source, self.facts.wallet)?;
+                earliest = SourceTimestamp(earliest.0.min(observation.source_time.0));
+            }
+        }
+        Ok(earliest)
     }
 }
 
@@ -4570,6 +4628,26 @@ mod continuation_v3_tests {
                     )
                     .unwrap();
                 assert_eq!(time.0.unix_timestamp(), 99);
+                let source_time = continuation
+                    .verified_source_time(&mut |receipt| {
+                        index
+                            .source_envelope(receipt)
+                            .map(CompleteActivityPage::from)
+                    })
+                    .unwrap();
+                assert_eq!(source_time.0.unix_timestamp(), 99);
+                let mut without_selected_stream = continuation.clone();
+                without_selected_stream.observed_source_receipt = None;
+                assert_eq!(
+                    without_selected_stream
+                        .verified_source_time(&mut |receipt| {
+                            index
+                                .source_envelope(receipt)
+                                .map(CompleteActivityPage::from)
+                        })
+                        .unwrap(),
+                    source_time
+                );
             } else {
                 assert!(result.is_err(), "{case}");
             }
