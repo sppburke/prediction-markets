@@ -128,10 +128,13 @@ pub enum CausalPositionError {
 /// Exact per-wallet source outcomes that retry without fencing or failing boot.
 ///
 /// A venue history the activity row parser refuses (issue #594: rehearsal attempt 9 aborted the
-/// whole boot on one wallet's `TRADE` row with price 3.1968021978) is that wallet's problem: it
-/// is excluded from the boot universe (left unvalidated for runtime admission) and, once live,
-/// yields `Deferred` on the refresh cadence. Only the observed shape is deferred: malformed pages,
-/// window invalidations, other row validations, aggregation and identity failures stay fatal.
+/// whole boot on one wallet's `TRADE` row with price 3.1968021978) is that wallet's problem. A
+/// `validate_direct` walk that encounters the row leaves the wallet out of the accepted set
+/// (unvalidated for runtime admission; a wallet reused on a fresh anchor is not re-read at boot),
+/// and a live wallet's periodic refresh yields `Deferred`, retried whenever the refresh rotation
+/// selects it while it keeps the anchor it already holds (issue #597). Only the observed shape is
+/// deferred: malformed pages, window invalidations, other row validations, aggregation and
+/// identity failures stay fatal.
 #[must_use]
 pub fn is_deferred_causal_position_error(error: &CausalPositionError) -> bool {
     match error {
