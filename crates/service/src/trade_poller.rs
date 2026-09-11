@@ -659,6 +659,22 @@ impl TradePoller {
         let _ = self.run_until(std::future::pending::<()>()).await;
     }
 
+    /// Scenario seam (issue #599): run exactly one reconciliation round. A stop that is already
+    /// requested when `run_until` begins no longer runs a round first, so the continuation
+    /// scenarios drive their single round through this hook.
+    #[cfg(feature = "scenario")]
+    pub async fn poll_round_once(mut self) -> Result<(), TradePollerOwnerError> {
+        {
+            let mut health = self
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            health.poll_started_at = Some(OffsetDateTime::now_utc());
+        }
+        self.drain_triggers();
+        self.poll_round().await
+    }
+
     /// Production entry point. A shutdown request cancels an in-flight round at its next await
     /// (issue #599): every wallet epoch-second already committed stays durable, an
     /// acknowledgement dropped by the cancellation does not undo the orchestrator's committed
