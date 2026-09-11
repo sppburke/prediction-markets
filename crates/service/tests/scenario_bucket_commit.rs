@@ -60,7 +60,7 @@ fn aggregate_rows_for_wallet(wallet_hex: &str, mut rows: Vec<Value>) -> FixtureA
     for row in &mut rows {
         row["proxyWallet"] = json!(wallet_hex);
     }
-    let read = support::producer_shaped_read(
+    let read = support::producer_shaped_read_v1(
         WalletAddress::from_hex(wallet_hex).unwrap(),
         &serde_json::to_vec(&rows).unwrap(),
         epoch,
@@ -104,7 +104,7 @@ impl CommitFixtureRead for BucketCommitEngine {
             .max()
             .unwrap();
         let rows: Vec<_> = groups.iter().flat_map(|group| group.rows.iter()).collect();
-        let read = support::producer_shaped_read(
+        let read = support::producer_shaped_read_v1(
             wallet,
             &serde_json::to_vec(&rows).unwrap(),
             fixed_end,
@@ -126,7 +126,11 @@ impl CommitFixtureRead for BucketCommitEngine {
             })
             .collect();
         let mut context = template.clone();
-        context.read_commitment = Some(support::scenario_receipt(read.page.receipt.sequence.0 + 1));
+        context.read_commitment = Some(
+            pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(
+                support::scenario_receipt(read.page.receipt.sequence.0 + 1),
+            ),
+        );
         context.decision_inputs_json = read.decision_inputs_json;
         context.page_occurrences = vec![read.page];
         self.commit(aggregates, &context, basis)
@@ -2449,7 +2453,7 @@ fn committed_source_read(
         .max()
         .unwrap();
     let mut writer = pe_event_log::Writer::open(dir.path().join("source.log")).unwrap();
-    support::append_committed_read(
+    support::append_committed_read_v1(
         &mut writer,
         wallet(),
         &serde_json::to_vec(&rows).unwrap(),
@@ -2468,7 +2472,8 @@ fn commit_open_source_read(
     let mut context = context(epoch, true);
     context.decision_inputs_json = read.decision_inputs_json.clone();
     context.page_occurrences = vec![read.page.clone()];
-    context.read_commitment = Some(receipt);
+    context.read_commitment =
+        Some(pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(receipt));
     context.identity_overrides = overrides;
     let committed = engine
         .commit(read.aggregates.clone(), &context, zero_basis())

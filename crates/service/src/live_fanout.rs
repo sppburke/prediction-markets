@@ -3141,7 +3141,9 @@ fn validate_live_observation_trade(
         ));
     }
 
-    if selected.source_id == crate::activity_ingest::ACTIVITY_WS_SOURCE_ID {
+    if binding.continuation.version() != 5
+        && selected.source_id == crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+    {
         let websocket = parse_activity_trade_observation(&selected.payload).map_err(|error| {
             economic_replay_error(format!(
                 "economic observation websocket parse failed: {error}"
@@ -3275,28 +3277,29 @@ where
             ));
         }
         let mut activity_page_lookup = |receipt| -> Result<_, EconomicReplayError> {
-            let (source_id, schema, parser) =
-                if Some(receipt) == binding.continuation.read_commitment {
-                    (
-                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID,
-                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
-                    )
-                } else {
-                    (
-                        crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
-                        pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-                        pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-                    )
-                };
-            let source = exact_economic_source(
-                receipt,
-                source_id,
-                schema,
-                parser,
-                evidence_cutoff_unix_ms,
-                lookup,
-            )?;
+            let source = lookup(receipt)?;
+            if source.received_unix_ms > evidence_cutoff_unix_ms {
+                return Err(economic_replay_error(
+                    "economic binding receipt differs or exceeds its evidence cutoff",
+                ));
+            }
+            if Some(receipt) == binding.continuation.read_commitment {
+                let (schema, parser) =
+                    binding.continuation.commitment_contract().ok_or_else(|| {
+                        economic_replay_error(
+                            "economic continuation commitment generation is invalid",
+                        )
+                    })?;
+                if source.source_id != crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+                    || source.schema_version != schema
+                    || source.parser_version != parser
+                    || source.content_type != ContentType::Json
+                {
+                    return Err(economic_replay_error(
+                        "economic commitment source contract differs",
+                    ));
+                }
+            }
             let received_at = source_time_from_millis(source.received_unix_ms)?;
             Ok(CompleteActivityPage {
                 payload: source.payload,
@@ -3316,6 +3319,18 @@ where
                     "economic observation complete activity reconstruction failed: {error}"
                 ))
             })?;
+        if let Some(receipt) = binding.continuation.observed_source_receipt {
+            binding
+                .continuation
+                .verify_stream_binding(
+                    &binding.continuation.facts.source_trade_id,
+                    receipt,
+                    &mut activity_page_lookup,
+                )
+                .map_err(|error| {
+                    economic_replay_error(format!("economic observation binding failed: {error}"))
+                })?;
+        }
         validate_live_observation_trade(economic, &aggregates, &selected, binding)?;
     }
     Ok(())
@@ -3861,7 +3876,7 @@ fn produced_decision_continuation(
         .filter_map(|page| page.bounds.map(|bounds| bounds.end))
         .max()
         .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
-    let commitment_payload = crate::bucket_commit::activity_read_commitment_payload(
+    let commitment_payload = crate::bucket_commit::activity_read_commitment_payload_v1(
         wallet,
         fixed_end,
         &page_occurrences,
@@ -3937,7 +3952,9 @@ fn produced_decision_continuation(
         reconstruction_quality: ReconstructionQuality::new(100)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
 
-        read_commitment: Some(read_commitment),
+        read_commitment: Some(
+            crate::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(read_commitment),
+        ),
         signal_config: pe_copy_signal_engine::SignalConfig::default(),
         copy_eligible: true,
         bracket_commit: false,
@@ -9422,7 +9439,12 @@ mod tests {
             Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
         >(continuation.facts.decision_inputs["pages"].clone())
         .unwrap();
-        let payload = crate::bucket_commit::activity_read_commitment_payload(
+        let encode = if continuation.version() == 5 {
+            crate::bucket_commit::activity_read_commitment_payload
+        } else {
+            crate::bucket_commit::activity_read_commitment_payload_v1
+        };
+        let payload = encode(
             continuation.facts.wallet,
             continuation.facts.decision_inputs["fixed_end"]
                 .as_i64()
@@ -9444,7 +9466,7 @@ mod tests {
                     .max()
                     .unwrap(),
                 source_id: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
-                schema_version: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                schema_version: continuation.commitment_contract().unwrap().0,
                 parser_version: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
                 content_type: ContentType::Json,
             },
@@ -10021,43 +10043,137 @@ mod tests {
     /// FAIL: strict live replay accepts a mutable continuation that redefines its committed read.
     #[test]
     fn strict_live_economic_rejects_read_commitment_substitution() {
-        let (prepared, account_id, sources, continuation) =
-            saturated_observation_replay_fixture(false, false);
-        replay_observation_fixture(&prepared, &account_id, &sources, &continuation).unwrap();
-        let mut collapsed = continuation.clone();
-        let leaf = collapsed.page_occurrences.last().unwrap().clone();
-        let evidence = collapsed.facts.decision_inputs["pages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|page| page["request_url"] == leaf.request_url)
-            .unwrap()
-            .clone();
-        collapsed.page_occurrences = vec![leaf];
-        collapsed.facts.decision_inputs["pages"] = serde_json::json!([evidence]);
-        let mut substituted = continuation.clone();
-        for occurrence in &mut substituted.page_occurrences {
-            occurrence.request_url = occurrence
-                .request_url
-                .replace("https://data-api.polymarket.com", "https://other.example");
+        for version in [4, 5] {
+            let (prepared, account_id, mut sources, mut continuation) =
+                saturated_observation_replay_fixture(false, false);
+            let old_sources = sources.clone();
+            if version == 5 {
+                let mut facts = continuation.facts.clone();
+                facts.paper_freshness_policy = Some(crate::bucket_commit::PaperFreshnessPolicy {
+                    activity_ws_enabled: false,
+                    copy_latency_budget_secs: 2,
+                });
+                continuation = DecisionContinuationV3::new(
+                    facts,
+                    continuation.observed_source_receipt,
+                    continuation.page_occurrences.clone(),
+                    continuation
+                        .read_commitment
+                        .map(crate::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2),
+                );
+                let replacement = read_commitment_source(&continuation);
+                *sources
+                    .iter_mut()
+                    .find(|(receipt, _)| Some(*receipt) == continuation.read_commitment)
+                    .unwrap() = replacement;
+                assert!(
+                    replay_observation_fixture(&prepared, &account_id, &old_sources, &continuation)
+                        .is_err()
+                );
+            }
+            replay_observation_fixture(&prepared, &account_id, &sources, &continuation).unwrap();
+            let mut collapsed = continuation.clone();
+            let leaf = collapsed.page_occurrences.last().unwrap().clone();
+            let evidence = collapsed.facts.decision_inputs["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|page| page["request_url"] == leaf.request_url)
+                .unwrap()
+                .clone();
+            collapsed.page_occurrences = vec![leaf];
+            collapsed.facts.decision_inputs["pages"] = serde_json::json!([evidence]);
+            let mut substituted = continuation.clone();
+            for occurrence in &mut substituted.page_occurrences {
+                occurrence.request_url = occurrence
+                    .request_url
+                    .replace("https://data-api.polymarket.com", "https://other.example");
+            }
+            for evidence in substituted.facts.decision_inputs["pages"]
+                .as_array_mut()
+                .unwrap()
+            {
+                evidence["request_url"] = serde_json::json!(
+                    evidence["request_url"]
+                        .as_str()
+                        .unwrap()
+                        .replace("https://data-api.polymarket.com", "https://other.example")
+                );
+            }
+            for changed in [collapsed, substituted] {
+                let error = replay_observation_fixture(&prepared, &account_id, &sources, &changed)
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("commitment differs"), "{error}");
+            }
         }
-        for evidence in substituted.facts.decision_inputs["pages"]
-            .as_array_mut()
+    }
+
+    /// PASS: only a verified v5 observation binding explains a changed stream source second;
+    /// missing bindings and legacy commitments preserve exact time equality.
+    #[test]
+    fn strict_live_economic_verifies_current_stream_time_binding() {
+        use crate::bucket_commit::{
+            ActivityReadCommitmentReceipt, ObservationBinding, PaperFreshnessPolicy,
+        };
+        let (prepared, account_id, mut sources, legacy) = observation_replay_fixture();
+        let receipt = legacy.observed_source_receipt.unwrap();
+        let stream = sources
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == receipt)
+            .unwrap();
+        let mut payload: serde_json::Value = serde_json::from_slice(&stream.1.payload).unwrap();
+        payload["timestamp"] = serde_json::json!(17);
+        stream.1.payload = serde_json::to_vec(&payload).unwrap();
+        assert!(replay_observation_fixture(&prepared, &account_id, &sources, &legacy).is_err());
+        let mut facts = legacy.facts.clone();
+        facts.paper_freshness_policy = Some(PaperFreshnessPolicy {
+            activity_ws_enabled: true,
+            copy_latency_budget_secs: 2,
+        });
+        let current = DecisionContinuationV3::new(
+            facts,
+            Some(receipt),
+            legacy.page_occurrences.clone(),
+            legacy
+                .read_commitment
+                .map(ActivityReadCommitmentReceipt::BindingsV2),
+        );
+        let replacement = read_commitment_source(&current);
+        *sources
+            .iter_mut()
+            .find(|(receipt, _)| Some(*receipt) == current.read_commitment)
+            .unwrap() = replacement;
+        assert!(replay_observation_fixture(&prepared, &account_id, &sources, &current).is_err());
+        let pages = serde_json::from_value::<
+            Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
+        >(current.facts.decision_inputs["pages"].clone())
+        .unwrap();
+        let binding = ObservationBinding {
+            stream_group_id: current.facts.source_trade_id.clone(),
+            stream_receipt: receipt,
+            history_group_id: current.facts.source_trade_id.clone(),
+            semantic_revision: current.facts.semantic_revision.clone(),
+            page_raw_hash: current.page_occurrences[0].raw_hash.clone(),
+            page_occurrence_index: 0,
+            identity_provenance: None,
+            identity_receipt: None,
+        };
+        let payload = crate::bucket_commit::activity_read_commitment_payload_v2(
+            current.facts.wallet,
+            current.facts.decision_inputs["fixed_end"].as_i64().unwrap(),
+            &current.page_occurrences,
+            &pages,
+            &[binding],
+        )
+        .unwrap();
+        sources
+            .iter_mut()
+            .find(|(receipt, _)| Some(*receipt) == current.read_commitment)
             .unwrap()
-        {
-            evidence["request_url"] = serde_json::json!(
-                evidence["request_url"]
-                    .as_str()
-                    .unwrap()
-                    .replace("https://data-api.polymarket.com", "https://other.example")
-            );
-        }
-        for changed in [collapsed, substituted] {
-            let error = replay_observation_fixture(&prepared, &account_id, &sources, &changed)
-                .err()
-                .unwrap();
-            assert!(error.to_string().contains("commitment differs"), "{error}");
-        }
+            .1
+            .payload = payload;
+        replay_observation_fixture(&prepared, &account_id, &sources, &current).unwrap();
     }
 
     /// PASS: strict live replay loads an engine-recorded A/0-to-B/1 correction from paper state
@@ -10144,7 +10260,9 @@ mod tests {
                     source_trade_id.clone(),
                     raw.observed_source_receipt.unwrap(),
                 )]),
-                read_commitment: raw.read_commitment,
+                read_commitment: raw
+                    .read_commitment
+                    .map(crate::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1),
                 reconstruction_quality: raw.facts.reconstruction_quality,
                 signal_config: pe_copy_signal_engine::SignalConfig::default(),
                 copy_eligible: true,

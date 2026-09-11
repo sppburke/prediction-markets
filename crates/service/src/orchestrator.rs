@@ -1313,10 +1313,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     // (#544 review round 3): capture is linearized against a
                     // concurrent refresh, and later watchlist/bankroll moves
                     // cannot change what a resumed continuation decides.
-                    let frozen_basis = self.freeze_decision_basis(&aggregates);
-                    let result =
-                        self.bucket_engine
-                            .commit(aggregates, context.as_ref(), frozen_basis);
+                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates);
+                    let result = self.bucket_engine.commit_with_freshness_policy(
+                        aggregates,
+                        context.as_ref(),
+                        frozen_basis,
+                        Some(policy),
+                    );
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {
@@ -1331,10 +1334,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     // Scenario/unit construction may omit the production writer lock;
                     // those harnesses have no competing membership writer to
                     // linearize the basis capture against.
-                    let frozen_basis = self.freeze_decision_basis(&aggregates);
-                    let result =
-                        self.bucket_engine
-                            .commit(aggregates, context.as_ref(), frozen_basis);
+                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates);
+                    let result = self.bucket_engine.commit_with_freshness_policy(
+                        aggregates,
+                        context.as_ref(),
+                        frozen_basis,
+                        Some(policy),
+                    );
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {
@@ -3461,17 +3467,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn freeze_decision_basis(
         &self,
         aggregates: &[pe_source_polymarket_public::ActivityAggregate],
-    ) -> crate::bucket_commit::FrozenDecisionBasis {
+    ) -> (
+        crate::bucket_commit::FrozenDecisionBasis,
+        crate::bucket_commit::PaperFreshnessPolicy,
+    ) {
         let watchlist = self.live_watchlist.snapshot();
         let leader = aggregates
             .first()
             .map(|aggregate| TraderId(aggregate.group_id.components().wallet));
-        crate::bucket_commit::FrozenDecisionBasis {
-            win_rate_p: leader
-                .map(|leader| self.win_rate_p_for(&watchlist, &leader))
-                .unwrap_or(Probability::ZERO),
-            bankroll: self.bankroll,
-        }
+        (
+            crate::bucket_commit::FrozenDecisionBasis {
+                win_rate_p: leader
+                    .map(|leader| self.win_rate_p_for(&watchlist, &leader))
+                    .unwrap_or(Probability::ZERO),
+                bankroll: self.bankroll,
+            },
+            crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: self.activity_ws_enabled,
+                copy_latency_budget_secs: self.copy_latency_budget_secs,
+            },
+        )
     }
 
     fn win_rate_p_for(&self, watchlist: &Watchlist, leader: &TraderId) -> Probability {

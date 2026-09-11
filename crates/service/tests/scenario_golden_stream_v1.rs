@@ -39,9 +39,8 @@ use pe_resolver_card::{
 use pe_risk_engine::{BinaryPayout, RiskBlock, RiskHaltCause, aggregate_resolution_credit};
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
 use pe_service::bucket_commit::{
-    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-    ACTIVITY_READ_COMMITMENT_SOURCE_ID, ActivityReadCommitment, BucketCommitEngine,
-    BucketDecisionContext, DecisionContinuationV3,
+    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+    ActivityReadCommitment, BucketCommitEngine, BucketDecisionContext, DecisionContinuationV3,
 };
 use pe_service::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
 use pe_service::decision_replay::{
@@ -149,7 +148,11 @@ async fn append_source_at(
             pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
         ),
         ACTIVITY_READ_COMMITMENT_SOURCE_ID => (
-            ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+            u32::from(
+                serde_json::from_slice::<ActivityReadCommitment>(payload)
+                    .unwrap()
+                    .version,
+            ),
             ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
         ),
         _ => (version, version),
@@ -831,7 +834,12 @@ fn rewrite_source_preimage(
         if envelope.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID {
             let commitment: ActivityReadCommitment = serde_json::from_slice(&payload).unwrap();
             let (page_payload, received_unix, receipt) = latest_page.as_ref().unwrap();
-            payload = support::producer_shaped_read(
+            let builder = if commitment.version == 2 {
+                support::producer_shaped_read_v2
+            } else {
+                support::producer_shaped_read_v1
+            };
+            payload = builder(
                 commitment.wallet,
                 page_payload,
                 commitment.fixed_end,
@@ -1757,7 +1765,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
             source_unix,
         )
         .await;
-        let read = support::producer_shaped_read(
+        let read = support::producer_shaped_read_v2(
             bodies.wallet,
             &bodies.activity,
             source_unix,
@@ -1972,7 +1980,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 .financial_clock_unix
                 .store(source_unix, std::sync::atomic::Ordering::SeqCst);
 
-            let mut read = support::producer_shaped_read(
+            let mut read = support::producer_shaped_read_v2(
                 bodies.wallet,
                 &bodies.activity,
                 source_unix,
@@ -1994,7 +2002,11 @@ async fn golden_source_stream_replays_exact_economic_core() {
                     recorded.websocket_receipt,
                 )]),
                 reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-                read_commitment: Some(recorded.commitment_receipt),
+                read_commitment: Some(
+                    pe_service::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(
+                        recorded.commitment_receipt,
+                    ),
+                ),
 
                 signal_config: Default::default(),
                 copy_eligible: true,
@@ -2484,7 +2496,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
     assert!(decision_rows.iter().all(|row| {
         replay_decision_pending(row).is_ok_and(|decision| {
             decision.continuation.facts.gate_result == "admitted"
-                && decision.continuation.version() == 4
+                && decision.continuation.version() == 5
                 && decision.continuation.read_commitment.is_some()
                 && decision.continuation.facts.provenance == TradeProvenance::ActivityWs
                 && decision.post_boundary.body.terminal.final_receipt.is_some()

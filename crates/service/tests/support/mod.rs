@@ -13,9 +13,9 @@ use pe_core_types::{
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
 use pe_service::bucket_commit::{
-    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-    ACTIVITY_READ_COMMITMENT_SOURCE_ID, BucketDecisionContext, PageOccurrence,
-    activity_read_commitment_payload,
+    ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+    ACTIVITY_READ_COMMITMENT_V1_SCHEMA_VERSION, BucketDecisionContext, PageOccurrence,
+    activity_read_commitment_payload_v1,
 };
 use pe_service::config::ServiceConfig;
 use pe_service::orchestrator_control::OrchestratorControl;
@@ -52,10 +52,11 @@ pub struct ProducerShapedRead {
     pub decision_inputs_json: String,
     pub page: PageOccurrence,
     pub commitment_payload: Vec<u8>,
+    pub commitment_version: u16,
 }
 
 /// Parse a short offset-zero page with no lower bound. Receive time is independent of the end.
-pub fn producer_shaped_read(
+pub fn producer_shaped_read_v1(
     wallet: WalletAddress,
     payload: &[u8],
     fixed_end: i64,
@@ -104,7 +105,7 @@ pub fn producer_shaped_read(
         raw_hash,
         receipt: page_receipt,
     };
-    let commitment_payload = activity_read_commitment_payload(
+    let commitment_payload = activity_read_commitment_payload_v1(
         wallet,
         fixed_end,
         std::slice::from_ref(&page),
@@ -117,7 +118,31 @@ pub fn producer_shaped_read(
             .to_string(),
         page,
         commitment_payload,
+        commitment_version: 1,
     }
+}
+
+/// Current v2 read with an explicit empty binding list; pair with continuation five.
+pub fn producer_shaped_read_v2(
+    wallet: WalletAddress,
+    payload: &[u8],
+    fixed_end: i64,
+    received_unix: i64,
+    page_receipt: AppendReceipt,
+) -> ProducerShapedRead {
+    let mut read = producer_shaped_read_v1(wallet, payload, fixed_end, received_unix, page_receipt);
+    let proof: serde_json::Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
+    let pages =
+        serde_json::from_value::<Vec<ReconciliationPageEvidence>>(proof["pages"].clone()).unwrap();
+    read.commitment_payload = pe_service::bucket_commit::activity_read_commitment_payload(
+        wallet,
+        fixed_end,
+        std::slice::from_ref(&read.page),
+        &pages,
+    )
+    .unwrap();
+    read.commitment_version = 2;
+    read
 }
 
 /// Synthetic receipt for scenarios that exercise the engine without a source log.
@@ -129,7 +154,7 @@ pub fn scenario_receipt(sequence: u64) -> AppendReceipt {
 }
 
 /// Append a successor-generation page and its genuine commitment to a real source log.
-pub fn append_committed_read(
+pub fn append_committed_read_v1(
     writer: &mut Writer,
     wallet: WalletAddress,
     payload: &[u8],
@@ -148,11 +173,46 @@ pub fn append_committed_read(
             payload: payload.to_vec(),
         })
         .unwrap();
-    let read = producer_shaped_read(wallet, payload, fixed_end, received_unix, page_receipt);
+    let read = producer_shaped_read_v1(wallet, payload, fixed_end, received_unix, page_receipt);
     let commitment = writer
         .append_synced(EnvelopeIn {
             source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
-            schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+            schema_version: ACTIVITY_READ_COMMITMENT_V1_SCHEMA_VERSION,
+            parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+            observed_at: SourceTimestamp(received_at.0),
+            received_at: received_at.clone(),
+            content_type: ContentType::Json,
+            payload: read.commitment_payload.clone(),
+        })
+        .unwrap();
+    (read, commitment)
+}
+
+/// Append current page and commitment v2 receipts for a continuation-five fixture.
+pub fn append_committed_read_v2(
+    writer: &mut Writer,
+    wallet: WalletAddress,
+    payload: &[u8],
+    fixed_end: i64,
+    received_unix: i64,
+) -> (ProducerShapedRead, AppendReceipt) {
+    let received_at = ReceivedAt(time::OffsetDateTime::from_unix_timestamp(received_unix).unwrap());
+    let page_receipt = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_service::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(received_at.0),
+            received_at: received_at.clone(),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        })
+        .unwrap();
+    let read = producer_shaped_read_v2(wallet, payload, fixed_end, received_unix, page_receipt);
+    let commitment = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
+            schema_version: pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
             parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
             observed_at: SourceTimestamp(received_at.0),
             received_at: received_at.clone(),
@@ -255,7 +315,7 @@ pub async fn send_trade_bucket_with_config(
     applied_configuration: RuntimeConfig,
 ) {
     let body = activity_body(&trade);
-    let read = producer_shaped_read(
+    let read = producer_shaped_read_v1(
         trade.wallet,
         &body,
         trade.observed_at.unix_timestamp(),
@@ -305,7 +365,11 @@ pub fn read_context(
         applied_configuration: RuntimeConfig::from_service_config(&ServiceConfig::default()),
         decision_inputs_json: read.decision_inputs_json.clone(),
         page_occurrences: vec![read.page.clone()],
-        read_commitment: Some(commitment),
+        read_commitment: Some(if read.commitment_version == 2 {
+            pe_service::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(commitment)
+        } else {
+            pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(commitment)
+        }),
         observed_source_receipts: HashMap::new(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: SignalConfig::default(),

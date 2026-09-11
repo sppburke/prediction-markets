@@ -816,6 +816,7 @@ mod tests {
         applied_configuration: RuntimeConfig,
     ) -> DecisionContinuationFacts {
         DecisionContinuationFacts {
+            paper_freshness_policy: None,
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v2".to_owned(),
             transaction_hash: "0xtransaction".to_owned(),
@@ -1120,6 +1121,87 @@ mod tests {
             upgraded["financial_semantic_version"],
             json!(crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
         );
+    }
+
+    /// PASS: continuation generations four and five retain their exact fixture bytes while
+    /// replaying the unchanged origin/main terminal document and evidence version.
+    #[test]
+    fn continuation_four_and_five_byte_fixtures_replay_unchanged() {
+        use crate::bucket_commit::{
+            ActivityReadCommitmentReceipt, PageOccurrence, PaperFreshnessPolicy,
+        };
+        use pe_source_polymarket_public::{ActivityRequestBounds, ReconciliationPageEvidence};
+        for version in [4, 5] {
+            let mut row = origin_main_row(
+                SourceTradeId("g2:fill".to_owned()),
+                ORIGIN_MAIN_TERMINAL,
+                DecisionPendingState::Terminal,
+                Some("fill"),
+            );
+            let mut facts = legacy17_continuation(&row.source_trade_id);
+            facts.paper_freshness_policy = (version == 5).then_some(PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 2,
+            });
+            let receipt = AppendReceipt {
+                sequence: EventSeq(2),
+                this_hash: blake3::Hash::from_bytes([2; 32]),
+            };
+            let commitment = AppendReceipt {
+                sequence: EventSeq(3),
+                this_hash: blake3::Hash::from_bytes([3; 32]),
+            };
+            let page = PageOccurrence {
+                request_url: "https://data-api.polymarket.com/activity?fixture=byte-compatibility"
+                    .to_owned(),
+                raw_hash: blake3::hash(b"[]").to_hex().to_string(),
+                receipt,
+            };
+            let evidence = ReconciliationPageEvidence {
+                request_url: page.request_url.clone(),
+                bounds: Some(ActivityRequestBounds {
+                    start: None,
+                    end: 1_700_000_010,
+                }),
+                partition: None,
+                offset: 0,
+                row_count: 0,
+                canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(b"[]")
+                    .unwrap(),
+                raw_page_hash: page.raw_hash.clone(),
+                received_at: pe_core_types::ReceivedAt(
+                    time::OffsetDateTime::from_unix_timestamp(1_700_000_010).unwrap(),
+                ),
+                schema_version: 2,
+                parser_version: 2,
+            };
+            facts.decision_inputs = json!({"fixed_end":1700000010,"pages":[evidence]});
+            let continuation = DecisionContinuationV3::new(
+                facts,
+                None,
+                vec![page],
+                Some(if version == 5 {
+                    ActivityReadCommitmentReceipt::BindingsV2(commitment)
+                } else {
+                    ActivityReadCommitmentReceipt::LegacyV1(commitment)
+                }),
+            );
+            row.frozen_inputs_json = serde_json::to_string(&continuation).unwrap();
+            let expected = if version == 5 {
+                include_str!("../tests/fixtures/decision_continuation_v5.json")
+            } else {
+                include_str!("../tests/fixtures/decision_continuation_v4.json")
+            };
+            assert_eq!(row.frozen_inputs_json.as_bytes(), expected.as_bytes());
+            row.frozen_inputs_json = expected.to_owned();
+            let replayed = replay_decision_pending(&row).unwrap();
+            assert_eq!(replayed.continuation.version(), version);
+            assert_eq!(replayed.recorded_decision_json, ORIGIN_MAIN_TERMINAL);
+            assert_eq!(
+                serde_json::to_string(&replayed.continuation).unwrap(),
+                row.frozen_inputs_json
+            );
+        }
     }
 
     /// PASS: a current typed terminal that lost its financial semantic field is rejected as

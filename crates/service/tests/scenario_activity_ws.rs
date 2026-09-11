@@ -1498,7 +1498,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
     }]))
     .unwrap();
     let mut source_writer = Writer::open(&source_path).unwrap();
-    let (read, commitment_receipt) = support::append_committed_read(
+    let (read, commitment_receipt) = support::append_committed_read_v1(
         &mut source_writer,
         leader_wallet(),
         &activity,
@@ -1720,7 +1720,11 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
                     page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-                    read_commitment: Some(commitment_receipt),
+                    read_commitment: Some(
+                        pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(
+                            commitment_receipt,
+                        ),
+                    ),
 
                     signal_config: SignalConfig::default(),
                     copy_eligible: true,
@@ -1835,7 +1839,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
     }]))
     .unwrap();
     let mut source_writer = Writer::open(&source_path).unwrap();
-    let (read, commitment_receipt) = support::append_committed_read(
+    let (read, commitment_receipt) = support::append_committed_read_v1(
         &mut source_writer,
         leader_wallet(),
         &activity,
@@ -2050,7 +2054,11 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
                     page_occurrences: vec![occurrence],
                     observed_source_receipts: HashMap::new(),
                     reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-                    read_commitment: Some(commitment_receipt),
+                    read_commitment: Some(
+                        pe_service::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(
+                            commitment_receipt,
+                        ),
+                    ),
 
                     signal_config: SignalConfig::default(),
                     copy_eligible: true,
@@ -2359,7 +2367,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false,
     }]))
     .unwrap();
-    let read = support::producer_shaped_read(
+    let read = support::producer_shaped_read_v1(
         leader_wallet(),
         &body,
         source_epoch,

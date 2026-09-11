@@ -1051,7 +1051,9 @@ impl TradePoller {
             page_occurrences: page_occurrences.to_vec(),
             observed_source_receipts,
             reconstruction_quality,
-            read_commitment: Some(read_commitment),
+            read_commitment: Some(
+                crate::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(read_commitment),
+            ),
             signal_config: self.signal_config.clone(),
             copy_eligible,
             bracket_commit: false,

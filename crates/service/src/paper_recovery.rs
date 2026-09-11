@@ -1375,6 +1375,7 @@ mod paper_log_tests {
             "f602cee694f90f8e48cdd43e70d6d9398879a9991662492af82ec4f7df31b222"
         );
         let facts = DecisionContinuationFacts {
+            paper_freshness_policy: None,
             source_trade_id: SourceTradeId("g2:fill".to_owned()),
             semantic_revision: "semantic-v2".to_owned(),
             transaction_hash: "0xtransaction".to_owned(),

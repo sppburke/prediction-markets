@@ -2028,7 +2028,7 @@ impl PaperStateDb {
                 .chain(scope.observed_source_receipt)
                 .chain(scope.read_commitment)
                 .collect::<Vec<_>>();
-            let in_scope = matches!(scope.version, 3 | 4)
+            let in_scope = matches!(scope.version, 3..=5)
                 && !receipts.is_empty()
                 && receipts.iter().all(|receipt| {
                     sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
@@ -7426,12 +7426,12 @@ mod tests {
         let (_dir, db) = db();
         insert_seal_fixture(&db, "rev-1");
         let keys = vec![(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())];
-        for version in [3, 4] {
+        for version in [3, 4, 5] {
             let frozen = serde_json::json!({
                 "version": version,
                 "observed_source_receipt": append_receipt(1, 1),
                 "page_occurrences": [{"receipt": append_receipt(2, 2)}],
-                "read_commitment": if version == 4 { Some(append_receipt(3, 3)) } else { None },
+                "read_commitment": if matches!(version, 4 | 5) { Some(append_receipt(3, 3)) } else { None },
             });
             db.lock()
                 .execute(
@@ -7464,7 +7464,7 @@ mod tests {
                 db.seal_decision_evidence_for_source_prefix(&extra, &keys, Some(EventSeq(3))),
                 Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
             ));
-            if version == 4 {
+            if matches!(version, 4 | 5) {
                 assert!(
                     db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(2)))
                         .is_err()

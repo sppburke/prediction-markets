@@ -724,7 +724,7 @@ fn install_committed_open_read(paper: &Arc<PaperStateDb>, source_log: &Path) {
     }]))
     .unwrap();
     let mut writer = Writer::open(source_log).unwrap();
-    let (read, commitment) = support::append_committed_read(
+    let (read, commitment) = support::append_committed_read_v1(
         &mut writer,
         wallet,
         &payload,

@@ -90,6 +90,7 @@ fn materialize_selection_source(
     let mut writer = Writer::open(path).unwrap();
     let empty = TailBinding::from(&Scanner::verify(path).unwrap());
     let mut boundaries = BTreeMap::new();
+    let mut remapped = BTreeMap::<u64, (AppendReceipt, AppendReceipt)>::new();
     for (logical_sequence, mut observation) in observations {
         if observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
             && let Some(continuation) = continuations
@@ -103,13 +104,43 @@ fn materialize_selection_source(
                 continuation.facts.decision_inputs["pages"].clone(),
             )
             .unwrap();
-            observation.payload = crate::bucket_commit::activity_read_commitment_payload(
-                continuation.facts.wallet,
-                fixed_end,
-                continuation.page_occurrences(),
-                &pages,
-            )
-            .unwrap();
+            observation.payload = if continuation.version() == 5 {
+                let mut commitment: crate::bucket_commit::ActivityReadCommitment =
+                    serde_json::from_slice(&observation.payload).unwrap();
+                let bindings = commitment.bindings.as_mut().unwrap();
+                for binding in bindings.iter_mut() {
+                    if let Some((old, actual)) = remapped.get(&binding.stream_receipt.sequence.0)
+                        && *old == binding.stream_receipt
+                    {
+                        binding.stream_receipt = *actual;
+                    }
+                    if let Some(receipt) = binding.identity_receipt
+                        && let Some((old, actual)) = remapped.get(&receipt.sequence.0)
+                        && *old == receipt
+                    {
+                        binding.identity_receipt = Some(*actual);
+                        if let Some(provenance) = &mut binding.identity_provenance {
+                            provenance.source_log_sequence = actual.sequence.0;
+                        }
+                    }
+                }
+                crate::bucket_commit::activity_read_commitment_payload_v2(
+                    continuation.facts.wallet,
+                    fixed_end,
+                    continuation.page_occurrences(),
+                    &pages,
+                    bindings,
+                )
+                .unwrap()
+            } else {
+                crate::bucket_commit::activity_read_commitment_payload_v1(
+                    continuation.facts.wallet,
+                    fixed_end,
+                    continuation.page_occurrences(),
+                    &pages,
+                )
+                .unwrap()
+            };
         }
         let old_receipt = observation.receipt;
         let actual_receipt = writer
@@ -123,6 +154,7 @@ fn materialize_selection_source(
                 payload: observation.payload,
             })
             .unwrap();
+        remapped.insert(old_receipt.sequence.0, (old_receipt, actual_receipt));
         for continuation in continuations.iter_mut() {
             for page in &mut continuation.page_occurrences {
                 if page.receipt == old_receipt {

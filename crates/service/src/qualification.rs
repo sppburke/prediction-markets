@@ -593,23 +593,50 @@ fn decision_observation_from_source(
         }
     }
     if let Some(websocket_receipt) = continuation.observed_source_receipt {
-        let observation = decision_source_receipt(source, websocket_receipt)?;
-        let activity = parse_activity_trade_observation(&observation.payload).map_err(|_| {
+        if continuation.version() != 5 {
+            let observation = decision_source_receipt(source, websocket_receipt)?;
+            let activity = parse_activity_trade_observation(&observation.payload).map_err(|_| {
             QualificationError::InsufficientEvidence(format!(
                 "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
                 websocket_receipt.sequence.0
             ))
         })?;
-        if observation.source_id != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
-            || observation.schema_version != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
-            || observation.parser_version != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
-            || activity.wallet != continuation.facts.wallet
-            || activity.group_id.key() != &continuation.facts.source_trade_id
-        {
-            return insufficient(format!(
-                "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
-                websocket_receipt.sequence.0
-            ));
+            if observation.source_id != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+                || observation.schema_version
+                    != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+                || observation.parser_version
+                    != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+                || activity.wallet != continuation.facts.wallet
+                || activity.group_id.key() != &continuation.facts.source_trade_id
+            {
+                return insufficient(format!(
+                    "decision source receipt replay failed: source receipt sequence {} does not match its frozen evidence",
+                    websocket_receipt.sequence.0
+                ));
+            }
+        } else {
+            continuation
+                .verify_stream_binding(
+                    &continuation.facts.source_trade_id,
+                    websocket_receipt,
+                    &mut |receipt| {
+                        let observation = decision_source_receipt(source, receipt)?;
+                        Ok::<_, QualificationError>(CompleteActivityPage {
+                            payload: observation.payload.clone(),
+                            observed_at: observation.observed_at.clone(),
+                            received_at: observation.received_at.clone(),
+                            source_id: observation.source_id.clone(),
+                            schema_version: observation.schema_version,
+                            parser_version: observation.parser_version,
+                            content_type: observation.content_type.clone(),
+                        })
+                    },
+                )
+                .map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "decision source receipt replay failed: {error}"
+                    ))
+                })?;
         }
     }
     let selected = decision_source_receipt(source, selected_receipt)?;
@@ -1993,7 +2020,7 @@ fn decision_rows_from_sealed_source(
         return Ok(SelectedDecisionRows::default());
     };
     let history = state.decision_pending_history()?;
-    let source_universe = source_universe?;
+    let mut source_universe = source_universe?;
     let terminal_rows = history
         .iter()
         .filter(|row| row.state == DecisionPendingState::Terminal)
@@ -2004,6 +2031,50 @@ fn decision_rows_from_sealed_source(
             )
         })
         .collect::<HashMap<_, _>>();
+    // V5 stream aliases are evidence in the authenticated complete read. Map their earliest
+    // receipts to the durable history identity before requiring group dispositions.
+    let current_reads = if history.iter().any(|row| {
+        DecisionContinuationV3::from_durable(row)
+            .is_ok_and(|continuation| continuation.version() == 5)
+    }) {
+        let reads = complete_activity_read_scopes(&history, sealed_sequence, source)?;
+        let mut targets = HashMap::new();
+        for read in &reads {
+            if read.continuation.version() != 5 {
+                continue;
+            }
+            let receipt = read.continuation.read_commitment.ok_or_else(|| {
+                QualificationError::InsufficientEvidence("binding commitment missing".to_owned())
+            })?;
+            let observation = source.observation(receipt)?;
+            let commitment: crate::bucket_commit::ActivityReadCommitment =
+                serde_json::from_slice(&observation.payload)?;
+            for binding in commitment.bindings.into_iter().flatten() {
+                if targets
+                    .insert(
+                        binding.stream_group_id.clone(),
+                        binding.history_group_id.clone(),
+                    )
+                    .is_some_and(|previous| previous != binding.history_group_id)
+                {
+                    return insufficient(
+                        "complete reads disagree about an observation binding target",
+                    );
+                }
+                if binding.stream_group_id != binding.history_group_id
+                    && let Some(sequence) = source_universe.remove(&binding.stream_group_id)
+                {
+                    source_universe
+                        .entry(binding.history_group_id)
+                        .and_modify(|first| *first = (*first).min(sequence))
+                        .or_insert(sequence);
+                }
+            }
+        }
+        Some(reads)
+    } else {
+        None
+    };
     let mut pending_groups = Vec::new();
     for (source_trade_id, first_sequence) in &source_universe {
         if start_sequence.is_some_and(|start| *first_sequence <= start.0) {
@@ -2021,7 +2092,7 @@ fn decision_rows_from_sealed_source(
                 terminal_rows.get(&(source_trade_id.clone(), group.semantic_revision.clone()));
             let receipt_bearing = row
                 .and_then(|row| DecisionContinuationV3::from_durable(row).ok())
-                .is_some_and(|continuation| matches!(continuation.version(), 3 | 4));
+                .is_some_and(|continuation| matches!(continuation.version(), 3..=5));
             if !receipt_bearing {
                 return insufficient(format!(
                     "source-log trade {source_trade_id} has no reconstructable receipt-bearing decision"
@@ -2030,7 +2101,10 @@ fn decision_rows_from_sealed_source(
             pending_groups.push((source_trade_id, group.semantic_revision));
         }
     }
-    let complete_reads = complete_activity_read_scopes(&history, sealed_sequence, source)?;
+    let complete_reads = match current_reads {
+        Some(reads) => reads,
+        None => complete_activity_read_scopes(&history, sealed_sequence, source)?,
+    };
     for (source_trade_id, revision) in pending_groups {
         if !complete_reads.iter().any(|read| {
             read.decisions.contains_key(source_trade_id)
@@ -2365,25 +2439,46 @@ fn decision_keys_from_source_observations(
             let Some(receipt) = *receipt else {
                 continue;
             };
-            let observation = source.observation(receipt)?;
-            let activity =
-                parse_activity_trade_observation(&observation.payload).map_err(|_| {
-                    QualificationError::InsufficientEvidence(format!(
-                        "decision websocket observation {} is invalid",
-                        receipt.sequence.0
-                    ))
-                })?;
-            if observation.source_id != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
-                || observation.schema_version
-                    != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
-                || observation.parser_version
-                    != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
-                || activity.wallet != read.continuation.facts.wallet
-                || activity.group_id.key() != source_trade_id
-            {
-                return insufficient(
-                    "decision websocket observation has the wrong source contract",
-                );
+            if read.continuation.version() != 5 {
+                let observation = source.observation(receipt)?;
+                let activity =
+                    parse_activity_trade_observation(&observation.payload).map_err(|_| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "decision websocket observation {} is invalid",
+                            receipt.sequence.0
+                        ))
+                    })?;
+                if observation.source_id != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+                    || observation.schema_version
+                        != pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+                    || observation.parser_version
+                        != pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+                    || activity.wallet != read.continuation.facts.wallet
+                    || activity.group_id.key() != source_trade_id
+                {
+                    return insufficient(
+                        "decision websocket observation has the wrong source contract",
+                    );
+                }
+            } else {
+                read.continuation
+                    .verify_stream_binding(source_trade_id, receipt, &mut |receipt| {
+                        let observation = source.observation(receipt)?;
+                        Ok::<_, QualificationError>(CompleteActivityPage {
+                            payload: observation.payload,
+                            observed_at: observation.observed_at,
+                            received_at: observation.received_at,
+                            source_id: observation.source_id,
+                            schema_version: observation.schema_version,
+                            parser_version: observation.parser_version,
+                            content_type: observation.content_type,
+                        })
+                    })
+                    .map_err(|error| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "decision websocket observation has the wrong source contract: {error}"
+                        ))
+                    })?;
             }
             first_observations
                 .entry(source_trade_id.clone())
@@ -3272,7 +3367,12 @@ fn verify_complete_second_action(
     expected: &[AppliedEffect],
 ) -> Result<(), QualificationError> {
     let frozen = &continuation.facts;
-    let verdict = classify_complete_second(
+    let classify = if continuation.version() == 5 {
+        classify_complete_second
+    } else {
+        pe_position_ledger::classify_complete_second_legacy
+    };
+    let verdict = classify(
         ledger,
         frozen.wallet,
         mutations,
@@ -5994,6 +6094,7 @@ mod tests {
             crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
         let continuation = DecisionContinuationV3::new(
             crate::bucket_commit::DecisionContinuationFacts {
+                paper_freshness_policy: None,
                 source_trade_id: source_trade_id.clone(),
                 semantic_revision: "semantic-v3".to_owned(),
                 transaction_hash: "0xclassification".to_owned(),
@@ -7228,6 +7329,76 @@ mod tests {
             .unwrap();
 
         verify_complete_second_action(&ledger, &continuation, &[mutation], &expected).unwrap();
+    }
+
+    /// PASS: the independent first entry verifies only under generation five's repaired proof;
+    /// the authentic legacy read retains the larger-component refusal.
+    #[test]
+    fn complete_second_replay_dispatches_by_continuation_generation() {
+        let mut rows = (0..5)
+            .map(|index| {
+                activity_row(
+                    "market-a",
+                    "asset-a",
+                    "1",
+                    "0.5",
+                    &format!("tx-{index}"),
+                    100,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.push(activity_row(
+            "market-b", "asset-b", "1", "0.5", "entry-b", 100,
+        ));
+        let payload = activity_payload(rows);
+        let aggregates = parsed_aggregates(&[&payload]);
+        let target = aggregates
+            .iter()
+            .find(|aggregate| aggregate.group_id.components().transaction_hash == "entry-b")
+            .unwrap();
+        let observation = activity_observation(2, &payload);
+        let (page, evidence) = activity_page_pair(&observation, &payload, None, 100, 0);
+        let (template, _) = single_read_fixture(2, "market-b", "BUY", false);
+        let mut frozen = template.facts;
+        frozen.source_trade_id = target.group_id.key().clone();
+        frozen.semantic_revision = target.semantic_revision.as_str().to_owned();
+        frozen.transaction_hash = "entry-b".to_owned();
+        frozen.decision_inputs = serde_json::json!({"fixed_end":100,"pages":[evidence]});
+        let original = DecisionContinuationV3::new(frozen, None, vec![page], None);
+        let mutations = aggregates
+            .iter()
+            .map(|aggregate| LedgerMutation::from_activity(aggregate).unwrap())
+            .collect::<Vec<_>>();
+        let ledger = PositionLedger::new();
+        let (_, expected) = ledger.simulate_all_or_none(&mutations).unwrap();
+        for version in [4, 5] {
+            let mut continuation = original.clone();
+            let mut observations = BTreeMap::from([(2, observation.clone())]);
+            if version == 5 {
+                commit_read_fixture_v2(&mut continuation, &mut observations);
+            } else {
+                commit_read_fixture(&mut continuation, &mut observations);
+            }
+            continuation
+                .reconstruct_complete_activity_read(&mut |receipt| {
+                    let source = decision_source_receipt(&observations, receipt)?;
+                    Ok::<_, QualificationError>(CompleteActivityPage {
+                        payload: source.payload.clone(),
+                        observed_at: source.observed_at.clone(),
+                        received_at: source.received_at.clone(),
+                        source_id: source.source_id.clone(),
+                        schema_version: source.schema_version,
+                        parser_version: source.parser_version,
+                        content_type: source.content_type.clone(),
+                    })
+                })
+                .unwrap();
+            assert_eq!(
+                verify_complete_second_action(&ledger, &continuation, &mutations, &expected)
+                    .is_ok(),
+                version == 5
+            );
+        }
     }
 
     /// PASS: a continuation that records Entry is insufficient evidence when the causal ledger
@@ -9919,6 +10090,7 @@ mod tests {
             parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
         };
         let continuation = crate::bucket_commit::DecisionContinuationFacts {
+            paper_freshness_policy: None,
             source_trade_id: source_trade_id.clone(),
             semantic_revision: "semantic-v3".to_owned(),
             transaction_hash: "0xpost-seal".to_owned(),
@@ -10709,6 +10881,45 @@ mod tests {
             continuation.facts.decision_inputs["pages"].clone(),
         )
         .unwrap();
+        let payload = crate::bucket_commit::activity_read_commitment_payload_v1(
+            continuation.facts.wallet,
+            fixed_end,
+            continuation.page_occurrences(),
+            &pages,
+        )
+        .unwrap();
+        let sequence = continuation.complete_bound().unwrap().sequence.0 + 1;
+        let mut commitment = activity_observation(sequence, &payload);
+        commitment.source_id = crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned();
+        commitment.schema_version =
+            crate::bucket_commit::ACTIVITY_READ_COMMITMENT_V1_SCHEMA_VERSION;
+        commitment.parser_version = crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION;
+        for page in continuation.page_occurrences() {
+            observations
+                .get_mut(&page.receipt.sequence.0)
+                .unwrap()
+                .schema_version = crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION;
+        }
+        *continuation = DecisionContinuationV3::new(
+            continuation.facts.clone(),
+            continuation.observed_source_receipt,
+            continuation.page_occurrences.clone(),
+            Some(crate::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1(commitment.receipt)),
+        );
+        observations.insert(sequence, commitment);
+    }
+
+    fn commit_read_fixture_v2(
+        continuation: &mut DecisionContinuationV3,
+        observations: &mut BTreeMap<u64, SourceObservation>,
+    ) {
+        let fixed_end = continuation.facts.decision_inputs["fixed_end"]
+            .as_i64()
+            .unwrap();
+        let pages = serde_json::from_value::<Vec<ReconciliationPageEvidence>>(
+            continuation.facts.decision_inputs["pages"].clone(),
+        )
+        .unwrap();
         let payload = crate::bucket_commit::activity_read_commitment_payload(
             continuation.facts.wallet,
             fixed_end,
@@ -10727,11 +10938,18 @@ mod tests {
                 .unwrap()
                 .schema_version = crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION;
         }
+        continuation.facts.paper_freshness_policy =
+            Some(crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+            });
         *continuation = DecisionContinuationV3::new(
             continuation.facts.clone(),
             continuation.observed_source_receipt,
             continuation.page_occurrences.clone(),
-            Some(commitment.receipt),
+            Some(
+                crate::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(commitment.receipt),
+            ),
         );
         observations.insert(sequence, commitment);
     }
@@ -11162,10 +11380,14 @@ mod tests {
     /// FAIL: service membership disagrees with atomic sealing or erased receipts establish a pre-Start exclusion.
     #[test]
     fn service_and_transactional_sealer_agree_across_read_generations() {
-        for committed in [false, true] {
+        for generation in [3, 4, 5] {
+            let committed = generation >= 4;
             for pre_start_ws in [false, true] {
                 let (mut continuation, mut observations) =
                     single_read_fixture(2, "0xfirst", "BUY", committed);
+                if generation == 5 {
+                    commit_read_fixture_v2(&mut continuation, &mut observations);
+                }
                 if pre_start_ws {
                     let payload = serde_json::to_vec(&serde_json::json!({"topic":"activity","type":"trades","payload": {
                         "proxyWallet": continuation.facts.wallet.to_string(), "conditionId":"0xfirst", "asset":"0xfirst",
@@ -11213,6 +11435,10 @@ mod tests {
                         let mut erased = serde_json::to_value(&continuation).unwrap();
                         erased["version"] = serde_json::json!(version);
                         erased.as_object_mut().unwrap().remove("read_commitment");
+                        erased
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("paper_freshness_policy");
                         if version == 2 {
                             let legacy = crate::bucket_commit::synthetic_legacy17_runtime_config();
                             erased["applied_configuration_hash"] =
@@ -11267,7 +11493,8 @@ mod tests {
                 }
             }
         }
-        for committed in [false, true] {
+        for generation in [3, 4, 5] {
+            let committed = generation >= 4;
             let (mut continuation, mut observations) =
                 single_read_fixture(2, "0xstraddling", "BUY", false);
             let first_payload = full_page_with_target(
@@ -11291,7 +11518,11 @@ mod tests {
                 serde_json::to_value(producer_page_evidence(&pages)).unwrap();
             observations.insert(1, first);
             if committed {
-                commit_read_fixture(&mut continuation, &mut observations);
+                if generation == 5 {
+                    commit_read_fixture_v2(&mut continuation, &mut observations);
+                } else {
+                    commit_read_fixture(&mut continuation, &mut observations);
+                }
             }
             let temp = tempfile::tempdir().unwrap();
             let state = PaperStateDb::open(&temp.path().join("straddling.db")).unwrap();
@@ -11350,6 +11581,58 @@ mod tests {
             .seal_decision_evidence_for_source_prefix(
                 &selected.in_prefix,
                 &selected.in_prefix,
+                Some(EventSeq(3)),
+            )
+            .unwrap();
+    }
+
+    /// PASS: the source verifier refuses different generations claiming one read; the sealer
+    /// still classifies both receipt-bearing rows and refuses an omitted row.
+    #[test]
+    fn shared_read_generation_disagreement_cannot_hide_a_row() {
+        let (mut first, mut observations) = single_read_fixture(2, "first", "BUY", false);
+        commit_read_fixture_v2(&mut first, &mut observations);
+        let mut facts = first.facts.clone();
+        facts.source_trade_id = SourceTradeId(format!("g2:{}", "b".repeat(64)));
+        facts.paper_freshness_policy = None;
+        let second = DecisionContinuationV3::new(
+            facts,
+            None,
+            first.page_occurrences.clone(),
+            first
+                .read_commitment
+                .map(crate::bucket_commit::ActivityReadCommitmentReceipt::LegacyV1),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let state = PaperStateDb::open(&temp.path().join("shared.db")).unwrap();
+        store_read_decision(&state, &first, "decision_pending", true);
+        store_read_decision(&state, &second, "decision_pending", true);
+        let rows = state.decision_pending_history().unwrap();
+        assert!(
+            complete_activity_read_scopes(&rows, EventSeq(3), SealedSource::Map(&observations))
+                .is_err()
+        );
+        let first_key = (
+            first.facts.source_trade_id.clone(),
+            first.facts.semantic_revision.clone(),
+        );
+        let second_key = (
+            second.facts.source_trade_id.clone(),
+            second.facts.semantic_revision.clone(),
+        );
+        assert!(
+            state
+                .seal_decision_evidence_for_source_prefix(
+                    &[],
+                    std::slice::from_ref(&first_key),
+                    Some(EventSeq(3))
+                )
+                .is_err()
+        );
+        state
+            .seal_decision_evidence_for_source_prefix(
+                &[],
+                &[first_key, second_key],
                 Some(EventSeq(3)),
             )
             .unwrap();
@@ -11451,54 +11734,89 @@ mod tests {
         }
     }
 
-    /// PASS: selection refuses missing/wrong/out-of-prefix commitments and V4-to-V3 downgrade over successor pages.
+    /// PASS: authentic 4/v1 and 5/v2 selection succeeds; missing, wrong, out-of-prefix,
+    /// downgraded, and cross-paired commitments fail over successor pages.
     /// FAIL: erased or substituted commitment evidence enters a sealed selection.
     #[test]
     fn read_commitment_missing_wrong_out_of_prefix_or_downgraded_fails() {
-        let (continuation, observations) = single_read_fixture(2, "0xtarget", "BUY", true);
-        for mutation in 0..5 {
-            let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("state.db");
-            let state = PaperStateDb::open(&path).unwrap();
-            store_read_decision(&state, &continuation, "decision_pending", true);
-            let mut changed = serde_json::to_value(&continuation).unwrap();
-            let mut source = observations.clone();
-            match mutation {
-                0 => {
-                    changed.as_object_mut().unwrap().remove("read_commitment");
-                }
-                1 => {
-                    changed["read_commitment"]["this_hash"] =
-                        serde_json::json!(blake3::hash(b"wrong").to_hex().to_string());
-                }
-                2 => {}
-                3 => {
-                    changed["version"] = serde_json::json!(3);
-                    changed.as_object_mut().unwrap().remove("read_commitment");
-                }
-                _ => {
-                    source.get_mut(&3).unwrap().source_id =
-                        crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned();
-                }
+        for version in [4, 5] {
+            let (mut continuation, mut observations) =
+                single_read_fixture(2, "0xtarget", "BUY", true);
+            if version == 5 {
+                commit_read_fixture_v2(&mut continuation, &mut observations);
             }
-            rusqlite::Connection::open(&path)
-                .unwrap()
-                .execute(
-                    "UPDATE decision_pending SET frozen_inputs_json = ?1",
-                    [changed.to_string()],
-                )
-                .unwrap();
-            let sealed = prefix_at(Some(if mutation == 2 { 2 } else { 3 }));
-            assert!(
-                decision_rows_from_source_observations(
-                    &state,
-                    &prefix_at(Some(1)),
-                    &sealed,
-                    &source
-                )
-                .is_err(),
-                "mutation {mutation}"
-            );
+            for mutation in 0..6 {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("state.db");
+                let state = PaperStateDb::open(&path).unwrap();
+                store_read_decision(&state, &continuation, "decision_pending", true);
+                assert!(
+                    decision_rows_from_source_observations(
+                        &state,
+                        &prefix_at(Some(1)),
+                        &prefix_at(Some(3)),
+                        &observations,
+                    )
+                    .is_ok(),
+                    "authentic generation {version}",
+                );
+                let mut changed = serde_json::to_value(&continuation).unwrap();
+                let mut source = observations.clone();
+                match mutation {
+                    0 => {
+                        changed.as_object_mut().unwrap().remove("read_commitment");
+                    }
+                    1 => {
+                        changed["read_commitment"]["this_hash"] =
+                            serde_json::json!(blake3::hash(b"wrong").to_hex().to_string());
+                    }
+                    2 => {}
+                    3 => {
+                        changed["version"] = serde_json::json!(3);
+                        changed.as_object_mut().unwrap().remove("read_commitment");
+                        changed
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("paper_freshness_policy");
+                    }
+                    4 => {
+                        source.get_mut(&3).unwrap().source_id =
+                            crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned();
+                    }
+                    _ => {
+                        changed["version"] = serde_json::json!(if version == 5 { 4 } else { 5 });
+                        if version == 5 {
+                            changed
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("paper_freshness_policy");
+                        } else {
+                            changed["paper_freshness_policy"] = serde_json::json!({
+                                "activity_ws_enabled": false,
+                                "copy_latency_budget_secs": 2,
+                            });
+                        }
+                    }
+                }
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                        [changed.to_string()],
+                    )
+                    .unwrap();
+                let sealed = prefix_at(Some(if mutation == 2 { 2 } else { 3 }));
+                assert!(
+                    decision_rows_from_source_observations(
+                        &state,
+                        &prefix_at(Some(1)),
+                        &sealed,
+                        &source
+                    )
+                    .is_err(),
+                    "generation {version}, mutation {mutation}",
+                );
+            }
         }
     }
     /// PASS: source verification loads the recorded A/0-to-B/1 correction and accepts B/1;

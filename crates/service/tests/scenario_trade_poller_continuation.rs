@@ -404,7 +404,15 @@ async fn recorded_poll(
         }) = control_rx.recv().await
         {
             let result = engine
-                .commit(aggregates.clone(), &context, zero_basis())
+                .commit_with_freshness_policy(
+                    aggregates.clone(),
+                    &context,
+                    zero_basis(),
+                    Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                        activity_ws_enabled: false,
+                        copy_latency_budget_secs: 2,
+                    }),
+                )
                 .unwrap();
             commits.push((aggregates, Arc::clone(&context), result.clone()));
             let _ = committed.send(Ok(result));
@@ -568,11 +576,14 @@ async fn poller_multipage_commitment_survives_restart() {
     let rows = paper.open_decision_pending().unwrap();
     assert_eq!(rows.len(), 1);
     let continuation = DecisionContinuationV3::from_durable(&rows[0]).unwrap();
-    assert_eq!(continuation.version(), 4);
+    assert_eq!(continuation.version(), 5);
     assert_eq!(continuation.read_commitment, Some(commitment));
     assert_eq!(continuation.page_occurrences.len(), pages.len());
     for (_, context, _) in &commits {
-        assert_eq!(context.read_commitment, Some(commitment));
+        assert_eq!(
+            context.read_commitment,
+            Some(pe_service::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(commitment))
+        );
     }
     let groups_before = paper.activity_groups_after(&wallet(), 0).unwrap();
     let positions_before = paper.leader_positions().unwrap();
