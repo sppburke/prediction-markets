@@ -377,9 +377,11 @@ snapshot, and no credit loss, unexpected fence/error, or successful database wri
 the handled-shutdown final status is the authoritative last observation and must also report zero.
 The quiescence rule owns no timeout of its own: the deadline is the production unit's configured
 stop timeout, an owner-managed setting the rehearsal reads and the driver rechecks. The binary's
-cooperative stop (issue #599) cancels an in-flight poll round at its next await; the orchestrator
-drain begins after the producers join and main's persistent control senders drop, and completes once
-queued controls and any in-flight fanout send are released. Its backstops (`SHUTDOWN_DEADLINE`, the
+cooperative stop (issue #599) stops poller admission and cancels every started reconciliation
+operation at its next await (accepted durable effects stand; an undisposed obligation is rebuilt
+from the source log at the next boot); the orchestrator drain begins after the producers join and
+main's persistent control senders drop, and completes once queued controls and any in-flight fanout
+send are released. Its backstops (`SHUTDOWN_DEADLINE`, the
 bounded abort joins, the final-status pass) are not a single bound and can exceed a short unit
 timeout only when an owner fails to stop cooperatively, in which case the unit's kill is the last
 resort (issue #600).
