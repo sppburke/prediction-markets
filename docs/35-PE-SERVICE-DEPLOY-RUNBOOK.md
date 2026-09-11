@@ -639,11 +639,14 @@ before the first synchronized schema-3 reconciliation page. After that boundary,
 and use a binary retaining schema-3 page and V4 continuation compatibility plus any later durable
 contracts below; never delete records or rewrite rows to make an older reader accept them.
 
-**#588 compatibility boundary.** Before the first durable continuation-5 write and before the
-first `history_only_bracket` disposition write, rollback still requires a reader compatible with
-the existing financial era and schemas described here and in [Rollback](#rollback). Either write requires
-a reader retaining the new versions and disposition; recovery then follows the roll-forward
-route. The disposition can cross this boundary before any continuation-5 write. Preserve all old
+**#588 compatibility boundary.** Before the first durable payload-2 read commitment (envelope
+schema 2, appended by the poller before any bucket application), the first durable continuation-5
+write and the first `history_only_bracket` disposition write, rollback still requires a reader
+compatible with the existing financial era and schemas described here and in [Rollback](#rollback).
+The earliest of those three writes requires a reader retaining the new versions and disposition;
+recovery then follows the roll-forward route. A commitment or the disposition can cross this
+boundary before any continuation-5 write (a corrected observation's commitment is durable even when
+its read ends in a stale or no-copy disposition, and boot authenticates it). Preserve all old
 source records, recorded effects, fences, financial records, and publication artifacts. See the
 [canonical continuation and commitment contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
@@ -1009,10 +1012,11 @@ boot inputs of the generation. The durable `target_revision` in
 revision or a reviewed descendant that retains the decoder and every later durable contract below.
 A post-#565 artifact without the decoder fails boot with `verify terminal pending …: missing field era`.
 
-**#588 compatibility prerequisite:** before the first durable continuation-5 write and before
-the first `history_only_bracket` disposition write, the financial/schema reader prerequisites
-above still apply. After either write, use a reader retaining the new versions and disposition
-and roll forward; an older reader lacking either contract is no longer a rollback target.
+**#588 compatibility prerequisite:** before the first durable payload-2 read commitment, the
+first durable continuation-5 write and the first `history_only_bracket` disposition write, the
+financial/schema reader prerequisites above still apply. After the earliest of those writes, use a
+reader retaining the new versions and disposition and roll forward; an older reader lacking any of
+the three contracts is no longer a rollback target.
 Preserve all old source records, recorded effects, fences, financial records, and publication
 artifacts. Continuation 5 and terminal-evidence version 5 are distinct contracts; use the
 [glossary compatibility table](_GLOSSARY.md#continuation-and-commitment-compatibility-588).

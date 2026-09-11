@@ -447,6 +447,11 @@ from effective membership/projection and cannot copy; there is no delete owner f
 | 4 | Activity-page schema 3 / parser 2 | Envelope schema 1 / parser 1 / payload 1 / domain `prediction-edge/activity-read-commitment/v1` | Legacy complete-second proof. |
 | 5 | Activity-page schema 3 / parser 2 | Envelope schema 2 / parser 1 / payload 2 / domain `prediction-edge/activity-read-commitment/v2`, with observation bindings | Frozen `PaperFreshnessPolicy`, repaired complete-second proof, and precise final paper Prepared freshness clock. |
 
+The first durable payload-2 commitment is itself a compatibility-boundary write: the poller
+appends it before bucket application and boot authenticates it, so a reader without the v2
+contract is no longer a rollback target after that write even when no continuation-5 decision
+followed (see the deploy runbook's #588 compatibility boundary).
+
 “Continuation 5” names the wire generation decoded by `DecisionContinuationV3`, distinct from
 `decision_replay::TERMINAL_EVIDENCE_VERSION = 5`. Historical continuations keep their authentic
 decoding and `classify_complete_second_legacy` proof; continuation 5 uses
