@@ -18,7 +18,7 @@ use tracing::info;
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
 use crate::paper_recovery::{MembershipReason, SealedMembershipEvidence};
-use crate::runtime_config::AppliedWatchlistCapacity;
+use crate::runtime_config::{AppliedWatchlistCapacity, MAX_ACTIVE_WATCHLIST_SIZE};
 use crate::supabase_reader::{self, SupabaseError};
 use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use crate::watchlist_maintenance::{
@@ -97,9 +97,18 @@ impl SupabaseWatchlistCapacity {
             &self.supabase_url,
             &self.supabase_anon_key,
             &self.supabase_secret_key,
-            target,
+            MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await?;
+        let fenced = self
+            .paper_state
+            .wallet_fences()
+            .map_err(MembershipApplyError::from)?
+            .into_iter()
+            .map(|record| record.wallet)
+            .collect();
+        let (incoming, incoming_last_trade) =
+            supabase_reader::select_membership(incoming, incoming_last_trade, &fenced, target);
         if incoming.entries.is_empty() {
             return Err(CapacityError::EmptyRanking { target });
         }
@@ -209,6 +218,7 @@ mod tests {
         let installs: Vec<pe_paper_state::AnchorInstallRecord> = wallets
             .iter()
             .map(|wallet| pe_paper_state::AnchorInstallRecord {
+                history_status: None,
                 wallet: *wallet,
                 balances: Vec::new(),
                 activity_cutoff_unix: cursor,
@@ -555,8 +565,12 @@ mod tests {
     async fn production_transition_prepares_and_acks_before_membership_publication() {
         let existing = WalletAddress([1; 20]);
         let newcomer = WalletAddress([2; 20]);
+        let fenced = WalletAddress([3; 20]);
         let newcomer_last_trade = 1_700_000_123_i64;
-        let ranking = Arc::new(vec![
+        let ranking = Arc::new(std::sync::Mutex::new(vec![
+            serde_json::json!({
+                "wallet_hex": fenced.to_string(), "hit_rate": "0.70", "ls_tstat": "3.0", "n_trades": 10,
+            }),
             serde_json::json!({
                 "wallet_hex": existing.to_string(),
                 "hit_rate": "0.60",
@@ -571,15 +585,35 @@ mod tests {
                 "n_trades": 8,
                 "last_trade_unix": newcomer_last_trade
             }),
-        ]);
+        ]));
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = Router::new()
             .route(
                 "/rest/v1/latest_ranking",
                 get({
                     let ranking = Arc::clone(&ranking);
-                    move || {
+                    let fetches = fetches.clone();
+                    move |axum::extract::Query(query): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| {
                         let ranking = Arc::clone(&ranking);
-                        async move { Json(ranking.as_ref().clone()) }
+                        let fetches = fetches.clone();
+                        async move {
+                            assert_eq!(query["limit"], MAX_ACTIVE_WATCHLIST_SIZE.to_string());
+                            assert_eq!(query["survives"], "is.true");
+                            assert!(!query.contains_key("batch_id"));
+                            fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let limit = query["limit"].parse::<usize>().unwrap();
+                            Json(
+                                ranking
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .take(limit)
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            )
+                        }
                     }
                 }),
             )
@@ -613,6 +647,8 @@ mod tests {
                 updated_at_unix: 1,
             })
             .unwrap();
+        let conn = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
+        conn.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [fenced.to_string()]).unwrap();
         let writer_lock = Arc::new(Mutex::new(()));
         let applied = AppliedWatchlistCapacity::new(1);
         let (requests, desired_rx) = capacity_request_channel(1, Arc::clone(&writer_lock));
@@ -712,11 +748,21 @@ mod tests {
             Some(newcomer_last_trade)
         );
 
+        // A newer moving batch arrives while this selected vector waits for installation.
+        ranking.lock().unwrap().clear();
         release_ack.notify_one();
         assert_eq!(apply.await.unwrap().unwrap(), 2);
         control.await.unwrap();
         assert_eq!(live.snapshot().entries.len(), 2);
         assert_eq!(applied.load(), request);
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !live
+                .snapshot()
+                .entries
+                .iter()
+                .any(|entry| entry.wallet == fenced)
+        );
         assert_eq!(
             paper_state.cursor(&newcomer).unwrap(),
             Some(newcomer_last_trade)
@@ -763,6 +809,66 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         source_log.task.abort();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn empty_selection_preserves_each_consumer_failure_contract() {
+        let (existing, fenced) = (WalletAddress([41; 20]), WalletAddress([42; 20]));
+        let app = Router::new().route("/rest/v1/latest_ranking", get(move || async move {
+            Json(vec![serde_json::json!({
+                "wallet_hex": fenced.to_string(), "hit_rate": "0.6", "ls_tstat": "2", "n_trades": 10,
+            })])
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = TempDir::new().unwrap();
+        let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let conn = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
+        conn.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [fenced.to_string()]).unwrap();
+        let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
+        let writer_lock = Arc::new(Mutex::new(()));
+        let applied = AppliedWatchlistCapacity::new(1);
+        let before = applied.load();
+        let (requests, desired) = capacity_request_channel(1, writer_lock.clone());
+        let request = requests.request(2).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            paper_state.clone(),
+            writer_lock,
+            applied.clone(),
+            desired,
+            AdmissionPreparer::new(tx, paper_state.clone()),
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "anon".to_owned(),
+            String::new(),
+        );
+        assert!(matches!(
+            applier.apply_inner(request).await,
+            Err(CapacityError::EmptyRanking { target: 2 })
+        ));
+        assert_eq!(applied.load(), before);
+        assert_eq!(
+            live.snapshot()
+                .entries
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<Vec<_>>(),
+            vec![existing]
+        );
+        assert!(paper_state.cursor(&fenced).unwrap().is_none());
+        assert!(
+            paper_state
+                .wallet_history_status(&fenced)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         server.abort();
     }
 }

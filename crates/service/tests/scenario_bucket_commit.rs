@@ -321,6 +321,7 @@ fn install_anchor_for_wallet(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            history_status: None,
             wallet,
             balances,
             cutoff,
@@ -644,6 +645,7 @@ fn bracket_unverified_covered_group_is_raw_only_without_reanchor_then_anchors() 
     let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            history_status: None,
             wallet: wallet(),
             balances: Vec::new(),
             cutoff: 92,

@@ -3324,6 +3324,7 @@ fn recorded_group_was_applied(
         "applied"
             | "wallet_fenced_applied"
             | "decision_pending"
+            | crate::bucket_commit::HISTORY_ONLY_BRACKET
             | "not_copy_eligible"
             | "not_an_entry"
             | "not_first_entry"
@@ -9303,6 +9304,7 @@ mod tests {
         state.seed_cursors_if_absent(&[(wallet, at)]).unwrap();
         state
             .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                history_status: None,
                 wallet,
                 balances: Vec::new(),
                 activity_cutoff_unix: at,
@@ -9327,7 +9329,14 @@ mod tests {
             )
             .unwrap();
         assert!(!state.position_validation_current(&wallet).unwrap());
+        connection.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [wallet.to_string()]).unwrap();
         verify_initial_membership(&start).unwrap();
+        let mut binding: serde_json::Value =
+            serde_json::from_str(&start.membership_proofs_hash).unwrap();
+        binding["manifest"]["proofs"][0]["history"]["proof_json"] =
+            serde_json::json!("{\"tampered\":true}");
+        start.membership_proofs_hash = serde_json::to_string(&binding).unwrap();
+        assert!(verify_initial_membership(&start).is_err());
     }
 
     #[test]
@@ -10479,6 +10488,7 @@ mod tests {
         state.set_cursor(&wallet, at).unwrap();
         state
             .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                history_status: None,
                 wallet,
                 balances: Vec::new(),
                 activity_cutoff_unix: at,
@@ -11949,5 +11959,109 @@ mod tests {
         assert!(
             verify_decision_continuation_facts(&aggregate, &frozen, Some(&correction)).is_err()
         );
+    }
+    #[test]
+    fn history_only_bracket_disposition_replays_as_applied() {
+        let id = pe_core_types::SourceTradeId("bracket".to_owned());
+        for applied in [
+            crate::bucket_commit::HISTORY_ONLY_BRACKET,
+            "not_copy_eligible",
+        ] {
+            assert!(recorded_group_was_applied(&id, applied).unwrap());
+        }
+        for covered in ["anchor_covered", "anchor_covered_late"] {
+            assert!(!recorded_group_was_applied(&id, covered).unwrap());
+        }
+        assert!(recorded_group_was_applied(&id, "unknown_bracket_reason").is_err());
+    }
+    #[test]
+    fn membership_tampering_is_rejected() {
+        use crate::paper_recovery::{RankingMembershipArtifact, SealedMembershipEvidence};
+        use crate::watchlist_admission::RANKING_MEMBERSHIP_SOURCE_ID;
+        let wallet = WalletAddress([91; 20]);
+        let other = WalletAddress([92; 20]);
+        let entry = pe_trader_index::WatchlistEntry {
+            wallet,
+            tier: pe_trader_index::WatchlistTier::Active,
+            leader_score_bps: BasisPoints(200),
+            lcb_5pct_bps: BasisPoints(200),
+            win_rate_bps: BasisPoints(6000),
+            closed_trades_in_window: 90,
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+        };
+        for mutation in [
+            "none",
+            "hash",
+            "source",
+            "schema",
+            "parser",
+            "batch",
+            "wallet",
+            "over_cap",
+            "missing_admission",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let mut writer = Writer::open(&path).unwrap();
+            let mut entries = vec![entry.clone()];
+            if mutation == "wallet" {
+                entries[0].wallet = other;
+            }
+            if mutation == "over_cap" {
+                let mut extra = entry.clone();
+                extra.wallet = other;
+                entries.push(extra);
+            }
+            let mut receipt = writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(
+                        if mutation == "source" {
+                            "wrong"
+                        } else {
+                            RANKING_MEMBERSHIP_SOURCE_ID
+                        }
+                        .to_owned(),
+                    ),
+                    schema_version: if mutation == "schema" { 2 } else { 1 },
+                    parser_version: if mutation == "parser" { 2 } else { 1 },
+                    observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                    received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&RankingMembershipArtifact {
+                        batch_id: Some(if mutation == "batch" { 8 } else { 7 }),
+                        entries,
+                    })
+                    .unwrap(),
+                })
+                .unwrap();
+            drop(writer);
+            if mutation == "hash" {
+                receipt.this_hash = blake3::hash(b"wrong");
+            }
+            let source = PublishedMembershipSource::scan(&path).unwrap();
+            let current = if mutation == "missing_admission" {
+                HashSet::new()
+            } else {
+                HashSet::from([wallet, other])
+            };
+            let (removed, added) = if mutation == "missing_admission" {
+                (vec![], vec![wallet])
+            } else {
+                (vec![other], vec![])
+            };
+            let result = verify_membership_change_evidence(
+                MembershipReason::FullRerank,
+                &removed,
+                &added,
+                1,
+                Some(7),
+                &SealedMembershipEvidence::full_rerank(receipt, Vec::new()).unwrap(),
+                &MembershipEvidenceContext {
+                    source: &source,
+                    current_membership: &current,
+                },
+            );
+            assert_eq!(result.is_ok(), mutation == "none", "{mutation}: {result:?}");
+        }
     }
 }

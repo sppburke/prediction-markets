@@ -8,6 +8,7 @@
     clippy::arithmetic_side_effects
 )]
 
+#[path = "support/mod.rs"]
 mod support;
 
 use std::collections::HashMap;
@@ -1669,6 +1670,7 @@ async fn golden_source_stream_replays_exact_economic_core() {
         .map(|wallet| {
             let captured = ledger_capture(seed_engine.ledger(), &paper, *wallet).unwrap();
             AnchorInstall {
+                history_status: None,
                 wallet: *wallet,
                 balances: Vec::new(),
                 cutoff: 0,
@@ -2824,4 +2826,277 @@ async fn golden_source_stream_replays_exact_economic_core() {
     println!(
         "PASS: I16-GOLDEN-PREIMAGE-V1 — deleted and one-byte-tampered preimages fail with exact typed reasons"
     );
+}
+
+/// Reuse the golden financial owners for the causal bracket's short continuation scenarios.
+#[allow(dead_code)]
+pub(crate) struct BracketFinancialHarness {
+    pub(crate) control: mpsc::Sender<OrchestratorControl>,
+    pub(crate) source: SourceLogHandle,
+    pub(crate) live: LiveWatchlist,
+    pub(crate) writer_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) paper_path: std::path::PathBuf,
+    pub(crate) source_path: std::path::PathBuf,
+    pub(crate) initial: Watchlist,
+    runtime: RuntimeConfig,
+    hooks: Arc<ScenarioHooks>,
+    books: Arc<GoldenBookFetcher>,
+    authority: GoldenAuthority,
+    actor: tokio::task::JoinHandle<()>,
+    coordinator: tokio::task::JoinHandle<()>,
+    _triggers: mpsc::Receiver<pe_service::activity_ingest::ReconciliationTrigger>,
+}
+
+#[allow(dead_code)]
+impl BracketFinancialHarness {
+    pub(crate) async fn new(
+        dir: &std::path::Path,
+        paper: Arc<PaperStateDb>,
+        initial_wallets: &[WalletAddress],
+    ) -> Self {
+        let paper_path = dir.join("paper.log");
+        let source_path = dir.join("source.log");
+        let live_path = dir.join("live_journal.log");
+        drop(Writer::open(&paper_path).unwrap());
+        drop(Writer::open(&source_path).unwrap());
+        drop(LiveJournal::open(&live_path).unwrap());
+        let mut runtime =
+            RuntimeConfig::from_service_config(&pe_service::config::ServiceConfig::default());
+        runtime.mode = "paper".to_owned();
+        runtime.min_resolution_horizon_secs = 0;
+        runtime.max_resolution_horizon_secs = 0;
+        runtime.price_impact_cap_bps = 300;
+        runtime.per_trade_cap = PerTradeCap::Bps(1_000);
+        runtime.slippage_rate = Decimal::ZERO;
+        runtime.sizing_mode = SizingMode::Contract { contracts: 5 };
+        runtime.sizing_contracts = 5;
+        let preparation = derive_golden_start(
+            dir,
+            &paper_path,
+            &source_path,
+            &live_path,
+            &dir.join("paper.db"),
+            1,
+            initial_wallets,
+            &runtime,
+        );
+        let mut writer = Writer::open(&paper_path).unwrap();
+        let start = append_qualification_start(&mut writer, &preparation.start, 1);
+        drop(writer);
+        paper
+            .reset_financial_era(
+                start,
+                CollateralAmount::from_decimal_exact(STARTING_BANKROLL).unwrap(),
+            )
+            .unwrap();
+        let authority = GoldenAuthority::new(start);
+        let receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let (source, source_rx) = SourceLogHandle::channel(64);
+        let (trigger_tx, trigger_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, true, 90),
+            )
+            .with_source_receipt_index(receipts.clone())
+            .run(),
+        );
+        let hooks = Arc::new(ScenarioHooks::default());
+        hooks
+            .financial_clock_unix
+            .store(100, std::sync::atomic::Ordering::SeqCst);
+        let books = Arc::new(GoldenBookFetcher::default());
+        let initial = golden_watchlist(initial_wallets);
+        let live = LiveWatchlist::new(initial.clone());
+        let writer_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let (control, control_rx) = mpsc::channel(4);
+        let mut orchestrator = Orchestrator::new_with_authority(
+            live.clone(),
+            OrchestratorConfig {
+                bankroll: STARTING_BANKROLL,
+                mode: ExecutionMode::Paper,
+                signal_config: SignalConfig::default(),
+                max_resolution_horizon_secs: 0,
+                min_resolution_horizon_secs: 0,
+                max_fill_price: runtime.max_fill_price,
+                min_fill_price: runtime.min_fill_price,
+                price_impact_cap_bps: 300,
+                entry_gate_config: CopyEntryGateConfig,
+                runtime_config: None,
+                live_accounts: None,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+                watchlist_writer_lock: Some(writer_lock.clone()),
+            },
+            WinnerFollowStrategy::new(runtime.winner_follow_config()),
+            Writer::open(&paper_path).unwrap(),
+            paper.clone(),
+            pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
+            new_shared_health_with_ws(false, true, 90),
+            golden_mid_cache(0)
+                .with_source_log(source.clone())
+                .with_clock({
+                    let hooks = hooks.clone();
+                    Arc::new(move || {
+                        OffsetDateTime::from_unix_timestamp(
+                            hooks
+                                .financial_clock_unix
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                        .unwrap()
+                    })
+                }),
+            control_rx,
+            None,
+            authority.clone(),
+            books.clone(),
+        )
+        .unwrap();
+        orchestrator.set_scenario_hooks(hooks.clone());
+        orchestrator
+            .configure_financial_log_paths(
+                paper_path.clone(),
+                source_path.clone(),
+                LiveAdmissionBuilder::new(
+                    reqwest::Client::new(),
+                    "http://unused.invalid",
+                    "http://unused.invalid",
+                    source.clone(),
+                ),
+                Arc::new(HistoricalMarkAdapter::new(
+                    reqwest::Client::new(),
+                    "http://unused.invalid",
+                    source.clone(),
+                )),
+                receipts,
+            )
+            .unwrap();
+        let actor = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+        Self {
+            control,
+            source,
+            live,
+            writer_lock,
+            paper_path,
+            source_path,
+            initial,
+            runtime,
+            hooks,
+            books,
+            authority,
+            actor,
+            coordinator,
+            _triggers: trigger_rx,
+        }
+    }
+
+    pub(crate) fn entry_payload(wallet: WalletAddress, epoch: i64) -> Vec<u8> {
+        let mut rows: serde_json::Value =
+            serde_json::from_slice(&golden_trade_bodies(1, epoch).activity).unwrap();
+        rows[0]["proxyWallet"] = wallet.to_string().into();
+        serde_json::to_vec(&rows).unwrap()
+    }
+
+    pub(crate) fn entry_gamma() -> Vec<u8> {
+        golden_trade_bodies(1, 100).gamma
+    }
+
+    pub(crate) fn entries(wallets: &[WalletAddress]) -> Vec<WatchlistEntry> {
+        golden_watchlist(wallets).entries
+    }
+
+    pub(crate) async fn ordinary_entry(
+        &self,
+        wallet: WalletAddress,
+        epoch: i64,
+    ) -> pe_service::bucket_commit::BucketCommitResult {
+        let bodies = golden_trade_bodies(1, epoch);
+        let gamma = append_source_at(
+            &self.source,
+            "polymarket.gamma.markets",
+            &bodies.gamma,
+            epoch,
+        )
+        .await;
+        let clob_long = append_source_at(
+            &self.source,
+            "polymarket.clob.markets",
+            &bodies.clob_long,
+            epoch,
+        )
+        .await;
+        let clob_compact = append_source_at(
+            &self.source,
+            "polymarket.clob.compact-market",
+            &bodies.compact,
+            epoch,
+        )
+        .await;
+        let book_receipt =
+            append_source_at(&self.source, "polymarket.clob.book", &bodies.book, epoch).await;
+        let (admission, book) = admission_and_book(
+            &bodies.condition,
+            epoch,
+            GoldenAdmissionBodies {
+                gamma: &bodies.gamma,
+                clob: &bodies.clob_long,
+                compact: &bodies.compact,
+                book: &bodies.book,
+            },
+            AdmissionReceipts {
+                gamma,
+                clob_long,
+                clob_compact,
+            },
+            book_receipt,
+        );
+        self.books.insert(
+            admission.market.ordered_outcome_token_ids[0].to_string(),
+            book,
+        );
+        self.hooks
+            .admission_artifacts
+            .lock()
+            .unwrap()
+            .push_back(admission);
+        self.hooks
+            .financial_clock_unix
+            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+        let payload = Self::entry_payload(wallet, epoch);
+        let page = append_source_at(&self.source, ACTIVITY_POLL_SOURCE_ID, &payload, epoch).await;
+        let read = support::producer_shaped_read_v2(wallet, &payload, epoch, epoch, page);
+        let commitment = append_source_at(
+            &self.source,
+            ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+            &read.commitment_payload,
+            epoch,
+        )
+        .await;
+        let mut context = support::read_context(&read, commitment, epoch);
+        context.applied_configuration = self.runtime.clone();
+        assert!(context.history_status.is_none());
+        let (committed, ack) = oneshot::channel();
+        self.control
+            .send(OrchestratorControl::CommitActivityBucket {
+                aggregates: read.aggregates,
+                context: Arc::new(context),
+                committed,
+            })
+            .await
+            .unwrap();
+        ack.await.unwrap().unwrap()
+    }
+
+    pub(crate) fn mutations(&self) -> usize {
+        self.authority.mutations()
+    }
+
+    pub(crate) async fn shutdown(self) {
+        drop(self.control);
+        self.actor.await.unwrap();
+        drop(self.source);
+        self.coordinator.await.unwrap();
+    }
 }

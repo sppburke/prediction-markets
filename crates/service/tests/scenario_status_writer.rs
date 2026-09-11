@@ -236,6 +236,7 @@ fn anchor_age_is_none_before_install_and_tracks_the_oldest_latest_anchor() {
 
     db.set_cursor(&wallet, 10).unwrap();
     db.install_anchors(&[AnchorInstallRecord {
+        history_status: None,
         wallet,
         balances: Vec::new(),
         activity_cutoff_unix: 10,
@@ -264,6 +265,7 @@ fn anchor_age_excludes_wallets_removed_from_the_live_watchlist() {
     }
     db.install_anchors(&[
         AnchorInstallRecord {
+            history_status: None,
             wallet: removed,
             balances: Vec::new(),
             activity_cutoff_unix: 10,
@@ -276,6 +278,7 @@ fn anchor_age_excludes_wallets_removed_from_the_live_watchlist() {
             recorded_at_unix: now - 100,
         },
         AnchorInstallRecord {
+            history_status: None,
             wallet: active,
             balances: Vec::new(),
             activity_cutoff_unix: 10,

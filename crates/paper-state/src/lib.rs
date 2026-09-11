@@ -277,6 +277,8 @@ pub struct PositionValidationRecord {
 /// accepted activity/positions bracket and wallet coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorInstallRecord {
+    /// Runtime history completion, committed with this anchor and preserving an existing complete proof.
+    pub history_status: Option<WalletHistoryStatusRecord>,
     pub wallet: WalletAddress,
     pub balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
     pub activity_cutoff_unix: i64,
@@ -1272,19 +1274,7 @@ impl PaperStateDb {
             )?;
         }
         if let Some(status) = &bucket.history_status {
-            tx.execute(
-                "INSERT INTO wallet_history_status_v2 \
-                     (wallet_hex, complete, proof_json, updated_at_unix) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(wallet_hex) DO UPDATE SET \
-                     complete = excluded.complete, proof_json = excluded.proof_json, \
-                     updated_at_unix = excluded.updated_at_unix",
-                params![
-                    status.wallet.to_string(),
-                    i64::from(status.complete),
-                    status.proof_json,
-                    status.updated_at_unix,
-                ],
-            )?;
+            upsert_history_status(&tx, status, false)?;
         }
         for pending in &bucket.pending {
             let durable: Option<(String, String, i64, String)> = tx
@@ -1469,18 +1459,7 @@ impl PaperStateDb {
     ) -> Result<(), PaperStateError> {
         serde_json::from_str::<serde_json::Value>(&status.proof_json)?;
         let conn = self.lock();
-        conn.execute(
-            "INSERT INTO wallet_history_status_v2 \
-                 (wallet_hex, complete, proof_json, updated_at_unix) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(wallet_hex) DO UPDATE SET complete = excluded.complete, \
-                 proof_json = excluded.proof_json, updated_at_unix = excluded.updated_at_unix",
-            params![
-                status.wallet.to_string(),
-                i64::from(status.complete),
-                status.proof_json,
-                status.updated_at_unix,
-            ],
-        )?;
+        upsert_history_status(&conn, status, false)?;
         Ok(())
     }
 
@@ -1629,6 +1608,9 @@ impl PaperStateDb {
                 proof_json: install.proof_json.clone(),
                 recorded_at_unix: install.recorded_at_unix,
             };
+            if let Some(status) = &install.history_status {
+                upsert_history_status(&tx, status, true)?;
+            }
             tx_upsert_position_validation(&tx, &validation)?;
             tx.execute(
                 "UPDATE poll_cursors SET activity_cutoff_unix = ?2, reanchor_required = 0 \
@@ -4262,6 +4244,29 @@ impl PaperStateDb {
 
 // ── Transaction-scoped helpers ──────────────────────────────────────────────
 
+fn upsert_history_status(
+    conn: &Connection,
+    status: &WalletHistoryStatusRecord,
+    preserve_complete: bool,
+) -> Result<(), PaperStateError> {
+    serde_json::from_str::<serde_json::Value>(&status.proof_json)?;
+    conn.execute(
+        "INSERT INTO wallet_history_status_v2 \
+             (wallet_hex, complete, proof_json, updated_at_unix) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(wallet_hex) DO UPDATE SET complete = excluded.complete, \
+             proof_json = excluded.proof_json, updated_at_unix = excluded.updated_at_unix \
+         WHERE NOT ?5 OR wallet_history_status_v2.complete = 0",
+        params![
+            status.wallet.to_string(),
+            i64::from(status.complete),
+            status.proof_json,
+            status.updated_at_unix,
+            preserve_complete,
+        ],
+    )?;
+    Ok(())
+}
+
 fn tx_upsert_position_validation(
     tx: &Transaction<'_>,
     validation: &PositionValidationRecord,
@@ -5609,6 +5614,7 @@ mod tests {
         ledger_hash_after: &str,
     ) -> AnchorInstallRecord {
         AnchorInstallRecord {
+            history_status: None,
             wallet,
             balances,
             activity_cutoff_unix,
@@ -5958,7 +5964,8 @@ mod tests {
         let (_dir, db) = db();
         let first = wallet();
         let second = other_wallet();
-        db.seed_cursors_if_absent(&[(first, 10), (second, 20)])
+        let third = WalletAddress([3; 20]);
+        db.seed_cursors_if_absent(&[(first, 10), (second, 20), (third, 30)])
             .unwrap();
         db.install_anchors(&[
             anchor_install(
@@ -5981,52 +5988,98 @@ mod tests {
             ),
         ])
         .unwrap();
+        db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: second,
+            complete: false,
+            proof_json: "{\"seed\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+        db.install_anchors(&[anchor_install(
+            third,
+            Vec::new(),
+            100,
+            220,
+            "baseline-third",
+        )])
+        .unwrap();
+        db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: third,
+            complete: true,
+            proof_json: "{\"original\":true}".to_owned(),
+            updated_at_unix: 2,
+        })
+        .unwrap();
+        let before_history = (
+            db.wallet_history_status(&first).unwrap(),
+            db.wallet_history_status(&second).unwrap(),
+            db.wallet_history_status(&third).unwrap(),
+        );
         let before_anchors = (
             db.position_anchors(&first).unwrap(),
             db.position_anchors(&second).unwrap(),
+            db.position_anchors(&third).unwrap(),
         );
         let before_mirror = leader_projection(&db);
         let before_validations = (
             db.position_validation(&first).unwrap(),
             db.position_validation(&second).unwrap(),
+            db.position_validation(&third).unwrap(),
         );
         let before_coverage = (
             db.wallet_coverage(&first).unwrap(),
             db.wallet_coverage(&second).unwrap(),
+            db.wallet_coverage(&third).unwrap(),
         );
 
-        let result = db.install_anchors_inner(
-            &[
-                anchor_install(
-                    first,
-                    vec![(
-                        named_market("0xfailing-first"),
-                        OutcomeId(0),
-                        ShareAmount::from_atomic(3),
-                    )],
-                    120,
-                    300,
-                    "failing-first",
-                ),
-                anchor_install(
-                    second,
-                    vec![(
-                        named_market("0xfailing-second"),
-                        OutcomeId(1),
-                        ShareAmount::from_atomic(4),
-                    )],
-                    120,
-                    310,
-                    "failing-second",
-                ),
-            ],
-            true,
+        let mut installs = [
+            anchor_install(
+                first,
+                vec![(
+                    named_market("0xfailing-first"),
+                    OutcomeId(0),
+                    ShareAmount::from_atomic(3),
+                )],
+                120,
+                300,
+                "failing-first",
+            ),
+            anchor_install(
+                second,
+                vec![(
+                    named_market("0xfailing-second"),
+                    OutcomeId(1),
+                    ShareAmount::from_atomic(4),
+                )],
+                120,
+                310,
+                "failing-second",
+            ),
+            anchor_install(third, Vec::new(), 120, 320, "failing-third"),
+        ];
+        for install in &mut installs {
+            install.history_status = Some(WalletHistoryStatusRecord {
+                wallet: install.wallet,
+                complete: true,
+                proof_json: install.proof_json.clone(),
+                updated_at_unix: install.recorded_at_unix,
+            });
+        }
+        let result = db.install_anchors_inner(&installs, true);
+        assert_eq!(
+            (
+                db.wallet_history_status(&first).unwrap(),
+                db.wallet_history_status(&second).unwrap(),
+                db.wallet_history_status(&third).unwrap(),
+            ),
+            before_history
         );
         assert!(matches!(result, Err(PaperStateError::Internal(_))));
         assert_eq!(
             (
                 db.position_anchors(&first).unwrap(),
                 db.position_anchors(&second).unwrap(),
+                db.position_anchors(&third).unwrap(),
             ),
             before_anchors
         );
@@ -6035,6 +6088,7 @@ mod tests {
             (
                 db.position_validation(&first).unwrap(),
                 db.position_validation(&second).unwrap(),
+                db.position_validation(&third).unwrap(),
             ),
             before_validations
         );
@@ -6042,6 +6096,7 @@ mod tests {
             (
                 db.wallet_coverage(&first).unwrap(),
                 db.wallet_coverage(&second).unwrap(),
+                db.wallet_coverage(&third).unwrap(),
             ),
             before_coverage
         );

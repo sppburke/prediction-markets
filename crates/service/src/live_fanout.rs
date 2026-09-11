@@ -3920,6 +3920,7 @@ fn produced_decision_continuation(
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     engine
         .install_anchors(&[crate::position_seeder::AnchorInstall {
+            history_status: None,
             wallet,
             balances: Vec::new(),
             cutoff: anchor_cutoff,
@@ -10240,6 +10241,7 @@ mod tests {
             state.set_cursor(&wallet, cutoff).unwrap();
             state
                 .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                    history_status: None,
                     wallet,
                     balances: Vec::new(),
                     activity_cutoff_unix: cutoff,

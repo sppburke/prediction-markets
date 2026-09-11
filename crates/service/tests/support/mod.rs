@@ -240,6 +240,7 @@ pub fn install_empty_anchor(
     paper_state.set_cursor(&wallet, cutoff_unix).unwrap();
     paper_state
         .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            history_status: None,
             wallet,
             balances: Vec::new(),
             activity_cutoff_unix: cutoff_unix,

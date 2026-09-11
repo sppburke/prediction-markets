@@ -449,6 +449,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     paper_state.set_cursor(&leader_wallet(), 0).unwrap();
     paper_state
         .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            history_status: None,
             wallet: leader_wallet(),
             balances: Vec::new(),
             activity_cutoff_unix: SOURCE_EPOCH - 1,

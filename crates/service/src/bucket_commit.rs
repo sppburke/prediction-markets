@@ -41,6 +41,9 @@ use crate::position_seeder::{AnchorInstall, ledger_capture};
 use crate::risk_inputs::SourceReceiptIndex;
 use crate::runtime_config::{RuntimeConfig, decode_pre_545_runtime_config};
 
+/// Admitted history whose copying is suppressed by a causal bracket.
+pub const HISTORY_ONLY_BRACKET: &str = "history_only_bracket";
+
 /// Source id of the per-read commitment record appended after one complete fixed-end activity
 /// read and before any of its buckets commit (#565). Never parsed as an activity page.
 pub const ACTIVITY_READ_COMMITMENT_SOURCE_ID: &str = "pe-service.activity-read-commitment";
@@ -1855,6 +1858,7 @@ pub(crate) mod continuation_validation_tests {
         paper_state.set_cursor(&wallet, 0).unwrap();
         paper_state
             .install_anchors(&[AnchorInstallRecord {
+                history_status: None,
                 wallet,
                 balances: Vec::new(),
                 activity_cutoff_unix: 0,
@@ -2240,6 +2244,7 @@ impl BucketCommitEngine {
                     ))
                 })?;
             records.push(AnchorInstallRecord {
+                history_status: install.history_status.clone(),
                 wallet: install.wallet,
                 balances: install.balances.clone(),
                 activity_cutoff_unix: install.cutoff,
@@ -2254,6 +2259,11 @@ impl BucketCommitEngine {
         }
         self.paper_state.install_anchors(&records)?;
         self.ledger = candidate;
+        for install in installs {
+            if let Some(status) = &install.history_status {
+                self.apply_history_projection(install.wallet, &[], Some(status));
+            }
+        }
         Ok(())
     }
 
@@ -2690,6 +2700,12 @@ impl BucketCommitEngine {
                                 && decision.action_order_dependent
                         }) {
                             "order_dependent_equal_second_action".to_owned()
+                        } else if context.bracket_commit
+                            && !context.copy_eligible
+                            && !coverage.reanchor_required
+                            && reanchor_trigger.is_none()
+                        {
+                            HISTORY_ONLY_BRACKET.to_owned()
                         } else {
                             "not_copy_eligible".to_owned()
                         }
@@ -2699,13 +2715,23 @@ impl BucketCommitEngine {
                 }
                 _ => "applied".to_owned(),
             };
+            let no_copy = if disposition == HISTORY_ONLY_BRACKET {
+                Some(NoCopyDisposition {
+                    provenance: "reconciled_rest".to_owned(),
+                    age_secs: context.recorded_at_unix.saturating_sub(source_epoch).max(0),
+                    reason: HISTORY_ONLY_BRACKET.to_owned(),
+                    recorded_at_unix: context.recorded_at_unix,
+                })
+            } else {
+                context.no_copy_dispositions.get(&source_trade_id).cloned()
+            };
             dispositions.insert(source_trade_id.0.clone(), disposition.clone());
             disposition_records.push(activity_record(
                 aggregate,
                 disposition,
                 &applied_effect.effect,
                 applied_effect.clamped_residual,
-                context.no_copy_dispositions.get(&source_trade_id).cloned(),
+                no_copy,
             )?);
         }
 
