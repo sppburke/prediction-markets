@@ -115,6 +115,7 @@ struct Obligation {
     group_id: SourceTradeId,
     received_at: OffsetDateTime,
     receipt: pe_event_log::AppendReceipt,
+    bindings: Vec<ObservationBinding>,
 }
 
 type WalletObligations = BTreeMap<i64, BTreeMap<String, Obligation>>;
@@ -137,6 +138,7 @@ fn insert_coalesced_obligation(
             if obligation.receipt.sequence < existing.receipt.sequence {
                 existing.received_at = obligation.received_at;
                 existing.receipt = obligation.receipt;
+                existing.bindings = obligation.bindings.clone();
             }
         })
         .or_insert(obligation);
@@ -155,6 +157,7 @@ fn insert_reconciliation_trigger(
             group_id: trigger.source_trade_id,
             received_at: trigger.received_at,
             receipt: trigger.receipt,
+            bindings: Vec::new(),
         },
     );
 }
@@ -279,29 +282,15 @@ impl ActivityCandidates {
         for (wallet, epochs) in self.by_wallet {
             let fenced = paper_state.is_wallet_fenced(&wallet)?;
             for (epoch, groups) in epochs {
-                for obligation in groups.into_values() {
-                    let candidates = bindings
-                        .get(&(
+                for mut obligation in groups.into_values() {
+                    obligation.bindings = bindings
+                        .remove(&(
                             obligation.group_id.clone(),
                             obligation.receipt.sequence,
                             obligation.receipt.this_hash,
                         ))
-                        .map_or(&[][..], Vec::as_slice);
-                    let disposed = if candidates.is_empty() {
-                        // Historical exact-ID receipts retain their existing acknowledgement contract.
-                        // A permanent fence also refuses original observations without a binding.
-                        fenced
-                            || paper_state
-                                .activity_group_state(&obligation.group_id)?
-                                .is_some()
-                    } else {
-                        let mut disposed = false;
-                        for binding in candidates {
-                            disposed |= binding_target_disposed(paper_state, binding)?;
-                        }
-                        disposed
-                    };
-                    if !disposed {
+                        .unwrap_or_default();
+                    if !obligation_disposed(paper_state, fenced, &obligation)? {
                         insert_coalesced_obligation(
                             &mut obligations.by_wallet,
                             wallet,
@@ -682,6 +671,8 @@ pub struct TradePoller {
     source_receipts: Option<SourceReceiptIndex>,
     #[cfg(feature = "scenario")]
     progress: Option<mpsc::Sender<PollerProgress>>,
+    #[cfg(feature = "scenario")]
+    wait_observer: Option<mpsc::Sender<PollerWait>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,7 +760,7 @@ enum Completion {
     Reconciled {
         wallet: WalletAddress,
         urgent: bool,
-        selected: Vec<AppendReceipt>,
+        selected: WalletObligations,
         result: Result<Vec<(i64, Obligation)>, ReconciliationError>,
     },
     Refreshed(
@@ -794,6 +785,13 @@ pub enum PollerProgress {
         selected: Vec<AppendReceipt>,
     },
     RoundCompleted,
+}
+
+/// Scenario-only snapshot taken immediately before the coordinator waits for progress.
+#[cfg(feature = "scenario")]
+pub struct PollerWait {
+    pub obligations: ReconciliationObligations,
+    pub wake: Option<tokio::time::Instant>,
 }
 
 fn remove_wallet_obligation(selected: &mut WalletObligations, epoch: i64, group: &SourceTradeId) {
@@ -843,6 +841,8 @@ impl TradePoller {
             source_receipts: None,
             #[cfg(feature = "scenario")]
             progress: None,
+            #[cfg(feature = "scenario")]
+            wait_observer: None,
         }
     }
 
@@ -850,6 +850,13 @@ impl TradePoller {
     #[cfg(feature = "scenario")]
     pub fn with_clock(mut self, now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>) -> Self {
         self.now = now;
+        self
+    }
+
+    /// Bounded, best-effort scheduling snapshots for deterministic scenarios.
+    #[cfg(feature = "scenario")]
+    pub fn with_wait_observer(mut self, observer: mpsc::Sender<PollerWait>) -> Self {
+        self.wait_observer = Some(observer);
         self
     }
 
@@ -926,16 +933,14 @@ impl TradePoller {
                         .chain(refresh_reconcile.keys().copied())
                         .collect::<Vec<_>>();
                     wallets.sort_by_key(|wallet| {
-                        (
-                            self.obligations.by_wallet.get(wallet).and_then(|epochs| {
-                                epochs
-                                    .values()
-                                    .flat_map(BTreeMap::values)
-                                    .map(|obligation| obligation.receipt.sequence)
-                                    .min()
-                            }),
-                            wallet.to_string(),
-                        )
+                        let receipt = self.obligations.by_wallet.get(wallet).and_then(|epochs| {
+                            epochs
+                                .values()
+                                .flat_map(BTreeMap::values)
+                                .map(|obligation| obligation.receipt.sequence)
+                                .min()
+                        });
+                        (receipt.is_none(), receipt, wallet.to_string())
                     });
                     wallets.dedup();
                     for wallet in wallets {
@@ -1139,12 +1144,22 @@ impl TradePoller {
                     .any(|attempt| attempt.deadline.is_some_and(|deadline| now <= deadline));
             let retry_delay = Duration::from_nanos(1_000_000_000 - u64::from(now.nanosecond()));
             let retry_ready = tokio::time::Instant::now() + retry_delay;
-            let wake = match (round.stage == RoundStage::Done, retry_pending) {
+            let wake = match (
+                round.stage == RoundStage::Done && !backstop_busy,
+                retry_pending,
+            ) {
                 (true, true) => Some(cadence.min(retry_ready)),
                 (true, false) => Some(cadence),
                 (false, true) => Some(retry_ready),
                 (false, false) => None,
             };
+            #[cfg(feature = "scenario")]
+            if let Some(observer) = &self.wait_observer {
+                let _ = observer.try_send(PollerWait {
+                    obligations: self.obligations.clone(),
+                    wake,
+                });
+            }
             tokio::select! {
                 biased;
                 () = &mut shutdown, if !stopping => stopping = true,
@@ -1159,6 +1174,23 @@ impl TradePoller {
                                     true
                                 } else { false }
                             } else { true };
+                            // A commitment precedes bucket application. Preserve its bindings even
+                            // when application leaves targets outstanding for a later read.
+                            for (epoch, groups) in &selected {
+                                for obligation in groups.values() {
+                                    if let Some(current) = self.obligations.by_wallet
+                                        .get_mut(&wallet)
+                                        .and_then(|epochs| epochs.get_mut(epoch))
+                                        .and_then(|groups| groups.get_mut(&obligation.group_id.0))
+                                        && current.receipt == obligation.receipt
+                                    {
+                                        current.bindings.clone_from(&obligation.bindings);
+                                    }
+                                }
+                            }
+                            if let Some(attempt) = attempts.get_mut(&wallet) {
+                                attempt.selected.clone_from(&selected);
+                            }
                             match result {
                                 Ok(resolved) => {
                                     if counts_round { round.successes += 1; }
@@ -1177,6 +1209,7 @@ impl TradePoller {
                                 }
                                 Err(error) if error.retryable() => {
                                     if counts_round { round.failures += 1; }
+                                    refresh_reconcile.remove(&wallet);
                                     if attempts.get(&wallet).is_some_and(|attempt| attempt.selected.is_empty()) {
                                         attempts.remove(&wallet);
                                     }
@@ -1185,9 +1218,11 @@ impl TradePoller {
                                 Err(error) => failure = Some(TradePollerOwnerError::Reconciliation(error.to_string())),
                             }
                             #[cfg(feature = "scenario")]
-                            self.report_progress(PollerProgress::Completed { wallet, selected });
-                            #[cfg(not(feature = "scenario"))]
-                            let _ = selected;
+                            self.report_progress(PollerProgress::Completed {
+                                wallet,
+                                selected: selected.values().flat_map(BTreeMap::values)
+                                    .map(|obligation| obligation.receipt).collect(),
+                            });
                         }
                         Some(Ok(Completion::Refreshed(wallet, result))) => {
                             busy_wallets.remove(&wallet);
@@ -1299,7 +1334,8 @@ impl TradePoller {
         fixed_end: i64,
     ) {
         let operation = self.operation();
-        let selected = attempt.selected.clone();
+        let mut selected = attempt.selected.clone();
+        #[cfg(feature = "scenario")]
         let frontier = selected
             .values()
             .flat_map(BTreeMap::values)
@@ -1320,12 +1356,12 @@ impl TradePoller {
         });
         tasks.spawn(async move {
             let result = operation
-                .reconcile_wallet(wallet, entry.as_ref(), &selected, fixed_end)
+                .reconcile_wallet(wallet, entry.as_ref(), &mut selected, fixed_end)
                 .await;
             Completion::Reconciled {
                 wallet,
                 urgent,
-                selected: frontier,
+                selected,
                 result,
             }
         });
@@ -1489,7 +1525,7 @@ impl WalletOperation {
         &self,
         wallet: WalletAddress,
         entry: Option<&pe_trader_index::WatchlistEntry>,
-        selected: &WalletObligations,
+        selected: &mut WalletObligations,
         fixed_end: i64,
     ) -> Result<Vec<(i64, Obligation)>, ReconciliationError> {
         let cursor_start = self
@@ -1530,18 +1566,7 @@ impl WalletOperation {
         let page_occurrences = recording.join_occurrences(&activity.pages)?;
         let buckets = activity.buckets()?;
         if buckets.is_empty() {
-            return Ok(if self.paper_state.is_wallet_fenced(&wallet)? {
-                selected
-                    .iter()
-                    .flat_map(|(epoch, groups)| {
-                        groups
-                            .values()
-                            .map(|obligation| (*epoch, obligation.clone()))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            });
+            return self.disposed_obligations(wallet, selected);
         }
         // Resolve every required token and record its metadata before freezing the read commitment.
         let mut identities = Vec::with_capacity(buckets.len());
@@ -1570,6 +1595,15 @@ impl WalletOperation {
                 &bindings,
             )
             .await?;
+        for matched in &correlation.matched {
+            if let Some(obligation) = selected
+                .get_mut(&matched.epoch)
+                .and_then(|groups| groups.get_mut(&matched.binding.stream_group_id.0))
+                && !obligation.bindings.contains(&matched.binding)
+            {
+                obligation.bindings.push(matched.binding.clone());
+            }
+        }
         if let Some(latest) = buckets
             .iter()
             .flatten()
@@ -1618,24 +1652,20 @@ impl WalletOperation {
                 break;
             }
         }
+        self.disposed_obligations(wallet, selected)
+    }
+
+    fn disposed_obligations(
+        &self,
+        wallet: WalletAddress,
+        selected: &WalletObligations,
+    ) -> Result<Vec<(i64, Obligation)>, ReconciliationError> {
+        let fenced = self.paper_state.is_wallet_fenced(&wallet)?;
         let mut resolved = Vec::new();
-        for matched in &correlation.matched {
-            if binding_target_disposed(&self.paper_state, &matched.binding)? {
-                resolved.push((matched.epoch, matched.obligation.clone()));
-            }
-        }
-        // A permanent wallet fence is the durable refusal for observations without a target.
-        // Bound observations still require their exact target revision's disposition.
-        if self.paper_state.is_wallet_fenced(&wallet)? {
-            for (epoch, groups) in selected {
-                for obligation in groups.values() {
-                    if !correlation
-                        .matched
-                        .iter()
-                        .any(|matched| matched.epoch == *epoch && matched.obligation == *obligation)
-                    {
-                        resolved.push((*epoch, obligation.clone()));
-                    }
+        for (epoch, groups) in selected {
+            for obligation in groups.values() {
+                if obligation_disposed(&self.paper_state, fenced, obligation)? {
+                    resolved.push((*epoch, obligation.clone()));
                 }
             }
         }
@@ -1791,7 +1821,6 @@ impl WalletOperation {
                     .transpose()?;
                 result.matched.push(MatchedObservation {
                     epoch: *epoch,
-                    obligation: obligation.clone(),
                     source_time: stream.source_time.0,
                     binding: ObservationBinding {
                         stream_group_id: obligation.group_id.clone(),
@@ -1832,12 +1861,12 @@ impl WalletOperation {
             let observation = matched
                 .iter()
                 .filter(|observation| observation.binding.history_group_id == group)
-                .min_by_key(|observation| observation.obligation.receipt.sequence);
+                .min_by_key(|observation| observation.binding.stream_receipt.sequence);
             let provenance = observation
                 .map(|_| TradeProvenance::ActivityWs)
                 .unwrap_or(TradeProvenance::RestPoll);
             if let Some(observation) = observation {
-                observed_source_receipts.insert(group.clone(), observation.obligation.receipt);
+                observed_source_receipts.insert(group.clone(), observation.binding.stream_receipt);
             }
             let source_time = crate::bucket_commit::earliest_bound_source_time(
                 aggregate.source_time.0,
@@ -2006,9 +2035,29 @@ struct Correlation {
 
 struct MatchedObservation {
     epoch: i64,
-    obligation: Obligation,
     source_time: OffsetDateTime,
     binding: ObservationBinding,
+}
+
+fn obligation_disposed(
+    paper_state: &PaperStateDb,
+    fenced: bool,
+    obligation: &Obligation,
+) -> Result<bool, pe_paper_state::PaperStateError> {
+    if obligation.bindings.is_empty() {
+        // Historical exact-ID receipts retain their existing acknowledgement contract.
+        // A permanent fence refuses only observations that never acquired a binding.
+        return Ok(fenced
+            || paper_state
+                .activity_group_state(&obligation.group_id)?
+                .is_some());
+    }
+    for binding in &obligation.bindings {
+        if binding_target_disposed(paper_state, binding)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn binding_target_disposed(

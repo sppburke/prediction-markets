@@ -736,11 +736,13 @@ struct RunningPoll {
     append_ack_gate: Arc<tokio::sync::Semaphore>,
     append_ack_arrived: Arc<tokio::sync::Notify>,
     bucket_ack_gate: Arc<tokio::sync::Semaphore>,
+    boundary_ack_gate: Arc<tokio::sync::Semaphore>,
     controls: mpsc::Receiver<ControlCompletion>,
     source: SourceLogHandle,
     triggers: mpsc::Sender<pe_service::activity_ingest::ReconciliationTrigger>,
     requests: mpsc::Receiver<RequestedPage>,
     progress: mpsc::Receiver<pe_service::trade_poller::PollerProgress>,
+    waits: mpsc::Receiver<pe_service::trade_poller::PollerWait>,
     stop: oneshot::Sender<()>,
     poller: tokio::task::JoinHandle<Result<(), pe_service::trade_poller::TradePollerOwnerError>>,
     ingest: tokio::task::JoinHandle<()>,
@@ -824,6 +826,14 @@ impl RunningPoll {
         unreachable!("round completion channel closed");
     }
 
+    fn clear_waits(&mut self) {
+        while self.waits.try_recv().is_ok() {}
+    }
+
+    async fn waiting(&mut self) -> pe_service::trade_poller::PollerWait {
+        self.waits.recv().await.unwrap()
+    }
+
     async fn finish(self) -> Vec<RecordedBucket> {
         self.stop.send(()).unwrap();
         self.poller.await.unwrap().unwrap();
@@ -903,7 +913,9 @@ fn start_recorded_poller_with_anchors(
     let append_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let append_ack_arrived = Arc::new(tokio::sync::Notify::new());
     let bucket_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let boundary_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let actor_ack_gate = bucket_ack_gate.clone();
+    let actor_boundary_gate = boundary_ack_gate.clone();
     let (control_events, controls) = mpsc::channel(16);
     let actor_paper = paper.clone();
     let (control_tx, mut control_rx) = mpsc::channel(8);
@@ -968,6 +980,7 @@ fn start_recorded_poller_with_anchors(
                     let _ = control_events
                         .send(ControlCompletion::Boundary(cutoff_unix))
                         .await;
+                    let _permit = actor_boundary_gate.acquire().await.unwrap();
                     let _ = acknowledged.send(Ok(()));
                 }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
@@ -1008,6 +1021,7 @@ fn start_recorded_poller_with_anchors(
     });
     let (requests_tx, requests) = mpsc::channel(8);
     let (progress_tx, progress) = mpsc::channel(64);
+    let (wait_tx, waits) = mpsc::channel(64);
     let (stop, stopped) = oneshot::channel();
     let now = Arc::new(std::sync::atomic::AtomicI64::new(EPOCH));
     let clock = now.clone();
@@ -1071,7 +1085,8 @@ fn start_recorded_poller_with_anchors(
     .with_clock(Arc::new(move || {
         OffsetDateTime::from_unix_timestamp(clock.load(Ordering::SeqCst)).unwrap()
     }))
-    .with_progress(progress_tx);
+    .with_progress(progress_tx)
+    .with_wait_observer(wait_tx);
     let poller = tokio::spawn(poller.run_until(async move {
         let _ = stopped.await;
     }));
@@ -1080,11 +1095,13 @@ fn start_recorded_poller_with_anchors(
             append_ack_gate,
             append_ack_arrived,
             bucket_ack_gate,
+            boundary_ack_gate,
             controls,
             source,
             triggers: trigger_tx,
             requests,
             progress,
+            waits,
             stop,
             poller,
             ingest,
@@ -1101,6 +1118,296 @@ fn stream_row(wallet: WalletAddress, transaction: &str, epoch: i64) -> Value {
     let mut row = activity_row("TRADE", transaction, MARKET_B, "BUY", "1", "asset-b", epoch);
     row["proxyWallet"] = json!(wallet.to_string());
     row
+}
+
+/// PASS: a binding recorded before an earlier bucket fences the wallet survives both empty and
+/// target-absent retries. Runtime and boot retain the same receipt and hold the same boundary.
+#[tokio::test(start_paused = true)]
+async fn fenced_retries_preserve_bound_targets_and_boundary_until_disposed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = (EPOCH.div_euclid(86_400) + 1) * 86_400;
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, false, Some(cutoff - 86_400));
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+
+    running.now.store(cutoff - 1, Ordering::SeqCst);
+    let target = stream_row(wallet(), "bound-after-fence", cutoff - 1);
+    let mut stream = target.clone();
+    stream["conditionId"] = json!("incorrect-stream-stamp");
+    let receipt = running.observe(stream).await;
+    let fence = activity_row(
+        "CONVERSION",
+        "earlier-fence",
+        MARKET_B,
+        "",
+        "1",
+        "",
+        cutoff - 2,
+    );
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[fence, target.clone()]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    assert!(paper.is_wallet_fenced(&wallet()).unwrap());
+    let target_aggregate = aggregate(target.clone());
+    assert!(
+        !paper
+            .activity_revision_disposed(
+                target_aggregate.group_id.key(),
+                target_aggregate.semantic_revision.as_str()
+            )
+            .unwrap()
+    );
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+
+    running.now.store(cutoff, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let empty_retry = running.requests.recv().await.unwrap();
+    running.round_completed().await;
+    running.clear_waits();
+    empty_retry.respond.send(b"[]".to_vec()).unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    assert_bound_runtime_matches_boot(&mut running, &dir, &paper, receipt, cutoff).await;
+
+    running.now.store(cutoff + 1, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let absent_retry = running.requests.recv().await.unwrap();
+    running.clear_waits();
+    absent_retry
+        .respond
+        .send(serde_json::to_vec(&[stream_row(wallet(), "unrelated-history", cutoff)]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    assert_bound_runtime_matches_boot(&mut running, &dir, &paper, receipt, cutoff).await;
+
+    // The expired frozen frontier still reaches its exact disposition on the ordinary backstop.
+    running.now.store(cutoff + 31, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[target]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    assert!(
+        paper
+            .activity_revision_disposed(
+                target_aggregate.group_id.key(),
+                target_aggregate.semantic_revision.as_str()
+            )
+            .unwrap()
+    );
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+    assert!(
+        matches!(running.controls.recv().await.unwrap(), ControlCompletion::Boundary(value) if value == cutoff)
+    );
+    running.finish().await;
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+async fn assert_bound_runtime_matches_boot(
+    running: &mut RunningPoll,
+    dir: &tempfile::TempDir,
+    paper: &PaperStateDb,
+    receipt: pe_event_log::AppendReceipt,
+    cutoff: i64,
+) {
+    let runtime = running.waiting().await.obligations;
+    let source_path = dir.path().join("source.log");
+    let mut rebuilt =
+        pe_service::trade_poller::rebuild_reconciliation_obligations(&source_path, paper).unwrap();
+    let boundary = source_frames(&source_path)
+        .into_iter()
+        .find(|frame| frame.source_id.0 == pe_service::trade_poller::DAILY_BOUNDARY_SOURCE_ID)
+        .unwrap();
+    rebuilt.install_boundary(pe_service::trade_poller::PendingBoundary {
+        cutoff_unix: cutoff,
+        receipt: pe_event_log::AppendReceipt {
+            sequence: boundary.seq,
+            this_hash: boundary.this_hash,
+        },
+    });
+    assert_eq!(runtime.len(), 1);
+    assert_eq!(
+        runtime.migration_evidence()[0]["receipt"],
+        serde_json::to_value(receipt).unwrap()
+    );
+    assert_eq!(runtime.migration_evidence(), rebuilt.migration_evidence());
+    assert_eq!(runtime.pending_boundary(), rebuilt.pending_boundary());
+    assert!(!runtime.boundary_ready());
+    assert_eq!(runtime.boundary_ready(), rebuilt.boundary_ready());
+    assert!(running.controls.try_recv().is_err());
+}
+
+/// PASS: two deferred maintenance handoffs yield the urgent slot to a fresh receipt; failed
+/// handoffs stop second-by-second retries and both wallets remain in the next backstop round.
+#[tokio::test(start_paused = true)]
+async fn deferred_maintenance_yields_to_receipts_and_returns_failures_to_backstop() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let fresh = WalletAddress([0xcc; 20]);
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet(), other], false, true, Some(EPOCH));
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        request.respond.send(b"[]".to_vec()).unwrap();
+        assert!(running.completed(expected).await.is_empty());
+    }
+    fail_refresh_positions(&mut running, wallet()).await;
+    let first_forced = running.requests.recv().await.unwrap();
+    assert!(first_forced.url.contains(&wallet().to_string()));
+    running.round_completed().await;
+
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let backstop = running.requests.recv().await.unwrap();
+    assert!(backstop.url.contains(&other.to_string()));
+    backstop.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(other).await;
+    fail_refresh_positions(&mut running, other).await;
+    running.round_completed().await;
+    let row = stream_row(fresh, "fresh-behind-maintenance", EPOCH + 30);
+    let receipt = running.observe(row.clone()).await;
+    first_forced.respond.fail();
+    running.completed(wallet()).await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(
+        urgent.url.contains(&fresh.to_string()),
+        "fresh receipt gets the released urgent slot: {}",
+        urgent.url
+    );
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(fresh).await, vec![receipt]);
+    let second_forced = running.requests.recv().await.unwrap();
+    assert!(second_forced.url.contains(&other.to_string()));
+    running.clear_waits();
+    second_forced.respond.fail();
+    running.completed(other).await;
+    let waiting = running.waiting().await;
+    assert_eq!(
+        waiting.wake,
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+    );
+    assert!(running.requests.try_recv().is_err());
+
+    // Repeated failures belong to the cadence, with both ordinary visits preserved.
+    running.now.store(EPOCH + 60, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        request.respond.fail();
+        assert!(running.completed(expected).await.is_empty());
+    }
+    fail_refresh_positions(&mut running, wallet()).await;
+    let repeated_forced = running.requests.recv().await.unwrap();
+    assert!(repeated_forced.url.contains(&wallet().to_string()));
+    running.round_completed().await;
+    running.clear_waits();
+    repeated_forced.respond.fail();
+    running.completed(wallet()).await;
+    assert_eq!(
+        running.waiting().await.wake,
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+    );
+    running.finish().await;
+}
+
+async fn fail_refresh_positions(running: &mut RunningPoll, wallet: WalletAddress) {
+    let activity = running.requests.recv().await.unwrap();
+    assert!(activity.url.contains("/activity?"));
+    assert!(activity.url.contains(&wallet.to_string()));
+    activity.respond.send(b"[]".to_vec()).unwrap();
+    let positions = running.requests.recv().await.unwrap();
+    assert!(positions.url.contains("/positions?"));
+    assert!(positions.url.contains(&wallet.to_string()));
+    positions.respond.fail();
+}
+
+/// PASS: holding boundary publication beyond the cadence leaves no expired wake armed; a trigger
+/// is still handled and completing publication admits the next round without another timer tick.
+#[tokio::test(start_paused = true)]
+async fn slow_boundary_publication_disarms_cadence_until_background_slot_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = EPOCH.div_euclid(86_400) * 86_400;
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, false, Some(cutoff - 86_400));
+    let gate = running.boundary_ack_gate.clone();
+    let held = gate.acquire().await.unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    assert!(
+        matches!(running.controls.recv().await.unwrap(), ControlCompletion::Boundary(value) if value == cutoff)
+    );
+    running.clear_waits();
+    running.now.store(EPOCH + 31, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    // An expired observation wakes the coordinator without admitting urgent or retry work.
+    let receipt = running
+        .observe(stream_row(wallet(), "stale-during-publication", EPOCH))
+        .await;
+    let waiting = running.waiting().await;
+    assert_eq!(
+        waiting.wake, None,
+        "a busy background slot cannot admit a cadence round"
+    );
+    assert_eq!(waiting.obligations.len(), 1);
+    assert!(
+        running.waits.try_recv().is_err(),
+        "the loop waits after handling the trigger"
+    );
+    assert!(
+        running.requests.try_recv().is_err(),
+        "no extra fetch while publication is held"
+    );
+    let now = tokio::time::Instant::now();
+    drop(held);
+    let next_round = running.requests.recv().await.unwrap();
+    assert_eq!(tokio::time::Instant::now(), now);
+    assert!(next_round.url.contains(&wallet().to_string()));
+    next_round.respond.send(b"[]".to_vec()).unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    running.finish().await;
 }
 
 /// PASS: a durable trigger starts a request before the thirty-second cadence advances.
