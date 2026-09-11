@@ -149,7 +149,8 @@ pub struct LiveFanoutConfig {
     pub source_receipts: SourceReceiptIndex,
     pub paper_log_path: PathBuf,
     /// Issue #599: the fanout outlives the orchestrator drain, so it must not keep the
-    /// control channel open; it upgrades per send and skips once the orchestrator is gone.
+    /// control channel open; it upgrades per send and, once the orchestrator is gone, the sync
+    /// fails closed with the same error a closed channel produced.
     pub orchestrator_control: tokio::sync::mpsc::WeakSender<OrchestratorControl>,
     pub http: reqwest::Client,
     pub polygon_receipt_rpc_url: String,
