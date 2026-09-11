@@ -575,13 +575,19 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
     // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
     // value is a config error, not a posture. One hour is far beyond any honest
     // calibration (the ranker's latency shift is 2s).
-    if cfg.copy_latency_budget_secs == 0 || cfg.copy_latency_budget_secs > 3_600 {
+    if !valid_copy_latency_budget_secs(cfg.copy_latency_budget_secs) {
         return Err(ServiceConfigError::Invalid(format!(
             "copy_latency_budget_secs must be in 1..=3600, got {}",
             cfg.copy_latency_budget_secs
         )));
     }
     Ok(cfg)
+}
+
+/// Shared bound for boot configuration and frozen paper freshness evidence.
+#[must_use]
+pub fn valid_copy_latency_budget_secs(seconds: u64) -> bool {
+    (1..=3_600).contains(&seconds)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

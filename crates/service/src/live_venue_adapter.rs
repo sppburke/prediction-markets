@@ -882,22 +882,28 @@ impl LiveAdmissionBuilder {
         );
         let clob_url = format!("{}/markets/{}", self.clob_base_url, condition_id.0);
         let compact_url = format!("{}/clob-markets/{}", self.clob_base_url, condition_id.0);
-        let (gamma_raw, gamma_receipt, gamma_received_at) = self
-            .fetch_and_record(
+        let (gamma, clob_long, clob_compact) = tokio::join!(
+            self.fetch_and_record(
                 &gamma_url,
                 GAMMA_MARKETS_SOURCE_ID,
                 GAMMA_MARKETS_SCHEMA_VERSION,
                 GAMMA_MARKETS_PARSER_VERSION,
-            )
-            .await?;
-        let (clob_raw, clob_long_receipt, clob_long_received_at) = self
-            .fetch_and_record(
+            ),
+            self.fetch_and_record(
                 &clob_url,
                 CLOB_LONG_MARKET_SOURCE_ID,
                 LIVE_MARKET_SCHEMA_VERSION,
                 LIVE_MARKET_PARSER_VERSION,
-            )
-            .await?;
+            ),
+            self.fetch_and_record(
+                &compact_url,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+                LIVE_MARKET_SCHEMA_VERSION,
+                LIVE_MARKET_PARSER_VERSION,
+            ),
+        );
+        let (gamma_raw, gamma_receipt, gamma_received_at) = gamma?;
+        let (clob_raw, clob_long_receipt, clob_long_received_at) = clob_long?;
         let mut market = validate_live_market(
             &gamma_raw,
             &clob_raw,
@@ -909,14 +915,7 @@ impl LiveAdmissionBuilder {
         market.observed_at_unix = gamma_received_at
             .max(clob_long_received_at)
             .unix_timestamp();
-        let (compact_raw, clob_compact_receipt, _compact_received_at) = self
-            .fetch_and_record(
-                &compact_url,
-                CLOB_COMPACT_MARKET_SOURCE_ID,
-                LIVE_MARKET_SCHEMA_VERSION,
-                LIVE_MARKET_PARSER_VERSION,
-            )
-            .await?;
+        let (compact_raw, clob_compact_receipt, _compact_received_at) = clob_compact?;
         let compact = parse_compact_market(
             &compact_raw,
             condition_id,
@@ -1381,25 +1380,269 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(frames.len(), 4);
-        assert_eq!(
-            frames
+        for (receipt, source_id) in [
+            (admission.receipts.gamma, GAMMA_MARKETS_SOURCE_ID),
+            (admission.receipts.clob_long, CLOB_LONG_MARKET_SOURCE_ID),
+            (
+                admission.receipts.clob_compact,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+            ),
+            (book.source_receipt.unwrap(), "polymarket.clob.book"),
+        ] {
+            let matching = frames
                 .iter()
-                .map(|(_, frame)| frame.source_id.0.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "polymarket.gamma.markets",
-                "polymarket.clob.markets",
-                "polymarket.clob.compact-market",
-                "polymarket.clob.book"
-            ]
-        );
-        assert_eq!(admission.receipts.gamma.sequence, frames[0].0);
-        assert_eq!(admission.receipts.clob_long.sequence, frames[1].0);
-        assert_eq!(admission.receipts.clob_compact.sequence, frames[2].0);
-        assert_eq!(book.source_receipt.unwrap().sequence, frames[3].0);
+                .filter(|(_, frame)| frame.source_id.0 == source_id)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(receipt.sequence, matching[0].0);
+            assert_eq!(receipt.this_hash, matching[0].1.this_hash);
+        }
 
         drop(source_log);
         coordinator.abort();
+        server.abort();
+    }
+
+    struct AdmissionGates {
+        started: tokio::sync::mpsc::Sender<usize>,
+        release: [tokio::sync::Semaphore; 3],
+        statuses: [u16; 3],
+        invalid: [bool; 3],
+        transport_failure: Option<usize>,
+    }
+
+    async fn gated_admission_response(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<AdmissionGates>>,
+        uri: Uri,
+    ) -> Response {
+        let index = if uri.path() == "/markets" {
+            0
+        } else if uri.path().starts_with("/clob-markets/") {
+            2
+        } else {
+            1
+        };
+        state.started.send(index).await.unwrap();
+        state.release[index].acquire().await.unwrap().forget();
+        if state.transport_failure == Some(index) {
+            return Response::new(axum::body::Body::from_stream(futures::stream::once(
+                async {
+                    Err::<axum::body::Bytes, _>(std::io::Error::other(
+                        "injected response body failure",
+                    ))
+                },
+            )));
+        }
+        let mut response = if state.invalid[index] {
+            axum::Json(json!({"invalid": true})).into_response()
+        } else {
+            admission_and_book_fixture(uri).await
+        };
+        *response.status_mut() = StatusCode::from_u16(state.statuses[index]).unwrap();
+        response
+    }
+
+    async fn start_gated_admission(
+        statuses: [u16; 3],
+        invalid: [bool; 3],
+        transport_failure: Option<usize>,
+    ) -> (
+        String,
+        std::sync::Arc<AdmissionGates>,
+        tokio::sync::mpsc::Receiver<usize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (started, receiver) = tokio::sync::mpsc::channel(3);
+        let state = std::sync::Arc::new(AdmissionGates {
+            started,
+            release: std::array::from_fn(|_| tokio::sync::Semaphore::new(0)),
+            statuses,
+            invalid,
+            transport_failure,
+        });
+        let router = Router::new()
+            .fallback(get(gated_admission_response))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (base, state, receiver, server)
+    }
+
+    async fn all_admission_requests_started(receiver: &mut tokio::sync::mpsc::Receiver<usize>) {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            seen.insert(
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(seen, std::collections::BTreeSet::from([0, 1, 2]));
+    }
+
+    /// PASS: every GET starts before any release; reverse completions retain exact named receipts.
+    #[tokio::test]
+    async fn admission_gets_overlap_and_receipts_follow_identity() {
+        let (base, gates, mut started, server) =
+            start_gated_admission([200; 3], [false; 3], None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let sink = crate::source_event_sink::SourceEventSink::open(&path).unwrap();
+        let index = crate::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+        let (source_log, receiver) = SourceLogHandle::channel(3);
+        let (trigger, _trigger_receiver) = tokio::sync::mpsc::channel(1);
+        let coordinator = tokio::spawn(
+            crate::activity_ingest::ActivityIngest::poll_only(
+                sink,
+                receiver,
+                trigger,
+                crate::health::new_shared_health_with_ws(false, true, 90),
+            )
+            .with_source_receipt_index(index.clone())
+            .run(),
+        );
+        let build = tokio::spawn(async move {
+            LiveAdmissionBuilder::new(reqwest::Client::new(), base.clone(), base, source_log)
+                .build(
+                    &pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned()),
+                    OffsetDateTime::UNIX_EPOCH,
+                )
+                .await
+        });
+        all_admission_requests_started(&mut started).await;
+        for (count, request) in [2, 1, 0].into_iter().enumerate() {
+            gates.release[request].add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while index.snapshot().len() != count + 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let admission = build.await.unwrap().unwrap();
+        assert_eq!(admission.receipts.clob_compact.sequence.0, 0);
+        assert_eq!(admission.receipts.clob_long.sequence.0, 1);
+        assert_eq!(admission.receipts.gamma.sequence.0, 2);
+        for (receipt, source, route) in [
+            (
+                admission.receipts.gamma,
+                GAMMA_MARKETS_SOURCE_ID,
+                "/markets".to_owned(),
+            ),
+            (
+                admission.receipts.clob_long,
+                CLOB_LONG_MARKET_SOURCE_ID,
+                format!("/markets/{ADMISSION_CONDITION}"),
+            ),
+            (
+                admission.receipts.clob_compact,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+                format!("/clob-markets/{ADMISSION_CONDITION}"),
+            ),
+        ] {
+            let frame = index.source_envelope(receipt).unwrap();
+            let expected = admission_and_book_fixture(route.parse().unwrap()).await;
+            let expected = axum::body::to_bytes(expected.into_body(), 1_000_000)
+                .await
+                .unwrap();
+            assert_eq!(frame.source_id.0, source);
+            assert_eq!(frame.payload, expected);
+        }
+        assert_eq!(Reader::replay(&path).unwrap().count(), 3);
+        coordinator.abort();
+        server.abort();
+    }
+
+    /// PASS: all sibling captures finish before ordered error selection; delayed or closed source
+    /// acknowledgements cannot report successful admission.
+    #[tokio::test]
+    async fn admission_join_preserves_failure_precedence_and_acknowledgements() {
+        for (statuses, invalid, transport, expected) in [
+            ([500, 200, 200], [false; 3], None, "http:500"),
+            ([200, 503, 200], [false; 3], None, "http:503"),
+            ([200, 200, 502], [false; 3], None, "http:502"),
+            ([500, 503, 502], [false; 3], None, "http:500"),
+            ([200, 503, 502], [true, false, false], None, "http:503"),
+            ([200, 200, 502], [true, false, false], None, "validation"),
+            ([200, 200, 502], [false, true, false], None, "validation"),
+            ([200; 3], [false, false, true], None, "validation"),
+            ([200; 3], [false; 3], Some(0), "transport"),
+            ([200; 3], [false; 3], Some(1), "transport"),
+            ([200; 3], [false; 3], Some(2), "transport"),
+        ] {
+            let (base, gates, mut started, server) =
+                start_gated_admission(statuses, invalid, transport).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let sink = crate::source_event_sink::SourceEventSink::open(&path).unwrap();
+            let (source_log, receiver) = SourceLogHandle::channel(1);
+            let (trigger, _trigger_receiver) = tokio::sync::mpsc::channel(1);
+            let build = tokio::spawn(async move {
+                LiveAdmissionBuilder::new(reqwest::Client::new(), base.clone(), base, source_log)
+                    .build(
+                        &pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned()),
+                        OffsetDateTime::UNIX_EPOCH,
+                    )
+                    .await
+            });
+            all_admission_requests_started(&mut started).await;
+            for gate in &gates.release {
+                gate.add_permits(1);
+            }
+            tokio::task::yield_now().await;
+            assert!(
+                !build.is_finished(),
+                "admission completed before source acknowledgements"
+            );
+            let coordinator = tokio::spawn(
+                crate::activity_ingest::ActivityIngest::poll_only(
+                    sink,
+                    receiver,
+                    trigger,
+                    crate::health::new_shared_health_with_ws(false, true, 90),
+                )
+                .run(),
+            );
+            let error = build.await.unwrap().unwrap_err();
+            let actual = match error {
+                LiveVenueAdapterError::MarketStatus(status) => format!("http:{status}"),
+                LiveVenueAdapterError::MarketValidation(_) => "validation".to_owned(),
+                LiveVenueAdapterError::MarketTransport(_) => "transport".to_owned(),
+                other => format!("unexpected admission failure: {other}"),
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(
+                Reader::replay(&path).unwrap().count(),
+                if transport.is_some() { 2 } else { 3 }
+            );
+            coordinator.abort();
+            server.abort();
+        }
+        let (base, gates, mut started, server) =
+            start_gated_admission([200; 3], [false; 3], None).await;
+        let (source_log, receiver) = SourceLogHandle::channel(1);
+        let build = tokio::spawn(async move {
+            LiveAdmissionBuilder::new(reqwest::Client::new(), base.clone(), base, source_log)
+                .build(
+                    &pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned()),
+                    OffsetDateTime::UNIX_EPOCH,
+                )
+                .await
+        });
+        all_admission_requests_started(&mut started).await;
+        drop(receiver);
+        for gate in &gates.release {
+            gate.add_permits(1);
+        }
+        assert!(matches!(
+            build.await.unwrap(),
+            Err(LiveVenueAdapterError::SourceLogClosed)
+        ));
         server.abort();
     }
 

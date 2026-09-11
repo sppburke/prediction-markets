@@ -1972,13 +1972,20 @@ async fn golden_source_stream_replays_exact_economic_core() {
                 .lock()
                 .unwrap()
                 .push_back(recorded.admission.clone());
+            let mut fixed_book = recorded.book.clone();
+            fixed_book.fetched_at_ms = u64::try_from(source_unix * 1_000).unwrap();
             book_fetcher.insert(
                 recorded.admission.market.ordered_outcome_token_ids[0].to_string(),
-                recorded.book.clone(),
+                fixed_book,
             );
             hooks
                 .financial_clock_unix
                 .store(source_unix, std::sync::atomic::Ordering::SeqCst);
+            hooks.age_clock.lock().unwrap().clear();
+            hooks.age_clock.lock().unwrap().extend(std::iter::repeat_n(
+                OffsetDateTime::from_unix_timestamp(source_unix).unwrap(),
+                3,
+            ));
 
             let mut read = support::producer_shaped_read_v2(
                 bodies.wallet,
@@ -2731,6 +2738,15 @@ async fn golden_source_stream_replays_exact_economic_core() {
     std::fs::create_dir(&tamper_root).unwrap();
     let last_recorded = &recorded_trades[ORIGINAL_COPIES - 1];
     let last_decision = decision_rows.last().unwrap();
+    qualification_replays_source_age_and_seal_binds_policy_and_clock(
+        &tamper_root,
+        &paper_path,
+        &source_path,
+        &state_path,
+        &live_path,
+        seal_receipt,
+        &first_operation.source_trade_id,
+    );
     let price_receipt = sealed_era
         .frames
         .iter()
@@ -2824,4 +2840,83 @@ async fn golden_source_stream_replays_exact_economic_core() {
     println!(
         "PASS: I16-GOLDEN-PREIMAGE-V1 — deleted and one-byte-tampered preimages fail with exact typed reasons"
     );
+}
+
+/// PASS: internally consistent row edits to disabled policy or exact clock still fail the unchanged seal digest.
+#[allow(clippy::too_many_arguments)]
+fn qualification_replays_source_age_and_seal_binds_policy_and_clock(
+    root: &std::path::Path,
+    paper_path: &std::path::Path,
+    source_path: &std::path::Path,
+    state_path: &std::path::Path,
+    live_path: &std::path::Path,
+    seal_receipt: AppendReceipt,
+    source_trade_id: &pe_core_types::SourceTradeId,
+) {
+    let original_digest = decision_evidence_digest(paper_path, state_path);
+    for mutation in ["paper-policy", "paper-clock"] {
+        let case = root.join(mutation);
+        std::fs::create_dir(&case).unwrap();
+        let cloned_state = case.join("paper.db");
+        clone_state(state_path, &cloned_state);
+        let connection = rusqlite::Connection::open(&cloned_state).unwrap();
+        let (frozen, post): (String, String) = connection.query_row(
+            "SELECT frozen_inputs_json, post_commit_inputs_json FROM decision_pending WHERE source_trade_id = ?1",
+            rusqlite::params![source_trade_id.0], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let mut continuation: DecisionContinuationV3 = serde_json::from_str(&frozen).unwrap();
+        let mut evidence: DecisionPostBoundaryEvidence = serde_json::from_str(&post).unwrap();
+        assert!(
+            !continuation
+                .facts
+                .paper_freshness_policy
+                .unwrap()
+                .activity_ws_enabled
+        );
+        if mutation == "paper-policy" {
+            continuation
+                .facts
+                .paper_freshness_policy
+                .as_mut()
+                .unwrap()
+                .copy_latency_budget_secs = 3;
+        } else {
+            let clock = evidence
+                .body
+                .clocks
+                .iter_mut()
+                .find(|clock| clock.purpose == "paper_prepared_staleness_gate")
+                .unwrap();
+            assert_eq!(clock.submillisecond_nanos, Some(0));
+            clock.submillisecond_nanos = Some(1);
+        }
+        connection.execute(
+            "UPDATE decision_pending SET frozen_inputs_json = ?2, post_commit_inputs_json = ?3 WHERE source_trade_id = ?1",
+            rusqlite::params![source_trade_id.0, serde_json::to_string(&continuation).unwrap(),
+                serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(evidence.body).unwrap()).unwrap()],
+        ).unwrap();
+        drop(connection);
+        let state = PaperStateDb::open_read_only(&cloned_state).unwrap();
+        replay_decision_pending(
+            &state
+                .decision_pending_for(source_trade_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        drop(state);
+        let changed_digest = decision_evidence_digest(paper_path, &cloned_state);
+        assert_ne!(changed_digest, original_digest);
+        assert_qualify_insufficient(
+            paper_path,
+            source_path,
+            live_path,
+            &cloned_state,
+            seal_receipt,
+            &case.join("report.json"),
+            &format!(
+                "decision evidence digest mismatch: sealed {original_digest}, replayed {changed_digest}"
+            ),
+        );
+    }
 }
