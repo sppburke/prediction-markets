@@ -309,6 +309,7 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
         let _ = engine_tx.send(engine);
     });
     let now = OffsetDateTime::from_unix_timestamp(EPOCH + 10).unwrap();
+    let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let result = TradePoller::new(
         TradePollerConfig {
             base_url: BASE_URL.to_owned(),
@@ -332,7 +333,17 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
         None,
     )
     .with_clock(Arc::new(move || now))
-    .run_until(async {})
+    .with_progress(progress_tx)
+    .run_until(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            if matches!(
+                progress,
+                pe_service::trade_poller::PollerProgress::RoundCompleted
+            ) {
+                break;
+            }
+        }
+    })
     .await;
     assert!(result.is_ok(), "the complete reconciliation round finishes");
     ingest.await.unwrap();
@@ -420,6 +431,7 @@ async fn recorded_poll(
         commits
     });
     let now = OffsetDateTime::from_unix_timestamp(EPOCH + 10).unwrap();
+    let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let result = TradePoller::new(
         TradePollerConfig {
             base_url: BASE_URL.to_owned(),
@@ -443,7 +455,17 @@ async fn recorded_poll(
         None,
     )
     .with_clock(Arc::new(move || now))
-    .run_until(async {})
+    .with_progress(progress_tx)
+    .run_until(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            if matches!(
+                progress,
+                pe_service::trade_poller::PollerProgress::RoundCompleted
+            ) {
+                break;
+            }
+        }
+    })
     .await;
     assert!(result.is_ok(), "{result:?}");
     ingest.await.unwrap();
@@ -557,7 +579,18 @@ async fn poller_multipage_commitment_survives_restart() {
             pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
         );
     }
-    let commitment_frame = &frames[pages.len()];
+    let commitment_frame = frames
+        .iter()
+        .find(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
+        .unwrap();
+    assert!(
+        frames
+            .iter()
+            .filter(
+                |frame| frame.source_id.0 == pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID
+            )
+            .all(|frame| frame.seq < commitment_frame.seq)
+    );
     assert_eq!(
         commitment_frame.source_id.0,
         ACTIVITY_READ_COMMITMENT_SOURCE_ID
@@ -686,4 +719,1208 @@ async fn poller_multipage_commitment_survives_restart() {
         groups_before
     );
     assert_eq!(paper.open_decision_pending().unwrap(), rows);
+}
+
+// These barriers connect the actual poller to the durable coordinator and bucket owner. Each
+// response and completion is explicitly released; paused time never schedules a wallet read.
+struct RequestedPage {
+    url: String,
+    respond: oneshot::Sender<Vec<u8>>,
+}
+
+struct GatedFetcher {
+    requests: mpsc::Sender<RequestedPage>,
+}
+
+impl ReconciliationFetcher for GatedFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let (respond, response) = oneshot::channel();
+            self.requests
+                .send(RequestedPage {
+                    url: url.to_owned(),
+                    respond,
+                })
+                .await
+                .map_err(|_| SourceError::Fatal {
+                    message: "request barrier closed".to_owned(),
+                })?;
+            response.await.map_err(|_| SourceError::Fatal {
+                message: "response barrier closed".to_owned(),
+            })
+        })
+    }
+}
+
+enum ControlCompletion {
+    BucketCommitted,
+    Anchored(WalletAddress),
+    Boundary(i64),
+}
+
+struct RunningPoll {
+    append_ack_gate: Arc<tokio::sync::Semaphore>,
+    append_ack_arrived: Arc<tokio::sync::Notify>,
+    bucket_ack_gate: Arc<tokio::sync::Semaphore>,
+    controls: mpsc::Receiver<ControlCompletion>,
+    source: SourceLogHandle,
+    triggers: mpsc::Sender<pe_service::activity_ingest::ReconciliationTrigger>,
+    requests: mpsc::Receiver<RequestedPage>,
+    progress: mpsc::Receiver<pe_service::trade_poller::PollerProgress>,
+    stop: oneshot::Sender<()>,
+    poller: tokio::task::JoinHandle<Result<(), pe_service::trade_poller::TradePollerOwnerError>>,
+    ingest: tokio::task::JoinHandle<()>,
+    control: tokio::task::JoinHandle<Vec<RecordedBucket>>,
+    now: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl RunningPoll {
+    async fn observe(&self, row: Value) -> pe_event_log::AppendReceipt {
+        use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger};
+        let payload = serde_json::to_vec(&row).unwrap();
+        let parsed =
+            pe_source_polymarket_public::parse_activity_trade_observation(&payload).unwrap();
+        let received =
+            OffsetDateTime::from_unix_timestamp(self.now.load(Ordering::SeqCst)).unwrap();
+        let receipt = self
+            .source
+            .append(pe_event_log::EnvelopeIn {
+                source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_owned()),
+                schema_version: 2,
+                parser_version: 2,
+                observed_at: parsed.source_time.clone(),
+                received_at: ReceivedAt(received),
+                content_type: pe_event_log::ContentType::Json,
+                payload,
+            })
+            .await
+            .unwrap();
+        self.triggers
+            .send(ReconciliationTrigger {
+                wallet: parsed.wallet,
+                source_time: parsed.source_time.0,
+                source_trade_id: parsed.group_id.key().clone(),
+                provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
+                received_at: received,
+                receipt,
+            })
+            .await
+            .unwrap();
+        receipt
+    }
+
+    async fn completed(&mut self, target: WalletAddress) -> Vec<pe_event_log::AppendReceipt> {
+        while let Some(progress) = self.progress.recv().await {
+            if let pe_service::trade_poller::PollerProgress::Completed { wallet, selected } =
+                progress
+                && wallet == target
+            {
+                return selected;
+            }
+        }
+        unreachable!("poller completed channel closed");
+    }
+
+    async fn round_completed(&mut self) {
+        while let Some(progress) = self.progress.recv().await {
+            if matches!(
+                progress,
+                pe_service::trade_poller::PollerProgress::RoundCompleted
+            ) {
+                return;
+            }
+        }
+        unreachable!("round completion channel closed");
+    }
+
+    async fn finish(self) -> Vec<RecordedBucket> {
+        self.stop.send(()).unwrap();
+        self.poller.await.unwrap().unwrap();
+        drop(self.source);
+        drop(self.triggers);
+        self.ingest.await.unwrap();
+        self.control.await.unwrap()
+    }
+}
+
+fn start_recorded_poller(
+    dir: &tempfile::TempDir,
+    wallets: &[WalletAddress],
+) -> (RunningPoll, Arc<PaperStateDb>) {
+    start_recorded_poller_with_owner(dir, wallets, false)
+}
+
+fn start_recorded_poller_with_owner(
+    dir: &tempfile::TempDir,
+    wallets: &[WalletAddress],
+    real_owner: bool,
+) -> (RunningPoll, Arc<PaperStateDb>) {
+    start_recorded_poller_with_anchors(dir, wallets, real_owner, false)
+}
+
+fn start_recorded_poller_with_anchors(
+    dir: &tempfile::TempDir,
+    wallets: &[WalletAddress],
+    real_owner: bool,
+    anchors: bool,
+) -> (RunningPoll, Arc<PaperStateDb>) {
+    let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    for wallet in wallets {
+        paper.set_cursor(wallet, EPOCH - 10).unwrap();
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet: *wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: EPOCH - 10,
+            })
+            .unwrap();
+        paper
+            .install_anchors(&[AnchorInstallRecord {
+                wallet: *wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: EPOCH - 10,
+                anchored_at_unix: if anchors { EPOCH - 3_601 } else { EPOCH - 10 },
+                ledger_hash_after: "scenario-anchor".to_owned(),
+                positions_proof_hash: "scenario-positions".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: EPOCH - 10,
+            }])
+            .unwrap();
+    }
+    let source_path = dir.path().join("source.log");
+    let sink = SourceEventSink::open(&source_path).unwrap();
+    let receipts = pe_service::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap();
+    let (source, source_rx) = SourceLogHandle::channel(8);
+    let (trigger_tx, trigger_rx) = mpsc::channel(8);
+    let health = new_shared_health_with_ws(false, true, 90);
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(sink, source_rx, trigger_tx.clone(), health.clone())
+            .with_source_receipt_index(receipts.clone())
+            .run(),
+    );
+    let identity = Arc::new(AssetIdentityResolver::new_runtime(
+        Arc::new(GammaFetcher),
+        BASE_URL.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source.clone(),
+    ));
+    let append_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let append_ack_arrived = Arc::new(tokio::sync::Notify::new());
+    let bucket_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let actor_ack_gate = bucket_ack_gate.clone();
+    let (control_events, controls) = mpsc::channel(16);
+    let actor_paper = paper.clone();
+    let (control_tx, mut control_rx) = mpsc::channel(8);
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    let (real_tx, real_rx) = mpsc::channel(8);
+    let real = real_owner.then(|| {
+        let orchestrator = support::continuation_orchestrator(
+            paper.clone(),
+            &dir.path().join("paper.log"),
+            wallet(),
+            real_rx,
+            support::continuation_hooks(EPOCH),
+        );
+        tokio::spawn(orchestrator.run(std::future::pending::<()>()))
+    });
+    let control = tokio::spawn(async move {
+        let mut commits = Vec::new();
+        while let Some(command) = control_rx.recv().await {
+            match command {
+                OrchestratorControl::CommitActivityBucket {
+                    aggregates,
+                    context,
+                    committed,
+                } => {
+                    let result = if real_owner {
+                        let (committed, result) = oneshot::channel();
+                        real_tx
+                            .send(OrchestratorControl::CommitActivityBucket {
+                                aggregates: aggregates.clone(),
+                                context: context.clone(),
+                                committed,
+                            })
+                            .await
+                            .unwrap();
+                        result.await.unwrap().unwrap()
+                    } else {
+                        engine
+                            .commit_with_freshness_policy(
+                                aggregates.clone(),
+                                &context,
+                                zero_basis(),
+                                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                                    activity_ws_enabled: true,
+                                    copy_latency_budget_secs: 2,
+                                }),
+                            )
+                            .unwrap()
+                    };
+                    commits.push((aggregates, context, result.clone()));
+                    let _ = control_events
+                        .send(ControlCompletion::BucketCommitted)
+                        .await;
+                    let _permit = actor_ack_gate.acquire().await.unwrap();
+                    let _ = committed.send(Ok(result));
+                }
+                OrchestratorControl::DailyBoundary {
+                    acknowledged,
+                    cutoff_unix,
+                    ..
+                } => {
+                    let _ = control_events
+                        .send(ControlCompletion::Boundary(cutoff_unix))
+                        .await;
+                    let _ = acknowledged.send(Ok(()));
+                }
+                OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
+                    let _ = acknowledged.send(());
+                }
+                OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let _ = captured.send(
+                        pe_service::position_seeder::ledger_capture(
+                            engine.ledger(),
+                            &actor_paper,
+                            wallet,
+                        )
+                        .map_err(|error| error.to_string()),
+                    );
+                }
+                OrchestratorControl::InstallAnchors {
+                    installs,
+                    acknowledged,
+                } => {
+                    let result = engine.install_anchors(&installs);
+                    if result.is_ok() {
+                        for install in &installs {
+                            let _ = control_events
+                                .send(ControlCompletion::Anchored(install.wallet))
+                                .await;
+                        }
+                    }
+                    let _ = acknowledged.send(result);
+                }
+                _ => unreachable!("unexpected control"),
+            }
+        }
+        drop(real_tx);
+        if let Some(real) = real {
+            real.await.unwrap();
+        }
+        commits
+    });
+    let (requests_tx, requests) = mpsc::channel(8);
+    let (progress_tx, progress) = mpsc::channel(64);
+    let (stop, stopped) = oneshot::channel();
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(EPOCH));
+    let clock = now.clone();
+    let mut membership = watchlist();
+    membership.entries = wallets
+        .iter()
+        .map(|wallet| {
+            let mut entry = watchlist().entries.remove(0);
+            entry.wallet = *wallet;
+            entry
+        })
+        .collect();
+    membership.active_count = wallets.len();
+    let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(GatedFetcher {
+        requests: requests_tx,
+    });
+    let preparer = anchors.then(|| {
+        pe_service::watchlist_admission::AdmissionPreparer::with_validator(
+            control_tx.clone(),
+            paper.clone(),
+            pe_service::position_seeder::CausalPositionValidator::new(
+                fetcher.clone(),
+                BASE_URL,
+                "scenario",
+                identity.clone(),
+            )
+            .with_clock(Arc::new(|| EPOCH)),
+        )
+    });
+    let mut obligations = ReconciliationObligations::default();
+    if anchors {
+        obligations.set_boundary_anchor(EPOCH.div_euclid(86_400) * 86_400 - 86_400);
+    }
+    let poller = TradePoller::new(
+        TradePollerConfig {
+            base_url: BASE_URL.to_owned(),
+            poll_interval_secs: 30,
+            activity_ws_enabled: true,
+            copy_latency_budget_secs: 2,
+        },
+        LiveWatchlist::new(membership),
+        fetcher,
+        identity,
+        source
+            .clone()
+            .with_append_ack_gate(append_ack_gate.clone(), append_ack_arrived.clone()),
+        trigger_rx,
+        control_tx,
+        paper.clone(),
+        health,
+        SignalConfig::default(),
+        LiveRuntimeConfig::new(RuntimeConfig::from_service_config(
+            &pe_service::config::ServiceConfig::default(),
+        )),
+        obligations,
+        preparer,
+    )
+    .with_source_receipt_index(receipts)
+    .with_clock(Arc::new(move || {
+        OffsetDateTime::from_unix_timestamp(clock.load(Ordering::SeqCst)).unwrap()
+    }))
+    .with_progress(progress_tx);
+    let poller = tokio::spawn(poller.run_until(async move {
+        let _ = stopped.await;
+    }));
+    (
+        RunningPoll {
+            append_ack_gate,
+            append_ack_arrived,
+            bucket_ack_gate,
+            controls,
+            source,
+            triggers: trigger_tx,
+            requests,
+            progress,
+            stop,
+            poller,
+            ingest,
+            control,
+            now,
+        },
+        paper,
+    )
+}
+
+fn stream_row(wallet: WalletAddress, transaction: &str, epoch: i64) -> Value {
+    let mut row = activity_row("TRADE", transaction, MARKET_B, "BUY", "1", "asset-b", epoch);
+    row["proxyWallet"] = json!(wallet.to_string());
+    row
+}
+
+/// PASS: a durable trigger starts a request before the thirty-second cadence advances.
+#[tokio::test(start_paused = true)]
+async fn urgent_trigger_wakes_idle_poller() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let ready_at = tokio::time::Instant::now();
+    let row = stream_row(wallet(), "idle-wake", EPOCH);
+    running.observe(row.clone()).await;
+    let request = running.requests.recv().await.unwrap();
+    assert_eq!(
+        tokio::time::Instant::now(),
+        ready_at,
+        "an urgent trigger must not wait for a cadence timer"
+    );
+    assert!(request.url.contains(&format!("end={EPOCH}")));
+    request
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&row)).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    assert!(
+        paper
+            .activity_group_state(aggregate(row).group_id.key())
+            .unwrap()
+            .is_some()
+    );
+    let commits = running.finish().await;
+    assert_eq!(commits.len(), 1);
+}
+
+/// PASS: B commits while A's backstop response remains held, using at most the two named slots.
+#[tokio::test(start_paused = true)]
+async fn urgent_wallet_progresses_while_unrelated_read_is_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet(), other]);
+    let blocked = running.requests.recv().await.unwrap();
+    let row = stream_row(other, "independent", EPOCH);
+    running.observe(row.clone()).await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&other.to_string()));
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    running.completed(other).await;
+    assert_eq!(
+        paper
+            .activity_groups_after(&other, EPOCH - 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(running.requests.try_recv().is_err());
+    // Stop admission while A is still started; its complete operation must drain.
+    running.stop.send(()).unwrap();
+    blocked.respond.send(b"[]".to_vec()).unwrap();
+    running.poller.await.unwrap().unwrap();
+    drop(running.source);
+    drop(running.triggers);
+    running.ingest.await.unwrap();
+    assert_eq!(running.control.await.unwrap().len(), 1);
+}
+
+/// PASS: duplicate reader receipts share one frozen attempt and one durable economic group.
+#[tokio::test(start_paused = true)]
+async fn duplicate_readers_share_one_frozen_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    let initial = running.requests.recv().await.unwrap();
+    let row = stream_row(wallet(), "three-readers", EPOCH);
+    let first = running.observe(row.clone()).await;
+    running.observe(row.clone()).await;
+    running.observe(row.clone()).await;
+    initial.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![first]);
+    let commits = running.finish().await;
+    assert_eq!(commits.len(), 1);
+    assert_eq!(
+        paper
+            .activity_groups_after(&wallet(), EPOCH - 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        commits[0]
+            .1
+            .observed_source_receipts
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first]
+    );
+}
+
+/// PASS: later arrivals cannot enlarge the selected receipts while a read is held or retried.
+#[tokio::test(start_paused = true)]
+async fn continuous_arrivals_do_not_expand_attempt_frontier() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let original = stream_row(wallet(), "frontier-original", EPOCH);
+    let first = running.observe(original.clone()).await;
+    let held = running.requests.recv().await.unwrap();
+    let later = stream_row(wallet(), "frontier-later", EPOCH);
+    let second = running.observe(later.clone()).await;
+    held.respond.send(b"[]".to_vec()).unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![first]);
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[original]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![first]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[later]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![second]);
+    running.finish().await;
+}
+
+/// PASS: notifications in one second cannot repeat a successful unmatched read; expiry uses backstop.
+#[tokio::test(start_paused = true)]
+async fn unmatched_retry_requires_advancing_fixed_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let row = stream_row(wallet(), "not-indexed", EPOCH);
+    let first = running.observe(row.clone()).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.completed(wallet()).await;
+    for _ in 0..3 {
+        running.observe(row.clone()).await;
+    }
+    assert!(running.requests.try_recv().is_err());
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let request = running.requests.recv().await.unwrap();
+    assert!(request.url.contains(&format!("end={}", EPOCH + 1)));
+    request.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
+    running.now.store(EPOCH + 3, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(running.requests.try_recv().is_err());
+    running
+        .observe(stream_row(wallet(), "arrived-after-expiry", EPOCH + 3))
+        .await;
+    assert!(running.requests.try_recv().is_err());
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(27)).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    assert_eq!(
+        running.completed(wallet()).await,
+        vec![first],
+        "expiry retains the original frontier for the ordinary backstop"
+    );
+    running.finish().await;
+}
+
+/// PASS: history at either adjacent second keeps its canonical epoch and ages from the older clock.
+#[tokio::test(start_paused = true)]
+async fn cross_second_binding_preserves_history_order_and_oldest_age() {
+    for delta in [-1, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        let stream = stream_row(wallet(), "two-clocks", EPOCH);
+        running.observe(stream).await;
+        let request = running.requests.recv().await.unwrap();
+        // A +1 history row becomes available on the next fixed end, without changing the frontier.
+        let request = if delta == 1 {
+            request.respond.send(b"[]".to_vec()).unwrap();
+            running.completed(wallet()).await;
+            running.now.store(EPOCH + 1, Ordering::SeqCst);
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            running.requests.recv().await.unwrap()
+        } else {
+            request
+        };
+        running.now.store(EPOCH + 3, Ordering::SeqCst);
+        let history = stream_row(wallet(), "two-clocks", EPOCH + delta);
+        let id = aggregate(history.clone()).group_id.key().clone();
+        request
+            .respond
+            .send(serde_json::to_vec(&[history]).unwrap())
+            .unwrap();
+        running.completed(wallet()).await;
+        let commits = running.finish().await;
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].2.source_epoch, EPOCH + delta);
+        let disposition = commits[0].1.no_copy_dispositions.get(&id).unwrap();
+        assert_eq!(disposition.age_secs, 3 - delta.min(0));
+        assert_eq!(
+            paper
+                .activity_group_state(&id)
+                .unwrap()
+                .unwrap()
+                .source_epoch,
+            EPOCH + delta
+        );
+        let commitment = source_frames(&dir.path().join("source.log"))
+            .into_iter()
+            .find(|frame| {
+                frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+            })
+            .unwrap();
+        let commitment: pe_service::bucket_commit::ActivityReadCommitment =
+            serde_json::from_slice(&commitment.payload).unwrap();
+        assert_eq!(commitment.bindings.unwrap().len(), 1);
+    }
+}
+
+/// PASS: the real orchestrator freezes and terminalizes a corrected observation; indexed raw
+/// history/stream/Gamma reconstruction and restart retain the correction.
+#[tokio::test(start_paused = true)]
+async fn corrected_identity_binding_replays_from_raw_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let mut stream = stream_row(wallet(), "identity-correction", EPOCH);
+    stream["conditionId"] = json!(MARKET_A);
+    stream["outcomeIndex"] = json!(1);
+    let stream_receipt = running.observe(stream).await;
+    let history = stream_row(wallet(), "identity-correction", EPOCH);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[history]).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.finish().await;
+    let rows = paper.decision_pending_history().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].state,
+        pe_paper_state::DecisionPendingState::Terminal
+    );
+    let continuation =
+        pe_service::bucket_commit::DecisionContinuationV3::from_durable(&rows[0]).unwrap();
+    assert_eq!(continuation.version(), 5);
+    let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+        .unwrap();
+    let observation = continuation
+        .observation_from_receipt_index(&index)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation.source_receipt, stream_receipt);
+    assert_eq!(
+        continuation.incoming_trade().unwrap().market_id,
+        market(MARKET_B)
+    );
+    pe_service::decision_replay::replay_decision_pending(&rows[0]).unwrap();
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+/// PASS: source legs stay separate; multiple candidates for corrected stamps create the existing
+/// invalid-mapping fence and never manufacture a binding to an arbitrary target.
+#[tokio::test(start_paused = true)]
+async fn transaction_legs_remain_distinct_during_correlation() {
+    for (previous_epoch, verified_mapping) in [
+        (None, true),
+        (Some(EPOCH), true),
+        (Some(EPOCH - 1), true),
+        (None, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(previous_epoch.map_or_else(
+                || b"[]".to_vec(),
+                |epoch| serde_json::to_vec(&[stream_row(wallet(), "many-legs", epoch)]).unwrap(),
+            ))
+            .unwrap();
+        running.round_completed().await;
+        let mut stream = stream_row(wallet(), "many-legs", EPOCH);
+        stream["conditionId"] = json!("incorrect-stamp");
+        let mut buy = stream_row(wallet(), "many-legs", EPOCH);
+        if !verified_mapping {
+            stream["asset"] = json!("unverified-asset");
+            buy["asset"] = json!("unverified-asset");
+        }
+        running.observe(stream).await;
+        let mut other_outcome = buy.clone();
+        other_outcome["outcomeIndex"] = json!(1);
+        let mut sell = buy.clone();
+        sell["side"] = json!("SELL");
+        let mut asset = buy.clone();
+        asset["asset"] = json!("other-asset");
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(&[buy.clone(), buy, other_outcome, sell, asset]).unwrap())
+            .unwrap();
+        running.completed(wallet()).await;
+        let commits = running.finish().await;
+        if !verified_mapping {
+            assert!(commits.is_empty());
+            assert!(paper.wallet_fences().unwrap().is_empty());
+            assert_eq!(
+                pe_service::trade_poller::rebuild_reconciliation_obligations(
+                    &dir.path().join("source.log"),
+                    &paper
+                )
+                .unwrap()
+                .len(),
+                1,
+                "raw candidates without a verified mapping remain outstanding"
+            );
+            continue;
+        }
+        assert_eq!(commits.len(), if previous_epoch.is_some() { 2 } else { 1 });
+        let commits = &commits[commits.len() - 1..];
+        assert_eq!(commits[0].0.len(), 4);
+        assert_eq!(
+            commits[0]
+                .0
+                .iter()
+                .map(|aggregate| aggregate.row_count)
+                .sum::<u64>(),
+            5
+        );
+        assert_eq!(
+            commits[0].2.newly_fenced,
+            Some(pe_position_ledger::WalletFenceCause::InvalidMapping)
+        );
+        assert!(commits[0].2.pending.is_empty());
+        let frame = source_frames(&dir.path().join("source.log"))
+            .into_iter()
+            .rfind(|frame| {
+                frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+            })
+            .unwrap();
+        let commitment: pe_service::bucket_commit::ActivityReadCommitment =
+            serde_json::from_slice(&frame.payload).unwrap();
+        assert_eq!(
+            commitment.bindings,
+            Some(Vec::new()),
+            "ambiguity never fabricates a target binding"
+        );
+        for target in &commits[0].0 {
+            assert!(
+                paper
+                    .activity_revision_disposed(
+                        target.group_id.key(),
+                        target.semantic_revision.as_str()
+                    )
+                    .unwrap()
+            );
+        }
+        if let Some(epoch) = previous_epoch {
+            let original = aggregate(stream_row(wallet(), "many-legs", epoch));
+            assert_eq!(
+                paper
+                    .activity_group_state(original.group_id.key())
+                    .unwrap()
+                    .unwrap()
+                    .source_epoch,
+                epoch
+            );
+        }
+        let fence = paper.wallet_fences().unwrap().remove(0);
+        assert_eq!(fence.cause, "invalid_mapping");
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &dir.path().join("source.log"),
+                &paper
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}
+
+fn write_source_prefix(path: &std::path::Path, frames: &[pe_event_log::EventEnvelope]) {
+    let mut writer = pe_event_log::Writer::open(path).unwrap();
+    for frame in frames {
+        writer
+            .append_synced(pe_event_log::EnvelopeIn {
+                source_id: frame.source_id.clone(),
+                schema_version: frame.schema_version,
+                parser_version: frame.parser_version,
+                observed_at: frame.observed_at.clone(),
+                received_at: frame.received_at.clone(),
+                content_type: frame.content_type.clone(),
+                payload: frame.payload.clone(),
+            })
+            .unwrap();
+    }
+}
+
+/// PASS: pages and a binding commitment retain work until the exact target revision has a
+/// durable disposition; a retained predecessor alone cannot acknowledge a revised aggregate.
+#[tokio::test(start_paused = true)]
+async fn binding_restart_requires_durable_target_revision() {
+    for revision_fence in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+        let mut history = stream_row(wallet(), "restart-revision", EPOCH);
+        if revision_fence {
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(serde_json::to_vec(&[history.clone()]).unwrap())
+                .unwrap();
+        } else {
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(b"[]".to_vec())
+                .unwrap();
+        }
+        running.round_completed().await;
+        let mut stream = history.clone();
+        stream["conditionId"] = json!("old-stream-stamp");
+        running.observe(stream).await;
+        if revision_fence {
+            history["size"] = json!("2");
+        }
+        let request = running.requests.recv().await.unwrap();
+        let before = dir.path().join("before.db");
+        // Existing SQLite backup owner preserves the pre-attempt durable state.
+        rusqlite::Connection::open(dir.path().join("paper.db"))
+            .unwrap()
+            .execute("VACUUM INTO ?1", [before.to_str().unwrap()])
+            .unwrap();
+        request
+            .respond
+            .send(serde_json::to_vec(&[history.clone()]).unwrap())
+            .unwrap();
+        running.completed(wallet()).await;
+        running.finish().await;
+        let frames = source_frames(&dir.path().join("source.log"));
+        let commitment_index = frames
+            .iter()
+            .rposition(|frame| {
+                frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+            })
+            .unwrap();
+        for (name, count) in [
+            ("pages", commitment_index),
+            ("commitment", commitment_index + 1),
+        ] {
+            let path = dir.path().join(format!("{name}.log"));
+            write_source_prefix(&path, &frames[..count]);
+            let before = PaperStateDb::open(&before).unwrap();
+            assert_eq!(
+                pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &before)
+                    .unwrap()
+                    .len(),
+                1,
+                "{name}"
+            );
+        }
+        let target = aggregate(history);
+        assert!(
+            paper
+                .activity_revision_disposed(
+                    target.group_id.key(),
+                    target.semantic_revision.as_str()
+                )
+                .unwrap()
+        );
+        if revision_fence {
+            assert_ne!(
+                paper
+                    .activity_group_state(target.group_id.key())
+                    .unwrap()
+                    .unwrap()
+                    .semantic_revision,
+                target.semantic_revision.as_str()
+            );
+        }
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &dir.path().join("source.log"),
+                &paper
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}
+
+/// PASS: altered bindings, digest inputs and commitment generations are rejected by boot, and
+/// a continuation cannot substitute the tampered commitment receipt.
+#[tokio::test(start_paused = true)]
+async fn binding_tamper_and_generation_substitution_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let mut stream = stream_row(wallet(), "tamper-binding", EPOCH);
+    stream["conditionId"] = json!("stream-stamp");
+    running.observe(stream).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[stream_row(wallet(), "tamper-binding", EPOCH)]).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.finish().await;
+    let original = source_frames(&dir.path().join("source.log"));
+    let pending = paper.open_decision_pending().unwrap().remove(0);
+    let continuation =
+        pe_service::bucket_commit::DecisionContinuationV3::from_durable(&pending).unwrap();
+    for change in [
+        "bindings",
+        "revision",
+        "group",
+        "stream_receipt",
+        "occurrence",
+        "metadata",
+        "digest",
+        "schema",
+        "parser",
+        "version",
+        "read_proof",
+    ] {
+        let mut frames = original.clone();
+        let frame = frames
+            .iter_mut()
+            .find(|frame| {
+                frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+            })
+            .unwrap();
+        let mut value: Value = serde_json::from_slice(&frame.payload).unwrap();
+        match change {
+            "bindings" => value["bindings"] = json!([]),
+            "revision" => value["bindings"][0]["semantic_revision"] = json!("changed"),
+            "group" => value["bindings"][0]["stream_group_id"] = json!("g2:changed"),
+            "stream_receipt" => value["bindings"][0]["stream_receipt"]["sequence"] = json!(0),
+            "occurrence" => value["bindings"][0]["page_occurrence_index"] = json!(99),
+            "metadata" => {
+                value["bindings"][0]["identity_provenance"]["source_log_sequence"] = json!(0)
+            }
+            "digest" => value["digest"] = json!("00".repeat(32)),
+            "schema" => frame.schema_version = 1,
+            "parser" => frame.parser_version = 2,
+            "version" => value["version"] = json!(1),
+            "read_proof" => {
+                value.as_object_mut().unwrap().remove("read_proof");
+            }
+            _ => unreachable!(),
+        }
+        frame.payload = serde_json::to_vec(&value).unwrap();
+        let path = dir.path().join(format!("{change}.log"));
+        write_source_prefix(&path, &frames);
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &paper).is_err(),
+            "{change}"
+        );
+        let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+        assert!(
+            continuation.observation_from_receipt_index(&index).is_err(),
+            "{change}"
+        );
+    }
+}
+
+/// PASS: shutdown leaves a held wallet operation alive through its page append and bucket ack;
+/// queued work never starts after shutdown, and every task joins.
+#[tokio::test(start_paused = true)]
+async fn shutdown_drains_started_wallet_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    let request = running.requests.recv().await.unwrap();
+    running
+        .observe(stream_row(wallet(), "queued-at-stop", EPOCH))
+        .await;
+    let held_append = running
+        .append_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let held_bucket = running
+        .bucket_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    running.stop.send(()).unwrap();
+    assert!(!running.poller.is_finished());
+    let history = stream_row(wallet(), "started-before-stop", EPOCH);
+    request
+        .respond
+        .send(serde_json::to_vec(&[history]).unwrap())
+        .unwrap();
+    running.append_ack_arrived.notified().await;
+    assert!(
+        !running.poller.is_finished(),
+        "the durable page acknowledgement is still held"
+    );
+    assert!(
+        paper
+            .activity_groups_after(&wallet(), EPOCH - 1)
+            .unwrap()
+            .is_empty()
+    );
+    drop(held_append);
+    loop {
+        if matches!(
+            running.controls.recv().await.unwrap(),
+            ControlCompletion::BucketCommitted
+        ) {
+            break;
+        }
+    }
+    assert!(
+        !running.poller.is_finished(),
+        "the durable bucket acknowledgement is still held"
+    );
+    drop(held_bucket);
+    running.poller.await.unwrap().unwrap();
+    assert!(running.requests.try_recv().is_err());
+    drop(running.source);
+    drop(running.triggers);
+    running.ingest.await.unwrap();
+    assert_eq!(running.control.await.unwrap().len(), 1);
+    assert_eq!(
+        paper
+            .activity_groups_after(&wallet(), EPOCH - 1)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// PASS: held urgent reads coexist with finite backstop revisits, both anchor classes, and the
+/// oldest ready boundary. A source receipt outside the boundary receive window cannot starve it.
+#[tokio::test(start_paused = true)]
+async fn urgent_load_preserves_backstop_anchor_and_boundary_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let age_due = WalletAddress([0xbb; 20]);
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet(), age_due], false, true);
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+            [wallet().to_string()],
+        )
+        .unwrap();
+    let first = running.requests.recv().await.unwrap();
+    let urgent_wallet = WalletAddress([0xcc; 20]);
+    running
+        .observe(stream_row(urgent_wallet, "urgent-during-reanchor", EPOCH))
+        .await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&urgent_wallet.to_string()));
+    first.respond.send(b"[]".to_vec()).unwrap();
+    // Keep urgent HTTP held while the independent slot completes its background round and bracket.
+    let anchored = loop {
+        tokio::select! {
+            request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
+            event = running.controls.recv() => if let ControlCompletion::Anchored(wallet) = event.unwrap() { break wallet; },
+        }
+    };
+    assert_eq!(anchored, wallet());
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let cutoff = loop {
+        if let ControlCompletion::Boundary(cutoff) = running.controls.recv().await.unwrap() {
+            break cutoff;
+        }
+    };
+    assert_eq!(cutoff, EPOCH.div_euclid(86_400) * 86_400);
+    urgent
+        .respond
+        .send(
+            serde_json::to_vec(&[stream_row(urgent_wallet, "urgent-during-reanchor", EPOCH)])
+                .unwrap(),
+        )
+        .unwrap();
+    running.completed(urgent_wallet).await;
+    let second_urgent = WalletAddress([0xdd; 20]);
+    running
+        .observe(stream_row(
+            second_urgent,
+            "urgent-during-age-refresh",
+            EPOCH,
+        ))
+        .await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&second_urgent.to_string()));
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let anchored = loop {
+        tokio::select! {
+            request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
+            event = running.controls.recv() => if let ControlCompletion::Anchored(wallet) = event.unwrap() { break wallet; },
+        }
+    };
+    assert_eq!(anchored, age_due);
+    urgent
+        .respond
+        .send(
+            serde_json::to_vec(&[stream_row(
+                second_urgent,
+                "urgent-during-age-refresh",
+                EPOCH,
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+    running.completed(second_urgent).await;
+    running.finish().await;
 }

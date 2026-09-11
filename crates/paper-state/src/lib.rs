@@ -889,6 +889,25 @@ impl PaperStateDb {
         .map_err(PaperStateError::from)
     }
 
+    /// Whether this exact aggregate revision has a durable disposition, including a refused
+    /// revision whose predecessor remains the immutable `activity_groups` row.
+    pub fn activity_revision_disposed(
+        &self,
+        source_trade_id: &SourceTradeId,
+        semantic_revision: &str,
+    ) -> Result<bool, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM activity_group_revisions \
+                 WHERE source_trade_id = ?1 AND semantic_revision = ?2) \
+                 OR EXISTS(SELECT 1 FROM activity_groups \
+                 WHERE source_trade_id = ?1 AND semantic_revision = ?2)",
+                params![source_trade_id.0, semantic_revision],
+                |row| row.get(0),
+            )
+            .map_err(PaperStateError::from)
+    }
+
     /// Greatest fully committed version-two bucket epoch for one wallet.
     pub fn last_activity_group_epoch(
         &self,

@@ -1029,7 +1029,7 @@ async fn main() -> Result<()> {
             return Ok(TaskExit::ChannelClosed("producer_start"));
         }
         activity_ingest
-            .run_until(activity_shutdown.wait_for(ShutdownPhase::StopProducers))
+            .run_until(activity_shutdown.wait_for(ShutdownPhase::StopSinks))
             .await
             .map(|()| TaskExit::CleanShutdown)
             .map_err(TaskFailure::typed)
@@ -1047,6 +1047,7 @@ async fn main() -> Result<()> {
     let poller_runtime_config = live_runtime_config.clone();
     let poller_admission_preparer = admission_preparer.clone();
     let poller_asset_identity = Arc::clone(&asset_identity);
+    let poller_source_receipts = source_receipts.clone();
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -1072,6 +1073,7 @@ async fn main() -> Result<()> {
             obligations,
             Some(poller_admission_preparer),
         )
+        .with_source_receipt_index(poller_source_receipts)
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
         .await
         .map(|()| TaskExit::CleanShutdown)
@@ -1658,7 +1660,6 @@ async fn main() -> Result<()> {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopProducers);
     let producers = [
-        TaskName::ActivityIngest,
         TaskName::PublicActivityPoll,
         TaskName::ResolutionPoller,
         TaskName::LiveAccountsPoller,
@@ -1679,6 +1680,9 @@ async fn main() -> Result<()> {
 
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopSinks);
     let sinks = [
+        // Source acknowledgements remain available while wallet operations and the
+        // serialized control owner drain.
+        TaskName::ActivityIngest,
         TaskName::LiveFanout,
         TaskName::SupabaseAnalyticsSink,
         TaskName::LiquiditySnapshotWorker,

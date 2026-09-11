@@ -793,3 +793,112 @@ fn continuation_validation_reads_only_referenced_frames() {
         "validation read {read} bytes with {referenced_bytes} referenced bytes and {padding_bytes} padding bytes"
     );
 }
+
+/// PASS: the installed boot reducer collects a cross-second binding in its existing walk,
+/// retains the original obligation without a target disposition, and clears it after the
+/// same target revision commits. It agrees with the fallback reducer at both boundaries.
+#[test]
+fn installed_boot_binding_requires_its_durable_target() {
+    let (_dir, paths) = installed_fixture();
+    let wallet = WalletAddress::from_hex(WALLET).unwrap();
+    let mut writer = Writer::open(&paths.source_log).unwrap();
+    let stream_payload = activity_payload("binding-installed-boot", NOW_UNIX + 1);
+    let stream =
+        pe_source_polymarket_public::parse_activity_trade_observation(&stream_payload).unwrap();
+    let stream_receipt = writer
+        .append_synced(envelope(
+            ACTIVITY_WS_SOURCE_ID,
+            2,
+            2,
+            &stream_payload,
+            NOW_UNIX + 1,
+        ))
+        .unwrap();
+    let mut history: serde_json::Value = serde_json::from_slice(&stream_payload).unwrap();
+    history["timestamp"] = serde_json::json!(NOW_UNIX + 2);
+    history["type"] = serde_json::json!("TRADE");
+    history["usdcSize"] = serde_json::json!("50");
+    let (read, _) = support::append_committed_read_v2(
+        &mut writer,
+        wallet,
+        &serde_json::to_vec(&[history]).unwrap(),
+        NOW_UNIX + 3,
+        NOW_UNIX + 3,
+    );
+    let target = &read.aggregates[0];
+    let proof: serde_json::Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
+    let pages = serde_json::from_value::<
+        Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
+    >(proof["pages"].clone())
+    .unwrap();
+    let binding = pe_service::bucket_commit::ObservationBinding {
+        stream_group_id: stream.group_id.key().clone(),
+        stream_receipt,
+        history_group_id: target.group_id.key().clone(),
+        semantic_revision: target.semantic_revision.as_str().to_owned(),
+        page_raw_hash: read.page.raw_hash.clone(),
+        page_occurrence_index: 0,
+        identity_provenance: None,
+        identity_receipt: None,
+    };
+    let payload = pe_service::bucket_commit::activity_read_commitment_payload_v2(
+        wallet,
+        NOW_UNIX + 3,
+        std::slice::from_ref(&read.page),
+        &pages,
+        &[binding],
+    )
+    .unwrap();
+    let commitment = writer
+        .append_synced(envelope(
+            pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+            2,
+            1,
+            &payload,
+            NOW_UNIX + 3,
+        ))
+        .unwrap();
+    drop(writer);
+    let paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+    for disposed in [false, true] {
+        if disposed {
+            support::install_empty_anchor(&paper, wallet, 0);
+            let mut engine = pe_service::bucket_commit::BucketCommitEngine::load(
+                paper.clone(),
+                pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
+            )
+            .unwrap();
+            let mut context = support::read_context(&read, commitment, NOW_UNIX + 3);
+            context
+                .observed_source_receipts
+                .insert(target.group_id.key().clone(), stream_receipt);
+            context.observation_provenance.insert(
+                target.group_id.key().clone(),
+                pe_copy_signal_engine::TradeProvenance::ActivityWs,
+            );
+            engine
+                .commit_with_freshness_policy(
+                    read.aggregates.clone(),
+                    &context,
+                    pe_service::bucket_commit::FrozenDecisionBasis {
+                        win_rate_p: pe_core_types::Probability::ZERO,
+                        bankroll: rust_decimal::Decimal::ZERO,
+                    },
+                    Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                        activity_ws_enabled: true,
+                        copy_latency_budget_secs: 2,
+                    }),
+                )
+                .unwrap();
+        }
+        let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        let mut boot = opened.boot;
+        let mut sink = opened.sink;
+        boot.extend(&mut sink).unwrap();
+        let published = boot.obligations(&paper, &paths.paper_log).unwrap();
+        let rebuilt = rebuild_reconciliation_obligations(&paths.source_log, &paper).unwrap();
+        assert_eq!(published, rebuilt);
+        assert_eq!(published.len(), usize::from(!disposed));
+        boot.verify_handoff(&mut sink).unwrap();
+    }
+}

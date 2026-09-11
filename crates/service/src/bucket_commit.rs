@@ -391,6 +391,72 @@ impl DecisionContinuationV3 {
         &self.page_occurrences
     }
 
+    fn read_verification(&self) -> ActivityReadVerification<'_> {
+        ActivityReadVerification {
+            version: self.version,
+            wallet: self.facts.wallet,
+            decision_inputs: &self.facts.decision_inputs,
+            page_occurrences: &self.page_occurrences,
+            read_commitment: self.read_commitment,
+        }
+    }
+
+    pub(crate) fn reconstruct_complete_activity_read<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<Vec<ActivityAggregate>, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        self.read_verification()
+            .reconstruct_complete_activity_read(lookup)
+    }
+
+    pub(crate) fn commitment_contract(&self) -> Option<(u32, u32)> {
+        self.read_verification().commitment_contract()
+    }
+
+    fn verify_read_commitment<L, E>(
+        &self,
+        fixed_end: i64,
+        pages: &[ReconciliationPageEvidence],
+        lookup: &mut L,
+    ) -> Result<Option<ActivityReadCommitment>, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        self.read_verification()
+            .verify_read_commitment(fixed_end, pages, lookup)
+    }
+
+    pub(crate) fn verify_stream_binding<L, E>(
+        &self,
+        target_id: &SourceTradeId,
+        receipt: AppendReceipt,
+        lookup: &mut L,
+    ) -> Result<SourceTimestamp, CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        self.read_verification()
+            .verify_stream_binding(target_id, receipt, lookup)
+    }
+}
+
+// The same read verifier serves a continuation and a commitment-only boot candidate. It owns
+// no decision, defaults, financial state, or persistence; all inputs are borrowed recorded proof.
+struct ActivityReadVerification<'a> {
+    version: u16,
+    wallet: WalletAddress,
+    decision_inputs: &'a Value,
+    page_occurrences: &'a [PageOccurrence],
+    read_commitment: Option<AppendReceipt>,
+}
+
+impl ActivityReadVerification<'_> {
     /// Reconstruct one frozen fixed-end activity read from its exact receipt occurrences.
     ///
     /// Page evidence is joined with multiplicity, every retained payload is parsed and checked,
@@ -404,12 +470,12 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
-        let wire: CompleteActivityReadWire =
-            serde_json::from_value(self.facts.decision_inputs.clone()).map_err(|error| {
-                complete_activity_read_error(format!(
-                    "decision complete activity read is invalid: {error}"
-                ))
-            })?;
+        let wire: CompleteActivityReadWire = serde_json::from_value(self.decision_inputs.clone())
+            .map_err(|error| {
+            complete_activity_read_error(format!(
+                "decision complete activity read is invalid: {error}"
+            ))
+        })?;
         if wire.fixed_end.is_some() != wire.pages.is_some() {
             return Err(complete_activity_read_error(
                 "decision complete activity read proof is partial",
@@ -531,11 +597,20 @@ impl DecisionContinuationV3 {
         let expected_version = if self.version == 5 { 2 } else { 1 };
         if commitment.version != expected_version
             || (expected_version == 2) != commitment.bindings.is_some()
-            || commitment.wallet != self.facts.wallet
+            || commitment.wallet != self.wallet
             || commitment.fixed_end != fixed_end
         {
             return Err(complete_activity_read_error(
                 "complete activity read commitment differs from its frozen proof",
+            ));
+        }
+        if let Some(proof) = &commitment.read_proof
+            && (self.version != 5
+                || proof.page_occurrences != self.page_occurrences
+                || proof.pages != pages)
+        {
+            return Err(complete_activity_read_error(
+                "commitment read proof differs from its frozen proof",
             ));
         }
         if let Some(bindings) = &commitment.bindings
@@ -546,9 +621,9 @@ impl DecisionContinuationV3 {
             ));
         }
         let digest = activity_read_digest_versioned(
-            self.facts.wallet,
+            self.wallet,
             fixed_end,
-            &self.page_occurrences,
+            self.page_occurrences,
             pages,
             commitment.bindings.as_deref(),
         )?;
@@ -576,13 +651,12 @@ impl DecisionContinuationV3 {
         let commitment_receipt = self
             .read_commitment
             .ok_or_else(|| complete_activity_read_error("binding commitment receipt is absent"))?;
-        let proof: CompleteActivityReadWire =
-            serde_json::from_value(self.facts.decision_inputs.clone())
-                .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        let proof: CompleteActivityReadWire = serde_json::from_value(self.decision_inputs.clone())
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         let pages = proof
             .pages
             .ok_or_else(|| complete_activity_read_error("binding read pages are absent"))?;
-        let joined = joined_read_pages(&self.page_occurrences, &pages)?;
+        let joined = joined_read_pages(self.page_occurrences, &pages)?;
         for binding in bindings {
             if binding.stream_receipt.sequence >= commitment_receipt.sequence
                 || binding
@@ -598,7 +672,7 @@ impl DecisionContinuationV3 {
                     "binding stream receipt lookup failed: {error}"
                 ))
             })?;
-            let observation = verified_stream_observation(&stream, self.facts.wallet)?;
+            let observation = verified_stream_observation(&stream, self.wallet)?;
             if observation.group_id.key() != &binding.stream_group_id {
                 return Err(complete_activity_read_error(
                     "binding stream group differs from its receipt",
@@ -637,7 +711,7 @@ impl DecisionContinuationV3 {
             let page = complete_activity_page(occurrence, self.version, lookup)?;
             let window = parse_complete_activity_page(
                 &page,
-                self.facts.wallet,
+                self.wallet,
                 "binding target page parse failed",
             )?;
             if !window.rows.iter().any(|row| {
@@ -722,7 +796,7 @@ impl DecisionContinuationV3 {
         let source = lookup(receipt).map_err(|error| {
             complete_activity_read_error(format!("stream receipt lookup failed: {error}"))
         })?;
-        let observation = verified_stream_observation(&source, self.facts.wallet)?;
+        let observation = verified_stream_observation(&source, self.wallet)?;
         if self.version != 5 {
             if observation.group_id.key() != target_id {
                 return Err(complete_activity_read_error(
@@ -741,7 +815,7 @@ impl DecisionContinuationV3 {
         if observation.group_id != target.group_id || observation.source_time != target.source_time
         {
             let wire: CompleteActivityReadWire =
-                serde_json::from_value(self.facts.decision_inputs.clone())
+                serde_json::from_value(self.decision_inputs.clone())
                     .map_err(|error| complete_activity_read_error(error.to_string()))?;
             let commitment = self
                 .verify_read_commitment(
@@ -781,7 +855,7 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
-        let joined = joined_read_pages(&self.page_occurrences, pages)?;
+        let joined = joined_read_pages(self.page_occurrences, pages)?;
         let mut grouped_pages = BTreeMap::<
             (Option<i64>, i64),
             Vec<(&PageOccurrence, &ReconciliationPageEvidence)>,
@@ -812,7 +886,7 @@ impl DecisionContinuationV3 {
                     )
                 })?;
             let expected_url = PolymarketEndpoint::UserPositionActivityPage {
-                user: self.facts.wallet.to_string(),
+                user: self.wallet.to_string(),
                 end: bounds.end,
                 start: bounds.start.map(|start| start.saturating_add(1)),
                 offset: page.offset,
@@ -880,7 +954,7 @@ impl DecisionContinuationV3 {
                 }
                 let window = parse_complete_activity_page(
                     &source,
-                    self.facts.wallet,
+                    self.wallet,
                     "complete activity read page parse failed",
                 )?;
                 if u32::try_from(window.rows.len()).ok() != Some(page.row_count)
@@ -945,7 +1019,9 @@ impl DecisionContinuationV3 {
             .flat_map(|segment| segment.rows)
             .collect())
     }
+}
 
+impl DecisionContinuationV3 {
     /// Resolve every V3 receipt through the boot-owned verified source-receipt index and derive
     /// observation time from the selected receipt. No timestamp copied into continuation JSON is
     /// trusted, and the growing source log is never replayed on this hot path (#545).
@@ -1147,7 +1223,7 @@ where
 }
 
 /// Payload of a complete-read commitment. V1 has no `bindings` field; V2 requires it,
-/// including the empty list for reads whose observations all match exactly.
+/// including the empty list for reads with no selected observation bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivityReadCommitment {
@@ -1157,6 +1233,17 @@ pub struct ActivityReadCommitment {
     pub digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Vec<ObservationBinding>>,
+    /// Existing digest inputs retained for binding authentication without a pending decision.
+    /// Absent on legacy and empty-binding commitments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_proof: Option<CommittedReadProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedReadProof {
+    pub page_occurrences: Vec<PageOccurrence>,
+    pub pages: Vec<ReconciliationPageEvidence>,
 }
 
 /// Immutable v1 preimage; never add fields to this historical encoding.
@@ -1294,8 +1381,62 @@ fn encode_activity_read_commitment(
         fixed_end,
         digest: digest.to_hex().to_string(),
         bindings: bindings.map(canonical_bindings).transpose()?,
+        read_proof: bindings
+            .filter(|bindings| !bindings.is_empty())
+            .map(|_| CommittedReadProof {
+                page_occurrences: occurrences.to_vec(),
+                pages: pages.to_vec(),
+            }),
     })
     .map_err(|error| complete_activity_read_error(format!("commitment payload failed: {error}")))
+}
+
+/// Authenticate bindings collected by the existing boot scan, with exact indexed reads only.
+/// A verified commitment is evidence of correlation, never evidence of durable disposition.
+pub(crate) fn verified_commitment_bindings(
+    receipt: AppendReceipt,
+    source_receipts: &SourceReceiptIndex,
+) -> Result<Vec<ObservationBinding>, CompleteActivityReadError> {
+    let source = source_receipts
+        .source_envelope(receipt)
+        .map_err(|error| complete_activity_read_error(error.to_string()))?;
+    let commitment: ActivityReadCommitment = serde_json::from_slice(&source.payload)
+        .map_err(|error| complete_activity_read_error(error.to_string()))?;
+    if source.source_id.0 != ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        || source.schema_version != ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION
+        || source.parser_version != ACTIVITY_READ_COMMITMENT_PARSER_VERSION
+        || source.content_type != ContentType::Json
+        || commitment.version != 2
+    {
+        return Err(complete_activity_read_error(
+            "binding commitment source generation differs",
+        ));
+    }
+    let bindings = commitment
+        .bindings
+        .as_ref()
+        .ok_or_else(|| complete_activity_read_error("v2 commitment bindings are absent"))?;
+    if bindings.is_empty() && commitment.read_proof.is_none() {
+        return Ok(Vec::new());
+    }
+    let proof = commitment
+        .read_proof
+        .as_ref()
+        .ok_or_else(|| complete_activity_read_error("binding commitment read proof is absent"))?;
+    let inputs = json!({ "fixed_end": commitment.fixed_end, "pages": proof.pages });
+    let verifier = ActivityReadVerification {
+        version: 5,
+        wallet: commitment.wallet,
+        decision_inputs: &inputs,
+        page_occurrences: &proof.page_occurrences,
+        read_commitment: Some(receipt),
+    };
+    verifier.reconstruct_complete_activity_read(&mut |receipt| {
+        source_receipts
+            .source_envelope(receipt)
+            .map(CompleteActivityPage::from)
+    })?;
+    Ok(bindings.clone())
 }
 
 pub(crate) fn joined_read_pages<'a>(
@@ -2301,6 +2442,35 @@ impl BucketCommitEngine {
                     .activity_group_state(aggregate.group_id.key())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let correlation_inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
+        if let Some(observations) = correlation_inputs.get("invalid_mapping_observations") {
+            let observations: Vec<(SourceTradeId, AppendReceipt)> =
+                serde_json::from_value(observations.clone())?;
+            if !observations.is_empty() {
+                // This is the deterministic bucket fence trigger, not a selected correlation
+                // target. Every ambiguous original receipt stays in the fence proof; no binding
+                // to any candidate is manufactured.
+                let trigger = aggregates
+                    .iter()
+                    .find(|aggregate| {
+                        !context
+                            .identity_unresolved
+                            .contains(aggregate.group_id.key())
+                    })
+                    .or_else(|| aggregates.first())
+                    .ok_or(BucketCommitError::Empty)?
+                    .group_id
+                    .key();
+                return self.commit_changed_bucket_fence(
+                    &aggregates,
+                    &durable,
+                    wallet,
+                    source_epoch,
+                    (WalletFenceCause::InvalidMapping, trigger.clone()),
+                    context,
+                );
+            }
+        }
         let changed: Vec<_> = aggregates
             .iter()
             .zip(&durable)
@@ -3095,8 +3265,72 @@ impl BucketCommitEngine {
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let (cause, trigger) = fence;
         let already_fenced = self.fences.contains(&wallet);
-        let proof = json!({"bucket_epoch": source_epoch, "cause": cause.as_str()});
+        let mut proof = json!({"bucket_epoch": source_epoch, "cause": cause.as_str()});
+        if cause == WalletFenceCause::InvalidMapping {
+            let inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
+            if let Some(observations) = inputs.get("invalid_mapping_observations") {
+                proof["invalid_mapping_observations"] = observations.clone();
+            }
+        }
         let proof_json = serde_json::to_string(&proof)?;
+        if cause == WalletFenceCause::InvalidMapping
+            && !already_fenced
+            && let Some((aggregate, state)) = aggregates
+                .iter()
+                .zip(durable)
+                .find_map(|(aggregate, state)| state.as_ref().map(|state| (aggregate, state)))
+        {
+            // Preserve the original disposition and its history clock as the fence witness.
+            // Once that fence is durable, the existing bucket owner can retain any revised
+            // candidates without replacing their original economic effects. A crash between
+            // these commits leaves the wallet fenced and the unfinished read replayable.
+            self.paper_state
+                .commit_activity_bucket(&ActivityBucketCommit {
+                    wallet,
+                    source_epoch: state.source_epoch,
+                    dispositions: vec![ActivityDispositionRecord {
+                        source_trade_id: aggregate.group_id.key().clone(),
+                        transaction_hash: state.transaction_hash.clone(),
+                        wallet,
+                        source_epoch: state.source_epoch,
+                        semantic_revision: state.semantic_revision.clone(),
+                        activity_type: aggregate
+                            .group_id
+                            .components()
+                            .activity_type
+                            .as_str()
+                            .to_owned(),
+                        disposition: state.disposition.clone(),
+                        proof_json: state.proof_json.clone(),
+                        no_copy: None,
+                    }],
+                    leader_positions: Vec::new(),
+                    gate_results: Vec::new(),
+                    history_effects: Vec::new(),
+                    history_status: None,
+                    pending: Vec::new(),
+                    fence: Some(WalletFenceRecord {
+                        wallet,
+                        source_trade_id: aggregate.group_id.key().clone(),
+                        cause: cause.as_str().to_owned(),
+                        proof_json,
+                        fenced_at_unix: context.recorded_at_unix,
+                    }),
+                    reanchor: None,
+                    advance_cursor: false,
+                })?;
+            self.fences.insert(wallet);
+            let mut result = self.commit_changed_bucket_fence(
+                aggregates,
+                durable,
+                wallet,
+                source_epoch,
+                (cause, trigger),
+                context,
+            )?;
+            result.newly_fenced = Some(cause);
+            return Ok(result);
+        }
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::new();
         let mut unresolved_trigger = None;
