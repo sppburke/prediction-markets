@@ -652,7 +652,6 @@ import datetime, json, os, signal, sqlite3, sys, time
 status, database, scenario_path, injection_path, sigint_marker = sys.argv[1:]
 db=sqlite3.connect(database)
 db.execute("insert into position_anchors values(?,?)",("0x0000000000000000000000000000000000000545",2))
-db.execute("update poll_cursors set reanchor_required=0 where wallet_hex=?",("0x0000000000000000000000000000000000000545",))
 fences_path=os.path.join(os.path.dirname(scenario_path),"rehearsal-fences")
 if os.path.exists(fences_path):
     for line in open(fences_path,encoding="utf-8"):
@@ -1194,7 +1193,7 @@ assert rows["account_census_before_after_identical"]=="true"
 assert open(census_query_count_path,encoding="utf-8").read().strip()=="2"
 assert rows["service_log_prefix_length"].isdigit()
 assert len(rows["service_log_prefix_sha256"])==64
-assert rows["database_observation"]=="anchor_after:2,reanchor_required:0,unexpected_fences:0"' \
+assert rows["database_observation"]=="anchor_rows_before:1,anchor_rows_after:2,unexpected_fences:0"' \
   "$root/rehearsal/evidence.json" "$root/pe-activation.json" "$root/target/service.toml" \
   "$root/target/service.env" "$root/rehearsal/environment-1111111.rehearsal.env" \
   "$root/rehearsal/copy/copied.sha256" \
@@ -1232,8 +1231,8 @@ assert financial["old_environment_sha256"] != financial["target_environment_sha2
   fail "joined rehearsal/driver fixture conflated inherited and target identities"
 
 # Scenarios REHEARSAL-FENCES-08A..08C
-# Preconditions: the fake child durably fences non-probe wallets after startup; the probe wallet
-# (...0545) is never fenced.
+# Preconditions: the fake child durably fences wallets after startup and installs one anchor for
+# wallet ...0545 above the pre-launch baseline.
 # PASS: every allowlisted cause still passes with unexpected_fences:0 and anchored=1; a defined
 # but unlisted cause and a non-enum cause each fail with reason=unsafe_evidence.
 # FAIL: an allowlisted cause fails, or an unlisted cause records REHEARSAL545_PASS.

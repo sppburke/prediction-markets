@@ -1,0 +1,245 @@
+[
+  {
+    "wallet": "0x1b912b17581b3d544431d13d5a060155a80127dc",
+    "oldest500_n": 500,
+    "oldest500_span": 92282224,
+    "oldest_ts": 1678180105,
+    "newest500_n": 500,
+    "newest500_span": 1678431,
+    "newest_ts": 1779090045
+  },
+  {
+    "wallet": "0xfd8e46519d0a8f9c35e5010ef4e7f56f7583aea4",
+    "oldest500_n": 500,
+    "oldest500_span": 1824436,
+    "oldest_ts": 1769534525,
+    "newest500_n": 500,
+    "newest500_span": 292311,
+    "newest_ts": 1779079308
+  },
+  {
+    "wallet": "0x72e1597864456eda62878413cf3e60c332e4a45d",
+    "oldest500_n": 500,
+    "oldest500_span": 5500887,
+    "oldest_ts": 1762867271,
+    "newest500_n": 500,
+    "newest500_span": 1291076,
+    "newest_ts": 1779144204
+  },
+  {
+    "wallet": "0x0bf96a1c55e6f47ea84335bc3fc08a89653efd90",
+    "oldest500_n": 500,
+    "oldest500_span": 657593,
+    "oldest_ts": 1771302919,
+    "newest500_n": 500,
+    "newest500_span": 91413,
+    "newest_ts": 1779130902
+  },
+  {
+    "wallet": "0x5a3354a0a35d00d2a1dbe6cea0e37e9c30a2ca0d",
+    "oldest500_n": 500,
+    "oldest500_span": 6005567,
+    "oldest_ts": 1769071224,
+    "newest500_n": 500,
+    "newest500_span": 3008563,
+    "newest_ts": 1779112982
+  },
+  {
+    "wallet": "0xdf6539d1fadb951a02a999d31a72e0cd7fd9c36d",
+    "oldest500_n": 0,
+    "oldest500_span": null,
+    "oldest_ts": null,
+    "newest500_n": 0,
+    "newest500_span": null,
+    "newest_ts": null
+  },
+  {
+    "wallet": "0xb7ab821f037a4c8deb9b23b8001a4be985d116d0",
+    "oldest500_n": 500,
+    "oldest500_span": 268197,
+    "oldest_ts": 1776174407,
+    "newest500_n": 500,
+    "newest500_span": 203206,
+    "newest_ts": 1779140642
+  },
+  {
+    "wallet": "0x057621bea5fc03a53af38530c95b17a510716232",
+    "oldest500_n": 500,
+    "oldest500_span": 2352710,
+    "oldest_ts": 1769188558,
+    "newest500_n": 500,
+    "newest500_span": 3149626,
+    "newest_ts": 1779148869
+  },
+  {
+    "wallet": "0xc561b14904d769eda31628082c005362ba60dc22",
+    "oldest500_n": 0,
+    "oldest500_span": null,
+    "oldest_ts": null,
+    "newest500_n": 0,
+    "newest500_span": null,
+    "newest_ts": null
+  },
+  {
+    "wallet": "0x9fbfe50bf171adaa347a5cb2b789b4a6e12ef003",
+    "oldest500_n": 500,
+    "oldest500_span": 3130214,
+    "oldest_ts": 1760363097,
+    "newest500_n": 500,
+    "newest500_span": 985286,
+    "newest_ts": 1779121816
+  },
+  {
+    "wallet": "0x31646b754f77b973910e7376b7015cb81fe83c65",
+    "oldest500_n": 500,
+    "oldest500_span": 50484673,
+    "oldest_ts": 1720959677,
+    "newest500_n": 500,
+    "newest500_span": 512691,
+    "newest_ts": 1779071276
+  },
+  {
+    "wallet": "0x38d812aff0b79f3bf5da2a477f780bcc163eea7c",
+    "oldest500_n": 0,
+    "oldest500_span": null,
+    "oldest_ts": null,
+    "newest500_n": 0,
+    "newest500_span": null,
+    "newest_ts": null
+  },
+  {
+    "wallet": "0x9c76cdb43fb46454da005fbc82047a64a18ec926",
+    "oldest500_n": 500,
+    "oldest500_span": 844721,
+    "oldest_ts": 1766029678,
+    "newest500_n": 500,
+    "newest500_span": 211321,
+    "newest_ts": 1779133194
+  },
+  {
+    "wallet": "0xdc5bd11896bfb0fb335dad88d99a7e9a6bc3f102",
+    "oldest500_n": 500,
+    "oldest500_span": 9814094,
+    "oldest_ts": 1744939121,
+    "newest500_n": 500,
+    "newest500_span": 4054574,
+    "newest_ts": 1779149475
+  },
+  {
+    "wallet": "0x330f6bf24e33d8348593bca54017ce83423791b1",
+    "oldest500_n": 0,
+    "oldest500_span": null,
+    "oldest_ts": null,
+    "newest500_n": 0,
+    "newest500_span": null,
+    "newest_ts": null
+  },
+  {
+    "wallet": "0x1f19c48aee80ec95396d91f0d21ac249b8a7f57a",
+    "oldest500_n": 500,
+    "oldest500_span": 22722,
+    "oldest_ts": 1774900805,
+    "newest500_n": 500,
+    "newest500_span": 102555,
+    "newest_ts": 1779106948
+  },
+  {
+    "wallet": "0x06dc51826bc524d9a83770e7de9dd7e005b04524",
+    "oldest500_n": 500,
+    "oldest500_span": 502846,
+    "oldest_ts": 1774380967,
+    "newest500_n": 500,
+    "newest500_span": 11190,
+    "newest_ts": 1779116869
+  },
+  {
+    "wallet": "0x88ec5ba618625d744988f87ab577be53b382ec61",
+    "oldest500_n": 0,
+    "oldest500_span": null,
+    "oldest_ts": null,
+    "newest500_n": 0,
+    "newest500_span": null,
+    "newest_ts": null
+  },
+  {
+    "wallet": "0xdfe29d6ef2a44606cf58967e1fd5854d9e594902",
+    "oldest500_n": 500,
+    "oldest500_span": 993765,
+    "oldest_ts": 1769928032,
+    "newest500_n": 500,
+    "newest500_span": 677147,
+    "newest_ts": 1779028814
+  },
+  {
+    "wallet": "0xaf17116ae2b1476032785a67bd5b7c8c05905c20",
+    "oldest500_n": 500,
+    "oldest500_span": 9515399,
+    "oldest_ts": 1762360153,
+    "newest500_n": 500,
+    "newest500_span": 1338119,
+    "newest_ts": 1779128167
+  },
+  {
+    "wallet": "0xc33d6aa3eb972639f31e46a6a02201cece380d40",
+    "oldest500_n": 500,
+    "oldest500_span": 5848612,
+    "oldest_ts": 1767708651,
+    "newest500_n": 500,
+    "newest500_span": 103881,
+    "newest_ts": 1779135378
+  },
+  {
+    "wallet": "0xa8ae2fb989de545c42c376d61ec887868ca57f3e",
+    "oldest500_n": 500,
+    "oldest500_span": 9085622,
+    "oldest_ts": 1752586463,
+    "newest500_n": 500,
+    "newest500_span": 881238,
+    "newest_ts": 1779130373
+  },
+  {
+    "wallet": "0x4e9e342ff236323b43f79c0da642a82bd12f0c30",
+    "oldest500_n": 500,
+    "oldest500_span": 1290563,
+    "oldest_ts": 1772060684,
+    "newest500_n": 500,
+    "newest500_span": 501282,
+    "newest_ts": 1779140684
+  },
+  {
+    "wallet": "0xdb5ad26b68d77ae966d29e7180147272ab7a3965",
+    "oldest500_n": 0,
+    "oldest500_span": null,
+    "oldest_ts": null,
+    "newest500_n": 0,
+    "newest500_span": null,
+    "newest_ts": null
+  },
+  {
+    "wallet": "0x5215b36ebe0f78b3114eb998ca8ade49402ab02f",
+    "oldest500_n": 500,
+    "oldest500_span": 2848847,
+    "oldest_ts": 1777635576,
+    "newest500_n": 500,
+    "newest500_span": 128064,
+    "newest_ts": 1787382295
+  },
+  {
+    "wallet": "0x8f1dfd0868d056f11f84e0233e1b89527c262fb6",
+    "oldest500_n": 500,
+    "oldest500_span": 140742,
+    "oldest_ts": 1774989145,
+    "newest500_n": 500,
+    "newest500_span": 44165,
+    "newest_ts": 1779130160
+  },
+  {
+    "wallet": "0xc7d02944a76b9f83b199e9090ecc92c82d241f8a",
+    "oldest500_n": 500,
+    "oldest500_span": 494984,
+    "oldest_ts": 1776962870,
+    "newest500_n": 500,
+    "newest500_span": 64173,
+    "newest_ts": 1779139248
+  }
+]

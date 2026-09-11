@@ -287,8 +287,8 @@ driver's own confidentiality tests forbid. Run each attempt under an explicitly 
 `PE_REHEARSAL_ROOT` with no `PE_REHEARSAL_COPY_DIR` or `PE_REHEARSAL_EVIDENCE_HASH_FILE` override
 (an override is taken verbatim and may point anywhere): the harness writes fixed-name artifacts per
 revision under the root and its evidence binds the result manifest by absolute path, so a fresh root
-preserves every earlier attempt and never reuses a copy the reanchor probe has already mutated. Reuse a
-root only to resume with an untouched copy; never delete an earlier attempt's root.
+preserves every earlier attempt and never reuses a copy an earlier attempt's binary has already
+mutated. Reuse a root only to resume with an untouched copy; never delete an earlier attempt's root.
 
 The no-target `--dry-run <reviewed-40-hex>` form used by CI is intentionally a path-independent
 parser/syntax check. The reviewed target pair remains accepted in dry-run and is mandatory for an
@@ -370,9 +370,9 @@ refuses PASS. The descriptor-fed privileged observer then takes a second
 canonical account census. PASS requires both censuses to be safe and identical in count and digest.
 The run stops at the first complete same-invocation proof, the first unsafe observation, process
 exit, or its bound. PASS requires the reviewed revision, a complete ordinary poll after start,
-successful re-anchor, real readiness, healthy critical owners, identical safe
-before/after privileged account censuses, the expected authorization-denied child snapshot, and no
-credit loss, unexpected fence/error, or successful database write. A nonzero
+at least one position anchor installed after launch, real readiness, healthy critical owners,
+identical safe before/after privileged account censuses, the expected authorization-denied child
+snapshot, and no credit loss, unexpected fence/error, or successful database write. A nonzero
 `reconciliation_obligations_dropped_total` in any fresh observed status aborts the run; before PASS,
 the handled-shutdown final status is the authoritative last observation and must also report zero.
 Websocket socket recycles (`dropping socket`) are recorded as `drops` and do not fail the run. For
@@ -380,8 +380,9 @@ this rehearsal, an
 unexpected fence is a `wallet_fences` row whose cause is outside the explicit incident-reviewed
 allowlist in `rehearsal545.sh`; membership in `WalletFenceCause` alone does not make a newly
 observed fence expected. Immediately before PASS, the harness synchronously rescans one exact
-complete service-log prefix, validates the final status, queries the current anchor/reanchor/fence
-database observation, and takes the final privileged account census.
+complete service-log prefix, validates the final status, queries the anchor row count against its
+pre-launch baseline and the unexpected-fence database observation, and takes the final privileged
+account census.
 The result binds that prefix's byte length and SHA-256 plus the database and census values; unsafe
 evidence arriving while readiness is in flight therefore fails the same invocation. The harness
 prints `REHEARSAL545_PASS` or `REHEARSAL545_FAIL` and writes a `rehearsal545-evidence-v1` JSON file. That
@@ -614,8 +615,7 @@ while taking a private online SQLite backup, then copy the source log with `cp -
 staged binary's unchanged `--validate-open-continuations --paper-state ... --source-log ...` on
 those copies. Perform all three operations inside step 4's guarded private-artifact sequence,
 before atomic binary replacement. Use the actual configured database and source paths. Do not run
-the rehearsal itself for this census: it rebinds migration paths, sets `reanchor_required`, and
-boots the service.
+the rehearsal itself for this census: it rebinds migration paths and boots the service.
 
 A successful copy validates only its captured rows. The source may advance between the backup
 and copy; a torn source tail fails validation and requires a fresh source copy, without repairing the

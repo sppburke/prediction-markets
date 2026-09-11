@@ -3114,6 +3114,9 @@ impl BracketFinancialHarness {
         self.actor.await.unwrap();
         drop(self.source);
         self.coordinator.await.unwrap();
+    }
+}
+
 /// PASS: internally consistent row edits to disabled policy or exact clock still fail the unchanged seal digest.
 #[allow(clippy::too_many_arguments)]
 fn qualification_replays_source_age_and_seal_binds_policy_and_clock(

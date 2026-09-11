@@ -329,6 +329,8 @@ fn clear_infra_exclusion_cli_requires_confirmation_and_exact_reason() {
     let infra = wallet_hex(0x61);
     let wrong_reason = wallet_hex(0x62);
     let missing = wallet_hex(0x63);
+    // The cold-probe shape since purge retirement: a live flag, no tombstone.
+    let flagged = wallet_hex(0x64);
     {
         let cache = WalletCache::open(&cache_path).unwrap();
         cache
@@ -343,6 +345,13 @@ fn clear_infra_exclusion_cli_requires_confirmation_and_exact_reason() {
             .execute(
                 "INSERT INTO purged_wallets VALUES (?1, 1, 'proven_loser')",
                 [&wrong_reason],
+            )
+            .unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO wallets (wallet_hex, is_active, is_infra) VALUES (?1, 1, 1)",
+                [&flagged],
             )
             .unwrap();
     }
@@ -377,7 +386,34 @@ fn clear_infra_exclusion_cli_requires_confirmation_and_exact_reason() {
     );
     assert!(cleared.status.success());
 
+    let flag_cleared = run_cli(
+        dir.path(),
+        &cache_path,
+        &["clear-infra-exclusion", "--wallet", &flagged, "--confirm"],
+    );
+    assert!(flag_cleared.status.success());
+    let flag_again = run_cli(
+        dir.path(),
+        &cache_path,
+        &["clear-infra-exclusion", "--wallet", &flagged, "--confirm"],
+    );
+    assert_eq!(
+        flag_again.status.code(),
+        Some(1),
+        "second clearance finds nothing"
+    );
+
     let cache = WalletCache::open(&cache_path).unwrap();
     assert!(!cache.is_purged(&infra).unwrap());
     assert!(cache.is_purged(&wrong_reason).unwrap());
+    assert!(!cache.conn_for_test_is_infra(&flagged), "live flag cleared");
+    let still_active: i64 = cache
+        .raw_conn_for_test()
+        .query_row(
+            "SELECT is_active FROM wallets WHERE wallet_hex = ?1",
+            [&flagged],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(still_active, 1, "clearance never changes is_active");
 }

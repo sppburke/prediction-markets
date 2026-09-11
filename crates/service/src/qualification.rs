@@ -12110,6 +12110,8 @@ mod tests {
                 },
             );
             assert_eq!(result.is_ok(), mutation == "none", "{mutation}: {result:?}");
+        }
+    }
 
     /// PASS: row-only checks admit a structurally valid terminal, while source-backed replay
     /// rejects a contradictory age; the receive clock remains the copy-delay clock.
