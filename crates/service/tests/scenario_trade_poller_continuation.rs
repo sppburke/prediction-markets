@@ -724,53 +724,7 @@ async fn poller_multipage_commitment_survives_restart() {
 
 // These barriers connect the actual poller to the durable coordinator and bucket owner. Each
 // response and completion is explicitly released; paused time never schedules a wallet read.
-struct RequestedPage {
-    url: String,
-    respond: PageResponse,
-}
-
-struct PageResponse(oneshot::Sender<Result<Vec<u8>, SourceError>>);
-
-impl PageResponse {
-    fn send(self, payload: Vec<u8>) -> Result<(), Result<Vec<u8>, SourceError>> {
-        self.0.send(Ok(payload))
-    }
-
-    fn fail(self) {
-        self.0
-            .send(Err(SourceError::Transient {
-                message: "injected retryable read failure".to_owned(),
-            }))
-            .unwrap();
-    }
-}
-
-struct GatedFetcher {
-    requests: mpsc::Sender<RequestedPage>,
-}
-
-impl ReconciliationFetcher for GatedFetcher {
-    fn fetch<'a>(
-        &'a self,
-        url: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
-        Box::pin(async move {
-            let (respond, response) = oneshot::channel();
-            self.requests
-                .send(RequestedPage {
-                    url: url.to_owned(),
-                    respond: PageResponse(respond),
-                })
-                .await
-                .map_err(|_| SourceError::Fatal {
-                    message: "request barrier closed".to_owned(),
-                })?;
-            response.await.map_err(|_| SourceError::Fatal {
-                message: "response barrier closed".to_owned(),
-            })?
-        })
-    }
-}
+use support::{GatedFetcher, RequestedPage};
 
 enum ControlCompletion {
     BucketCommitted,

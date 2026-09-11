@@ -5,8 +5,6 @@
 mod support;
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -52,10 +50,7 @@ use pe_service::supabase_state::{
     reconcile_active_financial_frames,
 };
 use pe_service::trade_poller::{ReconciliationObligations, TradePoller, TradePollerConfig};
-use pe_source_core::SourceError;
-use pe_source_polymarket_public::{
-    GAMMA_BATCH_SIZE, PageFetcher, ReconciliationFetcher, validate_live_market,
-};
+use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, validate_live_market};
 use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::parse_compact_market;
@@ -63,7 +58,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 const EPOCH: i64 = 1_800_000_000;
 const CASH: Decimal = dec!(1000);
@@ -105,50 +100,8 @@ fn runtime() -> RuntimeConfig {
     config
 }
 
-#[derive(Default)]
-struct PriceGate {
-    blocked: AtomicBool,
-    market: Mutex<Option<String>>,
-    started: Notify,
-    release: Notify,
-}
-#[derive(Clone)]
-struct Prices {
-    gate: Arc<PriceGate>,
-    markets: Arc<Mutex<HashMap<String, Value>>>,
-}
-impl PageFetcher for Prices {
-    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
-        if self
-            .gate
-            .market
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|market| url.contains(&format!("condition_ids={market}")))
-            && self.gate.blocked.swap(false, Ordering::SeqCst)
-        {
-            self.gate.started.notify_one();
-            self.gate.release.notified().await;
-        }
-        let markets = self.markets.lock().unwrap();
-        let rows = url
-            .split(['?', '&'])
-            .filter_map(|part| part.strip_prefix("condition_ids="))
-            .filter_map(|condition| markets.get(condition).cloned())
-            .collect::<Vec<_>>();
-        Ok(serde_json::to_vec(&rows).unwrap())
-    }
-}
-struct Page(Vec<u8>);
-impl ReconciliationFetcher for Page {
-    fn fetch<'a>(
-        &'a self,
-        _: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
-        Box::pin(async { Ok(self.0.clone()) })
-    }
-}
+use support::{Page, PriceGate, Prices};
+
 #[derive(Default)]
 struct Books(Mutex<HashMap<String, OrderBook>>);
 impl ClobBookFetcher for Books {

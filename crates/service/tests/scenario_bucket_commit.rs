@@ -2485,6 +2485,240 @@ fn commit_open_source_read(
     assert_eq!(committed.pending.len(), read.aggregates.len());
 }
 
+fn online_census_copy(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let state = dir.path().join("snapshot.db");
+    let source = dir.path().join("snapshot-source.log");
+    // SQLite's online backup captures committed WAL pages while the live owner stays open.
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    connection
+        .execute("VACUUM INTO ?1", [state.to_str().unwrap()])
+        .unwrap();
+    std::fs::copy(dir.path().join("source.log"), &source).unwrap();
+    (state, source)
+}
+
+fn census_cli(state: &std::path::Path, source: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"))
+        .arg("--validate-open-continuations")
+        .arg("--paper-state")
+        .arg(state)
+        .arg("--source-log")
+        .arg(source)
+        .output()
+        .unwrap()
+}
+
+/// PASS: a live post-backup continuation is outside the offline census, but in the boot census.
+#[test]
+fn online_snapshot_does_not_cover_later_continuation() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let (read, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xsnapshot-first",
+            MARKET_A,
+            0,
+            "BUY",
+            "2",
+            "0.4",
+            910,
+        )],
+    );
+    commit_open_source_read(&mut engine, &read, receipt, HashMap::new());
+    let captured = paper.open_decision_pending().unwrap();
+    let (state, source) = online_census_copy(&dir);
+    let (later, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xsnapshot-later",
+            MARKET_B,
+            0,
+            "BUY",
+            "3",
+            "0.6",
+            911,
+        )],
+    );
+    commit_open_source_read(&mut engine, &later, receipt, HashMap::new());
+    let offline = PaperStateDb::open_read_only(&state).unwrap();
+    let offline_index = pe_service::risk_inputs::SourceReceiptIndex::replay(&source).unwrap();
+    assert_eq!(offline.open_decision_pending().unwrap(), captured);
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&offline, &offline_index).unwrap(),
+        1
+    );
+    let current_index =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+            .unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper, &current_index).unwrap(),
+        2
+    );
+    assert!(
+        paper
+            .is_decision_pending_open(later.aggregates[0].group_id.key())
+            .unwrap()
+    );
+    for (state, source, expected) in [
+        (state, source, "open_rows=1 validated=1\n"),
+        (
+            dir.path().join("paper.db"),
+            dir.path().join("source.log"),
+            "open_rows=2 validated=2\n",
+        ),
+    ] {
+        let output = census_cli(&state, &source);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+/// PASS: newer invalid evidence fails before owner construction; all pending state stays unchanged.
+#[tokio::test]
+async fn post_snapshot_invalid_continuation_blocks_boot_resume() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let (read, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xboot-captured",
+            MARKET_A,
+            0,
+            "BUY",
+            "2",
+            "0.4",
+            910,
+        )],
+    );
+    commit_open_source_read(&mut engine, &read, receipt, HashMap::new());
+    let (state, source) = online_census_copy(&dir);
+    let (later, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xboot-newer",
+            MARKET_B,
+            0,
+            "BUY",
+            "3",
+            "0.6",
+            911,
+        )],
+    );
+    commit_open_source_read(&mut engine, &later, receipt, HashMap::new());
+    let id = later.aggregates[0].group_id.key();
+    let row = paper.decision_pending_for(id).unwrap().unwrap();
+    let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+    frozen["price"] = json!("0.7");
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![frozen.to_string(), id.0],
+        )
+        .unwrap();
+    let pending = paper.open_decision_pending().unwrap();
+    let positions = paper.leader_positions().unwrap();
+    let history = paper.gate_history().unwrap();
+    let cursor = paper.cursor(&wallet()).unwrap();
+    let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+    let offline = census_cli(&state, &source);
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(offline.stdout).unwrap(),
+        "open_rows=1 validated=1\n"
+    );
+    drop(engine);
+    let hooks = support::continuation_hooks(920);
+    let paper_path = dir.path().join("paper.log");
+    drop(pe_event_log::Writer::open(&paper_path).unwrap());
+    let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
+        .unwrap();
+    let mut resumes = 0;
+    let result = async {
+        let count = pe_service::bucket_commit::validate_open_continuations(&paper, &index)?;
+        let (_control, receiver) = tokio::sync::mpsc::channel(4);
+        let mut owner = support::continuation_orchestrator(
+            paper.clone(),
+            &paper_path,
+            wallet(),
+            receiver,
+            hooks.clone(),
+        );
+        resumes += count;
+        owner.resume_pending_before_producers().await.unwrap();
+        Ok::<_, pe_service::bucket_commit::ContinuationValidationError>(count)
+    }
+    .await;
+    assert_eq!(result.unwrap_err().source_trade_id.as_ref(), Some(id));
+    assert_eq!(resumes, 0);
+    assert_eq!(paper.open_decision_pending().unwrap(), pending);
+    assert_eq!(paper.leader_positions().unwrap(), positions);
+    assert_eq!(paper.gate_history().unwrap(), history);
+    assert_eq!(paper.cursor(&wallet()).unwrap(), cursor);
+    assert_eq!(paper.activity_groups_after(&wallet(), 0).unwrap(), groups);
+    support::assert_no_continuation_side_effects(
+        &paper,
+        &dir.path().join("paper.db"),
+        &paper_path,
+        &hooks,
+    );
+}
+
+/// PASS: the actual offline command rejects a fixed torn frame and never repairs either input.
+#[test]
+fn offline_census_rejects_torn_source_copy_without_repair() {
+    let (dir, _paper, mut engine) = fresh_anchored();
+    let (read, receipt) = committed_source_read(
+        &dir,
+        &[position_row(
+            "TRADE",
+            "0xtorn-copy",
+            MARKET_A,
+            0,
+            "BUY",
+            "2",
+            "0.4",
+            910,
+        )],
+    );
+    commit_open_source_read(&mut engine, &read, receipt, HashMap::new());
+    let (state, source) = online_census_copy(&dir);
+    // Keep the five-byte file header and one byte of the first frame length.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_len(6)
+        .unwrap();
+    assert!(matches!(
+        pe_event_log::Reader::replay(&source),
+        Err(pe_event_log::LogError::Truncated { .. })
+    ));
+    let before_state = std::fs::read(&state).unwrap();
+    let before_source = std::fs::read(&source).unwrap();
+    let output = census_cli(&state, &source);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("build verified source receipt index for open-continuation census"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), before_state);
+    assert_eq!(std::fs::read(&source).unwrap(), before_source);
+}
+
 /// PASS: the fact-altered row is named and validation stops before any resume, admission,
 /// dispatch seed, financial prepare, or paper order. FAIL: either row resumes or the edit passes.
 #[tokio::test]
