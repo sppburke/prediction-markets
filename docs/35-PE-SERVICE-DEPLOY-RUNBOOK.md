@@ -375,6 +375,14 @@ identical safe before/after privileged account censuses, the expected authorizat
 snapshot, and no credit loss, unexpected fence/error, or successful database write. A nonzero
 `reconciliation_obligations_dropped_total` in any fresh observed status aborts the run; before PASS,
 the handled-shutdown final status is the authoritative last observation and must also report zero.
+The quiescence rule owns no timeout of its own: the deadline is the production unit's configured
+stop timeout, an owner-managed setting the rehearsal reads and the driver rechecks. The binary's
+cooperative stop (issue #599) cancels an in-flight poll round at once; the orchestrator drain
+begins after the producers join and main's persistent control senders drop, and completes once
+queued controls and any in-flight fanout send are released. Its backstops (`SHUTDOWN_DEADLINE`, the
+bounded abort joins, the final-status pass) are not a single bound and can exceed a short unit
+timeout only when an owner fails to stop cooperatively, in which case the unit's kill is the last
+resort (issue #600).
 Websocket socket recycles (`dropping socket`) are recorded as `drops` and do not fail the run. For
 this rehearsal, an
 unexpected fence is a `wallet_fences` row whose cause is outside the explicit incident-reviewed

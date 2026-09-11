@@ -659,8 +659,11 @@ impl TradePoller {
         let _ = self.run_until(std::future::pending::<()>()).await;
     }
 
-    /// Production entry point. A shutdown request is honored only between complete fixed-end
-    /// reconciliation rounds, so a partially applied wallet round is never manufactured.
+    /// Production entry point. A shutdown request cancels an in-flight round at its next await
+    /// (issue #599): every wallet epoch-second already committed stays durable, an
+    /// acknowledgement dropped by the cancellation does not undo the orchestrator's committed
+    /// effect (bucket commit, anchor install, boundary mark), and the cancelled round publishes no
+    /// ready boundary of its own. A round that fails on its own still terminates the owner.
     pub async fn run_until(
         mut self,
         shutdown: impl Future<Output = ()>,
@@ -675,7 +678,13 @@ impl TradePoller {
         tokio::pin!(shutdown);
         loop {
             self.drain_triggers();
-            self.poll_round().await?;
+            // Issue #599: the shutdown branch is polled first, so a stop requested during a
+            // round cancels the round instead of waiting for it (minutes on production data).
+            tokio::select! {
+                biased;
+                () = &mut shutdown => return Ok(()),
+                result = self.poll_round() => result?,
+            }
             if self.config.poll_interval_secs == 0 {
                 return Err(TradePollerOwnerError::ZeroPollInterval);
             }
