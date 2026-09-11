@@ -756,21 +756,38 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
     manifest_patch_boundary rollback-wallet-live-stats-refreshed \
       '{"rollback_wallet_live_stats_refreshed":true}'
   fi
-  if ! manifest_flag local_restored; then
+  if ! manifest_flag local_restored || manifest_flag qualification_start_intent; then
     [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert before local restore"
     current_local_sha=$(sha256_file "$paper_state")
-    if [[ "$current_local_sha" != "$(manifest_get guarded_paper_state_sha256)" ]]; then
-      if ! manifest_flag local_mutation_observed; then
+    if manifest_flag qualification_start_intent ||
+       [[ "$current_local_sha" != "$(manifest_get guarded_paper_state_sha256)" ]]; then
+      # An inactive unit with an old-start intent may have run and stopped again. Only the
+      # untouched restored image permits a retry; never erase possible post-resumption writes.
+      if manifest_flag old_service_start_intent; then
+        [[ "$current_local_sha" == "$(manifest_get backup.sha256)" &&
+           ! -e "$paper_state-wal" && ! -e "$paper_state-shm" ]] ||
+          die "old-service resumption is ambiguous; refusing local restore"
+      fi
+      if [[ "$current_local_sha" != "$(manifest_get guarded_paper_state_sha256)" ]] &&
+         ! manifest_flag local_mutation_observed; then
         manifest_patch_boundary rollback-local-mutation-observed \
           "$(python3 -c 'import json,sys; print(json.dumps({"local_mutation_observed":True,"mutated_local_sha256":sys.argv[1]},sort_keys=True,separators=(",",":")))' "$current_local_sha")"
       fi
-      if [[ "$current_local_sha" != "$(manifest_get backup.sha256)" ]]; then
-        manifest_flag local_restore_intent ||
-          manifest_patch_boundary rollback-local-restore-intent '{"local_restore_intent":true}'
+      # Start may commit only into WAL, leaving either main-file hash unchanged. A durable
+      # restore intent plus backup equality AND absent sidecars certifies helper completion.
+      if { manifest_flag qualification_start_intent && ! manifest_flag local_restore_intent; } ||
+         [[ "$current_local_sha" != "$(manifest_get backup.sha256)" ||
+            -e "$paper_state-wal" || -e "$paper_state-shm" ]]; then
+        manifest_patch_boundary rollback-local-restore-intent \
+          '{"local_restore_intent":true,"local_restore_skipped":false}'
         restore_sqlite_backup "$backup_path" "$paper_state"
       else
         manifest_flag local_restore_intent ||
           die "local state equals the backup without a durable restore intent"
+        if manifest_flag local_restore_skipped; then
+          manifest_patch_boundary rollback-local-restore-intent \
+            '{"local_restore_intent":true,"local_restore_skipped":false}'
+        fi
       fi
     else
       manifest_patch_boundary rollback-local-restore-skipped '{"local_restore_skipped":true}'
@@ -781,6 +798,8 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
     else
       [[ "$(sha256_file "$paper_state")" == "$(manifest_get backup.sha256)" ]] ||
         die "restored local paper-state bytes differ from the complete backup"
+      [[ ! -e "$paper_state-wal" && ! -e "$paper_state-shm" ]] ||
+        die "restored local paper-state has surviving SQLite sidecars"
     fi
     verify_guarded_log_identities || die "paper/source/live log identity changed during rollback"
     manifest_patch_boundary local-restored '{"local_restored":true}'

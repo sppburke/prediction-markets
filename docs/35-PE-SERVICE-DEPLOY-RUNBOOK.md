@@ -526,9 +526,28 @@ is inert, then starts the old service and records `rolled_back`. A no-mutation r
 remote restore and refresh. At or after Start, rollback is forbidden: preserve the append-only era and
 recover with a compatible reader.
 
-Before Start, rollback restores remote or local state only when mutation occurred; otherwise it
-records the applicable restore-skipped result. If the service was active on entry, it restarts the
-still-installed, #557-hash-verified pre-#545 binary; if it was inactive, it remains inactive.
+Before Start, an unfinished rollback with durable `qualification_start_intent` must restore the
+complete SQLite backup even when the main-file hash is unchanged: the reset can have committed
+only into the write-ahead log. Restoration requires an inert service and verified archive, backup,
+log, and installed-artifact identities. The driver records `local_restore_intent` before calling
+`restore_sqlite_backup`, clears an obsolete `local_restore_skipped`, and certifies completion only
+when the main equals the complete backup and both `-wal` and `-shm` are absent. An interrupted
+replacement with equal main bytes but surviving sidecars re-enters that helper. Old skipped/restored
+receipts alone cannot certify completion. Without Start intent, unchanged local state retains the
+restore-skipped shortcut.
+
+An evidenced already-resumed old service keeps its legitimate database and log suffix writes.
+An inactive unit with an old-service start intent and changed database bytes or surviving sidecars
+is ambiguous and fails closed; diagnose that resumption before recovery. Terminal `rolled_back`
+manifests never restore again. If the service was active on entry, rollback restarts the still-installed,
+#557-hash-verified pre-#545 binary; if it was inactive, it remains inactive.
+
+For first financial activation, the stopped cross-store boundary remains necessary under the
+existing contract. Compile, rehearse, and make private preparation copies beforehand; the driver
+still takes its authoritative rollback backup and records the cross-store boundary while stopped.
+The online ordinary-update census below removes an additional stop window while retaining the
+same actual-boot validator. It does not provide a simultaneous live snapshot or guarantee startup
+success.
 
 After Start, retained pre-#545 version-2 continuation records survive the financial-era reset and
 remain boot inputs of this generation. Every binary started against it after Start, including any
@@ -590,25 +609,27 @@ open-continuation census does not authorize a plain swap. The binary enters prod
 `activate_financial_era.sh` after a rehearsal attempt passes from a fresh root on the exact merged,
 hash-bound release tree.
 
-Before swapping the binary, quiesce the service and take a consistent copy of the active paper
-state and source log using the SQLite `.backup` and `cp -p` mechanics in
-[`rehearsal545.sh`](../scripts/deploy/rehearsal545.sh). Run only this network-free, read-only census
-against that copy; never run the rehearsal itself for this gate, because it rebinds migration paths,
-sets `reanchor_required`, and boots the service.
+For an ordinary compatible update after verified financial activation, leave the service running
+while taking a private online SQLite backup, then copy the source log with `cp -p`, then run the
+staged binary's unchanged `--validate-open-continuations --paper-state ... --source-log ...` on
+those copies. Perform all three operations inside step 4's guarded private-artifact sequence,
+before atomic binary replacement. Use the actual configured database and source paths. Do not run
+the rehearsal itself for this census: it rebinds migration paths, sets `reanchor_required`, and
+boots the service.
 
-```bash
-# the staged candidate executable, e.g. /tmp/pe-service.new.<sha12>; the installed pre-#565
-# executable does not implement this flag
-/tmp/pe-service.new.<sha12> --validate-open-continuations \
-  --paper-state <quiesced-copy/paper_state.db> \
-  --source-log <quiesced-copy/source_events.log>
-```
+A successful copy validates only its captured rows. The source may advance between the backup
+and copy; a torn source tail fails validation and requires a fresh source copy, without repairing the
+copied log or changing production rows. Failure of backup, copy, or census blocks replacement.
+After a successful census, perform only the required restart; skip it if the exact desired binary
+already runs.
 
 Record stdout, stderr, and the exit status. Success prints `open_rows=N validated=N` and exits zero.
-A validation failure exits nonzero with `open decision continuation <source_trade_id>: <cause>`;
+A continuation validation failure exits nonzero with `open decision continuation <source_trade_id>: <cause>`;
 it blocks the swap for diagnosis without repairing rows or fabricating dispositions. Normal boot
 uses the same validator and logs `open decision continuations validated` with `open_rows=N` before
-resuming any open row. A boot-time validation failure is a startup error on stderr/journal (live
+resuming any open row. This mandatory validation of actual current rows is the final continuation
+gate before producers, serving requests, and the status writer; rows added after the private backup
+must pass it too. A boot-time validation failure is a startup error on stderr/journal (live
 fan-out, the HTTP server, and the status writer have not started yet); the row stays intact and the
 unit's `Restart=on-failure` policy repeats the failed start until the row is diagnosed. A `paper durability became uncertain` exit (for example after a failed risk-halt append)
 repeats the same way until storage works; preserve the era and the pending rows and diagnose
@@ -616,6 +637,24 @@ storage. The ordinary [rollback](#rollback) to a pre-#565 binary is available on
 before the first synchronized schema-3 reconciliation page. After that boundary, preserve all state
 and use a binary retaining schema-3 page and V4 continuation compatibility; never delete records or
 rewrite rows to make an older reader accept them.
+
+<!-- #588 compatibility boundary: filled by the docs phase -->
+
+Required release evidence for the first-activation/ordinary-update distinction:
+
+| Failure/recovery test | Required result |
+|---|---|
+| `FE-ROLLBACK-WAL-ONLY-10`, `FE-ROLLBACK-STALE-RECEIPTS-11` | Abrupt pre-Start WAL reset leaves the main hash unchanged; rollback restores backup bytes, original schema/content, and absent sidecars before old-reader-shaped SQL reopening. The shell fixture does not execute the installed old Rust binary. |
+| `FE-ROLLBACK-RESTORE-RETRY-12`, `FE-ROLLBACK-RESUMED-WRITES-13` | Restore-receipt and replacement interruptions converge without duplicate archive restore/start; evidenced resumed writes survive; ambiguous resumption fails closed. |
+| `FE-START-FORWARD-05` | A complete Start refuses rollback and preserves the append-only era. |
+| `online_snapshot_does_not_cover_later_continuation` | A continuation added after the backup is absent from the private census and included by current-state validation. |
+| `post_snapshot_invalid_continuation_blocks_boot_resume` | Invalid newer evidence fails current-state validation before continuation effects; pending rows remain intact for diagnosis and compatible recovery. |
+| `offline_census_rejects_torn_source_copy_without_repair` | The actual census CLI rejects a torn copied frame without changing either input; recover by making fresh copies. |
+
+The shell cases belong to `scripts/paper_reset/test_activate_financial_era.sh`; the snapshot/boot
+cases belong to `crates/service/tests/scenario_bucket_commit.rs`. Bind their passing results to the
+exact reviewed release before deployment. A passing private census never substitutes for boot
+validation or the first financial Start procedure.
 
 ## Facts
 
@@ -673,6 +712,21 @@ comparisons decide what remains; never guess from memory.
    The status command must print nothing; `--version` and the verification output must name the
    same full `revision`. A dirty release checkout fails during the build rather than emitting an
    unchecked identity.
+
+   **Before any new ranking/cycle capture**, complete the versioned cache finalization with the
+   new, reviewed `pe-bootstrap` binary on Forge:
+
+   ```bash
+   pe-bootstrap cache-finalize-v2 --db <reviewed-cache> --stage-record <new-stage-record>
+   ```
+
+   Use the existing `forge_pause.sh pause/status/restore` procedure only at that cache boundary.
+   Preserve another owner's pending cycle and its frozen manifest; do not replace its pointer,
+   re-finalize its cache beneath it, or start a competing cycle. Retain the new stage record before
+   allowing new capture/ranking through `scripts/rank_and_push.sh` and its normal append-only
+   publication. Restore only this task's recorded Forge flag, enablement, and activity independently.
+   The wrapper's later cutover finalization binds its targeted writes and does not replace this
+   pre-capture finalization.
 2. **Ship** hash-qualified:
    `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
 3. **Preflight on the VPS** (read-only; lock first):
@@ -699,13 +753,30 @@ comparisons decide what remains; never guess from memory.
    If installed = desired but running is prior, go to step 5. Any unit-policy or ownership drift
    stops the deploy for a reviewed correction; only enablement drift may be repaired in place with
    `sudo systemctl enable pe-service` (no `--now`, no restart).
-4. **Baseline + atomic swap** (the old process keeps running on its open inode):
+4. **Baseline, online census, and atomic swap** (the old process keeps running on its open inode).
+   Run this guarded sequence in the same shell holding the deployment lock. Substitute the actual
+   configured state/source paths for `paper_state.db` and `source_events.log` before execution:
 
    ```bash
-   art=/home/sean/.pe-deploy-artifacts/<desired-sha12>; install -d -m 0700 "$art"; umask 077
+   set -euo pipefail
+   art=/home/sean/.pe-deploy-artifacts/<desired-sha12>
+   install -d -m 0700 "$art"
+   umask 077
    cp status.json "$art/status.before.json"
    systemctl show pe-service -p InvocationID -p MainPID -p ExecStart -p WorkingDirectory > "$art/unit.before"
    sqlite3 -readonly paper_state.db ".backup '$art/paper.before.db'"
+   cp -p source_events.log "$art/source.before.log"
+   chmod 0600 "$art/paper.before.db" "$art/source.before.log"
+   if /tmp/pe-service.new.<desired-sha12> --validate-open-continuations \
+     --paper-state "$art/paper.before.db" \
+     --source-log "$art/source.before.log" \
+     > "$art/continuation-census.stdout" 2> "$art/continuation-census.stderr"; then
+     printf '0\n' > "$art/continuation-census.exit"
+   else
+     census_status=$?
+     printf '%s\n' "$census_status" > "$art/continuation-census.exit"
+     exit "$census_status"
+   fi
    [ -f target/release/pe-service.bak-<prior-sha12> ] || cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>
    sha256sum target/release/pe-service.bak-<prior-sha12>       # = prior (= installed = running)
    chmod 0755 /tmp/pe-service.new.<desired-sha12>
@@ -929,6 +1000,8 @@ boot inputs of the generation. The durable `target_revision` in
 `/home/sean/pe-financial-era.json` is the first compatible revision. The rollback target must be that
 revision or a reviewed descendant that retains the decoder. A post-#565 artifact without it fails
 boot with `verify terminal pending …: missing field era`.
+
+<!-- #588 compatibility boundary: filled by the docs phase -->
 
 ```bash
 cp -p target/release/pe-service.bak-<prior-sha12> /tmp/pe-service.rollback.<prior-sha12>
