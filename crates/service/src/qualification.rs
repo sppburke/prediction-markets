@@ -11819,6 +11819,204 @@ mod tests {
             }
         }
     }
+    /// PASS: an authentic nonempty binding selects identically through map/index and transactional sealing,
+    /// including a pre-Start stream with post-Start history and a recorded history identity correction.
+    #[test]
+    fn corrected_binding_selection_and_sealing_agree_through_both_adapters() {
+        for case in [
+            "valid",
+            "recorded_correction",
+            "shared_read",
+            "shared_recorded_correction",
+        ] {
+            for pre_start_stream in [false, true] {
+                let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture(case);
+                let continuation = &fixture.continuation;
+                let state = crate::bucket_commit::continuation_v3_tests::binding_state(&fixture);
+                for row in state.open_decision_pending().unwrap() {
+                    state
+                        .close_decision_pending(&row.source_trade_id, "{}", "no_fill", 100)
+                        .unwrap();
+                }
+                let source_path = fixture.dir.path().join("binding.log");
+                let candidate = Scanner::verify(&source_path).unwrap();
+                let sealed = TailBinding::from(&candidate);
+                let start = prefix_at(pre_start_stream.then_some(0));
+                let map =
+                    decision_rows_for_source_prefix(&state, &source_path, &start, &sealed).unwrap();
+                let (indexed, binding) = decision_rows_for_indexed_source_prefix(
+                    &state,
+                    &fixture.index,
+                    &candidate,
+                    &start,
+                )
+                .unwrap();
+                assert_eq!(map.rows, indexed.rows);
+                assert_eq!(map.in_prefix, indexed.in_prefix);
+                assert_eq!(binding, sealed);
+                let decisions = if case.starts_with("shared_") { 2 } else { 1 };
+                assert_eq!(map.rows.len(), decisions - usize::from(pre_start_stream));
+                assert_eq!(map.in_prefix.len(), decisions);
+                let keys = map
+                    .rows
+                    .iter()
+                    .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
+                    .collect::<Vec<_>>();
+                state
+                    .seal_decision_evidence_for_source_prefix(
+                        &keys,
+                        &map.in_prefix,
+                        sealed.last_sequence,
+                    )
+                    .unwrap();
+                let observations = source_observations(&source_path, &sealed).unwrap();
+                verify_decision_source_inputs(
+                    &state,
+                    &replayed_no_copy_decision(continuation),
+                    &observations,
+                )
+                .unwrap();
+                // The same recorded correction cannot authorize an unrelated frozen target.
+                let mut altered = continuation.clone();
+                altered.facts.market_id = MarketId(VenueMarketId("unbound".to_owned()));
+                assert!(
+                    verify_decision_source_inputs(
+                        &state,
+                        &replayed_no_copy_decision(&altered),
+                        &observations
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    /// PASS: two authentic reads cannot redirect the same stream group to conflicting history targets.
+    #[test]
+    fn corrected_binding_selection_rejects_conflicting_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let (first, _, _) =
+            crate::bucket_commit::continuation_v3_tests::append_binding_read("valid", &mut writer);
+        let (second, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+            "other_target",
+            &mut writer,
+        );
+        assert_ne!(first.facts.source_trade_id, second.facts.source_trade_id);
+        drop(writer);
+        let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+        store_read_decision(&state, &first, "decision_pending", true);
+        store_read_decision(&state, &second, "decision_pending", true);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        for continuation in [&first, &second] {
+            continuation.observation_from_receipt_index(&index).unwrap();
+        }
+        let candidate = Scanner::verify(&source_path).unwrap();
+        let sealed = TailBinding::from(&candidate);
+        let map = decision_rows_for_source_prefix(&state, &source_path, &prefix_at(None), &sealed)
+            .unwrap_err();
+        let indexed =
+            decision_rows_for_indexed_source_prefix(&state, &index, &candidate, &prefix_at(None))
+                .unwrap_err();
+        assert!(
+            map.to_string()
+                .contains("disagree about an observation binding target"),
+            "{map}"
+        );
+        assert_eq!(map.to_string(), indexed.to_string());
+    }
+
+    /// PASS: malformed v5 policy and a valid policy substituted into authentic v2 bytes fail both selectors.
+    #[test]
+    fn bound_selection_rejects_malformed_freshness_policy() {
+        for legacy in [false, true] {
+            let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture("valid");
+            let path = fixture.dir.path().join("selection.db");
+            let state = PaperStateDb::open(&path).unwrap();
+            store_read_decision(&state, &fixture.continuation, "decision_pending", true);
+            let source_path = fixture.dir.path().join("binding.log");
+            let candidate = Scanner::verify(&source_path).unwrap();
+            let sealed = TailBinding::from(&candidate);
+            let original = if legacy {
+                let mut facts = fixture.continuation.facts.clone();
+                facts.paper_freshness_policy = None;
+                facts.applied_configuration =
+                    crate::bucket_commit::synthetic_legacy17_runtime_config();
+                facts.applied_configuration_hash = facts.applied_configuration.canonical_hash();
+                crate::bucket_commit::pre_545_frozen_inputs(&facts)
+            } else {
+                serde_json::to_string(&fixture.continuation).unwrap()
+            };
+            let original: serde_json::Value = serde_json::from_str(&original).unwrap();
+            for policy in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!({})),
+                Some(serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":0})),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":3601}),
+                ),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":"true","copy_latency_budget_secs":2}),
+                ),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":"2"}),
+                ),
+                Some(serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":-1})),
+                Some(
+                    serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2,"extra":false}),
+                ),
+                Some(serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2})),
+            ] {
+                if (legacy && policy.is_none())
+                    || (!legacy
+                        && policy
+                            == Some(
+                                serde_json::json!({"activity_ws_enabled":true,"copy_latency_budget_secs":2}),
+                            ))
+                {
+                    continue;
+                }
+                let mut value = original.clone();
+                match policy {
+                    Some(policy) => value["paper_freshness_policy"] = policy,
+                    None => {
+                        value
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("paper_freshness_policy");
+                    }
+                }
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                        [value.to_string()],
+                    )
+                    .unwrap();
+                assert!(
+                    decision_rows_for_source_prefix(
+                        &state,
+                        &source_path,
+                        &prefix_at(None),
+                        &sealed
+                    )
+                    .is_err()
+                );
+                assert!(
+                    decision_rows_for_indexed_source_prefix(
+                        &state,
+                        &fixture.index,
+                        &candidate,
+                        &prefix_at(None)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
     /// PASS: source verification loads the recorded A/0-to-B/1 correction and accepts B/1;
     /// without a correction it accepts A/0. All three identity mutations and uncorrected B/1
     /// return InsufficientEvidence.
