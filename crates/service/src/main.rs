@@ -1009,7 +1009,6 @@ async fn main() -> Result<()> {
         _ => anyhow::bail!("boot source-log recorder and walk state disagree at the handoff"),
     };
     let (trigger_tx, trigger_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
-    let mut start = producer_start_rx.clone();
     let activity_watchlist = live_watchlist.clone();
     let activity_health = health.clone();
     let activity_ws_enabled = cfg.polymarket_activity_ws_enabled;
@@ -1022,6 +1021,7 @@ async fn main() -> Result<()> {
             trigger_tx,
             activity_health,
         )
+        .with_reader_start_gate(producer_start_rx.clone())
         .with_source_receipt_index(source_receipts.clone())
     } else {
         pe_service::activity_ingest::ActivityIngest::poll_only(
@@ -1035,14 +1035,17 @@ async fn main() -> Result<()> {
     let reconciliation_obligations_dropped =
         activity_ingest.reconciliation_triggers_dropped_counter();
     supervisor.spawn(TaskName::ActivityIngest, async move {
-        if start.wait_for(|started| *started).await.is_err() {
-            return Ok(TaskExit::ChannelClosed("producer_start"));
-        }
-        activity_ingest
+        // Recovery may append admission evidence before observation producers start.
+        match activity_ingest
             .run_until(activity_shutdown.wait_for(TaskName::ActivityIngest.stop_phase()))
             .await
-            .map(|()| TaskExit::CleanShutdown)
-            .map_err(TaskFailure::typed)
+        {
+            Ok(()) => Ok(TaskExit::CleanShutdown),
+            Err(pe_service::activity_ingest::ActivityIngestError::ProducerStartClosed) => {
+                Ok(TaskExit::ChannelClosed("producer_start"))
+            }
+            Err(error) => Err(TaskFailure::typed(error)),
+        }
     });
 
     // Polymarket trade poller task. Reads the live wallet set per poll round (#339).
