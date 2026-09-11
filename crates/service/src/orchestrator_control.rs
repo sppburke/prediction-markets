@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
 use crate::paper_recovery::{HaltState, MembershipChange, RiskHaltOwner};
 use crate::position_seeder::AnchorInstall;
+use crate::watchlist_maintenance::MembershipCommit;
 
 /// Exact single-owner ledger capture used by the causal bracket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +69,7 @@ pub enum OrchestratorControl {
     PublishMembership {
         change: MembershipChange,
         replacements: Vec<WatchlistEntry>,
+        checks: MembershipCommit,
         acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
     },
     /// Append one risk-cause edge before acknowledging it to the producer.

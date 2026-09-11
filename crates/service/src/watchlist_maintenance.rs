@@ -59,7 +59,7 @@ use pe_paper_state::{FillRow, PaperStateDb, PaperStateError};
 use pe_trader_index::{Watchlist, WatchlistEntry};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard, watch};
 use tracing::{info, warn};
 
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
@@ -163,6 +163,93 @@ pub struct MembershipPublication {
     pub evidence: serde_json::Value,
 }
 
+/// Process-local checks carried to the single-owner publication boundary; never serialized.
+#[derive(Debug, Default)]
+pub struct MembershipCommit {
+    pub seeds: Vec<(WalletAddress, i64)>,
+    pub capacity: Option<MembershipCapacityCheck>,
+}
+
+#[derive(Debug)]
+pub enum MembershipCapacityCheck {
+    Unchanged {
+        applied: AppliedWatchlistCapacity,
+        expected: WatchlistCapacityEpoch,
+    },
+    Transition {
+        applied: AppliedWatchlistCapacity,
+        desired: watch::Receiver<WatchlistCapacityEpoch>,
+        request: WatchlistCapacityEpoch,
+    },
+}
+
+impl MembershipCommit {
+    /// Called under the writer lock immediately before appending the membership record.
+    pub fn recheck_and_seed(
+        &self,
+        paper_state: &PaperStateDb,
+        live: &LiveWatchlist,
+        change: &MembershipChange,
+        replacements: &[WatchlistEntry],
+    ) -> Result<(), MembershipApplyError> {
+        match &self.capacity {
+            Some(MembershipCapacityCheck::Unchanged { applied, expected }) => {
+                let current = applied.load();
+                if current != *expected {
+                    return Err(stale_capacity_error(*expected, current));
+                }
+            }
+            Some(MembershipCapacityCheck::Transition {
+                desired, request, ..
+            }) if *desired.borrow() != *request => {
+                return Err(MembershipApplyError::Publication(
+                    "capacity request was superseded before membership commit".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        recheck_admissions(paper_state, &change.added)?;
+        let current = live.snapshot();
+        let (removed, added) = match change.reason {
+            MembershipReason::FullRerank | MembershipReason::CapacityChange => {
+                ranked_membership_change(&current.entries, replacements, change.capacity)
+            }
+            _ => {
+                let removed: HashSet<_> = change.removed.iter().copied().collect();
+                let added =
+                    planned_admissions(&current.entries, &removed, replacements, change.capacity);
+                let removed = current
+                    .entries
+                    .iter()
+                    .filter_map(|entry| removed.contains(&entry.wallet).then_some(entry.wallet))
+                    .collect();
+                (removed, added)
+            }
+        };
+        let same_wallets = |left: &[WalletAddress], right: &[WalletAddress]| {
+            left.iter().copied().collect::<HashSet<_>>()
+                == right.iter().copied().collect::<HashSet<_>>()
+        };
+        if !same_wallets(&removed, &change.removed) || !same_wallets(&added, &change.added) {
+            return Err(MembershipApplyError::EvidenceMutation);
+        }
+        recheck_publication_evidence(&change.evidence, &change.removed, &change.added)?;
+        // #511: insert-only — never jump an existing (possibly HELD) delivery cursor.
+        paper_state.seed_cursors_if_absent(&self.seeds)?;
+        Ok(())
+    }
+
+    /// Commit the capacity epoch with the successful live replacement under the writer lock.
+    pub fn commit_capacity(&self) {
+        if let Some(MembershipCapacityCheck::Transition {
+            applied, request, ..
+        }) = &self.capacity
+        {
+            applied.store(*request);
+        }
+    }
+}
+
 fn remove_loaded_fences(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
@@ -195,7 +282,7 @@ fn recheck_admissions(
 }
 
 fn recheck_publication_evidence(
-    publication: &MembershipPublication,
+    publication_evidence: &serde_json::Value,
     removed: &[WalletAddress],
     added: &[WalletAddress],
 ) -> Result<(), MembershipApplyError> {
@@ -203,7 +290,7 @@ fn recheck_publication_evidence(
     // scenario callers with documentary JSON. Production publishers always construct this enum;
     // qualification independently rejects an untyped durable record.
     let Ok(evidence) =
-        serde_json::from_value::<SealedMembershipEvidence>(publication.evidence.clone())
+        serde_json::from_value::<SealedMembershipEvidence>(publication_evidence.clone())
     else {
         return Ok(());
     };
@@ -546,12 +633,8 @@ pub async fn apply_evictions_and_backfill(
     if actual_removed.is_empty() && admissions.is_empty() {
         return Ok(current.entries.len());
     }
-    recheck_admissions(paper_state, &admissions)?;
-    recheck_publication_evidence(&publication, &actual_removed, &admissions)?;
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
-    // #511: insert-only — an existing (possibly HELD) delivery cursor is already a valid
-    // lower bound and must never be jumped by a re-admission seed; activity MAX-seeds.
-    paper_state.seed_cursors_if_absent(&seeds)?;
+    drop(_guard);
     publisher
         .publish_membership(
             MembershipChange {
@@ -563,16 +646,25 @@ pub async fn apply_evictions_and_backfill(
                 evidence: publication.evidence,
             },
             candidates.to_vec(),
+            MembershipCommit {
+                seeds,
+                capacity: Some(MembershipCapacityCheck::Unchanged {
+                    applied: applied_capacity.clone(),
+                    expected: expected_capacity,
+                }),
+            },
         )
         .await
         .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
     Ok(live.snapshot().entries.len())
 }
 
-/// Apply an exact ranked membership while the caller holds the structural-writer mutex.
+/// Compute an exact ranked membership under the caller's structural-writer mutex, then release
+/// it before awaiting the orchestrator's final recheck, cursor persistence and publication.
 ///
 /// Used by both same-cap full reranks and runtime capacity transitions. Cursor persistence is a
 /// fail-closed prerequisite to ArcSwap publication.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_ranked_membership_locked(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
@@ -581,6 +673,8 @@ pub(crate) async fn apply_ranked_membership_locked(
     incoming: &[WatchlistEntry],
     incoming_last_trade: &HashMap<WalletAddress, i64>,
     cap: usize,
+    writer_guard: MutexGuard<'_, ()>,
+    capacity: Option<MembershipCapacityCheck>,
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
     remove_loaded_fences(live, paper_state)?;
     let current = live.snapshot();
@@ -591,11 +685,8 @@ pub(crate) async fn apply_ranked_membership_locked(
     {
         return Ok((current.entries.len(), dropped));
     }
-    recheck_admissions(paper_state, &admissions)?;
-    recheck_publication_evidence(&publication, &dropped, &admissions)?;
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
-    // #511: insert-only (see membership admission above).
-    paper_state.seed_cursors_if_absent(&seeds)?;
+    drop(writer_guard);
     publisher
         .publish_membership(
             MembershipChange {
@@ -607,6 +698,7 @@ pub(crate) async fn apply_ranked_membership_locked(
                 evidence: publication.evidence,
             },
             incoming.to_vec(),
+            MembershipCommit { seeds, capacity },
         )
         .await
         .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
@@ -641,6 +733,11 @@ pub async fn apply_full_rerank_swap(
         incoming,
         incoming_last_trade,
         expected_capacity.target,
+        _guard,
+        Some(MembershipCapacityCheck::Unchanged {
+            applied: applied_capacity.clone(),
+            expected: expected_capacity,
+        }),
     )
     .await
 }
@@ -1372,7 +1469,7 @@ mod tests {
             acknowledged.send(result).unwrap();
         });
         AdmissionPreparer::new(control_tx, paper_state)
-            .publish_membership(change, replacements)
+            .publish_membership(change, replacements, Default::default())
             .await
             .unwrap();
         control.await.unwrap();
@@ -1943,8 +2040,19 @@ mod tests {
                         OrchestratorControl::PublishMembership {
                             change,
                             replacements,
+                            checks,
                             acknowledged,
                         } => {
+                            if let Err(error) = checks.recheck_and_seed(
+                                &fake_paper_state,
+                                &control_live,
+                                &change,
+                                &replacements,
+                            ) {
+                                acknowledged.send(Err(error.to_string())).unwrap();
+                                continue;
+                            }
+
                             if failure == Some("structural")
                                 && change.reason == MembershipReason::FullRerank
                             {
@@ -1972,6 +2080,7 @@ mod tests {
                             }
                             let removed = change.removed.into_iter().collect::<HashSet<_>>();
                             control_live.replace(&removed, &replacements, change.capacity);
+                            checks.commit_capacity();
                             acknowledged
                                 .send(Ok(pe_event_log::AppendReceipt {
                                     sequence: pe_core_types::EventSeq(1),

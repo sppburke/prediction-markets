@@ -70,20 +70,35 @@ fn capacity(target: usize) -> (AppliedWatchlistCapacity, WatchlistCapacityEpoch)
     (applied, epoch)
 }
 
-fn membership_preparer(live: LiveWatchlist, paper_state: Arc<PaperStateDb>) -> AdmissionPreparer {
+fn membership_preparer(
+    live: LiveWatchlist,
+    paper_state: Arc<PaperStateDb>,
+    writer_lock: Arc<Mutex<()>>,
+) -> AdmissionPreparer {
     let (control, mut commands) = mpsc::channel(1);
+    let control_paper = paper_state.clone();
     tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             let OrchestratorControl::PublishMembership {
                 change,
                 replacements,
+                checks,
                 acknowledged,
             } = command
             else {
                 panic!("membership scenario sent an unrelated control")
             };
+            let _writer = writer_lock.lock().await;
+            if let Err(error) =
+                checks.recheck_and_seed(&control_paper, &live, &change, &replacements)
+            {
+                acknowledged.send(Err(error.to_string())).unwrap();
+                continue;
+            }
+
             let removed = change.removed.into_iter().collect::<HashSet<_>>();
             live.replace(&removed, &replacements, change.capacity);
+            checks.commit_capacity();
             acknowledged
                 .send(Ok(pe_event_log::AppendReceipt {
                     sequence: pe_core_types::EventSeq(1),
@@ -389,7 +404,7 @@ fn small_sample_consistent_bleeder_demoted() {
 #[tokio::test]
 async fn backfilled_wallet_seeded_from_real_last_trade() {
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
 
     let existing = wallet(1);
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
@@ -414,8 +429,11 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
-        publication(),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
+        MembershipPublication {
+            reason: MembershipReason::KnockoutInactivity,
+            ..publication()
+        },
         &applied,
         epoch,
         &HashSet::new(),
@@ -451,7 +469,7 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
 #[tokio::test]
 async fn stale_seeded_wallet_no_admission_grace() {
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
 
     let existing = wallet(1);
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
@@ -470,8 +488,11 @@ async fn stale_seeded_wallet_no_admission_grace() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
-        publication(),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
+        MembershipPublication {
+            reason: MembershipReason::KnockoutInactivity,
+            ..publication()
+        },
         &applied,
         epoch,
         &HashSet::new(),
@@ -550,8 +571,11 @@ async fn writer_mutex_serializes_refresh_and_replace() {
             &live_m,
             &db_m,
             &lock_m,
-            &membership_preparer(live_m.clone(), Arc::clone(&db_m)),
-            publication(),
+            &membership_preparer(live_m.clone(), Arc::clone(&db_m), lock_m.clone()),
+            MembershipPublication {
+                reason: MembershipReason::KnockoutInactivity,
+                ..publication()
+            },
             &applied_m,
             epoch,
             &removed,
@@ -600,7 +624,7 @@ async fn full_rerank_swap_wholesale() {
     let (a, b, c, d) = (wallet(1), wallet(2), wallet(3), wallet(4));
     let live = LiveWatchlist::new(watchlist(vec![entry(a, 300), entry(b, 200), entry(c, 100)]));
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
 
     // Incoming batch top-N: B survives, D is admitted, A and C fall out.
     let incoming = vec![entry(b, 250), entry(d, 240)];
@@ -615,7 +639,7 @@ async fn full_rerank_swap_wholesale() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &applied,
         epoch,
@@ -664,7 +688,7 @@ async fn full_rerank_swap_identity_noop() {
     let (a, b) = (wallet(1), wallet(2));
     let live = LiveWatchlist::new(watchlist(vec![entry(a, 300), entry(b, 200)]));
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
     let incoming = vec![entry(a, 310), entry(b, 210)];
     let side: HashMap<WalletAddress, i64> = HashMap::new();
     let (applied, epoch) = capacity(25);
@@ -673,7 +697,7 @@ async fn full_rerank_swap_identity_noop() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &applied,
         epoch,
@@ -705,7 +729,7 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
         .collect();
     let live = LiveWatchlist::new(watchlist(initial));
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
 
     let top_100: Vec<WatchlistEntry> = (1..=100u8)
         .map(|n| entry(wallet(n), 2_000 - i32::from(n)))
@@ -721,7 +745,7 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &grow_capacity,
         grow_epoch,
@@ -742,7 +766,7 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &shrink_capacity,
         shrink_epoch,
@@ -774,7 +798,7 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
             .collect(),
     ));
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
     let applied = AppliedWatchlistCapacity::new(50);
     let stale_50 = applied.load();
     applied.store(WatchlistCapacityEpoch {
@@ -789,7 +813,7 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &applied,
         stale_50,
@@ -810,7 +834,7 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &applied,
         stale_50,
@@ -832,7 +856,7 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
     let newcomer = wallet(2);
     let live = LiveWatchlist::new(watchlist(vec![entry(original, 100)]));
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
     let (applied, epoch) = capacity(1);
     let incoming = vec![entry(newcomer, 200)];
     install_anchor(&db, newcomer, 0);
@@ -841,7 +865,7 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &applied,
         epoch,
@@ -872,7 +896,7 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
 #[tokio::test]
 async fn survivor_bench_exhausted_still_evicts_and_shrinks_below_cap() {
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
 
     let keep_a = wallet(1);
     let keep_b = wallet(2);
@@ -891,8 +915,11 @@ async fn survivor_bench_exhausted_still_evicts_and_shrinks_below_cap() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
-        publication(),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
+        MembershipPublication {
+            reason: MembershipReason::KnockoutInactivity,
+            ..publication()
+        },
         &applied,
         epoch,
         &removed,
@@ -932,7 +959,7 @@ async fn survivor_bench_exhausted_still_evicts_and_shrinks_below_cap() {
 #[tokio::test]
 async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
     let (_dir, db) = temp_db();
-    let lock = Mutex::new(());
+    let lock = Arc::new(Mutex::new(()));
 
     let before: Vec<WatchlistEntry> = (1..=27u8)
         .map(|n| entry(wallet(n), 2_000 - i32::from(n)))
@@ -944,7 +971,7 @@ async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db)),
+        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
         publication(),
         &applied,
         epoch,

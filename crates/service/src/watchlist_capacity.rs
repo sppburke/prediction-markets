@@ -22,8 +22,8 @@ use crate::runtime_config::{AppliedWatchlistCapacity, MAX_ACTIVE_WATCHLIST_SIZE}
 use crate::supabase_reader::{self, SupabaseError};
 use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use crate::watchlist_maintenance::{
-    MembershipApplyError, MembershipPublication, apply_ranked_membership_locked,
-    ranked_membership_change,
+    MembershipApplyError, MembershipCapacityCheck, MembershipPublication,
+    apply_ranked_membership_locked, ranked_membership_change,
 };
 
 /// Failure surface for one capacity transition. Every variant is fail-soft to the caller.
@@ -160,10 +160,14 @@ impl SupabaseWatchlistCapacity {
             &incoming.entries,
             &incoming_last_trade,
             target,
+            _writer,
+            Some(MembershipCapacityCheck::Transition {
+                applied: self.applied_capacity.clone(),
+                desired: self.desired_capacity.clone(),
+                request,
+            }),
         )
         .await?;
-        self.applied_capacity.store(request);
-        drop(_writer);
 
         info!(
             target,
@@ -366,6 +370,7 @@ mod tests {
                     evidence,
                 },
                 Vec::new(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -487,8 +492,19 @@ mod tests {
                         OrchestratorControl::PublishMembership {
                             change,
                             replacements,
+                            checks,
                             acknowledged,
                         } => {
+                            if let Err(error) = checks.recheck_and_seed(
+                                &fake_paper_state,
+                                &live,
+                                &change,
+                                &replacements,
+                            ) {
+                                acknowledged.send(Err(error.to_string())).unwrap();
+                                continue;
+                            }
+
                             if let Err(error) =
                                 crate::qualification::verify_published_membership_change(
                                     &change.clone().into_record(),
@@ -506,6 +522,7 @@ mod tests {
                             }
                             let removed = change.removed.into_iter().collect::<HashSet<_>>();
                             live.replace(&removed, &replacements, change.capacity);
+                            checks.commit_capacity();
                             acknowledged
                                 .send(Ok(pe_event_log::AppendReceipt {
                                     sequence: pe_core_types::EventSeq(1),
@@ -686,8 +703,19 @@ mod tests {
                     OrchestratorControl::PublishMembership {
                         change,
                         replacements,
+                        checks,
                         acknowledged,
                     } => {
+                        if let Err(error) = checks.recheck_and_seed(
+                            &fake_paper_state,
+                            &live_at_control,
+                            &change,
+                            &replacements,
+                        ) {
+                            acknowledged.send(Err(error.to_string())).unwrap();
+                            continue;
+                        }
+
                         if let Err(error) = crate::qualification::verify_published_membership_change(
                             &change.clone().into_record(),
                             &verifier_source_log,
@@ -703,6 +731,7 @@ mod tests {
                         }
                         let removed = change.removed.into_iter().collect::<HashSet<_>>();
                         live_at_control.replace(&removed, &replacements, change.capacity);
+                        checks.commit_capacity();
                         acknowledged
                             .send(Ok(pe_event_log::AppendReceipt {
                                 sequence: pe_core_types::EventSeq(1),

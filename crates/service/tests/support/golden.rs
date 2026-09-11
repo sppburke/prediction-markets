@@ -2422,6 +2422,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 .send(OrchestratorControl::PublishMembership {
                     change: change.clone(),
                     replacements,
+                    checks: Default::default(),
                     acknowledged,
                 })
                 .await
@@ -3091,6 +3092,18 @@ impl BracketFinancialHarness {
         wallet: WalletAddress,
         epoch: i64,
     ) -> pe_service::bucket_commit::BucketCommitResult {
+        self.queue_entry(wallet, epoch)
+            .await
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    pub(crate) async fn queue_entry(
+        &self,
+        wallet: WalletAddress,
+        epoch: i64,
+    ) -> oneshot::Receiver<Result<pe_service::bucket_commit::BucketCommitResult, String>> {
         let bodies = golden_trade_bodies(1, epoch);
         self.record_entry_admission(&bodies, epoch).await;
         let payload = Self::entry_payload(wallet, epoch);
@@ -3115,7 +3128,7 @@ impl BracketFinancialHarness {
             })
             .await
             .unwrap();
-        ack.await.unwrap().unwrap()
+        ack
     }
 
     pub(crate) fn mutations(&self) -> usize {
