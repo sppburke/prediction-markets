@@ -118,8 +118,6 @@ pub struct MaintenanceConfig {
     /// Trailing window (seconds) for the demotion realized-P&L conjunct
     /// (`WalletEdgeStats::windowed_pnl`).
     pub demotion_pnl_window_secs: u64,
-    /// Extra bench candidates fetched beyond the freed-slot count.
-    pub bench_overfetch: usize,
     /// Who owns membership between ranking batches (module docs; run28 cutover).
     pub membership_mode: MembershipMode,
 }
@@ -1238,7 +1236,6 @@ mod tests {
             demotion_min_trades: 10,
             demotion_cb_alpha: dec!(0.10),
             demotion_pnl_window_secs: 2_592_000, // 30 d
-            bench_overfetch: 10,
             membership_mode: MembershipMode::default(),
         }
     }

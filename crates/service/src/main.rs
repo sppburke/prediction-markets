@@ -1469,7 +1469,6 @@ async fn main() -> Result<()> {
         cfg.supabase_url.clone(),
         cfg.supabase_anon_key.clone(),
         cfg.supabase_secret_key.clone(),
-        applied_watchlist_capacity.clone(),
         cfg.supabase_refresh_interval_secs,
         watchlist_writer_lock.clone(),
         projection_dirty_rx,
@@ -1499,7 +1498,6 @@ async fn main() -> Result<()> {
             demotion_min_trades: cfg.demotion_min_trades,
             demotion_cb_alpha,
             demotion_pnl_window_secs: cfg.demotion_pnl_window_secs,
-            bench_overfetch: cfg.bench_overfetch,
             membership_mode,
         };
         let maintenance = run_maintenance_loop(

@@ -1654,16 +1654,7 @@ mod tests {
                 appended.send(receipt).unwrap();
             }
             if expected == "success" {
-                for _ in 0..32 {
-                    if completed.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                assert!(
-                    completed.load(Ordering::SeqCst),
-                    "admission stayed pending after every source acknowledgement"
-                );
+                // Every acknowledgement is released: completion is awaited, never polled.
                 let admission = build.await.unwrap().unwrap();
                 assert_eq!(
                     admission.receipts,

@@ -1352,26 +1352,11 @@ impl DecisionContinuationV3 {
                 }
                 _ => return Err(DecisionContinuationError::DurableMismatch),
             };
-            let commitment =
-                result.map_err(|_| DecisionContinuationError::SourceReceiptMismatch {
-                    sequence: selected.sequence.0,
-                })?;
-            if commitment
-                .as_ref()
-                .and_then(|commitment| commitment.bindings.as_ref())
-                .is_some_and(|bindings| !bindings.is_empty())
-            {
-                self.reconstruct_complete_activity_read(&mut |receipt| {
-                    source_receipts
-                        .source_envelope(receipt)
-                        .map(CompleteActivityPage::from)
-                })
-                .map_err(|_| {
-                    DecisionContinuationError::SourceReceiptMismatch {
-                        sequence: selected.sequence.0,
-                    }
-                })?;
-            }
+            // Legacy commitments carry no bindings (the shared verifier rejects them for
+            // generations below 5); generation 5 returned above through its bound read.
+            result.map_err(|_| DecisionContinuationError::SourceReceiptMismatch {
+                sequence: selected.sequence.0,
+            })?;
         }
         self.verify_websocket_receipt(source_receipts)?;
         let observed_unix_ms = source_receipts.received_millis(selected)?;

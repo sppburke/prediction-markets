@@ -2687,7 +2687,6 @@ fn verify_membership_change_evidence(
                     demotion_min_trades: artifact.demotion_min_trades,
                     demotion_cb_alpha: artifact.demotion_cb_alpha,
                     demotion_pnl_window_secs: artifact.demotion_pnl_window_secs,
-                    bench_overfetch: 0,
                     membership_mode: MembershipMode::Knockout,
                 };
                 let rederived = knockout_decision(

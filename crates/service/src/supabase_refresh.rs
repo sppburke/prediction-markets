@@ -21,7 +21,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::live_watchlist::LiveWatchlist;
-use crate::runtime_config::{AppliedWatchlistCapacity, MAX_ACTIVE_WATCHLIST_SIZE};
+use crate::runtime_config::MAX_ACTIVE_WATCHLIST_SIZE;
 use crate::supabase_reader::{self, SupabaseError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -397,7 +397,6 @@ pub async fn run_supabase_refresh_loop(
     base_url: String,
     anon_key: String,
     secret_key: String,
-    _applied_capacity: AppliedWatchlistCapacity,
     interval_secs: u64,
     writer_lock: Arc<Mutex<()>>,
     mut dirty: watch::Receiver<u64>,
@@ -581,7 +580,6 @@ mod tests {
             base,
             "anon".to_owned(),
             String::new(),
-            AppliedWatchlistCapacity::new(1),
             1,
             Arc::new(Mutex::new(())),
             rx,

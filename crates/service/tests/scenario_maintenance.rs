@@ -115,7 +115,6 @@ fn cfg() -> MaintenanceConfig {
         demotion_min_trades: 10,
         demotion_cb_alpha: dec!(0.10),
         demotion_pnl_window_secs: 2_592_000, // 30 d
-        bench_overfetch: 10,
         membership_mode: MembershipMode::default(),
     }
 }

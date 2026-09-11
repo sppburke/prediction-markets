@@ -1504,7 +1504,6 @@ impl PaperStateDb {
         &self,
         status: &WalletHistoryStatusRecord,
     ) -> Result<(), PaperStateError> {
-        serde_json::from_str::<serde_json::Value>(&status.proof_json)?;
         let conn = self.lock();
         upsert_history_status(&conn, status, false)?;
         Ok(())

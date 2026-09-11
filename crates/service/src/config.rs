@@ -256,9 +256,10 @@ pub struct ServiceConfig {
     #[serde(default = "default_inactivity_hard_cap_secs")]
     pub inactivity_hard_cap_secs: u64,
 
-    /// Extra bench candidates fetched beyond the freed-slot count when backfilling, so a
-    /// server-side casing/dedup miss still leaves enough rows to refill the set. Default:
-    /// 10. See `docs/_GLOSSARY.md`: `bench_overfetch`.
+    /// Accepted for configuration compatibility only. Since #588 it has no runtime effect:
+    /// membership maintenance reads the latest ranking batch bounded by
+    /// `MAX_ACTIVE_WATCHLIST_SIZE` instead of over-fetching freed slots. Default: 10. See
+    /// `docs/_GLOSSARY.md`: `bench_overfetch`.
     #[serde(default = "default_bench_overfetch")]
     pub bench_overfetch: usize,
 
