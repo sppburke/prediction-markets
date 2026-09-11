@@ -346,7 +346,13 @@ durable and unseen groups, or a revision of an already-durable group, still fenc
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
 activity cutoff, has an installed anchor no older than `ANCHOR_REFRESH_SECS`, and has
 `reanchor_required = false`. Any failed condition walks the wallet through `validate_direct`.
-`position_validation_current` is not a reuse prerequisite.
+`position_validation_current` is not a reuse prerequisite. When a required `validate_direct` walk
+encounters a `TRADE` row with a price outside the unit range (issue #594; observed 2026-09-11), the
+wallet is left out of the accepted set like a transient read failure (unvalidated for runtime
+admission; a wallet reused on a fresh anchor is not re-read at boot), and a live wallet's periodic
+anchor refresh reports it deferred instead of ending the poll round, keeping the anchor it already
+holds (issue #597). Malformed pages, window invalidations, other row validations, aggregation and
+identity failures remain boot-fatal.
 
 **Rehearsal isolation.** A #557 rehearsal uses a copy of production durable state at dedicated
 paths, an exclusive loopback bind, and a complete environment that explicitly sets `PE_BIND` plus
