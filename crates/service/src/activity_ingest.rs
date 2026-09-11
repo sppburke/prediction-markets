@@ -101,6 +101,17 @@ pub struct SourceLogReceiver {
     rx: mpsc::Receiver<SourceLogRequest>,
 }
 
+#[cfg(any(test, feature = "scenario"))]
+impl SourceLogReceiver {
+    /// Receive a capture with its durable acknowledgement held under test control.
+    pub async fn recv_for_test(&mut self) -> Option<(EnvelopeIn, oneshot::Sender<AppendReceipt>)> {
+        self.rx
+            .recv()
+            .await
+            .map(|request| (request.envelope, request.appended))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SourceLogHandleError {
     #[error("source-log coordinator closed")]

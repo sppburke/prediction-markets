@@ -624,3 +624,64 @@ pub async fn qualify_source_census(
     .unwrap();
     serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap()
 }
+
+/// Retained generation-four facts in each historical continuation wire encoding.
+pub fn legacy_continuation_wire(version: u16) -> serde_json::Value {
+    let mut wire: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/decision_continuation_v4.json")).unwrap();
+    wire["version"] = version.into();
+    if version < 4 {
+        wire.as_object_mut().unwrap().remove("read_commitment");
+    }
+    if version == 2 {
+        wire.as_object_mut().unwrap().remove("page_occurrences");
+        wire.as_object_mut()
+            .unwrap()
+            .remove("observed_source_receipt");
+        let config = wire["applied_configuration"].as_object_mut().unwrap();
+        assert_eq!(config.remove("era").unwrap(), "legacy17");
+        let compatibility = config.remove("legacy_compatibility").unwrap();
+        for (key, value) in compatibility.as_object().unwrap() {
+            config.insert(key.clone(), value.clone());
+        }
+    }
+    wire
+}
+
+/// Install an empty anchor through the bucket owner so qualification can verify its balance hash.
+pub fn install_verified_empty_anchor(
+    paper: &Arc<pe_paper_state::PaperStateDb>,
+    wallet: WalletAddress,
+    cutoff: i64,
+) {
+    paper.set_cursor(&wallet, cutoff).unwrap();
+    use pe_service::position_seeder::{
+        AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture,
+    };
+    let mut engine = pe_service::bucket_commit::BucketCommitEngine::load(
+        paper.clone(),
+        pe_service::paper_recovery::build_leader_ledger(paper).unwrap(),
+    )
+    .unwrap();
+    let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
+    engine
+        .install_anchors(&[AnchorInstall {
+            wallet,
+            balances: Vec::new(),
+            cutoff,
+            proof: AnchorProof {
+                positions_proof_hash: "scenario-positions".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: cutoff,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        }])
+        .unwrap();
+}

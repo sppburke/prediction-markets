@@ -5474,6 +5474,12 @@ fn verify_paper_prepared_freshness(
     if decision.continuation.version() != 5 {
         return Ok(());
     }
+    if decision.post_boundary.body.terminal.reason == "paper_stale_before_prepared"
+        && decision.post_boundary.body.authority
+            != crate::decision_replay::AuthorityEvidence::not_read("terminal_before_fill_authority")
+    {
+        return insufficient("paper Prepared expiry contradicts the terminal authority");
+    }
     let Some(now) =
         crate::decision_replay::paper_prepared_gate_clock(&decision.post_boundary.body.clocks)
             .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?
@@ -5512,6 +5518,15 @@ fn verify_paper_prepared_freshness(
         );
     }
     Ok(())
+}
+
+/// Capture the production Start membership binding for deterministic financial scenarios.
+#[cfg(feature = "scenario")]
+pub fn scenario_membership_proofs_hash(
+    state: &PaperStateDb,
+    membership: &[pe_core_types::WalletAddress],
+) -> Result<String, QualificationError> {
+    derive_membership_proofs_hash(state, membership)
 }
 
 #[cfg(test)]
@@ -12696,6 +12711,31 @@ mod tests {
             let observation = verify_decision_source_inputs(&state, &decision, &source).unwrap();
             assert_eq!(observation.observed_unix_ms, 1_700_000_100_000);
             verify_paper_prepared_freshness(&decision, &source).unwrap();
+            if expired {
+                for authority in [
+                    AuthorityEvidence::commit_fill_v2("settled_refusal", dec!(99)),
+                    AuthorityEvidence::local("settled_refusal"),
+                    AuthorityEvidence::not_read("another_reason"),
+                    AuthorityEvidence {
+                        bankroll: Some("99".to_owned()),
+                        ..AuthorityEvidence::not_read("terminal_before_fill_authority")
+                    },
+                ] {
+                    let mut contradictory = decision.clone();
+                    contradictory.post_boundary.body.authority = authority;
+                    contradictory.post_boundary =
+                        DecisionPostBoundaryEvidence::from_body(contradictory.post_boundary.body)
+                            .unwrap();
+                    let mut rehashed_row = row.clone();
+                    rehashed_row.post_commit_inputs_json =
+                        serde_json::to_string(&contradictory.post_boundary).unwrap();
+                    assert!(matches!(
+                        crate::decision_replay::replay_decision_pending(&rehashed_row),
+                        Err(crate::decision_replay::ReplayDecisionError::AuthorityBinding)
+                    ));
+                    assert!(verify_paper_prepared_freshness(&contradictory, &source).is_err());
+                }
+            }
             if enabled {
                 let clock = &mut decision.post_boundary.body.clocks[0];
                 *clock = DecisionClockEvidence::precise(

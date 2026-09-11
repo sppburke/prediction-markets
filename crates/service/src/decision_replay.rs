@@ -867,6 +867,12 @@ pub fn replay_decision_pending(
             && terminal.fill.is_none()
             && terminal.decline.is_none();
         let expired = terminal.reason == "paper_stale_before_prepared";
+        if expired
+            && post_boundary.body.authority
+                != AuthorityEvidence::not_read("terminal_before_fill_authority")
+        {
+            return Err(ReplayDecisionError::AuthorityBinding);
+        }
         if gate.is_some() != (final_fill || expired)
             || (terminal.disposition == "fill" && !final_fill)
             || (expired
@@ -1612,5 +1618,16 @@ mod tests {
             DecisionEvidenceAccumulator::from_pending_checkpoint(&row),
             Err(ReplayDecisionError::DocumentHash { .. })
         ));
+    }
+
+    /// PASS: the generation-five authority restriction does not change legacy reason validation.
+    #[test]
+    fn legacy_expiry_reason_keeps_existing_authority_contract() {
+        let row = terminal_row(
+            "legacy-expiry",
+            AuthorityEvidence::commit_fill_v2("settled_refusal", dec!(99)),
+            TerminalDispositionEvidence::no_fill("paper_stale_before_prepared"),
+        );
+        assert_byte_exact_replay(&row);
     }
 }

@@ -252,6 +252,7 @@ struct Harness {
     prices: Prices,
     authority: Authority,
     live: LiveAccounts,
+    admission_builder: Option<LiveAdmissionBuilder>,
     control: Option<mpsc::Sender<OrchestratorControl>>,
     task:
         Option<tokio::task::JoinHandle<Result<(), pe_service::orchestrator::OrchestratorRunError>>>,
@@ -270,7 +271,9 @@ impl Harness {
                 updated_at_unix: EPOCH - 1,
             })
             .unwrap();
-        support::install_empty_anchor(&paper, wallet(), 0);
+        support::install_verified_empty_anchor(&paper, wallet(), 0);
+        let live_path = dir.path().join("live_journal.log");
+        drop(pe_execution_core::LiveJournal::open(&live_path).unwrap());
         let empty = TailBinding {
             physical_tail: 5,
             last_sequence: None,
@@ -280,7 +283,9 @@ impl Harness {
             starting_bankroll: CollateralAmount::from_decimal_exact(CASH).unwrap(),
             paper_prefix: empty.clone(),
             source_prefix: empty.clone(),
-            live_prefix: empty,
+            live_prefix: TailBinding::from(
+                &pe_execution_core::LiveJournal::verified_tail(&live_path).unwrap(),
+            ),
             artifact_blake3: "fixture".to_owned(),
             static_config_hash: "fixture".to_owned(),
             hot_config_hash: runtime().canonical_hash(),
@@ -288,7 +293,11 @@ impl Harness {
             activation_id: "prepared-freshness".to_owned(),
             ranking_batch_id: 588,
             membership: vec![wallet()],
-            membership_proofs_hash: "fixture".to_owned(),
+            membership_proofs_hash: pe_service::qualification::scenario_membership_proofs_hash(
+                &paper,
+                &[wallet()],
+            )
+            .unwrap(),
             schema_version: 3,
             parser_version: 1,
             financial_semantic_version: 1,
@@ -348,6 +357,7 @@ impl Harness {
                 fail: Arc::new(AtomicBool::new(false)),
             },
             live: LiveAccounts::new(LiveAccountsSnapshot::default()),
+            admission_builder: None,
             control: None,
             task: None,
             coordinator,
@@ -501,12 +511,14 @@ impl Harness {
             .configure_financial_log_paths(
                 self.dir.path().join("paper.log"),
                 self.dir.path().join("source.log"),
-                LiveAdmissionBuilder::new(
-                    reqwest::Client::new(),
-                    "http://unused.invalid",
-                    "http://unused.invalid",
-                    self.source.clone(),
-                ),
+                self.admission_builder.clone().unwrap_or_else(|| {
+                    LiveAdmissionBuilder::new(
+                        reqwest::Client::new(),
+                        "http://unused.invalid",
+                        "http://unused.invalid",
+                        self.source.clone(),
+                    )
+                }),
                 Arc::new(HistoricalMarkAdapter::new(
                     reqwest::Client::new(),
                     "http://unused.invalid",
@@ -517,7 +529,8 @@ impl Harness {
             .unwrap();
         self.control = Some(control);
         self.task = Some(tokio::spawn(
-            owner.run_coordinated(std::future::pending::<()>()),
+            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+                .scope(at(), owner.run_coordinated(std::future::pending::<()>())),
         ));
     }
     fn attempt(&self, recorded: &Recorded, final_at: OffsetDateTime) {
@@ -694,6 +707,27 @@ impl Harness {
         receiver.await.unwrap();
     }
 }
+impl Harness {
+    async fn boot_barrier(&mut self) {
+        let (captured, receiver) = tokio::sync::oneshot::channel();
+        self.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::CaptureAdmissionLedger {
+                wallet: wallet(),
+                captured,
+            })
+            .await
+            .unwrap();
+        if receiver.await.is_err() {
+            panic!(
+                "boot recovery stopped: {:?}",
+                self.task.take().unwrap().await
+            );
+        }
+    }
+}
+
 impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
@@ -809,6 +843,14 @@ async fn paper_prepared_gate_preserves_nanosecond_boundary() {
         assert_eq!(h.prepared_count(), usize::from(remainder == 0));
         if remainder == 1 {
             assert_expired(&h, &recorded);
+        } else {
+            let report = h.qualify_one_fill().await;
+            assert!(report.replay.exact, "{:?}", report.reasons);
+            assert_eq!(report.replay.fills, 1);
+            assert_eq!(
+                report.verdict,
+                pe_service::qualification::QualificationVerdict::Fail
+            );
         }
     }
 }
@@ -1478,4 +1520,524 @@ async fn staged_generation_five_crash_between_staging_and_outcome_converges_once
             }
         }
     }
+}
+
+/// PASS: an actual boot bracket fence releases a staged seed with the same refusal in either
+/// recovery order; a failed terminal transaction preserves both owners until restart.
+#[tokio::test]
+async fn boot_fence_completes_staged_handoff_atomically_in_both_recovery_orders() {
+    for recovery_first in [true, false] {
+        for fail_terminal in [false, true] {
+            let mut h = Harness::new().await;
+            let held = h.record(1).await;
+            h.attempt(&held, at());
+            h.start(true);
+            h.poll(&held).await;
+            h.stop().await;
+            let recorded = h.record(2).await;
+            h.arm();
+            h.attempt(&recorded, at());
+            h.start(true);
+            *h.prices.gate.market.lock().unwrap() =
+                Some(held.admission.market.condition_id.0.clone());
+            h.prices.gate.blocked.store(true, Ordering::SeqCst);
+            let gate = h.prices.gate.clone();
+            {
+                let pending = h.poll(&recorded);
+                tokio::pin!(pending);
+                tokio::select! { biased; _ = gate.started.notified() => {}, _ = &mut pending => panic!("copy completed before staging crash") }
+            }
+            h.stop().await;
+            let open = h.terminal(&recorded);
+            assert_eq!(open.state, DecisionPendingState::Open);
+            let seed = h.paper.pending_dispatch_seeds().unwrap().remove(0);
+            let targets = h.paper.dispatch_targets(&seed.dispatch_id).unwrap();
+            let cash = h.paper.bankroll().unwrap();
+            let positions = h.paper.open_positions().unwrap();
+            let history = h.paper.gate_history().unwrap();
+            assert_eq!(h.prepared_count(), 1);
+
+            // The same source group with a changed semantic revision fences during boot's
+            // first activity read, through the real validator and bucket commit owner.
+            let mut changed: Value = serde_json::from_slice(&held.activity).unwrap();
+            changed[0]["size"] = "11".into();
+            let validator = pe_service::position_seeder::CausalPositionValidator::new(
+                Arc::new(Page(serde_json::to_vec(&changed).unwrap())),
+                "fixture://activity",
+                "prepared-freshness",
+                Arc::new(AssetIdentityResolver::new_runtime(
+                    Arc::new(Page(held.gamma.clone())),
+                    "fixture://gamma".to_owned(),
+                    GAMMA_BATCH_SIZE,
+                    h.source.clone(),
+                )),
+            )
+            .with_clock(Arc::new(|| EPOCH + 10));
+            let mut engine =
+                BucketCommitEngine::load(h.paper.clone(), build_leader_ledger(&h.paper).unwrap())
+                    .unwrap();
+            assert!(
+                validator
+                    .validate_direct(&[wallet()], &mut engine, &h.paper)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(h.paper.is_wallet_fenced(&wallet()).unwrap());
+            assert_eq!(h.terminal(&recorded), open);
+
+            let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+            connection.execute_batch("CREATE TABLE fence_transitions (kind TEXT NOT NULL);
+                CREATE TRIGGER count_fence_seed AFTER UPDATE OF state ON dispatch_seeds WHEN OLD.state = 'pending_paper' AND NEW.state = 'ready' BEGIN INSERT INTO fence_transitions VALUES ('seed'); END;
+                CREATE TRIGGER count_fence_terminal AFTER UPDATE OF state ON decision_pending WHEN OLD.state = 'open' AND NEW.state = 'terminal' BEGIN INSERT INTO fence_transitions VALUES ('terminal'); END;").unwrap();
+            if fail_terminal {
+                connection.execute_batch("CREATE TRIGGER fail_fence_terminal BEFORE UPDATE ON decision_pending WHEN NEW.state = 'terminal' BEGIN SELECT RAISE(FAIL, 'injected fence terminal failure'); END;").unwrap();
+            }
+            let recover_seeds = || {
+                pe_service::dispatch_recovery::resume_dispatch_seeds(
+                    &h.dir.path().join("paper.log"),
+                    &h.paper,
+                )
+                .unwrap()
+            };
+            if recovery_first {
+                let recovery = recover_seeds();
+                assert_eq!(recovery.left_pending, 1);
+                assert_eq!(recovery.finalized_stuck, 0);
+                assert_eq!(recovery.flipped_fill, 0);
+            }
+            h.hooks.age_clock.lock().unwrap().clear();
+            h.hooks.age_clock.lock().unwrap().push_back(at());
+            h.start(false);
+            if fail_terminal {
+                let error = h.task.take().unwrap().await.unwrap().unwrap_err();
+                assert!(matches!(
+                    error,
+                    pe_service::orchestrator::OrchestratorRunError::PendingRecovery(_)
+                ));
+            } else {
+                h.boot_barrier().await;
+            }
+            h.stop().await;
+            if fail_terminal {
+                assert_eq!(h.terminal(&recorded), open);
+                assert_eq!(
+                    h.paper.dispatch_seed(&seed.dispatch_id).unwrap().unwrap(),
+                    seed
+                );
+                assert!(h.paper.no_copy_disposition(&recorded.id).unwrap().is_none());
+                let count: usize = connection
+                    .query_row("SELECT count(*) FROM fence_transitions", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "the seed flip rolls back with terminalization");
+                let recovery = pe_service::dispatch_recovery::resume_dispatch_seeds(
+                    &h.dir.path().join("paper.log"),
+                    &h.paper,
+                )
+                .unwrap();
+                assert_eq!(recovery.left_pending, 1);
+                assert_eq!(
+                    h.paper.dispatch_targets(&seed.dispatch_id).unwrap(),
+                    targets
+                );
+                connection
+                    .execute_batch("DROP TRIGGER fail_fence_terminal;")
+                    .unwrap();
+                h.hooks.age_clock.lock().unwrap().push_back(at());
+                h.start(false);
+                h.boot_barrier().await;
+                h.stop().await;
+            }
+            let terminal = h.terminal(&recorded);
+            let replayed = replay_decision_pending(&terminal).unwrap();
+            assert_eq!(
+                terminal.terminal_disposition.as_deref(),
+                Some("no_copy:wallet_fenced_before_dispatch")
+            );
+            assert_eq!(
+                replayed.post_boundary.body.terminal.reason,
+                "wallet_fenced_before_dispatch"
+            );
+            assert_eq!(
+                replayed.post_boundary.body.terminal.dispatch_id.as_deref(),
+                Some(seed.dispatch_id.as_str())
+            );
+            assert_eq!(
+                h.paper
+                    .no_copy_disposition(&recorded.id)
+                    .unwrap()
+                    .unwrap()
+                    .2,
+                "wallet_fenced_before_dispatch"
+            );
+            let ready = h.paper.dispatch_seed(&seed.dispatch_id).unwrap().unwrap();
+            assert_eq!(ready.state, "ready");
+            assert_eq!(
+                ready.paper_outcome.as_deref(),
+                Some("no_fill:wallet_fenced_before_dispatch")
+            );
+            for _ in 0..2 {
+                let recovery = pe_service::dispatch_recovery::resume_dispatch_seeds(
+                    &h.dir.path().join("paper.log"),
+                    &h.paper,
+                )
+                .unwrap();
+                assert_eq!(
+                    (
+                        recovery.left_pending,
+                        recovery.flipped_fill,
+                        recovery.finalized_stuck
+                    ),
+                    (0, 0, 0)
+                );
+                h.start(false);
+                h.boot_barrier().await;
+                h.stop().await;
+                assert_eq!(h.terminal(&recorded), terminal);
+                assert_eq!(
+                    h.paper.dispatch_seed(&seed.dispatch_id).unwrap().unwrap(),
+                    ready
+                );
+            }
+            assert_eq!(
+                h.paper.dispatch_targets(&seed.dispatch_id).unwrap(),
+                targets
+            );
+            assert_eq!(h.paper.gate_history().unwrap(), history);
+            assert_eq!(h.paper.bankroll().unwrap(), cash);
+            assert_eq!(h.paper.open_positions().unwrap(), positions);
+            assert_eq!(h.prepared_count(), 1);
+            assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
+            for kind in ["seed", "terminal"] {
+                let count: usize = connection
+                    .query_row(
+                        "SELECT count(*) FROM fence_transitions WHERE kind = ?1",
+                        [kind],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "{kind}, recovery_first={recovery_first}, fail_terminal={fail_terminal}"
+                );
+            }
+        }
+    }
+}
+
+/// PASS: resumed generations 2/3/4 execute the legacy initial gate with identical terminal
+/// bytes, including its original millisecond-only clock and hash; no new Prepared gate appears.
+#[tokio::test]
+async fn resumed_legacy_generations_keep_initial_gate_terminal_bytes() {
+    let body = r#"{"version":4,"owners":["source_log","paper_log"],"source_trade_id":"g2:fill","applied_configuration_hash":"f602cee694f90f8e48cdd43e70d6d9398879a9991662492af82ec4f7df31b222","market_end":null,"market_price":null,"book":null,"clocks":[{"purpose":"initial_staleness_gate","unix_millis":1700000003000},{"purpose":"terminal_transition","unix_millis":1800000000000}],"authority":{"kind":"not_read","outcome":"terminal_before_fill_authority","bankroll":null},"terminal":{"disposition":"no_copy:stale_fallback_past_copy_budget","reason":"stale_fallback_past_copy_budget","fill":null,"dispatch_id":null}}"#;
+    let hash = blake3::hash(format!("[1,{body}]").as_bytes())
+        .to_hex()
+        .to_string();
+    let expected = format!(
+        "{},\"financial_semantic_version\":1,\"document_blake3\":\"{hash}\"}}",
+        body.strip_suffix('}').unwrap()
+    );
+    for version in [2, 3, 4] {
+        let mut h = Harness::new().await;
+        let wire = support::legacy_continuation_wire(version);
+        let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+        connection.execute("INSERT INTO decision_pending (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, post_commit_inputs_json, state, updated_at_unix) VALUES ('g2:fill', 'semantic-v2', ?1, 1700000000, ?2, '[]', 'open', 1700000000)", rusqlite::params![wallet().to_string(), wire.to_string()]).unwrap();
+        h.hooks
+            .age_clock
+            .lock()
+            .unwrap()
+            .push_back(OffsetDateTime::from_unix_timestamp(1_700_000_003).unwrap());
+        h.start(true);
+        h.boot_barrier().await;
+        h.stop().await;
+        let row = h
+            .paper
+            .decision_pending_for(&SourceTradeId("g2:fill".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.post_commit_inputs_json, expected,
+            "generation {version}"
+        );
+        assert_eq!(row.frozen_inputs_json, wire.to_string());
+        let replayed = replay_decision_pending(&row).unwrap();
+        assert_eq!(replayed.continuation.version(), version);
+        assert_eq!(h.prepared_count(), 0);
+        assert!(h.authority.inner.lock().unwrap().fills.is_empty());
+        h.start(false);
+        h.boot_barrier().await;
+        h.stop().await;
+        assert_eq!(
+            h.paper
+                .decision_pending_for(&row.source_trade_id)
+                .unwrap()
+                .unwrap(),
+            row
+        );
+    }
+}
+
+struct AdmissionResponses {
+    bodies: [Vec<u8>; 3],
+    started: mpsc::Sender<usize>,
+    release: [tokio::sync::Semaphore; 3],
+}
+
+async fn admission_response(
+    axum::extract::State(responses): axum::extract::State<Arc<AdmissionResponses>>,
+    uri: axum::http::Uri,
+) -> Vec<u8> {
+    let index = if uri.path() == "/markets" {
+        0
+    } else if uri.path().starts_with("/clob-markets/") {
+        2
+    } else {
+        1
+    };
+    responses.started.send(index).await.unwrap();
+    responses.release[index].acquire().await.unwrap().forget();
+    responses.bodies[index].clone()
+}
+
+impl Harness {
+    async fn qualify_one_fill(&mut self) -> pe_service::qualification::QualificationReport {
+        let cutoff = EPOCH - EPOCH.rem_euclid(86_400) + 86_400;
+        let timestamp = OffsetDateTime::from_unix_timestamp(cutoff).unwrap();
+        let boundary = self
+            .source
+            .append(EnvelopeIn {
+                source_id: SourceId("pe-service.boundary".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(
+                    &json!({"kind":"daily_boundary", "cutoff_unix":cutoff}),
+                )
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+        let price = self
+            .source
+            .append(EnvelopeIn {
+                source_id: SourceId("pe-service.clob-prices-history".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&json!({"history":[{"t":cutoff,"p":"0.50"}]})).unwrap(),
+            })
+            .await
+            .unwrap();
+        self.hooks.boundary_mark_prices.lock().unwrap().push_back(
+            pe_service::risk_inputs::HistoricalMarkPrice {
+                price: pe_core_types::Price::new(dec!(0.50)).unwrap(),
+                sample_unix: cutoff,
+                receipt: price,
+            },
+        );
+        self.hooks
+            .financial_clock_unix
+            .store(cutoff, Ordering::SeqCst);
+        let (acknowledged, receiver) = tokio::sync::oneshot::channel();
+        self.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::DailyBoundary {
+                cutoff_unix: cutoff,
+                boundary_receipt: boundary,
+                acknowledged,
+            })
+            .await
+            .unwrap();
+        receiver.await.unwrap().unwrap();
+        self.stop().await;
+        let paper_path = self.dir.path().join("paper.log");
+        let source_path = self.dir.path().join("source.log");
+        let live_path = self.dir.path().join("live_journal.log");
+        let source_prefix =
+            TailBinding::from(&pe_event_log::Scanner::verify(&source_path).unwrap());
+        let keys = self
+            .paper
+            .decision_pending_history()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.source_trade_id, row.semantic_revision))
+            .collect::<Vec<_>>();
+        let digest = self
+            .paper
+            .seal_decision_evidence_for_source_prefix(&keys, &keys, source_prefix.last_sequence)
+            .unwrap();
+        let seal = pe_service::paper_recovery::QualificationSealed {
+            start_receipt: self.authority.inner.lock().unwrap().start,
+            source_prefix,
+            financial_prefix: TailBinding::from(
+                &pe_event_log::Scanner::verify(&paper_path).unwrap(),
+            ),
+            live_prefix: TailBinding::from(
+                &pe_execution_core::LiveJournal::verified_tail(&live_path).unwrap(),
+            ),
+            decision_evidence_digest: blake3::hash(&digest).to_hex().to_string(),
+            sealed_cutoff_unix: cutoff,
+            reason: pe_service::paper_recovery::SealReason::Complete,
+        };
+        // Seal this short fixture explicitly so the complete verifier reaches performance gates.
+        // Exact replay must succeed; one fill cannot satisfy the promotion sample requirements.
+        let receipt = Writer::open(&paper_path)
+            .unwrap()
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: 2,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&PaperLogRecord::QualificationSealed(Box::new(seal)))
+                    .unwrap(),
+            })
+            .unwrap();
+        let options = pe_service::qualification::QualifyOptions {
+            paper_log: paper_path,
+            source_log: source_path,
+            live_journal: Some(live_path),
+            paper_state: self.dir.path().join("paper.db"),
+            seal_hash: receipt.this_hash.to_hex().to_string(),
+            output: self.dir.path().join("qualification.json"),
+        };
+        pe_service::qualification::run_qualify(&options)
+            .await
+            .unwrap();
+        serde_json::from_slice(&std::fs::read(options.output).unwrap()).unwrap()
+    }
+}
+
+/// PASS: three real GETs overlap and complete compact/long/Gamma; the resulting named receipts
+/// flow through the orchestrator's financial fill and exact sealed qualification replay.
+#[tokio::test]
+async fn reverse_completion_admission_executes_and_qualifies_exactly() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (started, mut requests) = mpsc::channel(3);
+    let responses = Arc::new(AdmissionResponses {
+        bodies: [
+            recorded.admission.receipts.gamma,
+            recorded.admission.receipts.clob_long,
+            recorded.admission.receipts.clob_compact,
+        ]
+        .map(|receipt| source_envelope(&h, receipt).payload),
+        started,
+        release: std::array::from_fn(|_| tokio::sync::Semaphore::new(0)),
+    });
+    let router = axum::Router::new()
+        .fallback(axum::routing::get(admission_response))
+        .with_state(responses.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    h.admission_builder = Some(
+        LiveAdmissionBuilder::new(reqwest::Client::new(), &base, &base, h.source.clone())
+            .with_clock(Arc::new(at)),
+    );
+    h.hooks.age_clock.lock().unwrap().extend([at(); 3]);
+    assert!(h.hooks.admission_artifacts.lock().unwrap().is_empty());
+    h.start(true);
+    let receipts = {
+        let pending = h.poll(&recorded);
+        tokio::pin!(pending);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            tokio::select! {
+                request = requests.recv() => { seen.insert(request.unwrap()); },
+                _ = &mut pending => panic!("financial decision completed before all admission requests started"),
+            }
+        }
+        assert_eq!(seen, std::collections::BTreeSet::from([0, 1, 2]));
+        let mut receipts = Vec::new();
+        let mut next = EventSeq(0);
+        while h.index.receipt_at(next).unwrap().is_some() {
+            next.0 += 1;
+        }
+        for (request, source) in [
+            (2, "polymarket.clob.compact-market"),
+            (1, "polymarket.clob.markets"),
+            (0, "polymarket.gamma.markets"),
+        ] {
+            responses.release[request].add_permits(1);
+            let receipt = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some((receipt, _)) = h.index.receipt_at(next).unwrap() {
+                        break receipt;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let envelope = source_envelope(&h, receipt);
+            assert_eq!(envelope.source_id.0, source);
+            assert_eq!(envelope.payload, responses.bodies[request]);
+            next.0 += 1;
+            receipts.push(receipt);
+        }
+        pending.await;
+        receipts
+    };
+    server.abort();
+    let row = h.terminal(&recorded);
+    assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+    assert_eq!(h.prepared_count(), 1);
+    assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
+    let frames = scan_paper_log(&h.dir.path().join("paper.log")).unwrap();
+    let economic = frames
+        .iter()
+        .find_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
+                ..
+            }) => Some(economic),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        [
+            economic.admission.receipts.clob_compact,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.gamma
+        ],
+        receipts.as_slice()
+    );
+    let core_hash = economic.core_hash().unwrap();
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report.reasons);
+    assert_eq!(
+        (
+            report.replay.financial_prepared,
+            report.replay.financial_final,
+            report.replay.decisions,
+            report.replay.fills
+        ),
+        (1, 1, 1, 1)
+    );
+    assert_eq!(report.evidence.economic_core_hashes, vec![core_hash]);
+    assert_eq!(
+        report.verdict,
+        pe_service::qualification::QualificationVerdict::Fail
+    );
+}
+
+fn source_envelope(h: &Harness, receipt: AppendReceipt) -> pe_event_log::EventEnvelope {
+    let (_, envelope) = pe_event_log::Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|(sequence, _)| *sequence == receipt.sequence)
+        .unwrap();
+    assert_eq!(envelope.this_hash, receipt.this_hash);
+    envelope
 }

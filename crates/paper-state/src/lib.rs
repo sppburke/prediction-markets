@@ -1032,11 +1032,32 @@ impl PaperStateDb {
         disposition: &NoCopyDisposition,
         pending: Option<PendingTerminalEvidence<'_>>,
     ) -> Result<(), PaperStateError> {
+        self.commit_seen_no_copy_with_flip_pending(
+            source_trade_id,
+            leader,
+            disposition,
+            None,
+            pending,
+        )
+    }
+
+    /// Complete a resumed no-copy refusal and its staged dispatch handoff atomically.
+    pub fn commit_seen_no_copy_with_flip_pending(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: &LeaderPositionRow,
+        disposition: &NoCopyDisposition,
+        flip: Option<DispatchFlip<'_>>,
+        pending: Option<PendingTerminalEvidence<'_>>,
+    ) -> Result<(), PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
         tx_upsert_leader(&tx, leader)?;
         tx_record_no_copy_disposition(&tx, source_trade_id, disposition)?;
+        if let Some(flip) = flip {
+            tx_flip_dispatch_ready(&tx, flip)?;
+        }
         tx_terminalize_pending(
             &tx,
             source_trade_id,
@@ -8851,5 +8872,32 @@ mod tests {
         );
         assert_eq!(db.decision_pending_for(&source).unwrap().unwrap(), terminal);
         assert_eq!(db.dispatch_targets(&staged.dispatch_id).unwrap(), targets);
+    }
+
+    /// PASS: a conflicting late flip reports no transition and retains the first ready outcome.
+    #[test]
+    fn ready_dispatch_seed_retains_earlier_outcome_on_conflicting_flip() {
+        let (_dir, db) = db();
+        let staged = seed("first-outcome", &["primary", "partner"]);
+        db.stage_dispatch_seed(&staged).unwrap();
+        let targets = db.dispatch_targets(&staged.dispatch_id).unwrap();
+        assert!(
+            db.flip_dispatch_ready(&staged.dispatch_id, "no_fill:wallet_fenced_before_dispatch")
+                .unwrap()
+        );
+        let ready = db.dispatch_seed(&staged.dispatch_id).unwrap().unwrap();
+        assert_eq!(ready.state, "ready");
+        for later in [
+            "fill",
+            "no_fill:paper_stale_before_prepared",
+            "no_fill:stuck_seed",
+        ] {
+            assert!(!db.flip_dispatch_ready(&staged.dispatch_id, later).unwrap());
+            assert_eq!(
+                db.dispatch_seed(&staged.dispatch_id).unwrap().unwrap(),
+                ready
+            );
+            assert_eq!(db.dispatch_targets(&staged.dispatch_id).unwrap(), targets);
+        }
     }
 }
