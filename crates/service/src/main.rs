@@ -447,9 +447,7 @@ async fn main() -> Result<()> {
             Some(replayed.last_ranking_batch_id),
         )
     } else {
-        // Before a financial Start, `latest_ranking` remains the boot owner. Read its marker first
-        // so a batch landing between the two reads is applied on the first maintenance tick. A
-        // failed marker read becomes `None`, which also forces the first full-rerank tick (#542).
+        // Bind the fresh survivor bench to the marker before loading the active state.
         let marker = supabase_reader::fetch_latest_batch_id(
             &ranking_client,
             &cfg.supabase_url,
@@ -457,17 +455,19 @@ async fn main() -> Result<()> {
             &cfg.supabase_secret_key,
         )
         .await
-        .unwrap_or_default();
-        let (watchlist, last_trade) = supabase_reader::fetch(
+        .context("fetch pre-Start ranking batch")?
+        .context("no pre-Start ranking batch")?;
+        let (watchlist, last_trade) = supabase_reader::fetch_batch(
             &ranking_client,
             &cfg.supabase_url,
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
-            initial_watchlist_size,
+            marker,
+            MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await
         .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;
-        (watchlist, last_trade, marker)
+        (watchlist, last_trade, Some(marker))
     };
     info!(
         active = initial_watchlist.active_count,
@@ -478,7 +478,7 @@ async fn main() -> Result<()> {
     );
 
     // Fail fast if the selected Supabase batch returned no durable members — there is no fallback
-    // source (#370). Both the pre-Start moving read and the Start-pinned read are survivor-filtered
+    // source (#370). Both the pre-Start batch read and the Start-pinned read are survivor-filtered
     // (#518), so a batch with no surviving rows fails closed rather than running an empty set.
     anyhow::ensure!(
         !initial_watchlist.entries.is_empty(),
@@ -486,8 +486,6 @@ async fn main() -> Result<()> {
     );
 
     let (projection_dirty, projection_dirty_rx) = projection_dirty_channel();
-    let live_watchlist =
-        LiveWatchlist::new_with_projection(initial_watchlist, projection_dirty.clone());
     let projection_status = WatchlistProjectionStatus::default();
 
     // Shared writer mutex (#350 WS1 PR-D): serializes the score-update refresh loop and the
@@ -682,6 +680,18 @@ async fn main() -> Result<()> {
         .into_iter()
         .map(|fence| fence.wallet)
         .collect();
+    let (initial_watchlist, bootstrap_last_trade) = if financial_start_record.is_none() {
+        supabase_reader::select_membership(
+            initial_watchlist,
+            bootstrap_last_trade,
+            &fenced,
+            initial_watchlist_size,
+        )
+    } else {
+        (initial_watchlist, bootstrap_last_trade)
+    };
+    let live_watchlist =
+        LiveWatchlist::new_with_projection(initial_watchlist, projection_dirty.clone());
     live_watchlist.remove_fenced(&fenced);
 
     // Validate the initial evaluation universe before any producer can observe it.
@@ -2193,6 +2203,7 @@ mod tests {
         paper_state.set_cursor(&wallet, 9_000).unwrap();
         paper_state
             .install_anchors(&[AnchorInstallRecord {
+                history_status: None,
                 wallet,
                 balances: Vec::new(),
                 activity_cutoff_unix: 9_000,
@@ -2303,5 +2314,72 @@ mod tests {
             select_boot_anchor_wallets(&paper_state, &[with_validation], true, NOW).unwrap();
         assert!(migration.reused.is_empty());
         assert_eq!(migration.walked, vec![with_validation]);
+    }
+    #[test]
+    fn fresh_pre_start_selection_uses_active_fences_before_cap_and_bracket() {
+        use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
+        use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let paper = PaperStateDb::open(&path).unwrap();
+        let (fenced, survivor) = (wallet(20), wallet(21));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [fenced.to_string()]).unwrap();
+        let entries = [fenced, survivor]
+            .map(|wallet| WatchlistEntry {
+                wallet,
+                tier: WatchlistTier::Active,
+                leader_score_bps: BasisPoints(1000),
+                lcb_5pct_bps: BasisPoints(0),
+                win_rate_bps: BasisPoints(6000),
+                closed_trades_in_window: 10,
+                reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            })
+            .to_vec();
+        let bench = Watchlist {
+            entries,
+            active_count: 2,
+            incubator_count: 0,
+            snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+        };
+        let fences = paper
+            .wallet_fences()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.wallet)
+            .collect();
+        let (selected, times) = supabase_reader::select_membership(
+            bench,
+            std::collections::HashMap::from([(fenced, NOW - 1), (survivor, NOW)]),
+            &fences,
+            1,
+        );
+        assert_eq!(
+            selected
+                .entries
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<Vec<_>>(),
+            vec![survivor]
+        );
+        assert_eq!(times, std::collections::HashMap::from([(survivor, NOW)]));
+        let to_validate = select_boot_anchor_wallets(&paper, &[survivor], true, NOW).unwrap();
+        assert_eq!(to_validate.walked, vec![survivor]);
+        assert!(paper.wallet_history_status(&survivor).unwrap().is_none());
+        // With no selectable members boot has no bracket work and reaches its empty-membership refusal.
+        let (empty, times) = supabase_reader::select_membership(
+            selected,
+            times,
+            &std::collections::HashSet::from([survivor]),
+            1,
+        );
+        assert!(empty.entries.is_empty());
+        assert!(times.is_empty());
+        assert!(
+            select_boot_anchor_wallets(&paper, &[], true, NOW)
+                .unwrap()
+                .walked
+                .is_empty()
+        );
     }
 }

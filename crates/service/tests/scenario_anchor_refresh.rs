@@ -501,6 +501,7 @@ async fn mutex_recheck_skips_a_fresh_anchor_without_a_validator() {
     paper.set_cursor(&wallet, 10).unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            history_status: None,
             wallet,
             balances: Vec::new(),
             activity_cutoff_unix: 10,
@@ -558,6 +559,7 @@ async fn contended_mutex_rereads_fresh_anchor_before_refreshing() {
     paper.set_cursor(&target, 10).unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            history_status: None,
             wallet: target,
             balances: Vec::new(),
             activity_cutoff_unix: 10,

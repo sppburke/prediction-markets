@@ -156,6 +156,7 @@ fn install(
     let captured = ledger_capture(engine.ledger(), paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            history_status: None,
             wallet: wallet(),
             balances,
             cutoff,
@@ -574,5 +575,69 @@ fn unknown_disposition_version_is_a_typed_replay_failure() {
         replay,
         Err(WalletLedgerReplayError::UnknownDisposition { disposition, .. })
             if disposition == "wallet_fenced_v2"
+    ));
+}
+
+#[test]
+fn history_only_bracket_disposition_replays_as_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("paper.db");
+    let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+    paper.set_cursor(&wallet(), 0).unwrap();
+    let mut engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+    install(&mut engine, &paper, 0, Vec::new());
+    let first = aggregate("0xbracket", "market-bracket", 0, "BUY", "2", 10);
+    let id = first.group_id.key().clone();
+    let mut bracket = context(20);
+    bracket.bracket_commit = true;
+    let result = engine.commit(vec![first], &bracket, zero_basis()).unwrap();
+    assert_eq!(
+        result.dispositions[&id.0],
+        pe_service::bucket_commit::HISTORY_ONLY_BRACKET
+    );
+    assert!(result.pending.is_empty());
+    let no_copy = paper.no_copy_disposition(&id).unwrap().unwrap();
+    assert_eq!(no_copy.2, pe_service::bucket_commit::HISTORY_ONLY_BRACKET);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT recorded_at_unix FROM no_copy_dispositions WHERE source_trade_id = ?1",
+            [&id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 20);
+    assert_eq!(no_copy.1, 10);
+    assert_eq!(no_copy.0, "reconciled_rest");
+    let legacy = aggregate("0xlegacy", "market-legacy", 0, "BUY", "3", 11);
+    engine
+        .commit(vec![legacy], &context(20), zero_basis())
+        .unwrap();
+    let expected = ledger_capture(engine.ledger(), &paper, wallet())
+        .unwrap()
+        .hash;
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    assert_eq!(
+        ledger_capture(&replayed, &paper, wallet()).unwrap().hash,
+        expected
+    );
+    drop(engine);
+    drop(paper);
+    let reopened = PaperStateDb::open(&path).unwrap();
+    assert_eq!(
+        ledger_capture(
+            &replay_wallet_ledger(&reopened, wallet()).unwrap(),
+            &reopened,
+            wallet()
+        )
+        .unwrap()
+        .hash,
+        expected
+    );
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE activity_groups SET disposition = 'unknown_bracket_reason' WHERE source_trade_id = ?1", [&id.0]).unwrap();
+    assert!(matches!(
+        replay_wallet_ledger(&reopened, wallet()),
+        Err(WalletLedgerReplayError::UnknownDisposition { .. })
     ));
 }

@@ -185,6 +185,7 @@ fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
 fn install_anchor(db: &PaperStateDb, wallet: WalletAddress, cursor: i64) {
     db.set_cursor(&wallet, cursor).unwrap();
     db.install_anchors(&[AnchorInstallRecord {
+        history_status: None,
         wallet,
         balances: Vec::new(),
         activity_cutoff_unix: cursor,

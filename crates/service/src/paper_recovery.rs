@@ -1876,177 +1876,195 @@ mod paper_log_tests {
     /// FAIL: any production evidence variant is unreadable or replay consults moving ranking.
     #[test]
     fn structural_membership_replays_every_production_evidence_variant() {
-        let dir = tempdir().unwrap();
-        let paper_path = dir.path().join("membership.log");
-        let source_path = dir.path().join("source.log");
-        let mut paper_writer = Writer::open(&paper_path).unwrap();
-        let mut source_writer = Writer::open(&source_path).unwrap();
-        let first = wallet();
-        let second = WalletAddress([2; 20]);
-        let third = WalletAddress([3; 20]);
-        let fourth = WalletAddress([4; 20]);
-        let mut started = start("activation");
-        started.membership = vec![first, second, third, fourth];
-        append(
-            &mut paper_writer,
-            PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(started)),
-        );
-
-        let reranked = vec![
-            watchlist_entry(first, 900),
-            watchlist_entry(second, 800),
-            watchlist_entry(third, 700),
-        ];
-        let ranking_receipt = append_membership_artifact(
-            &mut source_writer,
-            RANKING_MEMBERSHIP_SOURCE_ID,
-            &RankingMembershipArtifact {
-                batch_id: Some(8),
-                entries: reranked,
-            },
-        );
-        append(
-            &mut paper_writer,
-            PAPER_LOG_SCHEMA_VERSION,
-            &MembershipChange {
-                reason: MembershipReason::FullRerank,
-                removed: vec![fourth],
-                added: Vec::new(),
-                capacity: 3,
-                ranking_batch_id: Some(8),
-                evidence: SealedMembershipEvidence::full_rerank(ranking_receipt, Vec::new())
-                    .unwrap(),
-            }
-            .into_record(),
-        );
-
-        let knockout_receipt = append_membership_artifact(
-            &mut source_writer,
-            KNOCKOUT_CAUSAL_SOURCE_ID,
-            &KnockoutCausalArtifact {
-                wallet: third,
-                evaluated_at_unix: 259_200,
-                last_trade_unix: Some(0),
-                inactivity_threshold_secs: 259_200,
-                inactivity_hard_cap_secs: 604_800,
-                demotion_min_trades: 10,
-                demotion_cb_alpha: dec!(0.10),
-                demotion_pnl_window_secs: 2_592_000,
-                fills: Vec::new(),
-                settlements: Vec::new(),
-            },
-        );
-        append(
-            &mut paper_writer,
-            PAPER_LOG_SCHEMA_VERSION,
-            &MembershipChange {
-                reason: MembershipReason::KnockoutInactivity,
-                removed: vec![third],
-                added: Vec::new(),
-                capacity: 3,
-                ranking_batch_id: Some(8),
-                evidence: SealedMembershipEvidence::knockout_backfill(
-                    vec![SealedKnockoutEvidence {
-                        wallet: third,
-                        reason: MembershipReason::KnockoutInactivity,
-                        causal_receipt: knockout_receipt,
-                    }],
-                    None,
-                    Vec::new(),
-                )
-                .unwrap(),
-            }
-            .into_record(),
-        );
-
-        let capacity_receipt = append_membership_artifact(
-            &mut source_writer,
-            CAPACITY_CONFIG_SOURCE_ID,
-            &CapacityMembershipArtifact {
-                generation: 2,
-                target: 1,
-                published_entries: vec![watchlist_entry(first, 900)],
-            },
-        );
-        append(
-            &mut paper_writer,
-            PAPER_LOG_SCHEMA_VERSION,
-            &MembershipChange {
-                reason: MembershipReason::CapacityChange,
-                removed: vec![second],
-                added: Vec::new(),
-                capacity: 1,
-                ranking_batch_id: None,
-                evidence: SealedMembershipEvidence::capacity_change(
-                    2,
-                    capacity_receipt,
-                    Vec::new(),
-                )
-                .unwrap(),
-            }
-            .into_record(),
-        );
-        drop(paper_writer);
-        // Filler after the artifacts makes a hidden whole-log pass measurable (#572): exact
-        // indexed reads touch only the artifact frames.
-        for index in 0..20_000_i64 {
-            let at = OffsetDateTime::from_unix_timestamp(1_700_000_000 + index).unwrap();
-            source_writer
-                .append(pe_event_log::EnvelopeIn {
-                    source_id: SourceId("membership-filler".to_owned()),
-                    schema_version: 1,
-                    parser_version: 1,
-                    observed_at: SourceTimestamp(at),
-                    received_at: ReceivedAt(at),
-                    content_type: pe_event_log::ContentType::Json,
-                    payload: format!(r#"{{"filler":{index},"pad":"{:0>96}"}}"#, index).into_bytes(),
-                })
-                .unwrap();
-        }
-        source_writer.sync().unwrap();
-        drop(source_writer);
-        let source_length = std::fs::metadata(&source_path).unwrap().len();
-        assert!(source_length > 1_000_000, "{source_length}");
-
-        let era = paper_era(scan_paper_log(&paper_path).unwrap());
-        let initial_entries = vec![
-            watchlist_entry(first, 600),
-            watchlist_entry(second, 500),
-            watchlist_entry(third, 400),
-            watchlist_entry(fourth, 300),
-        ];
-        let replayed = replay_membership(&era, watchlist(initial_entries.clone()), &source_path)
-            .unwrap()
-            .unwrap();
-        let indexed_source = crate::qualification::PublishedMembershipSource::from_index(
-            crate::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap(),
-        );
-        #[cfg(target_os = "linux")]
-        let before = read_chars();
-        let indexed =
-            replay_membership_with_source(&era, watchlist(initial_entries), &indexed_source)
-                .unwrap()
-                .unwrap();
-        #[cfg(target_os = "linux")]
-        {
-            let read = read_chars() - before;
-            assert!(
-                read < source_length / 4,
-                "index-backed membership replay must read only its artifact frames: read {read} of {source_length} bytes"
+        for repaired in [false, true] {
+            let dir = tempdir().unwrap();
+            let paper_path = dir.path().join("membership.log");
+            let source_path = dir.path().join("source.log");
+            let mut paper_writer = Writer::open(&paper_path).unwrap();
+            let mut source_writer = Writer::open(&source_path).unwrap();
+            let first = wallet();
+            let second = WalletAddress([2; 20]);
+            let third = WalletAddress([3; 20]);
+            let fourth = WalletAddress([4; 20]);
+            let mut started = start("activation");
+            started.membership = vec![first, second, third, fourth];
+            append(
+                &mut paper_writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &PaperLogRecord::QualificationStarted(Box::new(started)),
             );
+
+            let reranked = vec![
+                watchlist_entry(first, 900),
+                watchlist_entry(second, 800),
+                watchlist_entry(third, 700),
+            ];
+            let reranked = if repaired {
+                let mut bench = vec![watchlist_entry(fourth, 1_000)];
+                bench.extend(reranked);
+                crate::supabase_reader::select_membership(
+                    watchlist(bench),
+                    HashMap::new(),
+                    &HashSet::from([fourth]),
+                    3,
+                )
+                .0
+                .entries
+            } else {
+                reranked
+            };
+            let ranking_receipt = append_membership_artifact(
+                &mut source_writer,
+                RANKING_MEMBERSHIP_SOURCE_ID,
+                &RankingMembershipArtifact {
+                    batch_id: Some(8),
+                    entries: reranked,
+                },
+            );
+            append(
+                &mut paper_writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &MembershipChange {
+                    reason: MembershipReason::FullRerank,
+                    removed: vec![fourth],
+                    added: Vec::new(),
+                    capacity: 3,
+                    ranking_batch_id: Some(8),
+                    evidence: SealedMembershipEvidence::full_rerank(ranking_receipt, Vec::new())
+                        .unwrap(),
+                }
+                .into_record(),
+            );
+
+            let knockout_receipt = append_membership_artifact(
+                &mut source_writer,
+                KNOCKOUT_CAUSAL_SOURCE_ID,
+                &KnockoutCausalArtifact {
+                    wallet: third,
+                    evaluated_at_unix: 259_200,
+                    last_trade_unix: Some(0),
+                    inactivity_threshold_secs: 259_200,
+                    inactivity_hard_cap_secs: 604_800,
+                    demotion_min_trades: 10,
+                    demotion_cb_alpha: dec!(0.10),
+                    demotion_pnl_window_secs: 2_592_000,
+                    fills: Vec::new(),
+                    settlements: Vec::new(),
+                },
+            );
+            append(
+                &mut paper_writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &MembershipChange {
+                    reason: MembershipReason::KnockoutInactivity,
+                    removed: vec![third],
+                    added: Vec::new(),
+                    capacity: 3,
+                    ranking_batch_id: Some(8),
+                    evidence: SealedMembershipEvidence::knockout_backfill(
+                        vec![SealedKnockoutEvidence {
+                            wallet: third,
+                            reason: MembershipReason::KnockoutInactivity,
+                            causal_receipt: knockout_receipt,
+                        }],
+                        None,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }
+                .into_record(),
+            );
+
+            let capacity_receipt = append_membership_artifact(
+                &mut source_writer,
+                CAPACITY_CONFIG_SOURCE_ID,
+                &CapacityMembershipArtifact {
+                    generation: 2,
+                    target: 1,
+                    published_entries: vec![watchlist_entry(first, 900)],
+                },
+            );
+            append(
+                &mut paper_writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &MembershipChange {
+                    reason: MembershipReason::CapacityChange,
+                    removed: vec![second],
+                    added: Vec::new(),
+                    capacity: 1,
+                    ranking_batch_id: None,
+                    evidence: SealedMembershipEvidence::capacity_change(
+                        2,
+                        capacity_receipt,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }
+                .into_record(),
+            );
+            drop(paper_writer);
+            // Filler after the artifacts makes a hidden whole-log pass measurable (#572): exact
+            // indexed reads touch only the artifact frames.
+            for index in 0..20_000_i64 {
+                let at = OffsetDateTime::from_unix_timestamp(1_700_000_000 + index).unwrap();
+                source_writer
+                    .append(pe_event_log::EnvelopeIn {
+                        source_id: SourceId("membership-filler".to_owned()),
+                        schema_version: 1,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(at),
+                        received_at: ReceivedAt(at),
+                        content_type: pe_event_log::ContentType::Json,
+                        payload: format!(r#"{{"filler":{index},"pad":"{:0>96}"}}"#, index)
+                            .into_bytes(),
+                    })
+                    .unwrap();
+            }
+            source_writer.sync().unwrap();
+            drop(source_writer);
+            let source_length = std::fs::metadata(&source_path).unwrap().len();
+            assert!(source_length > 1_000_000, "{source_length}");
+
+            let era = paper_era(scan_paper_log(&paper_path).unwrap());
+            let initial_entries = vec![
+                watchlist_entry(first, 600),
+                watchlist_entry(second, 500),
+                watchlist_entry(third, 400),
+                watchlist_entry(fourth, 300),
+            ];
+            let replayed =
+                replay_membership(&era, watchlist(initial_entries.clone()), &source_path)
+                    .unwrap()
+                    .unwrap();
+            let indexed_source = crate::qualification::PublishedMembershipSource::from_index(
+                crate::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap(),
+            );
+            #[cfg(target_os = "linux")]
+            let before = read_chars();
+            let indexed =
+                replay_membership_with_source(&era, watchlist(initial_entries), &indexed_source)
+                    .unwrap()
+                    .unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                let read = read_chars() - before;
+                assert!(
+                    read < source_length / 4,
+                    "index-backed membership replay must read only its artifact frames: read {read} of {source_length} bytes"
+                );
+            }
+            assert_eq!(
+                indexed.last_ranking_batch_id,
+                replayed.last_ranking_batch_id
+            );
+            assert_eq!(
+                serde_json::to_vec(&indexed.watchlist.entries).unwrap(),
+                serde_json::to_vec(&replayed.watchlist.entries).unwrap()
+            );
+            assert_eq!(replayed.last_ranking_batch_id, 8);
+            assert_eq!(replayed.watchlist.entries.len(), 1);
+            assert_eq!(replayed.watchlist.entries[0].wallet, first);
         }
-        assert_eq!(
-            indexed.last_ranking_batch_id,
-            replayed.last_ranking_batch_id
-        );
-        assert_eq!(
-            serde_json::to_vec(&indexed.watchlist.entries).unwrap(),
-            serde_json::to_vec(&replayed.watchlist.entries).unwrap()
-        );
-        assert_eq!(replayed.last_ranking_batch_id, 8);
-        assert_eq!(replayed.watchlist.entries.len(), 1);
-        assert_eq!(replayed.watchlist.entries[0].wallet, first);
     }
 
     /// PASS: a structural change published by the runtime orchestrator and replayed from that
@@ -2791,6 +2809,7 @@ fn applied_disposition(
         "applied"
             | "wallet_fenced_applied"
             | "decision_pending"
+            | crate::bucket_commit::HISTORY_ONLY_BRACKET
             | "not_copy_eligible"
             | "not_an_entry"
             | "not_first_entry"

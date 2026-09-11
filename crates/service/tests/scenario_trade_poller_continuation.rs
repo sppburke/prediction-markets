@@ -220,6 +220,7 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
         .unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            history_status: None,
             wallet: wallet(),
             balances: vec![
                 (
