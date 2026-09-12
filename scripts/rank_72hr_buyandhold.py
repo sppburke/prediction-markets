@@ -469,6 +469,10 @@ def main() -> int:
 
     # Open the read-only cache first: --universe-from-trades enumerates from it.
     conn = sqlite3.connect(f"file:{prm.db}?mode=ro", uri=True)
+    # One snapshot for the completeness filter and the per-wallet history scans
+    # below it, so a backfill committing in between cannot supply rows for a
+    # wallet the filter already judged complete. WAL readers do not block it.
+    conn.execute("BEGIN")
     conn.execute("PRAGMA query_only=ON;")
     schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
 
@@ -558,6 +562,9 @@ def main() -> int:
                     f"{total_qualified:,} qualifying, {len(floor_pos)} floor)")
 
     pos_fh.close()
+    # Every history read is done, so end the snapshot and release the read lock.
+    # Leaving it open would block a later writer for the rest of the process.
+    conn.close()
     log(f"extraction done in {time.time()-t0:.0f}s")
     log(f"  diagnostics: {diag}")
     log(f"wrote {pos_path}  ({total_qualified:,} positions)")

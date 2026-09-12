@@ -101,6 +101,70 @@ def _make_v2_cache(path: str) -> None:
     con.close()
 
 
+def _make_snapshot_cache(path: str) -> None:
+    """A WAL cache (as production is) with a quarantine table and one fresh
+    trade, so the staleness gate passes while `0xaaa` is still excludable.
+    """
+    con = sqlite3.connect(path)
+    con.executescript(
+        f"""
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE trades (source_trade_id TEXT, wallet_hex TEXT, market_id TEXT,
+            outcome_id TEXT, side TEXT, price_str TEXT, contracts TEXT,
+            timestamp_unix INTEGER);
+        CREATE INDEX idx_trades_wallet_ts ON trades(wallet_hex, timestamp_unix);
+        CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, backfill_partial INTEGER
+            DEFAULT 0, is_active INTEGER DEFAULT 1, is_infra INTEGER DEFAULT 0);
+        CREATE TABLE market_resolutions (fetched_at_unix INTEGER NOT NULL);
+        CREATE TABLE source_cursor (key TEXT PRIMARY KEY, value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL);
+        INSERT INTO trades (wallet_hex, timestamp_unix) VALUES ('0xfresh', {NOW});
+        INSERT INTO wallets (wallet_hex) VALUES ('0xaaa');
+        INSERT INTO market_resolutions VALUES ({NOW - HOUR});
+        INSERT INTO source_cursor VALUES ('clob_closed', '', {NOW - HOUR});
+        """
+    )
+    con.commit()
+    con.close()
+
+
+class QuarantineSnapshotTest(unittest.TestCase):
+    """A backfill committing between the quarantine read and the history read
+    must not leak partial history into a publication. Both reads have to observe
+    one snapshot, as `rank_cycle_manifest.snapshot` already does.
+    """
+
+    def setUp(self) -> None:
+        self.dir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.dir.name, "cache.db")
+        _make_snapshot_cache(self.db)
+
+    def tearDown(self) -> None:
+        self.dir.cleanup()
+
+    def test_concurrent_backfill_commit_cannot_leak_partial_history(self) -> None:
+        real = pr.partial_backfill_wallets
+
+        def commit_between(connection, *args, **kwargs):
+            """Capture the quarantine set, then let a backfill land."""
+            captured = real(connection, *args, **kwargs)
+            writer = sqlite3.connect(self.db)
+            writer.execute("UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = '0xaaa'")
+            writer.execute(
+                "INSERT INTO trades (wallet_hex, timestamp_unix) VALUES ('0xaaa', ?)", (NOW,)
+            )
+            writer.commit()
+            writer.close()
+            return captured
+
+        with mock.patch.object(pr, "partial_backfill_wallets", commit_between):
+            kept, dropped, _ = pr.filter_active_rows(
+                [{"wallet": "0xaaa"}], self.db, 72, 24, NOW
+            )
+        self.assertEqual(kept, [], "published a wallet a concurrent backfill made partial")
+        self.assertEqual(dropped, 1)
+
+
 class ActiveFilterTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

@@ -168,6 +168,13 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        # One snapshot for the quarantine set and every history read below it.
+        # Without this each SELECT is its own read transaction, so a backfill
+        # committing in between can mark a wallet partial after the exclusion
+        # set was captured and still have its new trades counted as recent.
+        # Same precedent as `rank_cycle_manifest.snapshot`; WAL readers do not
+        # block the writer.
+        con.execute("BEGIN")
         partial = partial_backfill_wallets(con)
         newest = _newest_trade_unix(con)
         if newest is None or now - newest > max_staleness_hours * 3600:

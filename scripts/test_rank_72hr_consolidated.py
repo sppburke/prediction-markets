@@ -194,6 +194,54 @@ class PartialBackfillUniverseTest(unittest.TestCase):
             self.assertEqual(rk.exclude_partial_backfills(conn, [WA, WB], 2), [WA, WB])
 
 
+class QuarantineSnapshotTest(unittest.TestCase):
+    """A backfill committing between the completeness filter and the per-wallet
+    history scans must not supply rows for a wallet the filter already judged.
+    Both must read one snapshot, as `rank_cycle_manifest.snapshot` does.
+    """
+
+    def test_concurrent_backfill_commit_is_invisible_to_the_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            out = str(Path(tmp) / "out")
+            build_core_cache(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, "
+                             "backfill_partial INTEGER NOT NULL DEFAULT 0, "
+                             "is_active INTEGER DEFAULT 1, is_infra INTEGER DEFAULT 0)")
+                conn.execute("INSERT INTO wallets(wallet_hex) VALUES (?)", (WA,))
+                held = conn.execute(
+                    "SELECT wallet_hex, side, market_id, outcome_id, price_str, contracts,"
+                    " timestamp_unix, source_trade_id FROM trades WHERE wallet_hex = ?",
+                    (WA,)).fetchall()
+                conn.execute("DELETE FROM trades WHERE wallet_hex = ?", (WA,))
+            self.assertTrue(held, "fixture must hold back real qualifying rows")
+
+            real = rk.exclude_partial_backfills
+
+            def commit_between(connection, wallets, schema_version):
+                """Judge completeness, then let a backfill land mid-run."""
+                kept = real(connection, wallets, schema_version)
+                writer = sqlite3.connect(db)
+                writer.executemany(
+                    "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)", held)
+                writer.execute(
+                    "UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = ?", (WA,))
+                writer.commit()
+                writer.close()
+                return kept
+
+            universe = Path(tmp) / "universe.txt"
+            universe.write_text(WA + "\n" + WB + "\n")
+            with mock.patch.object(rk, "exclude_partial_backfills", commit_between):
+                self.assertEqual(run_ranker(db, out, "--universe", str(universe),
+                                            "--floor-tstat", "0.1"), 0)
+            rows = read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))
+            self.assertEqual([r["wallet"] for r in rows], [WB],
+                             "ranked a wallet from history committed after the filter")
+
+
 class FlatRankingGoldenTest(unittest.TestCase):
     """Flat (half_life=0) stats == independent legacy recomputation; ranked desc by tstat_net."""
 
