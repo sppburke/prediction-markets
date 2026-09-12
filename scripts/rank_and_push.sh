@@ -443,6 +443,7 @@ PY
       --db "$DB" --day-utc "$CYCLE_DAY_UTC" \
       --versions-file "$PIPELINE_VERSIONS_TMP" \
       --configuration-file "$CYCLE_CONFIG_TMP" --output "$CURRENT_CYCLE_TMP"
+    # Schema-one partial active wallets force a retry even at an unchanged watermark.
     if "$PYTHON_BIN" scripts/rank_cycle_manifest.py unchanged \
       --current "$CURRENT_CYCLE_TMP" --root data/eval-results; then
       echo "RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"

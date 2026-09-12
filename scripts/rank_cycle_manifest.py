@@ -37,6 +37,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
     versions = {**versions, "ranker": ORACLE_VERSION}
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        connection.execute("BEGIN")
         schema = int(_one(connection, "PRAGMA user_version") or 0)
         universe = _wallet_universe(connection)
         if schema >= 2:
@@ -159,6 +160,17 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 ),
             }
         else:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(wallets)")}
+            partial = []
+            active_partial = 0
+            if "backfill_partial" in columns:
+                partial = sorted(str(row[0]).lower() for row in connection.execute(
+                    "SELECT wallet_hex FROM wallets WHERE backfill_partial = 1"
+                ))
+                active_partial = _one(connection,
+                    "SELECT COUNT(*) FROM active_tradeable_wallets WHERE backfill_partial = 1")
+            universe["backfill_partial_wallets"] = partial
+            universe["active_tradeable_partial_count"] = active_partial
             activity = {
                 "generation": 1,
                 "count": _one(connection, "SELECT COUNT(*) FROM trades"),
@@ -255,6 +267,9 @@ def main() -> int:
         atomic_write(args.output, snapshot(args.db, args.day_utc, versions, configuration))
         return 0
     current = json.loads(args.current.read_text(encoding="utf-8"))
+    # The wrapper must retry a same-day partial walk even if no new rows landed.
+    if current["universe"].get("active_tradeable_partial_count", 0) > 0:
+        return 1
     accepted = latest_accepted(args.root, current["day_utc"])
     if accepted is not None and accepted.get("fingerprint_sha256") == current.get(
         "fingerprint_sha256"

@@ -30,10 +30,11 @@ fn wallet(byte: u8) -> WalletAddress {
 }
 
 fn trade_url_cold(w: WalletAddress) -> String {
-    PolymarketEndpoint::UserTradeActivity {
+    PolymarketEndpoint::UserTradeActivityPage {
         user: w.to_string(),
-        end: None,
-        start: None,
+        end: 2_000_000_000,
+        start: Some(1),
+        offset: 0,
     }
     .url(BASE_URL)
 }
@@ -177,15 +178,17 @@ async fn scenario_watchlist_standalone_reads_existing_cache_trades() {
     // Insert 10 trades via fixture fetcher (same pattern as scenario_pile).
     let mut pages: HashMap<String, Vec<u8>> = HashMap::new();
     pages.insert(trade_url_cold(w), trades_page(10, "cc"));
-    let end_url = PolymarketEndpoint::UserTradeActivity {
+    let end_url = PolymarketEndpoint::UserTradeActivityPage {
         user: w.to_string(),
-        end: Some(1_700_000_010),
-        start: None,
+        end: 1_700_000_010,
+        start: Some(1),
+        offset: 0,
     }
     .url(BASE_URL);
     pages.insert(end_url, end_page());
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
+        .with_clock_for_test(|| 2_000_000_000)
         .with_concurrency(1)
         .with_wallet_timeout(30);
     fetcher.fetch_all(&[w], &mut cache).await.unwrap();

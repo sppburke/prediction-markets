@@ -67,8 +67,34 @@ any new wallets.
 `pe-bootstrap backfill` (`crates/bootstrap/src/backfill.rs:1`):
 - Selects `is_active = 1` wallets whose `last_polymarket_fetch_at` is NULL or older
   than 1 day (`backfill_limit = 0` = all due wallets).
-- Incremental two-phase cursor walk per wallet — it appends new trades, it does not
-  re-download history already in the cache.
+- Freeze one upper timestamp per wallet walk. Backward requests carry `start=1`
+  and a bounded `end`, including the cold infra probe, to reach full history.
+  Commit rows above each full page's minimum second, then acquire and commit that
+  entire second before advancing to `MIN(timestamp_unix) - 1`. Short pages commit
+  whole. The cold probe still classifies before any trade insert and discards
+  infra pages.
+- Re-acquire the cached maximum second before the forward phase to capture newly
+  indexed siblings. Acquire exact windows above that second through the frozen
+  upper bound using offsets and ordered lower-window / boundary-second /
+  upper-window splitting when saturated. **#608 keeps forward writes
+  whole-or-nothing**; incremental forward commits are deferred to #609. Each
+  acquisition window buffers at most the inclusive terminal offset's pages (see
+  glossary); the aggregate forward buffer can be larger.
+- A timeout, JSON/transport error, insert error, or saturated second stops the
+  wallet. Committed backward progress survives and the wallet stays in `failed`.
+  Nothing from an incomplete boundary second is written. Before acquisition, an
+  independently committed `wallets.backfill_partial=1` marker quarantines the
+  walk; marker-write failure blocks all trade writes. Successful completion
+  clears it even without stamping, and clears it atomically with
+  `last_polymarket_fetch_at` when stamping is enabled. Completion-transaction
+  failure also fails the wallet. Failure preserves the previous stamp, including
+  NULL and stale stamps; due selection retains its existing stamp rule.
+- Schema-one ranking excludes only `backfill_partial=1`, after either universe
+  source and before limiting. Legacy unstamped complete wallets and wallets
+  without a pile row remain eligible. Schema two is unchanged. The cycle
+  fingerprint includes the sorted marked-wallet set; any active tradeable
+  partial wallet prevents the unchanged-watermark shortcut, allowing same-day
+  retries even when row counts did not advance.
 - Refreshes `market_resolutions` (CLOB) / `market_schedules` (Gamma) for the
   cache's market set.
 
@@ -77,6 +103,39 @@ It does **not** add wallets via chain enumeration or Dune. Those are the
 (Backfill *can* flip an already-present pile wallet from `is_active=0→1` if it now
 meets the activation thresholds — that is re-classification of an existing wallet,
 not new discovery.)
+
+The gap-free guarantee covers stable API-visible history. `/activity` has delayed
+indexing ([source contract](15-SOURCES.md#polymarket)); rechecking the previous
+maximum second does not repair arbitrary late changes to older seconds. Rows
+above the frozen upper timestamp belong to the next walk.
+
+### #608 rollout and rollback on Forge
+
+Before building, preserve `target/release/pe-bootstrap` as
+`target/release/pe-bootstrap.pre-608-<rev>` and record the deployed revision.
+Build the corrected binary and restart via the [systemd loop lifecycle](#continuous-forge-supervisor).
+The additive column migrates on schema-one open; deploy the Python exclusion and
+cycle invalidation with the binary. Verify the selected zero-row cohort gains
+rows over repeated refreshes, then reaches marker zero and a success stamp.
+Compare one completed wallet's cached per-day counts to a read-only full re-fetch.
+These are deployment acceptance checks, not a substitute for deterministic tests.
+
+**Binary-only rollback** restores that saved executable and restarts the loop;
+the column and Python filter remain. Already marked wallets stay quarantined:
+the old completion writer can stamp them but cannot clear their marker, leaving
+a stamped marked wallet temporarily neither due nor rankable. This is an
+availability impact. Recover by running the corrected binary until those wallets
+complete (use an explicit fetch for a wallet whose fresh stamp prevents due
+selection, or wait for it to become stale). Never clear markers from an old
+success stamp.
+
+**Full rollback**, including Python, exposes retained partial histories to
+ranking. Leave the filter in place unless that visibility is explicitly accepted;
+never erase markers with a blanket SQL update. If a batch was published from
+partial data, use the [published-batch recovery](#part-2--rank-and-publish-the-one-command)
+procedure below (Oracle rollback), which publishes a new batch and verifies
+membership convergence. Replay impact: none; this is the schema-one research
+cache and universe.
 
 ### Commands
 

@@ -832,6 +832,43 @@ class RankAndPushScenario(unittest.TestCase):
             "watermark no-op invented a recovery pointer",
         )
 
+    def test_marker_set_changes_fingerprint_even_for_inactive_wallets(self):
+        db = self.root / "data" / "wallet_cache.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("ALTER TABLE wallets ADD COLUMN backfill_partial INTEGER NOT NULL DEFAULT 0")
+            conn.execute("INSERT INTO wallets VALUES ('inactive',0,0,0)")
+        first = self._run()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self._log("pe_bootstrap.log")
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = 'inactive'")
+        second = self._run()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
+        self.assertNotEqual(self._log("pe_bootstrap.log"), before)
+        third = self._run()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", third.stdout)
+
+    def test_unchanged_active_partial_wallet_forces_same_day_refresh(self):
+        db = self.root / "data" / "wallet_cache.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("ALTER TABLE wallets ADD COLUMN backfill_partial INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = '0xabc'")
+        first = self._run()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self._log("pe_bootstrap.log")
+        # The stub leaves both the marker and source watermark unchanged.
+        second = self._run()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
+        self.assertNotEqual(self._log("pe_bootstrap.log"), before)
+        manifests = sorted((self.root / "data/eval-results").glob("cron-*/accepted_cycle_manifest.json"))
+        for path in manifests:
+            manifest = json.loads(path.read_text())
+            self.assertEqual(manifest["universe"]["backfill_partial_wallets"], ["0xabc"])
+            self.assertEqual(manifest["universe"]["active_tradeable_partial_count"], 1)
+
     def test_v2_cycle_manifest_uses_only_completed_generations_and_stamps_versions(self):
         db = self.root / "data" / "wallet_cache.db"
         db.unlink()

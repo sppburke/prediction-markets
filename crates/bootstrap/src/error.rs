@@ -9,6 +9,8 @@ pub enum BootstrapError {
     },
     #[error("polymarket fetch for {wallet}: {message}")]
     Polymarket { wallet: String, message: String },
+    #[error("polymarket fetch for {wallet}: saturated activity second {second}")]
+    SaturatedSecond { wallet: String, second: i64 },
     #[error("trade parse for {wallet}: {message}")]
     TradeParse { wallet: String, message: String },
     #[error("cache: {message}")]

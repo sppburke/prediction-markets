@@ -1,20 +1,13 @@
 //! Polymarket bulk trade fetcher — incremental, cache-first, concurrent.
 //!
-//! For each wallet: performs a two-phase cursor walk against
-//! `/activity?type=TRADE`:
-//!   - **Phase 1 (backward fill)** — walks from the oldest cached timestamp
-//!     backward, filling any historical gap. Cold-start wallets use an
-//!     unbounded initial request and walk until an empty or partial page.
-//!   - **Phase 2 (forward fill)** — walks forward from the newest cached
-//!     timestamp, collecting new trades. `INCREMENTAL_STOP_THRESHOLD`
-//!     consecutive already-known IDs act as an overlap safety net.
+//! Backward history is committed page by page, completing each boundary second
+//! before moving below it. Forward history uses complete fixed-end windows and
+//! is committed whole-or-nothing (#609 incremental forward commits are separate).
+//! A durable partial marker quarantines interrupted histories from schema-one
+//! ranking; successful completion clears it atomically with the optional stamp.
 //!
-//! Each fetched page is sorted newest-first (defensive: API normally does this
-//! but the sort removes the silent-failure mode if ordering changes).
-//!
-//! `fetch_all` runs up to `concurrency` per-wallet fetches in parallel; the
-//! shared `PageFetcher` enforces the global rate-limit gate so aggregate
-//! throughput stays inside the Polymarket Data API limit (200 req/10s, ≈ 20 req/s).
+//! `fetch_all` runs up to `concurrency` wallets in parallel. The shared
+//! `PageFetcher` enforces the venue-wide rate-limit gate.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -26,6 +19,7 @@ use pe_core_types::{
     WalletAddress,
 };
 use pe_source_core::SourceError;
+use pe_source_polymarket_public::reconciliation::ACTIVITY_MAX_OFFSET;
 use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
 use pe_trader_index::snapshot::RawTrade;
 use rust_decimal::Decimal;
@@ -34,21 +28,39 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
-use crate::cache::{INCREMENTAL_STOP_THRESHOLD, WalletCache};
+use crate::cache::WalletCache;
 use crate::error::BootstrapError;
 use crate::infra_probe::{InfraProbe, ProbeClassification};
 
 const TRADE_FETCH_LIMIT: u32 = 500;
 
-/// Outcome of `fetch_wallet_incremental` (issue #197).
-///
-/// `Trades` is the normal path — the caller inserts via `cache.insert_new`.
-/// `Infra` signals the infra-probe fired on the first cold-start page; the
-/// caller calls `cache.mark_infra` and discards any parsed trades.
 #[derive(Debug)]
-pub(crate) enum WalletFetchResult {
-    Trades(Vec<RawTrade>),
+enum WalletFetchResult {
+    Complete,
     Infra { span_secs: i64 },
+}
+
+#[derive(Default)]
+struct CommitProgress {
+    pages_committed: u64,
+    trades_committed: u64,
+}
+
+enum WindowResult {
+    Complete(Vec<RawTrade>),
+    Saturated { boundary: i64 },
+}
+
+enum ForwardPiece {
+    Window { lo: i64, hi: i64 },
+    Second(i64),
+}
+
+struct TradePage {
+    rows: Vec<RawTrade>,
+    raw_count: usize,
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
 }
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
@@ -85,6 +97,8 @@ pub struct PolymarketBulkFetcher<F: PageFetcher> {
     /// var is read once per fetcher, keeping the threshold deterministic
     /// across all wallets in a run.
     infra_probe: InfraProbe,
+    #[cfg(any(test, feature = "scenario"))]
+    clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
 }
 
 /// Per-batch result of [`PolymarketBulkFetcher::fetch_all`].
@@ -97,7 +111,7 @@ pub struct FetchOutcome {
     /// Number of wallets in the input batch.
     pub attempted: usize,
     /// Wallets whose trades could not be fetched or written to SQLite. Their
-    /// progress was rolled back per-wallet; the rest of the batch succeeded.
+    /// completed backward pages remain durable and the wallet stays partial.
     pub failed: Vec<WalletAddress>,
 }
 
@@ -126,7 +140,24 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             // via `with_stamp_on_success(true)` (set by `backfill::run_backfill`).
             stamp_on_success: false,
             infra_probe: InfraProbe::default(),
+            #[cfg(any(test, feature = "scenario"))]
+            clock: None,
         }
+    }
+
+    /// Inject the wall clock for deterministic scenario requests and stamps.
+    #[cfg(any(test, feature = "scenario"))]
+    pub fn with_clock_for_test(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Some(Arc::new(clock));
+        self
+    }
+
+    fn now_unix(&self) -> i64 {
+        #[cfg(any(test, feature = "scenario"))]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        OffsetDateTime::now_utc().unix_timestamp()
     }
 
     /// Override the wallet-fetch concurrency (clamped to `>= 1`).
@@ -135,33 +166,17 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         self
     }
 
-    /// Override the per-wallet wall-clock timeout (in seconds). `0` disables the
-    /// timeout entirely (the default in [`Self::new`]); any positive value wraps
-    /// each `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets
-    /// whose total fetch wall-clock exceeds the budget are added to
-    /// [`FetchOutcome::failed`] via the standard soft-fail path (no SQLite write,
-    /// `last_polymarket_fetch_at` not stamped → re-queued by the next backfill).
+    /// Set the per-wallet timeout; zero disables it. On timeout, committed
+    /// backward progress survives, the marker stays partial, and the old stamp
+    /// is preserved so due wallets remain due.
     pub fn with_wallet_timeout(mut self, secs: u64) -> Self {
         self.wallet_timeout_secs = secs;
         self
     }
 
-    /// Enable per-wallet incremental stamping of `last_polymarket_fetch_at`.
-    ///
-    /// When `true`, each wallet's successful fetch (including the empty-page
-    /// case where there are no new trades) immediately writes
-    /// `last_polymarket_fetch_at = now()` to the `wallets` table under the same
-    /// `cache_mutex` guard that committed its trades. Failures (fetch error,
-    /// timeout, or `insert_new` error) do **not** stamp the wallet.
-    ///
-    /// This makes SIGINT mid-run preserve all completed work — succeeded
-    /// wallets keep their stamps, in-flight ones stay NULL and are re-queued
-    /// by the next `select_backfill_due`. Without this flag, callers must
-    /// stamp in a post-fetch loop (the legacy `pe-bootstrap::run` path) which
-    /// loses the stamps if the process exits before `fetch_all` returns.
-    ///
-    /// Default `false` to preserve the venue-agnostic stance of `fetch_all`
-    /// for the legacy seed-bootstrap path; `backfill::run_backfill` opts in.
+    /// Stamp each completed wallet in the same transaction that clears its
+    /// partial marker. With stamping disabled, completion still clears the marker
+    /// and preserves the old (including NULL) stamp. Errors never stamp.
     pub fn with_stamp_on_success(mut self, on: bool) -> Self {
         self.stamp_on_success = on;
         self
@@ -178,39 +193,10 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         self
     }
 
-    /// Fetch new trades for all `wallets`, updating `cache` incrementally.
-    ///
-    /// Up to `self.concurrency` wallets are fetched in parallel; the underlying
-    /// `PageFetcher` enforces the global rate-limit gate. HTTP 429 responses are
-    /// retried indefinitely at the page level (sleeping `Retry-After` seconds);
-    /// the only mechanism that skips a wallet on rate limiting is the per-wallet
-    /// wall-clock budget set via [`Self::with_wallet_timeout`] — when configured,
-    /// a wallet whose total fetch time exceeds the budget is soft-failed via
-    /// [`FetchOutcome::failed`] (no SQLite write happens, `last_polymarket_fetch_at`
-    /// stays NULL → re-queued by the next backfill).
-    ///
-    /// Per-wallet errors (non-recoverable network/parse error, SQLite insert failure,
-    /// or timeout-elapsed) are **not** returned as `Err` — they're captured in
-    /// [`FetchOutcome::failed`]. This lets callers decide per-use-case how to
-    /// handle partial success:
-    ///
-    /// - The legacy `lib.rs::run()` pipeline checks `outcome.failed.is_empty()` and
-    ///   errors on partial fetch (preserving prior behaviour).
-    /// - `backfill.rs::run_backfill` continues the post-fetch pipeline
-    ///   (resolutions + activation) and surfaces the partial-fetch error only at the
-    ///   very end. It also chains [`Self::with_stamp_on_success`] so per-wallet
-    ///   `last_polymarket_fetch_at` stamping happens inline as each wallet completes,
-    ///   making SIGINT-mid-run preserve all completed work.
-    ///
-    /// `Err` is reserved for catastrophic failures the caller cannot recover from
-    /// (none are currently emitted from this method; future internal-bug surfaces).
-    ///
-    /// Trades are committed to SQLite per-wallet inside a single transaction.
-    /// SQLite WAL mode provides per-commit durability — no manual checkpointing
-    /// or final flush is needed. When [`Self::with_stamp_on_success`] is enabled,
-    /// the stamp write occurs under the same `cache_mutex` guard that committed
-    /// the trades so a successful wallet's `(trades, stamp)` pair is atomic from
-    /// the operator's point of view.
+    /// Fetch wallets concurrently, retaining completed backward pages on failure.
+    /// HTTP 429 retries stay inside the wallet timeout. Network, parse, insert,
+    /// and completion errors are reported in `FetchOutcome::failed`; callers
+    /// choose whether to continue their post-fetch pipeline.
     pub async fn fetch_all(
         &self,
         wallets: &[WalletAddress],
@@ -225,29 +211,23 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                 let failed = Arc::clone(&failed);
                 async move {
                     let wallet_hex = wallet.to_string();
-                    let (known_ids, ts_bounds) = {
-                        let guard = cache_mutex.lock().await;
-                        let ids: HashSet<SourceTradeId> =
-                            guard.known_trade_ids(&wallet_hex).into_iter().collect();
-                        let bounds = guard.trade_ts_bounds(&wallet_hex).ok().flatten();
-                        (ids, bounds)
-                    };
-
-                    let fetch_future =
-                        self.fetch_wallet_incremental(wallet, &known_ids, ts_bounds);
+                    let hi = self.now_unix();
+                    let mut progress = CommitProgress::default();
+                    let fetch_future = self.fetch_wallet_incremental(
+                        wallet, hi, cache_mutex, &mut progress,
+                    );
                     let fetch_result = if self.wallet_timeout_secs > 0 {
                         match tokio::time::timeout(
-                            Duration::from_secs(self.wallet_timeout_secs),
-                            fetch_future,
-                        )
-                        .await
-                        {
-                            Ok(r) => r,
-                            Err(_elapsed) => {
-                                tracing::error!(
+                            Duration::from_secs(self.wallet_timeout_secs), fetch_future,
+                        ).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::warn!(
                                     wallet = %wallet_hex,
                                     timeout_secs = self.wallet_timeout_secs,
-                                    "polymarket: fetch timeout exceeded — trades for this wallet will be missing"
+                                    pages_committed = progress.pages_committed,
+                                    trades_committed = progress.trades_committed,
+                                    "polymarket: fetch timeout — committed progress kept; wallet stays due"
                                 );
                                 failed.lock().await.push(wallet);
                                 return;
@@ -258,34 +238,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                     };
 
                     match fetch_result {
-                        Ok(WalletFetchResult::Trades(new_trades)) => {
-                            let mut guard = cache_mutex.lock().await;
-                            if let Err(e) = guard.insert_new(&wallet_hex, new_trades) {
-                                tracing::error!(
-                                    wallet = %wallet_hex,
-                                    error = %e,
-                                    "polymarket: cache insert failed — trades for this wallet will be missing"
-                                );
-                                failed.lock().await.push(wallet);
-                                return;
-                            }
-                            if self.stamp_on_success {
-                                let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-                                if let Err(e) =
-                                    guard.update_last_polymarket_fetch(&wallet_hex, now_unix)
-                                {
-                                    // Trades are durable; missing stamp just means
-                                    // the next `select_backfill_due` will re-queue
-                                    // this wallet and the 3-known-IDs early-stop
-                                    // makes the re-fetch cheap. Not a hard failure.
-                                    tracing::warn!(
-                                        wallet = %wallet_hex,
-                                        error = %e,
-                                        "polymarket: stamp failed — wallet will be re-queued next backfill (trades are persisted)"
-                                    );
-                                }
-                            }
-                        }
+                        Ok(WalletFetchResult::Complete) => {}
                         Ok(WalletFetchResult::Infra { span_secs }) => {
                             // Issue #197: probe fired. Mark wallet infra under
                             // the same mutex guard. Do NOT insert trades, do
@@ -294,7 +247,8 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                             // active_tradeable_wallets view +
                             // apply_activation_rules gate.
                             let mut guard = cache_mutex.lock().await;
-                            if let Err(e) = guard.mark_infra(&wallet_hex) {
+                            if let Err(e) = guard.mark_infra(&wallet_hex)
+                                .and_then(|()| guard.finish_backfill(&wallet_hex, None)) {
                                 tracing::error!(
                                     wallet = %wallet_hex,
                                     error = %e,
@@ -313,7 +267,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                             tracing::error!(
                                 wallet = %wallet_hex,
                                 error = %e,
-                                "polymarket: fetch failed — trades for this wallet will be missing"
+                                "polymarket: fetch failed — committed progress kept; wallet stays due"
                             );
                             failed.lock().await.push(wallet);
                         }
@@ -331,210 +285,218 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         })
     }
 
-    /// Fetch trades not already in `known_ids` for a single wallet via two-phase cursor walk.
-    ///
-    /// Phase 1 (backward fill): walks backward from `oldest_cached_ts - 1` (or unbounded for
-    /// cold-start) until an empty or partial page signals no more history.
-    /// Phase 2 (forward fill): walks forward from `newest_cached_ts` (incremental only) until
-    /// empty or partial page; `INCREMENTAL_STOP_THRESHOLD` consecutive known IDs act as an
-    /// overlap safety net.
-    ///
-    /// Cursor semantics (empirically verified): `end` is inclusive (trade at `end` returned);
-    /// `start` is exclusive (trade at `start` not returned).
+    /// Freeze one upper bound for both phases. No cache guard crosses network I/O.
     async fn fetch_wallet_incremental(
         &self,
         wallet: WalletAddress,
-        known_ids: &HashSet<SourceTradeId>,
-        ts_bounds: Option<(i64, i64)>,
+        hi: i64,
+        cache: &Mutex<&mut WalletCache>,
+        progress: &mut CommitProgress,
     ) -> Result<WalletFetchResult, BootstrapError> {
         let wallet_hex = wallet.to_string();
-        let mut new_trades: Vec<RawTrade> = Vec::new();
-
-        // ── Phase 1: Backward fill ────────────────────────────────────────────
-        // Cold start: no initial end cursor (fetch from present backward).
-        // Incremental: begin at oldest_cached_ts - 1 to fill any gap below cache floor.
-        // end is inclusive: advance cursor to min(page_timestamps) - 1 each page.
-        let mut end_cursor: Option<i64> = ts_bounds.map(|(oldest, _)| oldest - 1);
-
-        'backward: loop {
-            let url = PolymarketEndpoint::UserTradeActivity {
-                user: wallet_hex.clone(),
-                end: end_cursor,
-                start: None,
+        let (known_ids, ts_bounds) = {
+            let mut guard = cache.lock().await;
+            let bounds = guard.trade_ts_bounds(&wallet_hex)?;
+            let ids: HashSet<_> = guard.known_trade_ids(&wallet_hex).into_iter().collect();
+            guard.begin_backfill(&wallet_hex)?;
+            (ids, bounds)
+        };
+        let mut cursor = ts_bounds.map_or(hi, |(oldest, _)| oldest - 1);
+        let mut first_page = true;
+        while cursor >= 1 {
+            let page = self.fetch_page(wallet, 1, cursor, 0).await?;
+            if first_page
+                && ts_bounds.is_none()
+                && let ProbeClassification::Infra { span_secs } =
+                    self.infra_probe.classify(&page.rows, page.raw_count)
+            {
+                return Ok(WalletFetchResult::Infra { span_secs });
             }
-            .url(&self.base_url);
-
-            // Retry indefinitely on HTTP 429 — rate limiting is transient and
-            // skipping a wallet on rate limit would permanently lose its trades.
-            let bytes = loop {
-                match self.fetcher.fetch_page(&url).await {
-                    Ok(b) => break b,
-                    Err(SourceError::RateLimited { retry_after_secs }) => {
-                        let wait = Duration::from_secs(u64::from(retry_after_secs).max(1));
-                        tracing::warn!(
-                            wallet = %wallet_hex,
-                            retry_after_secs,
-                            "polymarket: rate limited, retrying page after backoff"
-                        );
-                        tokio::time::sleep(wait).await;
-                    }
-                    Err(e) => {
-                        return Err(BootstrapError::Polymarket {
-                            wallet: wallet_hex.clone(),
-                            message: e.to_string(),
-                        });
-                    }
-                }
-            };
-
-            let (mut page, raw_count) = parse_trades_with_count(&bytes, wallet).map_err(|e| {
-                BootstrapError::TradeParse {
-                    wallet: wallet_hex.clone(),
-                    message: e,
-                }
-            })?;
-
-            if page.is_empty() {
-                break 'backward;
+            first_page = false;
+            if page.raw_count
+                < usize::try_from(TRADE_FETCH_LIMIT).map_err(|_| BootstrapError::Internal)?
+            {
+                Self::commit_rows(cache, &wallet_hex, &known_ids, page.rows, progress).await?;
+                break;
             }
-
-            // ── Infra probe (issue #197) ──────────────────────────────────
-            // Fires only on the FIRST page of a cold-start fetch. Both
-            // guards are required: `ts_bounds.is_none()` distinguishes cold
-            // from incremental; `end_cursor.is_none()` distinguishes the
-            // first backward iteration from later ones (`end_cursor` is set
-            // at the bottom of the loop after iteration 1).
-            if ts_bounds.is_none() && end_cursor.is_none() {
-                match self.infra_probe.classify(&page, raw_count) {
-                    ProbeClassification::Infra { span_secs } => {
-                        tracing::warn!(
-                            wallet = %wallet_hex,
-                            span_secs,
-                            threshold = self.infra_probe.threshold_secs,
-                            "polymarket: infra probe triggered — flagging wallet, discarding probe page"
-                        );
-                        return Ok(WalletFetchResult::Infra { span_secs });
-                    }
-                    ProbeClassification::NotInfra { span_secs } => {
-                        tracing::debug!(
-                            wallet = %wallet_hex,
-                            span_secs,
-                            "polymarket: infra probe passed"
-                        );
-                    }
-                    ProbeClassification::Inconclusive { reason } => {
-                        tracing::debug!(
-                            wallet = %wallet_hex,
-                            reason,
-                            "polymarket: infra probe inconclusive"
-                        );
-                    }
-                }
-            }
-
-            // Sort newest-first (defensive; API normally returns this order).
-            page.sort_by_key(|t| std::cmp::Reverse(t.timestamp.0));
-
-            let min_ts = page
-                .iter()
-                .map(|t| t.timestamp.0.unix_timestamp())
-                .min()
-                .unwrap_or(0);
-
-            for trade in page {
-                if !known_ids.contains(&trade.source_trade_id) {
-                    new_trades.push(trade);
-                }
-            }
-
-            if raw_count < TRADE_FETCH_LIMIT as usize {
-                break 'backward;
-            }
-
-            // Advance cursor: end is inclusive, subtract 1 to exclude current minimum.
-            end_cursor = Some(min_ts - 1);
+            let boundary = page.min_ts.ok_or(BootstrapError::Internal)?;
+            let above = page
+                .rows
+                .into_iter()
+                .filter(|trade| trade.timestamp.0.unix_timestamp() > boundary)
+                .collect();
+            Self::commit_rows(cache, &wallet_hex, &known_ids, above, progress).await?;
+            let second = self.fetch_second(wallet, boundary).await?;
+            Self::commit_rows(cache, &wallet_hex, &known_ids, second, progress).await?;
+            cursor = boundary - 1;
         }
 
-        // ── Phase 2: Forward fill (incremental only) ──────────────────────────
-        // Walk forward from newest cached trade to pick up new trades.
-        // start is exclusive: advance to max(page_timestamps) each page so the next
-        // request returns only trades strictly newer than those already seen.
-        if let Some((_, newest_ts)) = ts_bounds {
-            let mut start_cursor = newest_ts;
-            let mut consecutive_known: usize = 0;
+        if let Some((_, newest)) = ts_bounds {
+            // Re-acquire the former maximum second before extending above it:
+            // indexing may have exposed additional rows since the previous walk.
+            let mut forward = self.fetch_second(wallet, newest).await?;
+            forward.extend(self.fetch_forward(wallet, newest, hi).await?);
+            // #608 scope: ALL forward pieces remain buffered until complete.
+            Self::commit_rows(cache, &wallet_hex, &known_ids, forward, progress).await?;
+        }
+        cache
+            .lock()
+            .await
+            .finish_backfill(&wallet_hex, self.stamp_on_success.then(|| self.now_unix()))?;
+        Ok(WalletFetchResult::Complete)
+    }
 
-            'forward: loop {
-                let url = PolymarketEndpoint::UserTradeActivity {
-                    user: wallet_hex.clone(),
-                    end: None,
-                    start: Some(start_cursor),
+    async fn commit_rows(
+        cache: &Mutex<&mut WalletCache>,
+        wallet: &str,
+        known_ids: &HashSet<SourceTradeId>,
+        mut rows: Vec<RawTrade>,
+        progress: &mut CommitProgress,
+    ) -> Result<(), BootstrapError> {
+        rows.retain(|trade| !known_ids.contains(&trade.source_trade_id));
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let inserted = cache.lock().await.insert_new(wallet, rows)?;
+        progress.pages_committed += 1;
+        progress.trades_committed += inserted;
+        Ok(())
+    }
+
+    async fn fetch_page(
+        &self,
+        wallet: WalletAddress,
+        start: i64,
+        end: i64,
+        offset: u32,
+    ) -> Result<TradePage, BootstrapError> {
+        let url = PolymarketEndpoint::UserTradeActivityPage {
+            user: wallet.to_string(),
+            start: Some(start),
+            end,
+            offset,
+        }
+        .url(&self.base_url);
+        let bytes = loop {
+            match self.fetcher.fetch_page(&url).await {
+                Ok(bytes) => break bytes,
+                Err(SourceError::RateLimited { retry_after_secs }) => {
+                    tracing::warn!(%wallet, retry_after_secs, "polymarket: rate limited, retrying page after backoff");
+                    tokio::time::sleep(Duration::from_secs(u64::from(retry_after_secs).max(1)))
+                        .await;
                 }
-                .url(&self.base_url);
+                Err(error) => {
+                    return Err(BootstrapError::Polymarket {
+                        wallet: wallet.to_string(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        };
+        let page =
+            parse_trade_page(&bytes, wallet).map_err(|message| BootstrapError::TradeParse {
+                wallet: wallet.to_string(),
+                message,
+            })?;
+        if page.raw_count
+            > usize::try_from(TRADE_FETCH_LIMIT).map_err(|_| BootstrapError::Internal)?
+            || page.min_ts.is_some_and(|ts| ts < start)
+            || page.max_ts.is_some_and(|ts| ts > end)
+        {
+            return Err(BootstrapError::Polymarket {
+                wallet: wallet.to_string(),
+                message: format!(
+                    "activity page outside requested bounds [{start}, {end}] or page limit"
+                ),
+            });
+        }
+        Ok(page)
+    }
 
-                let bytes = loop {
-                    match self.fetcher.fetch_page(&url).await {
-                        Ok(b) => break b,
-                        Err(SourceError::RateLimited { retry_after_secs }) => {
-                            let wait = Duration::from_secs(u64::from(retry_after_secs).max(1));
-                            tracing::warn!(
-                                wallet = %wallet_hex,
-                                retry_after_secs,
-                                "polymarket: rate limited, retrying page after backoff"
-                            );
-                            tokio::time::sleep(wait).await;
-                        }
-                        Err(e) => {
+    /// A window buffers at most 5,500 rows (offsets 0 through 5,000 inclusive).
+    async fn fetch_window(
+        &self,
+        wallet: WalletAddress,
+        lo: i64,
+        hi: i64,
+    ) -> Result<WindowResult, BootstrapError> {
+        if lo >= hi {
+            return Ok(WindowResult::Complete(Vec::new()));
+        }
+        let mut rows = Vec::new();
+        let mut boundary = hi;
+        for offset in (0..=ACTIVITY_MAX_OFFSET)
+            .step_by(usize::try_from(TRADE_FETCH_LIMIT).map_err(|_| BootstrapError::Internal)?)
+        {
+            let page = self.fetch_page(wallet, lo + 1, hi, offset).await?;
+            if let Some(min) = page.min_ts {
+                boundary = boundary.min(min);
+            }
+            rows.extend(page.rows);
+            if page.raw_count
+                < usize::try_from(TRADE_FETCH_LIMIT).map_err(|_| BootstrapError::Internal)?
+            {
+                return Ok(WindowResult::Complete(rows));
+            }
+        }
+        Ok(WindowResult::Saturated { boundary })
+    }
+
+    async fn fetch_second(
+        &self,
+        wallet: WalletAddress,
+        second: i64,
+    ) -> Result<Vec<RawTrade>, BootstrapError> {
+        let lo = second.checked_sub(1).ok_or(BootstrapError::Internal)?;
+        match self.fetch_window(wallet, lo, second).await? {
+            WindowResult::Complete(rows) => Ok(rows),
+            WindowResult::Saturated { .. } => Err(BootstrapError::SaturatedSecond {
+                wallet: wallet.to_string(),
+                second,
+            }),
+        }
+    }
+
+    /// Ordered three-way splitting with strict progress and no recursive futures.
+    /// Completed pieces remain buffered here until the entire forward walk succeeds.
+    async fn fetch_forward(
+        &self,
+        wallet: WalletAddress,
+        lo: i64,
+        hi: i64,
+    ) -> Result<Vec<RawTrade>, BootstrapError> {
+        let mut pending = vec![ForwardPiece::Window { lo, hi }];
+        let mut rows = Vec::new();
+        while let Some(piece) = pending.pop() {
+            match piece {
+                ForwardPiece::Second(second) => {
+                    rows.extend(self.fetch_second(wallet, second).await?)
+                }
+                ForwardPiece::Window { lo, hi } => match self.fetch_window(wallet, lo, hi).await? {
+                    WindowResult::Complete(complete) => rows.extend(complete),
+                    WindowResult::Saturated { boundary } => {
+                        if boundary <= lo || boundary > hi {
                             return Err(BootstrapError::Polymarket {
-                                wallet: wallet_hex.clone(),
-                                message: e.to_string(),
+                                wallet: wallet.to_string(),
+                                message: format!("invalid split ({lo}, {hi}] at {boundary}"),
+                            });
+                        }
+                        // Push in reverse order: lower, seam second, then upper.
+                        if boundary < hi {
+                            pending.push(ForwardPiece::Window { lo: boundary, hi });
+                        }
+                        pending.push(ForwardPiece::Second(boundary));
+                        if lo < boundary - 1 {
+                            pending.push(ForwardPiece::Window {
+                                lo,
+                                hi: boundary - 1,
                             });
                         }
                     }
-                };
-
-                let (mut page, raw_count) =
-                    parse_trades_with_count(&bytes, wallet).map_err(|e| {
-                        BootstrapError::TradeParse {
-                            wallet: wallet_hex.clone(),
-                            message: e,
-                        }
-                    })?;
-
-                if page.is_empty() {
-                    break 'forward;
-                }
-
-                // Sort newest-first (defensive).
-                page.sort_by_key(|t| std::cmp::Reverse(t.timestamp.0));
-
-                let max_ts = page
-                    .iter()
-                    .map(|t| t.timestamp.0.unix_timestamp())
-                    .max()
-                    .unwrap_or(0);
-
-                for trade in page {
-                    if known_ids.contains(&trade.source_trade_id) {
-                        consecutive_known += 1;
-                        if consecutive_known >= INCREMENTAL_STOP_THRESHOLD {
-                            break 'forward;
-                        }
-                    } else {
-                        consecutive_known = 0;
-                        new_trades.push(trade);
-                    }
-                }
-
-                if raw_count < TRADE_FETCH_LIMIT as usize {
-                    break;
-                }
-
-                // Advance cursor: start is exclusive, so max_ts excludes the current page max.
-                start_cursor = max_ts;
+                },
             }
         }
-
-        Ok(WalletFetchResult::Trades(new_trades))
+        Ok(rows)
     }
 }
 
@@ -543,21 +505,50 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
 /// Parse `bytes` into trades, returning the raw JSON array count for
 /// pagination termination. Uses raw count so individual parse failures
 /// do not cause early pagination termination.
+fn parse_trade_page(bytes: &[u8], wallet: WalletAddress) -> Result<TradePage, String> {
+    let response: TradeResponse =
+        serde_json::from_slice(bytes).map_err(|e| format!("json: {e}"))?;
+    let raw_count = response.len();
+    // Bounds come from RAW rows, including rows the legacy converter rejects.
+    // A full page of rejected trades must never masquerade as an empty page.
+    let min_ts = response
+        .iter()
+        .map(|raw| timestamp_seconds(raw.timestamp))
+        .min();
+    let max_ts = response
+        .iter()
+        .map(|raw| timestamp_seconds(raw.timestamp))
+        .max();
+    let mut rows = Vec::with_capacity(raw_count);
+    for raw in response {
+        match convert_trade(raw, wallet) {
+            Ok(trade) => rows.push(trade),
+            Err(error) => tracing::warn!(%wallet, %error, "skipping unparseable trade"),
+        }
+    }
+    Ok(TradePage {
+        rows,
+        raw_count,
+        min_ts,
+        max_ts,
+    })
+}
+
+#[cfg(test)]
 fn parse_trades_with_count(
     bytes: &[u8],
     wallet: WalletAddress,
 ) -> Result<(Vec<RawTrade>, usize), String> {
-    let response: TradeResponse =
-        serde_json::from_slice(bytes).map_err(|e| format!("json: {e}"))?;
-    let raw_count = response.len();
-    let mut out = Vec::with_capacity(raw_count);
-    for raw in response {
-        match convert_trade(raw, wallet) {
-            Ok(t) => out.push(t),
-            Err(e) => tracing::warn!(wallet = %wallet, error = %e, "skipping unparseable trade"),
-        }
+    let page = parse_trade_page(bytes, wallet)?;
+    Ok((page.rows, page.raw_count))
+}
+
+fn timestamp_seconds(timestamp: i64) -> i64 {
+    if timestamp > 9_999_999_999 {
+        timestamp / 1_000
+    } else {
+        timestamp
     }
-    Ok((out, raw_count))
 }
 
 fn convert_trade(raw: PolymarketTrade, wallet: WalletAddress) -> Result<RawTrade, String> {
@@ -585,11 +576,7 @@ fn convert_trade(raw: PolymarketTrade, wallet: WalletAddress) -> Result<RawTrade
     };
 
     // Normalise to seconds; Polymarket sometimes uses milliseconds.
-    let ts_secs = if raw.timestamp > 9_999_999_999 {
-        raw.timestamp / 1_000
-    } else {
-        raw.timestamp
-    };
+    let ts_secs = timestamp_seconds(raw.timestamp);
     let dt = OffsetDateTime::from_unix_timestamp(ts_secs)
         .map_err(|_| format!("invalid timestamp {ts_secs}"))?;
 
@@ -713,30 +700,33 @@ mod tests {
 
     /// Cold-start URL: no end/start cursor.
     fn trade_url_cold(wallet: WalletAddress) -> String {
-        PolymarketEndpoint::UserTradeActivity {
+        PolymarketEndpoint::UserTradeActivityPage {
             user: wallet.to_string(),
-            end: None,
-            start: None,
+            end: 2_000_000_000,
+            start: Some(1),
+            offset: 0,
         }
         .url(BASE_URL)
     }
 
     /// Backward-fill URL with an inclusive `end` timestamp cursor.
     fn trade_url_end(wallet: WalletAddress, end: i64) -> String {
-        PolymarketEndpoint::UserTradeActivity {
+        PolymarketEndpoint::UserTradeActivityPage {
             user: wallet.to_string(),
-            end: Some(end),
-            start: None,
+            end,
+            start: Some(1),
+            offset: 0,
         }
         .url(BASE_URL)
     }
 
     /// Forward-fill URL with an exclusive `start` timestamp cursor.
     fn trade_url_start(wallet: WalletAddress, start: i64) -> String {
-        PolymarketEndpoint::UserTradeActivity {
+        PolymarketEndpoint::UserTradeActivityPage {
             user: wallet.to_string(),
-            end: None,
-            start: Some(start),
+            end: 2_000_000_000,
+            start: Some(start + 1),
+            offset: 0,
         }
         .url(BASE_URL)
     }
@@ -835,6 +825,27 @@ mod tests {
         let mut responses = HashMap::new();
         // Page 1: ts 3500..3001, min=3001, next end=3000
         responses.insert(trade_url_cold(wallet), page_json_n(500, 0, 3500));
+        for (second, id) in [
+            (3001, 499),
+            (2501, 999),
+            (2001, 1499),
+            (1501, 1999),
+            (1001, 2499),
+            (501, 2999),
+            (1, 3499),
+        ] {
+            responses.insert(
+                PolymarketEndpoint::UserTradeActivityPage {
+                    user: wallet.to_string(),
+                    start: Some(second),
+                    end: second,
+                    offset: 0,
+                }
+                .url(BASE_URL),
+                page_json_n(1, id, second),
+            );
+        }
+
         // Page 2: ts 3000..2501, min=2501, next end=2500
         responses.insert(trade_url_end(wallet, 3000), page_json_n(500, 500, 3000));
         // Page 3: empty → stop
@@ -846,6 +857,7 @@ mod tests {
         // Disable probe: this test's dense fixture (ts ∈ [3001, 3500], span = 499s)
         // would trigger the probe. The test exercises pagination, not infra logic.
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_clock_for_test(|| 2_000_000_000)
             .with_infra_probe(InfraProbe { threshold_secs: 0 });
         bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
@@ -861,7 +873,8 @@ mod tests {
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_clock_for_test(|| 2_000_000_000);
         bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert_eq!(cache.trade_count(), 499);
@@ -875,60 +888,14 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_clock_for_test(|| 2_000_000_000);
         bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert_eq!(cache.trade_count(), 10);
     }
 
     // ── Pagination: incremental / forward fill ────────────────────────────────
-
-    #[tokio::test]
-    async fn incremental_fetch_stops_after_k_consecutive_known_ids() {
-        // PASS: forward fill appends 2 new trades then stops on 3 consecutive known IDs.
-        let wallet = wallet_a();
-        let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-
-        // Cold run: 5 old trades (partial page → stops, no further backward cursor).
-        let old_page = page_json_hashes(&[
-            ("0xold1", 1_000_005),
-            ("0xold2", 1_000_004),
-            ("0xold3", 1_000_003),
-            ("0xold4", 1_000_002),
-            ("0xold5", 1_000_001),
-        ]);
-        // oldest=1_000_001, newest=1_000_005
-        let mut r_cold = HashMap::new();
-        r_cold.insert(trade_url_cold(wallet), old_page);
-        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold))
-            .fetch_all(&[wallet], &mut cache)
-            .await
-            .unwrap();
-        assert_eq!(cache.trade_count(), 5);
-
-        // Incremental run:
-        //   Phase 1 backward (end = 1_000_001 - 1 = 1_000_000) → empty → stop.
-        //   Phase 2 forward (start = 1_000_005): page with 2 new then 3 consecutive known.
-        let incr_page = page_json_hashes(&[
-            ("0xnew1", 2_000_002),
-            ("0xnew2", 2_000_001),
-            ("0xold1", 1_000_005), // known — 1
-            ("0xold2", 1_000_004), // known — 2
-            ("0xold3", 1_000_003), // known — 3: stop
-            ("0xold4", 1_000_002), // not reached
-            ("0xold5", 1_000_001), // not reached
-        ]);
-        let mut r_incr = HashMap::new();
-        r_incr.insert(trade_url_end(wallet, 1_000_000), page_json_n(0, 0, 0));
-        r_incr.insert(trade_url_start(wallet, 1_000_005), incr_page);
-        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr))
-            .fetch_all(&[wallet], &mut cache)
-            .await
-            .unwrap();
-
-        assert_eq!(cache.trade_count(), 7, "5 old + 2 new = 7");
-    }
 
     // ── Pagination: backward fill fills history below cache floor ─────────────
 
@@ -946,6 +913,7 @@ mod tests {
         let mut r_cold = HashMap::new();
         r_cold.insert(trade_url_cold(wallet), cold_page);
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold))
+            .with_clock_for_test(|| 2_000_000_000)
             .fetch_all(&[wallet], &mut cache)
             .await
             .unwrap();
@@ -957,8 +925,19 @@ mod tests {
         let hist_page = page_json_hashes(&[("0xhist1", 500), ("0xhist2", 499), ("0xhist3", 498)]);
         let mut r_incr = HashMap::new();
         r_incr.insert(trade_url_end(wallet, 997), hist_page);
+        r_incr.insert(
+            PolymarketEndpoint::UserTradeActivityPage {
+                user: wallet.to_string(),
+                end: 1000,
+                start: Some(1000),
+                offset: 0,
+            }
+            .url(BASE_URL),
+            b"[]".to_vec(),
+        );
         r_incr.insert(trade_url_start(wallet, 1000), page_json_n(0, 0, 0));
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr))
+            .with_clock_for_test(|| 2_000_000_000)
             .fetch_all(&[wallet], &mut cache)
             .await
             .unwrap();
@@ -976,6 +955,27 @@ mod tests {
         let mut responses = HashMap::new();
         // 7 full pages + 1 terminating empty page.
         responses.insert(trade_url_cold(wallet), page_json_n(500, 0, 3500));
+        for (second, id) in [
+            (3001, 499),
+            (2501, 999),
+            (2001, 1499),
+            (1501, 1999),
+            (1001, 2499),
+            (501, 2999),
+            (1, 3499),
+        ] {
+            responses.insert(
+                PolymarketEndpoint::UserTradeActivityPage {
+                    user: wallet.to_string(),
+                    start: Some(second),
+                    end: second,
+                    offset: 0,
+                }
+                .url(BASE_URL),
+                page_json_n(1, id, second),
+            );
+        }
+
         responses.insert(trade_url_end(wallet, 3000), page_json_n(500, 500, 3000));
         responses.insert(trade_url_end(wallet, 2500), page_json_n(500, 1000, 2500));
         responses.insert(trade_url_end(wallet, 2000), page_json_n(500, 1500, 2000));
@@ -991,6 +991,7 @@ mod tests {
         // Disable probe: this test's dense fixture would trigger it. The test
         // exercises pagination across 7 full pages, not infra logic.
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_clock_for_test(|| 2_000_000_000)
             .with_infra_probe(InfraProbe { threshold_secs: 0 })
             .fetch_all(&[wallet], &mut cache)
             .await
@@ -1017,7 +1018,8 @@ mod tests {
         let fetcher = RateLimitThenSucceedFetcher::new(inner, 3);
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_clock_for_test(|| 2_000_000_000);
         bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert_eq!(
@@ -1038,7 +1040,8 @@ mod tests {
         let fetcher = FixtureFetcher::new(HashMap::new()); // no fixture → Fatal error
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_clock_for_test(|| 2_000_000_000);
         let outcome = bulk
             .fetch_all(&[wallet], &mut cache)
             .await
@@ -1071,7 +1074,8 @@ mod tests {
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_clock_for_test(|| 2_000_000_000);
 
         let outcome = bulk
             .fetch_all(&[wallet_ok, wallet_fail], &mut cache)
@@ -1103,9 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn page_sort_handles_out_of_order_api_response() {
-        // Forward-fill page arrives oldest-first (ascending). After defensive sort
-        // (newest-first): new1 appears before known trades → appended; then 3
-        // consecutive known IDs trigger the stop threshold.
+        // A complete window accepts ascending API rows without a cursor jump.
         let wallet = wallet_a();
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
@@ -1119,33 +1121,35 @@ mod tests {
         let mut r1 = HashMap::new();
         r1.insert(trade_url_cold(wallet), old_page);
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
+            .with_clock_for_test(|| 2_000_000_000)
             .fetch_all(&[wallet], &mut cache)
             .await
             .unwrap();
 
-        // Incremental run:
-        //   Phase 1 backward (end = 1_000_001 - 1 = 1_000_000) → empty.
-        //   Phase 2 forward (start = 1_000_003): page arrives ascending (oldest-first).
-        //   After sort → [new1(2M), old1(1M+3), old2(1M+2), old3(1M+1)] → append new1,
-        //   then 3 consecutive known → stop.
-        let reversed_page = page_json_hashes(&[
-            ("0xold3", 1_000_001),
-            ("0xold2", 1_000_002),
-            ("0xold1", 1_000_003),
-            ("0xnew1", 2_000_000),
-        ]);
+        let reversed_page = page_json_hashes(&[("0xnew1", 2_000_000), ("0xnew2", 2_000_001)]);
         let mut r2 = HashMap::new();
         r2.insert(trade_url_end(wallet, 1_000_000), page_json_n(0, 0, 0));
+        r2.insert(
+            PolymarketEndpoint::UserTradeActivityPage {
+                user: wallet.to_string(),
+                end: 1_000_003,
+                start: Some(1_000_003),
+                offset: 0,
+            }
+            .url(BASE_URL),
+            b"[]".to_vec(),
+        );
         r2.insert(trade_url_start(wallet, 1_000_003), reversed_page);
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
+            .with_clock_for_test(|| 2_000_000_000)
             .fetch_all(&[wallet], &mut cache)
             .await
             .unwrap();
 
         assert_eq!(
             cache.trade_count(),
-            4,
-            "new trade before known sequence must be appended"
+            5,
+            "both rows in the complete window must be appended"
         );
     }
 
@@ -1163,8 +1167,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
-        let bulk =
-            PolymarketBulkFetcher::new(BASE_URL.to_owned(), HangFetcher).with_wallet_timeout(1);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), HangFetcher)
+            .with_clock_for_test(|| 2_000_000_000)
+            .with_wallet_timeout(1);
 
         let start = std::time::Instant::now();
         let outcome = bulk
@@ -1206,6 +1211,7 @@ mod tests {
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_clock_for_test(|| 2_000_000_000)
             .with_wallet_timeout(0);
         let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
@@ -1236,7 +1242,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher).with_wallet_timeout(1);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_clock_for_test(|| 2_000_000_000)
+            .with_wallet_timeout(1);
 
         let start = std::time::Instant::now();
         let outcome = bulk.fetch_all(&[fast, slow], &mut cache).await.unwrap();
@@ -1280,7 +1288,8 @@ mod tests {
 
         // No `with_wallet_timeout(_)` chain — exactly the shape used by the
         // 29 existing scenario and unit tests.
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_clock_for_test(|| 2_000_000_000);
         let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert!(outcome.failed.is_empty());
@@ -1320,6 +1329,7 @@ mod tests {
         responses.insert(trade_url_cold(wallet), page_json_n(3, 0, 1_700_000_000));
 
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_clock_for_test(|| 2_000_000_000)
             .with_stamp_on_success(true);
         let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
@@ -1349,6 +1359,7 @@ mod tests {
         responses.insert(trade_url_cold(wallet), page_json_n(0, 0, 0));
 
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_clock_for_test(|| 2_000_000_000)
             .with_stamp_on_success(true);
         let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
@@ -1376,6 +1387,7 @@ mod tests {
         // No fixture → FixtureFetcher returns Fatal → wallet lands in `failed`.
         let bulk =
             PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(HashMap::new()))
+                .with_clock_for_test(|| 2_000_000_000)
                 .with_stamp_on_success(true);
         let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
@@ -1404,7 +1416,8 @@ mod tests {
         responses.insert(trade_url_cold(wallet), page_json_n(2, 0, 1_700_000_000));
 
         // No `with_stamp_on_success` — matches existing scenario callers.
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_clock_for_test(|| 2_000_000_000);
         let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert!(outcome.failed.is_empty());

@@ -162,6 +162,38 @@ def read_csv_rows(path: str) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+class PartialBackfillUniverseTest(unittest.TestCase):
+    def test_both_universe_sources_filter_before_limit_and_keep_legacy_or_missing_rows(self):
+        for from_trades in (False, True):
+            for complete_stamp in (None, 1, "missing"):
+                with self.subTest(from_trades=from_trades, complete_stamp=complete_stamp):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        db = str(Path(tmp) / "cache.db")
+                        out = str(Path(tmp) / "out")
+                        build_core_cache(db)
+                        with sqlite3.connect(db) as conn:
+                            conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, "
+                                         "backfill_partial INTEGER NOT NULL DEFAULT 0, "
+                                         "last_polymarket_fetch_at INTEGER)")
+                            conn.execute("INSERT INTO wallets VALUES (?,1,1)", (WA,))
+                            if complete_stamp != "missing":
+                                conn.execute("INSERT INTO wallets VALUES (?,0,?)", (WB, complete_stamp))
+                        universe = Path(tmp) / "universe.txt"
+                        universe.write_text(WA + "\n" + WB + "\n")
+                        args = ["--universe-from-trades"] if from_trades else ["--universe", str(universe)]
+                        self.assertEqual(run_ranker(db, out, *args, "--limit-wallets", "1",
+                                                   "--floor-tstat", "0.1"), 0)
+                        rows = read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))
+                        self.assertEqual([r["wallet"] for r in rows], [WB])
+
+    def test_only_marker_one_is_excluded_and_schema_two_is_unchanged(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute("CREATE TABLE wallets (wallet_hex TEXT, backfill_partial INTEGER)")
+            conn.executemany("INSERT INTO wallets VALUES (?,?)", [(WA, 1), (WB, 2)])
+            self.assertEqual(rk.exclude_partial_backfills(conn, [WA, WB], 1), [WB])
+            self.assertEqual(rk.exclude_partial_backfills(conn, [WA, WB], 2), [WA, WB])
+
+
 class FlatRankingGoldenTest(unittest.TestCase):
     """Flat (half_life=0) stats == independent legacy recomputation; ranked desc by tstat_net."""
 

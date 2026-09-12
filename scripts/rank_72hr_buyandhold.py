@@ -232,6 +232,24 @@ def load_universe_from_trades(conn: sqlite3.Connection, limit: int,
     return wallets
 
 
+def exclude_partial_backfills(conn: sqlite3.Connection, wallets: list[str],
+                             schema_version: int) -> list[str]:
+    """Schema-one partial histories cannot establish first-ever entries.
+
+    Older caches and trade-only research fixtures have no marker column; legacy
+    unstamped wallets and wallets absent from the pile remain in the universe.
+    """
+    if schema_version >= 2:
+        return wallets
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(wallets)")}
+    if "backfill_partial" not in columns:
+        return wallets
+    partial = {str(row[0]).lower() for row in conn.execute(
+        "SELECT wallet_hex FROM wallets WHERE backfill_partial = 1"
+    )}
+    return [wallet for wallet in wallets if wallet not in partial]
+
+
 def load_market_maps(conn: sqlite3.Connection):
     """market_id -> winning_outcome_id, resolved_at_unix ; market_id -> end_date_unix."""
     log("loading market_resolutions ...")
@@ -459,13 +477,18 @@ def main() -> int:
     schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
 
     if prm.universe_from_trades:
-        wallets = load_universe_from_trades(conn, prm.limit_wallets, schema_version)
+        wallets = load_universe_from_trades(conn, 0, schema_version)
         universe_label = "trades-distinct"
         log(f"universe: {len(wallets)} wallets (all distinct trade wallets, #370)")
     else:
-        wallets = load_universe(prm.universe, prm.limit_wallets)
+        wallets = load_universe(prm.universe, 0)
         universe_label = os.path.basename(prm.universe)
         log(f"universe: {len(wallets)} wallets ({universe_label})")
+
+    wallets = exclude_partial_backfills(conn, wallets, schema_version)
+    if prm.limit_wallets > 0:
+        wallets = wallets[:prm.limit_wallets]
+    log(f"universe after completeness filter and limit: {len(wallets)} wallets")
 
     # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
     # Market maps (resolutions + schedules) are only needed by the SQLite path; the

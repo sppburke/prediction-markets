@@ -29,10 +29,11 @@ fn wallet(byte: u8) -> WalletAddress {
 }
 
 fn trade_url_cold(w: WalletAddress) -> String {
-    PolymarketEndpoint::UserTradeActivity {
+    PolymarketEndpoint::UserTradeActivityPage {
         user: w.to_string(),
-        end: None,
-        start: None,
+        end: 2_000_000_000,
+        start: Some(1),
+        offset: 0,
     }
     .url(BASE_URL)
 }
@@ -81,6 +82,7 @@ async fn scenario_succeeded_wallet_stamped_inline() {
     responses.insert(trade_url_cold(w), page_json(&trades));
 
     let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+        .with_clock_for_test(|| 2_000_000_000)
         .with_stamp_on_success(true);
     let outcome = bulk.fetch_all(&[w], &mut cache).await.unwrap();
     assert!(outcome.failed.is_empty());
@@ -132,6 +134,7 @@ async fn scenario_mixed_batch_only_stamps_succeeded() {
     // fail_w has no fixture → FixtureFetcher returns Fatal.
 
     let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+        .with_clock_for_test(|| 2_000_000_000)
         .with_stamp_on_success(true);
     let outcome = bulk.fetch_all(&[ok_w, fail_w], &mut cache).await.unwrap();
 
@@ -184,6 +187,7 @@ async fn scenario_sigint_mid_run_preserves_completed_via_inline_stamp() {
     responses_1.insert(trade_url_cold(a), page_json(&trades));
 
     let bulk_1 = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses_1))
+        .with_clock_for_test(|| 2_000_000_000)
         .with_stamp_on_success(true);
     bulk_1.fetch_all(&[a], &mut cache).await.unwrap();
 
@@ -205,6 +209,7 @@ async fn scenario_sigint_mid_run_preserves_completed_via_inline_stamp() {
     responses_2.insert(trade_url_cold(b), page_json(&trades_b));
 
     let bulk_2 = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses_2))
+        .with_clock_for_test(|| 2_000_000_000)
         .with_stamp_on_success(true);
     bulk_2.fetch_all(&[b], &mut cache).await.unwrap();
 

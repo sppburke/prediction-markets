@@ -60,10 +60,6 @@ pub type WalletUpsertRow = (
     i64,
 );
 
-/// Number of consecutive known `source_trade_id`s that signals the incremental fetch is done.
-/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
-pub(crate) const INCREMENTAL_STOP_THRESHOLD: usize = 3;
-
 /// Wallets deleted per transaction in [`WalletCache::purge_wallets`] (issue #385).
 /// Bounds WAL growth + lock-hold time per commit; a chunk-boundary crash leaves a
 /// consistent partial state a re-run completes idempotently.
@@ -381,6 +377,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     is_infra                 INTEGER NOT NULL DEFAULT 0,
     source_bits              INTEGER NOT NULL DEFAULT 0,
     last_polymarket_fetch_at INTEGER NULL,
+    backfill_partial        INTEGER NOT NULL DEFAULT 0,
     -- Written by nothing since the funder-graph removal (#326/#521); retained in
     -- fresh schema so a rolled-back binary can still create its
     -- idx_wallets_weekly index against it.
@@ -791,6 +788,12 @@ impl WalletCache {
         // already-incremental db is a no-op. Never inside a transaction.
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
         conn.execute_batch(SCHEMA)?;
+        add_column_if_missing(
+            &conn,
+            "wallets",
+            "backfill_partial",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // Migration (#326 PR4): drop the operator/funder/delta tables. They fed
         // only the deleted operator-graph machinery; dropping reclaims the bulk of
         // the cache (`counterparty_edges` alone was ~275M rows). Idempotent — a
@@ -1001,16 +1004,18 @@ impl WalletCache {
     /// `source_trade_id` (`INSERT OR IGNORE` skips duplicates).
     ///
     /// `trades` ordering is unimportant. All inserts run in a single
-    /// transaction for atomicity and write batching.
+    /// transaction for atomicity and write batching. Returns the number of rows
+    /// actually inserted, only after commit; duplicates contribute zero.
     pub fn insert_new(
         &mut self,
         wallet_hex: &str,
         trades: Vec<RawTrade>,
-    ) -> Result<(), BootstrapError> {
+    ) -> Result<u64, BootstrapError> {
         if trades.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let tx = self.conn.transaction()?;
+        let mut inserted = 0_u64;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO trades \
@@ -1020,7 +1025,7 @@ impl WalletCache {
             for t in &trades {
                 let contracts_i64 =
                     i64::try_from(t.contracts.0).map_err(|_| BootstrapError::Internal)?;
-                stmt.execute(params![
+                let affected = stmt.execute(params![
                     t.source_trade_id.0,
                     wallet_hex,
                     t.market_id.0.0,
@@ -1030,10 +1035,11 @@ impl WalletCache {
                     contracts_i64,
                     t.timestamp.0.unix_timestamp(),
                 ])?;
+                inserted += u64::try_from(affected).map_err(|_| BootstrapError::Internal)?;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(inserted)
     }
 
     /// Return all `source_trade_id`s known for `wallet_hex`, newest-first.
@@ -3923,6 +3929,38 @@ impl WalletCache {
         Ok(affected)
     }
 
+    /// Quarantine incomplete schema-one history before any incremental trade write.
+    /// Legacy fetch callers can supply wallets absent from the pile; create their
+    /// default row too so retained partial history cannot become rankable.
+    pub(crate) fn begin_backfill(&mut self, wallet_hex: &str) -> Result<(), BootstrapError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO wallets (wallet_hex, backfill_partial) VALUES (?1, 1) \
+             ON CONFLICT(wallet_hex) DO UPDATE SET backfill_partial = 1",
+            params![wallet_hex],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clear the partial marker on completion, optionally stamping in the same
+    /// transaction. A failed finalization leaves the marker and old stamp intact.
+    pub(crate) fn finish_backfill(
+        &mut self,
+        wallet_hex: &str,
+        stamp: Option<i64>,
+    ) -> Result<(), BootstrapError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE wallets SET backfill_partial = 0, \
+             last_polymarket_fetch_at = COALESCE(?2, last_polymarket_fetch_at) \
+             WHERE wallet_hex = ?1",
+            params![wallet_hex, stamp],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Set `last_polymarket_fetch_at = now_unix` for a single wallet.
     pub fn update_last_polymarket_fetch(
         &mut self,
@@ -5399,7 +5437,7 @@ mod tests {
             make_trade("0xtx2", wallet, 1_704_067_200),
             make_trade("0xtx1", wallet, 1_704_067_100),
         ];
-        cache.insert_new(&hex, trades).unwrap();
+        assert_eq!(cache.insert_new(&hex, trades).unwrap(), 2);
 
         assert_eq!(cache.trade_count(), 2);
         let ids = cache.known_trade_ids(&hex);
@@ -5422,10 +5460,87 @@ mod tests {
         let hex = wallet.to_string();
 
         let trades = vec![make_trade("0xtx1", wallet, 1_704_067_100)];
-        cache.insert_new(&hex, trades.clone()).unwrap();
-        cache.insert_new(&hex, trades).unwrap();
+        assert_eq!(cache.insert_new(&hex, trades.clone()).unwrap(), 1);
+        assert_eq!(cache.insert_new(&hex, trades).unwrap(), 0);
+        assert_eq!(
+            cache
+                .insert_new(
+                    &hex,
+                    vec![
+                        make_trade("0xnew", wallet, 1_704_067_101),
+                        make_trade("0xtx1", wallet, 1_704_067_100)
+                    ]
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(cache.insert_new(&hex, vec![]).unwrap(), 0);
 
-        assert_eq!(cache.trade_count(), 1, "duplicate must not be stored twice");
+        assert_eq!(cache.trade_count(), 2, "duplicate must not be stored twice");
+    }
+
+    #[test]
+    fn insert_new_rollback_returns_error_and_no_partial_batch() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let wallet = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let first = make_trade("ok", wallet, 100);
+        let mut bad = make_trade("overflow", wallet, 101);
+        bad.contracts = ContractQty(u64::MAX);
+        assert!(
+            cache
+                .insert_new(&wallet.to_string(), vec![first, bad])
+                .is_err()
+        );
+        assert_eq!(cache.trade_count(), 0);
+    }
+
+    #[test]
+    fn backfill_marker_is_durable_before_and_after_optional_stamp_finalization() {
+        for stamp in [None, Some(2000)] {
+            for old_stamp in [None, Some(1000)] {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("marker.db");
+                let wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+                let mut cache = WalletCache::open(&path).unwrap();
+                cache.begin_backfill(wallet).unwrap();
+                if let Some(old) = old_stamp {
+                    cache.update_last_polymarket_fetch(wallet, old).unwrap();
+                }
+                drop(cache);
+                let mut cache = WalletCache::open(&path).unwrap();
+                let read = |cache: &WalletCache| -> (i64, Option<i64>) {
+                    cache.conn.query_row("SELECT backfill_partial, last_polymarket_fetch_at FROM wallets WHERE wallet_hex = ?1",
+                        [wallet], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+                };
+                assert_eq!(read(&cache), (1, old_stamp));
+                cache.finish_backfill(wallet, stamp).unwrap();
+                drop(cache);
+                let cache = WalletCache::open(&path).unwrap();
+                assert_eq!(read(&cache), (0, stamp.or(old_stamp)));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_schema_gains_default_zero_marker_idempotently() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.db");
+        let cache = WalletCache::open(&path).unwrap();
+        cache.conn.execute_batch("ALTER TABLE wallets DROP COLUMN backfill_partial; INSERT INTO wallets (wallet_hex) VALUES ('legacy');").unwrap();
+        drop(cache);
+        for _ in 0..2 {
+            let cache = WalletCache::open(&path).unwrap();
+            let marker: i64 = cache
+                .conn
+                .query_row(
+                    "SELECT backfill_partial FROM wallets WHERE wallet_hex = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(marker, 0);
+        }
     }
 
     #[test]
