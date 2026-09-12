@@ -92,7 +92,11 @@ jobs:
 
       - name: Python drift-guard tests
         run: |
-          bash -n scripts/deploy/*.sh scripts/paper_reset/*.sh
+          # `bash -n a.sh b.sh` checks only the FIRST file and treats the rest as positional
+          # arguments, so a syntax error in any later script passed silently.
+          for script in scripts/deploy/*.sh scripts/paper_reset/*.sh; do
+            bash -n "$script" || exit 1
+          done
           bash scripts/deploy/rehearsal545.sh --dry-run \
             0000000000000000000000000000000000000000 >/dev/null
           python3 scripts/check_sql_unfiltered_dml.py

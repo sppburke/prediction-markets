@@ -425,6 +425,7 @@ src=sqlite3.connect("file:"+source+"?mode=ro", uri=True)
 dst=sqlite3.connect(tmp)
 try:
     src.backup(dst)
+    dst.execute("pragma cache_size=-262144")
     answer=dst.execute("pragma integrity_check").fetchone()
     if answer != ("ok",): raise SystemExit("SQLite backup integrity check failed")
     dst.commit()
@@ -445,6 +446,7 @@ tmp=destination+".restore.%d" % os.getpid()
 shutil.copyfile(source,tmp)
 db=sqlite3.connect("file:"+tmp+"?mode=ro",uri=True)
 try:
+    db.execute("pragma cache_size=-262144")
     if db.execute("pragma integrity_check").fetchone() != ("ok",): raise SystemExit("restored SQLite integrity check failed")
 finally: db.close()
 with open(tmp,"rb") as handle: os.fsync(handle.fileno())
@@ -511,6 +513,16 @@ SQL
 
 verify_guarded_log_identities() {
   python3 -c 'import hashlib,json,os,sys
+def digest(path,limit=None):
+    handle=open(path,"rb"); total=0; hasher=hashlib.sha256()
+    try:
+        while limit is None or total < limit:
+            want=1<<20 if limit is None else min(1<<20,limit-total)
+            chunk=handle.read(want)
+            if not chunk: break
+            hasher.update(chunk); total+=len(chunk); chunk=None
+    finally: handle.close()
+    return hasher.hexdigest(),total
 manifest=json.load(open(sys.argv[1],encoding="utf-8"))
 logs=manifest.get("guarded_logs")
 if not isinstance(logs,dict) or set(logs) != {"paper","source","live"}: raise SystemExit(1)
@@ -518,12 +530,22 @@ for name in ("paper","source","live"):
     row=logs[name]; path=row.get("path")
     if not isinstance(path,str) or not os.path.isfile(path): raise SystemExit(1)
     if os.path.getsize(path) != row.get("bytes"): raise SystemExit(1)
-    if hashlib.sha256(open(path,"rb").read()).hexdigest() != row.get("sha256"): raise SystemExit(1)' \
+    if digest(path)[0] != row.get("sha256"): raise SystemExit(1)' \
     "$MANIFEST"
 }
 
 verify_guarded_log_prefixes() {
   python3 -c 'import hashlib,json,os,sys
+def digest(path,limit=None):
+    handle=open(path,"rb"); total=0; hasher=hashlib.sha256()
+    try:
+        while limit is None or total < limit:
+            want=1<<20 if limit is None else min(1<<20,limit-total)
+            chunk=handle.read(want)
+            if not chunk: break
+            hasher.update(chunk); total+=len(chunk); chunk=None
+    finally: handle.close()
+    return hasher.hexdigest(),total
 manifest=json.load(open(sys.argv[1],encoding="utf-8"))
 logs=manifest.get("guarded_logs")
 if not isinstance(logs,dict) or set(logs) != {"paper","source","live"}: raise SystemExit(1)
@@ -531,8 +553,8 @@ for name in ("paper","source","live"):
     row=logs[name]; path=row.get("path"); size=row.get("bytes")
     if not isinstance(path,str) or not isinstance(size,int) or size < 0: raise SystemExit(1)
     if not os.path.isfile(path) or os.path.getsize(path) < size: raise SystemExit(1)
-    with open(path,"rb") as handle: prefix=handle.read(size)
-    if len(prefix) != size or hashlib.sha256(prefix).hexdigest() != row.get("sha256"): raise SystemExit(1)' \
+    actual,consumed=digest(path,size)
+    if consumed != size or actual != row.get("sha256"): raise SystemExit(1)' \
     "$MANIFEST"
 }
 
@@ -868,9 +890,19 @@ case "$state" in
     backup_sha=$(sha256_file "$backup_path")
     census=$(remote_paper_census)
     guarded_paper_state_sha=$(sha256_file "$paper_state")
-    patch=$(python3 -c 'import json,os,sys
+    patch=$(python3 -c 'import hashlib,json,os,sys
+def digest(path,limit=None):
+    handle=open(path,"rb"); total=0; hasher=hashlib.sha256()
+    try:
+        while limit is None or total < limit:
+            want=1<<20 if limit is None else min(1<<20,limit-total)
+            chunk=handle.read(want)
+            if not chunk: break
+            hasher.update(chunk); total+=len(chunk); chunk=None
+    finally: handle.close()
+    return hasher.hexdigest(),total
 backup,sha,guarded_state_sha,census,paper,source,live=sys.argv[1:]
-logs={name:{"path":path,"sha256":__import__("hashlib").sha256(open(path,"rb").read()).hexdigest(),"bytes":os.path.getsize(path)} for name,path in (("paper",paper),("source",source),("live",live))}
+logs={name:{"path":path,"sha256":digest(path)[0],"bytes":os.path.getsize(path)} for name,path in (("paper",paper),("source",source),("live",live))}
 print(json.dumps({"backup":{"path":backup,"sha256":sha},"guarded_paper_state_sha256":guarded_state_sha,"remote_census":json.loads(census),"guarded_logs":logs},sort_keys=True,separators=(",",":")))' \
       "$backup_path" "$backup_sha" "$guarded_paper_state_sha" "$census" "$paper_log" "$source_log" "$live_journal")
     if [[ "$(manifest_get preparation)" == "" ]]; then
