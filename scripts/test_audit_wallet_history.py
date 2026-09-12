@@ -50,6 +50,27 @@ class AuditHistoryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             audit.parse_page(json.dumps([{**row(), "size": "1e-29"}]))
 
+    def test_writer_lexicon_parity(self):
+        # A repeated field cannot be expressed with a dict literal, so this
+        # fixture is raw JSON. json.loads would silently keep "0.5".
+        duplicate = ('[{"transactionHash":"t","conditionId":"market","side":"BUY",'
+                     '"size":"1","price":"malformed","price":"0.5",'
+                     '"timestamp":1000,"outcomeIndex":0}]')
+        with self.assertRaises(ValueError):
+            audit.parse_page(duplicate)
+        # Every one of these is accepted by Python's Decimal and rejected by the
+        # writer, which fails the whole page: surrounding whitespace, a leading
+        # underscore, Unicode digits, and a separator inside the exponent.
+        for value in [" 0 ", " 0", "0 ", "\t0", "0\n", " 1e2 ", "_1",
+                      "\u0663", "\uff11", "1e1_0"]:
+            for field in ("size", "price"):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    audit.parse_page(json.dumps([{**row(), field: value}]))
+        # Forms the writer does accept must keep parsing.
+        for value in ["1_0", ".5", "1.", "+1", "-1", "1e2", "1E2", "1e+2", "1.5e3"]:
+            with self.subTest(value=value):
+                self.assertEqual(len(audit.parse_page(json.dumps([{**row(), "size": value}]))), 1)
+
     def test_collisions_are_reported_before_id_deduplication(self):
         venue = converted([row(), {**row(), "outcomeIndex": 1}, row()])
         result = audit.compare(venue, venue[:1])

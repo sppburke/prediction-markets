@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 import json
 import math
+import re
 import sqlite3
 import sys
 from urllib.parse import urlencode
@@ -16,6 +17,27 @@ MAX_OFFSET = 5000
 # time::OffsetDateTime without large-dates, matching the schema-one converter.
 MIN_TIMESTAMP = -377705116800
 MAX_TIMESTAMP = 253402300799
+# The lexicon rust_decimal 1.41 accepts via `Decimal::from_str` / `from_scientific`
+# (src/str.rs:243-245 signs and `_` only after a digit; :325-326 reject a leading
+# `_` and any other byte). It is ASCII-only and has no surrounding whitespace and
+# no separator inside the exponent. Python's `Decimal` accepts all four of those,
+# so an unchecked string makes this audit pass pages the writer fails whole.
+_DECIMAL_MANTISSA = r"[+-]?(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9][0-9_]*)"
+_DECIMAL_LEXICON = re.compile(r"\A(?:" + _DECIMAL_MANTISSA + r")(?:[eE][+-]?[0-9]+)?\Z")
+
+
+def _no_duplicate_fields(pairs):
+    """serde's derived `Deserialize` rejects a repeated field
+    (serde_derive/src/de/struct_.rs:269) and the writer deserializes the whole
+    array at once, so one repeat fails the entire page. `json.loads` would
+    instead keep the last value and hide the difference.
+    """
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate DTO field: {key!r}")
+        seen.add(key)
+    return dict(pairs)
 
 
 def timestamp_seconds(timestamp):
@@ -30,6 +52,8 @@ def _integer(value, minimum, maximum, name):
 
 def _decimal(value):
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"invalid DTO decimal: {value!r}")
+    if isinstance(value, str) and not _DECIMAL_LEXICON.match(value):
         raise ValueError(f"invalid DTO decimal: {value!r}")
     # serde_json visits fractional numbers (and integers outside i64/u64) as
     # f64; rust_decimal 1.41 then parses the float's decimal display. Strings
@@ -72,7 +96,7 @@ def _decimal(value):
 
 def parse_page(payload):
     """Validate the entire DTO array before performing any row conversions."""
-    raw = json.loads(payload)
+    raw = json.loads(payload, object_pairs_hook=_no_duplicate_fields)
     if not isinstance(raw, list):
         raise ValueError("activity response is not an array")
     validated = []
