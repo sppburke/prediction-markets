@@ -37,7 +37,7 @@ use pe_source_polymarket_public::{
     CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest, ClobCoveragePage, FixtureFetcher,
     PageFetcher, parse_activity_response,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
@@ -316,7 +316,46 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     let second = migrate_cache_v2(&side, &manifest_path).unwrap();
     assert!(second.resumed);
 
-    let cache = WalletCache::open(&side).unwrap();
+    let cache = WalletCache::open_configured(&pe_bootstrap::BootstrapConfig {
+        cache_path: side.clone(),
+        cache_page_cache_mib: 7,
+        cache_mmap_mib: 4096,
+        ..pe_bootstrap::BootstrapConfig::default()
+    })
+    .unwrap();
+    let conn = cache.raw_conn_for_test();
+    assert_eq!(
+        conn.pragma_query_value(None, "cache_size", |row| row.get::<_, i32>(0))
+            .unwrap(),
+        -7 * 1024
+    );
+    let effective_mmap: i64 = conn
+        .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+        .optional()
+        .unwrap()
+        .unwrap_or(0);
+    assert!((0..=4096 * (1_i64 << 20)).contains(&effective_mmap));
+    let mmap_disabled: bool = conn
+        .query_row(
+            "SELECT sqlite_compileoption_used('MAX_MMAP_SIZE=0')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !mmap_disabled {
+        assert!(effective_mmap > 0);
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' \
+             AND name IN ('trades', 'market_resolutions', 'source_cursor')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0,
+        "configured v2 open must not recreate legacy owners"
+    );
     assert_eq!(cache.schema_version().unwrap(), 2);
     assert!(
         cache.activity_aggregates_v2().unwrap().is_empty(),

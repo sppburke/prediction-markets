@@ -27,6 +27,8 @@ fn run_cli_with_env(
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"));
     command
+        .env_clear()
+        .current_dir(root)
         .args(args)
         .env("PE_BOOTSTRAP_OUTPUT", root.join("watchlist.json"))
         .env("PE_BOOTSTRAP_CACHE_PATH", cache_path)
@@ -266,6 +268,101 @@ fn every_locking_cli_entry_refuses_before_creating_the_cache() {
         !cache_path.exists(),
         "no-argument all created the cache before lock acquisition"
     );
+}
+
+#[test]
+fn invalid_cache_tuning_refuses_before_any_opener_creates_database_or_lock() {
+    let openers: [&[&str]; 3] = [
+        &["clear-infra-exclusion"],
+        &[],
+        &["cache-populate-payout-v2"],
+    ];
+    for args in openers {
+        for (key, value, setting) in [
+            (
+                "PE_BOOTSTRAP_CACHE_PAGE_CACHE_MIB",
+                "0".to_owned(),
+                "cache_page_cache_mib",
+            ),
+            (
+                "PE_BOOTSTRAP_CACHE_PAGE_CACHE_MIB",
+                (i32::MAX / 1024 + 1).to_string(),
+                "cache_page_cache_mib",
+            ),
+            (
+                "PE_BOOTSTRAP_CACHE_MMAP_MIB",
+                (i64::MAX / (1 << 20) + 1).to_string(),
+                "cache_mmap_mib",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cache_path = dir.path().join("never-opened.db");
+            let lock_path = pe_bootstrap::lock::lock_path_for(&cache_path);
+            assert!(!cache_path.exists() && !lock_path.exists());
+            let output = run_cli_with_env(dir.path(), &cache_path, args, &[(key, &value)]);
+            assert_eq!(output.status.code(), Some(1), "args={args:?}");
+            let logs = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                logs.contains(&format!("invalid: {setting} must be")),
+                "{logs}"
+            );
+            assert!(!cache_path.exists(), "args={args:?}: created database");
+            assert!(!lock_path.exists(), "args={args:?}: created lock");
+        }
+    }
+}
+
+#[test]
+fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
+    let openers: [&[&str]; 3] = [
+        &["clear-infra-exclusion"],
+        &[],
+        &["cache-populate-payout-v2"],
+    ];
+    for args in openers {
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.db");
+        let legacy_path = dir.path().join("wallet_set.json");
+        // Stop no-argument `all` in the local legacy reader after the open,
+        // before wallet discovery can perform any network I/O. The other two
+        // commands stop at their missing-wallet / v2-schema checks.
+        std::fs::write(&legacy_path, "invalid fixture JSON").unwrap();
+        let output = run_cli_with_env(
+            dir.path(),
+            &cache_path,
+            args,
+            &[
+                ("RUST_LOG", "info"),
+                ("PE_CACHE_PAGE_CACHE_MIB", "1"),
+                ("PE_CACHE_MMAP_MIB", "0"),
+                ("PE_BOOTSTRAP_CACHE_PAGE_CACHE_MIB", "3"),
+                ("PE_BOOTSTRAP_CACHE_MMAP_MIB", "2"),
+                (
+                    "PE_BOOTSTRAP_WALLET_SET_PATH",
+                    legacy_path.to_str().unwrap(),
+                ),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let tuning: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry["fields"]["message"] == "wallet cache: connection tuning applied")
+            .collect();
+        assert_eq!(tuning.len(), 1, "args={args:?}: {stdout}");
+        let fields = &tuning[0]["fields"];
+        assert_eq!(fields["requested_cache_kib"], -3 * 1024);
+        assert_eq!(fields["effective_cache_kib"], -3 * 1024);
+        assert_eq!(fields["requested_mmap_bytes"], 2 * (1 << 20));
+        let effective_mmap = fields["effective_mmap_bytes"].as_i64().unwrap();
+        assert!((0..=2 * (1 << 20)).contains(&effective_mmap));
+        assert!(cache_path.exists());
+    }
 }
 
 #[test]

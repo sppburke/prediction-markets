@@ -36,7 +36,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
-use crate::error::BootstrapError;
+use crate::{
+    config::{BootstrapConfig, CacheTuning},
+    error::BootstrapError,
+};
 
 /// Legacy wallet-cache generation understood by the pre-#544 trade readers.
 pub const CACHE_SCHEMA_VERSION_V1: i64 = 1;
@@ -90,11 +93,10 @@ pub const REQUIRED_TRADES_INDEXES: [&str; 3] = [
     "idx_trades_buy_market_outcome_wallet_ts",
 ];
 
+const WRITABLE_PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;";
+
 const SCHEMA: &str = concatcp!(
     "
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-
 CREATE TABLE IF NOT EXISTS trades (
     source_trade_id TEXT    PRIMARY KEY NOT NULL,
     wallet_hex      TEXT    NOT NULL,
@@ -761,8 +763,19 @@ pub struct StoredActivityAggregateV2 {
 }
 
 impl WalletCache {
-    /// Open or create the SQLite database at `path`. Runs schema migrations.
+    /// Open or create the SQLite database at `path` with the bootstrap defaults.
+    /// Runs schema migrations. Callers with operator config use [`Self::open_configured`].
     pub fn open(path: &Path) -> Result<Self, BootstrapError> {
+        Self::open_with_tuning(path, &BootstrapConfig::default().cache_tuning()?)
+    }
+
+    /// Open with operator-configured connection tuning. Validation precedes all
+    /// SQLite I/O, including for configs constructed without the loader.
+    pub fn open_configured(config: &BootstrapConfig) -> Result<Self, BootstrapError> {
+        Self::open_with_tuning(&config.cache_path, &config.cache_tuning()?)
+    }
+
+    fn open_with_tuning(path: &Path, tuning: &CacheTuning) -> Result<Self, BootstrapError> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -773,7 +786,8 @@ impl WalletCache {
             // `market_resolutions`, or `source_cursor` table. Running the v1
             // CREATE-on-open batch would recreate generation-blind owners and
             // defeat sealing, so v2 opens only the already-installed schema.
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+            conn.execute_batch(WRITABLE_PRAGMAS)?;
+            Self::apply_connection_tuning(&conn, tuning)?;
             return Ok(Self { conn });
         }
         if found != 0 && found != CACHE_SCHEMA_VERSION_V1 {
@@ -790,6 +804,8 @@ impl WalletCache {
         // holding this pragma converts it (reclaim_free_pages' mode-0 path); an
         // already-incremental db is a no-op. Never inside a transaction.
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+        conn.execute_batch(WRITABLE_PRAGMAS)?;
+        Self::apply_connection_tuning(&conn, tuning)?;
         conn.execute_batch(SCHEMA)?;
         // Migration (#326 PR4): drop the operator/funder/delta tables. They fed
         // only the deleted operator-graph machinery; dropping reclaims the bulk of
@@ -869,6 +885,30 @@ impl WalletCache {
         }
 
         Ok(Self { conn })
+    }
+
+    fn apply_connection_tuning(
+        conn: &Connection,
+        tuning: &CacheTuning,
+    ) -> Result<(), BootstrapError> {
+        conn.pragma_update(None, "cache_size", tuning.cache_kib)?;
+        conn.pragma_update(None, "mmap_size", tuning.mmap_bytes)?;
+        let effective_cache_kib: i32 =
+            conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
+        // A VFS without mmap support can omit the result row; disabled builds
+        // return zero. SQLite may also clamp the ceiling. None is a config error.
+        let effective_mmap_bytes: i64 = conn
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .optional()?
+            .unwrap_or(0);
+        tracing::info!(
+            requested_cache_kib = tuning.cache_kib,
+            effective_cache_kib,
+            requested_mmap_bytes = tuning.mmap_bytes,
+            effective_mmap_bytes,
+            "wallet cache: connection tuning applied"
+        );
+        Ok(())
     }
 
     /// Return the on-disk cache schema generation.
@@ -5371,10 +5411,53 @@ mod tests {
         WalletCache::open(&dir.path().join("cache.db")).unwrap()
     }
 
+    fn tmp_cache_with_tuning(dir: &TempDir, cache_mib: u64, mmap_mib: u64) -> WalletCache {
+        WalletCache::open_configured(&BootstrapConfig {
+            cache_path: dir.path().join("cache.db"),
+            cache_page_cache_mib: cache_mib,
+            cache_mmap_mib: mmap_mib,
+            ..BootstrapConfig::default()
+        })
+        .unwrap()
+    }
+
+    fn assert_connection_tuning(cache: &WalletCache, cache_kib: i32, mmap_bytes: i64) {
+        let conn = cache.raw_conn_for_test();
+        let effective_cache: i32 = conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap();
+        assert_eq!(effective_cache, cache_kib);
+        let effective_mmap: i64 = conn
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .optional()
+            .unwrap()
+            .unwrap_or(0);
+        assert!((0..=mmap_bytes).contains(&effective_mmap));
+        let mmap_disabled: bool = conn
+            .query_row(
+                "SELECT sqlite_compileoption_used('MAX_MMAP_SIZE=0')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if mmap_bytes > 0 && !mmap_disabled {
+            assert!(effective_mmap > 0);
+        }
+        let journal: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i32 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1);
+    }
+
     #[test]
     fn fresh_cache_is_empty() {
         let dir = TempDir::new().unwrap();
         let cache = tmp_cache(&dir);
+        assert_connection_tuning(&cache, -4096 * 1024, 2047 * (1 << 20));
         assert_eq!(cache.trade_count(), 0);
         assert!(
             cache
@@ -5431,18 +5514,38 @@ mod tests {
     #[test]
     fn round_trip_through_disk() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("cache.db");
         let wallet = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let hex = wallet.to_string();
         {
-            let mut cache = WalletCache::open(&path).unwrap();
+            // Above the bundled SQLite mmap cap: clamping must not fail the open.
+            let mut cache = tmp_cache_with_tuning(&dir, 8, 4096);
+            assert_connection_tuning(&cache, -8 * 1024, 4096 * (1 << 20));
             cache
                 .insert_new(&hex, vec![make_trade("0xtx1", wallet, 1_704_067_100)])
                 .unwrap();
         }
-        let cache2 = WalletCache::open(&path).unwrap();
+        let cache2 = tmp_cache_with_tuning(&dir, 16, 0);
+        assert_connection_tuning(&cache2, -16 * 1024, 0);
         assert_eq!(cache2.trade_count(), 1);
-        assert_eq!(cache2.trades_for(&hex).len(), 1);
+        assert_eq!(
+            cache2.trades_for(&hex)[0].source_trade_id,
+            SourceTradeId("0xtx1".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_connection_tuning_never_creates_database() {
+        let dir = TempDir::new().unwrap();
+        let config = BootstrapConfig {
+            cache_path: dir.path().join("cache.db"),
+            cache_page_cache_mib: 0,
+            ..BootstrapConfig::default()
+        };
+        assert!(matches!(
+            WalletCache::open_configured(&config),
+            Err(BootstrapError::Invalid { .. })
+        ));
+        assert!(!config.cache_path.exists());
     }
 
     #[test]
