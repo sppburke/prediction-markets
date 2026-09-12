@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Writer/auditor parity and fail-closed acquisition scenarios for #608/#609."""
 import json
+from decimal import Decimal
 import sqlite3
 import tempfile
 import unittest
@@ -110,7 +111,7 @@ class AuditHistoryTest(unittest.TestCase):
         """
         corpus = (Path(__file__).resolve().parent.parent
                   / "crates/bootstrap/tests/fixtures/dto_parity.jsonl")
-        checked = accepted = 0
+        checked = accepted = valued = 0
         for line in corpus.read_text(encoding="utf-8").splitlines():
             if not line.strip() or line.startswith("#"):
                 continue
@@ -122,12 +123,29 @@ class AuditHistoryTest(unittest.TestCase):
                 ours = False
             with self.subTest(case=record["name"]):
                 self.assertEqual(ours, record["writer_accepts"], record["page"])
+            # Acceptance parity is not enough: the two decoders can agree a page
+            # is valid and still normalise it differently, which would let the
+            # auditor drop a row the writer kept and report history complete
+            # without it. Compare the decoded decimals numerically, since the
+            # two render the same value differently (150 vs 1.5E+2).
+            expected = record.get("writer_values")
+            if ours and expected:
+                rows = audit.parse_page(record["page"])
+                self.assertEqual(len(rows), len(expected), record["name"])
+                for row, want in zip(rows, expected):
+                    with self.subTest(case=record["name"], field="size"):
+                        self.assertEqual(row["size"], Decimal(want["size"]))
+                    with self.subTest(case=record["name"], field="price"):
+                        self.assertEqual(row["price"], Decimal(want["price"]))
+                valued += 1
             checked += 1
             accepted += bool(record["writer_accepts"])
         # Guard against an emptied or one-sided corpus silently passing.
         self.assertGreaterEqual(checked, 100)
         self.assertGreaterEqual(accepted, 20)
         self.assertGreaterEqual(checked - accepted, 20)
+        # Guard against the value half silently covering nothing.
+        self.assertGreaterEqual(valued, 20, "corpus lost its normalized-value expectations")
 
     def test_collisions_are_reported_before_id_deduplication(self):
         venue = converted([row(), {**row(), "outcomeIndex": 1}, row()])

@@ -3872,9 +3872,11 @@ impl WalletCache {
     }
 
     /// Test-only (#538): mutable raw connection for in-crate tests (interrupt
-    /// handle acquisition, fixture DDL). Mirrors `raw_conn_for_test`.
-    #[cfg(test)]
-    pub(crate) fn raw_conn_mut_for_test(&mut self) -> &mut Connection {
+    /// handle acquisition, fixture DDL). Mirrors `raw_conn_for_test`, including
+    /// its gate — scenario tests need it for rusqlite's `trace` hook, which
+    /// takes `&mut Connection`.
+    #[cfg(any(test, feature = "scenario"))]
+    pub fn raw_conn_mut_for_test(&mut self) -> &mut Connection {
         &mut self.conn
     }
 
@@ -4437,14 +4439,6 @@ impl WalletCache {
     #[cfg(any(test, feature = "scenario"))]
     pub fn raw_conn_for_test(&self) -> &Connection {
         &self.conn
-    }
-
-    /// Mutable sibling of [`Self::raw_conn_for_test`], for helpers that need
-    /// `&mut Connection` (rusqlite's `trace` hook). Same gate, so neither adds
-    /// production surface.
-    #[cfg(any(test, feature = "scenario"))]
-    pub fn raw_conn_mut_for_test(&mut self) -> &mut Connection {
-        &mut self.conn
     }
 
     #[cfg(any(test, feature = "scenario"))]

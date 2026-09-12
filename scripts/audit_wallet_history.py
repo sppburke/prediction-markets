@@ -96,6 +96,7 @@ def _decimal(value):
         scale = min(28, max(0, -result.as_tuple().exponent))
         with localcontext() as context:
             context.prec = 96
+            unrounded = result
             while True:
                 rounded = result.quantize(Decimal((0, (1,), -scale)), rounding=ROUND_HALF_UP)
                 if rounded.copy_abs().scaleb(scale) <= 2**96 - 1:
@@ -104,6 +105,18 @@ def _decimal(value):
                 if scale == 0:
                     raise ValueError(f"invalid DTO decimal: {value!r}")
                 scale -= 1
+            # rust_decimal quirk the writer inherits: serde tries `from_str`
+            # before `from_scientific`, and `parse_str_radix_10` stops at its
+            # rounding boundary instead of erroring on the `e`. So when the
+            # mantissa needed rounding, `from_str` succeeds and the exponent is
+            # SILENTLY DISCARDED; only an unrounded mantissa reaches
+            # `from_scientific` and has its exponent applied. Verified against
+            # the pinned 1.41: "0.5…1e1" -> 0.5 (rounded, exponent dropped) but
+            # "0.5…0e1" -> 5 (exact, exponent applied). Mirroring this is the
+            # point of the auditor; diverging would let it reject a row the
+            # writer accepts and certify history as complete without it.
+            if separator and result != unrounded:
+                separator = ""
             if separator:
                 shift = int(exponent)
                 if abs(shift) > 28 or shift < 0 and scale - shift > 28:
