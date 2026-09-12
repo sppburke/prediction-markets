@@ -10914,30 +10914,39 @@ mod tests {
         assert_eq!(sequence, EventSeq(2));
         let mut bytes = fs::read(&paths.source_log).unwrap();
         let frame_start = usize::try_from(offset).unwrap();
-        let corrupt_len = 67_108_864_u32;
-        assert!(bytes.len() < usize::try_from(corrupt_len).unwrap());
-        bytes[frame_start..frame_start + 4].copy_from_slice(&corrupt_len.to_le_bytes());
-        fs::write(&paths.source_log, &bytes).unwrap();
-        let journal_before = fs::read(&paths.live_journal).unwrap();
+        // The oversized LEN runs the body read short; the four (remaining - 4 - k) values read the
+        // body completely and run short by k bytes on the CRC. Every one must classify as
+        // corruption, never as a repairable partial tail, and must leave both logs untouched.
+        let pristine = bytes.clone();
+        let remaining = bytes.len() - frame_start - 4;
+        let mut corrupt_lens = vec![67_108_864_u32];
+        corrupt_lens.extend((0..4_usize).map(|k| u32::try_from(remaining - 4 - k).unwrap()));
+        for corrupt_len in corrupt_lens {
+            let mut bytes = pristine.clone();
+            assert!(bytes.len() < 67_108_864);
+            bytes[frame_start..frame_start + 4].copy_from_slice(&corrupt_len.to_le_bytes());
+            fs::write(&paths.source_log, &bytes).unwrap();
+            let journal_before = fs::read(&paths.live_journal).unwrap();
 
-        assert!(matches!(
-            verify_live_preparation_posture(
-                &paths.live_journal,
-                &paths.source_log,
-                &config.status_path,
-            ),
-            Err(QualificationError::EventLog(pe_event_log::LogError::CrcMismatch {
-                at_seq: EventSeq(2), byte_offset,
-            })) if byte_offset == offset
-        ));
-        assert!(matches!(
-            rollback_check_financial_era(&manifest, &config),
-            Err(QualificationError::EventLog(pe_event_log::LogError::CrcMismatch {
-                at_seq: EventSeq(2), byte_offset,
-            })) if byte_offset == offset
-        ));
-        assert_eq!(fs::read(&paths.source_log).unwrap(), bytes);
-        assert_eq!(fs::read(&paths.live_journal).unwrap(), journal_before);
+            assert!(matches!(
+                verify_live_preparation_posture(
+                    &paths.live_journal,
+                    &paths.source_log,
+                    &config.status_path,
+                ),
+                Err(QualificationError::EventLog(pe_event_log::LogError::CrcMismatch {
+                    at_seq: EventSeq(2), byte_offset,
+                })) if byte_offset == offset
+            ));
+            assert!(matches!(
+                rollback_check_financial_era(&manifest, &config),
+                Err(QualificationError::EventLog(pe_event_log::LogError::CrcMismatch {
+                    at_seq: EventSeq(2), byte_offset,
+                })) if byte_offset == offset
+            ));
+            assert_eq!(fs::read(&paths.source_log).unwrap(), bytes);
+            assert_eq!(fs::read(&paths.live_journal).unwrap(), journal_before);
+        }
     }
 
     #[test]

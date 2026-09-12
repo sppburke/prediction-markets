@@ -102,7 +102,18 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
     }
 
     let mut crc_buf = [0u8; 4];
-    read_exact_frame(r, &mut crc_buf, byte_offset)?;
+    if let Err(error) = read_exact_frame(r, &mut crc_buf, byte_offset) {
+        // A LEN that swallowed the real CRC and part of the next frame reads its body completely
+        // and only runs short here; the body then holds a complete zstd frame plus trailing
+        // bytes. A genuine partial write with a complete body and a short CRC holds exactly one
+        // frame and stays an incomplete tail.
+        if matches!(error, FrameReadError::Truncated { .. })
+            && complete_zstd_frame_has_trailing_bytes(&compressed)
+        {
+            return Err(FrameReadError::CrcMismatch { byte_offset });
+        }
+        return Err(error);
+    }
 
     let stored_crc = u32::from_le_bytes(crc_buf);
     let computed_crc = crc32fast::hash(&compressed);
