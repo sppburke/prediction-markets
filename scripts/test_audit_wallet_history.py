@@ -53,11 +53,24 @@ class AuditHistoryTest(unittest.TestCase):
     def test_writer_lexicon_parity(self):
         # A repeated field cannot be expressed with a dict literal, so this
         # fixture is raw JSON. json.loads would silently keep "0.5".
-        duplicate = ('[{"transactionHash":"t","conditionId":"market","side":"BUY",'
-                     '"size":"1","price":"malformed","price":"0.5",'
-                     '"timestamp":1000,"outcomeIndex":0}]')
+        valid = ('"transactionHash":"t","conditionId":"market","side":"BUY","size":"1",'
+                 '"price":"0.5","timestamp":1000,"outcomeIndex":0')
+        # A repeated field cannot be expressed with a dict literal, so these are
+        # raw JSON. json.loads would silently keep the last value.
         with self.assertRaises(ValueError):
-            audit.parse_page(duplicate)
+            audit.parse_page('[{"transactionHash":"t","conditionId":"market","side":"BUY",'
+                             '"size":"1","price":"malformed","price":"0.5",'
+                             '"timestamp":1000,"outcomeIndex":0}]')
+        # serde tracks repeats only for fields it knows; a repeated ignored field
+        # is consumed by IgnoredAny, so the writer accepts these pages.
+        for ignored in ['"title":"a","title":"b"', '"usdcSize":"1","usdcSize":"2"']:
+            with self.subTest(ignored=ignored):
+                self.assertEqual(len(audit.parse_page("[{" + valid + "," + ignored + "}]")), 1)
+        # serde_json has no NaN/Infinity literals and fails the whole page on one,
+        # even inside an ignored field. Python's json accepts all three.
+        for constant in ["NaN", "Infinity", "-Infinity"]:
+            with self.subTest(constant=constant), self.assertRaises(ValueError):
+                audit.parse_page("[{" + valid + ',"usdcSize":' + constant + "}]")
         # Every one of these is accepted by Python's Decimal and rejected by the
         # writer, which fails the whole page: surrounding whitespace, a leading
         # underscore, Unicode digits, and a separator inside the exponent.

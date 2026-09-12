@@ -26,18 +26,31 @@ _DECIMAL_MANTISSA = r"[+-]?(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9][0-9_]*)"
 _DECIMAL_LEXICON = re.compile(r"\A(?:" + _DECIMAL_MANTISSA + r")(?:[eE][+-]?[0-9]+)?\Z")
 
 
-def _no_duplicate_fields(pairs):
-    """serde's derived `Deserialize` rejects a repeated field
-    (serde_derive/src/de/struct_.rs:269) and the writer deserializes the whole
-    array at once, so one repeat fails the entire page. `json.loads` would
-    instead keep the last value and hide the difference.
+# The DTO fields serde knows, in the writer's camelCase spelling. serde tracks
+# repeats only for these; a repeated *ignored* field is consumed by IgnoredAny
+# and accepted, so checking every key would reject pages the writer takes.
+_DTO_FIELDS = frozenset(
+    ("transactionHash", "conditionId", "side", "size", "price", "timestamp", "outcomeIndex")
+)
+
+
+class _Object(dict):
+    """A decoded object that remembers its field names, repeats included."""
+
+    __slots__ = ("field_names",)
+
+
+def _object_pairs(pairs):
+    value = _Object(pairs)
+    value.field_names = [key for key, _ in pairs]
+    return value
+
+
+def _reject_json_constant(name):
+    """serde_json has no NaN/Infinity literals and fails the whole page on one,
+    even inside a field the DTO ignores. Python's json accepts all three.
     """
-    seen = set()
-    for key, _ in pairs:
-        if key in seen:
-            raise ValueError(f"duplicate DTO field: {key!r}")
-        seen.add(key)
-    return dict(pairs)
+    raise ValueError(f"invalid JSON constant: {name}")
 
 
 def timestamp_seconds(timestamp):
@@ -96,13 +109,20 @@ def _decimal(value):
 
 def parse_page(payload):
     """Validate the entire DTO array before performing any row conversions."""
-    raw = json.loads(payload, object_pairs_hook=_no_duplicate_fields)
+    raw = json.loads(payload, object_pairs_hook=_object_pairs,
+                     parse_constant=_reject_json_constant)
     if not isinstance(raw, list):
         raise ValueError("activity response is not an array")
     validated = []
     for row in raw:
         if not isinstance(row, dict):
             raise ValueError("activity DTO is not an object")
+        seen = set()
+        for name in getattr(row, "field_names", ()):
+            if name in _DTO_FIELDS:
+                if name in seen:
+                    raise ValueError(f"duplicate DTO field: {name!r}")
+                seen.add(name)
         for key in ("transactionHash", "conditionId", "side"):
             if not isinstance(row.get(key), str):
                 raise ValueError(f"invalid DTO {key}")
