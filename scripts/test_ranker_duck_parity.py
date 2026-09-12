@@ -270,6 +270,37 @@ class SnapshotQuarantineTest(unittest.TestCase):
             export(db, pq)
             self.assertEqual(ranker_duck.snapshot_partial_wallets(pq), set())
 
+    def test_completion_during_the_export_is_not_bound(self) -> None:
+        """A wallet completing between the trade export and the completeness
+        export would pair partial trades with a "complete" marker. DuckDB cannot
+        snapshot an attached SQLite database, so the exporter must detect the
+        change and publish no binding.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "cache.db"), str(Path(tmp) / "parquet")
+            self._cache_with_marker(db, partial=W("a"))
+
+            real = exp._export_table
+
+            def complete_mid_export(con, out_dir, tbl, row_group_size):
+                """Let the backfill finish right after the trades are written."""
+                n = real(con, out_dir, tbl, row_group_size)
+                if tbl == "trades":
+                    with sqlite3.connect(db) as conn:
+                        conn.execute("UPDATE wallets SET backfill_partial = 0")
+                return n
+
+            with mock.patch.object(exp, "_export_table", complete_mid_export):
+                export(db, pq)
+            self.assertFalse(
+                (Path(pq) / "schema_v1_export_manifest.json").exists(),
+                "bound a snapshot whose trades and markers describe different states")
+            with self.assertRaises(FileNotFoundError):
+                ranker_duck.snapshot_partial_wallets(pq)
+            # A quiet re-export binds normally.
+            export(db, pq)
+            self.assertTrue((Path(pq) / "schema_v1_export_manifest.json").exists())
+
     def test_snapshot_exclusion_precedes_the_wallet_limit(self) -> None:
         """The approved plan requires load -> exclude -> slice. Truncating first
         would let --limit-wallets spend its slots on wallets the snapshot filter

@@ -23,6 +23,7 @@ Run: `python3 scripts/export_trades_parquet.py --db data/wallet_cache.db --out-d
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sqlite3
 import sys
@@ -98,6 +99,39 @@ def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     size_gb = os.path.getsize(final) / 1e9
     log(f"{tbl}: {n:,} rows -> {final} ({size_gb:.2f} GB)")
     return int(n)
+
+
+def _completeness_witness(con) -> str | None:
+    """Digest of every wallet's completeness state, for detecting a source change
+    across the export.
+
+    DuckDB's transaction does NOT snapshot an attached SQLite database — a re-read
+    inside one sees an external commit — so the two exports cannot be made atomic
+    that way. Instead we prove after the fact that nothing moved: `begin_walk`
+    (cache.rs) commits `backfill_partial = 1` before it writes any row, so a walk
+    that touched trades during the export must have changed this digest. The
+    frontier and floor are included so a walk that both started and finished
+    inside the window, returning the marker to its old value, still shows up.
+    """
+    if not _table_exists(con, "wallets"):
+        return None
+    columns = []
+    for name in ("backfill_partial", "forward_frontier_unix", "backward_floor_unix"):
+        try:
+            con.execute(f"SELECT {name} FROM src.wallets LIMIT 0;")
+        except Exception:  # noqa: BLE001 — column absent on an older cache
+            continue
+        columns.append(name)
+    if "backfill_partial" not in columns:
+        return None
+    projection = ", ".join(f"COALESCE(CAST({c} AS VARCHAR), 'null')" for c in columns)
+    rows = con.execute(
+        f"SELECT wallet_hex, {projection} FROM src.wallets ORDER BY wallet_hex"
+    ).fetchall()
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(("\x1f".join("" if v is None else str(v) for v in row) + "\x1e").encode())
+    return digest.hexdigest()
 
 
 def _export_wallet_completeness(con, out_dir: str, row_group_size: int) -> bool:
@@ -309,6 +343,10 @@ def main() -> int:
         projection = _verify_v2_projection(con, a.out_dir)
         _write_v2_export_manifest(a.out_dir, counts, projection)
     else:
+        # Witness the completeness state before the trade export so a wallet that
+        # starts or finishes a backfill mid-export cannot leave partial trades
+        # paired with a "complete" marker.
+        witness_before = _completeness_witness(con)
         for tbl in TABLES:
             _export_table(con, a.out_dir, tbl, a.row_group_size)
         for tbl in OPTIONAL_TABLES:
@@ -316,10 +354,18 @@ def main() -> int:
                 _export_table(con, a.out_dir, tbl, a.row_group_size)
             else:
                 log(f"{tbl}: table absent (pre-migration cache) -> skipped")
-        if _export_wallet_completeness(con, a.out_dir, a.row_group_size):
-            _write_v1_export_manifest(a.out_dir)
-        else:
+        exported = _export_wallet_completeness(con, a.out_dir, a.row_group_size)
+        witness_after = _completeness_witness(con)
+        if not exported:
             _discard_v1_export_manifest(a.out_dir)
+        elif witness_before is None or witness_before != witness_after:
+            # A wallet's completeness changed while the trades were being written,
+            # so the two outputs describe different database states. Publish no
+            # binding: ranking then falls back to SQLite instead of trusting them.
+            log("completeness changed during the export -> snapshot NOT bound; re-export")
+            _discard_v1_export_manifest(a.out_dir)
+        else:
+            _write_v1_export_manifest(a.out_dir)
 
     log(f"export complete in {time.time() - t0:.0f}s -> {a.out_dir}")
     return 0
