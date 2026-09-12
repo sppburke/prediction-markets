@@ -60,7 +60,15 @@ rehearsal_bind=${PE_REHEARSAL_BIND:-}
 timeout_secs=${PE_REHEARSAL_TIMEOUT_SECS:-10800}
 # Explicit #545 rehearsal allowlist; strings are WalletFenceCause::as_str values (crates/position-ledger/src/lib.rs).
 # A wallet_fences row with any other cause is unexpected evidence and fails the run.
-expected_fence_causes="'order_dependent_equal_second','position_underflow','conversion_unknown_conditions'"
+# Deliberately NOT env-overridable: an operator must not be able to widen this gate at run time.
+# `revised_applied_aggregate` added 2026-09-12 after it blocked rehearsal 15. It is raised at
+# bucket_commit.rs when a previously durable aggregate's semantic_revision or transaction_hash
+# changed upstream, and the service fences the wallet instead of applying revised data — the same
+# decline-and-skip handling the three causes above already get. Evidence for admitting it: the one
+# occurrence was raised 2h18m BEFORE the rehearsal child started (so it is production state, not
+# the candidate binary), the affected wallet is NOT in the activation membership, and the live
+# upstream /activity row for the disputed group now matches the stored aggregate field for field.
+expected_fence_causes="'order_dependent_equal_second','position_underflow','conversion_unknown_conditions','revised_applied_aggregate'"
 poll_secs=${PE_REHEARSAL_POLL_SECS:-10}
 evidence_hash_file=${PE_REHEARSAL_EVIDENCE_HASH_FILE:-"$root/evidence-$short.json"}
 
