@@ -528,9 +528,22 @@ def main() -> int:
         else:
             if snapshot_partial:
                 before = len(wallets)
-                wallets = [w for w in wallets if w.lower() not in snapshot_partial]
-                log(f"snapshot completeness filter: {before} -> {len(wallets)} wallets "
-                    f"({len(snapshot_partial)} partial when the Parquet was exported)")
+                kept = [w for w in wallets if w.lower() not in snapshot_partial]
+                if before and not kept:
+                    # The live cache says these wallets are complete; only the
+                    # snapshot still calls them partial, so it predates their
+                    # recovery. Excluding everything here would return 76, which
+                    # the wrapper maps to fatal when nothing is retryable, and the
+                    # supervisor would stop even though SQLite holds complete,
+                    # usable history. Prefer the live data over the stale snapshot.
+                    log(f"snapshot calls all {before} live-complete wallets partial; "
+                        "it predates their recovery -> SQLite path (re-export to use DuckDB)")
+                    engine.close()
+                    engine = None
+                else:
+                    wallets = kept
+                    log(f"snapshot completeness filter: {before} -> {len(wallets)} wallets "
+                        f"({len(snapshot_partial)} partial when the Parquet was exported)")
     if prm.limit_wallets > 0:
         wallets = wallets[:prm.limit_wallets]
     log(f"universe after completeness filter and limit: {len(wallets)} wallets")

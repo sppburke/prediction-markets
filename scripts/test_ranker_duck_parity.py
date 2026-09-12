@@ -271,6 +271,42 @@ class SnapshotQuarantineTest(unittest.TestCase):
             export(db, pq)
             self.assertEqual(ranker_duck.snapshot_partial_wallets(pq), set())
 
+    def test_stale_snapshot_does_not_starve_the_ranker(self) -> None:
+        """If every rankable wallet recovered since the export, excluding them all
+        would return 76, which the wrapper maps to fatal when nothing is retryable
+        — stopping the supervisor even though SQLite holds complete history. The
+        live cache must win over a snapshot that predates the recovery.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "cache.db"), str(Path(tmp) / "parquet")
+            build_parity_cache(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, "
+                             "backfill_partial INTEGER NOT NULL DEFAULT 0, "
+                             "is_active INTEGER DEFAULT 1, is_infra INTEGER DEFAULT 0)")
+                # Everything in the trade universe is partial when the snapshot
+                # is taken — derived from trades so the fixture cannot drift out
+                # of step with build_parity_cache.
+                universe = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT wallet_hex FROM trades WHERE wallet_hex IS NOT NULL")]
+                self.assertTrue(universe)
+                for w in universe:
+                    conn.execute("INSERT OR REPLACE INTO wallets(wallet_hex, "
+                                 "backfill_partial) VALUES (?,1)", (w,))
+            export(db, pq)
+            self.assertEqual(len(ranker_duck.snapshot_partial_wallets(pq)), len(universe))
+            # They all recover; the next export fails, so the snapshot is stale.
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE wallets SET backfill_partial = 0")
+
+            out = str(Path(tmp) / "recovered")
+            # auto: must fall back to SQLite and rank, not return empty.
+            self.assertEqual(run_pass1(db, out, "auto", pq), 0,
+                             "a stale snapshot must not starve the ranker")
+            rows = read_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))
+            self.assertTrue(rows, "SQLite history was complete; ranking must produce rows")
+
     def test_export_and_ranking_cannot_overlap(self) -> None:
         """A validated snapshot must not be replaceable while extraction reads it.
         The exporter takes the snapshot lock exclusively and ranking holds it
