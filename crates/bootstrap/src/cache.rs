@@ -2537,6 +2537,13 @@ impl WalletCache {
     /// the `0x`-prefixed join-key invariant the write paths maintain (see the
     /// `market_events` schema note) — no fresh `LEFT JOIN`.
     pub fn coverage_counts(&self) -> Result<CoverageReport, BootstrapError> {
+        // One deferred read transaction so every count below observes the SAME
+        // committed state. Without it a backfill committing mid-probe can leave
+        // the marker count and the market-gap counts describing different states,
+        // and the report can say CLEAN when no single state was. This is NOT the
+        // `CacheMutationLock` the probe deliberately avoids (see coverage.rs): a
+        // WAL read transaction does not block writers.
+        let read = self.conn.unchecked_transaction()?;
         // Read-only coverage also supports schema-one caches not yet migrated.
         let has_partial: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wallets') WHERE name = 'backfill_partial')",
@@ -2552,13 +2559,15 @@ impl WalletCache {
         let scheduled = self.scheduled_market_ids();
         let missing_resolution = traded.iter().filter(|&m| !resolved.contains(m)).count();
         let missing_schedule = traded.iter().filter(|&m| !scheduled.contains(m)).count();
-        Ok(CoverageReport {
+        let report = CoverageReport {
             // COUNT(*) is non-negative, so the conversion never saturates in
             // practice; `unwrap_or(0)` keeps the lint happy without an `as` cast.
             fetch_incomplete: usize::try_from(fetch_incomplete).unwrap_or(0),
             missing_resolution,
             missing_schedule,
-        })
+        };
+        read.finish()?;
+        Ok(report)
     }
 
     /// Returns `(oldest_ts, newest_ts)` for `wallet_hex`, or `None` if no trades cached.
@@ -4428,6 +4437,14 @@ impl WalletCache {
     #[cfg(any(test, feature = "scenario"))]
     pub fn raw_conn_for_test(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Mutable sibling of [`Self::raw_conn_for_test`], for helpers that need
+    /// `&mut Connection` (rusqlite's `trace` hook). Same gate, so neither adds
+    /// production surface.
+    #[cfg(any(test, feature = "scenario"))]
+    pub fn raw_conn_mut_for_test(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 
     #[cfg(any(test, feature = "scenario"))]

@@ -189,3 +189,94 @@ fn scenario_coverage_partial_prior_stamp_is_incomplete_and_unmigrated_reader_wor
         assert_eq!(report.is_clean(), !migrated);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #608: every coverage count must observe ONE committed state.
+//
+// The probe reads the partial-marker count and the three market sets in separate
+// statements. Without a read transaction a backfill committing mid-probe leaves
+// them describing different states, and the report can say CLEAN when no single
+// state was. A SQL trace commits a real change from a second connection *after*
+// the first read, which is the interleaving a static-state test cannot reach.
+// `trace` takes a bare fn pointer, hence the statics.
+static INTERLEAVE_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static INTERLEAVE_STATE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn interleave_after_first_read(sql: &str) {
+    use std::sync::atomic::Ordering::SeqCst;
+    match INTERLEAVE_STATE.load(SeqCst) {
+        // Arm once the wallet count is about to run...
+        0 if sql.contains("active_tradeable_wallets") => INTERLEAVE_STATE.store(1, SeqCst),
+        // ...then fire on the NEXT statement, so the deferred snapshot is already
+        // established and this commit must be invisible to the remaining reads.
+        1 => {
+            INTERLEAVE_STATE.store(2, SeqCst);
+            let guard = INTERLEAVE_PATH.lock().unwrap();
+            if let Some(path) = guard.as_ref() {
+                if let Ok(writer) = rusqlite::Connection::open(path) {
+                    let _ = writer.execute_batch("DELETE FROM market_resolutions;");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn coverage_counts_ignore_a_commit_landing_mid_probe() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wallet_cache.db");
+    {
+        let mut cache = WalletCache::open(&path).unwrap();
+        seed_active_wallet(&mut cache, WALLET_1_HEX);
+        cache
+            .update_last_polymarket_fetch(WALLET_1_HEX, 1_700_300_000)
+            .unwrap();
+        cache
+            .insert_new(
+                WALLET_1_HEX,
+                vec![trade(wallet(WALLET_1_HEX), MARKET_A, "t", 1_700_000_000)],
+            )
+            .unwrap();
+        cache
+            .insert_resolution(MARKET_A, Some(0), 1_700_100_000, 1_700_200_000)
+            .unwrap();
+        cache
+            .insert_schedule(MARKET_A, Some(1_700_100_000), 1_700_200_000)
+            .unwrap();
+    }
+    let before = WalletCache::open_read_only(&path)
+        .unwrap()
+        .coverage_counts()
+        .unwrap();
+    assert_eq!(before.missing_resolution, 0, "fixture must start clean");
+
+    *INTERLEAVE_PATH.lock().unwrap() = Some(path.clone());
+    INTERLEAVE_STATE.store(0, SeqCst);
+    let during = {
+        let mut cache = WalletCache::open_read_only(&path).unwrap();
+        cache
+            .raw_conn_mut_for_test()
+            .trace(Some(interleave_after_first_read));
+        cache.coverage_counts().unwrap()
+    };
+    assert_eq!(
+        INTERLEAVE_STATE.load(SeqCst),
+        2,
+        "the interleaving never fired; the test would be vacuous"
+    );
+    assert_eq!(
+        during.missing_resolution, 0,
+        "a commit landing mid-probe leaked into a later count: the reads did not share one snapshot"
+    );
+
+    let after = WalletCache::open_read_only(&path)
+        .unwrap()
+        .coverage_counts()
+        .unwrap();
+    assert_eq!(
+        after.missing_resolution, 1,
+        "the injected delete must really have been durable"
+    );
+}
