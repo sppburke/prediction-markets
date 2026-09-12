@@ -3266,17 +3266,87 @@ rm -f "$sh63_big" "$sh63_root/short.log"
 echo "PASS: FE-STREAMHASH-63"
 
 # ── FE-BACKUPCACHE-64: both SQLite maintenance connections raise cache_size BEFORE their check ───
-# Wiring and ordering only. Whether the raised cache actually shortens the check is an operational
+# Asserted at RUNTIME by tracing real sqlite3 calls, not by searching the source: a text search
+# passes when the pragma is commented out (the text survives in the comment) and when it is issued
+# on the wrong connection. Whether the raised cache actually shortens the check is an operational
 # measurement against the real 4.28 GB copy, recorded in the PR — never asserted here.
-for sh64_fn in complete_sqlite_backup restore_sqlite_backup; do
-  sh64_body=$(sed -n "/^$sh64_fn() {/,/^}/p" "$DRIVER")
-  [[ -n "$sh64_body" ]] || fail "FE-BACKUPCACHE-64 could not extract $sh64_fn"
-  printf '%s\n' "$sh64_body" | grep -q 'pragma cache_size=-262144' ||
-    fail "FE-BACKUPCACHE-64 $sh64_fn does not raise cache_size"
-  printf '%s\n' "$sh64_body" |
-    awk '/pragma cache_size=-262144/{seen=1} /pragma integrity_check/{if(!seen) exit 1} END{exit !seen}' ||
-    fail "FE-BACKUPCACHE-64 $sh64_fn raises cache_size after its integrity check"
-done
+sh64_root=$TEST_TMP/backupcache
+mkdir -p "$sh64_root/tracer"
+cat > "$sh64_root/tracer/sitecustomize.py" <<'TRACER'
+import os, sqlite3
+_trace = os.environ.get("PE_SQLITE_TRACE")
+if _trace:
+    _log = open(_trace, "a", buffering=1)
+    _connect = sqlite3.connect
+
+    class _Traced(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            _log.write("%d\t%s\n" % (id(self), " ".join(str(sql).split())))
+            return super().execute(sql, *args, **kwargs)
+
+    def connect(*args, **kwargs):
+        kwargs.setdefault("factory", _Traced)
+        return _connect(*args, **kwargs)
+
+    sqlite3.connect = connect
+TRACER
+python3 - "$sh64_root/source.db" <<'SEED' || fail "FE-BACKUPCACHE-64 could not seed the fixture database"
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table t(a integer primary key, b text)")
+con.executemany("insert into t(b) values(?)", [("row %d" % i,) for i in range(256)])
+con.commit(); con.close()
+SEED
+
+sh64_assert() {                      # <label> <trace file>
+  python3 - "$1" "$2" <<'ASSERT' || fail "FE-BACKUPCACHE-64 $1 did not raise cache_size on the checked connection before its integrity check"
+import sys
+label, path = sys.argv[1], sys.argv[2]
+rows = [line.rstrip("\n").split("\t", 1) for line in open(path) if "\t" in line]
+cache = [i for i, (cid, sql) in enumerate(rows) if sql.lower() == "pragma cache_size=-262144"]
+check = [i for i, (cid, sql) in enumerate(rows) if sql.lower() == "pragma integrity_check"]
+assert check, "%s never ran integrity_check (trace: %r)" % (label, rows)
+assert cache, "%s never raised cache_size (trace: %r)" % (label, rows)
+first_check = check[0]
+same = [i for i in cache if rows[i][0] == rows[first_check][0] and i < first_check]
+assert same, "%s raised cache_size on a different connection or after the check (trace: %r)" % (label, rows)
+ASSERT
+}
+
+sed -n '/^complete_sqlite_backup() {/,/^}/p' "$DRIVER" > "$sh64_root/backup.sh"
+sed -n '/^restore_sqlite_backup() {/,/^}/p' "$DRIVER" > "$sh64_root/restore.sh"
+[[ -s "$sh64_root/backup.sh" && -s "$sh64_root/restore.sh" ]] ||
+  fail "FE-BACKUPCACHE-64 could not extract the SQLite maintenance owners"
+
+PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$sh64_root/backup.trace" \
+  bash -c "source '$sh64_root/backup.sh'; complete_sqlite_backup '$sh64_root/source.db' '$sh64_root/backup.db'" ||
+  fail "FE-BACKUPCACHE-64 complete_sqlite_backup failed"
+sh64_assert complete_sqlite_backup "$sh64_root/backup.trace"
+[[ -s "$sh64_root/backup.db" ]] || fail "FE-BACKUPCACHE-64 complete_sqlite_backup produced no destination"
+
+PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$sh64_root/restore.trace" \
+  bash -c "source '$sh64_root/restore.sh'; restore_sqlite_backup '$sh64_root/backup.db' '$sh64_root/restored.db'" ||
+  fail "FE-BACKUPCACHE-64 restore_sqlite_backup failed"
+sh64_assert restore_sqlite_backup "$sh64_root/restore.trace"
+[[ -s "$sh64_root/restored.db" ]] || fail "FE-BACKUPCACHE-64 restore_sqlite_backup produced no destination"
+
+# The tracer itself must be able to fail: a connection that never raises the cache is rejected.
+PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$sh64_root/negative.trace" python3 - "$sh64_root/source.db" <<'NEG'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("pragma integrity_check")
+con.close()
+NEG
+if python3 - negative "$sh64_root/negative.trace" <<'ASSERT' 2>/dev/null
+import sys
+rows = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[2]) if "\t" in l]
+cache = [i for i, (c, s) in enumerate(rows) if s.lower() == "pragma cache_size=-262144"]
+check = [i for i, (c, s) in enumerate(rows) if s.lower() == "pragma integrity_check"]
+assert check and cache and any(rows[i][0] == rows[check[0]][0] and i < check[0] for i in cache)
+ASSERT
+then
+  fail "FE-BACKUPCACHE-64 the runtime assertion cannot fail; it would certify an untuned connection"
+fi
 echo "PASS: FE-BACKUPCACHE-64"
 
 echo "PASS: 64 scenario contracts, including WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
