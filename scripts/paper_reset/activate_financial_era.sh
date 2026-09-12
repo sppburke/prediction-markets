@@ -391,16 +391,29 @@ exec "$@"
 }
 
 manifest_complete_start() {
-  local output
+  local output status
   output=$(run_target_offline --financial-era=rollback-check \
-    --activation-manifest="$MANIFEST") || return 2
+    --activation-manifest="$MANIFEST") || {
+    printf 'rollback-check output: %s\n' "$output" >&2
+    return 2
+  }
   COMPLETE_START_OUTPUT=$output
-  python3 -c 'import json,sys
+  if python3 -c 'import json,sys
 try: value=json.loads(sys.argv[1])
 except Exception: raise SystemExit(2)
+if not isinstance(value, dict): raise SystemExit(2)
 if value.get("complete_start") is True: raise SystemExit(0)
 if value.get("complete_start") is False: raise SystemExit(1)
-raise SystemExit(2)' "$output"
+raise SystemExit(2)' "$output"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ $status -ne 1 ]]; then
+    printf 'rollback-check output: %s\n' "$output" >&2
+    return 2
+  fi
+  return 1
 }
 
 complete_sqlite_backup() {

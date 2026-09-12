@@ -601,7 +601,15 @@ db.close()' \
     if [[ -f "$state/complete-start" ]]; then
       echo '{"complete_start":true,"receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}'
     else
-      [[ ! -f "$state/rollback-error" ]] || exit 95
+      if [[ -f "$state/rollback-error" ]]; then
+        echo 'rollback-error stdout marker'
+        echo 'rollback-error stderr marker' >&2
+        exit 95
+      fi
+      if [[ -f "$state/rollback-output" ]]; then
+        cat "$state/rollback-output"
+        exit 0
+      fi
       echo '{"complete_start":false,"repaired":false}'
     fi
     ;;
@@ -2598,7 +2606,8 @@ done
 # Scenario FE-START-UNKNOWN-02
 # Preconditions: stopped service with no Start and a completed stop receipt.
 # Injected boundary: `service-stopped`, followed by an unreadable Start scan.
-# PASS: rollback refuses before any restore. FAIL: unknown is treated as no Start or restore runs.
+# PASS: rollback preserves stdout/stderr diagnostics and refuses before any restore.
+# FAIL: unknown is treated as no Start, diagnostics are lost, or restore runs.
 root=$TEST_TMP/start-unknown
 setup_fixture "$root"
 driver_args "$root"
@@ -2614,7 +2623,24 @@ status=$?
 set -e
 [[ $status -ne 0 && "$output" == *'QualificationStarted state is unknown'* ]] ||
   fail "unknown Start state did not block rollback"
+[[ "$output" == *'rollback-check output: rollback-error stdout marker'* ]] ||
+  fail "unknown Start state discarded rollback-check stdout: $output"
+grep -Fxq 'rollback-error stderr marker' <<< "$output" ||
+  fail "unknown Start state changed or discarded rollback-check stderr: $output"
 [[ ! -e "$root/test-state/restore-count" ]] || fail "unknown Start state reached restore"
+rm "$root/test-state/rollback-error"
+for rollback_output in 'invalid-json' '{}' '{"complete_start":"false"}' 'null' '[]' '0' '"x"'; do
+  printf '%s\n' "$rollback_output" > "$root/test-state/rollback-output"
+  set +e
+  output=$(run_driver "$root" --rollback-before-start 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *'QualificationStarted state is unknown'* ]] ||
+    fail "invalid Start output did not block rollback: $output"
+  [[ "$output" == *"rollback-check output: $rollback_output"* ]] ||
+    fail "invalid Start output was discarded: $output"
+  [[ ! -e "$root/test-state/restore-count" ]] || fail "invalid Start output reached restore"
+done
 
 # Scenario FE-ROLLBACK-NOMUT-03
 # Preconditions: guarded service with no remote archive and no local Start attempt.

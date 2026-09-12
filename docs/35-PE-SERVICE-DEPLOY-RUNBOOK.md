@@ -537,6 +537,69 @@ is inert, then starts the old service and records `rolled_back`. A no-mutation r
 remote restore and refresh. At or after Start, rollback is forbidden: preserve the append-only era and
 recover with a compatible reader.
 
+An existing `prepared` manifest remains bound to its original target. When that binary is safe,
+the normal retirement route is `--rollback-before-start` with the same target/config/environment,
+evidence, and membership arguments recorded by that manifest. From `prepared`, a successful
+no-Start check records `rolled_back` with `no_financial_mutation: true`. The rollback route must
+**NOT** be used to retire a manifest whose bound binary is the pre-#605 one: the driver's identity
+checks force rollback-check to execute that original target, repeating the memory incident.
+Use the Rollout A′ procedure below for that untouched `prepared` manifest.
+
+With the #605 fix, rollback-check reads the verified source prefix and tolerates a partial trailing
+source frame without writing to that log; the later stopped `prepare` scan remains strict.
+
+Rollback-check selects the projection reducer's position-page, mark-price, resolution, and custody
+receipts from each account's first Baseline onward, unions their `(sequence, hash)` tuples, and
+verifies the source prefix even when that set is empty. The prefix observer retains at most one
+envelope per selected tuple, cloning only after membership succeeds; outer retained bytes scale
+with selected payload bytes. Existing journal and recursive-reducer allocations are outside this
+bound. A required receipt missing from the verified prefix still fails closed in the reducer.
+
+Before fresh activation, archive a normally retired no-mutation manifest under the existing deploy
+lock. Acquire the provisioned `~/.pe-deploy.lock` exactly as the driver does (`exec 9<"$DEPLOY_LOCK"` followed by
+`flock -n 9`, with `DEPLOY_LOCK` naming that existing file). While holding the lock, re-check the
+expected `activation_id`, `state == rolled_back`, and `no_financial_mutation == true`; refuse if
+any differ. Rename `~/pe-financial-era.json` to the unique, previously absent
+`~/pe-financial-era.<activation_id>.<utc>.rolled_back.json`, then `fsync` the parent directory as
+in `scripts/deploy/generation_common.sh::atomic_manifest_json`, and only then release the lock.
+A `rolled_back` manifest at the fixed path refuses forward activation because it requires a new
+activation identity; the driver creates a fresh manifest only when that path is absent.
+
+**Rollout A′ — archive an untouched `prepared` manifest with evidence.** This procedure retires
+only the manifest; it requires proof that the failed driver never reached service stop or mutation.
+Do not invoke the bound binary to obtain that proof.
+
+1. Acquire the existing provisioned `~/.pe-deploy.lock` with the same acquisition as the driver and
+   `generation_common.sh`: set `DEPLOY_LOCK="$HOME/.pe-deploy.lock"`, require that file to exist,
+   then `exec 9<"$DEPLOY_LOCK"` and `flock -n 9`. Refuse on failure; never recreate the lock inode.
+   Keep this lock through all checks, note creation, rename, and directory synchronization.
+2. Read `~/pe-financial-era.json` under the lock. Verify the expected `activation_id`,
+   `state == prepared`, `preparation` explicitly null, and no flag ending in `_intent`, `_adopted`,
+   `_restored`, or `_completed` true. Verify `stop_invoked` is absent or false, `backup` absent or
+   null, and no `financial-era-*-paper-state.db` backup exists in the driver's `SERVICE_ROOT`
+   (normally `~/prediction-markets`). Confirm from the failed invocation's logs and the service's
+   systemd history that the driver never stopped it: the current nonzero `MainPID` must equal the
+   recorded pre-invocation `MainPID`, with the same systemd invocation. Verify the installed
+   binary, config, and environment paths and SHA-256 values remain the recorded old artifacts
+   (`old_artifact_sha256`, `old_config_sha256`, `old_environment_sha256`). Refuse if any check
+   disagrees or its evidence is unavailable; `prepared` alone is insufficient.
+3. Choose a unique UTC timestamp and the previously absent archive path
+   `~/pe-financial-era.<activation_id>.<utc>.prepared-archived.json`. Write its previously absent
+   sibling `<archive>.note.json` recording the retirement reason (the bound pre-#605 rollback-check
+   memory incident), activation identity, check timestamp, original manifest SHA-256, checked state,
+   all matching flags and their values, null preparation, backup absence and searched directory,
+   stop evidence with before/current MainPID and systemd invocation, and installed artifact
+   paths plus expected/observed hashes. Include the log/evidence references establishing the
+   before values. Create the note with mode `0600`, flush it, and `fsync` its file before proceeding.
+4. Rename the unchanged manifest to that archive path while still holding the lock. `fsync` the
+   parent directory using the `os.open(parent, os.O_RDONLY | os.O_DIRECTORY)` / `os.fsync` /
+   `os.close` pattern in `generation_common.sh::atomic_manifest_json`; synchronize the note's
+   directory entry together with the rename. Preserve both files if any synchronization fails.
+5. Only after synchronization succeeds, release the lock (`flock -u 9`, then `exec 9<&-`). Keep
+   the archived manifest in `prepared` state and retain its evidence note. Proceed with the new
+   release's build, staged release tree, SHA-bound rehearsal PASS, and fresh activation at the
+   now-absent fixed manifest path, as after the normal `rolled_back` archive route.
+
 Before Start, an unfinished rollback with durable `qualification_start_intent` must restore the
 complete SQLite backup even when the main-file hash is unchanged: the reset can have committed
 only into the write-ahead log. Restoration requires an inert service and verified archive, backup,
