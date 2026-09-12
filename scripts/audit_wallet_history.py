@@ -93,10 +93,15 @@ def _decimal(value):
             raise ValueError(f"invalid DTO decimal: {value!r}")
         # Decimal::from_str rounds excess scale or coefficient digits, with
         # midpoint rounding away from zero, into its 96-bit coefficient.
-        scale = min(28, max(0, -result.as_tuple().exponent))
+        # The mantissa's own decimal places, before any clamping. Whether Rust
+        # takes its rounding path is STRUCTURAL — how many digits it had to
+        # consume — not numeric. "0.5" + 28 zeros + "e1" rounds away only zeros,
+        # so the value is unchanged yet the exponent is still discarded.
+        mantissa_places = max(0, -result.as_tuple().exponent)
+        scale = min(28, mantissa_places)
+        clamped_scale = scale
         with localcontext() as context:
             context.prec = 96
-            unrounded = result
             while True:
                 rounded = result.quantize(Decimal((0, (1,), -scale)), rounding=ROUND_HALF_UP)
                 if rounded.copy_abs().scaleb(scale) <= 2**96 - 1:
@@ -115,7 +120,7 @@ def _decimal(value):
             # "0.5…0e1" -> 5 (exact, exponent applied). Mirroring this is the
             # point of the auditor; diverging would let it reject a row the
             # writer accepts and certify history as complete without it.
-            if separator and result != unrounded:
+            if separator and (mantissa_places > 28 or scale < clamped_scale):
                 separator = ""
             if separator:
                 shift = int(exponent)

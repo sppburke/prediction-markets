@@ -693,6 +693,8 @@ mod tests {
     use pe_source_polymarket_public::FixtureFetcher;
     use tempfile::TempDir;
 
+    use std::str::FromStr;
+
     use super::*;
     use crate::cache::WalletCache;
 
@@ -706,6 +708,7 @@ mod tests {
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let mut checked = 0usize;
         let mut accepted = 0usize;
+        let mut valued = 0usize;
         for line in corpus.lines() {
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
@@ -716,6 +719,30 @@ mod tests {
             let expected = record["writer_accepts"].as_bool().unwrap();
             let actual = parse_trade_page(page.as_bytes(), wallet).is_ok();
             assert_eq!(actual, expected, "parity case {name:?}: page {page:?}");
+            // Acceptance alone cannot see a normalization difference, and the
+            // corpus's `writer_values` are generated outside this crate. Decode
+            // them here with the real DTO so a drift between the generator and
+            // this parser fails, not just a Python-side mismatch.
+            if let Some(values) = record.get("writer_values").and_then(|v| v.as_array()) {
+                let rows: TradeResponse = serde_json::from_str(page)
+                    .unwrap_or_else(|e| panic!("parity case {name:?} should decode: {e}"));
+                assert_eq!(rows.len(), values.len(), "parity case {name:?}: row count");
+                for (row, want) in rows.iter().zip(values) {
+                    let want_size = want["size"].as_str().unwrap();
+                    let want_price = want["price"].as_str().unwrap();
+                    assert_eq!(
+                        row.size,
+                        Decimal::from_str(want_size).unwrap(),
+                        "parity case {name:?}: size"
+                    );
+                    assert_eq!(
+                        row.price,
+                        Decimal::from_str(want_price).unwrap(),
+                        "parity case {name:?}: price"
+                    );
+                }
+                valued += 1;
+            }
             checked += 1;
             accepted += usize::from(expected);
         }
@@ -727,6 +754,8 @@ mod tests {
             "corpus has only {} rejected cases",
             checked - accepted
         );
+        // The value half must not silently cover nothing.
+        assert!(valued >= 20, "corpus has only {valued} valued cases");
     }
 
     /// A fetcher that returns `RateLimited` for the first `rate_limit_count` calls,
