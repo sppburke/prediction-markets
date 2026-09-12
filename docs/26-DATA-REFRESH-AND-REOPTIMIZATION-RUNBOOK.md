@@ -19,6 +19,7 @@ and publishes to Supabase `latest_ranking`, which `pe-service` reads.
 
 ```bash
 # Build the bootstrap binary used below (from repo root).
+# For the #606 comparison, preserve the installed baseline first (protocol below).
 cargo build --release -p pe-bootstrap
 ```
 
@@ -40,6 +41,12 @@ cargo build --release -p pe-bootstrap
   rebuild.
   Symptom to recognize: `sqlite: unable to open database file` from a stage whose cache
   path is demonstrably writable.
+- **Wallet-cache memory.** The operator knobs and defaults are in
+  [Bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap); the effective
+  [mmap ceiling](https://www.sqlite.org/pragma.html#pragma_mmap_size) is capped by
+  bundled SQLite's platform/build limit (or zero when mmap is unavailable), so use
+  the writer's `wallet cache: connection tuning applied` log rather than assuming
+  the requested size was granted.
 - **Market resolutions (no RPC).** The Polymarket CLOB `/markets?closed=true`
   listing is the sole payout-resolution source (#369; key-free). Gamma supplies
   schedules, event mappings, liquidity, and mark-price inputs, never payouts.
@@ -55,6 +62,43 @@ cargo build --release -p pe-bootstrap
   schema two requires the verified Parquet/DuckDB path and rejects SQLite.
 
 ---
+
+## Wallet-cache tuning measurement and rollback (#606)
+
+Run this comparison on Forge through the existing
+[systemd loop lifecycle](#continuous-forge-supervisor), using the defaults in
+[Bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) for the candidate.
+This changes read-side caching only; per-wallet transactions, WAL and index maintenance
+remain unchanged. No automatic memory sizing is performed.
+
+1. Before building, preserve the currently installed `c1cdf82` binary as
+   `target/release/pe-bootstrap.pre-606-c1cdf82` and retain the current `.env` for
+   rollback. Use that binary and `.env` as the baseline. Record baseline pragmas as
+   **SQLite defaults (no pragma set by the binary, `cache.rs:95–96` at `c1cdf82`)**;
+   a fresh read-only Python connection's cache/mmap pragmas are not the writer's view.
+2. Measure two 10-minute windows per binary, on the same cache generation and the
+   same cycle kind (`cycle-resume`). Select the `backfill` stage child from
+   `pgrep -x pe-bootstrap`, checking `/proc/<pid>/cmdline` for `backfill`. Retain
+   the PID, binary identity, cache generation, cycle log and window timestamps;
+   discard a window if that stage exits or its PID changes.
+3. At each window's start/end, query `select max(rowid) from trades` through a
+   read-only Python SQLite connection. Its delta is inserted rows. Record the
+   `/proc/<pid>/io` `read_bytes` and `write_bytes` deltas. Every 30 seconds sample
+   `/proc/<pid>/status` `VmRSS` and `/proc/meminfo` `MemAvailable`; retain the
+   sampled RSS peak and available-memory minimum. Read bytes per 1,000 inserted
+   rows is `1000 * read_bytes_delta / inserted_rows`; zero inserted rows makes
+   the window inconclusive and requires a repeat. Do not report pages/s.
+4. Build the candidate on Forge, stop the loop, verify its descendants have exited,
+   and restart via systemd with the candidate binary and configured `.env`.
+   Retain the new writer log's `requested_cache_kib`, `effective_cache_kib`,
+   `requested_mmap_bytes` and `effective_mmap_bytes` for each candidate window;
+   cache KiB values use SQLite's negative-KiB convention. Success requires lower
+   read bytes per 1,000 inserted rows than baseline with `MemAvailable` never
+   below **2 GiB**.
+5. If `MemAvailable` falls below that floor or any `MemoryPressure`/OOM kernel
+   line occurs during measurement, stop the loop through systemd, verify descendants
+   have exited, restore the preserved binary and prior `.env`, and restart the
+   loop through that same lifecycle. Keep the cache generation and recovery pointers.
 
 ## Part 1 — Backfill tradeable wallets (no new wallet discovery)
 

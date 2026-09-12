@@ -70,6 +70,19 @@ pub struct BootstrapConfig {
     #[serde(default = "default_cache_path", alias = "bootstrap_cache_path")]
     pub cache_path: PathBuf,
 
+    /// SQLite page-cache budget in MiB (at least 1). Applied on each writable open.
+    /// `PE_BOOTSTRAP_CACHE_PAGE_CACHE_MIB` overrides.
+    #[serde(
+        default = "default_cache_page_cache_mib",
+        alias = "bootstrap_cache_page_cache_mib"
+    )]
+    pub cache_page_cache_mib: u64,
+
+    /// SQLite mmap ceiling in MiB; 0 disables it. SQLite may clamp the effective
+    /// ceiling to its platform/build limit. `PE_BOOTSTRAP_CACHE_MMAP_MIB` overrides.
+    #[serde(default = "default_cache_mmap_mib", alias = "bootstrap_cache_mmap_mib")]
+    pub cache_mmap_mib: u64,
+
     /// Path to the enumerated wallet address list. `PE_BOOTSTRAP_WALLET_SET_PATH` overrides.
     #[serde(
         default = "default_wallet_set_path",
@@ -470,6 +483,14 @@ fn default_cache_path() -> PathBuf {
     PathBuf::from("wallet_cache.db")
 }
 
+const fn default_cache_page_cache_mib() -> u64 {
+    4096
+}
+
+const fn default_cache_mmap_mib() -> u64 {
+    2047
+}
+
 fn default_wallet_set_path() -> PathBuf {
     PathBuf::from("wallet_set.json")
 }
@@ -615,6 +636,8 @@ impl Default for BootstrapConfig {
         Self {
             output_path: PathBuf::from("./watchlist.json"),
             cache_path: default_cache_path(),
+            cache_page_cache_mib: default_cache_page_cache_mib(),
+            cache_mmap_mib: default_cache_mmap_mib(),
             wallet_set_path: default_wallet_set_path(),
             audit_window_days: None,
             min_closed_trades: default_min_closed_trades(),
@@ -661,6 +684,42 @@ impl Default for BootstrapConfig {
 
 // ── Loader ────────────────────────────────────────────────────────────────────
 
+/// Validated SQLite pragma arguments. Constructed only by the config owner.
+pub(crate) struct CacheTuning {
+    pub cache_kib: i32,
+    pub mmap_bytes: i64,
+}
+
+impl BootstrapConfig {
+    pub(crate) fn cache_tuning(&self) -> Result<CacheTuning, BootstrapError> {
+        let cache_kib = self
+            .cache_page_cache_mib
+            .checked_mul(1024)
+            .and_then(|kib| i32::try_from(kib).ok())
+            .filter(|&kib| kib > 0)
+            .ok_or_else(|| BootstrapError::Invalid {
+                message: format!(
+                    "cache_page_cache_mib must be between 1 and {} MiB (KiB must fit i32)",
+                    i32::MAX / 1024
+                ),
+            })?;
+        let mmap_bytes = self
+            .cache_mmap_mib
+            .checked_mul(1 << 20)
+            .and_then(|bytes| i64::try_from(bytes).ok())
+            .ok_or_else(|| BootstrapError::Invalid {
+                message: format!(
+                    "cache_mmap_mib must be at most {} MiB (bytes must fit i64)",
+                    i64::MAX / (1 << 20)
+                ),
+            })?;
+        Ok(CacheTuning {
+            cache_kib: -cache_kib,
+            mmap_bytes,
+        })
+    }
+}
+
 /// Load `BootstrapConfig` from an optional TOML file with `PE_*` env vars overlaid.
 ///
 /// When `path` is `Some`, the TOML file is read first; env vars override individual fields.
@@ -684,6 +743,8 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
         )
         .merge(Env::prefixed("PE_BOOTSTRAP_").lowercase(true))
         .extract()?;
+    // Fail before callers acquire a cache lock or open/create any database.
+    cfg.cache_tuning()?;
     Ok(cfg)
 }
 
@@ -938,6 +999,106 @@ mod tests {
             let cfg = load(Some(std::path::Path::new("config.toml")))
                 .map_err(|e| figment::Error::from(e.to_string()))?;
             assert_eq!(cfg.purge_bulk_min_wallets, 7_500);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cache_tuning_defaults_and_aliases_through_load() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("PE_BOOTSTRAP_OUTPUT", "watchlist.json");
+            let cfg = load(None).unwrap();
+            assert_eq!(cfg.cache_page_cache_mib, 4096);
+            assert_eq!(cfg.cache_mmap_mib, 2047);
+            jail.create_file(
+                "config.toml",
+                "bootstrap_cache_page_cache_mib = 16\nbootstrap_cache_mmap_mib = 8\n",
+            )?;
+            let cfg = load(Some(Path::new("config.toml"))).unwrap();
+            assert_eq!(cfg.cache_page_cache_mib, 16);
+            assert_eq!(cfg.cache_mmap_mib, 8);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cache_tuning_env_precedence_through_load() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("PE_BOOTSTRAP_OUTPUT", "watchlist.json");
+            jail.create_file(
+                "config.toml",
+                "cache_page_cache_mib = 16\ncache_mmap_mib = 8\n",
+            )?;
+            let path = Some(Path::new("config.toml"));
+            let cfg = load(path).unwrap();
+            assert_eq!((cfg.cache_page_cache_mib, cfg.cache_mmap_mib), (16, 8));
+            jail.set_env("PE_CACHE_PAGE_CACHE_MIB", "32");
+            jail.set_env("PE_CACHE_MMAP_MIB", "64");
+            let cfg = load(path).unwrap();
+            assert_eq!((cfg.cache_page_cache_mib, cfg.cache_mmap_mib), (32, 64));
+            jail.set_env("PE_BOOTSTRAP_CACHE_PAGE_CACHE_MIB", "128");
+            jail.set_env("PE_BOOTSTRAP_CACHE_MMAP_MIB", "256");
+            let cfg = load(path).unwrap();
+            assert_eq!((cfg.cache_page_cache_mib, cfg.cache_mmap_mib), (128, 256));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cache_tuning_rejects_malformed_and_out_of_range_through_load() {
+        for (key, value, semantic) in [
+            ("CACHE_PAGE_CACHE_MIB", "broken".to_owned(), false),
+            ("CACHE_MMAP_MIB", "broken".to_owned(), false),
+            ("CACHE_PAGE_CACHE_MIB", "-1".to_owned(), false),
+            ("CACHE_MMAP_MIB", "-1".to_owned(), false),
+            ("CACHE_PAGE_CACHE_MIB", "0".to_owned(), true),
+            (
+                "CACHE_PAGE_CACHE_MIB",
+                (i32::MAX / 1024 + 1).to_string(),
+                true,
+            ),
+            ("CACHE_PAGE_CACHE_MIB", u64::MAX.to_string(), true),
+            (
+                "CACHE_MMAP_MIB",
+                (i64::MAX / (1 << 20) + 1).to_string(),
+                true,
+            ),
+            ("CACHE_MMAP_MIB", u64::MAX.to_string(), true),
+        ] {
+            figment::Jail::expect_with(|jail| {
+                jail.set_env("PE_BOOTSTRAP_OUTPUT", "watchlist.json");
+                jail.set_env(format!("PE_BOOTSTRAP_{key}"), &value);
+                let error = load(None).unwrap_err();
+                assert_eq!(matches!(error, BootstrapError::Invalid { .. }), semantic);
+                assert!(
+                    error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains(&key.to_ascii_lowercase()),
+                    "{error}"
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn cache_tuning_accepts_boundaries_and_disabled_mmap_through_load() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("PE_BOOTSTRAP_OUTPUT", "watchlist.json");
+            jail.set_env("PE_BOOTSTRAP_CACHE_PAGE_CACHE_MIB", "1");
+            jail.set_env("PE_BOOTSTRAP_CACHE_MMAP_MIB", "0");
+            let cfg = load(None).unwrap();
+            assert_eq!((cfg.cache_page_cache_mib, cfg.cache_mmap_mib), (1, 0));
+            let max_cache = u64::try_from(i32::MAX / 1024).unwrap();
+            let max_mmap = u64::try_from(i64::MAX / (1 << 20)).unwrap();
+            jail.set_env("PE_BOOTSTRAP_CACHE_PAGE_CACHE_MIB", max_cache.to_string());
+            jail.set_env("PE_BOOTSTRAP_CACHE_MMAP_MIB", max_mmap.to_string());
+            let cfg = load(None).unwrap();
+            assert_eq!(
+                (cfg.cache_page_cache_mib, cfg.cache_mmap_mib),
+                (max_cache, max_mmap)
+            );
             Ok(())
         });
     }
