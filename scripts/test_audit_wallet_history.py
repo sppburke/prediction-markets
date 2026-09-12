@@ -71,6 +71,25 @@ class AuditHistoryTest(unittest.TestCase):
         for constant in ["NaN", "Infinity", "-Infinity"]:
             with self.subTest(constant=constant), self.assertRaises(ValueError):
                 audit.parse_page("[{" + valid + ',"usdcSize":' + constant + "}]")
+        # serde_json decodes `-0` as floating point, which fails the integer DTO
+        # fields; Python's json would return int 0 and accept the page.
+        for payload in [
+            '[{"transactionHash":"t","conditionId":"market","side":"BUY","size":"1",'
+            '"price":"0.5","timestamp":-0,"outcomeIndex":0}]',
+            '[{"transactionHash":"t","conditionId":"market","side":"BUY","size":"1",'
+            '"price":"0.5","timestamp":1000,"outcomeIndex":-0}]',
+        ]:
+            self.assertIn(":-0", payload)  # the fixture must really carry the literal
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                audit.parse_page(payload)
+        # serde reads the same literal as -0.0 without complaint in a field the
+        # DTO ignores, inside an ignored object, and in the decimal fields.
+        for tail in ['"usdcSize":-0', '"meta":{"x":-0}']:
+            with self.subTest(tail=tail):
+                self.assertEqual(len(audit.parse_page("[{" + valid + "," + tail + "}]")), 1)
+        decimal_negative_zero = ('[{"transactionHash":"t","conditionId":"market","side":"BUY",'
+                                 '"size":"1","price":-0,"timestamp":1000,"outcomeIndex":0}]')
+        self.assertEqual(len(audit.parse_page(decimal_negative_zero)), 1)
         # Every one of these is accepted by Python's Decimal and rejected by the
         # writer, which fails the whole page: surrounding whitespace, a leading
         # underscore, Unicode digits, and a separator inside the exponent.

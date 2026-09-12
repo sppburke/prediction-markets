@@ -46,6 +46,15 @@ def _object_pairs(pairs):
     return value
 
 
+def _parse_int(literal):
+    """serde_json decodes the literal `-0` as floating point `-0.0`, so it fails
+    the integer DTO fields and satisfies the decimal ones. Python's json returns
+    int 0 and hides the difference. Returning the float mirrors the writer, and
+    `_integer`'s exact-type check then rejects it only where serde does.
+    """
+    return -0.0 if literal == "-0" else int(literal)
+
+
 def _reject_json_constant(name):
     """serde_json has no NaN/Infinity literals and fails the whole page on one,
     even inside a field the DTO ignores. Python's json accepts all three.
@@ -110,7 +119,7 @@ def _decimal(value):
 def parse_page(payload):
     """Validate the entire DTO array before performing any row conversions."""
     raw = json.loads(payload, object_pairs_hook=_object_pairs,
-                     parse_constant=_reject_json_constant)
+                     parse_constant=_reject_json_constant, parse_int=_parse_int)
     if not isinstance(raw, list):
         raise ValueError("activity response is not an array")
     validated = []
