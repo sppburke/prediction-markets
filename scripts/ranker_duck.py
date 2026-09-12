@@ -39,6 +39,8 @@ TRADES_PARQUET = "trades.parquet"
 RESOLUTIONS_PARQUET = "market_resolutions.parquet"
 SCHEDULES_PARQUET = "market_schedules.parquet"
 WALLET_COMPLETENESS_PARQUET = "wallet_completeness.parquet"
+V1_EXPORT_MANIFEST = "schema_v1_export_manifest.json"
+V1_BOUND_FILES = (TRADES_PARQUET, WALLET_COMPLETENESS_PARQUET)
 # Deliberately NOT in REQUIRED_PARQUET: a cache that predates the #608 marker has
 # no quarantine at all, so demanding the projection would strand the DuckDB path
 # on every such cache. The caller requires it only when the live cache carries
@@ -127,6 +129,31 @@ def snapshot_partial_wallets(parquet_dir: str | None = None) -> set[str]:
     path = os.path.join(parquet_dir, WALLET_COMPLETENESS_PARQUET)
     if not os.path.exists(path):
         raise FileNotFoundError(f"snapshot completeness projection missing: {path}")
+    # The trades and the completeness projection are separate files replaced one at
+    # a time. Only accept them as evidence when the manifest written at the end of
+    # the export still matches BOTH, which proves they came from the same run; an
+    # export that died in between leaves a mismatch and the pair is refused.
+    manifest_path = os.path.join(parquet_dir, V1_EXPORT_MANIFEST)
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(
+            f"snapshot export manifest missing: {manifest_path} "
+            "(trades and completeness are not bound to one export)"
+        )
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    recorded = manifest.get("files") or {}
+    for name in V1_BOUND_FILES:
+        bound = recorded.get(name)
+        target = os.path.join(parquet_dir, name)
+        if bound is None or not os.path.exists(target):
+            raise FileNotFoundError(f"snapshot export manifest does not bind {name}")
+        stat = os.stat(target)
+        if int(bound.get("size", -1)) != stat.st_size or \
+                int(bound.get("mtime_ns", -1)) != stat.st_mtime_ns:
+            raise FileNotFoundError(
+                f"snapshot export is inconsistent: {name} does not match the manifest "
+                "(an export was interrupted; re-export before using DuckDB)"
+            )
     con = duckdb.connect()
     try:
         rows = con.execute(

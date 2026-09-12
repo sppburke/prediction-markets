@@ -35,6 +35,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -239,6 +240,63 @@ class SnapshotQuarantineTest(unittest.TestCase):
             export(db, pq)
             fresh = self._ranked(tmp, db, pq, "fresh")
             self.assertIn(W("a"), fresh, "a re-exported complete wallet must rank again")
+
+    def test_interrupted_export_is_refused_not_trusted(self) -> None:
+        """trades.parquet and wallet_completeness.parquet are replaced one at a
+        time. An export that dies between them leaves new trades paired with an
+        older marker, which would certify history the quarantine withheld.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "cache.db"), str(Path(tmp) / "parquet")
+            self._cache_with_marker(db, partial=W("a"))
+            export(db, pq)
+            manifest = Path(pq) / "schema_v1_export_manifest.json"
+            self.assertTrue(manifest.exists(), "export must bind the pair")
+
+            # A later export replaces trades and then dies before the manifest.
+            second = str(Path(tmp) / "parquet2")
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE wallets SET backfill_partial = 0")
+            export(db, second)
+            shutil.copy2(os.path.join(second, "trades.parquet"),
+                         os.path.join(pq, "trades.parquet"))
+
+            with self.assertRaises(FileNotFoundError):
+                ranker_duck.snapshot_partial_wallets(pq)
+            # Forced duck must fail closed rather than rank the mismatched pair.
+            with self.assertRaises(FileNotFoundError):
+                self._ranked(tmp, db, pq, "interrupted")
+            # A complete re-export repairs the binding.
+            export(db, pq)
+            self.assertEqual(ranker_duck.snapshot_partial_wallets(pq), set())
+
+    def test_snapshot_exclusion_precedes_the_wallet_limit(self) -> None:
+        """The approved plan requires load -> exclude -> slice. Truncating first
+        would let --limit-wallets spend its slots on wallets the snapshot filter
+        is about to drop, silently shrinking the ranked set.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "cache.db"), str(Path(tmp) / "parquet")
+            self._cache_with_marker(db, partial=W("a"))
+            export(db, pq)
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE wallets SET backfill_partial = 0")
+            out = str(Path(tmp) / "limited")
+            argv = ["rank_72hr_buyandhold.py", "--db", db, "--out-dir", out,
+                    "--universe-from-trades", "--limit-wallets", "1",
+                    "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO,
+                    "--as-of", AS_OF_ISO, "--min-avg-per-month", "1",
+                    "--min-active-months", "2", "--target-n", "5",
+                    "--floor-tstat", "0.0", "--scheduled-only"]
+            env = {"PE_RANKER_ENGINE": "duck", "PE_RANKER_PARQUET_DIR": pq,
+                   "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}
+            with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", argv):
+                self.assertEqual(rk.main(), 0)
+            ranked = [r["wallet"] for r in
+                      read_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))]
+            self.assertNotIn(W("a"), ranked)
+            self.assertEqual(len(ranked), 1,
+                             "the limit must be spent on a wallet that survives exclusion")
 
     def test_snapshot_without_evidence_falls_back_instead_of_ranking_blind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

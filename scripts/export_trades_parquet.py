@@ -56,6 +56,13 @@ V2_TABLES = (
     "cache_v2_migration_state",
 )
 V2_EXPORT_MANIFEST = "schema_v2_export_manifest.json"
+# Binds the schema-one trade snapshot to the completeness projection taken with
+# it (#608). The two are separate files replaced one at a time, so an export that
+# dies between them would otherwise leave new trades paired with an older
+# "complete" marker and certify history the quarantine meant to withhold. Written
+# LAST, so an interrupted export leaves it stale and the reader refuses the pair.
+V1_EXPORT_MANIFEST = "schema_v1_export_manifest.json"
+V1_BOUND_FILES = ("trades.parquet", "wallet_completeness.parquet")
 
 
 def log(msg: str) -> None:
@@ -122,6 +129,44 @@ def _export_wallet_completeness(con, out_dir: str, row_group_size: int) -> bool:
     n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')").fetchone()[0]
     log(f"{WALLET_COMPLETENESS}: {n:,} rows -> {final}")
     return True
+
+
+def _file_identity(path: str) -> dict:
+    """Size and nanosecond mtime — enough to prove two files came from the same
+    export run. `os.replace` updates both, so a file swapped after the manifest was
+    written no longer matches it. Deliberately not a digest: `trades.parquet` runs
+    to tens of GB and the threat here is an interrupted export, not tampering.
+    """
+    stat = os.stat(path)
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _write_v1_export_manifest(out_dir: str) -> None:
+    """Publish the schema-one trade + completeness pair as one generation."""
+    import json
+
+    value = {
+        "version": 1,
+        "files": {name: _file_identity(os.path.join(out_dir, name))
+                  for name in V1_BOUND_FILES},
+    }
+    final = os.path.join(out_dir, V1_EXPORT_MANIFEST)
+    temporary = final + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as destination:
+        json.dump(value, destination, sort_keys=True, separators=(",", ":"))
+        destination.write("\n")
+        destination.flush()
+        os.fsync(destination.fileno())
+    os.replace(temporary, final)
+    log(f"schema-one export manifest -> {final}")
+
+
+def _discard_v1_export_manifest(out_dir: str) -> None:
+    """Remove the binding when there is no completeness projection to bind."""
+    final = os.path.join(out_dir, V1_EXPORT_MANIFEST)
+    if os.path.exists(final):
+        os.remove(final)
+        log(f"schema-one export manifest removed (no completeness projection) -> {final}")
 
 
 def _projection_rows(con, relation_prefix: str) -> list[dict]:
@@ -271,7 +316,10 @@ def main() -> int:
                 _export_table(con, a.out_dir, tbl, a.row_group_size)
             else:
                 log(f"{tbl}: table absent (pre-migration cache) -> skipped")
-        _export_wallet_completeness(con, a.out_dir, a.row_group_size)
+        if _export_wallet_completeness(con, a.out_dir, a.row_group_size):
+            _write_v1_export_manifest(a.out_dir)
+        else:
+            _discard_v1_export_manifest(a.out_dir)
 
     log(f"export complete in {time.time() - t0:.0f}s -> {a.out_dir}")
     return 0

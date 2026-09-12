@@ -493,17 +493,13 @@ def main() -> int:
         log(f"universe: {len(wallets)} wallets ({universe_label})")
 
     wallets = exclude_partial_backfills(conn, wallets, schema_version)
-    if prm.limit_wallets > 0:
-        wallets = wallets[:prm.limit_wallets]
-    log(f"universe after completeness filter and limit: {len(wallets)} wallets")
-
-    if not wallets and schema_version < 2:
-        log("empty universe after completeness filter")
-        return 76
 
     # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
     # Market maps (resolutions + schedules) are only needed by the SQLite path; the
     # DuckDB path joins them in SQL over the Parquet snapshot.
+    # This runs BEFORE --limit-wallets: every completeness exclusion must happen on
+    # the unlimited universe, then the slice is taken. Truncating first would let the
+    # limit consume slots with wallets the snapshot filter is about to drop.
     engine = ranker_duck.get_engine(schema_version=schema_version)
     if engine is not None and schema_version < 2 and _cache_has_partial_marker(conn):
         # DuckDB reads the Parquet snapshot, not the live cache, so the live marker
@@ -526,10 +522,15 @@ def main() -> int:
                 wallets = [w for w in wallets if w.lower() not in snapshot_partial]
                 log(f"snapshot completeness filter: {before} -> {len(wallets)} wallets "
                     f"({len(snapshot_partial)} partial when the Parquet was exported)")
-            if not wallets:
-                log("empty universe after the snapshot completeness filter")
-                conn.close()
-                return 76
+    if prm.limit_wallets > 0:
+        wallets = wallets[:prm.limit_wallets]
+    log(f"universe after completeness filter and limit: {len(wallets)} wallets")
+
+    if not wallets and schema_version < 2:
+        log("empty universe after completeness filter")
+        conn.close()
+        return 76
+
     res, sched = (None, None) if engine is not None else load_market_maps(conn)
 
     decay = "flat (no decay)" if prm.half_life_days <= 0 else f"half_life={prm.half_life_days}d"
