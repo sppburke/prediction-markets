@@ -38,6 +38,11 @@ from decimal import Decimal, InvalidOperation
 TRADES_PARQUET = "trades.parquet"
 RESOLUTIONS_PARQUET = "market_resolutions.parquet"
 SCHEDULES_PARQUET = "market_schedules.parquet"
+WALLET_COMPLETENESS_PARQUET = "wallet_completeness.parquet"
+# Deliberately NOT in REQUIRED_PARQUET: a cache that predates the #608 marker has
+# no quarantine at all, so demanding the projection would strand the DuckDB path
+# on every such cache. The caller requires it only when the live cache carries
+# the marker — see `rank_72hr_buyandhold.main`.
 REQUIRED_PARQUET = (TRADES_PARQUET, RESOLUTIONS_PARQUET, SCHEDULES_PARQUET)
 # OPTIONAL snapshots (issue #421 PR4 / #429 PR4 — the CLV price series + its token→outcome map).
 # Absent until the prices-history backfill + export run, so deliberately NOT in REQUIRED_PARQUET:
@@ -107,6 +112,29 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
                 f"schema-two Parquet hash mismatch for {name}"
             )
     return value
+
+
+def snapshot_partial_wallets(parquet_dir: str | None = None) -> set[str]:
+    """Wallets that were partially backfilled when this snapshot was taken.
+
+    Ranking must exclude these as well as the currently marked set: a wallet
+    partial at export time and completed since would otherwise pass the live
+    check while DuckDB reads its partial rows out of the snapshot.
+    """
+    import duckdb
+
+    _, parquet_dir, _ = engine_settings(None, parquet_dir, None)
+    path = os.path.join(parquet_dir, WALLET_COMPLETENESS_PARQUET)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"snapshot completeness projection missing: {path}")
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            f"SELECT wallet_hex FROM read_parquet('{_q(path)}') WHERE backfill_partial = 1"
+        ).fetchall()
+    finally:
+        con.close()
+    return {str(r[0]).lower() for r in rows if r[0] is not None}
 
 
 def _snapshot_state(parquet_dir: str, max_age_hours: float,

@@ -462,6 +462,13 @@ def scan_and_filter_sqlite(conn, w, prm, res, sched, diag):
     return positions
 
 
+def _cache_has_partial_marker(conn) -> bool:
+    """True iff this cache carries the #608 quarantine marker. A cache without it
+    has no quarantine, so a Parquet snapshot needs no completeness evidence."""
+    return any(row[1] == "backfill_partial"
+               for row in conn.execute("PRAGMA table_info(wallets)"))
+
+
 def main() -> int:
     prm = parse_args()
     os.makedirs(prm.out_dir, exist_ok=True)
@@ -498,6 +505,31 @@ def main() -> int:
     # Market maps (resolutions + schedules) are only needed by the SQLite path; the
     # DuckDB path joins them in SQL over the Parquet snapshot.
     engine = ranker_duck.get_engine(schema_version=schema_version)
+    if engine is not None and schema_version < 2 and _cache_has_partial_marker(conn):
+        # DuckDB reads the Parquet snapshot, not the live cache, so the live marker
+        # check above is not sufficient on its own: a wallet partial when the
+        # snapshot was taken and completed since would pass it while its partial
+        # rows are what actually get ranked. A wallet is usable only if it was
+        # complete then AND is complete now. Without that evidence the snapshot
+        # cannot be trusted, so fall back to SQLite rather than rank blind.
+        try:
+            snapshot_partial = ranker_duck.snapshot_partial_wallets()
+        except FileNotFoundError as error:
+            if ranker_duck.engine_settings(None, None, None)[0] == "duck":
+                raise
+            log(f"{error} -> SQLite path (re-export to use DuckDB)")
+            engine.close()
+            engine = None
+        else:
+            if snapshot_partial:
+                before = len(wallets)
+                wallets = [w for w in wallets if w.lower() not in snapshot_partial]
+                log(f"snapshot completeness filter: {before} -> {len(wallets)} wallets "
+                    f"({len(snapshot_partial)} partial when the Parquet was exported)")
+            if not wallets:
+                log("empty universe after the snapshot completeness filter")
+                conn.close()
+                return 76
     res, sched = (None, None) if engine is not None else load_market_maps(conn)
 
     decay = "flat (no decay)" if prm.half_life_days <= 0 else f"half_life={prm.half_life_days}d"

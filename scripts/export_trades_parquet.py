@@ -32,6 +32,12 @@ import time
 # `market_schedules` now also carries `start_date_unix` (issue #421 PR4); it rides along free via
 # `SELECT *`, so no change is needed here for that column.
 TABLES = ("trades", "market_resolutions", "market_schedules")
+# The quarantine projection (#608). Ranking excludes partial wallets, but the
+# exclusion is only sound if it is evaluated against the SAME history the
+# extraction reads: a wallet partial when this snapshot was taken and completed
+# afterwards passes a live marker check while DuckDB still reads its partial
+# rows. Exported so `ranker_duck` can exclude the snapshot-era set as well.
+WALLET_COMPLETENESS = "wallet_completeness"
 # OPTIONAL tables (issue #421 PR4 — the CLV price series; #429 PR4 — its token→outcome map).
 # Absent on a pre-migration cache (the export attaches READ_ONLY and does not run schema), so each
 # is skipped with a warning rather than aborting the whole export. `ranker_duck.py` registers each
@@ -85,6 +91,37 @@ def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     size_gb = os.path.getsize(final) / 1e9
     log(f"{tbl}: {n:,} rows -> {final} ({size_gb:.2f} GB)")
     return int(n)
+
+
+def _export_wallet_completeness(con, out_dir: str, row_group_size: int) -> bool:
+    """Export `wallet_hex, backfill_partial` for schema one. Returns False when the
+    cache predates the marker, after removing any stale file so a snapshot never
+    carries completeness evidence that does not belong to it.
+    """
+    final = os.path.join(out_dir, f"{WALLET_COMPLETENESS}.parquet")
+    has_column = False
+    if _table_exists(con, "wallets"):
+        try:
+            con.execute("SELECT backfill_partial FROM src.wallets LIMIT 0;")
+            has_column = True
+        except Exception:  # noqa: BLE001 — only failure mode here is "column absent"
+            has_column = False
+    if not has_column:
+        if os.path.exists(final):
+            os.remove(final)
+            log(f"{WALLET_COMPLETENESS}: marker absent -> removed stale {final}")
+        else:
+            log(f"{WALLET_COMPLETENESS}: marker absent (pre-#608 cache) -> skipped")
+        return False
+    tmp = final + ".tmp"
+    con.execute(
+        f"COPY (SELECT wallet_hex, backfill_partial FROM src.wallets) TO '{_q(tmp)}' "
+        f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)});"
+    )
+    os.replace(tmp, final)
+    n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')").fetchone()[0]
+    log(f"{WALLET_COMPLETENESS}: {n:,} rows -> {final}")
+    return True
 
 
 def _projection_rows(con, relation_prefix: str) -> list[dict]:
@@ -234,6 +271,7 @@ def main() -> int:
                 _export_table(con, a.out_dir, tbl, a.row_group_size)
             else:
                 log(f"{tbl}: table absent (pre-migration cache) -> skipped")
+        _export_wallet_completeness(con, a.out_dir, a.row_group_size)
 
     log(f"export complete in {time.time() - t0:.0f}s -> {a.out_dir}")
     return 0

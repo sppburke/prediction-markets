@@ -200,6 +200,64 @@ def positions_set(path: str) -> set[tuple]:
     return out
 
 
+class SnapshotQuarantineTest(unittest.TestCase):
+    """#608: the Parquet snapshot must carry its own completeness evidence.
+
+    A wallet partial when the snapshot was exported and completed afterwards
+    passes a live marker check, but DuckDB still reads its partial rows, so
+    ranking it would use history the quarantine was meant to withhold.
+    """
+
+    def _cache_with_marker(self, db: str, partial: str | None) -> None:
+        build_parity_cache(db)
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, "
+                         "backfill_partial INTEGER NOT NULL DEFAULT 0, "
+                         "is_active INTEGER DEFAULT 1, is_infra INTEGER DEFAULT 0)")
+            for wallet in {W("a"), W("b")}:
+                conn.execute("INSERT INTO wallets(wallet_hex, backfill_partial) VALUES (?,?)",
+                             (wallet, 1 if wallet == partial else 0))
+
+    def _ranked(self, tmp: str, db: str, pq: str, tag: str) -> list[str]:
+        out = str(Path(tmp) / tag)
+        self.assertEqual(run_pass1(db, out, "duck", pq), 0)
+        return [r["wallet"] for r in read_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))]
+
+    def test_recovered_wallet_is_not_ranked_from_a_stale_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "cache.db"), str(Path(tmp) / "parquet")
+            self._cache_with_marker(db, partial=W("a"))
+            export(db, pq)  # snapshot taken while 0xaaa.. was still partial
+            self.assertTrue(os.path.exists(os.path.join(pq, "wallet_completeness.parquet")))
+            # Backfill completes; the next export fails, so the snapshot is unchanged.
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE wallets SET backfill_partial = 0")
+            stale = self._ranked(tmp, db, pq, "stale")
+            self.assertNotIn(W("a"), stale,
+                             "ranked a wallet from history that was partial when exported")
+            # Re-exporting is what makes it usable again.
+            export(db, pq)
+            fresh = self._ranked(tmp, db, pq, "fresh")
+            self.assertIn(W("a"), fresh, "a re-exported complete wallet must rank again")
+
+    def test_snapshot_without_evidence_falls_back_instead_of_ranking_blind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "cache.db"), str(Path(tmp) / "parquet")
+            self._cache_with_marker(db, partial=None)
+            export(db, pq)
+            os.remove(os.path.join(pq, "wallet_completeness.parquet"))
+            with self.assertRaises(FileNotFoundError):
+                # Forced duck must fail closed rather than silently rank.
+                self._ranked(tmp, db, pq, "forced")
+            # A cache with no quarantine at all needs no evidence.
+            plain = str(Path(tmp) / "plain.db")
+            build_parity_cache(plain)
+            pq2 = str(Path(tmp) / "parquet2")
+            export(plain, pq2)
+            self.assertFalse(os.path.exists(os.path.join(pq2, "wallet_completeness.parquet")))
+            self.assertEqual(run_pass1(plain, str(Path(tmp) / "plainout"), "duck", pq2), 0)
+
+
 class DuckParityTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_schema_two_verified_projection_and_engine_refusal(self) -> None:
