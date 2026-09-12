@@ -249,6 +249,13 @@ The cutoff must be at or below the stored frontier and the marker must be zero,
 checked from one consistent snapshot with the rows. The auditor walks full
 activity with complete boundary-second pagination, mirrors DTO/conversion rules,
 and reports per-UTC-day counts and the symmetric transaction-ID difference.
+That mirroring is enforced, not asserted: the auditor and the Rust writer both
+read `crates/bootstrap/tests/fixtures/dto_parity.jsonl`, so any input the two
+parsers judge differently fails CI. Python's `json` and `Decimal` accept several
+inputs serde rejects — duplicate recognized fields, `NaN`/`Infinity`, the `-0`
+literal in an integer field, surrounding whitespace, Unicode digits and unpaired
+surrogates — and serde accepts some the auditor must not reject, such as a
+repeated field the DTO ignores. Extend the corpus when either parser changes.
 It reports intra-wallet collisions **before** collapsing IDs, with all conflicting
 normalized rows and the stored representative. A failed page or saturated second
 refuses comparison. Acceptance requires an empty difference for that completed

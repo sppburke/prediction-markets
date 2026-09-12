@@ -133,8 +133,17 @@ def parse_page(payload):
                     raise ValueError(f"duplicate DTO field: {name!r}")
                 seen.add(name)
         for key in ("transactionHash", "conditionId", "side"):
-            if not isinstance(row.get(key), str):
+            text = row.get(key)
+            if not isinstance(text, str):
                 raise ValueError(f"invalid DTO {key}")
+            # serde_json fails the page on an unpaired surrogate while building
+            # a String, but accepts one inside a field the DTO ignores, so this
+            # check belongs to the recognized string fields only. Python's json
+            # decodes lone surrogates happily; encoding is what rejects them.
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError(f"invalid DTO {key}: unpaired surrogate") from error
         value = dict(row)
         value["price"] = _decimal(row.get("price"))
         value["size"] = _decimal(row.get("size"))

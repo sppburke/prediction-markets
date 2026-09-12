@@ -696,6 +696,39 @@ mod tests {
     use super::*;
     use crate::cache::WalletCache;
 
+    /// Writer/auditor DTO parity. `scripts/audit_wallet_history.py` claims to
+    /// mirror this parser (docs/26), but Python's json and decimal accept
+    /// several inputs serde rejects and vice versa. Both sides read this one
+    /// corpus so a divergence fails CI instead of shipping a false-clean audit.
+    #[test]
+    fn dto_parity_corpus_matches_the_writer() {
+        let corpus = include_str!("../tests/fixtures/dto_parity.jsonl");
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let mut checked = 0usize;
+        let mut accepted = 0usize;
+        for line in corpus.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            let name = record["name"].as_str().unwrap();
+            let page = record["page"].as_str().unwrap();
+            let expected = record["writer_accepts"].as_bool().unwrap();
+            let actual = parse_trade_page(page.as_bytes(), wallet).is_ok();
+            assert_eq!(actual, expected, "parity case {name:?}: page {page:?}");
+            checked += 1;
+            accepted += usize::from(expected);
+        }
+        // Guard against an emptied or one-sided corpus silently passing.
+        assert!(checked >= 100, "corpus shrank to {checked} cases");
+        assert!(accepted >= 20, "corpus has only {accepted} accepted cases");
+        assert!(
+            checked - accepted >= 20,
+            "corpus has only {} rejected cases",
+            checked - accepted
+        );
+    }
+
     /// A fetcher that returns `RateLimited` for the first `rate_limit_count` calls,
     /// then delegates to an inner `FixtureFetcher`. Tests that rate-limited pages
     /// are retried rather than causing the wallet to be skipped.

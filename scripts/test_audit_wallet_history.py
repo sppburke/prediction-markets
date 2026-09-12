@@ -103,6 +103,32 @@ class AuditHistoryTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(len(audit.parse_page(json.dumps([{**row(), "size": value}]))), 1)
 
+    def test_dto_parity_corpus_matches_the_writer(self):
+        """The runbook claims this auditor mirrors the Rust writer's whole-page
+        validation. Both read this one corpus, so a divergence fails CI instead
+        of shipping an audit that certifies a page the writer cannot ingest.
+        """
+        corpus = (Path(__file__).resolve().parent.parent
+                  / "crates/bootstrap/tests/fixtures/dto_parity.jsonl")
+        checked = accepted = 0
+        for line in corpus.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            record = json.loads(line)
+            try:
+                audit.parse_page(record["page"])
+                ours = True
+            except ValueError:
+                ours = False
+            with self.subTest(case=record["name"]):
+                self.assertEqual(ours, record["writer_accepts"], record["page"])
+            checked += 1
+            accepted += bool(record["writer_accepts"])
+        # Guard against an emptied or one-sided corpus silently passing.
+        self.assertGreaterEqual(checked, 100)
+        self.assertGreaterEqual(accepted, 20)
+        self.assertGreaterEqual(checked - accepted, 20)
+
     def test_collisions_are_reported_before_id_deduplication(self):
         venue = converted([row(), {**row(), "outcomeIndex": 1}, row()])
         result = audit.compare(venue, venue[:1])
