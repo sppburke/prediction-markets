@@ -5050,9 +5050,15 @@ fn verify_live_preparation_posture(
     source_log_path: &Path,
     status_path: &Path,
 ) -> Result<LogTailBinding, QualificationError> {
-    let source_envelopes = Reader::replay(source_log_path)?
-        .map(|item| item.map(|(_, envelope)| envelope))
-        .collect::<Result<Vec<_>, _>>()?;
+    let scan = Scanner::inspect(source_log_path)?;
+    let mut source_envelopes = Vec::new();
+    if Scanner::walk_prefix(&scan.verified_tail, &mut |_, envelope| {
+        source_envelopes.push(envelope.clone());
+    })?
+    .is_none()
+    {
+        return insufficient("source prefix did not match its verified binding");
+    }
     let before = pe_execution_core::LiveJournal::verified_tail(live_path).map_err(|error| {
         QualificationError::InsufficientEvidence(format!("live journal: {error}"))
     })?;
@@ -10458,6 +10464,223 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    fn financial_era_live_source_fixture(root: &Path) -> (FinancialEraManifest, ServiceConfig) {
+        let paper_log = root.join("paper.log");
+        let source_log = root.join("source.log");
+        let live_journal = root.join("live_journal.log");
+        let paper_state = root.join("paper.db");
+        let status_path = root.join("status.json");
+        drop(Writer::open(&paper_log).unwrap());
+        drop(PaperStateDb::open(&paper_state).unwrap());
+        let mut source_writer = Writer::open(&source_log).unwrap();
+        let journal = LiveJournal::open(&live_journal).unwrap();
+        let account_id = AccountId::new("live-a").unwrap();
+        let binding = pe_execution_core::CredentialBindingIdentity {
+            version: 1,
+            key_id: "key".to_owned(),
+        };
+        let observed_at = OffsetDateTime::from_unix_timestamp(1).unwrap();
+        let account_state = authenticated_boundary_state(&account_id, &binding, observed_at);
+        let mut baseline = boundary_baseline(&account_id, &binding, &account_state, 1);
+        let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut baseline else {
+            unreachable!();
+        };
+        mark.venue_position_evidence =
+            append_empty_position_sources(&mut source_writer, &mark.account_binding, observed_at);
+        journal.append(account_id, observed_at, baseline).unwrap();
+        drop(journal);
+        drop(source_writer);
+        fs::write(
+            &status_path,
+            br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"live-a","requested_live_mode":"off","effective_live_mode":"off","armed":false}]}}"#,
+        )
+        .unwrap();
+        let config = ServiceConfig {
+            event_log_path: paper_log.clone(),
+            source_event_log_path: source_log.clone(),
+            paper_state_db_path: paper_state.clone(),
+            status_path,
+            ..ServiceConfig::default()
+        };
+        let manifest = FinancialEraManifest {
+            kind: FINANCIAL_ERA_KIND.to_owned(),
+            state: "prepared".to_owned(),
+            activation_id: "act-545".to_owned(),
+            generation: "g557".to_owned(),
+            fresh_bankroll: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+            target_revision: "1".repeat(40),
+            artifact_blake3: "a".repeat(64),
+            static_config_hash: "b".repeat(64),
+            ranking_batch_id: 545,
+            membership: Vec::new(),
+            schema_version: 3,
+            parser_version: 1,
+            financial_semantic_version: 1,
+            start_unix: 1_700_000_000,
+            paths: FinancialEraPaths {
+                paper_log,
+                source_log,
+                live_journal,
+                paper_state,
+            },
+            old_artifact_sha256: "d".repeat(64),
+            target_artifact_sha256: "e".repeat(64),
+            old_config_sha256: "f".repeat(64),
+            target_config_sha256: "0".repeat(64),
+            old_environment_sha256: "1".repeat(64),
+            target_environment_sha256: "2".repeat(64),
+            preparation: None,
+            stop_invoked: false,
+            service_was_active: None,
+            backup: None,
+            remote_census: None,
+            guarded_logs: None,
+            start_receipt: None,
+            started_unix: None,
+        };
+        (manifest, config)
+    }
+
+    fn append_partial_source_frame(path: &Path) {
+        use std::io::Write as _;
+
+        let (offset, _, _) = Reader::replay_with_offsets(path)
+            .unwrap()
+            .last()
+            .unwrap()
+            .unwrap();
+        let bytes = fs::read(path).unwrap();
+        let last_frame = &bytes[usize::try_from(offset).unwrap()..];
+        assert!(last_frame.len() > 8);
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&last_frame[..last_frame.len() / 2]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn financial_live_posture_accepts_partial_source_tail_with_unchanged_live_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config) = financial_era_live_source_fixture(temp.path());
+        let paths = &manifest.paths;
+        let live_binding = LiveJournal::verified_tail(&paths.live_journal).unwrap();
+        assert_eq!(
+            verify_live_preparation_posture(
+                &paths.live_journal,
+                &paths.source_log,
+                &config.status_path,
+            )
+            .unwrap(),
+            live_binding
+        );
+        let source_binding = Scanner::verify(&paths.source_log).unwrap();
+        append_partial_source_frame(&paths.source_log);
+        let scan = Scanner::inspect(&paths.source_log).unwrap();
+        assert_eq!(scan.verified_tail, source_binding);
+        assert!(scan.incomplete_tail.is_some());
+        assert_eq!(
+            verify_live_preparation_posture(
+                &paths.live_journal,
+                &paths.source_log,
+                &config.status_path,
+            )
+            .unwrap(),
+            live_binding
+        );
+    }
+
+    #[test]
+    fn financial_rollback_check_accepts_partial_source_tail_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config) = financial_era_live_source_fixture(temp.path());
+        let complete = rollback_check_financial_era(&manifest, &config).unwrap();
+        assert_eq!(complete, r#"{"complete_start":false,"repaired":false}"#);
+        append_partial_source_frame(&manifest.paths.source_log);
+        let before = fs::read(&manifest.paths.source_log).unwrap();
+
+        assert_eq!(
+            rollback_check_financial_era(&manifest, &config).unwrap(),
+            complete
+        );
+        assert_eq!(fs::read(&manifest.paths.source_log).unwrap(), before);
+    }
+
+    #[test]
+    fn financial_prepare_rejects_partial_source_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config) = financial_era_live_source_fixture(temp.path());
+        let rows = financial_config_rows();
+        prepare_financial_era(&manifest, &config, &rows).unwrap();
+        let prefix = Scanner::verify(&manifest.paths.source_log).unwrap();
+        append_partial_source_frame(&manifest.paths.source_log);
+        let before = fs::read(&manifest.paths.source_log).unwrap();
+
+        assert!(matches!(
+            prepare_financial_era(&manifest, &config, &rows),
+            Err(QualificationError::EventLog(pe_event_log::LogError::Truncated {
+                byte_offset, ..
+            })) if byte_offset == prefix.physical_tail
+        ));
+        assert_eq!(fs::read(&manifest.paths.source_log).unwrap(), before);
+    }
+
+    #[test]
+    fn financial_rollback_check_rejects_receipt_missing_from_partial_source_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config) = financial_era_live_source_fixture(temp.path());
+        rollback_check_financial_era(&manifest, &config).unwrap();
+        let path = &manifest.paths.source_log;
+        let (offset, missing_sequence, _) = Reader::replay_with_offsets(path)
+            .unwrap()
+            .last()
+            .unwrap()
+            .unwrap();
+        let bytes = fs::read(path).unwrap();
+        let offset = usize::try_from(offset).unwrap();
+        fs::write(path, &bytes[..offset + (bytes.len() - offset) / 2]).unwrap();
+        let scan = Scanner::inspect(path).unwrap();
+        assert_eq!(scan.verified_tail.last_sequence, Some(EventSeq(0)));
+        assert_eq!(
+            scan.incomplete_tail.unwrap().next_sequence,
+            missing_sequence
+        );
+        let before = fs::read(path).unwrap();
+
+        assert!(matches!(
+            rollback_check_financial_era(&manifest, &config),
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("retained complete-position evidence is missing, malformed, or inconsistent")
+        ));
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn financial_rollback_check_rejects_interior_crc_damage_with_partial_source_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config) = financial_era_live_source_fixture(temp.path());
+        rollback_check_financial_era(&manifest, &config).unwrap();
+        let path = &manifest.paths.source_log;
+        let (second_offset, _, _) = Reader::replay_with_offsets(path)
+            .unwrap()
+            .nth(1)
+            .unwrap()
+            .unwrap();
+        append_partial_source_frame(path);
+        let mut bytes = fs::read(path).unwrap();
+        bytes[usize::try_from(second_offset).unwrap() - 1] ^= 0xff;
+        fs::write(path, &bytes).unwrap();
+
+        assert!(matches!(
+            rollback_check_financial_era(&manifest, &config),
+            Err(QualificationError::EventLog(
+                pe_event_log::LogError::CrcMismatch {
+                    at_seq: EventSeq(0),
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]

@@ -537,6 +537,24 @@ is inert, then starts the old service and records `rolled_back`. A no-mutation r
 remote restore and refresh. At or after Start, rollback is forbidden: preserve the append-only era and
 recover with a compatible reader.
 
+An existing `prepared` manifest remains bound to its original target. To replace it with a new
+release, first run `--rollback-before-start` with the same target/config/environment, evidence,
+and membership arguments recorded by that manifest. From `prepared`, a successful no-Start check
+records `rolled_back` with `no_financial_mutation: true`. Rollback-check reads the verified source
+prefix and tolerates a partial trailing source frame without writing to that log; the later stopped
+`prepare` scan remains strict.
+
+Before fresh activation, archive that no-mutation manifest under the existing deploy lock. Acquire
+the provisioned `~/.pe-deploy.lock` exactly as the driver does (`exec 9<"$DEPLOY_LOCK"` followed by
+`flock -n 9`, with `DEPLOY_LOCK` naming that existing file). While holding the lock, re-check the
+expected `activation_id`, `state == rolled_back`, and `no_financial_mutation == true`; refuse if
+any differ. Rename `~/pe-financial-era.json` to the unique, previously absent
+`~/pe-financial-era.<activation_id>.<utc>.rolled_back.json`, then `fsync` the parent directory as
+in `scripts/deploy/generation_common.sh::atomic_manifest_json`, and only then release the lock.
+A `rolled_back` manifest at the fixed path refuses forward activation because it requires a new
+activation identity; the driver creates a fresh manifest only when that path is absent. Proceed
+with the new release's build, staged release tree, SHA-bound rehearsal PASS, and fresh activation.
+
 Before Start, an unfinished rollback with durable `qualification_start_intent` must restore the
 complete SQLite backup even when the main-file hash is unchanged: the reset can have committed
 only into the write-ahead log. Restoration requires an inert service and verified archive, backup,
