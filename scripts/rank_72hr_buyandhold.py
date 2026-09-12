@@ -52,6 +52,7 @@ re-run and independently verified.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import math
 import os
@@ -501,6 +502,14 @@ def main() -> int:
     # the unlimited universe, then the slice is taken. Truncating first would let the
     # limit consume slots with wallets the snapshot filter is about to drop.
     engine = ranker_duck.get_engine(schema_version=schema_version)
+    # Shared for as long as the snapshot is in use. The completeness check below
+    # validates file identities, but DuckDB reads those pathnames later, so an
+    # exporter replacing them in between would feed unfinished history into
+    # extraction with both exclusion checks already passed. The exporter takes
+    # this lock exclusively, so it cannot swap files underneath us.
+    snapshot_guard = contextlib.ExitStack()
+    if engine is not None:
+        snapshot_guard.enter_context(ranker_duck.snapshot_lock(exclusive=False))
     if engine is not None and schema_version < 2 and _cache_has_partial_marker(conn):
         # DuckDB reads the Parquet snapshot, not the live cache, so the live marker
         # check above is not sufficient on its own: a wallet partial when the
@@ -529,6 +538,7 @@ def main() -> int:
     if not wallets and schema_version < 2:
         log("empty universe after completeness filter")
         conn.close()
+        snapshot_guard.close()
         return 76
 
     res, sched = (None, None) if engine is not None else load_market_maps(conn)
@@ -598,6 +608,8 @@ def main() -> int:
     # Every history read is done, so end the snapshot and release the read lock.
     # Leaving it open would block a later writer for the rest of the process.
     conn.close()
+    # Extraction is complete; let an exporter replace the snapshot again.
+    snapshot_guard.close()
     log(f"extraction done in {time.time()-t0:.0f}s")
     log(f"  diagnostics: {diag}")
     log(f"wrote {pos_path}  ({total_qualified:,} positions)")

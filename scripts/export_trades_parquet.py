@@ -324,6 +324,16 @@ def main() -> int:
     import duckdb
 
     os.makedirs(a.out_dir, exist_ok=True)
+    # Exclusive for the whole export: readers must not see a half-replaced
+    # snapshot, and must not have a validated one swapped underneath them.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ranker_duck
+
+    with ranker_duck.snapshot_lock(a.out_dir, exclusive=True):
+        return _export(a, duckdb)
+
+
+def _export(a, duckdb) -> int:
     con = duckdb.connect()
     con.execute("INSTALL sqlite_scanner;")
     con.execute("LOAD sqlite_scanner;")

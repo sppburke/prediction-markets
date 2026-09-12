@@ -37,6 +37,7 @@ import math
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -269,6 +270,35 @@ class SnapshotQuarantineTest(unittest.TestCase):
             # A complete re-export repairs the binding.
             export(db, pq)
             self.assertEqual(ranker_duck.snapshot_partial_wallets(pq), set())
+
+    def test_export_and_ranking_cannot_overlap(self) -> None:
+        """A validated snapshot must not be replaceable while extraction reads it.
+        The exporter takes the snapshot lock exclusively and ranking holds it
+        shared, so the two serialise instead of racing over mutable pathnames.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pq = str(Path(tmp) / "parquet")
+            lock = os.path.join(pq, ranker_duck.SNAPSHOT_LOCK)
+
+            def try_take(mode: str) -> bool:
+                """Non-blocking acquire from another process; True iff granted."""
+                return subprocess.run(
+                    ["flock", mode, "-n", lock, "-c", "true"],
+                    capture_output=True).returncode == 0
+
+            # A reader holds it shared: another reader may join, a writer may not.
+            with ranker_duck.snapshot_lock(pq, exclusive=False):
+                self.assertTrue(try_take("-s"), "a second reader must be allowed")
+                self.assertFalse(try_take("-x"),
+                                 "an exporter must not replace a snapshot being read")
+            # Released: a writer can proceed.
+            self.assertTrue(try_take("-x"), "the lock must release")
+
+            # A writer holds it exclusive: no reader may start mid-replacement.
+            with ranker_duck.snapshot_lock(pq, exclusive=True):
+                self.assertFalse(try_take("-s"),
+                                 "ranking must not start on a half-written snapshot")
+            self.assertTrue(try_take("-s"), "the lock must release")
 
     def test_completion_during_the_export_is_not_bound(self) -> None:
         """A wallet completing between the trade export and the completeness

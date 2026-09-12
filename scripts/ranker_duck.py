@@ -28,6 +28,8 @@ Engine selection (env, overridable by the caller):
 from __future__ import annotations
 
 import json
+import contextlib
+import fcntl
 import hashlib
 import os
 import time
@@ -114,6 +116,38 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
                 f"schema-two Parquet hash mismatch for {name}"
             )
     return value
+
+
+SNAPSHOT_LOCK = ".parquet_snapshot.lock"
+
+
+@contextlib.contextmanager
+def snapshot_lock(parquet_dir: str | None = None, *, exclusive: bool):
+    """Serialise Parquet snapshot writers against readers.
+
+    The exporter replaces `trades.parquet` and `wallet_completeness.parquet` with
+    `os.replace`, and DuckDB reads them later through views over those pathnames.
+    Without this, a snapshot validated as complete can be swapped for one written
+    from an unfinished walk before extraction reads it, and both exclusion checks
+    still pass. Writers take it exclusive, readers shared, so an export cannot
+    replace files a ranking run is reading, and a ranking run cannot start on a
+    snapshot mid-replacement.
+
+    Mirrors the `flock` coordination `rank_and_push.sh` already uses, on a
+    persistent inode inside the snapshot directory.
+    """
+    _, parquet_dir, _ = engine_settings(None, parquet_dir, None)
+    os.makedirs(parquet_dir, exist_ok=True)
+    path = os.path.join(parquet_dir, SNAPSHOT_LOCK)
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield path
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def snapshot_partial_wallets(parquet_dir: str | None = None) -> set[str]:
