@@ -371,7 +371,7 @@ async fn main() {
                         let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                             &bootstrap_config.cache_path,
                         )?;
-                        let mut cache = WalletCache::open(&bootstrap_config.cache_path)?;
+                        let mut cache = WalletCache::open_configured(&bootstrap_config)?;
                         pe_bootstrap::populate_clob_payout_v2(&bootstrap_config, &mut cache)
                             .await
                             .and_then(json_report)
@@ -555,7 +555,7 @@ async fn main() {
         // Genuine readers return above through `open_read_only`.
         let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
-        let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
+        let mut cache = match WalletCache::open_configured(&bootstrap_config) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: cache open failed");
@@ -1075,7 +1075,7 @@ async fn main() {
     // No-arg → run "all" with strict=false (soft-fail default). It follows the
     // same central lock-before-open contract as the named `all` command (#544).
     let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, "all");
-    let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
+    let mut cache = match WalletCache::open_configured(&bootstrap_config) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "bootstrap: cache open failed");

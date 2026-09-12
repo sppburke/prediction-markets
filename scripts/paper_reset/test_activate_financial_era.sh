@@ -32,7 +32,10 @@ reject_text() {
   fi
 }
 
-bash -n "$DRIVER" "$COMMON" "$GENERATION" "$ROLLBACK" "$REHEARSAL" "$REHEARSAL_PREFLIGHT"
+# Per file: `bash -n a b` checks only the first and treats the rest as positional arguments.
+for script in "$DRIVER" "$COMMON" "$GENERATION" "$ROLLBACK" "$REHEARSAL" "$REHEARSAL_PREFLIGHT"; do
+  bash -n "$script" || fail "syntax error in $script"
+done
 REPOSITORY_HARNESS_BUNDLE_SHA256=$(bash -c \
   'source "$1"; harness_bundle_digest "$2"' bash "$COMMON" "$REPO_ROOT/scripts/deploy") ||
   fail "could not derive the repository rehearsal harness bundle"
@@ -601,7 +604,15 @@ db.close()' \
     if [[ -f "$state/complete-start" ]]; then
       echo '{"complete_start":true,"receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}'
     else
-      [[ ! -f "$state/rollback-error" ]] || exit 95
+      if [[ -f "$state/rollback-error" ]]; then
+        echo 'rollback-error stdout marker'
+        echo 'rollback-error stderr marker' >&2
+        exit 95
+      fi
+      if [[ -f "$state/rollback-output" ]]; then
+        cat "$state/rollback-output"
+        exit 0
+      fi
       echo '{"complete_start":false,"repaired":false}'
     fi
     ;;
@@ -2598,7 +2609,8 @@ done
 # Scenario FE-START-UNKNOWN-02
 # Preconditions: stopped service with no Start and a completed stop receipt.
 # Injected boundary: `service-stopped`, followed by an unreadable Start scan.
-# PASS: rollback refuses before any restore. FAIL: unknown is treated as no Start or restore runs.
+# PASS: rollback preserves stdout/stderr diagnostics and refuses before any restore.
+# FAIL: unknown is treated as no Start, diagnostics are lost, or restore runs.
 root=$TEST_TMP/start-unknown
 setup_fixture "$root"
 driver_args "$root"
@@ -2614,7 +2626,24 @@ status=$?
 set -e
 [[ $status -ne 0 && "$output" == *'QualificationStarted state is unknown'* ]] ||
   fail "unknown Start state did not block rollback"
+[[ "$output" == *'rollback-check output: rollback-error stdout marker'* ]] ||
+  fail "unknown Start state discarded rollback-check stdout: $output"
+grep -Fxq 'rollback-error stderr marker' <<< "$output" ||
+  fail "unknown Start state changed or discarded rollback-check stderr: $output"
 [[ ! -e "$root/test-state/restore-count" ]] || fail "unknown Start state reached restore"
+rm "$root/test-state/rollback-error"
+for rollback_output in 'invalid-json' '{}' '{"complete_start":"false"}' 'null' '[]' '0' '"x"'; do
+  printf '%s\n' "$rollback_output" > "$root/test-state/rollback-output"
+  set +e
+  output=$(run_driver "$root" --rollback-before-start 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 && "$output" == *'QualificationStarted state is unknown'* ]] ||
+    fail "invalid Start output did not block rollback: $output"
+  [[ "$output" == *"rollback-check output: $rollback_output"* ]] ||
+    fail "invalid Start output was discarded: $output"
+  [[ ! -e "$root/test-state/restore-count" ]] || fail "invalid Start output reached restore"
+done
 
 # Scenario FE-ROLLBACK-NOMUT-03
 # Preconditions: guarded service with no remote archive and no local Start attempt.
@@ -3144,4 +3173,221 @@ PY
 done
 echo 'PASS: FE-ROLLBACK-RESUMED-WRITES-13'
 
-echo "PASS: 62 scenario contracts, including WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+
+# ── FE-STREAMHASH-63: the three embedded Python hashes must not allocate per file size ──────────
+# #545 attempt 14 aborted AFTER stopping production and taking the backup, with MemoryError, because
+# each of these blocks read a whole file (the source log is 13.76 GB on a 1,967 MB host). Both the
+# file length AND the recorded prefix length exceed the address-space limit below, so the prefix
+# verifier's allocation — which is driven by the recorded `bytes` — is genuinely exercised.
+sh63_root=$TEST_TMP/streamhash
+mkdir -p "$sh63_root"
+sh63_limit_kib=262144                                    # 256 MiB address space
+sh63_big=$sh63_root/big.log                              # 320 MiB payload > the limit
+python3 - "$sh63_big" <<'FIXTURE' || fail "FE-STREAMHASH-63 could not build the fixture"
+import sys
+block = b"pe-financial-era streaming hash fixture\n" * 26215
+block = block[: 1 << 20] if len(block) >= (1 << 20) else block + b"\0" * ((1 << 20) - len(block))
+with open(sys.argv[1], "wb") as handle:
+    for _ in range(320):
+        handle.write(block)
+FIXTURE
+printf 'trailing suffix beyond the recorded prefix\n' >> "$sh63_big"
+sh63_prefix_bytes=$(( 288 * 1024 * 1024 ))               # recorded prefix also > the limit
+sh63_prefix_sha=$(head -c "$sh63_prefix_bytes" "$sh63_big" | sha256sum | cut -d' ' -f1)
+sh63_full_sha=$(sha256sum "$sh63_big" | cut -d' ' -f1)
+sh63_full_bytes=$(stat -c %s "$sh63_big")
+
+sh63_manifest() {
+  python3 - "$1" "$sh63_big" "$2" "$3" <<'WRITE'
+import json, sys
+manifest, path, sha, size = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+logs = {name: {"path": path, "sha256": sha, "bytes": size} for name in ("paper", "source", "live")}
+json.dump({"guarded_logs": logs}, open(manifest, "w"), sort_keys=True)
+WRITE
+}
+sh63_manifest "$sh63_root/whole.json" "$sh63_full_sha" "$sh63_full_bytes"
+sh63_manifest "$sh63_root/prefix.json" "$sh63_prefix_sha" "$sh63_prefix_bytes"
+
+# Extract each verifier verbatim from the shipped driver and run it in a constrained subprocess.
+sed -n '/^verify_guarded_log_identities() {/,/^}/p' "$DRIVER" > "$sh63_root/identities.sh"
+sed -n '/^verify_guarded_log_prefixes() {/,/^}/p' "$DRIVER" > "$sh63_root/prefixes.sh"
+[[ -s "$sh63_root/identities.sh" && -s "$sh63_root/prefixes.sh" ]] ||
+  fail "FE-STREAMHASH-63 could not extract the verifier bodies"
+
+MANIFEST="$sh63_root/whole.json" bash -c "ulimit -v $sh63_limit_kib
+source '$sh63_root/identities.sh'; verify_guarded_log_identities" ||
+  fail "FE-STREAMHASH-63 identity verifier failed under a ${sh63_limit_kib} KiB limit"
+
+MANIFEST="$sh63_root/prefix.json" bash -c "ulimit -v $sh63_limit_kib
+source '$sh63_root/prefixes.sh'; verify_guarded_log_prefixes" ||
+  fail "FE-STREAMHASH-63 prefix verifier failed under a ${sh63_limit_kib} KiB limit"
+
+# The recording block, taken verbatim from the driver, in a fresh constrained subprocess.
+sed -n '/patch=\$(python3 -c/,/"\$backup_path" "\$backup_sha"/p' "$DRIVER" > "$sh63_root/record.sh"
+[[ -s "$sh63_root/record.sh" ]] || fail "FE-STREAMHASH-63 could not extract the recording block"
+sh63_patch=$(bash -c "ulimit -v $sh63_limit_kib
+backup_path=/tmp/backup.db; backup_sha=deadbeef; guarded_paper_state_sha=cafebabe; census='{}'
+paper_log='$sh63_big'; source_log='$sh63_big'; live_journal='$sh63_big'
+source '$sh63_root/record.sh'
+printf '%s' \"\$patch\"") ||
+  fail "FE-STREAMHASH-63 recording block failed under a ${sh63_limit_kib} KiB limit"
+python3 - "$sh63_patch" "$sh63_full_sha" "$sh63_full_bytes" <<'CHECK' ||
+import json, sys
+patch, sha, size = json.loads(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+logs = patch["guarded_logs"]
+assert set(logs) == {"paper", "source", "live"}, logs
+for row in logs.values():
+    assert row["sha256"] == sha, (row["sha256"], sha)
+    assert row["bytes"] == size, (row["bytes"], size)
+CHECK
+  fail "FE-STREAMHASH-63 recorded digests disagree with sha256sum"
+
+# A file shorter than the recorded prefix, and a wrong digest, are still rejected.
+head -c 1024 "$sh63_big" > "$sh63_root/short.log"
+python3 - "$sh63_root/short.json" "$sh63_root/short.log" "$sh63_prefix_sha" "$sh63_prefix_bytes" <<'WRITE'
+import json, sys
+manifest, path, sha, size = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+logs = {name: {"path": path, "sha256": sha, "bytes": size} for name in ("paper", "source", "live")}
+json.dump({"guarded_logs": logs}, open(manifest, "w"), sort_keys=True)
+WRITE
+if MANIFEST="$sh63_root/short.json" bash -c "source '$sh63_root/prefixes.sh'
+verify_guarded_log_prefixes" 2>/dev/null; then
+  fail "FE-STREAMHASH-63 prefix verifier accepted a file shorter than the recorded bytes"
+fi
+# The full-file digest is guaranteed to differ from the prefix digest (the file has a suffix);
+# a character substitution is not, because a digest may contain no instance of that character.
+[[ "$sh63_full_sha" != "$sh63_prefix_sha" ]] || fail "FE-STREAMHASH-63 fixture digests collide"
+sh63_manifest "$sh63_root/wrong.json" "$sh63_full_sha" "$sh63_prefix_bytes"
+if MANIFEST="$sh63_root/wrong.json" bash -c "source '$sh63_root/prefixes.sh'
+verify_guarded_log_prefixes" 2>/dev/null; then
+  fail "FE-STREAMHASH-63 prefix verifier accepted a wrong digest"
+fi
+rm -f "$sh63_big" "$sh63_root/short.log"
+echo "PASS: FE-STREAMHASH-63"
+
+# ── FE-BACKUPCACHE-64: every integrity check must run with the raised cache budget in effect ─────
+# Observed with SQLite's own statement-level hook (`set_trace_callback`), which fires for EVERY
+# statement the connection executes — including statements inside `executescript` and those issued
+# through any cursor — so the assertion does not depend on enumerating Python execution APIs. At
+# each `integrity_check` the effective `cache_size` is read back from that same connection, so a
+# later reset, a reset inside a script, or a second untuned check cannot pass. Whether the raised
+# cache actually shortens the check is an operational measurement against the real 4.28 GB copy,
+# recorded in the PR — never asserted here.
+sh64_root=$TEST_TMP/backupcache
+mkdir -p "$sh64_root/tracer"
+cat > "$sh64_root/tracer/sitecustomize.py" <<'TRACER'
+import os, sqlite3
+
+_trace = os.environ.get("PE_SQLITE_TRACE")
+if _trace:
+    _log = open(_trace, "a", buffering=1)
+    _connect = sqlite3.connect
+    _counter = [0]
+    _busy = [False]
+
+    def _watch(connection, token):
+        def callback(statement):
+            if _busy[0] or "integrity_check" not in " ".join(str(statement).split()).lower():
+                return
+            _busy[0] = True                      # the read-back is itself a statement
+            try:
+                effective = sqlite3.Connection.execute(
+                    connection, "pragma cache_size").fetchone()[0]
+                _log.write("%s\t%s\n" % (token, effective))
+            finally:
+                _busy[0] = False
+        connection.set_trace_callback(callback)
+
+    def connect(*args, **kwargs):
+        con = _connect(*args, **kwargs)
+        _counter[0] += 1
+        _watch(con, "c%d" % _counter[0])         # token is never reused, unlike id()
+        return con
+
+    sqlite3.connect = connect
+TRACER
+python3 - "$sh64_root/source.db" <<'SEED' || fail "FE-BACKUPCACHE-64 could not seed the fixture database"
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table t(a integer primary key, b text)")
+con.executemany("insert into t(b) values(?)", [("row %d" % i,) for i in range(256)])
+con.commit(); con.close()
+SEED
+
+# ONE evaluator, shared by the positive path and every negative control: a trace is "tuned" only
+# when it contains at least one observation and every observation reports -262144.
+cat > "$sh64_root/evaluate.py" <<'EVAL'
+import sys
+rows = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1]) if "\t" in l]
+if not rows:
+    print("none"); raise SystemExit(0)
+print("tuned" if all(v.strip() == "-262144" for _, v in rows) else "untuned")
+EVAL
+sh64_eval() { python3 "$sh64_root/evaluate.py" "$1"; }
+
+sed -n '/^complete_sqlite_backup() {/,/^}/p' "$DRIVER" > "$sh64_root/backup.sh"
+sed -n '/^restore_sqlite_backup() {/,/^}/p' "$DRIVER" > "$sh64_root/restore.sh"
+[[ -s "$sh64_root/backup.sh" && -s "$sh64_root/restore.sh" ]] ||
+  fail "FE-BACKUPCACHE-64 could not extract the SQLite maintenance owners"
+# Bound what the tracer can see: these owners must open connections only through sqlite3.connect.
+for sh64_owner in "$sh64_root/backup.sh" "$sh64_root/restore.sh"; do
+  grep -qE 'sqlite3\.(Connection\(|dbapi2\.)' "$sh64_owner" &&
+    fail "FE-BACKUPCACHE-64 $(basename "$sh64_owner") constructs a connection the tracer cannot see"
+done
+
+PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$sh64_root/backup.trace" \
+  bash -c "source '$sh64_root/backup.sh'; complete_sqlite_backup '$sh64_root/source.db' '$sh64_root/backup.db'" ||
+  fail "FE-BACKUPCACHE-64 complete_sqlite_backup failed"
+[[ "$(sh64_eval "$sh64_root/backup.trace")" == tuned ]] ||
+  fail "FE-BACKUPCACHE-64 complete_sqlite_backup checked with an untuned or unobserved connection"
+[[ -s "$sh64_root/backup.db" ]] || fail "FE-BACKUPCACHE-64 complete_sqlite_backup produced no destination"
+
+PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$sh64_root/restore.trace" \
+  bash -c "source '$sh64_root/restore.sh'; restore_sqlite_backup '$sh64_root/backup.db' '$sh64_root/restored.db'" ||
+  fail "FE-BACKUPCACHE-64 restore_sqlite_backup failed"
+[[ "$(sh64_eval "$sh64_root/restore.trace")" == tuned ]] ||
+  fail "FE-BACKUPCACHE-64 restore_sqlite_backup checked with an untuned or unobserved connection"
+[[ -s "$sh64_root/restored.db" ]] || fail "FE-BACKUPCACHE-64 restore_sqlite_backup produced no destination"
+
+# Negative controls. Each must be OBSERVED and judged untuned: a control that merely produces an
+# empty trace would pass vacuously, so "none" is a failure of the control itself.
+sh64_reject() {                      # <label> <python body>
+  local label=$1 body=$2 trace=$sh64_root/neg-$1.trace verdict
+  rm -f "$trace"
+  PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$trace" python3 -c "$body" "$sh64_root/source.db" ||
+    fail "FE-BACKUPCACHE-64 negative control $label did not run"
+  verdict=$(sh64_eval "$trace")
+  [[ "$verdict" == none ]] &&
+    fail "FE-BACKUPCACHE-64 negative control $label observed nothing; the tracer is not instrumenting it"
+  [[ "$verdict" == untuned ]] ||
+    fail "FE-BACKUPCACHE-64 accepted the '$label' negative control"
+}
+sh64_reject no-pragma 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma integrity_check"); c.close()'
+sh64_reject cursor-override 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c.cursor().execute("pragma cache_size=-2000"); c.execute("pragma integrity_check"); c.close()'
+sh64_reject reset-before-check 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c.execute("pragma cache_size=-2000"); c.execute("pragma integrity_check"); c.close()'
+sh64_reject reopened-connection 'import gc,sqlite3,sys
+a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-262144"); a.close(); del a; gc.collect()
+b=sqlite3.connect(sys.argv[1]); b.execute("pragma integrity_check"); b.close()'
+sh64_reject second-untuned-check 'import sqlite3,sys
+a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-262144"); a.execute("pragma integrity_check")
+b=sqlite3.connect(sys.argv[1]); b.execute("pragma integrity_check"); a.close(); b.close()'
+sh64_reject cursor-issued-check 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.cursor().execute("pragma integrity_check"); c.close()'
+sh64_reject script-reset-then-check 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c.executescript("pragma cache_size=-2000; pragma integrity_check;"); c.close()'
+sh64_reject script-two-checks 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c.executescript("pragma integrity_check; pragma cache_size=-2000; pragma integrity_check;"); c.close()'
+sh64_reject shortcut-cursor-check 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144"); c.execute("pragma integrity_check")
+cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
+cur.execute("pragma integrity_check").fetchone(); c.close()'
+echo "PASS: FE-BACKUPCACHE-64"
+
+echo "PASS: 64 scenario contracts, including WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
