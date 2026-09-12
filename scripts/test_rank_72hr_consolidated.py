@@ -15,7 +15,7 @@ asserts the four properties the consolidation must preserve plus the two it adds
   * `--universe` and `--universe-from-trades` are mutually exclusive — supplying both, or
     neither, errors;
   * decay (half_life=30) reshapes the score and yields n_eff < n (positive control);
-  * an empty edge floor returns 0 (no crash).
+  * an empty schema-one edge floor returns 76 (no crash).
 
 Imports the ranker module (numpy + pandas) so CI runs it after `pip install -r
 scripts/requirements.txt`, alongside test_ranker_decay.py.
@@ -174,10 +174,10 @@ class PartialBackfillUniverseTest(unittest.TestCase):
                         with sqlite3.connect(db) as conn:
                             conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, "
                                          "backfill_partial INTEGER NOT NULL DEFAULT 0, "
-                                         "last_polymarket_fetch_at INTEGER)")
-                            conn.execute("INSERT INTO wallets VALUES (?,1,1)", (WA,))
+                                         "last_polymarket_fetch_at INTEGER, is_active INTEGER DEFAULT 0, is_infra INTEGER DEFAULT 0)")
+                            conn.execute("INSERT INTO wallets(wallet_hex,backfill_partial,last_polymarket_fetch_at) VALUES (?,1,1)", (WA,))
                             if complete_stamp != "missing":
-                                conn.execute("INSERT INTO wallets VALUES (?,0,?)", (WB, complete_stamp))
+                                conn.execute("INSERT INTO wallets(wallet_hex,backfill_partial,last_polymarket_fetch_at) VALUES (?,0,?)", (WB, complete_stamp))
                         universe = Path(tmp) / "universe.txt"
                         universe.write_text(WA + "\n" + WB + "\n")
                         args = ["--universe-from-trades"] if from_trades else ["--universe", str(universe)]
@@ -318,7 +318,7 @@ class DecayPositiveControlTest(unittest.TestCase):
 
 
 class EmptyFloorTest(unittest.TestCase):
-    def test_empty_floor_returns_zero(self) -> None:
+    def test_empty_floor_returns_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "cache.db")
             out = str(Path(tmp) / "out")
@@ -326,7 +326,7 @@ class EmptyFloorTest(unittest.TestCase):
             # An unreachable floor: eligible wallets exist, but none clear t-stat >= 999.
             rc = run_ranker(db, out, "--universe-from-trades", "--half-life-days", "0",
                             "--floor-tstat", "999")
-            self.assertEqual(rc, 0)  # no crash, graceful stop
+            self.assertEqual(rc, 76)  # wrapper owns whether this is retryable
             self.assertTrue((Path(out) / "ranked_72hr_buyandhold.csv").exists())
             self.assertFalse((Path(out) / "250_72hr_buyandhold_variance.txt").exists())
 

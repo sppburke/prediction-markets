@@ -32,7 +32,7 @@ use pe_source_polymarket_public::{
     ClobCoveragePage, ClobPayoutResolution, ClobResolutionEvidence,
 };
 use pe_trader_index::snapshot::RawTrade;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
@@ -380,6 +380,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     source_bits              INTEGER NOT NULL DEFAULT 0,
     last_polymarket_fetch_at INTEGER NULL,
     backfill_partial        INTEGER NOT NULL DEFAULT 0,
+    forward_frontier_unix   INTEGER,
+    backward_floor_unix     INTEGER,
     -- Written by nothing since the funder-graph removal (#326/#521); retained in
     -- fresh schema so a rolled-back binary can still create its
     -- idx_wallets_weekly index against it.
@@ -470,8 +472,8 @@ pub struct ClassifyInfraReport {
 /// backtest. Produced by [`WalletCache::coverage_counts`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CoverageReport {
-    /// Active, non-infra wallets never fetched from Polymarket
-    /// (`last_polymarket_fetch_at IS NULL`).
+    /// Active, non-infra wallets with an incomplete walk or no successful fetch
+    /// (`backfill_partial = 1 OR last_polymarket_fetch_at IS NULL`).
     pub fetch_incomplete: usize,
     /// Distinct traded markets with no `market_resolutions` row.
     pub missing_resolution: usize,
@@ -810,6 +812,8 @@ impl WalletCache {
             "backfill_partial",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        add_column_if_missing(&conn, "wallets", "forward_frontier_unix", "INTEGER")?;
+        add_column_if_missing(&conn, "wallets", "backward_floor_unix", "INTEGER")?;
         // Migration (#326 PR4): drop the operator/funder/delta tables. They fed
         // only the deleted operator-graph machinery; dropping reclaims the bulk of
         // the cache (`counterparty_edges` alone was ~275M rows). Idempotent — a
@@ -1055,29 +1059,7 @@ impl WalletCache {
             return Ok(0);
         }
         let tx = self.conn.transaction()?;
-        let mut inserted = 0_u64;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO trades \
-                 (source_trade_id, wallet_hex, market_id, outcome_id, side, price_str, contracts, timestamp_unix) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for t in &trades {
-                let contracts_i64 =
-                    i64::try_from(t.contracts.0).map_err(|_| BootstrapError::Internal)?;
-                let affected = stmt.execute(params![
-                    t.source_trade_id.0,
-                    wallet_hex,
-                    t.market_id.0.0,
-                    i64::from(t.outcome_id),
-                    side_to_str(&t.side),
-                    t.price.0.to_string(),
-                    contracts_i64,
-                    t.timestamp.0.unix_timestamp(),
-                ])?;
-                inserted += u64::try_from(affected).map_err(|_| BootstrapError::Internal)?;
-            }
-        }
+        let inserted = insert_rows(&tx, wallet_hex, &trades)?;
         tx.commit()?;
         Ok(inserted)
     }
@@ -1086,19 +1068,15 @@ impl WalletCache {
     ///
     /// # Precondition
     /// Returns an empty `Vec` if the wallet has never been seen.
-    pub fn known_trade_ids(&self, wallet_hex: &str) -> Vec<SourceTradeId> {
-        let mut stmt = match self.conn.prepare(
+    pub fn known_trade_ids(&self, wallet_hex: &str) -> Result<Vec<SourceTradeId>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
             "SELECT source_trade_id FROM trades \
              WHERE wallet_hex = ?1 ORDER BY timestamp_unix DESC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt.query_map(params![wallet_hex], |r| r.get::<_, String>(0));
-        match rows {
-            Ok(iter) => iter.filter_map(Result::ok).map(SourceTradeId).collect(),
-            Err(_) => Vec::new(),
-        }
+        )?;
+        let rows = stmt.query_map(params![wallet_hex], |r| {
+            r.get::<_, String>(0).map(SourceTradeId)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Return all trades for `wallet_hex` sorted by timestamp ascending (FIFO order).
@@ -2552,19 +2530,23 @@ impl WalletCache {
     /// Compute the four backtest-readiness gap counts (issue #208) in one read pass.
     ///
     /// Each count is a dedicated `COUNT(*)` or set-difference — never a `.len()`
-    /// over a list-materialising helper. `fetch_incomplete` mirrors the `IS NULL`
-    /// branch of [`Self::select_backfill_due`] without materialising the wallet
+    /// over a list-materialising helper. `fetch_incomplete` counts marked or never-completed wallets, matching the incomplete
+    /// branches of [`Self::select_backfill_due`] without materialising the wallet
     /// list. The `missing_*` counts difference [`Self::all_market_ids`] against
     /// [`Self::resolved_market_ids`] / [`Self::scheduled_market_ids`], inheriting
     /// the `0x`-prefixed join-key invariant the write paths maintain (see the
     /// `market_events` schema note) — no fresh `LEFT JOIN`.
     pub fn coverage_counts(&self) -> Result<CoverageReport, BootstrapError> {
-        let fetch_incomplete: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM active_tradeable_wallets \
-             WHERE last_polymarket_fetch_at IS NULL",
-            [],
-            |r| r.get(0),
-        )?;
+        // Read-only coverage also supports schema-one caches not yet migrated.
+        let has_partial: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wallets') WHERE name = 'backfill_partial')",
+            [], |r| r.get(0))?;
+        let query = if has_partial {
+            "SELECT COUNT(*) FROM active_tradeable_wallets WHERE backfill_partial = 1 OR last_polymarket_fetch_at IS NULL"
+        } else {
+            "SELECT COUNT(*) FROM active_tradeable_wallets WHERE last_polymarket_fetch_at IS NULL"
+        };
+        let fetch_incomplete: i64 = self.conn.query_row(query, [], |r| r.get(0))?;
         let traded = self.all_market_ids();
         let resolved = self.resolved_market_ids();
         let scheduled = self.scheduled_market_ids();
@@ -3467,7 +3449,7 @@ impl WalletCache {
         let inactivity_cutoff = now_unix - inactivity_secs;
         let mut stmt = self.conn.prepare(
             "SELECT v.wallet_hex FROM active_tradeable_wallets v \
-             WHERE v.last_polymarket_fetch_at IS NOT NULL \
+             WHERE v.backfill_partial = 0 AND v.last_polymarket_fetch_at IS NOT NULL \
                AND v.last_polymarket_fetch_at >= ?1 \
                AND (SELECT MAX(t.timestamp_unix) FROM trades t \
                     WHERE t.wallet_hex = v.wallet_hex) < ?2",
@@ -3972,33 +3954,102 @@ impl WalletCache {
     /// Quarantine incomplete schema-one history before any incremental trade write.
     /// Legacy fetch callers can supply wallets absent from the pile; create their
     /// default row too so retained partial history cannot become rankable.
-    pub(crate) fn begin_backfill(&mut self, wallet_hex: &str) -> Result<(), BootstrapError> {
+    pub(crate) fn begin_walk(
+        &mut self,
+        wallet_hex: &str,
+        anchor: Option<i64>,
+    ) -> Result<(), BootstrapError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO wallets (wallet_hex, backfill_partial) VALUES (?1, 1) \
-             ON CONFLICT(wallet_hex) DO UPDATE SET backfill_partial = 1",
-            params![wallet_hex],
+            "INSERT INTO wallets (wallet_hex, backfill_partial, forward_frontier_unix) VALUES (?1, 1, ?2) \
+             ON CONFLICT(wallet_hex) DO UPDATE SET backfill_partial = 1, \
+             forward_frontier_unix = COALESCE(wallets.forward_frontier_unix, ?2)",
+            params![wallet_hex, anchor],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Clear the partial marker on completion, optionally stamping in the same
-    /// transaction. A failed finalization leaves the marker and old stamp intact.
-    pub(crate) fn finish_backfill(
+    pub(crate) fn forward_frontier(&self, wallet_hex: &str) -> Result<Option<i64>, BootstrapError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT forward_frontier_unix FROM wallets WHERE wallet_hex = ?1",
+                params![wallet_hex],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub(crate) fn backward_floor(&self, wallet_hex: &str) -> Result<Option<i64>, BootstrapError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT backward_floor_unix FROM wallets WHERE wallet_hex = ?1",
+                params![wallet_hex],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Commit a proved piece and its outward-only coverage bounds together, even
+    /// when conversion or duplicate filtering leaves no rows to insert.
+    pub(crate) fn commit_walk_piece(
+        &mut self,
+        wallet_hex: &str,
+        rows: Vec<RawTrade>,
+        frontier_unix: Option<i64>,
+        floor_unix: Option<i64>,
+    ) -> Result<u64, BootstrapError> {
+        let tx = self.conn.transaction()?;
+        let inserted = insert_rows(&tx, wallet_hex, &rows)?;
+        if let Some(frontier) = frontier_unix {
+            tx.execute(
+                "UPDATE wallets SET forward_frontier_unix = ?2 WHERE wallet_hex = ?1 \
+                AND (forward_frontier_unix IS NULL OR forward_frontier_unix < ?2)",
+                params![wallet_hex, frontier],
+            )?;
+        }
+        if let Some(floor) = floor_unix {
+            tx.execute(
+                "UPDATE wallets SET backward_floor_unix = ?2 WHERE wallet_hex = ?1 \
+                AND (backward_floor_unix IS NULL OR backward_floor_unix > ?2)",
+                params![wallet_hex, floor],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Finalize only after both phases completed. Failure preserves quarantine,
+    /// the old stamp and all previously committed pieces.
+    pub(crate) fn finish_walk(
         &mut self,
         wallet_hex: &str,
         stamp: Option<i64>,
+        hi: i64,
     ) -> Result<(), BootstrapError> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE wallets SET backfill_partial = 0, \
+             forward_frontier_unix = MAX(COALESCE(forward_frontier_unix, ?3), ?3), \
              last_polymarket_fetch_at = COALESCE(?2, last_polymarket_fetch_at) \
              WHERE wallet_hex = ?1",
-            params![wallet_hex, stamp],
+            params![wallet_hex, stamp, hi],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// All quarantined wallets, including inactive and infrastructure rows.
+    pub(crate) fn partial_backfill_wallet_hexes(&self) -> Result<HashSet<String>, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT wallet_hex FROM wallets WHERE backfill_partial = 1")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
 
     /// Set `last_polymarket_fetch_at = now_unix` for a single wallet.
@@ -4038,8 +4089,8 @@ impl WalletCache {
 
     /// Retroactively classify already-cached wallets as infra (issue #197).
     ///
-    /// Mirrors the cold-start probe semantics over cached trades: for each
-    /// wallet that has ≥500 trades, compute the timestamp span over the
+    /// Mirrors the cold-start probe semantics over completed cached histories:
+    /// for each unmarked wallet with ≥500 trades, compute the timestamp span over the
     /// OLDEST 500. If `(newest - oldest) < threshold_secs`, the wallet is
     /// infra. The window-function SQL uses the `idx_trades_wallet_ts` index
     /// for a direct partition+order scan.
@@ -4056,7 +4107,7 @@ impl WalletCache {
         threshold_secs: i64,
         dry_run: bool,
     ) -> Result<ClassifyInfraReport, BootstrapError> {
-        // Single scan: every wallet with ≥500 trades contributes one row;
+        // Single scan: every unmarked wallet with ≥500 trades contributes one row;
         // `is_infra` = 1 when the OLDEST 500 span is below threshold.
         let (scanned, candidates): (usize, Vec<String>) = {
             let mut stmt = self.conn.prepare(
@@ -4076,7 +4127,8 @@ impl WalletCache {
                     GROUP BY wallet_hex \
                  ) \
                  SELECT wallet_hex, ((newest - oldest) < ?1) AS is_infra FROM page \
-                 WHERE cnt = 500",
+                 WHERE cnt = 500 AND NOT EXISTS (SELECT 1 FROM wallets w \
+                    WHERE w.wallet_hex = page.wallet_hex AND w.backfill_partial = 1)",
             )?;
             let rows = stmt.query_map(params![threshold_secs], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -4106,8 +4158,8 @@ impl WalletCache {
 
     /// Select active wallets due for Polymarket backfill.
     ///
-    /// Filters `is_active = 1` AND (`last_polymarket_fetch_at IS NULL` OR
-    /// `last_polymarket_fetch_at < now_unix - staleness_secs`). Orders by
+    /// Filters active non-infrastructure wallets AND (`backfill_partial = 1` OR
+    /// `last_polymarket_fetch_at IS NULL` OR `last_polymarket_fetch_at < now_unix - staleness_secs`). Orders by
     /// `last_polymarket_fetch_at ASC NULLS FIRST` then by Dune quality signals
     /// (`dune_win_rate_bps DESC NULLS LAST, dune_closed_markets DESC NULLS LAST`).
     /// `limit = 0` returns all due wallets (no LIMIT clause).
@@ -4119,7 +4171,7 @@ impl WalletCache {
     ) -> Result<Vec<String>, BootstrapError> {
         let cutoff = now_unix - staleness_secs;
         let base = "SELECT wallet_hex FROM active_tradeable_wallets \
-                    WHERE (last_polymarket_fetch_at IS NULL OR last_polymarket_fetch_at < ?1) \
+                    WHERE (backfill_partial = 1 OR last_polymarket_fetch_at IS NULL OR last_polymarket_fetch_at < ?1) \
                     ORDER BY last_polymarket_fetch_at ASC NULLS FIRST, \
                              dune_win_rate_bps DESC NULLS LAST, \
                              dune_closed_markets DESC NULLS LAST";
@@ -4733,9 +4785,41 @@ fn row_to_trade(
     })
 }
 
+/// Schema-one row insertion shared by standalone and coverage transactions.
+fn insert_rows(
+    tx: &Transaction<'_>,
+    wallet_hex: &str,
+    trades: &[RawTrade],
+) -> Result<u64, BootstrapError> {
+    let mut inserted = 0_u64;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO trades \
+                 (source_trade_id, wallet_hex, market_id, outcome_id, side, price_str, contracts, timestamp_unix) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for t in trades {
+            let contracts_i64 =
+                i64::try_from(t.contracts.0).map_err(|_| BootstrapError::Internal)?;
+            let affected = stmt.execute(params![
+                t.source_trade_id.0,
+                wallet_hex,
+                t.market_id.0.0,
+                i64::from(t.outcome_id),
+                side_to_str(&t.side),
+                t.price.0.to_string(),
+                contracts_i64,
+                t.timestamp.0.unix_timestamp(),
+            ])?;
+            inserted += u64::try_from(affected).map_err(|_| BootstrapError::Internal)?;
+        }
+    }
+    Ok(inserted)
+}
+
 /// Add column `col` with full SQL declaration `decl` (e.g. `"INTEGER NULL"` or
 /// `"TEXT NOT NULL DEFAULT 'gamma'"`) to `table` if it is not already present. Idempotent: safe to
-/// call on every [`WalletCache::open`].
+/// call on every [`WalletCache::open_with_tuning`].
 ///
 /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so existence is probed via `pragma_table_info`;
 /// `ALTER TABLE … ADD COLUMN` with a constant DEFAULT back-fills existing rows. Used for the additive
@@ -5500,6 +5584,7 @@ mod tests {
         assert!(
             cache
                 .known_trade_ids("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap()
                 .is_empty()
         );
         assert!(
@@ -5523,7 +5608,7 @@ mod tests {
         assert_eq!(cache.insert_new(&hex, trades).unwrap(), 2);
 
         assert_eq!(cache.trade_count(), 2);
-        let ids = cache.known_trade_ids(&hex);
+        let ids = cache.known_trade_ids(&hex).unwrap();
         assert_eq!(ids.len(), 2);
         // newest-first order
         assert_eq!(ids[0], SourceTradeId("0xtx2".to_owned()));
@@ -5586,7 +5671,7 @@ mod tests {
                 let path = dir.path().join("marker.db");
                 let wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
                 let mut cache = WalletCache::open(&path).unwrap();
-                cache.begin_backfill(wallet).unwrap();
+                cache.begin_walk(wallet, None).unwrap();
                 if let Some(old) = old_stamp {
                     cache.update_last_polymarket_fetch(wallet, old).unwrap();
                 }
@@ -5597,7 +5682,7 @@ mod tests {
                         [wallet], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
                 };
                 assert_eq!(read(&cache), (1, old_stamp));
-                cache.finish_backfill(wallet, stamp).unwrap();
+                cache.finish_walk(wallet, stamp, 2000).unwrap();
                 drop(cache);
                 let cache = WalletCache::open(&path).unwrap();
                 assert_eq!(read(&cache), (0, stamp.or(old_stamp)));
@@ -5610,10 +5695,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("legacy.db");
         let cache = WalletCache::open(&path).unwrap();
-        cache.conn.execute_batch("ALTER TABLE wallets DROP COLUMN backfill_partial; INSERT INTO wallets (wallet_hex) VALUES ('legacy');").unwrap();
+        cache.conn.execute_batch("ALTER TABLE wallets DROP COLUMN backfill_partial; ALTER TABLE wallets DROP COLUMN backward_floor_unix; ALTER TABLE wallets DROP COLUMN forward_frontier_unix; INSERT INTO wallets (wallet_hex) VALUES ('legacy');").unwrap();
         drop(cache);
         for _ in 0..2 {
-            let cache = WalletCache::open(&path).unwrap();
+            let config = BootstrapConfig {
+                cache_path: path.clone(),
+                cache_page_cache_mib: 8,
+                cache_mmap_mib: 0,
+                ..BootstrapConfig::default()
+            };
+            let cache = WalletCache::open_configured(&config).unwrap();
+            assert_connection_tuning(&cache, -8 * 1024, 0);
+            assert_eq!(cache.forward_frontier("legacy").unwrap(), None);
+            assert_eq!(cache.backward_floor("legacy").unwrap(), None);
             let marker: i64 = cache
                 .conn
                 .query_row(
@@ -5624,6 +5718,42 @@ mod tests {
                 .unwrap();
             assert_eq!(marker, 0);
         }
+    }
+
+    #[test]
+    fn walk_bounds_are_atomic_outward_only_even_for_empty_pieces() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("bounds.db")).unwrap();
+        cache.begin_walk("wallet", Some(100)).unwrap();
+        cache
+            .commit_walk_piece("wallet", vec![], Some(200), Some(50))
+            .unwrap();
+        cache
+            .commit_walk_piece("wallet", vec![], Some(150), Some(75))
+            .unwrap();
+        assert_eq!(cache.forward_frontier("wallet").unwrap(), Some(200));
+        assert_eq!(cache.backward_floor("wallet").unwrap(), Some(50));
+        cache.conn.execute_batch("CREATE TRIGGER fail_floor BEFORE UPDATE OF backward_floor_unix ON wallets BEGIN SELECT RAISE(ABORT,'floor'); END").unwrap();
+        assert!(
+            cache
+                .commit_walk_piece("wallet", vec![], Some(300), Some(1))
+                .is_err()
+        );
+        assert_eq!(cache.forward_frontier("wallet").unwrap(), Some(200));
+        assert_eq!(cache.backward_floor("wallet").unwrap(), Some(50));
+    }
+
+    #[test]
+    fn fresh_partial_wallet_due_and_stamp_seed_does_not_clear_quarantine() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("due.db")).unwrap();
+        cache.conn.execute_batch("INSERT INTO wallets(wallet_hex,is_active,last_polymarket_fetch_at,backfill_partial) VALUES ('partial',1,1000,1),('complete',1,1000,0),('inactive',0,1000,1),('infra',1,1000,1); UPDATE wallets SET is_infra=1 WHERE wallet_hex='infra'").unwrap();
+        cache.seed_last_polymarket_fetch_from_trades().unwrap();
+        assert_eq!(
+            cache.select_backfill_due(1001, 100, 0).unwrap(),
+            ["partial"]
+        );
+        assert_eq!(cache.partial_backfill_wallet_hexes().unwrap().len(), 3);
     }
 
     #[test]

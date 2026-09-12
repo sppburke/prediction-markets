@@ -70,7 +70,7 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fixture_fetcher())
-        .with_clock_for_test(|| 2_000_000_000);
+        .with_clock_for_test(|| 2_000_000_120);
     fetcher.fetch_all(&wallets, &mut cache).await.unwrap();
 
     // Reconstruct ledgers per-wallet (mirrors production rank phase).

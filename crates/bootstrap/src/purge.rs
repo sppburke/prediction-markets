@@ -113,12 +113,13 @@ pub fn run_purge(
         config.purge_loser_neff_min,
     )?;
 
+    let partial = cache.partial_backfill_wallet_hexes()?;
     // Restrict rule A to is_active = 1 (strict v1 boundary).
     let active: HashSet<String> = cache.active_tradeable_wallet_hexes()?.into_iter().collect();
     let rule_a: Vec<String> = decisions
         .rule_a
         .into_iter()
-        .filter(|w| active.contains(w))
+        .filter(|w| active.contains(w) && !partial.contains(w))
         .collect();
 
     // Rule B: active + refreshed-this-run + dormant, minus eligible (the guard).
@@ -130,7 +131,9 @@ pub fn run_purge(
             pile::BACKFILL_STALENESS_SECS,
         )?
         .into_iter()
-        .filter(|w| !decisions.eligible.contains(w) && !rule_a_set.contains(w))
+        .filter(|w| {
+            !partial.contains(w) && !decisions.eligible.contains(w) && !rule_a_set.contains(w)
+        })
         .collect();
 
     let mut rows: Vec<PurgeRow> = Vec::with_capacity(rule_a.len() + rule_b.len());

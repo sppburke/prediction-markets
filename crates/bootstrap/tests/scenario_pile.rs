@@ -162,7 +162,7 @@ async fn scenario_backfill_refreshes_trade_count_and_activates() {
     responses.insert(trade_url_cold(w), page);
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_000);
+        .with_clock_for_test(|| 2_000_000_120);
     fetcher.fetch_all(&[w], &mut cache).await.unwrap();
 
     let count_in_db = cache.trade_count();
@@ -291,7 +291,7 @@ async fn scenario_migrate_seeds_timestamps_before_activating() {
     let mut responses = HashMap::new();
     responses.insert(trade_url_cold(w), page_json(&trades_refs));
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&[w], &mut cache)
         .await
         .unwrap();

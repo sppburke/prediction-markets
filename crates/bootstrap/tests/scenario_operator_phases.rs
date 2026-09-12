@@ -188,7 +188,7 @@ async fn scenario_watchlist_standalone_reads_existing_cache_trades() {
     pages.insert(end_url, end_page());
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(1)
         .with_wallet_timeout(30);
     fetcher.fetch_all(&[w], &mut cache).await.unwrap();

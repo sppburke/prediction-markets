@@ -68,7 +68,7 @@ cargo build --release -p pe-bootstrap
 Run this comparison on Forge through the existing
 [systemd loop lifecycle](#continuous-forge-supervisor), using the defaults in
 [Bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) for the candidate.
-This changes read-side caching only; per-wallet transactions, WAL and index maintenance
+This changes read-side caching only; acquisition transactions, WAL and index maintenance
 remain unchanged. No automatic memory sizing is performed.
 
 1. Before building, preserve the currently installed `c1cdf82` binary as
@@ -108,78 +108,185 @@ any new wallets.
 
 ### What this does and does not do
 
-`pe-bootstrap backfill` (`crates/bootstrap/src/backfill.rs:1`):
-- Selects `is_active = 1` wallets whose `last_polymarket_fetch_at` is NULL or older
-  than 1 day (`backfill_limit = 0` = all due wallets).
-- Freeze one upper timestamp per wallet walk. Backward requests carry `start=1`
-  and a bounded `end`, including the cold infra probe, to reach full history.
-  Commit rows above each full page's minimum second, then acquire and commit that
-  entire second before advancing to `MIN(timestamp_unix) - 1`. Short pages commit
-  whole. The cold probe still classifies before any trade insert and discards
-  infra pages.
-- Re-acquire the cached maximum second before the forward phase to capture newly
-  indexed siblings. Acquire exact windows above that second through the frozen
-  upper bound using offsets and ordered lower-window / boundary-second /
-  upper-window splitting when saturated. **#608 keeps forward writes
-  whole-or-nothing**; incremental forward commits are deferred to #609. Each
-  acquisition window buffers at most the inclusive terminal offset's pages (see
-  glossary); the aggregate forward buffer can be larger.
-- A timeout, JSON/transport error, insert error, or saturated second stops the
-  wallet. Committed backward progress survives and the wallet stays in `failed`.
-  Nothing from an incomplete boundary second is written. Before acquisition, an
-  independently committed `wallets.backfill_partial=1` marker quarantines the
-  walk; marker-write failure blocks all trade writes. Successful completion
-  clears it even without stamping, and clears it atomically with
-  `last_polymarket_fetch_at` when stamping is enabled. Completion-transaction
-  failure also fails the wallet. Failure preserves the previous stamp, including
-  NULL and stale stamps; due selection retains its existing stamp rule.
-- Schema-one ranking excludes only `backfill_partial=1`, after either universe
-  source and before limiting. Legacy unstamped complete wallets and wallets
-  without a pile row remain eligible. Schema two is unchanged. The cycle
-  fingerprint includes the sorted marked-wallet set; any active tradeable
-  partial wallet prevents the unchanged-watermark shortcut, allowing same-day
-  retries even when row counts did not advance.
-- Refreshes `market_resolutions` (CLOB) / `market_schedules` (Gamma) for the
-  cache's market set.
+`pe-bootstrap backfill` selects active, non-infrastructure wallets through
+`active_tradeable_wallets`. A marked wallet is due regardless of its previous
+fetch stamp; otherwise the existing staleness rule applies. The timeout and
+concurrency defaults are unchanged (see [bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap)).
 
-It does **not** add wallets via chain enumeration or Dune. Those are the
-`enumerate` and `discovery` subcommands — **do not run them** for a pure backfill.
-(Backfill *can* flip an already-present pile wallet from `is_active=0→1` if it now
-meets the activation thresholds — that is re-classification of an existing wallet,
-not new discovery.)
+Each wallet walk samples one frozen bound, `hi = now - ACTIVITY_SETTLE_LAG_SECS`.
+Every request uses DESC order and an explicit upper bound no greater than `hi`.
+Backward requests also carry `start=1` to avoid the venue's default history window.
+The cache stores a durable closed interval
+`[backward_floor_unix, forward_frontier_unix]`:
 
-The gap-free guarantee covers stable API-visible history. `/activity` has delayed
-indexing ([source contract](15-SOURCES.md#polymarket)); rechecking the previous
-maximum second does not repair arbitrary late changes to older seconds. Rows
-above the frozen upper timestamp belong to the next walk.
+- Backward pages commit the rows strictly above their minimum second `m` and
+  `floor=m+1` together, then acquire **all** of second `m` and commit its rows
+  with `floor=m`. Cancellation between these transactions resumes at `m`.
+  Short or empty terminal pages record floor 1. Empty or wholly unconvertible
+  pieces still advance coverage; stored `MIN(timestamp_unix)` is not a cursor.
+- Forward acquisition scans upward from the persisted frontier. Its first window
+  is one second wide; later widths target `FORWARD_WINDOW_TARGET_ROWS` using
+  **raw** response density, with at most eightfold growth, the canonical maximum
+  width, and eightfold shrinkage on saturation. Each complete window commits its
+  rows and frontier in one transaction. There is no known-ID early stop.
+- Before acquisition, `begin_walk` upserts `backfill_partial=1`, seeding a NULL
+  frontier from `min(entry_max, hi+1)-1` on both insert and update. Legacy cached
+  maxima are therefore re-covered for same-second siblings. A wallet without a
+  pile row is supported; its new row defaults inactive. No history means no seed;
+  the first cold backward commit establishes frontier `hi`. Persisted coverage
+  is retained even when the trade table is empty.
+- Timeout, transport/JSON/conversion-boundary errors, saturation of a single
+  second, or failed transactions leave earlier committed pieces intact. The
+  wallet remains partial, its old stamp is unchanged, and logs report durable
+  transaction progress. Finalization clears the marker, extends the frontier to
+  at least `hi`, and optionally stamps success in one transaction. Failure to
+  finalize is a failed wallet, including when stamping is disabled. Cold-empty
+  completion is valid: marker zero, defined frontier, no trade rows.
 
-### #608 rollout and rollback on Forge
+Durability is **per completed backward piece or forward window transaction**, not
+per HTTP response. One interrupted window loses its buffered work. At the
+inclusive offset ceiling a window requires at most eleven page responses; a
+saturated attempt commits nothing. If a budget cannot complete a dense first
+second, that bounded attempt repeats next cycle. Progress across interruptions
+requires at least one completed window per walk; there is no promise of eventual
+completion. A durable in-flight-window checkpoint was deliberately excluded.
 
-Before building, preserve `target/release/pe-bootstrap` as
-`target/release/pe-bootstrap.pre-608-<rev>` and record the deployed revision.
-Build the corrected binary and restart via the [systemd loop lifecycle](#continuous-forge-supervisor).
-The additive column migrates on schema-one open; deploy the Python exclusion and
-cycle invalidation with the binary. Verify the selected zero-row cohort gains
-rows over repeated refreshes, then reaches marker zero and a success stamp.
-Compare one completed wallet's cached per-day counts to a read-only full re-fetch.
-These are deployment acceptance checks, not a substitute for deterministic tests.
+The interval certifies what covering requests acquired, not that every returned
+row is retained. Schema one still rejects individual trades during conversion
+(zero/negative size, quantity overflow, unknown side, invalid price/timestamp),
+while malformed DTO fields reject an entire page. It also keys `trades` on
+`source_trade_id=transactionHash` alone: counterparties in different wallets and
+distinct trades sharing a hash collide under `INSERT OR IGNORE`. Schema-two
+identity repair remains outside this change.
 
-**Binary-only rollback** restores that saved executable and restarts the loop;
-the column and Python filter remain. Already marked wallets stay quarantined:
-the old completion writer can stamp them but cannot clear their marker, leaving
-a stamped marked wallet temporarily neither due nor rankable. This is an
-availability impact. Recover by running the corrected binary until those wallets
-complete (use an explicit fetch for a wallet whose fresh stamp prevents due
-selection, or wait for it to become stale). Never clear markers from an old
-success stamp.
+Marker zero additionally establishes that the backward phase exhausted available
+history, so **requested coverage** extends from the beginning of history through
+the frontier. During a cold partial walk, history below the floor remains
+unacquired even though the frontier is already set. The coverage pair moves only
+outward under the walker. Inherited history below a legacy seeded anchor is not
+retrospectively re-queried or proven settled. Pre-#609 holes below that anchor and
+rows first becoming visible after their crossing request are outside this
+coverage guarantee. The settle lag applies to normalized integer timestamps;
+at `t=hi`, the bucket `[t,t+1)` has been closed one second less than the lag.
+The stricter bucket-end reading would require subtracting one additional second;
+this implementation uses the approved timestamp discipline. The next crossing is
+on the wallet's next **due walk**, governed by staleness, not the loop's success
+wait. No immutable activity-bucket closure is promised by the venue.
 
-**Full rollback**, including Python, exposes retained partial histories to
-ranking. Leave the filter in place unless that visibility is explicitly accepted;
-never erase markers with a blanket SQL update. If a batch was published from
-partial data, use the [published-batch recovery](#part-2--rank-and-publish-the-one-command)
-procedure below (Oracle rollback), which publishes a new batch and verifies
-membership convergence. Replay impact: none; this is the schema-one research
-cache and universe.
+Every wallet with zero stored trades receives the settled-head infra probe,
+including a previously completed empty wallet. Classification precedes inserts;
+probe rows are discarded and infra classification preserves the prior stamp,
+even a non-NULL stamp from an earlier empty success. Two verdict changes are
+accepted: the settled head can be sparser than the previously unbounded newest
+head, and a timed-out walk that retained a sparse page is no longer cold on retry
+and therefore does not re-probe a newly dense head. No persistent probe lifecycle
+was added.
+
+Schema-one production Python ranking and newly prepared database-backed
+publications exclude **all** marked wallets before truncation, including inactive
+wallets and retained-CSV `--skip-rank` publications. Wallets without a pile row
+and unmarked legacy wallets remain eligible. Saved publication requests remain
+immutable on resume. The cycle fingerprint includes the full marked set; the
+`unchanged` guard reads current state and refuses only while active,
+non-infrastructure marked wallets remain retryable. Activating an inactive marked
+wallet deliberately makes it retryable while it stays excluded.
+
+The single `run_ranking_stage` policy owner interprets schema-one exit 76 (empty
+universe, summaries, eligible set, edge floor, candidates or publication; also
+**global trade staleness**) as 75 while retryable partial wallets currently exist,
+and as 1 otherwise. It reads the database after refresh, independently of the
+frozen manifest, including resumed cycles. No request is persisted for these
+refusals; the loop retains the logical-cycle pointer and retries backfill.
+Other failures, including resolution/CLOB freshness and stored publication hash
+mismatches, retain their existing exit codes. Schema two is unchanged.
+
+Coverage reports count partial histories as incomplete even with prior stamps.
+Both purge rules protect marked wallets, including a retained loser CSV; the
+rule-B selector also guards independently. Retroactive infra classification
+excludes them in preview and apply mode. Stamp seeding and raw trade readers are
+unchanged. The exclusion guarantee is scoped to the production Python ranking
+pipeline: offline watchlist/backtest consumers may incorporate retained partial
+history. The production service continues to bootstrap from Supabase only.
+
+Backfill also refreshes configured resolutions and schedules. It does not perform
+new wallet discovery; it may activate existing pile wallets under the existing
+activation policy. Event mappings are refreshed by the separate `events` command.
+
+### #608/#609 rollout, acceptance and rollback on Forge
+
+Stop the loop through the [systemd lifecycle](#continuous-forge-supervisor) and wait
+for its cycle/descendants to exit. Preserve `target/release/pe-bootstrap` as
+`pe-bootstrap.pre-608-<rev>`, record the revision, then build and restart with the
+Python changes. Both public writable openers delegate to `open_with_tuning`, whose
+schema-one migration installs the marker and two nullable coverage columns without
+changing #606 tuning. `capture` runs before the first writable open and tolerates
+missing columns; `winner-discovery` is the cycle's first writable opener.
+
+Before deployment freeze the active zero-trade cohort on Forge and retain its
+hash outside the repository:
+
+```bash
+sqlite3 -readonly data/wallet_cache.db 'SELECT a.wallet_hex FROM active_tradeable_wallets a LEFT JOIN trades t ON t.wallet_hex = a.wallet_hex WHERE t.wallet_hex IS NULL ORDER BY 1;' > ~/608-cohort.txt
+sha256sum ~/608-cohort.txt
+```
+
+Record each wallet's disposition for the first three cycles: not due (unmarked,
+fresh stamp, unchanged rows), partial/retryable (non-decreasing acquired rows and
+frontier, still selected), completed empty (marker zero, stamp/frontier, zero
+rows), completed nonempty (marker zero, stamp/frontier, positive rows), or infra
+(discarded probe, preserved prior stamp, excluded from completion/retry assertions).
+No cohort wallet's acquired row count may decrease. Every marked **active,
+non-infrastructure** wallet must be re-selected. Universal completion is not the
+gate: each wallet must match its disposition.
+
+Audit one completed nonempty cohort wallet with the read-only operational tool:
+
+```bash
+python3 scripts/audit_wallet_history.py --db data/wallet_cache.db --wallet "$wallet" --cutoff "$cutoff"
+```
+
+The cutoff must be at or below the stored frontier and the marker must be zero,
+checked from one consistent snapshot with the rows. The auditor walks full
+activity with complete boundary-second pagination, mirrors DTO/conversion rules,
+and reports per-UTC-day counts and the symmetric transaction-ID difference.
+It reports intra-wallet collisions **before** collapsing IDs, with all conflicting
+normalized rows and the stored representative. A failed page or saturated second
+refuses comparison. Acceptance requires an empty difference for that completed
+wallet; collisions remain explicit evidence of schema-one loss, not a false clean
+audit. `--base-url` supports a deterministic test endpoint.
+
+**Binary-only rollback:** stop the loop, restore the preserved executable, restart.
+The old writer never updates the new columns, so marked histories remain
+quarantined and become retryable as soon as the corrected binary returns.
+If the old writer appended above an established frontier with #609 gaps, the
+corrected walker repairs them from that frontier. Exception: rollback after a
+cold NULL-anchor `begin_walk` but before the first coverage commit leaves no
+established frontier. If the old writer then builds gapped history, restoring the
+corrected binary seeds from cached bounds and may inherit those holes; use the
+re-walk lever or accept the documented legacy limitation. Never clear a marker
+by hand from an old success stamp.
+
+**Full rollback** including Python exposes retained partial histories to ranking.
+Keep the filter or explicitly accept that visibility and use the
+[published-batch recovery](#part-2--rank-and-publish-the-one-command) procedure if
+necessary. Replay impact: none; this is the schema-one research cache and ranking
+universe, with no live trading mutation.
+
+**Operator re-walk lever**, with the loop stopped:
+
+```sql
+UPDATE wallets SET forward_frontier_unix = 0, backward_floor_unix = 1,
+    backfill_partial = 1 WHERE wallet_hex = :w;
+```
+
+This deliberately resets coverage to the empty interval and is the sole exception
+to outward-only bounds; it bypasses the walker guard. The marker schedules a walk
+only for an active, non-infrastructure wallet. Do not seed from stored `MIN` or
+`MIN-1`: that can skip same-second siblings or claim beyond the next frozen bound.
+The backward phase issues no request and forward acquisition covers `[1,hi]`,
+then later walks extend as time advances. A cached trade above `hi` neither blocks
+correct finalization nor authorizes a request above it. Automated repair at scale
+remains outside scope (#595 census).
 
 ### Commands
 
@@ -304,8 +411,9 @@ In order it runs: **Step 0** data refresh — `winner-discovery
 audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`) →
 `backfill --defer-activation` (trades only) → `events` → `resolutions` →
 The production wrapper performs no infrastructure or ordinary purge; exclusions gate
-acquisition (discovery, activation, and backfill), and rank/export applies only trade-recency and
-current-eligibility filters without deleting history (`docs/37`).
+acquisition (discovery, activation, and backfill), and production rank/export applies
+trade-recency, current-eligibility and schema-one completeness filters without deleting history
+(`docs/37`).
 `resolutions` performs a full CLOB closed-market re-walk, backfills missing
 schedule `end_date`s, then audits and repairs every traded, scheduled past-end
 market still missing a terminal row. The subcommand runs the full

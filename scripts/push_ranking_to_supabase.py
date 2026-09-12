@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from partial_backfill_wallets import partial_backfill_wallets
 import sys
 import tempfile
 import time
@@ -36,6 +37,13 @@ TEMPFAIL_EXIT = 75
 class CacheStaleError(Exception):
     """The trade, resolution-content, or completed-CLOB-sweep freshness contract
     (docs/26) was not honoured, so publication must fail closed."""
+
+
+class RankingUnavailableError(ValueError):
+    """Schema-one empty publication or globally stale trades, before preparation.
+
+    The wrapper alone decides whether current quarantine makes this retryable.
+    """
 
 
 class SupabaseRequestError(Exception):
@@ -160,10 +168,12 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        partial = partial_backfill_wallets(con)
         newest = _newest_trade_unix(con)
         if newest is None or now - newest > max_staleness_hours * 3600:
             age = "unknown" if newest is None else f"{(now - newest) / 3600:.1f}"
-            raise CacheStaleError(
+            error_type = RankingUnavailableError if _cache_schema(con) < 2 else CacheStaleError
+            raise error_type(
                 f"cache {db_path!r} newest trade is {age}h old "
                 f"(> {max_staleness_hours}h bound) — backfill before pushing (docs/26)"
             )
@@ -206,7 +216,8 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
     finally:
         con.close()
     cutoff = now - active_window_hours * 3600
-    kept = [r for r in rows if last.get(r["wallet"].lower(), -1) >= cutoff]
+    kept = [r for r in rows if r["wallet"].lower() not in partial
+            and last.get(r["wallet"].lower(), -1) >= cutoff]
     return kept, len(rows) - len(kept), last
 
 
@@ -615,7 +626,12 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
     rows.sort(key=key_fn, reverse=True)
     top = rows[: a.top_n]
     if not top:
-        raise ValueError("no rows to push (empty CSV, or the active filter removed all)")
+        schema_version = 1
+        if a.db:
+            with sqlite3.connect(f"file:{a.db}?mode=ro", uri=True) as con:
+                schema_version = _cache_schema(con)
+        error_type = RankingUnavailableError if schema_version < 2 else ValueError
+        raise error_type("no rows to push (empty CSV, or the active/completeness filter removed all)")
 
     config_hash = None
     manifest = None
@@ -882,6 +898,9 @@ def main() -> int:
             if a.prepare_only:
                 print("publish request prepared; network publication skipped")
                 return 0
+    except RankingUnavailableError as error:
+        print(f"UNAVAILABLE: could not prepare publication: {error}", file=sys.stderr)
+        return 76
     except (CacheStaleError, json.JSONDecodeError, OSError, sqlite3.Error, ValueError) as error:
         print(f"FATAL: could not prepare publication: {error}", file=sys.stderr)
         return 1

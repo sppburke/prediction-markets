@@ -127,7 +127,7 @@ async fn probe_fires_on_dense_full_page() {
     );
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(1);
     let outcome = fetcher.fetch_all(&[w], &mut cache).await.unwrap();
 
@@ -175,7 +175,7 @@ async fn probe_passes_on_sparse_full_page() {
     pages.insert(next_backward_url(w, base_ts - 1), empty_page());
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(1);
     let outcome = fetcher.fetch_all(&[w], &mut cache).await.unwrap();
 
@@ -208,7 +208,7 @@ async fn probe_skipped_on_partial_page() {
     );
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(1);
     let outcome = fetcher.fetch_all(&[w], &mut cache).await.unwrap();
 
@@ -239,7 +239,7 @@ async fn probe_skipped_on_empty_page() {
     pages.insert(cold_url(w), empty_page());
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(1);
     let outcome = fetcher.fetch_all(&[w], &mut cache).await.unwrap();
 
@@ -289,7 +289,7 @@ async fn probe_only_fires_on_first_cold_page() {
     pages.insert(next_backward_url(w, page3_cursor), empty_page());
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(1);
     let outcome = fetcher.fetch_all(&[w], &mut cache).await.unwrap();
 

@@ -7,6 +7,10 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/activity.rs"]
+mod activity;
+use activity::HistoryFetcher;
+
 use std::collections::HashMap;
 
 use pe_bootstrap::build_seed_watchlist;
@@ -55,17 +59,6 @@ fn trade_url_end(wallet: WalletAddress, end: i64) -> String {
     .url(BASE_URL)
 }
 
-/// Forward-fill URL with an exclusive `start` timestamp cursor.
-fn trade_url_start(wallet: WalletAddress, start: i64) -> String {
-    PolymarketEndpoint::UserTradeActivityPage {
-        user: wallet.to_string(),
-        end: 2_000_000_000,
-        start: Some(start + 1),
-        offset: 0,
-    }
-    .url(BASE_URL)
-}
-
 /// Build a JSON page of trades for `wallet`. Timestamps must be supplied
 /// strictly decreasing (newest-first) so the API order is realistic.
 fn trades_page(wallet: &str, hashes: &[(&str, i64)]) -> Vec<u8> {
@@ -78,10 +71,6 @@ fn trades_page(wallet: &str, hashes: &[(&str, i64)]) -> Vec<u8> {
         })
         .collect();
     format!("[{}]", entries.join(",")).into_bytes()
-}
-
-fn empty_page() -> Vec<u8> {
-    b"[]".to_vec()
 }
 
 // ── Scenario 1 ────────────────────────────────────────────────────────────────
@@ -108,11 +97,11 @@ async fn scenario_first_run_full_fetch() {
     responses.insert(trade_url_cold(wallet_a()), page);
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_000);
+        .with_clock_for_test(|| 2_000_000_120);
     fetcher.fetch_all(&[wallet_a()], &mut cache).await.unwrap();
 
     assert_eq!(
-        cache.known_trade_ids(WALLET_A_HEX).len(),
+        cache.known_trade_ids(WALLET_A_HEX).unwrap().len(),
         3,
         "all 3 trades must be in the cache"
     );
@@ -146,32 +135,17 @@ async fn scenario_empty_warm_run_inserts_nothing() {
 
     // Cold run.
     let mut r1 = HashMap::new();
-    r1.insert(trade_url_cold(wallet_a()), page);
+    r1.insert(trade_url_end(wallet_a(), 2_000_003), page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_123)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
     assert_eq!(cache.trade_count(), 3);
 
-    // Warm run:
-    //   Phase 1 backward (end = 2_000_001 - 1 = 2_000_000) → empty.
-    //   Phase 2 forward (start = 2_000_003) → empty.
-    let mut r2 = HashMap::new();
-    r2.insert(trade_url_end(wallet_a(), 2_000_000), empty_page());
-    r2.insert(
-        PolymarketEndpoint::UserTradeActivityPage {
-            user: wallet_a().to_string(),
-            end: 2_000_003,
-            start: Some(2_000_003),
-            offset: 0,
-        }
-        .url(BASE_URL),
-        b"[]".to_vec(),
-    );
-    r2.insert(trade_url_start(wallet_a(), 2_000_003), empty_page());
-    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
-        .with_clock_for_test(|| 2_000_000_000)
+    let venue = HistoryFetcher::new(vec![]);
+    PolymarketBulkFetcher::new(BASE_URL.to_owned(), venue)
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
@@ -203,16 +177,13 @@ async fn scenario_second_run_appends_only_unknown_trades() {
         ],
     );
     let mut r1 = HashMap::new();
-    r1.insert(trade_url_cold(wallet_a()), old_page);
+    r1.insert(trade_url_end(wallet_a(), 1_000_003), old_page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 1_000_123)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
 
-    // Warm run:
-    //   Phase 1 backward (end = 1_000_001 - 1 = 1_000_000) → empty.
-    //   Phase 2 forward (start = 1_000_003): 3 new rows in the complete window.
     let new_page = trades_page(
         WALLET_A_HEX,
         &[
@@ -221,21 +192,9 @@ async fn scenario_second_run_appends_only_unknown_trades() {
             ("0xnew3", 2_000_001),
         ],
     );
-    let mut r2 = HashMap::new();
-    r2.insert(trade_url_end(wallet_a(), 1_000_000), empty_page());
-    r2.insert(
-        PolymarketEndpoint::UserTradeActivityPage {
-            user: wallet_a().to_string(),
-            end: 1_000_003,
-            start: Some(1_000_003),
-            offset: 0,
-        }
-        .url(BASE_URL),
-        b"[]".to_vec(),
-    );
-    r2.insert(trade_url_start(wallet_a(), 1_000_003), new_page);
-    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
-        .with_clock_for_test(|| 2_000_000_000)
+    let venue = HistoryFetcher::new(serde_json::from_slice(&new_page).unwrap());
+    PolymarketBulkFetcher::new(BASE_URL.to_owned(), venue)
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
@@ -244,6 +203,7 @@ async fn scenario_second_run_appends_only_unknown_trades() {
 
     let ids: Vec<_> = cache
         .known_trade_ids(WALLET_A_HEX)
+        .unwrap()
         .iter()
         .map(|id| id.0.clone())
         .collect();
@@ -279,7 +239,7 @@ async fn scenario_replay_reproducibility() {
     responses.insert(trade_url_cold(wallet_a()), page);
 
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
@@ -334,33 +294,17 @@ async fn scenario_out_of_order_page_handled() {
         ],
     );
     let mut r1 = HashMap::new();
-    r1.insert(trade_url_cold(wallet_a()), old_page);
+    r1.insert(trade_url_end(wallet_a(), 1_000_003), old_page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 1_000_123)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
 
-    // Incremental run:
-    //   Phase 1 backward (end = 1_000_001 - 1 = 1_000_000) → empty.
-    //   Phase 2 forward (start = 1_000_003): page arrives oldest-first (ascending).
-    //   The complete window is persisted independently of row order.
     let reversed_page = trades_page(WALLET_A_HEX, &[("0xnew1", 2_000_000)]);
-    let mut r2 = HashMap::new();
-    r2.insert(trade_url_end(wallet_a(), 1_000_000), empty_page());
-    r2.insert(
-        PolymarketEndpoint::UserTradeActivityPage {
-            user: wallet_a().to_string(),
-            end: 1_000_003,
-            start: Some(1_000_003),
-            offset: 0,
-        }
-        .url(BASE_URL),
-        b"[]".to_vec(),
-    );
-    r2.insert(trade_url_start(wallet_a(), 1_000_003), reversed_page);
-    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
-        .with_clock_for_test(|| 2_000_000_000)
+    let venue = HistoryFetcher::new(serde_json::from_slice(&reversed_page).unwrap());
+    PolymarketBulkFetcher::new(BASE_URL.to_owned(), venue)
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
@@ -372,6 +316,7 @@ async fn scenario_out_of_order_page_handled() {
     );
     let ids: Vec<_> = cache
         .known_trade_ids(WALLET_A_HEX)
+        .unwrap()
         .iter()
         .map(|id| id.0.clone())
         .collect();
@@ -399,7 +344,7 @@ async fn scenario_unlimited_window_includes_all_trades() {
     let mut responses = HashMap::new();
     responses.insert(trade_url_cold(wallet_a()), page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&[wallet_a()], &mut cache)
         .await
         .unwrap();
@@ -461,7 +406,7 @@ async fn scenario_parallel_fetch_matches_sequential() {
     let dir_par = TempDir::new().unwrap();
     let mut cache_par = WalletCache::open(&dir_par.path().join("cache.db")).unwrap();
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses.clone()))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(N)
         .fetch_all(&wallets, &mut cache_par)
         .await
@@ -471,7 +416,7 @@ async fn scenario_parallel_fetch_matches_sequential() {
     let dir_seq = TempDir::new().unwrap();
     let mut cache_seq = WalletCache::open(&dir_seq.path().join("cache.db")).unwrap();
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .with_concurrency(1)
         .fetch_all(&wallets, &mut cache_seq)
         .await
@@ -482,8 +427,8 @@ async fn scenario_parallel_fetch_matches_sequential() {
 
     for (i, w) in wallets.iter().enumerate() {
         let hex = w.to_string();
-        let par_ids = cache_par.known_trade_ids(&hex);
-        let seq_ids = cache_seq.known_trade_ids(&hex);
+        let par_ids = cache_par.known_trade_ids(&hex).unwrap();
+        let seq_ids = cache_seq.known_trade_ids(&hex).unwrap();
         let expected_hash = format!("0xhash{i:02}");
         assert_eq!(par_ids.len(), 1);
         assert_eq!(par_ids[0], SourceTradeId(expected_hash));
@@ -548,7 +493,7 @@ async fn scenario_per_wallet_streaming_isolation() {
     }
 
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_000)
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&wallets, &mut cache)
         .await
         .unwrap();

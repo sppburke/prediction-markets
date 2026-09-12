@@ -149,3 +149,43 @@ fn scenario_coverage_clean_when_fully_covered() {
     );
     println!("PASS: scenario_coverage_clean_when_fully_covered — {report:?}");
 }
+
+#[test]
+fn scenario_coverage_partial_prior_stamp_is_incomplete_and_unmigrated_reader_works() {
+    for migrated in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = WalletCache::open(&path).unwrap();
+        seed_active_wallet(&mut cache, WALLET_1_HEX);
+        cache
+            .update_last_polymarket_fetch(WALLET_1_HEX, 1_700_300_000)
+            .unwrap();
+        cache
+            .insert_new(
+                WALLET_1_HEX,
+                vec![trade(wallet(WALLET_1_HEX), MARKET_A, "t", 1_700_000_000)],
+            )
+            .unwrap();
+        cache
+            .insert_resolution(MARKET_A, Some(0), 1_700_100_000, 1_700_200_000)
+            .unwrap();
+        cache
+            .insert_schedule(MARKET_A, Some(1_700_100_000), 1_700_200_000)
+            .unwrap();
+        if migrated {
+            cache
+                .raw_conn_for_test()
+                .execute_batch("UPDATE wallets SET backfill_partial = 1")
+                .unwrap();
+        } else {
+            cache
+                .raw_conn_for_test()
+                .execute_batch("ALTER TABLE wallets DROP COLUMN backfill_partial")
+                .unwrap();
+        }
+        drop(cache);
+        let report = run_coverage(&path).unwrap();
+        assert_eq!(report.fetch_incomplete, usize::from(migrated));
+        assert_eq!(report.is_clean(), !migrated);
+    }
+}

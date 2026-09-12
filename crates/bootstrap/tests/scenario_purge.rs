@@ -1211,3 +1211,41 @@ fn archive_survives_additive_main_schema_migration() {
     assert_eq!(nulls, 5, "old archive rows read NULL in the new column");
     println!("PASS: additive main migration never bricks an existing archive");
 }
+
+#[test]
+fn run_purge_protects_partial_history_under_both_rules_then_preserves_unmarked_behavior() {
+    for rule_a in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let mut cache = open_cache(&dir);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let partial = wallet_hex(0xa);
+        let fresh = wallet_hex(0xb);
+        active_with_trade(&mut cache, &partial, now, now - 90 * DAY);
+        active_with_trade(&mut cache, &fresh, now, now - 3600);
+        cache.raw_conn_for_test().execute("UPDATE wallets SET backfill_partial=1, backward_floor_unix=100, forward_frontier_unix=200 WHERE wallet_hex=?1",[&partial]).unwrap();
+        let body = if rule_a {
+            format!("wallet,tstat_net,mean_net,n_eff,eligible\n{partial},-3,-0.5,50,True\n")
+        } else {
+            "wallet,tstat_net,mean_net,n_eff,eligible\n".to_owned()
+        };
+        let config = cfg(write_csv(&dir, &body), true);
+        let before = cache.trades_for(&partial);
+        let report = run_purge(&config, &mut cache, false).unwrap();
+        assert_eq!(report.proven_losers_deleted + report.dead_weight_deleted, 0);
+        assert!(!cache.is_purged(&partial).unwrap());
+        assert_eq!(cache.trades_for(&partial).len(), before.len());
+        let state:(i64,i64,i64)=cache.raw_conn_for_test().query_row("SELECT backfill_partial, backward_floor_unix, forward_frontier_unix FROM wallets WHERE wallet_hex=?1",[&partial],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(state, (1, 100, 200));
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "UPDATE wallets SET backfill_partial=0 WHERE wallet_hex=?1",
+                [&partial],
+            )
+            .unwrap();
+        let report = run_purge(&config, &mut cache, false).unwrap();
+        assert_eq!(report.proven_losers_deleted + report.dead_weight_deleted, 1);
+        assert_eq!(cache.is_purged(&partial).unwrap(), rule_a);
+        assert!(!cache.conn_for_test_wallet_exists(&partial));
+    }
+}

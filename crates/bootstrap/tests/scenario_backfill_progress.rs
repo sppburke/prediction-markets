@@ -1,9 +1,8 @@
-//! #608: durable complete seconds, restart equivalence, and whole forward writes.
+//! #608/#609: durable complete pieces, restart equivalence and failure isolation.
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pe_bootstrap::cache::WalletCache;
@@ -118,7 +117,7 @@ fn bulk(
     };
     (
         PolymarketBulkFetcher::new(BASE.to_owned(), fetcher)
-            .with_clock_for_test(|| NOW)
+            .with_clock_for_test(|| NOW + 120)
             .with_wallet_timeout(1)
             .with_infra_probe(InfraProbe { threshold_secs: 0 })
             .with_stamp_on_success(true),
@@ -210,7 +209,7 @@ async fn two_pages_survive_timeout_reopen_and_resume_matches_uninterrupted_bytes
     );
     drop(cache);
     let cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    assert_eq!(state(&cache), (0, Some(NOW)));
+    assert_eq!(state(&cache), (0, Some(NOW + 120)));
     let mut uninterrupted = WalletCache::open(&dir.path().join("uninterrupted.db")).unwrap();
     let mut all = Pages::new();
     backward(&mut all, NOW, &rows);
@@ -224,51 +223,6 @@ async fn two_pages_survive_timeout_reopen_and_resume_matches_uninterrupted_bytes
             .is_empty()
     );
     assert_eq!(row_bytes(&cache), row_bytes(&uninterrupted));
-}
-
-#[tokio::test(start_paused = true)]
-async fn resume_with_600_newer_trades_cannot_jump_over_the_older_forward_page() {
-    let dir = TempDir::new().unwrap();
-    let mut cache = cache(&dir);
-    let rows = history(700, 10_000);
-    let mut first = Pages::new();
-    put(&mut first, 1, NOW, 0, &rows[..500]);
-    window(&mut first, 9501, 9501, &rows[499..500]);
-    assert_eq!(
-        bulk(first)
-            .0
-            .fetch_all(&[wallet()], &mut cache)
-            .await
-            .unwrap()
-            .failed,
-        [wallet()]
-    );
-    let newer: Vec<_> = (0..600)
-        .map(|i| trade(1000 + i, 20_000 - i64::try_from(i).unwrap()))
-        .collect();
-    let mut rest = Pages::new();
-    backward(&mut rest, 9500, &rows[500..]);
-    window(&mut rest, 10_000, 10_000, &rows[..1]);
-    window(&mut rest, 10_001, NOW, &newer);
-    let (fetcher, requests) = bulk(rest);
-    assert!(
-        fetcher
-            .fetch_all(&[wallet()], &mut cache)
-            .await
-            .unwrap()
-            .failed
-            .is_empty()
-    );
-    assert_eq!(cache.trade_count(), 1300);
-    assert!(requests.lock().unwrap().contains(&url(10_001, NOW, 500)));
-    assert_eq!(state(&cache), (0, Some(NOW)));
-    let mut all = rows;
-    all.extend(newer);
-    let ids = cache.known_trade_ids(&wallet().to_string());
-    assert!(all.iter().all(|r| {
-        ids.iter()
-            .any(|id| id.0 == r["transactionHash"].as_str().unwrap())
-    }));
 }
 
 #[tokio::test(start_paused = true)]
@@ -339,111 +293,6 @@ async fn saturated_backward_second_commits_only_above_it_and_stays_due() {
     );
 }
 
-async fn seed(cache: &mut WalletCache, top: i64) {
-    let mut pages = Pages::new();
-    put(&mut pages, 1, NOW, 0, &[trade(100_000, top)]);
-    assert!(
-        bulk(pages)
-            .0
-            .fetch_all(&[wallet()], cache)
-            .await
-            .unwrap()
-            .failed
-            .is_empty()
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn saturated_5500_row_forward_window_splits_lower_seam_upper_in_order() {
-    let dir = TempDir::new().unwrap();
-    let mut cache = cache(&dir);
-    seed(&mut cache, 1000).await;
-    let rows = history(5500, 10_000);
-    let boundary = 4501;
-    let mut pages = Pages::new();
-    put(&mut pages, 1, 999, 0, &[]);
-    window(&mut pages, 1000, 1000, &[trade(100_000, 1000)]);
-    window(&mut pages, 1001, NOW, &rows);
-    window(&mut pages, 1001, boundary - 1, &[]);
-    window(&mut pages, boundary, boundary, &rows[5499..]);
-    window(&mut pages, boundary + 1, NOW, &rows[..5499]);
-    let (fetcher, requests) = bulk(pages);
-    assert!(
-        fetcher
-            .fetch_all(&[wallet()], &mut cache)
-            .await
-            .unwrap()
-            .failed
-            .is_empty()
-    );
-    assert_eq!(cache.trade_count(), 5501);
-    let mut actual: Vec<_> = cache
-        .known_trade_ids(&wallet().to_string())
-        .into_iter()
-        .map(|id| id.0)
-        .collect();
-    let mut expected: Vec<_> = rows
-        .iter()
-        .map(|r| r["transactionHash"].as_str().unwrap().to_owned())
-        .collect();
-    expected.push(
-        trade(100_000, 1000)["transactionHash"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-    );
-    actual.sort();
-    expected.sort();
-    assert_eq!(actual, expected);
-    assert_eq!(state(&cache), (0, Some(NOW)));
-    let req = requests.lock().unwrap();
-    let lower = req
-        .iter()
-        .position(|u| *u == url(1001, boundary - 1, 0))
-        .unwrap();
-    assert_eq!(req[lower + 1], url(boundary, boundary, 0));
-    assert_eq!(req[lower + 2], url(boundary + 1, NOW, 0));
-}
-
-#[tokio::test(start_paused = true)]
-async fn forward_split_at_lo_plus_one_and_hi_stops_on_saturated_seam_without_writing() {
-    for boundary in [1001, NOW] {
-        let dir = TempDir::new().unwrap();
-        let mut cache = cache(&dir);
-        seed(&mut cache, 1000).await;
-        let before = row_bytes(&cache);
-        let rows: Vec<_> = (0..5500).map(|i| trade(i, boundary)).collect();
-        let mut pages = Pages::new();
-        put(&mut pages, 1, 999, 0, &[]);
-        window(&mut pages, 1000, 1000, &[trade(100_000, 1000)]);
-        window(&mut pages, 1001, NOW, &rows);
-        if boundary > 1001 {
-            window(&mut pages, 1001, boundary - 1, &[trade(90000, 1002)]);
-        }
-        window(&mut pages, boundary, boundary, &rows);
-        let (fetcher, requests) = bulk(pages);
-        assert_eq!(
-            fetcher
-                .fetch_all(&[wallet()], &mut cache)
-                .await
-                .unwrap()
-                .failed,
-            [wallet()]
-        );
-        assert_eq!(
-            row_bytes(&cache),
-            before,
-            "even a completed lower forward piece must remain uncommitted"
-        );
-        assert_eq!(state(&cache), (1, Some(NOW)));
-        assert_eq!(
-            requests.lock().unwrap().last(),
-            Some(&url(boundary, boundary, 5000))
-        );
-        assert!(!requests.lock().unwrap().contains(&url(1001, 1000, 0)));
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn later_json_and_insert_errors_keep_prior_pages_and_rollback_failed_batch() {
     for insert_failure in [false, true] {
@@ -503,161 +352,4 @@ async fn failed_marker_write_blocks_all_trade_writes() {
     assert_eq!(cache.trade_count(), 0);
     assert_eq!(state(&cache), (0, None));
     assert!(requests.lock().unwrap().is_empty());
-}
-
-#[tokio::test(start_paused = true)]
-async fn frozen_hi_excludes_new_arrivals_and_rechecks_previous_maximum_second() {
-    struct AdvancingFetcher {
-        inner: FixtureFetcher,
-        clock: Arc<AtomicI64>,
-    }
-    impl PageFetcher for AdvancingFetcher {
-        async fn fetch_page(&self, request: &str) -> Result<Vec<u8>, SourceError> {
-            self.clock.store(NOW + 100, Ordering::SeqCst);
-            self.inner.fetch_page(request).await
-        }
-    }
-    let dir = TempDir::new().unwrap();
-    let mut cache = cache(&dir);
-    seed(&mut cache, 1000).await;
-    let clock = Arc::new(AtomicI64::new(NOW));
-    let mut pages = Pages::new();
-    put(&mut pages, 1, 999, 0, &[]);
-    // Duplicate cached ID ignored; newly indexed sibling at the old max retained.
-    window(
-        &mut pages,
-        1000,
-        1000,
-        &[trade(100_000, 1000), trade(1, 1000), trade(1, 1000)],
-    );
-    window(&mut pages, 1001, NOW, &[trade(2, NOW)]);
-    let reader_clock = clock.clone();
-    let fetcher = PolymarketBulkFetcher::new(
-        BASE.to_owned(),
-        AdvancingFetcher {
-            inner: FixtureFetcher::new(pages),
-            clock,
-        },
-    )
-    .with_clock_for_test(move || reader_clock.load(Ordering::SeqCst))
-    .with_stamp_on_success(true);
-    assert!(
-        fetcher
-            .fetch_all(&[wallet()], &mut cache)
-            .await
-            .unwrap()
-            .failed
-            .is_empty()
-    );
-    assert_eq!(cache.trade_count(), 3);
-    assert_eq!(
-        cache
-            .trade_ts_bounds(&wallet().to_string())
-            .unwrap()
-            .unwrap()
-            .1,
-        NOW
-    );
-    let mut next = Pages::new();
-    put(&mut next, 1, 999, 0, &[]);
-    window(&mut next, NOW, NOW, &[trade(2, NOW)]);
-    window(&mut next, NOW + 1, NOW + 100, &[trade(3, NOW + 1)]);
-    assert!(
-        bulk(next)
-            .0
-            .with_clock_for_test(|| NOW + 100)
-            .fetch_all(&[wallet()], &mut cache)
-            .await
-            .unwrap()
-            .failed
-            .is_empty()
-    );
-    assert_eq!(cache.trade_count(), 4);
-}
-
-#[tokio::test(start_paused = true)]
-async fn failed_completion_commit_is_failed_and_preserves_marker_and_stamp() {
-    for stamping in [false, true] {
-        let dir = TempDir::new().unwrap();
-        let mut cache = cache(&dir);
-        cache
-            .update_last_polymarket_fetch(&wallet().to_string(), 100)
-            .unwrap();
-        cache.raw_conn_for_test().execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE final_parent (id INTEGER PRIMARY KEY);
-             CREATE TABLE final_child (id INTEGER REFERENCES final_parent(id) DEFERRABLE INITIALLY DEFERRED);
-             CREATE TRIGGER fail_completion AFTER UPDATE OF backfill_partial ON wallets
-             WHEN NEW.backfill_partial = 0 BEGIN INSERT INTO final_child VALUES (1); END;"
-        ).unwrap();
-        let mut pages = Pages::new();
-        put(&mut pages, 1, NOW, 0, &[trade(1, 1000)]);
-        assert_eq!(
-            bulk(pages)
-                .0
-                .with_stamp_on_success(stamping)
-                .fetch_all(&[wallet()], &mut cache)
-                .await
-                .unwrap()
-                .failed,
-            [wallet()]
-        );
-        assert_eq!(cache.trade_count(), 1);
-        drop(cache);
-        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        assert_eq!(state(&cache), (1, Some(100)));
-        cache
-            .raw_conn_for_test()
-            .execute_batch("DROP TRIGGER fail_completion;")
-            .unwrap();
-        let mut pages = Pages::new();
-        put(&mut pages, 1, 999, 0, &[]);
-        window(&mut pages, 1000, 1000, &[trade(1, 1000)]);
-        window(&mut pages, 1001, NOW, &[]);
-        assert!(
-            bulk(pages)
-                .0
-                .with_stamp_on_success(stamping)
-                .fetch_all(&[wallet()], &mut cache)
-                .await
-                .unwrap()
-                .failed
-                .is_empty()
-        );
-        drop(cache);
-        let cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        assert_eq!(state(&cache), (0, Some(if stamping { NOW } else { 100 })));
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn full_history_uses_positive_start_including_the_cold_probe() {
-    let dir = TempDir::new().unwrap();
-    let mut cache = cache(&dir);
-    let rows = history(550, 1_000_000_000); // Decades before the frozen upper bound.
-    let mut pages = Pages::new();
-    backward(&mut pages, NOW, &rows);
-    // A default-window request would succeed but silently hide this old history.
-    pages.insert(
-        PolymarketEndpoint::UserTradeActivityPage {
-            user: wallet().to_string(),
-            start: None,
-            end: NOW,
-            offset: 0,
-        }
-        .url(BASE),
-        b"[]".to_vec(),
-    );
-    let (fetcher, requests) = bulk(pages);
-    assert!(
-        fetcher
-            .fetch_all(&[wallet()], &mut cache)
-            .await
-            .unwrap()
-            .failed
-            .is_empty()
-    );
-    assert_eq!(cache.trade_count(), 550);
-    assert_eq!(requests.lock().unwrap()[0], url(1, NOW, 0));
-    assert_eq!(requests.lock().unwrap()[2], url(1, 999_999_500, 0));
 }

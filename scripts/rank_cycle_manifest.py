@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 from latency_shift_rerank import ORACLE_VERSION
+from partial_backfill_wallets import partial_backfill_wallets
 
 MANIFEST_VERSION = 1
 
@@ -160,17 +161,6 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 ),
             }
         else:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(wallets)")}
-            partial = []
-            active_partial = 0
-            if "backfill_partial" in columns:
-                partial = sorted(str(row[0]).lower() for row in connection.execute(
-                    "SELECT wallet_hex FROM wallets WHERE backfill_partial = 1"
-                ))
-                active_partial = _one(connection,
-                    "SELECT COUNT(*) FROM active_tradeable_wallets WHERE backfill_partial = 1")
-            universe["backfill_partial_wallets"] = partial
-            universe["active_tradeable_partial_count"] = active_partial
             activity = {
                 "generation": 1,
                 "count": _one(connection, "SELECT COUNT(*) FROM trades"),
@@ -192,6 +182,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 if cursor is None
                 else {"value": str(cursor[0]), "updated_at": int(cursor[1])},
             }
+        universe["backfill_partial_wallets"] = sorted(partial_backfill_wallets(connection))
         body = {
             "version": MANIFEST_VERSION,
             "day_utc": day_utc,
@@ -254,6 +245,7 @@ def parse_args():
     capture.add_argument("--configuration-file", required=True, type=Path)
     capture.add_argument("--output", required=True, type=Path)
     compare = subparsers.add_parser("unchanged")
+    compare.add_argument("--db", required=True, type=Path)
     compare.add_argument("--current", required=True, type=Path)
     compare.add_argument("--root", required=True, type=Path)
     return parser.parse_args()
@@ -268,8 +260,12 @@ def main() -> int:
         return 0
     current = json.loads(args.current.read_text(encoding="utf-8"))
     # The wrapper must retry a same-day partial walk even if no new rows landed.
-    if current["universe"].get("active_tradeable_partial_count", 0) > 0:
-        return 1
+    connection = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    try:
+        if partial_backfill_wallets(connection, retryable_only=True):
+            return 1
+    finally:
+        connection.close()
     accepted = latest_accepted(args.root, current["day_utc"])
     if accepted is not None and accepted.get("fingerprint_sha256") == current.get(
         "fingerprint_sha256"

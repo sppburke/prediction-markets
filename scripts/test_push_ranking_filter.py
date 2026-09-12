@@ -153,13 +153,13 @@ class ActiveFilterTest(unittest.TestCase):
         # Newest trade is 48h old > 24h staleness bound -> abort, do not filter.
         _make_cache(self.db, [("0xaaa", NOW - 48 * HOUR)])
         rows = [{"wallet": "0xaaa"}]
-        with self.assertRaises(pr.CacheStaleError):
+        with self.assertRaises(pr.RankingUnavailableError):
             pr.filter_active_rows(rows, self.db, 72, 24, NOW)
 
     def test_empty_cache_aborts(self) -> None:
         _make_cache(self.db, [])
         rows = [{"wallet": "0xaaa"}]
-        with self.assertRaises(pr.CacheStaleError):
+        with self.assertRaises(pr.RankingUnavailableError):
             pr.filter_active_rows(rows, self.db, 72, 24, NOW)
 
     def test_missing_clob_cursor_aborts(self) -> None:

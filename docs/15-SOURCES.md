@@ -89,11 +89,14 @@
 > at 500, and offsets above 5,000 return 400. Bootstrap therefore completes every
 > boundary second before stepping below it, using inclusive `start`/`end` as
 > recorded by the reconciliation check below. A full terminal single-second
-> page is incomplete, never a success. The walk freezes its upper bound and
-> rechecks the previous maximum second before extending; its gap-free guarantee
-> covers stable API-visible history, not arbitrary late indexing into older
-> seconds (see the measured indexing latency above). This check used current
-> official documentation; no fresh live-wallet completeness claim is made.
+> page is incomplete, never a success. The #608/#609 walk freezes
+> `hi = now - ACTIVITY_SETTLE_LAG_SECS` and acquires complete forward windows
+> above a durable frontier. A legacy anchor re-covers the cached maximum second.
+> Requested coverage excludes inherited gaps below that anchor and rows first
+> visible after their crossing request; the source promises no immutable bucket
+> closure. The settled discipline and accepted schema-one retention limits are
+> specified in `docs/26`. Re-read the official reference on 2026-09-12 for this
+> implementation; no fresh live-wallet completeness claim is made.
 
 > **Data-API reconciliation contract re-verified live (2026-09-03, issues #544/#555/#557).**
 > `/activity` accepts one comma-separated `type` parameter: the production request

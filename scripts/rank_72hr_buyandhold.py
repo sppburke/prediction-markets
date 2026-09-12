@@ -56,6 +56,7 @@ import csv
 import math
 import os
 import sqlite3
+from partial_backfill_wallets import partial_backfill_wallets
 import sys
 import time
 from dataclasses import dataclass
@@ -241,12 +242,7 @@ def exclude_partial_backfills(conn: sqlite3.Connection, wallets: list[str],
     """
     if schema_version >= 2:
         return wallets
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(wallets)")}
-    if "backfill_partial" not in columns:
-        return wallets
-    partial = {str(row[0]).lower() for row in conn.execute(
-        "SELECT wallet_hex FROM wallets WHERE backfill_partial = 1"
-    )}
+    partial = partial_backfill_wallets(conn)
     return [wallet for wallet in wallets if wallet not in partial]
 
 
@@ -490,6 +486,10 @@ def main() -> int:
         wallets = wallets[:prm.limit_wallets]
     log(f"universe after completeness filter and limit: {len(wallets)} wallets")
 
+    if not wallets and schema_version < 2:
+        log("empty universe after completeness filter")
+        return 76
+
     # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
     # Market maps (resolutions + schedules) are only needed by the SQLite path; the
     # DuckDB path joins them in SQL over the Parquet snapshot.
@@ -564,7 +564,7 @@ def main() -> int:
 
     if not summaries:
         log("no qualifying positions; aborting")
-        return 1
+        return 76 if schema_version < 2 else 1
 
     stats = pd.DataFrame(summaries)
     stats["eligible"] = (
@@ -587,7 +587,7 @@ def main() -> int:
     elig = stats[stats["eligible"]].copy().reset_index(drop=True)
     if n_elig == 0:
         log("no eligible wallets; stopping after ranking")
-        return 0
+        return 76 if schema_version < 2 else 0
 
     # intermediate deliverable: ranked_72hr_buyandhold (eligible, ranked by net t-stat)
     ranked_txt = os.path.join(prm.out_dir, "ranked_72hr_buyandhold.txt")
@@ -607,7 +607,7 @@ def main() -> int:
     floor_wallets = floor["wallet"].tolist()
     if not floor_wallets:
         log("no wallets clear the edge floor; stopping")
-        return 0
+        return 76 if schema_version < 2 else 0
 
     # Weekly (sum, count) matrices of net return per (wallet, resolution-week), built from
     # the retained per-wallet arrays. Group return for a set S in week t is
