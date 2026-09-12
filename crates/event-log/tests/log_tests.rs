@@ -846,8 +846,12 @@ fn scanner_rejects_length_corruption_that_swallows_the_crc_without_repair() {
         Scanner::verify(&path).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
         let frame_start = usize::try_from(prefix.physical_tail).unwrap();
+        // `remaining` already excludes LEN's four bytes; declaring `remaining - k` makes the body
+        // read consume the real body, the real CRC and the following frame, leaving exactly k
+        // bytes for the CRC read.
         let remaining = bytes.len() - frame_start - 4;
-        let corrupt_len = u32::try_from(remaining - 4 - k).unwrap();
+        let corrupt_len = u32::try_from(remaining - k).unwrap();
+        assert_eq!(bytes.len() - (frame_start + 4 + remaining - k), k);
         bytes[frame_start..frame_start + 4].copy_from_slice(&corrupt_len.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
 

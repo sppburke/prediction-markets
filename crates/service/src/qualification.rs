@@ -10912,7 +10912,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(sequence, EventSeq(2));
-        let mut bytes = fs::read(&paths.source_log).unwrap();
+        let bytes = fs::read(&paths.source_log).unwrap();
         let frame_start = usize::try_from(offset).unwrap();
         // The oversized LEN runs the body read short; the four (remaining - 4 - k) values read the
         // body completely and run short by k bytes on the CRC. Every one must classify as
@@ -10920,7 +10920,7 @@ mod tests {
         let pristine = bytes.clone();
         let remaining = bytes.len() - frame_start - 4;
         let mut corrupt_lens = vec![67_108_864_u32];
-        corrupt_lens.extend((0..4_usize).map(|k| u32::try_from(remaining - 4 - k).unwrap()));
+        corrupt_lens.extend((0..4_usize).map(|k| u32::try_from(remaining - k).unwrap()));
         for corrupt_len in corrupt_lens {
             let mut bytes = pristine.clone();
             assert!(bytes.len() < 67_108_864);
