@@ -3265,28 +3265,60 @@ fi
 rm -f "$sh63_big" "$sh63_root/short.log"
 echo "PASS: FE-STREAMHASH-63"
 
-# ── FE-BACKUPCACHE-64: both SQLite maintenance connections raise cache_size BEFORE their check ───
-# Asserted at RUNTIME by tracing real sqlite3 calls, not by searching the source: a text search
-# passes when the pragma is commented out (the text survives in the comment) and when it is issued
-# on the wrong connection. Whether the raised cache actually shortens the check is an operational
-# measurement against the real 4.28 GB copy, recorded in the PR — never asserted here.
+# ── FE-BACKUPCACHE-64: every integrity check must run on a connection whose cache is raised ──────
+# Asserted at RUNTIME, and by the EFFECTIVE value at the moment of each check rather than by
+# statement order. Order-based tracing is not enough: a later `cache_size=-2000`, a pragma issued
+# through a cursor or executescript, a reused connection id after garbage collection, or a second
+# untuned check can all slip past it. Here the tracer intercepts `pragma integrity_check` on every
+# execution path and reads `pragma cache_size` back from that same connection at that instant.
+# Whether the raised cache actually shortens the check is an operational measurement against the
+# real 4.28 GB copy, recorded in the PR — never asserted here.
 sh64_root=$TEST_TMP/backupcache
 mkdir -p "$sh64_root/tracer"
 cat > "$sh64_root/tracer/sitecustomize.py" <<'TRACER'
 import os, sqlite3
+
 _trace = os.environ.get("PE_SQLITE_TRACE")
 if _trace:
     _log = open(_trace, "a", buffering=1)
     _connect = sqlite3.connect
+    _counter = [0]
+
+    def _record(connection, sql):
+        # Read the EFFECTIVE budget back from this very connection, bypassing the traced
+        # wrappers, at the moment the check runs.
+        if "integrity_check" not in " ".join(str(sql).split()).lower():
+            return
+        effective = sqlite3.Connection.execute(connection, "pragma cache_size").fetchone()[0]
+        _log.write("%s\t%s\n" % (getattr(connection, "_pe_token", "?"), effective))
+
+    class _Cursor(sqlite3.Cursor):
+        def execute(self, sql, *a, **k):
+            _record(self.connection, sql); return super().execute(sql, *a, **k)
+        def executemany(self, sql, *a, **k):
+            _record(self.connection, sql); return super().executemany(sql, *a, **k)
+        def executescript(self, sql, *a, **k):
+            _record(self.connection, sql); return super().executescript(sql, *a, **k)
 
     class _Traced(sqlite3.Connection):
-        def execute(self, sql, *args, **kwargs):
-            _log.write("%d\t%s\n" % (id(self), " ".join(str(sql).split())))
-            return super().execute(sql, *args, **kwargs)
+        def cursor(self, factory=_Cursor):
+            return super().cursor(factory)
+        def execute(self, sql, *a, **k):
+            _record(self, sql); return super().execute(sql, *a, **k)
+        def executemany(self, sql, *a, **k):
+            _record(self, sql); return super().executemany(sql, *a, **k)
+        def executescript(self, sql, *a, **k):
+            _record(self, sql); return super().executescript(sql, *a, **k)
 
     def connect(*args, **kwargs):
         kwargs.setdefault("factory", _Traced)
-        return _connect(*args, **kwargs)
+        con = _connect(*args, **kwargs)
+        _counter[0] += 1
+        try:
+            con._pe_token = "c%d" % _counter[0]      # never reused, unlike id()
+        except AttributeError:
+            pass
+        return con
 
     sqlite3.connect = connect
 TRACER
@@ -3299,17 +3331,13 @@ con.commit(); con.close()
 SEED
 
 sh64_assert() {                      # <label> <trace file>
-  python3 - "$1" "$2" <<'ASSERT' || fail "FE-BACKUPCACHE-64 $1 did not raise cache_size on the checked connection before its integrity check"
+  python3 - "$1" "$2" <<'ASSERT' || fail "FE-BACKUPCACHE-64 $1 ran an integrity check on an untuned connection"
 import sys
 label, path = sys.argv[1], sys.argv[2]
-rows = [line.rstrip("\n").split("\t", 1) for line in open(path) if "\t" in line]
-cache = [i for i, (cid, sql) in enumerate(rows) if sql.lower() == "pragma cache_size=-262144"]
-check = [i for i, (cid, sql) in enumerate(rows) if sql.lower() == "pragma integrity_check"]
-assert check, "%s never ran integrity_check (trace: %r)" % (label, rows)
-assert cache, "%s never raised cache_size (trace: %r)" % (label, rows)
-first_check = check[0]
-same = [i for i in cache if rows[i][0] == rows[first_check][0] and i < first_check]
-assert same, "%s raised cache_size on a different connection or after the check (trace: %r)" % (label, rows)
+rows = [l.rstrip("\n").split("\t", 1) for l in open(path) if "\t" in l]
+assert rows, "%s ran no integrity check at all" % label
+bad = [(tok, val) for tok, val in rows if val.strip() != "-262144"]
+assert not bad, "%s checked with effective cache_size %r" % (label, bad)
 ASSERT
 }
 
@@ -3330,23 +3358,35 @@ PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$sh64_root/restore.trace" \
 sh64_assert restore_sqlite_backup "$sh64_root/restore.trace"
 [[ -s "$sh64_root/restored.db" ]] || fail "FE-BACKUPCACHE-64 restore_sqlite_backup produced no destination"
 
-# The tracer itself must be able to fail: a connection that never raises the cache is rejected.
-PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$sh64_root/negative.trace" python3 - "$sh64_root/source.db" <<'NEG'
-import sqlite3, sys
-con = sqlite3.connect(sys.argv[1])
-con.execute("pragma integrity_check")
-con.close()
-NEG
-if python3 - negative "$sh64_root/negative.trace" <<'ASSERT' 2>/dev/null
+# Negative controls: each of these MUST be rejected, or the assertion certifies nothing.
+sh64_reject() {                      # <label> <python body>
+  local label=$1 body=$2 trace=$sh64_root/neg-$1.trace
+  rm -f "$trace"
+  PYTHONPATH="$sh64_root/tracer" PE_SQLITE_TRACE="$trace" python3 -c "$body" "$sh64_root/source.db" ||
+    fail "FE-BACKUPCACHE-64 negative control $label did not run"
+  if python3 - "$label" "$trace" <<'ASSERT' 2>/dev/null
 import sys
 rows = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[2]) if "\t" in l]
-cache = [i for i, (c, s) in enumerate(rows) if s.lower() == "pragma cache_size=-262144"]
-check = [i for i, (c, s) in enumerate(rows) if s.lower() == "pragma integrity_check"]
-assert check and cache and any(rows[i][0] == rows[check[0]][0] and i < check[0] for i in cache)
+assert rows and not [r for r in rows if r[1].strip() != "-262144"]
 ASSERT
-then
-  fail "FE-BACKUPCACHE-64 the runtime assertion cannot fail; it would certify an untuned connection"
-fi
+  then fail "FE-BACKUPCACHE-64 accepted the '$label' negative control"; fi
+}
+sh64_reject no-pragma 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma integrity_check"); c.close()'
+sh64_reject cursor-override 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c.cursor().execute("pragma cache_size=-2000"); c.execute("pragma integrity_check"); c.close()'
+sh64_reject reset-before-check 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c.execute("pragma cache_size=-2000"); c.execute("pragma integrity_check"); c.close()'
+sh64_reject reopened-connection 'import gc,sqlite3,sys
+a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-262144"); a.close(); del a; gc.collect()
+b=sqlite3.connect(sys.argv[1]); b.execute("pragma integrity_check"); b.close()'
+sh64_reject second-untuned-check 'import sqlite3,sys
+a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-262144"); a.execute("pragma integrity_check")
+b=sqlite3.connect(sys.argv[1]); b.execute("pragma integrity_check"); a.close(); b.close()'
+sh64_reject cursor-issued-check 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.cursor().execute("pragma integrity_check"); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
 echo "PASS: 64 scenario contracts, including WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
