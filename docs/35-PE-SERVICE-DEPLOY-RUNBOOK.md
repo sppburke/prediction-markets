@@ -544,6 +544,13 @@ records `rolled_back` with `no_financial_mutation: true`. Rollback-check reads t
 prefix and tolerates a partial trailing source frame without writing to that log; the later stopped
 `prepare` scan remains strict.
 
+Rollback-check selects the projection reducer's position-page, mark-price, resolution, and custody
+receipts from each account's first Baseline onward, unions their `(sequence, hash)` tuples, and
+verifies the source prefix even when that set is empty. The prefix observer retains at most one
+envelope per selected tuple, cloning only after membership succeeds; outer retained bytes scale
+with selected payload bytes. Existing journal and recursive-reducer allocations are outside this
+bound. A required receipt missing from the verified prefix still fails closed in the reducer.
+
 Before fresh activation, archive that no-mutation manifest under the existing deploy lock. Acquire
 the provisioned `~/.pe-deploy.lock` exactly as the driver does (`exec 9<"$DEPLOY_LOCK"` followed by
 `flock -n 9`, with `DEPLOY_LOCK` naming that existing file). While holding the lock, re-check the

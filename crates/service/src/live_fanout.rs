@@ -288,6 +288,50 @@ fn source_envelopes_for_live_events(
         .collect()
 }
 
+/// Select only source receipts consumed by the projection reducer after the first Baseline.
+/// Audit-only history and admission receipts do not require source payloads on this path.
+/// Missing or inconsistent evidence remains the reducer's decision.
+pub(crate) fn projection_source_receipts(
+    account_id: &AccountId,
+    events: &[LiveJournalEvent],
+) -> HashSet<(pe_core_types::EventSeq, blake3::Hash)> {
+    let baseline_index =
+        pe_execution_core::live_journal::first_account_baseline_index(events, account_id)
+            .unwrap_or(events.len());
+    let mut receipts = HashSet::new();
+    for event in &events[baseline_index..] {
+        match &event.payload {
+            LiveJournalPayload::AccountPortfolioMarked(mark) => {
+                receipts.extend(
+                    mark.venue_position_evidence
+                        .pages
+                        .iter()
+                        .map(|page| (page.receipt.sequence, page.receipt.this_hash)),
+                );
+                receipts.extend(
+                    mark.prices
+                        .iter()
+                        .map(|price| (price.receipt.sequence, price.receipt.this_hash)),
+                );
+            }
+            LiveJournalPayload::ResolutionFinalized(resolution) => {
+                let receipt = resolution.source_append_receipt;
+                receipts.insert((receipt.sequence, receipt.this_hash));
+            }
+            LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
+                receipts.extend(
+                    custody
+                        .venue_position_receipts
+                        .iter()
+                        .map(|receipt| (receipt.sequence, receipt.this_hash)),
+                );
+            }
+            _ => {}
+        }
+    }
+    receipts
+}
+
 /// Start the first-boot arming fence, then drive mode, redemption, retention, and ordered fan-out.
 pub async fn run_live_fanout(config: LiveFanoutConfig) {
     let _ = run_live_fanout_until(config, std::future::pending()).await;
@@ -8713,6 +8757,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projection_source_receipts_select_only_reducer_evidence_after_baseline() {
+        let account_id = AccountId::new("source-scope").unwrap();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let baseline = baseline_event(&account_id, 1);
+        let mut daily = baseline.clone();
+        let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut daily.payload else {
+            unreachable!();
+        };
+        mark.kind = MarkKind::Daily;
+        mark.venue_position_evidence.pages[0].receipt = fixture_receipt(120);
+        mark.venue_position_evidence.pages[1].receipt = fixture_receipt(121);
+        let duplicate_page = mark.venue_position_evidence.pages[0].clone();
+        mark.venue_position_evidence.pages.push(duplicate_page);
+        let price = pe_execution_core::MarkPrice {
+            condition_id: PolymarketConditionId("condition".to_owned()),
+            outcome_index: 0,
+            price: Price::new(dec!(0.5)).unwrap(),
+            receipt: fixture_receipt(9),
+            observed_unix: 0,
+        };
+        mark.prices = vec![price.clone(), price];
+        let conflicting_receipt = AppendReceipt {
+            sequence: EventSeq(120),
+            this_hash: blake3::hash(b"conflicting hash stays for the reducer to reject"),
+        };
+        let custody = LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 4,
+            timestamp: now,
+            payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+                pe_execution_core::RedemptionCustodyReconciledAudit {
+                    identity: RedemptionAttemptIdentity {
+                        account_id: account_id.clone(),
+                        condition_id: PolymarketConditionId("condition".to_owned()),
+                        adapter: "adapter".to_owned(),
+                        custody_wallet: mark.account_binding.custody_wallet.clone(),
+                    },
+                    account_state: mark.account_state.clone(),
+                    venue_positions: Vec::new(),
+                    venue_position_receipts: vec![
+                        fixture_receipt(110),
+                        fixture_receipt(110),
+                        conflicting_receipt,
+                    ],
+                },
+            )),
+        };
+        let resolution = resolution_event(&account_id, 3);
+        // Every receipt-bearing variant before the first Baseline is audit-only.
+        let mut audit_mark = daily.clone();
+        let LiveJournalPayload::AccountPortfolioMarked(mark) = &mut audit_mark.payload else {
+            unreachable!();
+        };
+        for page in &mut mark.venue_position_evidence.pages {
+            page.receipt = fixture_receipt(200);
+        }
+        for price in &mut mark.prices {
+            price.receipt = fixture_receipt(201);
+        }
+        let mut audit_resolution = resolution.clone();
+        let LiveJournalPayload::ResolutionFinalized(resolution_audit) =
+            &mut audit_resolution.payload
+        else {
+            unreachable!();
+        };
+        resolution_audit.source_append_receipt = fixture_receipt(202);
+        let mut audit_custody = custody.clone();
+        let LiveJournalPayload::RedemptionCustodyReconciled(custody_audit) =
+            &mut audit_custody.payload
+        else {
+            unreachable!();
+        };
+        custody_audit.venue_position_receipts = vec![fixture_receipt(203)];
+        let mut events = vec![audit_mark, audit_resolution, audit_custody];
+        assert!(projection_source_receipts(&account_id, &events).is_empty());
+        events.extend([
+            baseline,
+            approved_admission_event(&account_id, &finality_prepared(), 2, now),
+            daily,
+            resolution.clone(),
+            resolution,
+            custody,
+        ]);
+        let mut expected = [2, 9, 100, 101, 110, 120, 121]
+            .map(|sequence| {
+                let receipt = fixture_receipt(sequence);
+                (receipt.sequence, receipt.this_hash)
+            })
+            .into_iter()
+            .collect::<HashSet<_>>();
+        expected.insert((conflicting_receipt.sequence, conflicting_receipt.this_hash));
+        assert_eq!(projection_source_receipts(&account_id, &events), expected);
+    }
+
     fn gamma_risk_price_source(
         receipt: AppendReceipt,
         condition_id: &str,
@@ -12772,6 +12911,69 @@ mod tests {
         derive_projection_rows_with_sources(account_id, events, &sources)
     }
 
+    fn projection_snapshot(derived: &ProjectionDerivation) -> serde_json::Value {
+        serde_json::json!({
+            "fills": derived.fills,
+            "positions": derived.positions,
+            "custody_positions": derived.custody_positions,
+            "reserved": derived.reserved,
+            "economic_cash": derived.economic_cash,
+            "receivable": derived.receivable,
+            "latest_free_collateral": derived.latest_free_collateral,
+            "latest_reconciled_at": derived.latest_reconciled_at,
+            "baseline_equity": derived.baseline_equity,
+            "baseline_cutoff_unix": derived.baseline_cutoff_unix,
+            "baseline_sequence": derived.baseline_sequence,
+            "account_binding": derived.account_binding,
+            "daily_marks": derived.daily_marks,
+            "realized_closes": derived.realized_closes,
+            "validated_prepared_sequences": derived.validated_prepared_sequences,
+            "pending_approved_admission_keys": derived.pending_approved_admission_keys,
+            "open_exposures": derived.open_exposures.iter().map(|exposure| (
+                &exposure.leader_wallet, &exposure.market_id, exposure.debit,
+            )).collect::<Vec<_>>(),
+            "receivable_by_condition": derived.receivable_by_condition,
+        })
+    }
+
+    fn derive_with_filtered_source_equivalence(
+        account_id: &AccountId,
+        events: &[LiveJournalEvent],
+        additional_sources: &[EventEnvelope],
+        expected_sequences: &[u64],
+    ) -> ProjectionDerivation {
+        let mut full_sources = baseline_sources(account_id);
+        full_sources.extend_from_slice(additional_sources);
+        full_sources.push(source_envelope(
+            fixture_receipt(240),
+            "unreferenced",
+            vec![b' '; 16_384],
+            OffsetDateTime::UNIX_EPOCH,
+        ));
+        full_sources.sort_by_key(|source| source.seq);
+        let selected = projection_source_receipts(account_id, events);
+        let expected = expected_sequences
+            .iter()
+            .map(|sequence| {
+                let receipt = fixture_receipt(*sequence);
+                (receipt.sequence, receipt.this_hash)
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(selected, expected);
+        let filtered = full_sources
+            .iter()
+            .filter(|source| selected.contains(&(source.seq, source.this_hash)))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(filtered.len(), expected.len());
+        assert!(filtered.len() < full_sources.len());
+        assert!(filtered.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+        let full = derive_projection_rows_with_sources(account_id, events, &full_sources).unwrap();
+        let reduced = derive_projection_rows_with_sources(account_id, events, &filtered).unwrap();
+        assert_eq!(projection_snapshot(&reduced), projection_snapshot(&full));
+        reduced
+    }
+
     fn baseline_event(account_id: &AccountId, seq: u64) -> LiveJournalEvent {
         let cash = CollateralAmount::from_atomic(10_000_000);
         let account_binding =
@@ -16630,8 +16832,12 @@ mod tests {
         ));
         let mut accepted_sources = vec![source, price_source];
         accepted_sources.extend(daily_position_sources);
-        let derived =
-            derive_with_baseline_evidence(&account_id, &events, &accepted_sources).unwrap();
+        let derived = derive_with_filtered_source_equivalence(
+            &account_id,
+            &events,
+            &accepted_sources,
+            &[2, 9, 100, 101, 120, 121],
+        );
         assert_eq!(
             derived.daily_marks.get(&86_400),
             Some(&CollateralAmount::from_decimal_exact(dec!(9.062380)).unwrap())
@@ -16874,9 +17080,12 @@ mod tests {
             ),
             Err(ProjectionReducerError::CustodyInventoryMismatch)
         ));
-        let custody =
-            derive_with_baseline_evidence(&account_id, &events, &custody_and_resolution_sources)
-                .unwrap();
+        let custody = derive_with_filtered_source_equivalence(
+            &account_id,
+            &events,
+            &custody_and_resolution_sources,
+            &[2, 100, 101, 110, 111],
+        );
         assert_eq!(custody.economic_cash, resolved.economic_cash);
         assert_eq!(custody.receivable, Decimal::ZERO);
         assert!(custody.custody_positions.is_empty());
