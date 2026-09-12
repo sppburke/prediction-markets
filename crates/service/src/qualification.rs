@@ -10898,6 +10898,49 @@ mod tests {
     }
 
     #[test]
+    fn financial_rollback_check_rejects_interior_length_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config) = financial_era_live_source_fixture(temp.path());
+        let paths = &manifest.paths;
+        // Leave all required baseline evidence before the damaged, unreferenced interior frame:
+        // accepting a shorter prefix would otherwise still satisfy the projection reducer.
+        append_unreferenced_source_frames(&paths.source_log, 3);
+        rollback_check_financial_era(&manifest, &config).unwrap();
+        let (offset, sequence, _) = Reader::replay_with_offsets(&paths.source_log)
+            .unwrap()
+            .nth(2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequence, EventSeq(2));
+        let mut bytes = fs::read(&paths.source_log).unwrap();
+        let frame_start = usize::try_from(offset).unwrap();
+        let corrupt_len = 67_108_864_u32;
+        assert!(bytes.len() < usize::try_from(corrupt_len).unwrap());
+        bytes[frame_start..frame_start + 4].copy_from_slice(&corrupt_len.to_le_bytes());
+        fs::write(&paths.source_log, &bytes).unwrap();
+        let journal_before = fs::read(&paths.live_journal).unwrap();
+
+        assert!(matches!(
+            verify_live_preparation_posture(
+                &paths.live_journal,
+                &paths.source_log,
+                &config.status_path,
+            ),
+            Err(QualificationError::EventLog(pe_event_log::LogError::CrcMismatch {
+                at_seq: EventSeq(2), byte_offset,
+            })) if byte_offset == offset
+        ));
+        assert!(matches!(
+            rollback_check_financial_era(&manifest, &config),
+            Err(QualificationError::EventLog(pe_event_log::LogError::CrcMismatch {
+                at_seq: EventSeq(2), byte_offset,
+            })) if byte_offset == offset
+        ));
+        assert_eq!(fs::read(&paths.source_log).unwrap(), bytes);
+        assert_eq!(fs::read(&paths.live_journal).unwrap(), journal_before);
+    }
+
+    #[test]
     fn financial_rollback_check_rejects_interior_crc_damage_with_partial_source_tail() {
         let temp = tempfile::tempdir().unwrap();
         let (manifest, config) = financial_era_live_source_fixture(temp.path());

@@ -401,6 +401,7 @@ manifest_complete_start() {
   if python3 -c 'import json,sys
 try: value=json.loads(sys.argv[1])
 except Exception: raise SystemExit(2)
+if not isinstance(value, dict): raise SystemExit(2)
 if value.get("complete_start") is True: raise SystemExit(0)
 if value.get("complete_start") is False: raise SystemExit(1)
 raise SystemExit(2)' "$output"; then

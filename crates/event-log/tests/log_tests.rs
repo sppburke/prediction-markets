@@ -776,6 +776,91 @@ fn verify_prefix_returns_a_canonical_path_for_noncanonical_input() {
 }
 
 #[test]
+fn scanner_rejects_interior_length_corruption_without_repair() {
+    let dir = tmp_dir();
+    let path = dir.path().join("corrupt-length.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"prefix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let prefix = Scanner::verify(&path).unwrap();
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"interior".to_vec())).unwrap();
+        writer.append(make_envelope(b"following".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    Scanner::verify(&path).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let frame_start = usize::try_from(prefix.physical_tail).unwrap();
+    let corrupt_len = 67_108_864_u32;
+    assert!(bytes.len() < usize::try_from(corrupt_len).unwrap());
+    bytes[frame_start..frame_start + 4].copy_from_slice(&corrupt_len.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(matches!(
+        Scanner::inspect(&path),
+        Err(LogError::CrcMismatch { at_seq: EventSeq(1), byte_offset })
+            if byte_offset == prefix.physical_tail
+    ));
+    // Even a trusted binding to the preceding prefix must not authorize truncating real frames.
+    assert!(matches!(
+        Writer::open_with_expected_tail(&path, &prefix),
+        Err(LogError::CrcMismatch {
+            at_seq: EventSeq(1),
+            ..
+        })
+    ));
+    assert!(matches!(
+        Writer::open(&path),
+        Err(LogError::CrcMismatch {
+            at_seq: EventSeq(1),
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn scanner_reports_incomplete_tail_for_partial_body_and_short_zstd_header() {
+    let dir = tmp_dir();
+    let path = dir.path().join("partial-body.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"prefix".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let prefix = Scanner::verify(&path).unwrap();
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer
+            .append(make_envelope(b"partial tail".to_vec()))
+            .unwrap();
+        writer.sync().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let body_start = usize::try_from(prefix.physical_tail).unwrap() + 4;
+    let body_len = bytes.len() - body_start - 4;
+    assert!(body_len > 8);
+    // Every body cut includes mid-body and input shorter than the four-byte zstd magic.
+    // A complete body with missing/partial CRC remains a genuine incomplete tail too.
+    for available in 0..body_len + 4 {
+        let partial = &bytes[..body_start + available];
+        std::fs::write(&path, partial).unwrap();
+        let scan = Scanner::inspect(&path).unwrap();
+        assert_eq!(
+            scan.verified_tail, prefix,
+            "available body bytes: {available}"
+        );
+        let incomplete = scan.incomplete_tail.unwrap();
+        assert_eq!(incomplete.byte_offset, prefix.physical_tail);
+        assert_eq!(incomplete.next_sequence, EventSeq(1));
+        assert_eq!(std::fs::read(&path).unwrap(), partial);
+    }
+}
+
+#[test]
 fn walk_prefix_stops_before_complete_suffix_and_counts_only_prefix_frames() {
     let dir = tmp_dir();
     let path = dir.path().join("walk-complete-suffix.log");

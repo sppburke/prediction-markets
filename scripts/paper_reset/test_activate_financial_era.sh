@@ -2629,7 +2629,7 @@ grep -Fxq 'rollback-error stderr marker' <<< "$output" ||
   fail "unknown Start state changed or discarded rollback-check stderr: $output"
 [[ ! -e "$root/test-state/restore-count" ]] || fail "unknown Start state reached restore"
 rm "$root/test-state/rollback-error"
-for rollback_output in 'invalid-json' '{}' '{"complete_start":"false"}'; do
+for rollback_output in 'invalid-json' '{}' '{"complete_start":"false"}' 'null' '[]' '0' '"x"'; do
   printf '%s\n' "$rollback_output" > "$root/test-state/rollback-output"
   set +e
   output=$(run_driver "$root" --rollback-before-start 2>&1)

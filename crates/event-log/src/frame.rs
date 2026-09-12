@@ -87,8 +87,19 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
         len: len_raw,
     })?;
 
-    let mut compressed = vec![0u8; len];
-    read_exact_frame(r, &mut compressed, byte_offset)?;
+    let mut compressed = Vec::with_capacity(len);
+    r.by_ref()
+        .take(u64::from(len_raw))
+        .read_to_end(&mut compressed)?;
+    if compressed.len() < len {
+        // A short read can also mean LEN swallowed the real CRC and following frames.
+        // A complete self-delimiting zstd frame with trailing bytes proves length corruption;
+        // an unfinished zstd frame (including a partial header) remains an incomplete tail.
+        if complete_zstd_frame_has_trailing_bytes(&compressed) {
+            return Err(FrameReadError::CrcMismatch { byte_offset });
+        }
+        return Err(FrameReadError::Truncated { byte_offset });
+    }
 
     let mut crc_buf = [0u8; 4];
     read_exact_frame(r, &mut crc_buf, byte_offset)?;
@@ -103,6 +114,16 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
         .map_err(|e| FrameReadError::Decompress(e.to_string()))?;
 
     Ok(Some(decompressed))
+}
+
+fn complete_zstd_frame_has_trailing_bytes(compressed: &[u8]) -> bool {
+    let Ok(decoder) = zstd::stream::read::Decoder::with_buffer(compressed) else {
+        return false;
+    };
+    let mut decoder = decoder.single_frame();
+    // Decode to a sink so this classification does not retain another decompressed payload.
+    // The slice is already a BufRead; finish returns exactly the unconsumed input bytes.
+    io::copy(&mut decoder, &mut io::sink()).is_ok() && !decoder.finish().is_empty()
 }
 
 fn read_exact_frame(
