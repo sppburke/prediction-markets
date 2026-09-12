@@ -28,8 +28,6 @@ Engine selection (env, overridable by the caller):
 from __future__ import annotations
 
 import json
-import contextlib
-import fcntl
 import hashlib
 import os
 import time
@@ -40,13 +38,6 @@ from decimal import Decimal, InvalidOperation
 TRADES_PARQUET = "trades.parquet"
 RESOLUTIONS_PARQUET = "market_resolutions.parquet"
 SCHEDULES_PARQUET = "market_schedules.parquet"
-WALLET_COMPLETENESS_PARQUET = "wallet_completeness.parquet"
-V1_EXPORT_MANIFEST = "schema_v1_export_manifest.json"
-V1_BOUND_FILES = (TRADES_PARQUET, WALLET_COMPLETENESS_PARQUET)
-# Deliberately NOT in REQUIRED_PARQUET: a cache that predates the #608 marker has
-# no quarantine at all, so demanding the projection would strand the DuckDB path
-# on every such cache. The caller requires it only when the live cache carries
-# the marker — see `rank_72hr_buyandhold.main`.
 REQUIRED_PARQUET = (TRADES_PARQUET, RESOLUTIONS_PARQUET, SCHEDULES_PARQUET)
 # OPTIONAL snapshots (issue #421 PR4 / #429 PR4 — the CLV price series + its token→outcome map).
 # Absent until the prices-history backfill + export run, so deliberately NOT in REQUIRED_PARQUET:
@@ -116,86 +107,6 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
                 f"schema-two Parquet hash mismatch for {name}"
             )
     return value
-
-
-SNAPSHOT_LOCK = ".parquet_snapshot.lock"
-
-
-@contextlib.contextmanager
-def snapshot_lock(parquet_dir: str | None = None, *, exclusive: bool):
-    """Serialise Parquet snapshot writers against readers.
-
-    The exporter replaces `trades.parquet` and `wallet_completeness.parquet` with
-    `os.replace`, and DuckDB reads them later through views over those pathnames.
-    Without this, a snapshot validated as complete can be swapped for one written
-    from an unfinished walk before extraction reads it, and both exclusion checks
-    still pass. Writers take it exclusive, readers shared, so an export cannot
-    replace files a ranking run is reading, and a ranking run cannot start on a
-    snapshot mid-replacement.
-
-    Mirrors the `flock` coordination `rank_and_push.sh` already uses, on a
-    persistent inode inside the snapshot directory.
-    """
-    _, parquet_dir, _ = engine_settings(None, parquet_dir, None)
-    os.makedirs(parquet_dir, exist_ok=True)
-    path = os.path.join(parquet_dir, SNAPSHOT_LOCK)
-    handle = open(path, "a+")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        try:
-            yield path
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    finally:
-        handle.close()
-
-
-def snapshot_partial_wallets(parquet_dir: str | None = None) -> set[str]:
-    """Wallets that were partially backfilled when this snapshot was taken.
-
-    Ranking must exclude these as well as the currently marked set: a wallet
-    partial at export time and completed since would otherwise pass the live
-    check while DuckDB reads its partial rows out of the snapshot.
-    """
-    import duckdb
-
-    _, parquet_dir, _ = engine_settings(None, parquet_dir, None)
-    path = os.path.join(parquet_dir, WALLET_COMPLETENESS_PARQUET)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"snapshot completeness projection missing: {path}")
-    # The trades and the completeness projection are separate files replaced one at
-    # a time. Only accept them as evidence when the manifest written at the end of
-    # the export still matches BOTH, which proves they came from the same run; an
-    # export that died in between leaves a mismatch and the pair is refused.
-    manifest_path = os.path.join(parquet_dir, V1_EXPORT_MANIFEST)
-    if not os.path.exists(manifest_path):
-        raise FileNotFoundError(
-            f"snapshot export manifest missing: {manifest_path} "
-            "(trades and completeness are not bound to one export)"
-        )
-    with open(manifest_path, encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    recorded = manifest.get("files") or {}
-    for name in V1_BOUND_FILES:
-        bound = recorded.get(name)
-        target = os.path.join(parquet_dir, name)
-        if bound is None or not os.path.exists(target):
-            raise FileNotFoundError(f"snapshot export manifest does not bind {name}")
-        stat = os.stat(target)
-        if int(bound.get("size", -1)) != stat.st_size or \
-                int(bound.get("mtime_ns", -1)) != stat.st_mtime_ns:
-            raise FileNotFoundError(
-                f"snapshot export is inconsistent: {name} does not match the manifest "
-                "(an export was interrupted; re-export before using DuckDB)"
-            )
-    con = duckdb.connect()
-    try:
-        rows = con.execute(
-            f"SELECT wallet_hex FROM read_parquet('{_q(path)}') WHERE backfill_partial = 1"
-        ).fetchall()
-    finally:
-        con.close()
-    return {str(r[0]).lower() for r in rows if r[0] is not None}
 
 
 def _snapshot_state(parquet_dir: str, max_age_hours: float,

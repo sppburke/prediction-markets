@@ -23,7 +23,6 @@ Run: `python3 scripts/export_trades_parquet.py --db data/wallet_cache.db --out-d
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import sqlite3
 import sys
@@ -33,12 +32,6 @@ import time
 # `market_schedules` now also carries `start_date_unix` (issue #421 PR4); it rides along free via
 # `SELECT *`, so no change is needed here for that column.
 TABLES = ("trades", "market_resolutions", "market_schedules")
-# The quarantine projection (#608). Ranking excludes partial wallets, but the
-# exclusion is only sound if it is evaluated against the SAME history the
-# extraction reads: a wallet partial when this snapshot was taken and completed
-# afterwards passes a live marker check while DuckDB still reads its partial
-# rows. Exported so `ranker_duck` can exclude the snapshot-era set as well.
-WALLET_COMPLETENESS = "wallet_completeness"
 # OPTIONAL tables (issue #421 PR4 — the CLV price series; #429 PR4 — its token→outcome map).
 # Absent on a pre-migration cache (the export attaches READ_ONLY and does not run schema), so each
 # is skipped with a warning rather than aborting the whole export. `ranker_duck.py` registers each
@@ -57,13 +50,6 @@ V2_TABLES = (
     "cache_v2_migration_state",
 )
 V2_EXPORT_MANIFEST = "schema_v2_export_manifest.json"
-# Binds the schema-one trade snapshot to the completeness projection taken with
-# it (#608). The two are separate files replaced one at a time, so an export that
-# dies between them would otherwise leave new trades paired with an older
-# "complete" marker and certify history the quarantine meant to withhold. Written
-# LAST, so an interrupted export leaves it stale and the reader refuses the pair.
-V1_EXPORT_MANIFEST = "schema_v1_export_manifest.json"
-V1_BOUND_FILES = ("trades.parquet", "wallet_completeness.parquet")
 
 
 def log(msg: str) -> None:
@@ -99,108 +85,6 @@ def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     size_gb = os.path.getsize(final) / 1e9
     log(f"{tbl}: {n:,} rows -> {final} ({size_gb:.2f} GB)")
     return int(n)
-
-
-def _completeness_witness(con) -> str | None:
-    """Digest of every wallet's completeness state, for detecting a source change
-    across the export.
-
-    DuckDB's transaction does NOT snapshot an attached SQLite database — a re-read
-    inside one sees an external commit — so the two exports cannot be made atomic
-    that way. Instead we prove after the fact that nothing moved: `begin_walk`
-    (cache.rs) commits `backfill_partial = 1` before it writes any row, so a walk
-    that touched trades during the export must have changed this digest. The
-    frontier and floor are included so a walk that both started and finished
-    inside the window, returning the marker to its old value, still shows up.
-    """
-    if not _table_exists(con, "wallets"):
-        return None
-    columns = []
-    for name in ("backfill_partial", "forward_frontier_unix", "backward_floor_unix"):
-        try:
-            con.execute(f"SELECT {name} FROM src.wallets LIMIT 0;")
-        except Exception:  # noqa: BLE001 — column absent on an older cache
-            continue
-        columns.append(name)
-    if "backfill_partial" not in columns:
-        return None
-    projection = ", ".join(f"COALESCE(CAST({c} AS VARCHAR), 'null')" for c in columns)
-    rows = con.execute(
-        f"SELECT wallet_hex, {projection} FROM src.wallets ORDER BY wallet_hex"
-    ).fetchall()
-    digest = hashlib.sha256()
-    for row in rows:
-        digest.update(("\x1f".join("" if v is None else str(v) for v in row) + "\x1e").encode())
-    return digest.hexdigest()
-
-
-def _export_wallet_completeness(con, out_dir: str, row_group_size: int) -> bool:
-    """Export `wallet_hex, backfill_partial` for schema one. Returns False when the
-    cache predates the marker, after removing any stale file so a snapshot never
-    carries completeness evidence that does not belong to it.
-    """
-    final = os.path.join(out_dir, f"{WALLET_COMPLETENESS}.parquet")
-    has_column = False
-    if _table_exists(con, "wallets"):
-        try:
-            con.execute("SELECT backfill_partial FROM src.wallets LIMIT 0;")
-            has_column = True
-        except Exception:  # noqa: BLE001 — only failure mode here is "column absent"
-            has_column = False
-    if not has_column:
-        if os.path.exists(final):
-            os.remove(final)
-            log(f"{WALLET_COMPLETENESS}: marker absent -> removed stale {final}")
-        else:
-            log(f"{WALLET_COMPLETENESS}: marker absent (pre-#608 cache) -> skipped")
-        return False
-    tmp = final + ".tmp"
-    con.execute(
-        f"COPY (SELECT wallet_hex, backfill_partial FROM src.wallets) TO '{_q(tmp)}' "
-        f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)});"
-    )
-    os.replace(tmp, final)
-    n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')").fetchone()[0]
-    log(f"{WALLET_COMPLETENESS}: {n:,} rows -> {final}")
-    return True
-
-
-def _file_identity(path: str) -> dict:
-    """Size and nanosecond mtime — enough to prove two files came from the same
-    export run. `os.replace` updates both, so a file swapped after the manifest was
-    written no longer matches it. Deliberately not a digest: `trades.parquet` runs
-    to tens of GB and the threat here is an interrupted export, not tampering.
-    """
-    stat = os.stat(path)
-    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
-def _write_v1_export_manifest(out_dir: str) -> None:
-    """Publish the schema-one trade + completeness pair as one generation."""
-    import json
-
-    value = {
-        "version": 1,
-        "files": {name: _file_identity(os.path.join(out_dir, name))
-                  for name in V1_BOUND_FILES},
-    }
-    final = os.path.join(out_dir, V1_EXPORT_MANIFEST)
-    temporary = final + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as destination:
-        json.dump(value, destination, sort_keys=True, separators=(",", ":"))
-        destination.write("\n")
-        destination.flush()
-        os.fsync(destination.fileno())
-    os.replace(temporary, final)
-    log(f"schema-one export manifest -> {final}")
-
-
-def _discard_v1_export_manifest(out_dir: str) -> None:
-    """Remove the binding when there is no completeness projection to bind."""
-    final = os.path.join(out_dir, V1_EXPORT_MANIFEST)
-    if os.path.exists(final):
-        os.remove(final)
-        log(f"schema-one export manifest removed (no completeness projection) -> {final}")
 
 
 def _projection_rows(con, relation_prefix: str) -> list[dict]:
@@ -324,16 +208,6 @@ def main() -> int:
     import duckdb
 
     os.makedirs(a.out_dir, exist_ok=True)
-    # Exclusive for the whole export: readers must not see a half-replaced
-    # snapshot, and must not have a validated one swapped underneath them.
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import ranker_duck
-
-    with ranker_duck.snapshot_lock(a.out_dir, exclusive=True):
-        return _export(a, duckdb)
-
-
-def _export(a, duckdb) -> int:
     con = duckdb.connect()
     con.execute("INSTALL sqlite_scanner;")
     con.execute("LOAD sqlite_scanner;")
@@ -353,10 +227,6 @@ def _export(a, duckdb) -> int:
         projection = _verify_v2_projection(con, a.out_dir)
         _write_v2_export_manifest(a.out_dir, counts, projection)
     else:
-        # Witness the completeness state before the trade export so a wallet that
-        # starts or finishes a backfill mid-export cannot leave partial trades
-        # paired with a "complete" marker.
-        witness_before = _completeness_witness(con)
         for tbl in TABLES:
             _export_table(con, a.out_dir, tbl, a.row_group_size)
         for tbl in OPTIONAL_TABLES:
@@ -364,18 +234,6 @@ def _export(a, duckdb) -> int:
                 _export_table(con, a.out_dir, tbl, a.row_group_size)
             else:
                 log(f"{tbl}: table absent (pre-migration cache) -> skipped")
-        exported = _export_wallet_completeness(con, a.out_dir, a.row_group_size)
-        witness_after = _completeness_witness(con)
-        if not exported:
-            _discard_v1_export_manifest(a.out_dir)
-        elif witness_before is None or witness_before != witness_after:
-            # A wallet's completeness changed while the trades were being written,
-            # so the two outputs describe different database states. Publish no
-            # binding: ranking then falls back to SQLite instead of trusting them.
-            log("completeness changed during the export -> snapshot NOT bound; re-export")
-            _discard_v1_export_manifest(a.out_dir)
-        else:
-            _write_v1_export_manifest(a.out_dir)
 
     log(f"export complete in {time.time() - t0:.0f}s -> {a.out_dir}")
     return 0

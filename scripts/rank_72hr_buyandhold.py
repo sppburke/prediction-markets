@@ -52,7 +52,6 @@ re-run and independently verified.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import csv
 import math
 import os
@@ -463,13 +462,6 @@ def scan_and_filter_sqlite(conn, w, prm, res, sched, diag):
     return positions
 
 
-def _cache_has_partial_marker(conn) -> bool:
-    """True iff this cache carries the #608 quarantine marker. A cache without it
-    has no quarantine, so a Parquet snapshot needs no completeness evidence."""
-    return any(row[1] == "backfill_partial"
-               for row in conn.execute("PRAGMA table_info(wallets)"))
-
-
 def main() -> int:
     prm = parse_args()
     os.makedirs(prm.out_dir, exist_ok=True)
@@ -494,66 +486,18 @@ def main() -> int:
         log(f"universe: {len(wallets)} wallets ({universe_label})")
 
     wallets = exclude_partial_backfills(conn, wallets, schema_version)
-
-    # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
-    # Market maps (resolutions + schedules) are only needed by the SQLite path; the
-    # DuckDB path joins them in SQL over the Parquet snapshot.
-    # This runs BEFORE --limit-wallets: every completeness exclusion must happen on
-    # the unlimited universe, then the slice is taken. Truncating first would let the
-    # limit consume slots with wallets the snapshot filter is about to drop.
-    engine = ranker_duck.get_engine(schema_version=schema_version)
-    # Shared for as long as the snapshot is in use. The completeness check below
-    # validates file identities, but DuckDB reads those pathnames later, so an
-    # exporter replacing them in between would feed unfinished history into
-    # extraction with both exclusion checks already passed. The exporter takes
-    # this lock exclusively, so it cannot swap files underneath us.
-    snapshot_guard = contextlib.ExitStack()
-    if engine is not None:
-        snapshot_guard.enter_context(ranker_duck.snapshot_lock(exclusive=False))
-    if engine is not None and schema_version < 2 and _cache_has_partial_marker(conn):
-        # DuckDB reads the Parquet snapshot, not the live cache, so the live marker
-        # check above is not sufficient on its own: a wallet partial when the
-        # snapshot was taken and completed since would pass it while its partial
-        # rows are what actually get ranked. A wallet is usable only if it was
-        # complete then AND is complete now. Without that evidence the snapshot
-        # cannot be trusted, so fall back to SQLite rather than rank blind.
-        try:
-            snapshot_partial = ranker_duck.snapshot_partial_wallets()
-        except FileNotFoundError as error:
-            if ranker_duck.engine_settings(None, None, None)[0] == "duck":
-                raise
-            log(f"{error} -> SQLite path (re-export to use DuckDB)")
-            engine.close()
-            engine = None
-        else:
-            if snapshot_partial:
-                before = len(wallets)
-                kept = [w for w in wallets if w.lower() not in snapshot_partial]
-                if before and not kept:
-                    # The live cache says these wallets are complete; only the
-                    # snapshot still calls them partial, so it predates their
-                    # recovery. Excluding everything here would return 76, which
-                    # the wrapper maps to fatal when nothing is retryable, and the
-                    # supervisor would stop even though SQLite holds complete,
-                    # usable history. Prefer the live data over the stale snapshot.
-                    log(f"snapshot calls all {before} live-complete wallets partial; "
-                        "it predates their recovery -> SQLite path (re-export to use DuckDB)")
-                    engine.close()
-                    engine = None
-                else:
-                    wallets = kept
-                    log(f"snapshot completeness filter: {before} -> {len(wallets)} wallets "
-                        f"({len(snapshot_partial)} partial when the Parquet was exported)")
     if prm.limit_wallets > 0:
         wallets = wallets[:prm.limit_wallets]
     log(f"universe after completeness filter and limit: {len(wallets)} wallets")
 
     if not wallets and schema_version < 2:
         log("empty universe after completeness filter")
-        conn.close()
-        snapshot_guard.close()
         return 76
 
+    # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
+    # Market maps (resolutions + schedules) are only needed by the SQLite path; the
+    # DuckDB path joins them in SQL over the Parquet snapshot.
+    engine = ranker_duck.get_engine(schema_version=schema_version)
     res, sched = (None, None) if engine is not None else load_market_maps(conn)
 
     decay = "flat (no decay)" if prm.half_life_days <= 0 else f"half_life={prm.half_life_days}d"
@@ -621,8 +565,6 @@ def main() -> int:
     # Every history read is done, so end the snapshot and release the read lock.
     # Leaving it open would block a later writer for the rest of the process.
     conn.close()
-    # Extraction is complete; let an exporter replace the snapshot again.
-    snapshot_guard.close()
     log(f"extraction done in {time.time()-t0:.0f}s")
     log(f"  diagnostics: {diag}")
     log(f"wrote {pos_path}  ({total_qualified:,} positions)")
