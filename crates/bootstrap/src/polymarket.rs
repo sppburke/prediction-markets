@@ -724,8 +724,13 @@ mod tests {
             // them here with the real DTO so a drift between the generator and
             // this parser fails, not just a Python-side mismatch.
             if let Some(values) = record.get("writer_values").and_then(|v| v.as_array()) {
-                let rows: TradeResponse = serde_json::from_str(page)
-                    .unwrap_or_else(|e| panic!("parity case {name:?} should decode: {e}"));
+                let decoded = serde_json::from_str::<TradeResponse>(page);
+                assert!(
+                    decoded.is_ok(),
+                    "parity case {name:?} should decode: {:?}",
+                    decoded.as_ref().err()
+                );
+                let rows = decoded.expect("checked immediately above");
                 assert_eq!(rows.len(), values.len(), "parity case {name:?}: row count");
                 for (row, want) in rows.iter().zip(values) {
                     let want_size = want["size"].as_str().unwrap();

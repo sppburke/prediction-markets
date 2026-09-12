@@ -212,10 +212,10 @@ fn interleave_after_first_read(sql: &str) {
         1 => {
             INTERLEAVE_STATE.store(2, SeqCst);
             let guard = INTERLEAVE_PATH.lock().unwrap();
-            if let Some(path) = guard.as_ref() {
-                if let Ok(writer) = rusqlite::Connection::open(path) {
-                    let _ = writer.execute_batch("DELETE FROM market_resolutions;");
-                }
+            if let Some(path) = guard.as_ref()
+                && let Ok(writer) = rusqlite::Connection::open(path)
+            {
+                let _ = writer.execute_batch("DELETE FROM market_resolutions;");
             }
         }
         _ => {}
