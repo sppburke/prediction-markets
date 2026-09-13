@@ -281,6 +281,12 @@ while (($#)); do
   esac
 done
 if [[ -z "$file" && -z "$sql" ]]; then stdin=$(dd bs=4096 2>/dev/null || true); fi
+# #618: count the legacy-contract proof directly, so a test can assert the post-stop remote check
+# never ran rather than inferring it from a missing receipt.
+if [[ "$stdin" == *rolbypassrls* ]]; then
+  count=0; [[ ! -f "$state/legacy-contract-count" ]] || count=$(<"$state/legacy-contract-count")
+  echo $((count + 1)) > "$state/legacy-contract-count"
+fi
 if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ $(<"$state/service.active") == false ]] || exit 98
   count=0; [[ ! -f "$state/archive-count" ]] || count=$(<"$state/archive-count")
@@ -974,7 +980,10 @@ drive_to_verified() {
 try: print(json.load(open(sys.argv[1]))["state"])
 except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
     [[ "$state" == verified ]] && return 0
-    if [[ "$state" == started ]]; then write_clean_status "$root"; fi
+    # `touch` deliberately, NOT write_clean_status: on an existing file touch preserves content,
+    # so a dirty status written by the fake `systemctl start` still refuses here. Replacing the
+    # document would hand these convergence tests passing evidence they never earned.
+    if [[ "$state" == started ]]; then touch "$root/prediction-markets/gen/g557/status.json"; fi
     run_driver "$root" >/dev/null
   done
   return 1
@@ -1913,6 +1922,9 @@ set -e
 # PASS: the pre-stop preflight refuses; the service was never stopped and no stop intent was
 #       recorded, so production is exactly where it started.
 # FAIL: the driver stops the service to discover what it could have read first.
+# Scope: the harness rollback-check at driver:724 does not read status.json, so this isolates the
+# new pre-stop preflight. Protection against a status that goes bad AFTER that earlier check is
+# what FE-PREFLIGHT-66 proves.
 root=$TEST_TMP/preflight-dirty-before-stop
 setup_fixture "$root"
 python3 -c 'import json,sys
@@ -1958,8 +1970,12 @@ set -e
   fail "expected a pre-stop and a post-stop observation"
 [[ $(<"$root/test-state/stop-count") == 1 ]] ||
   fail "the service should have been stopped exactly once"
-compgen -G "$root/financial-era-*-paper-state.db" > /dev/null &&
+compgen -G "$root/prediction-markets/financial-era-*-paper-state.db" > /dev/null &&
   fail "a backup was started after the post-stop preflight refused"
+compgen -G "$root/prediction-markets/financial-era-*-paper-state.db.tmp.*" > /dev/null &&
+  fail "a partial backup was started after the post-stop preflight refused"
+[[ $(<"$root/test-state/legacy-contract-count") == 1 ]] ||
+  fail "the post-stop remote contract check ran despite the preflight refusal"
 python3 -c 'import json,sys
 v=json.load(open(sys.argv[1]))
 missing=[k for k in ("service_stop_intent","stop_invoked") if not v.get(k)]
