@@ -56,6 +56,7 @@ import csv
 import math
 import os
 import sqlite3
+from partial_backfill_wallets import partial_backfill_wallets
 import sys
 import time
 from dataclasses import dataclass
@@ -230,6 +231,19 @@ def load_universe_from_trades(conn: sqlite3.Connection, limit: int,
     if limit > 0:
         wallets = wallets[:limit]
     return wallets
+
+
+def exclude_partial_backfills(conn: sqlite3.Connection, wallets: list[str],
+                             schema_version: int) -> list[str]:
+    """Schema-one partial histories cannot establish first-ever entries.
+
+    Older caches and trade-only research fixtures have no marker column; legacy
+    unstamped wallets and wallets absent from the pile remain in the universe.
+    """
+    if schema_version >= 2:
+        return wallets
+    partial = partial_backfill_wallets(conn)
+    return [wallet for wallet in wallets if wallet not in partial]
 
 
 def load_market_maps(conn: sqlite3.Connection):
@@ -455,17 +469,30 @@ def main() -> int:
 
     # Open the read-only cache first: --universe-from-trades enumerates from it.
     conn = sqlite3.connect(f"file:{prm.db}?mode=ro", uri=True)
+    # One snapshot for the completeness filter and the per-wallet history scans
+    # below it, so a backfill committing in between cannot supply rows for a
+    # wallet the filter already judged complete. WAL readers do not block it.
+    conn.execute("BEGIN")
     conn.execute("PRAGMA query_only=ON;")
     schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
 
     if prm.universe_from_trades:
-        wallets = load_universe_from_trades(conn, prm.limit_wallets, schema_version)
+        wallets = load_universe_from_trades(conn, 0, schema_version)
         universe_label = "trades-distinct"
         log(f"universe: {len(wallets)} wallets (all distinct trade wallets, #370)")
     else:
-        wallets = load_universe(prm.universe, prm.limit_wallets)
+        wallets = load_universe(prm.universe, 0)
         universe_label = os.path.basename(prm.universe)
         log(f"universe: {len(wallets)} wallets ({universe_label})")
+
+    wallets = exclude_partial_backfills(conn, wallets, schema_version)
+    if prm.limit_wallets > 0:
+        wallets = wallets[:prm.limit_wallets]
+    log(f"universe after completeness filter and limit: {len(wallets)} wallets")
+
+    if not wallets and schema_version < 2:
+        log("empty universe after completeness filter")
+        return 76
 
     # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
     # Market maps (resolutions + schedules) are only needed by the SQLite path; the
@@ -535,13 +562,16 @@ def main() -> int:
                     f"{total_qualified:,} qualifying, {len(floor_pos)} floor)")
 
     pos_fh.close()
+    # Every history read is done, so end the snapshot and release the read lock.
+    # Leaving it open would block a later writer for the rest of the process.
+    conn.close()
     log(f"extraction done in {time.time()-t0:.0f}s")
     log(f"  diagnostics: {diag}")
     log(f"wrote {pos_path}  ({total_qualified:,} positions)")
 
     if not summaries:
         log("no qualifying positions; aborting")
-        return 1
+        return 76 if schema_version < 2 else 1
 
     stats = pd.DataFrame(summaries)
     stats["eligible"] = (
@@ -564,7 +594,7 @@ def main() -> int:
     elig = stats[stats["eligible"]].copy().reset_index(drop=True)
     if n_elig == 0:
         log("no eligible wallets; stopping after ranking")
-        return 0
+        return 76 if schema_version < 2 else 0
 
     # intermediate deliverable: ranked_72hr_buyandhold (eligible, ranked by net t-stat)
     ranked_txt = os.path.join(prm.out_dir, "ranked_72hr_buyandhold.txt")
@@ -584,7 +614,7 @@ def main() -> int:
     floor_wallets = floor["wallet"].tolist()
     if not floor_wallets:
         log("no wallets clear the edge floor; stopping")
-        return 0
+        return 76 if schema_version < 2 else 0
 
     # Weekly (sum, count) matrices of net return per (wallet, resolution-week), built from
     # the retained per-wallet arrays. Group return for a set S in week t is

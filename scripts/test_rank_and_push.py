@@ -98,6 +98,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.wrapper = self.root / "scripts" / "rank_and_push.sh"
         shutil.copy(WRAPPER, self.wrapper)
         shutil.copy(WRAPPER.parent / "rank_cycle_manifest.py", self.root / "scripts")
+        shutil.copy(WRAPPER.parent / "partial_backfill_wallets.py", self.root / "scripts")
 
         # The fake publisher below does not contact this syntactically valid endpoint.
         (self.root / ".env").write_text(
@@ -832,6 +833,42 @@ class RankAndPushScenario(unittest.TestCase):
             "watermark no-op invented a recovery pointer",
         )
 
+    def test_marker_set_changes_fingerprint_even_for_inactive_wallets(self):
+        db = self.root / "data" / "wallet_cache.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("ALTER TABLE wallets ADD COLUMN backfill_partial INTEGER NOT NULL DEFAULT 0")
+            conn.execute("INSERT INTO wallets VALUES ('inactive',0,0,0)")
+        first = self._run()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self._log("pe_bootstrap.log")
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = 'inactive'")
+        second = self._run()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
+        self.assertNotEqual(self._log("pe_bootstrap.log"), before)
+        third = self._run()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", third.stdout)
+
+    def test_unchanged_active_partial_wallet_forces_same_day_refresh(self):
+        db = self.root / "data" / "wallet_cache.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("ALTER TABLE wallets ADD COLUMN backfill_partial INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = '0xabc'")
+        first = self._run()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self._log("pe_bootstrap.log")
+        # The stub leaves both the marker and source watermark unchanged.
+        second = self._run()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
+        self.assertNotEqual(self._log("pe_bootstrap.log"), before)
+        manifests = sorted((self.root / "data/eval-results").glob("cron-*/accepted_cycle_manifest.json"))
+        for path in manifests:
+            manifest = json.loads(path.read_text())
+            self.assertEqual(manifest["universe"]["backfill_partial_wallets"], ["0xabc"])
+
     def test_v2_cycle_manifest_uses_only_completed_generations_and_stamps_versions(self):
         db = self.root / "data" / "wallet_cache.db"
         db.unlink()
@@ -886,6 +923,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         out = next((self.root / "data/eval-results").glob("cron-*"))
         manifest = json.loads((out / "accepted_cycle_manifest.json").read_text())
+        self.assertEqual(manifest["universe"]["backfill_partial_wallets"], [])
         self.assertEqual(manifest["source_watermark"]["activity"]["generation"], 1)
         self.assertEqual(manifest["source_watermark"]["activity"]["count"], 2)
         self.assertEqual(manifest["source_watermark"]["activity"]["newest_source_unix"], 10)
@@ -1335,6 +1373,230 @@ class RankAndPushScenario(unittest.TestCase):
         r = subprocess.run(["bash", "-n", str(WRAPPER)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, f"bash -n failed: {r.stderr}")
         print("PASS: bash -n syntax check")
+
+
+
+class QuarantineEntryPointsTest(unittest.TestCase):
+    """Real ranking/publisher entry points behind the real wrapper and supervisor.
+
+    Only external refresh/publication transport and time are deterministic fakes.
+    The wrapper owns the disposition, pointers and current-state queries.
+    """
+    setUp = RankAndPushScenario.setUp
+    tearDown = RankAndPushScenario.tearDown
+    _run = RankAndPushScenario._run
+    _log = RankAndPushScenario._log
+    _write_python_shim = RankAndPushScenario._write_python_shim
+    NOW = 1_775_001_600
+
+    def prepare(self, case, *, marked=True, active=True, transition=None):
+        from test_rank_72hr_consolidated import build_core_cache, WA, WB
+        self.wa, self.wb = WA, WB
+        scripts = self.root / "scripts"
+        for name in ("ranker_decay.py", "ranker_duck.py", "partial_backfill_wallets.py"):
+            shutil.copy(WRAPPER.parent / name, scripts / name)
+        db = self.root / "data/wallet_cache.db"
+        db.unlink()
+        build_core_cache(str(db))
+        with sqlite3.connect(db) as con:
+            con.executescript("PRAGMA user_version=1;"
+                "ALTER TABLE market_resolutions ADD COLUMN fetched_at_unix INTEGER;"
+                "CREATE TABLE source_cursor(key TEXT, value TEXT, updated_at INTEGER);"
+                "CREATE TABLE wallets(wallet_hex TEXT PRIMARY KEY, is_active INTEGER, is_infra INTEGER, backfill_partial INTEGER, last_polymarket_fetch_at INTEGER);"
+                "CREATE VIEW active_tradeable_wallets AS SELECT * FROM wallets WHERE is_active=1 AND is_infra=0;")
+            con.execute("UPDATE market_resolutions SET fetched_at_unix=?", (self.NOW,))
+            con.execute("INSERT INTO source_cursor VALUES ('clob_closed','',?)", (self.NOW,))
+            con.executemany("INSERT INTO wallets VALUES (?,?,0,?,?)",
+                            [(WA, int(active), int(marked), self.NOW), (WB, 1, int(case == "all"), self.NOW)])
+            if case == "all" and not marked:
+                con.execute("UPDATE wallets SET backfill_partial=0")
+                con.execute("DELETE FROM trades")
+            if case in ("publish_empty", "publish_stale", "publish_partial", "integrity"):
+                con.execute("UPDATE trades SET timestamp_unix=? WHERE wallet_hex=?", (self.NOW-4*86400, WB))
+                con.execute("UPDATE trades SET timestamp_unix=? WHERE wallet_hex=?", (self.NOW-3600, WA))
+                if case == "publish_empty" and not marked:
+                    con.execute("UPDATE trades SET timestamp_unix=?", (self.NOW-4*86400,))
+                    con.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                                ("0x"+"f"*40,"buy","fresh",0,"0.5",1,self.NOW,"fresh"))
+                if case == "publish_stale":
+                    con.execute("UPDATE trades SET timestamp_unix=? WHERE wallet_hex=?",(self.NOW-30*3600,WA))
+                    con.execute("UPDATE trades SET timestamp_unix=? WHERE wallet_hex=?",(self.NOW-25*3600,WB))
+                if case in ("publish_partial", "integrity"):
+                    con.execute("UPDATE trades SET timestamp_unix=? WHERE wallet_hex=?", (self.NOW-3600,WB))
+        # The refresh fake logs the same active/non-infra due predicate and changes
+        # state AFTER capture, proving the guard never consults the frozen set.
+        refresh = scripts / "fixture_refresh.py"
+        refresh.write_text(f'''
+import json, sqlite3
+from pathlib import Path
+con=sqlite3.connect("data/wallet_cache.db")
+transition={transition!r}
+if transition == "partial":
+    con.execute("UPDATE wallets SET backfill_partial=1")
+elif transition == "recovered_empty":
+    con.execute("UPDATE wallets SET backfill_partial=0")
+    con.execute("DELETE FROM trades")
+con.commit()
+due=[r[0] for r in con.execute("SELECT wallet_hex FROM active_tradeable_wallets WHERE backfill_partial=1 OR last_polymarket_fetch_at IS NULL OR last_polymarket_fetch_at < ?", ({self.NOW}-86400,))]
+with open("due.log","a") as f: f.write(json.dumps(due)+"\\n")
+count=len(Path("due.log").read_text().splitlines())
+if Path("stop_after_two").exists() and count >= 2:
+    Path("data/eval-results/rank_and_push.loop").write_text("stop\\n")
+''')
+        boot = self.root / "target/release/pe-bootstrap"
+        boot.write_text(boot.read_text().replace('sub="$1"',
+            f'if [[ "$1" == "backfill" ]]; then {shlex.quote(sys.executable)} scripts/fixture_refresh.py; fi\nsub="$1"'))
+        if case.startswith("publish") or case == "integrity":
+            # Keep the upstream ranking fakes; publication preparation below is real.
+            publisher = scripts / "push_ranking_to_supabase.py"
+            shutil.copy(WRAPPER.parent / "push_ranking_to_supabase.py", scripts / "real_publisher.py")
+            # Input fixture is installed before the real prepare function runs.
+            publisher.write_text(f'''
+import csv, json, hashlib, sys
+from pathlib import Path
+import real_publisher as pub
+pub.time.time=lambda: {self.NOW}
+args=sys.argv[1:]
+if "--ranked-csv" in args:
+    path=Path(args[args.index("--ranked-csv")+1])
+    path.write_text("wallet,survives,tstat_net_ls,hit_rate,n_filled\\n{WA},True,4,0.8,40\\n{WB},True,3,0.8,40\\n")
+    if "--manifest-file" in args:
+        manifest=Path(args[args.index("--manifest-file")+1])
+        manifest.write_text(json.dumps({{"outputs":{{"latency_shift_ranked_sha256":hashlib.sha256(path.read_bytes()).hexdigest()}}}}))
+entries=[]
+config_hash=None
+def transport(method,url,key,body=None,**kwargs):
+    global entries,config_hash
+    with open("transport.log","a") as f: f.write(method+" "+url+"\\n")
+    if method=="POST":
+        entries=body["p_entries"];config_hash=body["p_batch"]["config_hash"]
+        return 200,1
+    if "latest_ranking" in url:
+        return 200,[dict(batch_id=1,rank=r["rank"],survives=r["survives"]) for r in entries]
+    if "select=config_hash" in url:
+        return 200,[{{"config_hash":"wrong" if {case!r}=="integrity" else config_hash}}]
+    return 200,[]
+pub._req=transport
+raise SystemExit(pub.main())
+''')
+        elif case == "pass2":
+            shutil.copy(WRAPPER.parent / "latency_shift_rerank.py", scripts / "latency_shift_rerank.py")
+            # A legitimate empty candidate CSV reaches the real pass-2a owner.
+            ranker = scripts / "rank_72hr_buyandhold.py"
+            ranker.write_text(ranker.read_text().replace('wallet\\n0xabc\\n', 'wallet,eligible,tstat_net,mean_net\\n'+WB+',False,0,-1\\n'))
+        else:
+            shutil.copy(WRAPPER.parent / "rank_72hr_buyandhold.py", scripts / "real_ranker.py")
+            floor = "999" if case == "floor" else "0.1"
+            min_trl = "99" if case == "eligible" else "0"
+            (scripts / "rank_72hr_buyandhold.py").write_text(f'''
+import sys
+import real_ranker
+sys.argv += ["--win-start","2026-01-01","--win-end","2026-04-01","--as-of","2026-04-01","--min-trl",{min_trl!r},"--floor-tstat",{floor!r},"--min-avg-per-month","0","--min-active-months","0"]
+raise SystemExit(real_ranker.main())
+''')
+        return db
+
+    def assert_unprepared(self):
+        self.assertFalse(list((self.root / "data/eval-results").glob("cron-*/ranking_publish_request.json")))
+        self.assertFalse((self.root / "data/eval-results/rank_and_push.pending").exists())
+        self.assertFalse((self.root / "transport.log").exists())
+        self.assertTrue((self.root / "data/eval-results/rank_and_push.cycle").exists())
+
+    def test_real_empty_owners_retry_with_partial_and_fail_without(self):
+        for case in ("all", "eligible", "floor", "pass2", "publish_empty", "publish_stale"):
+            for marked in (True, False):
+                with self.subTest(case=case, marked=marked):
+                    self.tearDown(); self.setUp()
+                    self.prepare(case, marked=marked)
+                    result = self._run()
+                    self.assertEqual(result.returncode, 75 if marked else 1, result.stdout+result.stderr)
+                    self.assertIn("exit 76", result.stderr)
+                    self.assert_unprepared()
+                    due = json.loads((self.root / "due.log").read_text().splitlines()[0])
+                    self.assertEqual(self.wa in due, marked)
+
+    def test_current_state_both_directions_including_reused_manifest(self):
+        for transition, marked, expected in [("partial",False,75), ("recovered_empty",True,1)]:
+            with self.subTest(transition=transition):
+                self.tearDown(); self.setUp()
+                self.prepare("all", marked=marked, transition=transition)
+                first=self._run()
+                self.assertEqual(first.returncode,expected,first.stdout+first.stderr)
+                pointer=self.root/"data/eval-results/rank_and_push.cycle"
+                manifest=self.root/pointer.read_text().strip()/"cycle_manifest.json"
+                frozen=manifest.read_bytes()
+                second=self._run()
+                self.assertEqual(second.returncode,expected,second.stdout+second.stderr)
+                self.assertEqual(manifest.read_bytes(),frozen)
+                self.assert_unprepared()
+
+    def test_inactive_excluded_but_does_not_trigger_retry_then_activation_recovers_retry(self):
+        db=self.prepare("publish_empty",active=False)
+        first=self._run()
+        self.assertEqual(first.returncode,1,first.stdout+first.stderr)
+        self.assert_unprepared()
+        with sqlite3.connect(db) as con: con.execute("UPDATE wallets SET is_active=1")
+        second=self._run()
+        self.assertEqual(second.returncode,75,second.stdout+second.stderr)
+
+    def test_integrity_failure_stays_permanent_after_request_is_persisted(self):
+        self.prepare("integrity")
+        result=self._run()
+        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+        self.assertIn("stored config_hash",result.stderr)
+        self.assertNotIn("exit 76",result.stderr)
+        requests=list((self.root/"data/eval-results").glob("cron-*/ranking_publish_request.json"))
+        self.assertEqual(len(requests),1)
+        self.assertTrue((self.root/"data/eval-results/rank_and_push.pending").exists())
+
+    def test_real_pure_repush_excludes_before_limit_and_resume_is_immutable_without_analytics(self):
+        db=self.prepare("publish_partial",active=False)
+        out=self.root/"data/eval-results/cron-retained";out.mkdir()
+        (out/"latency_shift_ranked.csv").write_text("wallet\nplaceholder\n")
+        # Pure re-push and its guard must import no analytics, including transitively.
+        blocker=self.root/"blocked";blocker.mkdir()
+        (blocker/"sitecustomize.py").write_text('import sys\nclass Block:\n def find_spec(self,name,*args):\n  if name.split(".")[0] in ("numpy","pandas"): raise ImportError("analytics forbidden")\nsys.meta_path.insert(0,Block())\n')
+        args=("--skip-rank","--skip-discovery","--skip-backfill","--out-dir",str(out),"--top-n","1")
+        result=self._run(*args,exit_env={"PYTHONPATH":str(blocker)})
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        request=out/"ranking_publish_request.json";before=request.read_bytes()
+        self.assertEqual(json.loads(before)["entries"][0]["wallet_hex"],self.wb)
+        with sqlite3.connect(db) as con: con.execute("UPDATE wallets SET backfill_partial=1")
+        unavailable=self._run(*args,exit_env={"PYTHONPATH":str(blocker)})
+        self.assertEqual(unavailable.returncode,75,unavailable.stdout+unavailable.stderr)
+        self.assertEqual(request.read_bytes(),before)
+        (self.root/"data/eval-results/rank_and_push.pending").write_text(str(request.relative_to(self.root))+"\n")
+        result=self._run("--resume-pending",exit_env={"PYTHONPATH":str(blocker)})
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(request.read_bytes(),before)
+
+    def run_real_loop(self, case):
+        self.prepare(case)
+        loop=self.root/"scripts/rank_and_push_loop.sh"
+        loop.write_text((WRAPPER.parent/"rank_and_push_loop.sh").read_text().replace("TRANSIENT_RETRY_DELAY_SECS=60","TRANSIENT_RETRY_DELAY_SECS=1"))
+        (self.root/"data/eval-results/rank_and_push.loop").write_text("run\n")
+        (self.root/"stop_after_two").touch()
+        result=subprocess.run(["bash",str(loop)],cwd=self.root,capture_output=True,text=True,timeout=60)
+        return result
+
+    def test_supervisor_retries_same_cycle_and_reselects_each_empty_owner(self):
+        for case in ("all","eligible","floor","pass2","publish_empty","publish_stale"):
+            with self.subTest(case=case):
+                self.tearDown();self.setUp()
+                result=self.run_real_loop(case)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                self.assertIn("LOOP_TEMPFAIL",result.stdout)
+                self.assertIn("kind=cycle-resume",result.stdout)
+                due=(self.root/"due.log").read_text().splitlines()
+                self.assertEqual(len(due),2)
+                self.assertTrue(all(self.wa in json.loads(line) for line in due))
+                self.assert_unprepared()
+
+    def test_supervisor_stops_on_persisted_integrity_failure(self):
+        result=self.run_real_loop("integrity")
+        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+        self.assertNotIn("LOOP_TEMPFAIL",result.stdout)
+        self.assertEqual(len((self.root/"due.log").read_text().splitlines()),1)
 
 
 if __name__ == "__main__":

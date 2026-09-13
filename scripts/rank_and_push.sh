@@ -443,8 +443,9 @@ PY
       --db "$DB" --day-utc "$CYCLE_DAY_UTC" \
       --versions-file "$PIPELINE_VERSIONS_TMP" \
       --configuration-file "$CYCLE_CONFIG_TMP" --output "$CURRENT_CYCLE_TMP"
+    # Schema-one partial active wallets force a retry even at an unchanged watermark.
     if "$PYTHON_BIN" scripts/rank_cycle_manifest.py unchanged \
-      --current "$CURRENT_CYCLE_TMP" --root data/eval-results; then
+      --db "$DB" --current "$CURRENT_CYCLE_TMP" --root data/eval-results; then
       echo "RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"
       exit 0
     fi
@@ -586,6 +587,34 @@ run_refresh_stage() {
   esac
 }
 
+# 76 is emitted only for schema-one empty ranking/publication or globally stale
+# trades, before a publication request exists. All other exits retain their meaning.
+# Read CURRENT state: the frozen manifest precedes backfill and survives retries.
+run_ranking_stage() {
+  local label="$1"; shift
+  local rc=0
+  "$@" || rc=$?
+  if [[ "$rc" -eq 76 ]]; then
+    local guard_rc=0
+    "$PYTHON_BIN" - "$DB" <<'PYGUARD' || guard_rc=$?
+import sqlite3
+import sys
+sys.path.insert(0, "scripts")
+from partial_backfill_wallets import partial_backfill_wallets
+with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
+    retryable = partial_backfill_wallets(connection, retryable_only=True)
+sys.exit(75 if retryable else 1)
+PYGUARD
+    if [[ "$guard_rc" -eq 75 ]]; then
+      echo "   [$label] TEMPFAIL exit 76 → 75; incomplete wallets await backfill" >&2
+      return 75
+    fi
+    echo "   [$label] FATAL exit 76 → 1; no retryable partial wallets" >&2
+    return 1
+  fi
+  return "$rc"
+}
+
 # Always-on data refresh (discover → activate → backfill → events → resolutions). Each half is
 # independently bypassable; when both are skipped the whole step is a no-op (no binary needed).
 refresh_data() {
@@ -673,7 +702,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     )
   fi
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
-  "$PYTHON_BIN" scripts/rank_72hr_buyandhold.py \
+  run_ranking_stage "pass-1" "$PYTHON_BIN" scripts/rank_72hr_buyandhold.py \
     --db "$DB" "${UNIVERSE_ARGS[@]}" --out-dir "$OUT_DIR" \
     "${WIN_ARGS[@]}" --ttr-hours "$TTR_HOURS" \
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
@@ -684,7 +713,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
 
   echo "── Stage 2a/3: emit reference-oracle fetch targets (#536) ─────────────────────"
   TARGETS_CSV="$OUT_DIR/oracle_targets.csv"
-  "$PYTHON_BIN" scripts/latency_shift_rerank.py \
+  run_ranking_stage "pass-2" "$PYTHON_BIN" scripts/latency_shift_rerank.py \
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
@@ -709,7 +738,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
   fi
 
   echo "── Stage 2c/3: pass-2 reference-oracle rerank (adds hit_rate) ─────────────────"
-  "$PYTHON_BIN" scripts/latency_shift_rerank.py \
+  run_ranking_stage "pass-2" "$PYTHON_BIN" scripts/latency_shift_rerank.py \
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
@@ -826,18 +855,18 @@ activate_bound_cache() {
 
 push_rc=0
 if [[ "$CUTOVER_MODE" == "1" && "$RESUME_PENDING" != "1" ]]; then
-  "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
+  run_ranking_stage "push" "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
     "${PUSH_ARGS[@]}" --prepare-only || push_rc=$?
   if [[ "$push_rc" -eq 0 ]]; then
     activate_bound_cache "$PUBLISH_REQUEST_FILE"
-    "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
+    run_ranking_stage "push" "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
       --resume-request "$PUBLISH_REQUEST_FILE" || push_rc=$?
   fi
 elif [[ "$RESUME_PENDING" == "1" ]]; then
   activate_bound_cache "$PUBLISH_REQUEST_FILE"
-  "$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
+  run_ranking_stage "push" "$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
 else
-  "$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
+  run_ranking_stage "push" "$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
 fi
 if [[ "$push_rc" -ne 0 ]]; then
   echo "   [push] exit $push_rc — pending request retained for recovery" >&2

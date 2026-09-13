@@ -446,6 +446,11 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     )
     .unwrap();
     std::fs::copy(
+        repository.join("scripts/partial_backfill_wallets.py"),
+        scripts.join("partial_backfill_wallets.py"),
+    )
+    .unwrap();
+    std::fs::copy(
         repository.join("scripts/push_ranking_to_supabase.py"),
         scripts.join("push_ranking_to_supabase.py"),
     )

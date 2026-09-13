@@ -306,7 +306,7 @@ def main() -> int:
     log(f"pass-1 edge-floor candidates: {len(cand)} wallets")
     if not cand:
         log("no candidates; nothing to re-rank")
-        return 1
+        return 76 if schema_version < 2 else 1
 
     # Group candidate positions by (market, outcome) — one reference series each.
     by_mo: dict[tuple[str, str], list[dict]] = {}

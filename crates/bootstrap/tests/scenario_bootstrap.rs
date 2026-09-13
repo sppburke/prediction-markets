@@ -39,16 +39,18 @@ fn fixture_fetcher() -> FixtureFetcher {
     let winner = WalletAddress::from_hex(WINNER_HEX).unwrap();
     let loser = WalletAddress::from_hex(LOSER_HEX).unwrap();
 
-    let winner_url = PolymarketEndpoint::UserTradeActivity {
+    let winner_url = PolymarketEndpoint::UserTradeActivityPage {
         user: winner.to_string(),
-        end: None,
-        start: None,
+        end: 2_000_000_000,
+        start: Some(1),
+        offset: 0,
     }
     .url(BASE_URL);
-    let loser_url = PolymarketEndpoint::UserTradeActivity {
+    let loser_url = PolymarketEndpoint::UserTradeActivityPage {
         user: loser.to_string(),
-        end: None,
-        start: None,
+        end: 2_000_000_000,
+        start: Some(1),
+        offset: 0,
     }
     .url(BASE_URL);
 
@@ -67,7 +69,8 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
     // Fetch trades using fixture fetcher (no network).
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fixture_fetcher());
+    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fixture_fetcher())
+        .with_clock_for_test(|| 2_000_000_120);
     fetcher.fetch_all(&wallets, &mut cache).await.unwrap();
 
     // Reconstruct ledgers per-wallet (mirrors production rank phase).

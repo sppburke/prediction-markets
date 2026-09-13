@@ -81,6 +81,23 @@
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
+> **Schema-one bootstrap history contract (#608), Last checked: 2026-09-12;
+> re-verify by 2026-11-11.** The [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity)
+> confirms that omitted/zero `start` on DESC reads uses the most recent roughly
+> three years; positive `start=1` reaches full history. Each request retains its
+> bounded `end`. Stable DESC offset ordering is documented, page size is capped
+> at 500, and offsets above 5,000 return 400. Bootstrap therefore completes every
+> boundary second before stepping below it, using inclusive `start`/`end` as
+> recorded by the reconciliation check below. A full terminal single-second
+> page is incomplete, never a success. The #608/#609 walk freezes
+> `hi = now - ACTIVITY_SETTLE_LAG_SECS` and acquires complete forward windows
+> above a durable frontier. A legacy anchor re-covers the cached maximum second.
+> Requested coverage excludes inherited gaps below that anchor and rows first
+> visible after their crossing request; the source promises no immutable bucket
+> closure. The settled discipline and accepted schema-one retention limits are
+> specified in `docs/26`. Re-read the official reference on 2026-09-12 for this
+> implementation; no fresh live-wallet completeness claim is made.
+
 > **Data-API reconciliation contract re-verified live (2026-09-03, issues #544/#555/#557).**
 > `/activity` accepts one comma-separated `type` parameter: the production request
 > `TRADE,SPLIT,MERGE,REDEEM,CONVERSION` returned mixed position-changing activity in one response.
@@ -163,7 +180,7 @@
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
-| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-10 | 2026-11-09 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-12 | 2026-11-11 |
 | https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |

@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 from latency_shift_rerank import ORACLE_VERSION
+from partial_backfill_wallets import partial_backfill_wallets
 
 MANIFEST_VERSION = 1
 
@@ -37,6 +38,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
     versions = {**versions, "ranker": ORACLE_VERSION}
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        connection.execute("BEGIN")
         schema = int(_one(connection, "PRAGMA user_version") or 0)
         universe = _wallet_universe(connection)
         if schema >= 2:
@@ -180,6 +182,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 if cursor is None
                 else {"value": str(cursor[0]), "updated_at": int(cursor[1])},
             }
+        universe["backfill_partial_wallets"] = sorted(partial_backfill_wallets(connection))
         body = {
             "version": MANIFEST_VERSION,
             "day_utc": day_utc,
@@ -242,6 +245,7 @@ def parse_args():
     capture.add_argument("--configuration-file", required=True, type=Path)
     capture.add_argument("--output", required=True, type=Path)
     compare = subparsers.add_parser("unchanged")
+    compare.add_argument("--db", required=True, type=Path)
     compare.add_argument("--current", required=True, type=Path)
     compare.add_argument("--root", required=True, type=Path)
     return parser.parse_args()
@@ -255,6 +259,13 @@ def main() -> int:
         atomic_write(args.output, snapshot(args.db, args.day_utc, versions, configuration))
         return 0
     current = json.loads(args.current.read_text(encoding="utf-8"))
+    # The wrapper must retry a same-day partial walk even if no new rows landed.
+    connection = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    try:
+        if partial_backfill_wallets(connection, retryable_only=True):
+            return 1
+    finally:
+        connection.close()
     accepted = latest_accepted(args.root, current["day_utc"])
     if accepted is not None and accepted.get("fingerprint_sha256") == current.get(
         "fingerprint_sha256"

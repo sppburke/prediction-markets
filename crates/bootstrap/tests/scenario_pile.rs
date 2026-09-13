@@ -30,10 +30,11 @@ fn wallet(byte: u8) -> WalletAddress {
 }
 
 fn trade_url_cold(w: WalletAddress) -> String {
-    PolymarketEndpoint::UserTradeActivity {
+    PolymarketEndpoint::UserTradeActivityPage {
         user: w.to_string(),
-        end: None,
-        start: None,
+        end: 2_000_000_000,
+        start: Some(1),
+        offset: 0,
     }
     .url(BASE_URL)
 }
@@ -160,7 +161,8 @@ async fn scenario_backfill_refreshes_trade_count_and_activates() {
     let mut responses = HashMap::new();
     responses.insert(trade_url_cold(w), page);
 
-    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+        .with_clock_for_test(|| 2_000_000_120);
     fetcher.fetch_all(&[w], &mut cache).await.unwrap();
 
     let count_in_db = cache.trade_count();
@@ -289,6 +291,7 @@ async fn scenario_migrate_seeds_timestamps_before_activating() {
     let mut responses = HashMap::new();
     responses.insert(trade_url_cold(w), page_json(&trades_refs));
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+        .with_clock_for_test(|| 2_000_000_120)
         .fetch_all(&[w], &mut cache)
         .await
         .unwrap();

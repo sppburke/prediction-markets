@@ -15,7 +15,7 @@ asserts the four properties the consolidation must preserve plus the two it adds
   * `--universe` and `--universe-from-trades` are mutually exclusive — supplying both, or
     neither, errors;
   * decay (half_life=30) reshapes the score and yields n_eff < n (positive control);
-  * an empty edge floor returns 0 (no crash).
+  * an empty schema-one edge floor returns 76 (no crash).
 
 Imports the ranker module (numpy + pandas) so CI runs it after `pip install -r
 scripts/requirements.txt`, alongside test_ranker_decay.py.
@@ -162,6 +162,86 @@ def read_csv_rows(path: str) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+class PartialBackfillUniverseTest(unittest.TestCase):
+    def test_both_universe_sources_filter_before_limit_and_keep_legacy_or_missing_rows(self):
+        for from_trades in (False, True):
+            for complete_stamp in (None, 1, "missing"):
+                with self.subTest(from_trades=from_trades, complete_stamp=complete_stamp):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        db = str(Path(tmp) / "cache.db")
+                        out = str(Path(tmp) / "out")
+                        build_core_cache(db)
+                        with sqlite3.connect(db) as conn:
+                            conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, "
+                                         "backfill_partial INTEGER NOT NULL DEFAULT 0, "
+                                         "last_polymarket_fetch_at INTEGER, is_active INTEGER DEFAULT 0, is_infra INTEGER DEFAULT 0)")
+                            conn.execute("INSERT INTO wallets(wallet_hex,backfill_partial,last_polymarket_fetch_at) VALUES (?,1,1)", (WA,))
+                            if complete_stamp != "missing":
+                                conn.execute("INSERT INTO wallets(wallet_hex,backfill_partial,last_polymarket_fetch_at) VALUES (?,0,?)", (WB, complete_stamp))
+                        universe = Path(tmp) / "universe.txt"
+                        universe.write_text(WA + "\n" + WB + "\n")
+                        args = ["--universe-from-trades"] if from_trades else ["--universe", str(universe)]
+                        self.assertEqual(run_ranker(db, out, *args, "--limit-wallets", "1",
+                                                   "--floor-tstat", "0.1"), 0)
+                        rows = read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))
+                        self.assertEqual([r["wallet"] for r in rows], [WB])
+
+    def test_only_marker_one_is_excluded_and_schema_two_is_unchanged(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute("CREATE TABLE wallets (wallet_hex TEXT, backfill_partial INTEGER)")
+            conn.executemany("INSERT INTO wallets VALUES (?,?)", [(WA, 1), (WB, 2)])
+            self.assertEqual(rk.exclude_partial_backfills(conn, [WA, WB], 1), [WB])
+            self.assertEqual(rk.exclude_partial_backfills(conn, [WA, WB], 2), [WA, WB])
+
+
+class QuarantineSnapshotTest(unittest.TestCase):
+    """A backfill committing between the completeness filter and the per-wallet
+    history scans must not supply rows for a wallet the filter already judged.
+    Both must read one snapshot, as `rank_cycle_manifest.snapshot` does.
+    """
+
+    def test_concurrent_backfill_commit_is_invisible_to_the_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            out = str(Path(tmp) / "out")
+            build_core_cache(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, "
+                             "backfill_partial INTEGER NOT NULL DEFAULT 0, "
+                             "is_active INTEGER DEFAULT 1, is_infra INTEGER DEFAULT 0)")
+                conn.execute("INSERT INTO wallets(wallet_hex) VALUES (?)", (WA,))
+                held = conn.execute(
+                    "SELECT wallet_hex, side, market_id, outcome_id, price_str, contracts,"
+                    " timestamp_unix, source_trade_id FROM trades WHERE wallet_hex = ?",
+                    (WA,)).fetchall()
+                conn.execute("DELETE FROM trades WHERE wallet_hex = ?", (WA,))
+            self.assertTrue(held, "fixture must hold back real qualifying rows")
+
+            real = rk.exclude_partial_backfills
+
+            def commit_between(connection, wallets, schema_version):
+                """Judge completeness, then let a backfill land mid-run."""
+                kept = real(connection, wallets, schema_version)
+                writer = sqlite3.connect(db)
+                writer.executemany(
+                    "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)", held)
+                writer.execute(
+                    "UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = ?", (WA,))
+                writer.commit()
+                writer.close()
+                return kept
+
+            universe = Path(tmp) / "universe.txt"
+            universe.write_text(WA + "\n" + WB + "\n")
+            with mock.patch.object(rk, "exclude_partial_backfills", commit_between):
+                self.assertEqual(run_ranker(db, out, "--universe", str(universe),
+                                            "--floor-tstat", "0.1"), 0)
+            rows = read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))
+            self.assertEqual([r["wallet"] for r in rows], [WB],
+                             "ranked a wallet from history committed after the filter")
+
+
 class FlatRankingGoldenTest(unittest.TestCase):
     """Flat (half_life=0) stats == independent legacy recomputation; ranked desc by tstat_net."""
 
@@ -286,7 +366,7 @@ class DecayPositiveControlTest(unittest.TestCase):
 
 
 class EmptyFloorTest(unittest.TestCase):
-    def test_empty_floor_returns_zero(self) -> None:
+    def test_empty_floor_returns_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "cache.db")
             out = str(Path(tmp) / "out")
@@ -294,7 +374,7 @@ class EmptyFloorTest(unittest.TestCase):
             # An unreachable floor: eligible wallets exist, but none clear t-stat >= 999.
             rc = run_ranker(db, out, "--universe-from-trades", "--half-life-days", "0",
                             "--floor-tstat", "999")
-            self.assertEqual(rc, 0)  # no crash, graceful stop
+            self.assertEqual(rc, 76)  # wrapper owns whether this is retryable
             self.assertTrue((Path(out) / "ranked_72hr_buyandhold.csv").exists())
             self.assertFalse((Path(out) / "250_72hr_buyandhold_variance.txt").exists())
 

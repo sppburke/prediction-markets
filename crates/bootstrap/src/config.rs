@@ -146,10 +146,10 @@ pub struct BootstrapConfig {
 
     /// Per-wallet wall-clock budget (seconds) for the Polymarket `fetch_all`
     /// loop. `0` disables the timeout; positive values wrap each
-    /// `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets that
+    /// `walk_wallet` call in `tokio::time::timeout`. Wallets that
     /// trip the timeout are soft-failed (added to `FetchOutcome::failed`) so
-    /// the post-fetch pipeline still runs and `last_polymarket_fetch_at`
-    /// remains NULL → next backfill re-queues them. Canonical default in
+    /// the post-fetch pipeline still runs and the old `last_polymarket_fetch_at`
+    /// is preserved. The partial marker makes active, non-infra wallets due again. Canonical default in
     /// `docs/_GLOSSARY.md` "Bootstrap defaults" section.
     /// `PE_BOOTSTRAP_POLYMARKET_WALLET_TIMEOUT_SECS` overrides.
     #[serde(

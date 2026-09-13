@@ -31,10 +31,11 @@ fn wallet(byte: u8) -> WalletAddress {
 }
 
 fn trade_url_cold(w: WalletAddress) -> String {
-    PolymarketEndpoint::UserTradeActivity {
+    PolymarketEndpoint::UserTradeActivityPage {
         user: w.to_string(),
-        end: None,
-        start: None,
+        end: 2_000_000_000,
+        start: Some(1),
+        offset: 0,
     }
     .url(BASE_URL)
 }
@@ -111,7 +112,9 @@ async fn scenario_timed_out_wallet_is_requeued_on_next_run() {
     assert_eq!(due_before.len(), 1, "wallet must be due before run");
 
     // Drive the fetch with a HangFetcher; timeout fires after 1s.
-    let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), HangFetcher).with_wallet_timeout(1);
+    let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), HangFetcher)
+        .with_clock_for_test(|| 2_000_000_120)
+        .with_wallet_timeout(1);
 
     let start = std::time::Instant::now();
     let outcome = bulk.fetch_all(&[w], &mut cache).await.unwrap();
@@ -125,7 +128,7 @@ async fn scenario_timed_out_wallet_is_requeued_on_next_run() {
     );
 
     // Cache integrity: no trades, no funder edges written from the cancelled walk.
-    let ids = cache.known_trade_ids(&w.to_string());
+    let ids = cache.known_trade_ids(&w.to_string()).unwrap();
     assert!(
         ids.is_empty(),
         "cancellation-safety: no partial cache writes"
@@ -182,7 +185,9 @@ async fn scenario_mixed_batch_timeout_isolates_stragglers() {
     responses.insert(trade_url_cold(fast), page_json(&trades));
 
     let fetcher = PartialHangFetcher::new(FixtureFetcher::new(responses));
-    let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher).with_wallet_timeout(1);
+    let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+        .with_clock_for_test(|| 2_000_000_120)
+        .with_wallet_timeout(1);
 
     let now = 1_700_000_000_i64;
 
@@ -199,8 +204,8 @@ async fn scenario_mixed_batch_timeout_isolates_stragglers() {
     );
 
     // Verify fast wallet got its trade persisted; slow has none.
-    let fast_ids = cache.known_trade_ids(&fast.to_string());
-    let slow_ids = cache.known_trade_ids(&slow.to_string());
+    let fast_ids = cache.known_trade_ids(&fast.to_string()).unwrap();
+    let slow_ids = cache.known_trade_ids(&slow.to_string()).unwrap();
     assert_eq!(
         fast_ids.len(),
         1,
@@ -254,6 +259,7 @@ async fn scenario_timeout_disabled_does_not_interfere_with_success() {
     responses.insert(trade_url_cold(w), page_json(&trades));
 
     let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+        .with_clock_for_test(|| 2_000_000_120)
         .with_wallet_timeout(0);
     let outcome = bulk.fetch_all(&[w], &mut cache).await.unwrap();
 
@@ -262,5 +268,5 @@ async fn scenario_timeout_disabled_does_not_interfere_with_success() {
         "disabled timeout must not soft-fail"
     );
     assert_eq!(outcome.succeeded_count(), 1);
-    assert_eq!(cache.known_trade_ids(&w.to_string()).len(), 1);
+    assert_eq!(cache.known_trade_ids(&w.to_string()).unwrap().len(), 1);
 }
