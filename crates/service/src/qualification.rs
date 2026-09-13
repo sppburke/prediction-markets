@@ -4930,6 +4930,11 @@ pub enum FinancialEraCommand {
     Prepare,
     Start,
     RollbackCheck,
+    /// The gates that are meaningful while the service is still *running* (#618). The activation
+    /// driver runs this immediately before the stop, so a refusal costs no downtime, and again the
+    /// moment the service is inert, so a refusal the shutdown itself caused is found in seconds
+    /// rather than after the backup and integrity check.
+    Preflight,
 }
 
 pub fn run_financial_era(
@@ -4957,6 +4962,28 @@ pub fn run_financial_era(
             start_financial_era(&manifest, config, &config_rows)
         }
         FinancialEraCommand::RollbackCheck => rollback_check_financial_era(&manifest, config),
+        FinancialEraCommand::Preflight => {
+            // Exactly four gate groups, every one of them reading a local file: the manifest
+            // (already validated above), the staged target configuration, the exported Financial15
+            // rows, and `status.json`. No database, no log scan — so this stays a seconds-long
+            // answer even when it runs with the service already stopped.
+            validate_financial_target_config(config)?;
+            let config_rows = read_financial_config_rows(financial_config_rows_path)?;
+            let hot_config_hash = derive_hot_config_hash(&config_rows, config)?;
+            let accounts = verify_live_status_posture(&config.status_path)?;
+            // Name what was proven. The driver records this, so a later reader can tell which gates
+            // this observation covered and which ones only the post-stop preparation runs.
+            Ok(serde_json::to_string(&serde_json::json!({
+                "gates": [
+                    "financial_manifest",
+                    "financial_target_config",
+                    "financial15_config_rows",
+                    "live_status_posture",
+                ],
+                "hot_config_hash": hot_config_hash,
+                "live_accounts": accounts.len(),
+            }))?)
+        }
     }
 }
 
@@ -10614,6 +10641,222 @@ mod tests {
                 .unwrap();
         }
         writer.sync().unwrap();
+    }
+
+    /// Give the fixture the offline authority inputs `validate_financial_target_config` requires,
+    /// and write the exported Financial15 rows the preflight reads.
+    fn preflight_fixture(root: &Path) -> (FinancialEraManifest, ServiceConfig, PathBuf) {
+        let (manifest, mut config) = financial_era_live_source_fixture(root);
+        config.supabase_authoritative = true;
+        config.supabase_url = "https://example.invalid".to_owned();
+        config.supabase_secret_key = "service-role".to_owned();
+        let manifest_path = root.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let rows_path = root.join("rows.json");
+        fs::write(
+            &rows_path,
+            serde_json::to_vec(&financial_config_rows()).unwrap(),
+        )
+        .unwrap();
+        (manifest, config, manifest_path)
+    }
+
+    fn run_preflight(root: &Path, config: &ServiceConfig) -> Result<String, QualificationError> {
+        run_financial_era(
+            FinancialEraCommand::Preflight,
+            &root.join("manifest.json"),
+            config,
+            Some(&root.join("rows.json")),
+        )
+    }
+
+    /// #618. The preflight must cover exactly the four gate groups that are valid against a running
+    /// service, and NOT the journal, source-log or paper-state gates — those assert on a tail that
+    /// is still moving while the service runs.
+    ///
+    /// Proof by absence rather than by corruption: a corrupted source log would still be passed by
+    /// an implementation that read the live journal but not the source log. Here every file the
+    /// preflight is forbidden to touch is *deleted* while the manifest still names it.
+    /// PASS: the preflight succeeds anyway.
+    /// FAIL: it touched something outside its four groups.
+    #[test]
+    fn preflight_ignores_every_file_outside_its_four_gate_groups() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config, _) = preflight_fixture(temp.path());
+        for forbidden in [
+            &manifest.paths.paper_log,
+            &manifest.paths.source_log,
+            &manifest.paths.live_journal,
+            &manifest.paths.paper_state,
+        ] {
+            fs::remove_file(forbidden).unwrap();
+            assert!(!forbidden.exists());
+        }
+        let report = run_preflight(temp.path(), &config).expect("preflight must not read those");
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(
+            report["gates"],
+            serde_json::json!([
+                "financial_manifest",
+                "financial_target_config",
+                "financial15_config_rows",
+                "live_status_posture",
+            ])
+        );
+        assert_eq!(report["live_accounts"], 1);
+
+        // ...and prepare, which does read them, refuses on the same fixture. Without this the test
+        // above could pass simply because the files were never load-bearing.
+        assert!(
+            run_financial_era(
+                FinancialEraCommand::Prepare,
+                &temp.path().join("manifest.json"),
+                &config,
+                Some(&temp.path().join("rows.json")),
+            )
+            .is_err(),
+            "prepare must still depend on the files the preflight ignores"
+        );
+    }
+
+    /// #618. Each promised gate must have its own refusal: a fixture that is valid everywhere else
+    /// cannot detect an omitted gate.
+    #[test]
+    fn preflight_refuses_on_each_of_its_four_gate_groups() {
+        // 1. manifest group — configured paths differ from the manifest's.
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut config, _) = preflight_fixture(temp.path());
+        let moved = config.source_event_log_path.with_extension("moved");
+        fs::rename(&config.source_event_log_path, &moved).unwrap();
+        config.source_event_log_path = moved;
+        assert!(
+            run_preflight(temp.path(), &config).is_err(),
+            "a manifest/config path mismatch must refuse"
+        );
+
+        // 2. target-config group — the offline authority inputs are the whole point of the gate.
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut config, _) = preflight_fixture(temp.path());
+        config.supabase_secret_key = String::new();
+        assert!(
+            run_preflight(temp.path(), &config).is_err(),
+            "a credential-less target config must refuse"
+        );
+
+        // 3. Financial15 rows group — syntactically valid JSON, semantically forbidden content.
+        let temp = tempfile::tempdir().unwrap();
+        let (_, config, _) = preflight_fixture(temp.path());
+        let mut rows = financial_config_rows();
+        rows.push(ConfigRow {
+            key: RISK_HALT_RELEASE_HASH_KEY.to_owned(),
+            value: "c".repeat(64),
+            value_type: "text".to_owned(),
+        });
+        fs::write(
+            temp.path().join("rows.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            run_preflight(temp.path(), &config).is_err(),
+            "the incident-only risk halt release must refuse"
+        );
+
+        // 4. live-status group — the #618 gate itself.
+        let temp = tempfile::tempdir().unwrap();
+        let (_, config, _) = preflight_fixture(temp.path());
+        fs::write(
+            &config.status_path,
+            br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":true,"accounts":[]}}"#,
+        )
+        .unwrap();
+        assert!(
+            run_preflight(temp.path(), &config).is_err(),
+            "a stale live snapshot must refuse"
+        );
+    }
+
+    /// #618. Every live-status refusal the post-stop preparation makes, the preflight makes too —
+    /// that equivalence is what lets the driver trust an earlier observation.
+    #[test]
+    fn preflight_live_status_refusals_match_preparation() {
+        let dirty = [
+            (
+                "stale",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":true,"accounts":[]}}"#[..],
+            ),
+            (
+                "pending dispatch work",
+                &br#"{"live":{"pending_dispatch_seeds":1,"ready_dispatch_seeds":0,"stale":false,"accounts":[]}}"#[..],
+            ),
+            (
+                "ready dispatch work",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":2,"stale":false,"accounts":[]}}"#[..],
+            ),
+            ("absent live block", &br#"{}"#[..]),
+            ("malformed json", &b"{not json"[..]),
+            (
+                "absent accounts array",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false}}"#[..],
+            ),
+            (
+                "requested mode on",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"live-a","requested_live_mode":"on","effective_live_mode":"off","armed":false}]}}"#[..],
+            ),
+            (
+                "effective mode on",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"live-a","requested_live_mode":"off","effective_live_mode":"on","armed":false}]}}"#[..],
+            ),
+            (
+                "armed",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"live-a","requested_live_mode":"off","effective_live_mode":"off","armed":true}]}}"#[..],
+            ),
+            (
+                "duplicate account id",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"live-a","requested_live_mode":"off","effective_live_mode":"off","armed":false},{"account_id":"live-a","requested_live_mode":"off","effective_live_mode":"off","armed":false}]}}"#[..],
+            ),
+            (
+                "non-canonical account id",
+                &br#"{"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"stale":false,"accounts":[{"account_id":"LIVE A","requested_live_mode":"off","effective_live_mode":"off","armed":false}]}}"#[..],
+            ),
+        ];
+        for (name, status) in dirty {
+            let temp = tempfile::tempdir().unwrap();
+            let (_, config, _) = preflight_fixture(temp.path());
+            fs::write(&config.status_path, status).unwrap();
+            let preflight = run_preflight(temp.path(), &config);
+            assert!(preflight.is_err(), "{name}: preflight must refuse");
+            let prepared = run_financial_era(
+                FinancialEraCommand::Prepare,
+                &temp.path().join("manifest.json"),
+                &config,
+                Some(&temp.path().join("rows.json")),
+            );
+            assert!(prepared.is_err(), "{name}: prepare must refuse too");
+        }
+    }
+
+    /// #618. The preflight needs the exported rows exactly as prepare does; an absent or malformed
+    /// export is evidence it cannot do without.
+    #[test]
+    fn preflight_requires_the_exported_financial15_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, config, manifest_path) = preflight_fixture(temp.path());
+        assert!(
+            run_financial_era(
+                FinancialEraCommand::Preflight,
+                &manifest_path,
+                &config,
+                None
+            )
+            .is_err(),
+            "an absent rows argument must refuse"
+        );
+        fs::write(temp.path().join("rows.json"), b"{not json").unwrap();
+        assert!(
+            run_preflight(temp.path(), &config).is_err(),
+            "a malformed rows export must refuse"
+        );
     }
 
     #[test]
