@@ -868,6 +868,27 @@ impl WalletCache {
             "source",
             "TEXT NOT NULL DEFAULT 'clob'",
         )?;
+        // Migration (issue #615): add `end_date_unix` to both CLOB payout evidence tables. The
+        // column joined their `CREATE TABLE` in #566, after #548 shipped the tables, so a cache
+        // whose tables predate #566 keeps the original shape — `CREATE TABLE IF NOT EXISTS` cannot
+        // widen an existing table. `commit_clob_payout_generation` then fails with "table
+        // clob_payout_evidence_v2 has no column named end_date_unix", and because the `resolutions`
+        // stage treats that as fatal it aborts the whole ranking cycle (production, 2026-09-12).
+        // `ensure_lane_a_v2_schema` already adds the same pair, but only on the v1→v2 migration
+        // lane; a v1 cache opens through here and never reached it. Existing rows stay NULL, the
+        // honest "end date not recorded" sentinel — mirrors the `start_date_unix` precedent above.
+        add_column_if_missing(
+            &conn,
+            "clob_payout_evidence_v2",
+            "end_date_unix",
+            "INTEGER NULL",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "clob_payout_evidence_staging_v2",
+            "end_date_unix",
+            "INTEGER NULL",
+        )?;
         // Migration (issue #186): add `polymarket_contracts_seen` bitmask if
         // absent. Pre-migration rows default to 0 ("no V1/V2 attribution
         // available"); enumeration populates via UPSERT OR-merge on each
@@ -6669,6 +6690,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "source column must exist exactly once");
+    }
+
+    /// Issue #615. Scenario: a v1 cache whose CLOB payout evidence tables predate #566 and so
+    /// lack `end_date_unix`, reopened by the current opener.
+    /// PASS: the statement `commit_clob_payout_generation` runs cannot be prepared against the
+    /// legacy shape, both tables carry exactly one `end_date_unix` column after a reopen, and the
+    /// statement prepares from then on.
+    /// FAIL: the column is still absent after the reopen, or the statement still cannot prepare.
+    #[test]
+    fn clob_payout_end_date_migration_repairs_pre_566_tables() {
+        const COMMIT_INSERT: &str = "INSERT INTO clob_payout_evidence_v2 \
+             (market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+              tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
+              schema_version, parser_version, fetched_at_unix, origin) \
+             SELECT market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+                    tokens_json, raw_page_sha256, generation, page_ordinal, schema_version, \
+                    parser_version, fetched_at_unix, origin \
+             FROM clob_payout_evidence_staging_v2 WHERE generation = ?1";
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            // Narrow the tables back to their pre-#566 shape. `end_date_unix` carries no index,
+            // CHECK, or key membership, so SQLite can drop it in place.
+            let cache = WalletCache::open(&path).unwrap();
+            cache
+                .conn
+                .execute_batch(
+                    "ALTER TABLE clob_payout_evidence_v2 DROP COLUMN end_date_unix; \
+                     ALTER TABLE clob_payout_evidence_staging_v2 DROP COLUMN end_date_unix;",
+                )
+                .unwrap();
+            let refused = cache.conn.prepare(COMMIT_INSERT).unwrap_err().to_string();
+            assert!(
+                refused.contains("end_date_unix"),
+                "the legacy shape must reject the commit statement, got: {refused}"
+            );
+        }
+        // Reopening must widen both tables.
+        let cache = WalletCache::open(&path).unwrap();
+        for table in ["clob_payout_evidence_v2", "clob_payout_evidence_staging_v2"] {
+            let count: i64 = cache
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'end_date_unix'",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "{table} must gain exactly one end_date_unix column"
+            );
+        }
+        cache.conn.prepare(COMMIT_INSERT).unwrap();
+        // Idempotent: a further reopen must neither error nor duplicate the column.
+        let cache = WalletCache::open(&path).unwrap();
+        let count: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('clob_payout_evidence_v2') \
+                 WHERE name = 'end_date_unix'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "reopening must not duplicate the column");
+        cache.conn.prepare(COMMIT_INSERT).unwrap();
     }
 
     #[test]
