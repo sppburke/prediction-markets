@@ -5066,25 +5066,18 @@ fn retain_live_preparation_sources(
     Ok(source_envelopes)
 }
 
-fn verify_live_preparation_posture(
-    live_path: &Path,
-    source_log_path: &Path,
+/// The `status.json` half of [`verify_live_preparation_posture`] (#618): the part of the posture
+/// that is *only* meaningful against a running service — the account snapshot is not stale, no
+/// dispatch work is pending or ready, and every account the status names is uniquely `off` and
+/// unarmed. Returns those account ids, which the caller unions with the live journal's.
+///
+/// Split out so the activation driver can ask this question **before** it stops the service, and
+/// again the moment the service is inert, instead of only after an hour of backup and integrity
+/// work has already been spent (#545 attempt 15). Behaviour is unchanged: same predicates, same
+/// order, same messages, same error variants.
+fn verify_live_status_posture(
     status_path: &Path,
-) -> Result<LogTailBinding, QualificationError> {
-    let before = pe_execution_core::LiveJournal::verified_tail(live_path).map_err(|error| {
-        QualificationError::InsufficientEvidence(format!("live journal: {error}"))
-    })?;
-    let recovery =
-        pe_execution_core::live_journal::recovery_inventory(live_path, None).map_err(|error| {
-            QualificationError::InsufficientEvidence(format!("live recovery inventory: {error}"))
-        })?;
-    if !recovery.open_orders.is_empty() {
-        return insufficient("financial-era prepare found a nonterminal live order");
-    }
-    if !recovery.approved_admissions.is_empty() {
-        return insufficient("financial-era prepare found an unmatched Approved admission");
-    }
-
+) -> Result<HashSet<AccountId>, QualificationError> {
     let status: serde_json::Value =
         serde_json::from_slice(&fs::read(status_path)?).map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
@@ -5150,6 +5143,29 @@ fn verify_live_preparation_posture(
             );
         }
     }
+    Ok(account_ids)
+}
+
+fn verify_live_preparation_posture(
+    live_path: &Path,
+    source_log_path: &Path,
+    status_path: &Path,
+) -> Result<LogTailBinding, QualificationError> {
+    let before = pe_execution_core::LiveJournal::verified_tail(live_path).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!("live journal: {error}"))
+    })?;
+    let recovery =
+        pe_execution_core::live_journal::recovery_inventory(live_path, None).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!("live recovery inventory: {error}"))
+        })?;
+    if !recovery.open_orders.is_empty() {
+        return insufficient("financial-era prepare found a nonterminal live order");
+    }
+    if !recovery.approved_admissions.is_empty() {
+        return insufficient("financial-era prepare found an unmatched Approved admission");
+    }
+
+    let mut account_ids = verify_live_status_posture(status_path)?;
 
     #[derive(Deserialize)]
     struct LiveAccountEnvelope {
