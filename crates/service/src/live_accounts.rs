@@ -13,11 +13,12 @@
 //! exactly as the Phase-A baseline (no dispatch seeds are staged).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use pe_core_types::AccountId;
 use serde::Deserialize;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::supabase_reader::{SupabaseError, auth_token};
 
@@ -25,6 +26,30 @@ use crate::supabase_reader::{SupabaseError, auth_token};
 /// `_GLOSSARY.md` `live_armed_accounts_max`. Bounded by the p95 ≤ 2.0 s end-to-end and
 /// CLOB ≤ 5 req/s budgets; raising it requires re-validating those budgets.
 pub const LIVE_ARMED_ACCOUNTS_MAX: usize = 2;
+
+/// Most attempts a single poll tick may make (#620); [`live_accounts_attempt_plan`] lowers it when
+/// the interval cannot pay for them. Supabase returns intermittent gateway 504s in short bursts;
+/// with one attempt per tick, four consecutive bursts exhaust [`LIVE_ACCOUNTS_STALE_AFTER_SECS`] and
+/// the snapshot is marked stale — which skips live mode passes and failed the #545 financial-era
+/// preparation gate after the downtime was already spent.
+const LIVE_ACCOUNTS_POLL_ATTEMPTS: u32 = 3;
+
+/// Wait between attempts. Deliberately short: the whole sequence must fit inside one tick.
+const LIVE_ACCOUNTS_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Percentage of the poll interval the attempt sequence may consume. The remainder is headroom — a
+/// sequence that overran its tick would stretch the effective cadence and cause the staleness this
+/// retry exists to prevent.
+const LIVE_ACCOUNTS_POLL_BUDGET_PERCENT: u32 = 80;
+
+/// The smallest per-request timeout worth issuing. An attempt count whose requests would each get
+/// less than this is not affordable, so the plan drops an attempt instead of shrinking the timeout
+/// below something that could answer.
+const LIVE_ACCOUNTS_MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Requests one attempt issues: `accounts` then `account_credentials`. The timeout is applied to
+/// each of them, so the budget has to be divided by both the attempts and these.
+const LIVE_ACCOUNTS_REQUESTS_PER_ATTEMPT: u32 = 2;
 
 /// Snapshot staleness bound (#514): 4 × the 30 s accounts poll cadence
 /// ([`crate::config_poller::CONFIG_POLL_INTERVAL_SECS`]), the `_GLOSSARY.md` polled-source
@@ -223,10 +248,23 @@ pub async fn fetch_live_accounts(
     anon_key: &str,
     secret_key: &str,
 ) -> Result<LiveAccountsSnapshot, SupabaseError> {
+    fetch_live_accounts_within(client, base_url, anon_key, secret_key, None).await
+}
+
+/// As [`fetch_live_accounts`], with an optional per-request timeout. The poller derives one from its
+/// interval so a hung request cannot consume the whole tick; a timeout surfaces as
+/// [`SupabaseError::Transport`], which is exactly what it is.
+async fn fetch_live_accounts_within(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    timeout: Option<Duration>,
+) -> Result<LiveAccountsSnapshot, SupabaseError> {
     let token = auth_token(anon_key, secret_key);
-    let rows: Vec<AccountRow> = fetch_json(client, &accounts_url(base_url), token).await?;
+    let rows: Vec<AccountRow> = fetch_json(client, &accounts_url(base_url), token, timeout).await?;
     let creds: Vec<CredentialMetaRow> =
-        fetch_json(client, &credentials_url(base_url), token).await?;
+        fetch_json(client, &credentials_url(base_url), token, timeout).await?;
     let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &creds);
     snapshot.fetched_at_unix = Some(time::OffsetDateTime::now_utc().unix_timestamp());
     Ok(snapshot)
@@ -236,14 +274,16 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
     token: &str,
+    timeout: Option<Duration>,
 ) -> Result<T, SupabaseError> {
-    let resp = client
+    let mut request = client
         .get(url)
         .header("apikey", token)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(SupabaseError::Transport)?;
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let resp = request.send().await.map_err(SupabaseError::Transport)?;
     let status = resp.status();
     if !status.is_success() {
         return Err(SupabaseError::Status(status.as_u16()));
@@ -251,8 +291,103 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
     resp.json().await.map_err(SupabaseError::Decode)
 }
 
-/// Poll loop: refresh the snapshot every `interval_secs`, keeping last-known-good on any
-/// failure. Spawned beside the config poller with the same 30 s cadence (#508).
+/// How many attempts this tick can afford and how long each of their requests may take. Every
+/// attempt issues [`LIVE_ACCOUNTS_REQUESTS_PER_ATTEMPT`] requests, so the returned pair always
+/// satisfies `attempts * requests * timeout + backoffs <= interval`: the sequence can never overrun
+/// its own tick, which is itself what marks the snapshot stale. A short interval buys fewer attempts
+/// rather than a timeout too small to answer with.
+fn live_accounts_attempt_plan(interval: Duration) -> (u32, Duration) {
+    // Saturating: `Duration`'s multiply panics on overflow; this must not be a panic path.
+    let budget = interval.saturating_mul(LIVE_ACCOUNTS_POLL_BUDGET_PERCENT) / 100;
+    let mut attempts = LIVE_ACCOUNTS_POLL_ATTEMPTS;
+    loop {
+        let backoffs = LIVE_ACCOUNTS_RETRY_BACKOFF.saturating_mul(attempts.saturating_sub(1));
+        let per_request =
+            budget.saturating_sub(backoffs) / (attempts * LIVE_ACCOUNTS_REQUESTS_PER_ATTEMPT);
+        if per_request >= LIVE_ACCOUNTS_MIN_REQUEST_TIMEOUT || attempts == 1 {
+            return (attempts, per_request.max(LIVE_ACCOUNTS_MIN_REQUEST_TIMEOUT));
+        }
+        attempts -= 1;
+    }
+}
+
+/// Whether another attempt inside this tick could plausibly succeed. Gateway and transport failures
+/// are the bursty ones worth retrying; a 4xx (notably the 401/403 authorization denial) will answer
+/// identically however many times it is asked, so it fails fast and keeps the budget.
+fn live_accounts_error_is_transient(error: &SupabaseError) -> bool {
+    match error {
+        SupabaseError::Transport(_) => true,
+        SupabaseError::Status(status) => *status >= 500,
+        // `RequestBuilder::timeout` covers the response body too, and a timeout struck while
+        // reading it surfaces from `Response::json` — so it arrives here as `Decode`, not
+        // `Transport`. It is still a timeout and still worth another attempt; a genuine
+        // JSON/schema error is not.
+        SupabaseError::Decode(error) => error.is_timeout(),
+        _ => false,
+    }
+}
+
+/// One poll: as many attempts as the tick affords, stopping early on success or on a non-transient
+/// error.
+async fn poll_live_accounts_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    interval: Duration,
+) -> Result<LiveAccountsSnapshot, SupabaseError> {
+    let (attempts, request_timeout) = live_accounts_attempt_plan(interval);
+    let mut retried = false;
+    // Every attempt but the last: a transient failure sleeps and tries again; anything else is the
+    // answer. The final attempt falls through so its own result is the poll's result — there is no
+    // synthetic error to invent when the budget runs out.
+    for attempt in 1..attempts {
+        match fetch_live_accounts_within(
+            client,
+            base_url,
+            anon_key,
+            secret_key,
+            Some(request_timeout),
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                if retried {
+                    info!(attempt, "live accounts poll recovered inside the tick");
+                }
+                return Ok(snapshot);
+            }
+            Err(error) if !live_accounts_error_is_transient(&error) => return Err(error),
+            Err(error) => warn!(
+                attempt,
+                error = %error,
+                "live accounts poll attempt failed; retrying inside the tick"
+            ),
+        }
+        retried = true;
+        tokio::time::sleep(LIVE_ACCOUNTS_RETRY_BACKOFF).await;
+    }
+    let outcome = fetch_live_accounts_within(
+        client,
+        base_url,
+        anon_key,
+        secret_key,
+        Some(request_timeout),
+    )
+    .await;
+    if outcome.is_ok() && retried {
+        info!(
+            attempt = attempts,
+            "live accounts poll recovered inside the tick"
+        );
+    }
+    outcome
+}
+
+/// Poll loop: refresh the snapshot every `interval_secs`, keeping last-known-good only after every
+/// attempt in the tick has failed. Spawned beside the config poller with the same 30 s cadence
+/// (#508). Retrying inside the tick matters because the staleness bound is exactly four intervals:
+/// without it, a burst of four failed polls marks the snapshot stale (#620).
 pub async fn run_live_accounts_poller(
     live: LiveAccounts,
     client: reqwest::Client,
@@ -261,11 +396,12 @@ pub async fn run_live_accounts_poller(
     secret_key: String,
     interval_secs: u64,
 ) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        match fetch_live_accounts(&client, &base_url, &anon_key, &secret_key).await {
+        match poll_live_accounts_once(&client, &base_url, &anon_key, &secret_key, interval).await {
             Ok(snapshot) => live.store(snapshot),
             Err(e) => warn!(error = %e, "live accounts poll failed; keeping last-known-good"),
         }
@@ -275,6 +411,8 @@ pub async fn run_live_accounts_poller(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    use axum::response::IntoResponse;
 
     use super::*;
 
@@ -393,6 +531,217 @@ mod tests {
             assert!(!url.contains(field), "{field} must not be selected");
         }
         assert!(url.starts_with("https://example.test/rest/v1/accounts?select=account_id,"));
+    }
+
+    /// #620. Scenario: the accounts endpoint returns HTTP 504 for the first two attempts of a tick
+    /// and succeeds on the third — the shape Supabase's gateway actually produces.
+    /// PASS: the poll returns a snapshot within the single tick, having made 3 accounts requests.
+    /// FAIL: the poll returns an error, i.e. the burst cost the whole interval (the pre-fix
+    /// behavior, which after four such intervals marks the snapshot stale).
+    #[tokio::test]
+    async fn transient_gateway_failures_recover_inside_one_tick() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new()
+            .route(
+                "/rest/v1/accounts",
+                axum::routing::get(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        let seen = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if seen < 2 {
+                            return axum::http::StatusCode::GATEWAY_TIMEOUT.into_response();
+                        }
+                        axum::Json(serde_json::json!([])).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/rest/v1/account_credentials",
+                axum::routing::get(|| async { axum::Json(serde_json::json!([])) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let polled = poll_live_accounts_once(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "publishable-key",
+            "",
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(
+            polled.is_ok(),
+            "a two-failure burst must not cost the whole tick, got {polled:?}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "expected two retries inside the tick"
+        );
+        server.abort();
+    }
+
+    /// #620. An authorization denial answers identically however many times it is asked, so it must
+    /// not consume the retry budget.
+    /// PASS: exactly one accounts request, and the 401 is returned.
+    /// FAIL: more than one request (budget wasted on an error that cannot change).
+    #[tokio::test]
+    async fn authorization_denial_is_not_retried() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/rest/v1/accounts",
+            axum::routing::get(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let polled = poll_live_accounts_once(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "publishable-key",
+            "",
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(
+            matches!(&polled, Err(SupabaseError::Status(401))),
+            "expected an unretried 401, got {polled:?}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 4xx must not be retried"
+        );
+        server.abort();
+    }
+
+    /// #620. `RequestBuilder::timeout` covers the response body, so a stall *after* the 200 status
+    /// line surfaces from `Response::json` as `Decode`, not `Transport`.
+    /// PASS: the poll recovers inside the tick, having made 3 accounts requests.
+    /// FAIL: the poll returns the first `Decode` after one attempt — the pre-fix classification,
+    /// which leaves body-phase stalls costing a whole interval each.
+    #[tokio::test]
+    async fn body_phase_timeouts_recover_inside_one_tick() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new()
+            .route(
+                "/rest/v1/accounts",
+                axum::routing::get(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        let seen = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Headers go out immediately; the body stalls well past the derived
+                        // per-request timeout on the first two attempts.
+                        let stall = if seen < 2 {
+                            Duration::from_secs(3)
+                        } else {
+                            Duration::ZERO
+                        };
+                        axum::body::Body::from_stream(futures::stream::once(async move {
+                            tokio::time::sleep(stall).await;
+                            Ok::<&'static str, std::io::Error>("[]")
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/rest/v1/account_credentials",
+                axum::routing::get(|| async { axum::Json(serde_json::json!([])) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // 5 s buys three attempts at 500 ms each — six times shorter than the 3 s stall.
+        let polled = poll_live_accounts_once(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "publishable-key",
+            "",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            polled.is_ok(),
+            "a body-phase stall must be retried like any other timeout, got {polled:?}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "expected two retries inside the tick"
+        );
+        server.abort();
+    }
+
+    /// The attempt sequence must fit inside its tick with no exception: overrunning would stretch
+    /// the effective cadence, which is itself what marks the snapshot stale. `interval_secs.max(1)`
+    /// in the poller makes 1 s the smallest interval this can be asked about.
+    #[test]
+    fn attempt_sequence_fits_inside_the_tick() {
+        for secs in [1_u64, 2, 3, 5, 30, 120] {
+            let interval = Duration::from_secs(secs);
+            let (attempts, per_request) = live_accounts_attempt_plan(interval);
+            let backoffs = LIVE_ACCOUNTS_RETRY_BACKOFF.saturating_mul(attempts.saturating_sub(1));
+            // Every request in every attempt timing out is the worst the tick can cost.
+            let worst_case = per_request
+                .saturating_mul(LIVE_ACCOUNTS_REQUESTS_PER_ATTEMPT)
+                .saturating_mul(attempts)
+                + backoffs;
+            assert!(
+                worst_case <= interval,
+                "interval {secs}s: worst case {worst_case:?} exceeds the tick"
+            );
+            assert!(per_request >= LIVE_ACCOUNTS_MIN_REQUEST_TIMEOUT);
+            assert!((1..=LIVE_ACCOUNTS_POLL_ATTEMPTS).contains(&attempts));
+        }
+    }
+
+    /// The production cadence must still buy the full retry budget; a short interval may not.
+    #[test]
+    fn the_production_interval_affords_every_attempt() {
+        let (attempts, _) = live_accounts_attempt_plan(Duration::from_secs(
+            crate::config_poller::CONFIG_POLL_INTERVAL_SECS,
+        ));
+        assert_eq!(attempts, LIVE_ACCOUNTS_POLL_ATTEMPTS);
+    }
+
+    /// Only gateway/transport failures are worth another attempt inside the tick.
+    #[test]
+    fn only_transient_errors_are_retried() {
+        assert!(live_accounts_error_is_transient(&SupabaseError::Status(
+            504
+        )));
+        assert!(live_accounts_error_is_transient(&SupabaseError::Status(
+            502
+        )));
+        assert!(live_accounts_error_is_transient(&SupabaseError::Status(
+            500
+        )));
+        assert!(!live_accounts_error_is_transient(&SupabaseError::Status(
+            401
+        )));
+        assert!(!live_accounts_error_is_transient(&SupabaseError::Status(
+            403
+        )));
+        assert!(!live_accounts_error_is_transient(&SupabaseError::Status(
+            404
+        )));
     }
 
     /// PASS: PostgREST authorization denial on the first protected account read produces the
