@@ -228,6 +228,16 @@ case "$1" in
     echo false > "$state/service.active"
     count=0; [[ ! -f "$state/stop-count" ]] || count=$(<"$state/stop-count")
     echo $((count + 1)) > "$state/stop-count"
+    # #618: production writes status.json once more on its way down, and that write can record
+    # `stale: true`. Model it so the post-stop preflight has something real to catch.
+    if [[ -f "$state/stale-status-on-stop" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]
+value=json.load(open(path))
+value["live"]["stale"]=True
+json.dump(value,open(path,"w"))' \
+        "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
     if [[ -f "$state/crash-after-stop" ]]; then
       rm -f "$state/crash-after-stop"
       exit 86
@@ -271,6 +281,12 @@ while (($#)); do
   esac
 done
 if [[ -z "$file" && -z "$sql" ]]; then stdin=$(dd bs=4096 2>/dev/null || true); fi
+# #618: count the legacy-contract proof directly, so a test can assert the post-stop remote check
+# never ran rather than inferring it from a missing receipt.
+if [[ "$stdin" == *rolbypassrls* ]]; then
+  count=0; [[ ! -f "$state/legacy-contract-count" ]] || count=$(<"$state/legacy-contract-count")
+  echo $((count + 1)) > "$state/legacy-contract-count"
+fi
 if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ $(<"$state/service.active") == false ]] || exit 98
   count=0; [[ ! -f "$state/archive-count" ]] || count=$(<"$state/archive-count")
@@ -496,12 +512,33 @@ setup_hermetic_financial_driver() {
   edit_bound_manifest_row "$root" harness_bundle_sha256 replace "$HERMETIC_BUNDLE_SHA256"
 }
 
+# #618: a running production service always has a status file, and the preflight reads it. The fake
+# `systemctl start` writes one; fixtures that begin with the service already active must too, or the
+# driver would be asked to preflight a service whose status simply does not exist.
+write_clean_status() {
+  local root=$1
+  mkdir -p "$root/prediction-markets/gen/g557"
+  python3 -c 'import datetime,json,os,sys
+root=sys.argv[1]; path=os.path.join(root,"prediction-markets/gen/g557/status.json")
+value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+"tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,"uptime_secs":1,
+"mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,"oldest_anchor_age_secs":0,
+"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+"source_health":{"poll_error_streak":0,"copy_admission_blocked":False,"ws_sink_poisoned":False,"poll_last_round_age_secs":0},
+"runtime_config":{"applied_hash":"b"*64,"rejected":None},
+"watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
+"supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
+"accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,"requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
+json.dump(value,open(path,"w"))' "$root"
+}
+
 setup_fixture() {
   local root=$1 service=$root/prediction-markets target=$root/target state=$root/test-state staged=$root/staged-557
   local journal_mode=${2:-delete}
   mkdir -p "$service/target/release" "$service/smoke-test" "$service/gen/g557" "$target" "$state" "$staged"
   : > "$root/.pe-deploy.lock"
   echo true > "$state/service.active"
+  write_clean_status "$root"
   printf '%s\n' old-binary > "$service/target/release/pe-service"
   printf '%s\n' 'bind = "127.0.0.1:8080"' > "$service/smoke-test/service.toml"
   printf '%s\n' 'PE_BIND=127.0.0.1:8080' > "$service/.env"
@@ -598,6 +635,30 @@ db.close()' \
         "$PE_ACTIVATION_TEST_ROOT/target/pe-service"
     fi
     echo '{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    ;;
+  *--financial-era=preflight*)
+    record_offline_environment preflight
+    # #618: exercise the real gate rather than bypassing it. Record every call so a test can assert
+    # which observation refused, then apply the live-status predicate to the actual status file.
+    [[ "$*" == *--financial-config-rows=* ]] || {
+      echo 'financial-era preflight requires the exported Financial15 rows' >&2
+      exit 1
+    }
+    count=0; [[ ! -f "$state/preflight-count" ]] || count=$(<"$state/preflight-count")
+    echo $((count + 1)) > "$state/preflight-count"
+    python3 -c 'import json,sys
+live=json.load(open(sys.argv[1]))["live"]
+bad = (live.get("stale") is not False
+       or live.get("pending_dispatch_seeds") != 0
+       or live.get("ready_dispatch_seeds") != 0
+       or any(a.get("requested_live_mode") != "off" or a.get("effective_live_mode") != "off"
+              or a.get("armed") is not False for a in live.get("accounts", [])))
+raise SystemExit(1 if bad else 0)' \
+      "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json" || {
+      echo 'financial-era live status is stale or has pending dispatch work' >&2
+      exit 1
+    }
+    echo '{"gates":["financial_manifest","financial_target_config","financial15_config_rows","live_status_posture"],"hot_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","live_accounts":1}'
     ;;
   *--financial-era=rollback-check*)
     record_offline_environment rollback-check
@@ -919,6 +980,9 @@ drive_to_verified() {
 try: print(json.load(open(sys.argv[1]))["state"])
 except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
     [[ "$state" == verified ]] && return 0
+    # `touch` deliberately, NOT write_clean_status: on an existing file touch preserves content,
+    # so a dirty status written by the fake `systemctl start` still refuses here. Replacing the
+    # document would hand these convergence tests passing evidence they never earned.
     if [[ "$state" == started ]]; then touch "$root/prediction-markets/gen/g557/status.json"; fi
     run_driver "$root" >/dev/null
   done
@@ -1852,6 +1916,95 @@ set -e
   fail "LD_AUDIT target assignment was not explicitly refused: $output"
 [[ ! -e "$root/pe-financial-era.json" && ! -e "$root/test-state/stop-count" ]] ||
   fail "LD_AUDIT target assignment crossed the pre-manifest mutation boundary"
+
+# Scenario FE-PREFLIGHT-65 — a status that is already dirty costs no downtime (#618).
+# Preconditions: `live.stale` is true before the driver runs.
+# PASS: the pre-stop preflight refuses; the service was never stopped and no stop intent was
+#       recorded, so production is exactly where it started.
+# FAIL: the driver stops the service to discover what it could have read first.
+# Scope: the harness rollback-check at driver:724 does not read status.json, so this isolates the
+# new pre-stop preflight. Protection against a status that goes bad AFTER that earlier check is
+# what FE-PREFLIGHT-66 proves.
+root=$TEST_TMP/preflight-dirty-before-stop
+setup_fixture "$root"
+python3 -c 'import json,sys
+path=sys.argv[1]; value=json.load(open(path)); value["live"]["stale"]=True
+json.dump(value,open(path,"w"))' "$root/prediction-markets/gen/g557/status.json"
+driver_args "$root"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'preflight refused before the stop'* ]] ||
+  fail "a dirty status did not refuse at the pre-stop preflight: $output"
+[[ ! -e "$root/test-state/stop-count" ]] ||
+  fail "the driver stopped production to learn what the preflight already knew"
+[[ $(<"$root/test-state/preflight-count") == 1 ]] ||
+  fail "expected exactly one preflight observation"
+python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+raise SystemExit(0 if not v.get("service_stop_intent") and not v.get("stop_invoked") else 1)' \
+  "$root/pe-financial-era.json" ||
+  fail "a pre-stop preflight refusal recorded a stop boundary"
+echo "PASS: FE-PREFLIGHT-65"
+
+# Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
+# Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
+#   it; the shutdown write then records `stale: true` — the #545 attempt-15 shape.
+# PASS: the post-stop preflight refuses immediately; the stop receipts stand, but no legacy contract
+#       check, no backup and no integrity check ever ran.
+# FAIL: the refusal waits until preparation, an hour of downtime later.
+root=$TEST_TMP/preflight-dirtied-by-shutdown
+setup_fixture "$root"
+: > "$root/test-state/stale-status-on-stop"
+driver_args "$root"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'preflight refused immediately after the stop'* ]] ||
+  fail "a shutdown-dirtied status was not caught by the post-stop preflight: $output"
+[[ "$output" == *'preflight pre-stop:'* ]] ||
+  fail "the pre-stop observation should have passed on a clean status"
+[[ $(<"$root/test-state/preflight-count") == 2 ]] ||
+  fail "expected a pre-stop and a post-stop observation"
+[[ $(<"$root/test-state/stop-count") == 1 ]] ||
+  fail "the service should have been stopped exactly once"
+compgen -G "$root/prediction-markets/financial-era-*-paper-state.db" > /dev/null &&
+  fail "a backup was started after the post-stop preflight refused"
+compgen -G "$root/prediction-markets/financial-era-*-paper-state.db.tmp.*" > /dev/null &&
+  fail "a partial backup was started after the post-stop preflight refused"
+[[ $(<"$root/test-state/legacy-contract-count") == 1 ]] ||
+  fail "the post-stop remote contract check ran despite the preflight refusal"
+python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+missing=[k for k in ("service_stop_intent","stop_invoked") if not v.get(k)]
+if missing: raise SystemExit("stop receipts were not preserved: %s" % missing)
+if v.get("legacy_contract_verified"): raise SystemExit("the remote contract check ran anyway")
+if v.get("backup"): raise SystemExit("a backup receipt was recorded")' \
+  "$root/pe-financial-era.json" ||
+  fail "the post-stop refusal left the wrong manifest state"
+echo "PASS: FE-PREFLIGHT-66"
+
+# Scenario FE-PREFLIGHT-67 — a stopped re-entry must not need a surviving rows export (#618).
+# Preconditions: the service is already inactive at entry, so neither preflight call applies. The
+#   rows export lives in a per-invocation temp dir that the EXIT trap removes, so an unconditional
+#   post-stop re-check would refuse this otherwise valid retry and leave production down.
+# PASS: the run converges with no preflight attempted at all.
+# FAIL: the driver demands evidence this invocation had no reason to produce.
+root=$TEST_TMP/preflight-inactive-entry
+setup_fixture "$root"
+echo false > "$root/test-state/service.active"
+driver_args "$root"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 0 ]] ||
+  fail "an initially inactive entry did not converge: $output"
+[[ ! -e "$root/test-state/preflight-count" ]] ||
+  fail "a preflight ran for an entry that never had a running service to ask"
+echo "PASS: FE-PREFLIGHT-67"
 
 # Scenario REHEARSAL-REVIEWED-BYTES-07
 # Preconditions: the target binary is copied, then preflight atomically replaces its original path.
@@ -3390,4 +3543,4 @@ cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
-echo "PASS: 64 scenario contracts, including WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 67 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"

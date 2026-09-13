@@ -230,14 +230,16 @@ async fn main() -> Result<()> {
             "prepare" => pe_service::qualification::FinancialEraCommand::Prepare,
             "start" => pe_service::qualification::FinancialEraCommand::Start,
             "rollback-check" => pe_service::qualification::FinancialEraCommand::RollbackCheck,
+            "preflight" => pe_service::qualification::FinancialEraCommand::Preflight,
             value => anyhow::bail!(
-                "--financial-era must be prepare, start, or rollback-check; got {value}"
+                "--financial-era must be prepare, start, rollback-check, or preflight; got {value}"
             ),
         };
         let manifest = PathBuf::from(required_arg_value(&args, "--activation-manifest")?);
         let financial_config_rows = match command {
             pe_service::qualification::FinancialEraCommand::Prepare
-            | pe_service::qualification::FinancialEraCommand::Start => Some(PathBuf::from(
+            | pe_service::qualification::FinancialEraCommand::Start
+            | pe_service::qualification::FinancialEraCommand::Preflight => Some(PathBuf::from(
                 required_arg_value(&args, "--financial-config-rows")?,
             )),
             pe_service::qualification::FinancialEraCommand::RollbackCheck => None,

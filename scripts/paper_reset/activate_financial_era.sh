@@ -870,6 +870,23 @@ case "$state" in
     if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); raise SystemExit(0 if v.get("stop_invoked") else 1)' "$MANIFEST"; then
       current_active=$(systemctl_active_state pe-service)
       verify_persisted_financial_guard unit_stop_policy "$current_active"
+      # #618: ask the gates that only a RUNNING service can answer while it is still running, so a
+      # refusal costs no downtime. Deliberately outside the stop-intent conditional: a resume that
+      # recorded the intent but never executed the stop still has a live service to ask.
+      # `verify_legacy_service_contract` is read-only (it queries the database, not the service) and
+      # still runs after the stop; this is an early warning, not a replacement. Both it and the rows
+      # export are `psql` calls, and both are free here because nothing is stopped yet.
+      preflight_ran=false
+      if [[ "$current_active" == true ]]; then
+        verify_legacy_service_contract
+        export_financial_config_rows
+        preflight_report=$(run_target_offline --financial-era=preflight \
+          --activation-manifest="$MANIFEST" \
+          --financial-config-rows="$financial_config_rows_file") ||
+          die "financial-era preflight refused before the stop; production was not touched"
+        printf 'financial-era preflight pre-stop: %s\n' "$preflight_report"
+        preflight_ran=true
+      fi
       if ! manifest_flag service_stop_intent; then
         was_active=$current_active
         manifest_patch_boundary service-stop-intent "{\"service_stop_intent\":true,\"service_was_active\":$was_active}"
@@ -881,6 +898,20 @@ case "$state" in
       fi
       [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service did not become inert"
       manifest_patch_boundary service-stopped "{\"stop_invoked\":true,\"service_was_active\":$was_active}"
+      # #618: the service wrote `status.json` once more on its way down, and that write can poison
+      # the very flag the pre-stop preflight just approved. Re-ask the same local gates NOW — before
+      # `verify_legacy_service_contract`'s remote psql (which has no deadline), before the backup,
+      # and before the ~34-minute integrity check — so a shutdown-caused refusal costs seconds
+      # instead of an hour. Guarded on the pre-stop preflight having run in THIS invocation: the
+      # rows export lives in a per-invocation temp dir that the EXIT trap removes, so an
+      # unconditional call would refuse a perfectly valid stopped re-entry for want of a file.
+      if [[ "$preflight_ran" == true ]]; then
+        preflight_report=$(run_target_offline --financial-era=preflight \
+          --activation-manifest="$MANIFEST" \
+          --financial-config-rows="$financial_config_rows_file") ||
+          die "financial-era preflight refused immediately after the stop; no backup was started"
+        printf 'financial-era preflight post-stop: %s\n' "$preflight_report"
+      fi
     fi
     [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert"
     verify_legacy_service_contract
