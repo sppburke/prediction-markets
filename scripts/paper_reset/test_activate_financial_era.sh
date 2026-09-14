@@ -2115,12 +2115,13 @@ if v.get("backup"): raise SystemExit("a backup receipt was recorded")' \
   fail "the post-stop refusal left the wrong manifest state"
 echo "PASS: FE-PREFLIGHT-66"
 
-# Scenario FE-PREFLIGHT-67 — a stopped re-entry must not need a surviving rows export (#618).
-# Preconditions: the service is already inactive at entry, so neither preflight call applies. The
-#   rows export lives in a per-invocation temp dir that the EXIT trap removes, so an unconditional
-#   post-stop re-check would refuse this otherwise valid retry and leave production down.
-# PASS: the run converges with no preflight attempted at all.
-# FAIL: the driver demands evidence this invocation had no reason to produce.
+# Scenario FE-PREFLIGHT-67 — an already-stopped entry is gated exactly like a forward one (#628).
+# Preconditions: the service is already inactive at entry, so the pre-stop arm never runs. Under
+#   #618 this invocation performed NO preflight at all and walked into the backup ungated; the rows
+#   export was the only reason, and it is idempotent, so it is recreated instead.
+# PASS: the run converges having performed exactly ONE preflight — the post-stop one — before the
+#   backup, and without stopping a service that was already inactive.
+# FAIL: no preflight (the #618 hole), or a stop of an already-inert service.
 root=$TEST_TMP/preflight-inactive-entry
 setup_fixture "$root"
 echo false > "$root/test-state/service.active"
@@ -2131,8 +2132,10 @@ status=$?
 set -e
 [[ $status -eq 0 ]] ||
   fail "an initially inactive entry did not converge: $output"
-[[ ! -e "$root/test-state/preflight-count" ]] ||
-  fail "a preflight ran for an entry that never had a running service to ask"
+[[ $(<"$root/test-state/preflight-count") == 1 ]] ||
+  fail "an already-stopped entry must carry exactly one current preflight before the backup"
+[[ ! -e "$root/test-state/stop-count" ]] ||
+  fail "the driver stopped a service that was already inert"
 echo "PASS: FE-PREFLIGHT-67"
 
 # Scenario REHEARSAL-REVIEWED-BYTES-07

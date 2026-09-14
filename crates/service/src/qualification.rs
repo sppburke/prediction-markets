@@ -4963,14 +4963,30 @@ pub fn run_financial_era(
         }
         FinancialEraCommand::RollbackCheck => rollback_check_financial_era(&manifest, config),
         FinancialEraCommand::Preflight => {
-            // Exactly four gate groups, every one of them reading a local file: the manifest
-            // (already validated above), the staged target configuration, the exported Financial15
-            // rows, and `status.json`. No database, no log scan — so this stays a seconds-long
-            // answer even when it runs with the service already stopped.
+            // Five gate groups: the manifest (already validated above), the staged target
+            // configuration, the exported Financial15 rows, `status.json`, and the membership
+            // proof. Four read a local file; the fifth reads the paper state. No log scan, so this
+            // stays a short answer even when it runs with the service already stopped.
             validate_financial_target_config(config)?;
             let config_rows = read_financial_config_rows(financial_config_rows_path)?;
             let hot_config_hash = derive_hot_config_hash(&config_rows, config)?;
             let accounts = verify_live_status_posture(&config.status_path)?;
+            // #624: this is the gate that cost 100 minutes of downtime. `prepare` evaluates the
+            // membership proof roughly 95 minutes AFTER the stop, so a single member missing its
+            // `position_validations` row was discovered with production already down and the
+            // window unrecoverable. It is a local read, so it belongs here with the others.
+            //
+            // The opener is the one `prepare` itself uses: read-only, `query_only`, a 5s busy
+            // timeout, and it admits an unmigrated schema. That matters because the PRE-stop
+            // preflight runs while the live service still holds the database; WAL allows the
+            // concurrent reader.
+            //
+            // This shrinks the exposure rather than removing it: a stopped service commits no
+            // activity, so validations freeze at the stop, and the residual race between a passing
+            // preflight and `prepare` collapses from ~100 minutes to the seconds in between.
+            let state =
+                PaperStateDb::open_read_only_allowing_unmigrated(&manifest.paths.paper_state)?;
+            derive_membership_proofs_hash(&state, &manifest.membership)?;
             // Name what was proven. The driver records this, so a later reader can tell which gates
             // this observation covered and which ones only the post-stop preparation runs.
             Ok(serde_json::to_string(&serde_json::json!({
@@ -4979,6 +4995,7 @@ pub fn run_financial_era(
                     "financial_target_config",
                     "financial15_config_rows",
                     "live_status_posture",
+                    "membership_proof",
                 ],
                 "hot_config_hash": hot_config_hash,
                 "live_accounts": accounts.len(),

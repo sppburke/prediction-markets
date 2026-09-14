@@ -3206,6 +3206,8 @@ mod anchor_replay_tests {
 
 #[cfg(test)]
 mod financial_boot_gate_tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use rust_decimal_macros::dec;
 
