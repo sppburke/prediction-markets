@@ -325,9 +325,16 @@ raise SystemExit(0 if durable else 1)' "$MANIFEST"
 atomic_manifest_json() {
   local json=$1 boundary=$2
   maybe_crash "before-manifest-$boundary"
-  python3 -c 'import json,os,sys
-path,payload=sys.argv[1:]
-value=json.loads(payload)
+  # #626: the payload arrives on STDIN, never argv. Linux caps ONE argv element at MAX_ARG_STRLEN
+  # (32 pages = 131,072 bytes), independent of the much larger ARG_MAX, and a financial-era
+  # preparation carries the full membership proof binding -- 21,711,795 bytes for a 26-wallet
+  # membership. As an argument that is E2BIG; the activation died here right after the expensive
+  # post-stop prepare had already succeeded. A shell variable has no such limit and `printf` is a
+  # builtin, so nothing is exec'd with the payload. The atomic replace and both fsyncs below are
+  # unchanged, and the crash boundaries stay outside this call exactly as before.
+  printf '%s' "$json" | python3 -c 'import json,os,sys
+path=sys.argv[1]
+value=json.loads(sys.stdin.read())
 parent=os.path.dirname(path) or "."
 tmp=os.path.join(parent, ".pe-activation.tmp.%d" % os.getpid())
 with open(tmp, "w", encoding="utf-8") as handle:
@@ -339,7 +346,7 @@ os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 directory=os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 try: os.fsync(directory)
-finally: os.close(directory)' "$MANIFEST" "$json"
+finally: os.close(directory)' "$MANIFEST"
   maybe_crash "$boundary"
   maybe_crash "after-manifest-$boundary"
 }
@@ -360,11 +367,12 @@ print(json.dumps(value, sort_keys=True, separators=(",",":")))' \
 
 manifest_patch_boundary() {
   local boundary=$1 patch=$2 json
-  json=$(python3 -c 'import json,sys
-path,patch=sys.argv[1:]
+  # #626: patch on stdin, manifest by path. Same argv ceiling as `atomic_manifest_json`.
+  json=$(printf '%s' "$patch" | python3 -c 'import json,sys
+path=sys.argv[1]
 value=json.load(open(path, encoding="utf-8"))
-value.update(json.loads(patch))
-print(json.dumps(value, sort_keys=True, separators=(",",":")))' "$MANIFEST" "$patch")
+value.update(json.loads(sys.stdin.read()))
+print(json.dumps(value, sort_keys=True, separators=(",",":")))' "$MANIFEST")
   atomic_manifest_json "$json" "$boundary"
 }
 

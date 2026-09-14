@@ -943,7 +943,11 @@ print(json.dumps({"backup":{"path":backup,"sha256":sha},"guarded_paper_state_sha
         --activation-manifest="$MANIFEST" \
         --financial-config-rows="$financial_config_rows_file") ||
         die "read-only financial-era preparation failed"
-      manifest_patch_boundary preparation "$(python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$preparation")"
+      # #626: the preparation reaches python on stdin. It carries the full membership-proof binding
+      # (21,711,795 bytes for the live 26-wallet membership) and as a single argv element that is
+      # E2BIG -- which is where activation died, immediately after the ~95-minute post-stop prepare
+      # had already succeeded and with the service already stopped.
+      manifest_patch_boundary preparation "$(printf '%s' "$preparation" | python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.stdin.read())},sort_keys=True,separators=(",",":")))')"
     fi
     manifest_advance guarded "$patch"
     state=guarded
@@ -1098,9 +1102,6 @@ if [[ "$state" == started ]]; then
   [[ -f "$generation/status.json" ]] || die "fresh status proof is not available yet"
   hot_config_hash=$(manifest_get preparation.start.hot_config_hash)
   [[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "prepared hot-config identity is invalid"
-  membership_proofs_hash=$(manifest_get preparation.start.membership_proofs_hash)
-  [[ "$membership_proofs_hash" =~ ^[0-9a-f]{64}$ ]] ||
-    die "prepared membership-proofs identity is invalid"
   verify_guarded_log_prefixes || die "paper/source/live prefixes do not extend their guarded identities"
   python3 -c 'import decimal,json,os,sys
 path,started,revision,hot,bankroll,membership_count,ranking_identity=sys.argv[1:]

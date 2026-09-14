@@ -2013,57 +2013,43 @@ raise SystemExit(0 if not v.get("service_stop_intent") and not v.get("stop_invok
   fail "a pre-stop preflight refusal recorded a stop boundary"
 echo "PASS: FE-PREFLIGHT-65"
 
-# Scenario FE-SEAM-68 — the real preparation shape cannot cross the driver's own plumbing (#626).
+# Scenario FE-SEAM-68 — a production-shaped preparation now crosses the driver plumbing (#626).
 # Preconditions: the prepare shim emits the PRODUCTION shape — a serialized MembershipProofBinding
-#       carrying each member's proof documents — instead of the miniature fixture the other
-#       scenarios use. Sizes come from the measured live generation (mean validation proof
-#       341,056 B); the live 26-member binding was 21,711,795 B against a 131,072-byte
-#       MAX_ARG_STRLEN.
-# PASS (today): the driver cannot record the preparation, because it passes the whole payload as a
-#       single argv element at activate_financial_era.sh:945. This scenario PINS that failure. It is
-#       the canary for the seam no test covered: the shell suite stubs the Rust side and the AC10
-#       rehearsal never drives this script, so nothing ever fed real output to the real driver.
-# FAIL: the driver silently accepts a production-shaped preparation — meaning either the transport
-#       was fixed (then flip this scenario to assert convergence AND make the production shape the
-#       default above) or the shim stopped emitting the real shape.
-# Scope: this pins transport only. #625 (the bare-64-hex regex at :1081) and #627 (the batch:<id>
-# projection token at :1101) sit further along the same path and need their own coverage once the
-# payload can reach them.
+#       carrying each member proof document — instead of the miniature fixture the other scenarios
+#       use. Sizes come from the measured live generation (mean validation proof 341,056 B); the
+#       live 26-member binding was 21,711,795 B against a 131,072-byte MAX_ARG_STRLEN.
+# PASS: the driver RECORDS the preparation. Before the stdin transport it could not: the whole
+#       payload went as one argv element and failed E2BIG at activate_financial_era.sh:945 —
+#       immediately after the ~95-minute post-stop prepare had already succeeded, with production
+#       already stopped and rollback forbidden.
+# FAIL: the preparation is unrecorded, or the run dies with "Argument list too long" — the
+#       transport regressed to argv.
+# Scope: transport only. This scenario says nothing about proof or projection content.
 root=$TEST_TMP/seam-production-shaped-preparation
 setup_fixture "$root"
 driver_args "$root"
 set +e
 printf '3 341056\n' > "$root/test-state/production-shaped-preparation"
 output=$(drive_to_verified "$root" 2>&1)
-status=$?
 set -e
-[[ $status -ne 0 ]] ||
-  fail "a production-shaped preparation converged; the transport limit or the shim shape changed"
-state=$(python3 -c 'import json,sys
-try: print(json.load(open(sys.argv[1]))["state"])
-except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
-[[ "$state" != verified ]] ||
-  fail "driver reached verified with a production-shaped preparation: seam closed, update this test"
-# Not merely "it failed": assert it failed for the TRANSPORT reason. Verified in isolation — the
-# exact transform at activate_financial_era.sh:945 on a 2,048,811-byte preparation returns rc=126
-# with "Argument list too long". Without this the scenario would also pass on a malformed payload,
-# which is precisely the vacuous-fixture trap that hid this defect in the first place.
+[[ "$output" != *'Argument list too long'* ]] ||
+  fail "a production-shaped preparation still hit the argv limit; the transport regressed: $output"
 recorded=$(python3 -c 'import json,sys
 try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
 except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
-[[ "$recorded" == "no" ]] ||
-  fail "preparation recorded ($recorded) despite exceeding the argv limit: transport may be fixed"
-# Require the TRANSPORT diagnostic exactly. `read-only financial-era preparation failed` is the
-# driver's generic response to any unsuccessful prepare (activate_financial_era.sh:944) and fires
-# BEFORE the argv transform at :945, so accepting it would let a crashed generator — which emits no
-# payload at all — keep this canary green. That is the precise vacuous pass this file exists to
-# prevent, and the first version of this scenario had it.
-[[ "$output" == *'Argument list too long'* ]] ||
-  fail "production-shaped preparation did not fail at the argv transport, so this scenario proves \
-nothing. Driver output was: $output"
+[[ "$recorded" == "yes" ]] ||
+  fail "a production-shaped preparation was not recorded ($recorded); the transport does not carry \
+the real payload"
+# Prove it carried the WHOLE payload, not a truncated one: the recorded binding must still be at
+# least the generated size. A transport that silently truncated would satisfy "recorded".
+carried=$(python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))["preparation"]
+print(len(json.dumps(v,separators=(",",":"))))' "$root/pe-financial-era.json")
+[[ "$carried" -ge 1000000 ]] ||
+  fail "the recorded preparation is only $carried bytes; the payload was truncated in transit"
 
-# Control: the SAME generator at a size UNDER the limit must produce a preparation the driver
-# records. Without this, a generator that emits nothing would satisfy every assertion above.
+# Control: the SAME generator at a size UNDER the old limit must also record, so the oversized case
+# is evidence about SIZE rather than about the generator working at all.
 control=$TEST_TMP/seam-undersized-control
 setup_fixture "$control"
 driver_args "$control"
@@ -2073,9 +2059,9 @@ control_recorded=$(python3 -c 'import json,sys
 try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
 except FileNotFoundError: print("absent")' "$control/pe-financial-era.json")
 [[ "$control_recorded" == "yes" ]] ||
-  fail "the seam generator cannot produce a recordable preparation even under the argv limit \
-(got $control_recorded), so the oversized case proves nothing about SIZE"
-echo "PASS: FE-SEAM-68 (pinned: oversized stops at state=$state unrecorded via argv; undersized records)"
+  fail "the seam generator cannot produce a recordable preparation even when small (got \
+$control_recorded), so the oversized case proves nothing about SIZE"
+echo "PASS: FE-SEAM-68 (production-shaped preparation recorded, $carried bytes carried via stdin)"
 
 # Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
 # Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
