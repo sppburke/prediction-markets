@@ -10697,19 +10697,21 @@ mod tests {
     /// PASS: the preflight succeeds anyway.
     /// FAIL: it touched something outside its four groups.
     #[test]
-    fn preflight_ignores_every_file_outside_its_four_gate_groups() {
+    fn preflight_reads_the_paper_state_but_never_scans_a_log() {
         let temp = tempfile::tempdir().unwrap();
         let (manifest, config, _) = preflight_fixture(temp.path());
+        // #628: the preflight gained a fifth gate -- the membership proof -- so it now reads the
+        // paper state. What must STILL hold is that it scans no LOG: that is what keeps it a
+        // seconds-long answer, and what lets it run before the stop instead of 95 minutes after.
         for forbidden in [
             &manifest.paths.paper_log,
             &manifest.paths.source_log,
             &manifest.paths.live_journal,
-            &manifest.paths.paper_state,
         ] {
             fs::remove_file(forbidden).unwrap();
             assert!(!forbidden.exists());
         }
-        let report = run_preflight(temp.path(), &config).expect("preflight must not read those");
+        let report = run_preflight(temp.path(), &config).expect("preflight must not read the logs");
         let report: serde_json::Value = serde_json::from_str(&report).unwrap();
         assert_eq!(
             report["gates"],
@@ -10718,12 +10720,22 @@ mod tests {
                 "financial_target_config",
                 "financial15_config_rows",
                 "live_status_posture",
+                "membership_proof",
             ])
         );
         assert_eq!(report["live_accounts"], 1);
 
-        // ...and prepare, which does read them, refuses on the same fixture. Without this the test
-        // above could pass simply because the files were never load-bearing.
+        // The new gate must be load-bearing, not merely advertised: remove the paper state and the
+        // preflight has to refuse. Naming it in `gates` while ignoring it would be the exact
+        // vacuous pass that let a missing position_validations row cost 100 minutes of downtime.
+        fs::remove_file(&manifest.paths.paper_state).unwrap();
+        assert!(
+            run_preflight(temp.path(), &config).is_err(),
+            "the membership-proof gate must refuse when the paper state is unreadable"
+        );
+
+        // ...and prepare, which reads the logs too, refuses on the same fixture. Without this the
+        // assertion above could pass simply because the files were never load-bearing.
         assert!(
             run_financial_era(
                 FinancialEraCommand::Prepare,
@@ -10732,7 +10744,7 @@ mod tests {
                 Some(&temp.path().join("rows.json")),
             )
             .is_err(),
-            "prepare must still depend on the files the preflight ignores"
+            "prepare must still depend on the logs the preflight ignores"
         );
     }
 
