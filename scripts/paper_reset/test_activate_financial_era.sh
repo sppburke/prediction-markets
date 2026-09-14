@@ -252,10 +252,10 @@ root=sys.argv[1]; path=os.path.join(root,"prediction-markets/gen/g557/status.jso
 value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
 "tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,"uptime_secs":1,
 "mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,"oldest_anchor_age_secs":0,
-"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":100,
 "source_health":{"poll_error_streak":0,"copy_admission_blocked":False,"ws_sink_poisoned":False,"poll_last_round_age_secs":0},
 "runtime_config":{"applied_hash":"b"*64,"rejected":None},
-"watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
+"watchlist_projection":{"applied":{"token":"2026-09-14T18:36:09.442332+00:00","count":1,"time":"now"},"last_error":None},
 "supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
 "accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,"requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
 json.dump(value,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT"
@@ -535,10 +535,10 @@ root=sys.argv[1]; path=os.path.join(root,"prediction-markets/gen/g557/status.jso
 value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
 "tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,"uptime_secs":1,
 "mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,"oldest_anchor_age_secs":0,
-"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":100,
 "source_health":{"poll_error_streak":0,"copy_admission_blocked":False,"ws_sink_poisoned":False,"poll_last_round_age_secs":0},
 "runtime_config":{"applied_hash":"b"*64,"rejected":None},
-"watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
+"watchlist_projection":{"applied":{"token":"2026-09-14T18:36:09.442332+00:00","count":1,"time":"now"},"last_error":None},
 "supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
 "accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,"requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
 json.dump(value,open(path,"w"))' "$root"
