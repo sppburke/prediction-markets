@@ -9,25 +9,19 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# The gate used to be one serial job. Measured on the 2026-09-14 main run (61 min end to end):
+# the Rust acceptance gate was 12.5 min, the Postgres scenarios 5.6 min, and a single serial
+# `run:` block of shell/python drift guards 40.9 min -- of which two scenario suites
+# (test_activate_generation.sh and test_activate_financial_era.sh) were ~16 min each, because
+# both replay the real activation driver once per crash boundary.
+#
+# Splitting by owner turns sum() into max(). The two activation suites are already separate
+# scripts, so no sharding logic is needed. Neither suite invokes cargo, so those jobs skip the
+# toolchain, the cargo tools, the build cache and the disk reclaim entirely.
 jobs:
-  gate:
-    name: rustc 1.95.0 acceptance gate
+  contracts:
+    name: agent workflow contracts
     runs-on: ubuntu-latest
-    # Postgres for the issue #397 authoritative-RPC parity + concurrency test
-    # (crates/service/tests/pg_parity.rs). The main nextest gate self-skips that test
-    # (PE_TEST_PG_URL unset); the dedicated step below loads the schema and runs it for real.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,6 +38,27 @@ jobs:
           bash scripts/check_skill_parity.sh --sync
           git diff --exit-code
           python3 scripts/check_agent_workflow_contract.py
+
+      - name: Shell syntax
+        run: |
+          # `bash -n a.sh b.sh` checks only the FIRST file and treats the rest as positional
+          # arguments, so a syntax error in any later script passed silently.
+          for script in scripts/deploy/*.sh scripts/paper_reset/*.sh; do
+            bash -n "$script" || exit 1
+          done
+
+  rust:
+    name: rustc 1.95.0 acceptance gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       # The Rust target/ plus the (#397) redundant `pe-service --features scenario` re-link can
       # exhaust the runner root fs; that surfaces as `ld ... signal 7 [Bus error]` while linking
@@ -68,7 +83,12 @@ jobs:
         with:
           tool: cargo-nextest,cargo-deny,cargo-audit
 
+      # One shared cache for both Rust-building jobs. `rust` is the sole writer so the two
+      # jobs cannot race to save; `postgres` restores it read-only and therefore does not
+      # cold-build pe-service on every run the way a per-job cache key would.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate
 
       - name: rustc version contains 1.95.0
         run: rustc --version | grep -F '1.95.0'
@@ -90,13 +110,24 @@ jobs:
 
       - run: cargo metadata --locked --format-version 1 > /dev/null
 
+  drift:
+    name: Python drift-guard tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python analytics deps
+        run: python3 -m pip install -r scripts/requirements.txt
+
       - name: Python drift-guard tests
         run: |
-          # `bash -n a.sh b.sh` checks only the FIRST file and treats the rest as positional
-          # arguments, so a syntax error in any later script passed silently.
-          for script in scripts/deploy/*.sh scripts/paper_reset/*.sh; do
-            bash -n "$script" || exit 1
-          done
           bash scripts/deploy/rehearsal545.sh --dry-run \
             0000000000000000000000000000000000000000 >/dev/null
           python3 scripts/check_sql_unfiltered_dml.py
@@ -123,22 +154,99 @@ jobs:
           python3 scripts/test_ranker_bench_composition.py
           python3 scripts/test_ranker_clv_source_comparison.py
           python3 scripts/verify_bakeoff_components.py
-          bash scripts/deploy/test_activate_generation.sh
-          bash scripts/paper_reset/test_activate_financial_era.sh
+
+  activation-generation:
+    name: generation activation scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: bash scripts/deploy/test_activate_generation.sh
+
+  activation-financial:
+    name: financial-era activation scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: bash scripts/paper_reset/test_activate_financial_era.sh
+
+  postgres:
+    name: Postgres scenarios
+    runs-on: ubuntu-latest
+    # Postgres for the issue #397 authoritative-RPC parity + concurrency test
+    # (crates/service/tests/pg_parity.rs). The main nextest gate self-skips that test
+    # (PE_TEST_PG_URL unset); the dedicated steps below load the schema and run it for real.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+          df -h /
+
+      - name: Install pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate
+          save-if: "false"
 
       - name: Legacy-to-financial PostgreSQL archive/restore scenario (issue #545)
         env:
           PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
           PG_LEGACY_URL: postgres://postgres:postgres@localhost:5432/pe_legacy_545
-        # Keep this in the workspace gate after the Rust build/test commands: the scenario's
-        # `cargo run -p pe-service --all-features --bin pe-service -- ...` invocations are incremental.
         run: bash scripts/deploy/test_legacy_to_financial_pg.sh
 
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
       # Load both Supabase schema files into the Postgres service (creating the Supabase
       # roles the grants reference), then run the pg_parity test against the real PL/pgSQL.
       # This is the only check of the live SQL execution + the B-E self-referencing-UPDATE
-      # lost-update safety; the workspace nextest above self-skips it (no PE_TEST_PG_URL).
+      # lost-update safety; the workspace nextest in the `rust` job self-skips it (no PE_TEST_PG_URL).
       - name: Load Supabase schema into Postgres
         env:
           PGURL: postgres://postgres:postgres@localhost:5432/postgres
