@@ -533,7 +533,12 @@ json.dump(value,open(path,"w"))' "$root"
 }
 
 setup_fixture() {
-  local root=$1 service=$root/prediction-markets target=$root/target state=$root/test-state staged=$root/staged-557
+  # `root` MUST be assigned in its own `local` statement: bash expands every word on a `local` line
+  # before the assignments take effect, so declaring the derived paths alongside it silently resolves
+  # `$root` from the CALLER's global of that name. Invisible while every scenario does
+  # `root=X; setup_fixture "$root"`, and wrong the moment a caller uses any other variable.
+  local root=$1
+  local service=$root/prediction-markets target=$root/target state=$root/test-state staged=$root/staged-557
   local journal_mode=${2:-delete}
   mkdir -p "$service/target/release" "$service/smoke-test" "$service/gen/g557" "$target" "$state" "$staged"
   : > "$root/.pe-deploy.lock"
@@ -603,6 +608,54 @@ case "$*" in
       "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/live_journal.log"; then
       echo 'financial-era prepare found an unmatched Approved admission' >&2
       exit 1
+    fi
+    # The default below is a miniature, production-UNLIKE preparation: a 64-hex
+    # `membership_proofs_hash` and a one-wallet membership. The real command emits a serialized
+    # `MembershipProofBinding` carrying every member's anchor and validation proof documents; on the
+    # live generation that measured 21,711,795 bytes for 26 members. Fixtures that model the small
+    # shape are why the whole `guarded -> started -> verified` path could stay broken under a green
+    # suite (#628). PE_SEAM_PRODUCTION_SHAPED_PREPARATION=1 emits the real shape instead, at a size
+    # driven by the measured mean validation proof document (341,056 B).
+    # A marker file, NOT an env var: run_target_offline runs the target under `env -i` with a
+    # four-name allowlist (activate_financial_era.sh:373-377), so an exported toggle never reaches
+    # this shim. Marker files under $state are the established mechanism (see crash-after-* above).
+    seam_marker=${PE_ACTIVATION_TEST_ROOT:-}/test-state/production-shaped-preparation
+    if [[ -f "$seam_marker" ]]; then
+      python3 -c 'import json,sys
+# Fail loudly rather than emitting nothing: a generator that dies silently would make the driver
+# report its GENERIC prepare failure, which a permissive scenario would misread as the transport
+# defect. Emitting no payload must never look like emitting an oversized one.
+count, target = int(sys.argv[1]), int(sys.argv[2])
+assert count > 0 and target > 0, "seam marker must carry positive <members> <bytes>"
+members = ["0x%040x" % (0x545 + i) for i in range(count)]
+overhead = len(json.dumps({"tag": "proof", "pad": ""}))
+doc = json.dumps({"tag": "proof", "pad": "a" * max(target - overhead, 0)})
+assert len(doc) == max(target, overhead), "document is not the requested serialized size"
+proofs = [{
+    "wallet": m,
+    "history": {"complete": True, "proof_json": "{\"history\":true}", "updated_at_unix": 1},
+    "coverage": {"activity_cutoff_unix": 1, "coverage_generation": 0, "reanchor_required": False,
+                 "anchor_seq": 1, "anchored_at_unix": 1},
+    "anchor": {"anchor_seq": 1, "anchored_at_unix": 1, "activity_cutoff_unix": 1,
+               "balances_json": "[]", "ledger_hash_after": "ledger", "proof_json": doc},
+    "validation": {"ledger_hash": "ledger", "positions_proof_hash": "positions",
+                   "activity_bounds_json": "[]", "source_log_generation": "g557",
+                   "proof_json": doc, "recorded_at_unix": 1},
+} for m in members]
+binding = json.dumps({"version": 1, "proof_hash": "c" * 64,
+                      "manifest": {"membership": members, "proofs": proofs}},
+                     separators=(",", ":"))
+zero = "0" * 64
+prefix = {"physical_tail": 1, "last_sequence": None, "last_hash": zero}
+print(json.dumps({"start": {"starting_bankroll": 10000000000,
+    "paper_prefix": prefix, "source_prefix": prefix, "live_prefix": prefix,
+    "artifact_blake3": "a" * 64, "static_config_hash": "b" * 64, "hot_config_hash": "b" * 64,
+    "generation": "g557", "activation_id": "act-545", "ranking_batch_id": 545,
+    "membership": members, "membership_proofs_hash": binding,
+    "schema_version": 3, "parser_version": 1, "financial_semantic_version": 1},
+    "expected_receipt": {"sequence": 1, "this_hash": "c" * 64}}, separators=(",", ":")))' \
+        $(cat "$seam_marker")
+      exit 0
     fi
     cat <<'JSON'
 {"start":{"starting_bankroll":10000000000,"paper_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"source_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"live_prefix":{"physical_tail":1,"last_sequence":null,"last_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"artifact_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","static_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","hot_config_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"g557","activation_id":"act-545","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"],"membership_proofs_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","schema_version":3,"parser_version":1,"financial_semantic_version":1},"expected_receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
@@ -1947,6 +2000,70 @@ raise SystemExit(0 if not v.get("service_stop_intent") and not v.get("stop_invok
   "$root/pe-financial-era.json" ||
   fail "a pre-stop preflight refusal recorded a stop boundary"
 echo "PASS: FE-PREFLIGHT-65"
+
+# Scenario FE-SEAM-68 — the real preparation shape cannot cross the driver's own plumbing (#626).
+# Preconditions: the prepare shim emits the PRODUCTION shape — a serialized MembershipProofBinding
+#       carrying each member's proof documents — instead of the miniature fixture the other
+#       scenarios use. Sizes come from the measured live generation (mean validation proof
+#       341,056 B); the live 26-member binding was 21,711,795 B against a 131,072-byte
+#       MAX_ARG_STRLEN.
+# PASS (today): the driver cannot record the preparation, because it passes the whole payload as a
+#       single argv element at activate_financial_era.sh:945. This scenario PINS that failure. It is
+#       the canary for the seam no test covered: the shell suite stubs the Rust side and the AC10
+#       rehearsal never drives this script, so nothing ever fed real output to the real driver.
+# FAIL: the driver silently accepts a production-shaped preparation — meaning either the transport
+#       was fixed (then flip this scenario to assert convergence AND make the production shape the
+#       default above) or the shim stopped emitting the real shape.
+# Scope: this pins transport only. #625 (the bare-64-hex regex at :1081) and #627 (the batch:<id>
+# projection token at :1101) sit further along the same path and need their own coverage once the
+# payload can reach them.
+root=$TEST_TMP/seam-production-shaped-preparation
+setup_fixture "$root"
+driver_args "$root"
+set +e
+printf '3 341056\n' > "$root/test-state/production-shaped-preparation"
+output=$(drive_to_verified "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 ]] ||
+  fail "a production-shaped preparation converged; the transport limit or the shim shape changed"
+state=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["state"])
+except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
+[[ "$state" != verified ]] ||
+  fail "driver reached verified with a production-shaped preparation: seam closed, update this test"
+# Not merely "it failed": assert it failed for the TRANSPORT reason. Verified in isolation — the
+# exact transform at activate_financial_era.sh:945 on a 2,048,811-byte preparation returns rc=126
+# with "Argument list too long". Without this the scenario would also pass on a malformed payload,
+# which is precisely the vacuous-fixture trap that hid this defect in the first place.
+recorded=$(python3 -c 'import json,sys
+try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
+except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
+[[ "$recorded" == "no" ]] ||
+  fail "preparation recorded ($recorded) despite exceeding the argv limit: transport may be fixed"
+# Require the TRANSPORT diagnostic exactly. `read-only financial-era preparation failed` is the
+# driver's generic response to any unsuccessful prepare (activate_financial_era.sh:944) and fires
+# BEFORE the argv transform at :945, so accepting it would let a crashed generator — which emits no
+# payload at all — keep this canary green. That is the precise vacuous pass this file exists to
+# prevent, and the first version of this scenario had it.
+[[ "$output" == *'Argument list too long'* ]] ||
+  fail "production-shaped preparation did not fail at the argv transport, so this scenario proves \
+nothing. Driver output was: $output"
+
+# Control: the SAME generator at a size UNDER the limit must produce a preparation the driver
+# records. Without this, a generator that emits nothing would satisfy every assertion above.
+control=$TEST_TMP/seam-undersized-control
+setup_fixture "$control"
+driver_args "$control"
+printf '1 1024\n' > "$control/test-state/production-shaped-preparation"
+drive_to_verified "$control" >/dev/null 2>&1 || true
+control_recorded=$(python3 -c 'import json,sys
+try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
+except FileNotFoundError: print("absent")' "$control/pe-financial-era.json")
+[[ "$control_recorded" == "yes" ]] ||
+  fail "the seam generator cannot produce a recordable preparation even under the argv limit \
+(got $control_recorded), so the oversized case proves nothing about SIZE"
+echo "PASS: FE-SEAM-68 (pinned: oversized stops at state=$state unrecorded via argv; undersized records)"
 
 # Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
 # Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
@@ -3543,4 +3660,4 @@ cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
-echo "PASS: 67 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 68 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
