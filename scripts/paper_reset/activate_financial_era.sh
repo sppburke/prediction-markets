@@ -1000,6 +1000,20 @@ if [[ "$state" == guarded ]]; then
     psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql"
     manifest_patch_boundary live-schema-installed '{"live_schema_installed":true}'
   fi
+  # #628: initial authority seeding and RESUME are different states. The pristine assertions below
+  # -- `last_prepared_seq` null and the untouched fresh bankroll -- are exactly right the FIRST
+  # time, because nothing has traded yet. But the service is started further down, and a crash
+  # after that (`--simulate-crash-after before-manifest-started`, or any real interruption) leaves
+  # a `guarded` manifest whose retry now meets an era that has legitimately traded. `seed_financial_start`
+  # itself copes -- it returns `existing` for a matching Start and never resets progress
+  # (scripts/supabase_paper_state_schema.sql) -- so the DRIVER's pristine read-back is the only
+  # thing refusing, and it refuses forever: the activation can never roll forward even though the
+  # correct service is running normally. On resume, re-prove Start IDENTITY and accept the progress.
+  if manifest_flag authority_start_seeded; then
+    authority_start_mode=resume
+  else
+    authority_start_mode=initial
+  fi
   authority_start=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select seed_financial_start($start_seq,'$start_hash');
      select json_build_object('bankroll',(select bankroll_str from paper_bankroll where id=0),
@@ -1012,11 +1026,16 @@ lines=[line for line in sys.argv[1].splitlines() if line]
 if len(lines) != 2: raise SystemExit("authority Start proof must contain seed and read-back rows")
 seed,row=map(json.loads,lines)
 if seed.get("outcome") not in {"applied","existing"}: raise SystemExit("authority Start seed conflicted")
-sequence=int(sys.argv[2]); digest=sys.argv[3]
+sequence=int(sys.argv[2]); digest=sys.argv[3]; mode=sys.argv[5]
 if seed.get("start_seq") != sequence or seed.get("start_hash") != digest: raise SystemExit("seed result identity differs")
-if row.get("start_seq") != sequence or row.get("start_hash") != digest or row.get("last_prepared_seq") is not None: raise SystemExit("authority Start read-back differs")
-if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise SystemExit("authority bankroll read-back differs")' \
-    "$authority_start" "$start_seq" "$start_hash" "$fresh_bankroll" ||
+# Identity is proven on BOTH paths: a different Start is still refused after a resume.
+if row.get("start_seq") != sequence or row.get("start_hash") != digest: raise SystemExit("authority Start read-back differs")
+if mode == "initial":
+    if row.get("last_prepared_seq") is not None: raise SystemExit("authority Start read-back differs")
+    if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise SystemExit("authority bankroll read-back differs")
+elif mode != "resume":
+    raise SystemExit("unknown authority Start mode")' \
+    "$authority_start" "$start_seq" "$start_hash" "$fresh_bankroll" "$authority_start_mode" ||
     die "authority Start seed/read-back proof failed"
   manifest_patch_boundary authority-start-seeded \
     "$(python3 -c 'import json,sys; print(json.dumps({"authority_start_seeded":True,"authority_start_proof":[json.loads(line) for line in sys.argv[1].splitlines() if line]},sort_keys=True,separators=(",",":")))' "$authority_start")"

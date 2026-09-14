@@ -439,6 +439,27 @@ impl SupabaseStateClient {
             .transpose()
     }
 
+    /// The authoritative bankroll together with its financial-progress marker (#628).
+    ///
+    /// Boot needs both in one observation: the Start-baseline equality may only be enforced while
+    /// this store has applied no fill, and reading them separately would reintroduce the very
+    /// split-read race that makes a first fill look like a corrupt balance.
+    pub async fn fetch_bankroll_progress(
+        &self,
+    ) -> Result<Option<(Decimal, Option<i64>)>, SupabaseStateError> {
+        let url = format!(
+            "{}/rest/v1/paper_bankroll?select=bankroll_str,last_prepared_seq&id=eq.0",
+            self.base_url
+        );
+        let rows: Vec<BankrollProgressRow> = self.get_json(&url).await?;
+        rows.first()
+            .map(|r| {
+                bankroll_money(&r.bankroll_str, "paper_bankroll bankroll_str")
+                    .map(|bankroll| (bankroll, r.last_prepared_seq))
+            })
+            .transpose()
+    }
+
     /// The authoritative net positions, for the boot pull into the local cache.
     ///
     /// Pages through PostgREST (#516): the server caps ANY single response at its
@@ -933,6 +954,19 @@ fn validate_prepared_fill_row(
 #[derive(Debug, Deserialize)]
 struct BankrollRow {
     bankroll_str: String,
+}
+
+/// The authoritative bankroll row plus its financial-progress marker (#628).
+///
+/// `last_prepared_seq` advances on RESOLUTIONS as well as fills, so a non-null marker is not a
+/// general proof that a fill happened. What holds — and all the boot gate needs — is the converse
+/// on a freshly reset era: the resolution poller only selects existing paper positions, those can
+/// only originate from fills, and the era reset clears them. So nothing can advance the marker
+/// before the first fill, and `None` means this store has applied none.
+#[derive(Debug, Deserialize)]
+struct BankrollProgressRow {
+    bankroll_str: String,
+    last_prepared_seq: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

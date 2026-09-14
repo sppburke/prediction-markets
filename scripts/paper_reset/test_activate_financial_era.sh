@@ -342,8 +342,20 @@ elif [[ "$sql" == *information_schema.columns* ]]; then
 elif [[ "$sql" == *paper_fills_archive* ]]; then
   echo '0 0 0 1 0'
 elif [[ "$sql" == *seed_financial_start* ]]; then
-  echo '{"outcome":"applied","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
-  echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
+  # #628: `authority-has-traded` makes the authority report a legitimately PROGRESSED era -- the
+  # exact state a resumed activation meets after the service started and filled. `seed_financial_start`
+  # is idempotent for a matching Start, so it still answers `existing`; only the read-back moves.
+  if [[ -f "$state/authority-has-traded" ]]; then
+    echo '{"outcome":"existing","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    echo '{"bankroll":"9998.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":42}'
+  elif [[ -f "$state/authority-start-impostor" ]]; then
+    # A DIFFERENT Start on a progressed era: identity must still be refused on the resume path.
+    echo '{"outcome":"existing","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    echo '{"bankroll":"9998.99","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","last_prepared_seq":42}'
+  else
+    echo '{"outcome":"applied","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
+  fi
 elif [[ "$sql" == *"'start_seq'"* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
 elif [[ "$sql" == *json_build_object* ]]; then
@@ -3071,6 +3083,57 @@ run_driver "$root" >/dev/null
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
   fail "Start recovery did not durably roll forward to started"
 
+# Scenario FE-SERVICE-START-69 — a resumed activation accepts an era that has already traded (#628).
+# Preconditions: complete Start, service started, then an interruption before `started` is recorded.
+#   Before the retry the AUTHORITY reports a progressed era: `last_prepared_seq` set and cash moved.
+# PASS: the retry rolls forward to `started`, proving Start identity without re-proving pristineness,
+#       and without repeating the archive or starting the service a second time.
+# FAIL: the driver refuses ("authority Start read-back differs"), stranding an activation whose
+#       service is running normally, with rollback already forbidden by the complete Start.
+root=$TEST_TMP/post-service-start-traded
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after before-manifest-started >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 && $(<"$root/test-state/service.active") == true ]] ||
+  fail "traded-resume fixture did not reach the post-service-start seam"
+archive_before=$(<"$root/test-state/archive-count")
+start_before=$(<"$root/test-state/start-count")
+
+# The service is up and has traded: the authority has advanced past the pristine baseline.
+touch "$root/test-state/authority-has-traded"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 0 ]] ||
+  fail "a resumed activation refused an era that legitimately traded: $output"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
+  fail "traded resume did not durably roll forward to started"
+[[ $(<"$root/test-state/archive-count") -eq "$archive_before" ]] ||
+  fail "traded resume repeated the remote archive"
+[[ $(<"$root/test-state/start-count") -eq "$start_before" ]] ||
+  fail "traded resume started the service a second time"
+
+# Control: identity is still proven on the resume path. A progressed era carrying a DIFFERENT Start
+# must still refuse, otherwise accepting progress would have become a hole.
+root=$TEST_TMP/post-service-start-traded-impostor
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after before-manifest-started >/dev/null 2>&1
+set -e
+touch "$root/test-state/authority-start-impostor"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'authority Start read-back differs'* ]] ||
+  fail "a resumed activation accepted a different authority Start: $output"
+echo "PASS: FE-SERVICE-START-69"
+
 root=$TEST_TMP/post-service-start-empty-membership
 setup_fixture "$root"
 driver_args "$root"
@@ -3660,4 +3723,4 @@ cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
-echo "PASS: 68 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 69 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"

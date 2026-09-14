@@ -530,14 +530,32 @@ async fn main() -> Result<()> {
     paper_state
         .init_bankroll(starting_bankroll)
         .context("initialise paper-state bankroll")?;
+    // #628: a FRESH financial activation is not the same thing as RECOVERY of an era that has
+    // already traded. While a store has applied no fill, the era is still pristine there and this
+    // equality is the real protection against activating onto the wrong balance. Once a fill lands,
+    // it debits cash in the SAME transaction that records it (`PaperStateDb::apply_financial_fill`),
+    // so demanding the Start baseline would refuse to boot for the rest of the era's life — and the
+    // financial recovery that reconciles the difference runs only further below.
+    //
+    // The freshness marker is per-store on purpose: the authority can apply a fill before the local
+    // projection catches up, so a single shared predicate would wrongly refuse one side or excuse
+    // the other. It is deliberately NOT "has a Start been recorded" — initial activation also
+    // carries a Start, and a service that seeds Start then crashes before any fill leaves a
+    // pristine era that must keep this protection. Start identity is unaffected and is still
+    // validated on BOTH paths by `seed_financial_start`, which is idempotent on a match and fails
+    // otherwise.
     if financial_start.is_some() {
-        anyhow::ensure!(
+        pe_service::paper_recovery::check_start_baseline_bankroll(
+            pe_service::paper_recovery::FinancialBootStore::Local,
+            paper_state
+                .fills_count()
+                .context("read the local financial fill count")?
+                == 0,
             paper_state
                 .bankroll()
-                .context("read Start-bound local bankroll")?
-                == Some(starting_bankroll),
-            "local bankroll differs from QualificationStarted before authority mutation"
-        );
+                .context("read Start-bound local bankroll")?,
+            starting_bankroll,
+        )?;
     }
     // #511: LEGACY-ONLY blind frame replay. In authoritative mode the boot frame-walk
     // below owns local application — every unresolved frame is decided by the authority
@@ -576,16 +594,18 @@ async fn main() -> Result<()> {
             &cfg.supabase_secret_key,
         );
         if let Some(start) = financial_start {
-            let authoritative_bankroll = client
-                .fetch_bankroll()
+            // #628: one observation, so the balance and the progress marker cannot straddle a
+            // concurrent fill and make a legitimate first fill look like a corrupt balance.
+            let authoritative = client
+                .fetch_bankroll_progress()
                 .await
                 .context("read Start-bound authoritative bankroll")?;
-            anyhow::ensure!(
-                authoritative_bankroll == Some(starting_bankroll),
-                "authoritative bankroll {:?} differs from QualificationStarted baseline {}",
-                authoritative_bankroll,
-                starting_bankroll
-            );
+            pe_service::paper_recovery::check_start_baseline_bankroll(
+                pe_service::paper_recovery::FinancialBootStore::Authoritative,
+                authoritative.is_none_or(|(_, last_prepared_seq)| last_prepared_seq.is_none()),
+                authoritative.map(|(bankroll, _)| bankroll),
+                starting_bankroll,
+            )?;
             paper_state
                 .seed_financial_start(start)
                 .context("seed local financial Start")?;
