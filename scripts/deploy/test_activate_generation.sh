@@ -34,6 +34,37 @@ set -e
 grep -q 'parser.env:6:' "$TEST_TMP/parser.err" ||
   fail "environment parser did not report the offending physical line"
 
+# The service unit evaluates the file with `set -a; source`: a whole-value `${NAME}` reference
+# (unquoted or double-quoted) takes the value NAME holds at that line. Everything else bash would
+# expand differently stays literal, so the ownership proof refuses it instead of modelling it.
+reference_env="$TEST_TMP/parser-reference.env"
+printf '%s\n' 'BASE=value' 'REF=${BASE}' 'DQ="${BASE}"' "SQ='\${BASE}'" 'PART=a${BASE}b' \
+  'BRACELESS=$BASE' 'LATER=${AFTER}' 'AFTER=z' 'BASE=changed' 'AGAIN=${BASE}' > "$reference_env"
+mapfile -d '' -t parsed < <(
+  bash -c 'source "$1"; env_file_values "$2"' bash "$SCRIPT_DIR/generation_common.sh" "$reference_env" &&
+    printf '__PARSED__\0'
+)
+[[ "$(printf '%s|' "${parsed[@]}")" == 'BASE=changed|REF=value|DQ=value|SQ=${BASE}|PART=a${BASE}b|BRACELESS=$BASE|LATER=${AFTER}|AFTER=z|AGAIN=changed|__PARSED__|' ]] ||
+  fail "environment parser did not resolve whole-value references the way the unit does: ${parsed[*]}"
+
+# The seam that refused the #545 activation: the process environment came from the unit's own
+# evaluator, the proof's expectation from the parser, and a whole-value reference must compare equal.
+proof_root="$TEST_TMP/ownership-proof"
+mkdir -p "$proof_root/proc/4242" "$proof_root/service"
+printf '%s\n' 'PE_A=value' 'PE_B=${PE_A}' > "$proof_root/service/.env"
+printf '%s\0' "$proof_root/service/pe-service" smoke-test/service.toml > "$proof_root/proc/4242/cmdline"
+{
+  env -i /bin/bash --noprofile --norc -c 'set -a; . "$1"; set +a; env -0' _ "$proof_root/service/.env"
+  printf '%s\0' CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service "HOME=$proof_root" \
+    INVOCATION_ID=invocation-test-2 JOURNAL_STREAM=8:558 LANG=C.UTF-8 LOGNAME=sean PATH=/usr/bin \
+    SHELL=/bin/bash SYSTEMD_EXEC_PID=1235 USER=sean
+} > "$proof_root/proc/4242/environ"
+PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$proof_root" PROC_ROOT="$proof_root/proc" bash -c \
+  'source "$1"; process_runs_service "$2" "$3" "$4" "$5" 4242' \
+  bash "$SCRIPT_DIR/generation_common.sh" "$proof_root/service/pe-service" \
+  "$proof_root/service/smoke-test/service.toml" "$proof_root/service/.env" "$proof_root/service" ||
+  fail "the ownership proof refused a process whose unit expanded a whole-value reference"
+
 # Representative accepted/rejected physical lines for the fail-closed EnvironmentFile subset.
 assert_env_parser_case() {
   local label=$1 disposition=$2 line=$3 expected=${4:-}

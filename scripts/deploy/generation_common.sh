@@ -142,12 +142,16 @@ readonly -a SERVICE_ENV_ALLOWLIST=(
   PE_POLYGON_RECEIPT_RPC_URL
 )
 
-# Parse only one-line environment assignments whose systemd EnvironmentFile interpretation is
-# identical to ours, without invoking a shell. Blank lines and lines whose first non-whitespace
+# Parse only one-line environment assignments on which this parser and the service unit's
+# `set -a; source` agree, without invoking a shell. Blank lines and lines whose first non-whitespace
 # character is `#` or `;` are ignored. Every other physical line must be exactly `NAME=value`: no
 # `export`, no leading name whitespace, no whitespace adjacent to `=`, and no backslash anywhere.
 # A value may be unquoted (including interior spaces, but no leading/trailing whitespace or quotes),
-# or wholly single/double quoted with no backslash or matching quote inside. With requested names,
+# or wholly single/double quoted with no backslash or matching quote inside. One bounded expansion is
+# modelled because production relies on it (PE_POLYGON_HTTP_URL=${PE_POLYGON_HTTP_URL_SPPBURKE}): an
+# unquoted or double-quoted value that is exactly `${NAME}` takes the value NAME holds at that line
+# when NAME was assigned earlier in this file, copied once and never reinterpreted; every other
+# expansion stays literal. With requested names,
 # emit only those final assignments; without names, emit every final assignment. Output is
 # NUL-delimited so values retain interior whitespace and cannot be reinterpreted as shell syntax.
 env_file_values() {
@@ -175,6 +179,8 @@ except UnicodeDecodeError as error:
 
 assignments = {}
 assignment = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)")
+# The one bounded expansion described in the contract above, resolved at assignment time.
+whole_reference = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 forbidden = {"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"}
 for line_number, physical_line in enumerate(text.splitlines(), 1):
     line = physical_line[:-1] if physical_line.endswith("\r") else physical_line
@@ -193,11 +199,16 @@ for line_number, physical_line in enumerate(text.splitlines(), 1):
         if len(encoded) < 2 or encoded[-1] != quote or quote in encoded[1:-1]:
             raise SystemExit(f"{path}:{line_number}: invalid quoted environment value")
         value = encoded[1:-1]
+        expandable = quote == "\""
     else:
         if (encoded.startswith((" ", "\t")) or encoded.endswith((" ", "\t"))
                 or "\"" in encoded or "\x27" in encoded):
             raise SystemExit(f"{path}:{line_number}: invalid environment value")
         value = encoded
+        expandable = True
+    reference = whole_reference.fullmatch(value) if expandable else None
+    if reference is not None and reference.group(1) in assignments:
+        value = assignments[reference.group(1)]
     assignments[name] = value
 
 names = requested if requested else assignments.keys()
@@ -420,7 +431,8 @@ process_runs_service() {
   # Ownership of what runs NOW, from the process itself (lossless, no unit-file interpretation):
   #   argv  == exactly `<binary> <config>` (NUL-split; empty elements kept)
   #   environ: every variable the installed environment file defines under `env_file_values` data
-  #   semantics is present with an equal value, and every extra name is
+  #   semantics (earlier whole-value `${NAME}` references resolved, as the unit's `set -a; source`
+  #   does) is present with an equal value, and every extra name is
   #   one of the exact systemd-injected names observed for the production unit or one of the unit's
   #   `bash -c` wrapper's own variables. PWD, SHLVL, OLDPWD, and _ are stripped from the expected set
   #   because they do not affect the binary; cwd is proved independently from /proc/<pid>/cwd.
