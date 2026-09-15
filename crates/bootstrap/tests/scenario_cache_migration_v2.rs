@@ -2739,6 +2739,18 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
             );
         }
     }
+    // Spellings with repeated separators name the same files; the immutable
+    // prior read builds its SQLite URI from the canonical path.
+    let doubled = |path: &std::path::Path| std::path::PathBuf::from(format!("/{}", path.display()));
+    let respelled = stage_cache_cycle_v2(
+        &doubled(&fixed),
+        &doubled(&prior),
+        &doubled(&side),
+        Some(&doubled(&manifest)),
+    )
+    .unwrap();
+    assert!(respelled.resumed);
+    assert_eq!(respelled.prior_schema, 1);
     let fixed_sha256 = sha256_file(&fixed).unwrap();
     assert_eq!(staged.prior_sha256.as_deref(), Some(fixed_sha256.as_str()));
     assert_eq!(staged.side_sha256.as_deref(), Some(fixed_sha256.as_str()));
@@ -2979,6 +2991,45 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     );
     assert!(!dir.path().join("missing-c").exists());
     assert!(!dir.path().join("cron-10.prior.db").exists());
+    // A manifest name that is itself a link without a target is refused: the
+    // prior copied later could give it a target and make it an alias.
+    let dangling_manifest = dir.path().join("dangling.json");
+    std::os::unix::fs::symlink("cron-11.prior.db", &dangling_manifest).unwrap();
+    let dangling = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-11.prior.db"),
+        &dir.path().join("cron-11.side.db"),
+        Some(&dangling_manifest),
+    )
+    .unwrap_err();
+    assert!(
+        dangling
+            .to_string()
+            .contains("symbolic link without a target"),
+        "{dangling}"
+    );
+    assert!(!dir.path().join("cron-11.prior.db").exists());
+    // The manifest is written under its resolved identity, so a spelling that
+    // differs only in form (a trailing `/.`) lands on the same file and leaves
+    // no temporary file behind.
+    let spelled =
+        std::path::PathBuf::from(format!("{}/.", dir.path().join("spelled.json").display()));
+    let normalized = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-12.prior.db"),
+        &dir.path().join("cron-12.side.db"),
+        Some(&spelled),
+    )
+    .unwrap();
+    assert!(!normalized.resumed);
+    assert!(dir.path().join("spelled.json").is_file());
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
     assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
 }
 

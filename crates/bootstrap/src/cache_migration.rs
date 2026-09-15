@@ -2087,6 +2087,11 @@ pub fn stage_cache_cycle_v2(
         roles.push(("cache build manifest", path));
     }
     require_distinct_files(&roles)?;
+    // The manifest is checked and written under one spelling: its resolved
+    // identity, whose parent directory exists.
+    let build_manifest_path = build_manifest_path
+        .map(canonical_intended_path)
+        .transpose()?;
     if side_path.exists() {
         require_regular_file(side_path, "private candidate cache")?;
         if !prior_path.exists() {
@@ -2101,7 +2106,7 @@ pub fn stage_cache_cycle_v2(
         // An unsealed initial candidate whose manifest went missing gets it
         // back from the immutable prior; a sealed candidate keeps its recorded
         // input hash in `sealed_generation_manifests` and needs no file.
-        if let Some(path) = build_manifest_path
+        if let Some(path) = build_manifest_path.as_deref()
             && report.side_schema != CACHE_SCHEMA_VERSION_V2
             && !path.exists()
         {
@@ -2125,7 +2130,7 @@ pub fn stage_cache_cycle_v2(
     // this authentic hash-bound build manifest; the candidate is a byte copy
     // of the verified prior, so the prior hash is the backup hash. Written
     // before the candidate is adopted so an interrupted cycle resumes with it.
-    if let Some(path) = build_manifest_path
+    if let Some(path) = build_manifest_path.as_deref()
         && verified_user_version(prior_path)? != CACHE_SCHEMA_VERSION_V2
         && !path.exists()
     {
@@ -2248,7 +2253,8 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
 
 /// Identity of a staged path: its parent directory resolved through the file
 /// system, joined with its file name, itself resolved when it already exists
-/// so a linked alias of a role collides. The parent must already exist.
+/// so a linked alias of a role collides; a link without a target is refused.
+/// The parent must already exist.
 /// Staging never creates directories, so a spelling that would put a
 /// directory or a file at a cache role is refused before anything is written.
 fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
@@ -2268,7 +2274,17 @@ fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
     let intended = parent.join(name);
     match std::fs::canonicalize(&intended) {
         Ok(existing) => Ok(existing),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(intended),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A link without a target is not an absent file: a copy made
+            // later could give it one and turn it into an alias.
+            if std::fs::symlink_metadata(&intended).is_ok() {
+                return invalid(format!(
+                    "{} is a symbolic link without a target",
+                    path.display()
+                ));
+            }
+            Ok(intended)
+        }
         Err(error) => Err(error.into()),
     }
 }

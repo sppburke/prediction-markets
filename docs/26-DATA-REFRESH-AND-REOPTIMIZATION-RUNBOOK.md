@@ -629,6 +629,8 @@ and every retained history, without a frozen reference:
 # Under the cache lock: checkpoint + integrity-check the fixed main, copy it to the
 # immutable prior, copy the prior to the candidate (each copy hash-verified before its
 # rename). A schema-one prior also gets its hash-bound build manifest for the initial seal.
+# Every path names a file in an existing directory (the cycle directory beside the fixed
+# cache): staging never creates directories.
 pe-bootstrap cache-stage-v2 --db "$FIXED_PHYSICAL" --prior "$PRIOR" --side "$SIDE" \
   --manifest "$CACHE_BUILD_MANIFEST"
 pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   # unsealed candidate only
