@@ -885,3 +885,146 @@ impl ReconciliationFetcher for Page {
         Box::pin(async { Ok(self.0.clone()) })
     }
 }
+
+// Audited Prepared-fill economics shared by the authority crash matrix and the post-Start boot
+// scenario.
+use pe_core_types::{
+    BasisPoints, CollateralAmount, KellyFraction, PolymarketConditionId, PolymarketTokenId,
+    Probability, ShareAmount,
+};
+use pe_execution_core::{
+    AdmissionReceipts, BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
+    LadderAskAudit, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit,
+    MarketSelection, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit,
+    SizingModeAudit,
+};
+use pe_resolver_card::{
+    VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+};
+use pe_risk_engine::RiskSnapshot;
+use pe_venue_polymarket::CompactFeeSchedule;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
+/// A receipt whose hash is one repeated byte, for audit receipts whose content is never re-derived.
+pub fn hashed_receipt(sequence: u64, byte: u8) -> AppendReceipt {
+    AppendReceipt {
+        sequence: EventSeq(sequence),
+        this_hash: blake3::Hash::from_bytes([byte; 32]),
+    }
+}
+
+/// One fully audited Prepared fill: BUY two shares at 0.50, principal 1, zero fee, so applying it
+/// debits exactly 1 from the Start cash. `financial_prefix` is the Start receipt the risk audit
+/// binds to.
+pub fn economic_prepared(
+    source_receipt: AppendReceipt,
+    financial_prefix: AppendReceipt,
+) -> EconomicPrepared {
+    let price = Price::new(dec!(0.5)).unwrap();
+    let shares = ShareAmount::from_whole(2).unwrap();
+    let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
+    EconomicPrepared {
+        version: ECONOMIC_PREPARED_VERSION,
+        market: MarketSelection {
+            condition_id: PolymarketConditionId("condition".to_owned()),
+            outcome_index: 0,
+            token_id: PolymarketTokenId("token-0".to_owned()),
+            side: Side::Buy,
+            market_id: "condition".to_owned(),
+        },
+        admission: LiveAdmissionArtifactAudit {
+            market: LiveMarketEvidenceAudit {
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                ordered_outcome_token_ids: [
+                    PolymarketTokenId("token-0".to_owned()),
+                    PolymarketTokenId("token-1".to_owned()),
+                ],
+                neg_risk: false,
+                minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                minimum_order_size: shares,
+                observed_at_unix: 1_800_000_000,
+                schema_version: 1,
+                parser_version: 1,
+                freshness_window_secs: 60,
+            },
+            settlement: VenueSettlementRecord {
+                schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+                condition_id: PolymarketConditionId("condition".to_owned()),
+                status: VenueResolutionStatus::Unresolved,
+                raw_evidence_hash: "settlement".to_owned(),
+                source_timestamp_unix: Some(1_800_000_000),
+                observed_at_unix: 1_800_000_000,
+                parser_version: 1,
+                freshness_window_secs: 60,
+            },
+            fee_schedule: CompactFeeSchedule::Zero,
+            scheduled_end_unix: Some(1_800_003_600),
+            receipts: AdmissionReceipts {
+                gamma: hashed_receipt(1, 1),
+                clob_long: hashed_receipt(2, 2),
+                clob_compact: hashed_receipt(3, 3),
+            },
+        },
+        ladder: LadderPlanAudit {
+            used_asks: vec![LadderAskAudit { price, shares }],
+            best_ask: price,
+            limit_price: price,
+            minimum_shares: shares,
+            principal,
+        },
+        book_receipt: hashed_receipt(4, 4),
+        observation: Some(ObservationEvidence {
+            source_receipt,
+            complete_bound_receipt: source_receipt,
+            observed_unix_ms: 1_700_000_000_000,
+            provenance: "scenario_rest".to_owned(),
+        }),
+        sizing: SizingAudit {
+            mode: SizingModeAudit::Kelly {
+                fraction: KellyFraction::new(dec!(0.25)).unwrap(),
+                probability: Probability::new(dec!(0.6)).unwrap(),
+            },
+            budget: principal,
+            principal,
+            minimum_shares: shares,
+            expected_shares: shares,
+            expected_vwap: price,
+            all_in_price: price,
+            slippage_rate: Decimal::ZERO,
+        },
+        fee: FeeAudit {
+            schedule: CompactFeeSchedule::Zero,
+            expected_fee: CollateralAmount::ZERO,
+            reserve: CollateralAmount::ZERO,
+        },
+        risk: RiskAudit {
+            financial_prefix,
+            snapshot: RiskSnapshot {
+                leader_exposure_bps: BasisPoints::ZERO,
+                market_exposure_bps: BasisPoints::ZERO,
+                family_exposure_bps: BasisPoints::ZERO,
+                total_copy_exposure_bps: BasisPoints::ZERO,
+                intraday_pnl_bps: BasisPoints::ZERO,
+                rolling_7d_pnl_bps: BasisPoints::ZERO,
+                absolute_pnl_bps: BasisPoints::ZERO,
+                copy_latency_kill_switch_active: false,
+                proposed_trade_bps: BasisPoints(1_000),
+                per_trade_cap_bps: 1_000,
+                concentration_caps: None,
+            },
+            decision: RiskDecisionAudit::Approved,
+            price_receipts: Vec::new(),
+            evaluated_at_unix_ms: 1_800_000_000_000,
+        },
+        balance: BalanceAudit {
+            cash_before: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+            worst_case_debit: principal,
+            price_impact_cap_bps: 100,
+            chase_ceiling: price,
+            band_floor: Price::ZERO,
+            band_ceiling_exclusive: Price::ONE,
+        },
+        applied_configuration_hash: "config".to_owned(),
+    }
+}

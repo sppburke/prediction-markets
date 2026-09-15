@@ -698,7 +698,6 @@ if manifest.get("generation_legacy_history") != json.loads(sys.argv[3]): raise S
    "$static_config_hash" == "$(manifest_get static_config_hash)" &&
    "$ranking_batch_id" == "$(manifest_get ranking_batch_id)" ]] ||
   die "financial-era evidence identity changed"
-ranking_identity="batch:$ranking_batch_id"
 python3 -c 'import decimal,json,sys
 manifest,members,bankroll=sys.argv[1:]
 value=json.load(open(manifest,encoding="utf-8"))
@@ -1104,7 +1103,7 @@ if [[ "$state" == started ]]; then
   [[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "prepared hot-config identity is invalid"
   verify_guarded_log_prefixes || die "paper/source/live prefixes do not extend their guarded identities"
   python3 -c 'import decimal,json,os,sys
-path,started,revision,hot,bankroll,membership_count,ranking_identity=sys.argv[1:]
+path,started,revision,hot,bankroll,membership_count=sys.argv[1:]
 started=int(started); membership_count=int(membership_count)
 value=json.load(open(path,encoding="utf-8"))
 if os.stat(path).st_mtime < started: raise SystemExit("status predates financial-era start")
@@ -1153,8 +1152,7 @@ for account in accounts:
         raise SystemExit("a live account is not off and unarmed")
 if None in identities or len(identities) != len(set(identities)): raise SystemExit("live account inventory is not uniquely identified")' \
     "$generation/status.json" "$(manifest_get started_unix)" "$target_revision" \
-    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" \
-    "$ranking_identity" ||
+    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" ||
     die "first fresh health proof is incomplete"
   readiness_url=$(installed_readiness_url) || die "installed readiness endpoint is invalid"
   financial_readiness_response=$(mktemp)
@@ -1198,14 +1196,10 @@ if fills == 0 and decimal.Decimal(rows[0][0]) != decimal.Decimal(bankroll): rais
   remote_verified=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select json_build_object(
        'paper_fills',(select count(*) from paper_fills),
-       'settled_markets',(select count(*) from settled_markets),
-       'paper_positions',(select count(*) from paper_positions),
-       'fill_market_snapshots',(select count(*) from fill_market_snapshots),
        'bankroll_count',(select count(*) from paper_bankroll),
        'bankroll',(select bankroll_str from paper_bankroll where id=0),
        'start_seq',(select start_seq from paper_bankroll where id=0),
        'start_hash',(select start_hash from paper_bankroll where id=0),
-       'last_prepared_seq',(select last_prepared_seq from paper_bankroll where id=0),
        'ranking_batch_id',(select max(batch_id) from ranking_batches),
        'membership',coalesce((select json_agg(wallet_hex order by wallet_hex) from service_watchlist),'[]'::json)
      )::text;") || die "read remote verified-state proof"

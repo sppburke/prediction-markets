@@ -10663,7 +10663,38 @@ mod tests {
     /// Give the fixture the offline authority inputs `validate_financial_target_config` requires,
     /// and write the exported Financial15 rows the preflight reads.
     fn preflight_fixture(root: &Path) -> (FinancialEraManifest, ServiceConfig, PathBuf) {
-        let (manifest, mut config) = financial_era_live_source_fixture(root);
+        let (mut manifest, mut config) = financial_era_live_source_fixture(root);
+        // #628: one valid member, so the membership-proof gate has something to prove. Same rows
+        // as `initial_membership_proof_does_not_read_current_projection`.
+        let member = WalletAddress([42; 20]);
+        let at = manifest.start_unix;
+        let state = PaperStateDb::open(&manifest.paths.paper_state).unwrap();
+        state
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet: member,
+                complete: true,
+                proof_json: "{\"complete\":true}".to_owned(),
+                updated_at_unix: at,
+            })
+            .unwrap();
+        state.seed_cursors_if_absent(&[(member, at)]).unwrap();
+        state
+            .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                history_status: None,
+                wallet: member,
+                balances: Vec::new(),
+                activity_cutoff_unix: at,
+                anchored_at_unix: at,
+                ledger_hash_after: "ledger".to_owned(),
+                positions_proof_hash: "positions".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "g557".to_owned(),
+                proof_json: "{\"anchor\":1}".to_owned(),
+                recorded_at_unix: at,
+            }])
+            .unwrap();
+        drop(state);
+        manifest.membership = vec![member];
         config.supabase_authoritative = true;
         config.supabase_url = "https://example.invalid".to_owned();
         config.supabase_secret_key = "service-role".to_owned();
@@ -10725,17 +10756,41 @@ mod tests {
         );
         assert_eq!(report["live_accounts"], 1);
 
-        // The new gate must be load-bearing, not merely advertised: remove the paper state and the
-        // preflight has to refuse. Naming it in `gates` while ignoring it would be the exact
-        // vacuous pass that let a missing position_validations row cost 100 minutes of downtime.
-        fs::remove_file(&manifest.paths.paper_state).unwrap();
+        // The gate must be load-bearing for the exact defect that cost attempt 16 its 100 minutes:
+        // a member whose current position validation is gone. Everything else about the fixture
+        // stays valid, so only the membership gate can refuse -- and it has to say so.
+        let member = manifest.membership[0];
+        let connection = rusqlite::Connection::open(&manifest.paths.paper_state).unwrap();
+        connection
+            .execute(
+                "DELETE FROM position_validations WHERE wallet_hex = ?1",
+                [member.to_string()],
+            )
+            .unwrap();
+        let refusal = run_preflight(temp.path(), &config)
+            .expect_err("a member without a validation row must refuse")
+            .to_string();
         assert!(
-            run_preflight(temp.path(), &config).is_err(),
-            "the membership-proof gate must refuse when the paper state is unreadable"
+            refusal.contains(&format!(
+                "membership proof lacks a current position validation for {member}"
+            )),
+            "{refusal}"
         );
+        // Restoring the row (the values the anchor install wrote) re-admits the fixture: the
+        // refusal was that row and nothing else.
+        connection
+            .execute(
+                "INSERT INTO position_validations VALUES (?1, 'ledger', 'positions', '[]', 'g557', \
+                 '{\"anchor\":1}', ?2)",
+                rusqlite::params![member.to_string(), manifest.start_unix],
+            )
+            .unwrap();
+        drop(connection);
+        run_preflight(temp.path(), &config).expect("the repaired row re-admits the fixture");
 
-        // ...and prepare, which reads the logs too, refuses on the same fixture. Without this the
-        // assertion above could pass simply because the files were never load-bearing.
+        // ...and prepare, which reads the logs too, refuses on the same fixture -- with the paper
+        // state intact, so only the missing logs can be the cause. Without this the log deletions
+        // above could pass simply because the files were never load-bearing.
         assert!(
             run_financial_era(
                 FinancialEraCommand::Prepare,

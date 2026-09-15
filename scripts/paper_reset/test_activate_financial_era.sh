@@ -380,17 +380,17 @@ elif [[ "$sql" == *seed_financial_start* ]]; then
 elif [[ "$sql" == *"'start_seq'"* ]]; then
   # #628: the authority observation for a traded era, and for a still-fresh era whose cash is wrong.
   if [[ -f "$state/remote-traded" ]]; then
-    echo '{"paper_fills":1,"settled_markets":1,"paper_positions":1,"fill_market_snapshots":1,"bankroll_count":1,"bankroll":"10000.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":3,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+    echo '{"paper_fills":1,"bankroll_count":1,"bankroll":"10000.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
   elif [[ -f "$state/remote-wrong-start" ]]; then
-    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
   elif [[ -f "$state/remote-wrong-membership" ]]; then
-    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000999"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000999"]}'
   elif [[ -f "$state/remote-wrong-batch" ]]; then
-    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":999,"membership":["0x0000000000000000000000000000000000000545"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":999,"membership":["0x0000000000000000000000000000000000000545"]}'
   elif [[ -f "$state/remote-wrong-bankroll" ]]; then
-    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"9999","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"9999","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
   else
-  echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
   fi
 elif [[ "$sql" == *json_build_object* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"paper_bankroll":1,"fill_market_snapshots":0}'
@@ -693,14 +693,18 @@ binding = json.dumps({"version": 1, "proof_hash": "c" * 64,
                      separators=(",", ":"))
 zero = "0" * 64
 prefix = {"physical_tail": 1, "last_sequence": None, "last_hash": zero}
-print(json.dumps({"start": {"starting_bankroll": 10000000000,
+preparation = json.dumps({"start": {"starting_bankroll": 10000000000,
     "paper_prefix": prefix, "source_prefix": prefix, "live_prefix": prefix,
     "artifact_blake3": "a" * 64, "static_config_hash": "b" * 64, "hot_config_hash": "b" * 64,
     "generation": "g557", "activation_id": "act-545", "ranking_batch_id": 545,
     "membership": members, "membership_proofs_hash": binding,
     "schema_version": 3, "parser_version": 1, "financial_semantic_version": 1},
-    "expected_receipt": {"sequence": 1, "this_hash": "c" * 64}}, separators=(",", ":")))' \
-        $(cat "$seam_marker")
+    "expected_receipt": {"sequence": 1, "this_hash": "c" * 64}}, separators=(",", ":"))
+# Keep a copy of the exact bytes emitted, so the scenario can compare what the driver RECORDED
+# against them rather than against a size threshold a partial payload could still clear.
+with open(sys.argv[3], "w") as emitted: emitted.write(preparation)
+print(preparation)' \
+        $(cat "$seam_marker") "$seam_marker.emitted"
       exit 0
     fi
     cat <<'JSON'
@@ -2058,55 +2062,51 @@ raise SystemExit(0 if not v.get("service_stop_intent") and not v.get("stop_invok
   fail "a pre-stop preflight refusal recorded a stop boundary"
 echo "PASS: FE-PREFLIGHT-65"
 
-# Scenario FE-SEAM-68 — a production-shaped preparation now crosses the driver plumbing (#626).
+# Scenario FE-SEAM-68 — a production-shaped preparation crosses the driver plumbing AND converges
+#       (#626, #628).
 # Preconditions: the prepare shim emits the PRODUCTION shape — a serialized MembershipProofBinding
 #       carrying each member proof document — instead of the miniature fixture the other scenarios
 #       use. Sizes come from the measured live generation (mean validation proof 341,056 B); the
 #       live 26-member binding was 21,711,795 B against a 131,072-byte MAX_ARG_STRLEN.
-# PASS: the driver RECORDS the preparation. Before the stdin transport it could not: the whole
-#       payload went as one argv element and failed E2BIG at activate_financial_era.sh:945 —
-#       immediately after the ~95-minute post-stop prepare had already succeeded, with production
-#       already stopped and rollback forbidden.
-# FAIL: the preparation is unrecorded, or the run dies with "Argument list too long" — the
-#       transport regressed to argv.
-# Scope: transport only. This scenario says nothing about proof or projection content.
+# PASS: the run reaches `verified`, and the preparation the manifest carries is EXACTLY the one the
+#       generator emitted. Before the stdin transport the whole payload went as one argv element
+#       and failed E2BIG at activate_financial_era.sh:945 — immediately after the ~95-minute
+#       post-stop prepare had succeeded, with production already stopped and rollback forbidden.
+#       Before the membership-proof regex was deleted, the recorded preparation was then refused
+#       for not being a 64-hex digest, which a "was it recorded" check could not see.
+# FAIL: the run stops short of `verified`, dies with "Argument list too long", or the recorded
+#       preparation differs from the emitted one (a truncating or re-encoding transport — a whole
+#       missing member proof still clears any plausible size threshold).
 root=$TEST_TMP/seam-production-shaped-preparation
 setup_fixture "$root"
 driver_args "$root"
-set +e
 printf '3 341056\n' > "$root/test-state/production-shaped-preparation"
+set +e
 output=$(drive_to_verified "$root" 2>&1)
+converged=$?
 set -e
 [[ "$output" != *'Argument list too long'* ]] ||
   fail "a production-shaped preparation still hit the argv limit; the transport regressed: $output"
-recorded=$(python3 -c 'import json,sys
-try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
-except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
-[[ "$recorded" == "yes" ]] ||
-  fail "a production-shaped preparation was not recorded ($recorded); the transport does not carry \
-the real payload"
-# Prove it carried the WHOLE payload, not a truncated one: the recorded binding must still be at
-# least the generated size. A transport that silently truncated would satisfy "recorded".
-carried=$(python3 -c 'import json,sys
-v=json.load(open(sys.argv[1]))["preparation"]
-print(len(json.dumps(v,separators=(",",":"))))' "$root/pe-financial-era.json")
-[[ "$carried" -ge 1000000 ]] ||
-  fail "the recorded preparation is only $carried bytes; the payload was truncated in transit"
+[[ "$converged" == 0 ]] ||
+  fail "a production-shaped preparation did not reach verified: $output"
+emitted=$root/test-state/production-shaped-preparation.emitted
+python3 -c 'import json,sys
+recorded=json.load(open(sys.argv[1]))["preparation"]
+emitted=json.load(open(sys.argv[2]))
+raise SystemExit(0 if recorded == emitted else 1)' "$root/pe-financial-era.json" "$emitted" ||
+  fail "the recorded preparation differs from the one the generator emitted"
+carried=$(wc -c < "$emitted")
 
-# Control: the SAME generator at a size UNDER the old limit must also record, so the oversized case
-# is evidence about SIZE rather than about the generator working at all.
+# Control: the SAME generator at a size UNDER the old limit must also converge, so the oversized
+# case is evidence about SIZE rather than about the generator working at all.
 control=$TEST_TMP/seam-undersized-control
 setup_fixture "$control"
 driver_args "$control"
 printf '1 1024\n' > "$control/test-state/production-shaped-preparation"
-drive_to_verified "$control" >/dev/null 2>&1 || true
-control_recorded=$(python3 -c 'import json,sys
-try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
-except FileNotFoundError: print("absent")' "$control/pe-financial-era.json")
-[[ "$control_recorded" == "yes" ]] ||
-  fail "the seam generator cannot produce a recordable preparation even when small (got \
-$control_recorded), so the oversized case proves nothing about SIZE"
-echo "PASS: FE-SEAM-68 (production-shaped preparation recorded, $carried bytes carried via stdin)"
+drive_to_verified "$control" >/dev/null 2>&1 ||
+  fail "the seam generator cannot converge even when small, so the oversized case proves nothing \
+about SIZE"
+echo "PASS: FE-SEAM-68 (production-shaped preparation verified, $carried bytes carried via stdin)"
 
 # Scenario FE-VERIFY-70 — a financial era that has TRADED reaches `verified` (#628, #627).
 # Preconditions: all three observations report a post-fill, post-settlement era -- status

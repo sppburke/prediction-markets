@@ -546,11 +546,11 @@ async fn main() -> Result<()> {
     // otherwise.
     if financial_start.is_some() {
         pe_service::paper_recovery::check_start_baseline_bankroll(
-            pe_service::paper_recovery::FinancialBootStore::Local,
+            "local",
             paper_state
                 .fills_count()
                 .context("read the local financial fill count")?
-                == 0,
+                > 0,
             paper_state
                 .bankroll()
                 .context("read Start-bound local bankroll")?,
@@ -601,8 +601,8 @@ async fn main() -> Result<()> {
                 .await
                 .context("read Start-bound authoritative bankroll")?;
             pe_service::paper_recovery::check_start_baseline_bankroll(
-                pe_service::paper_recovery::FinancialBootStore::Authoritative,
-                authoritative.is_none_or(|(_, last_prepared_seq)| last_prepared_seq.is_none()),
+                "authoritative",
+                authoritative.is_some_and(|(_, last_prepared_seq)| last_prepared_seq.is_some()),
                 authoritative.map(|(bankroll, _)| bankroll),
                 starting_bankroll,
             )?;

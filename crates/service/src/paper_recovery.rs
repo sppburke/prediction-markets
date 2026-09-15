@@ -36,63 +36,31 @@ use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pendi
 use crate::position_seeder::ledger_capture;
 use crate::supabase_sink::supabase_fill_from;
 
-/// Which store an observed boot bankroll came from (#628).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FinancialBootStore {
-    Local,
-    Authoritative,
-}
-
-impl FinancialBootStore {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Authoritative => "authoritative",
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum FinancialBootBankrollError {
-    #[error("{} bankroll {observed:?} differs from QualificationStarted baseline {expected}", store.label())]
-    BaselineDiffers {
-        store: FinancialBootStore,
-        observed: Option<Decimal>,
-        expected: Decimal,
-    },
-}
-
 /// #628: the Start-baseline bankroll gate applied at boot, for one store.
 ///
 /// A FRESH financial activation and RECOVERY of an era that has already traded are different
-/// states, and only the first one can legitimately carry the Start baseline. On the first boot
-/// after Start nothing has been seeded locally, the era is still pristine, and this equality is
-/// the real protection against activating onto the wrong balance. On every later boot the era has
-/// legitimately progressed — a fill debits cash in the same transaction that records it — so
-/// enforcing the baseline would refuse to boot for the rest of the era's life, and the financial
-/// recovery that reconciles the difference runs only after this point.
+/// states, and only the first one can legitimately carry the Start baseline. While a store has
+/// applied no fill the era is still pristine there, and this equality is the real protection
+/// against activating onto the wrong balance. Once a fill lands it debits cash in the same
+/// transaction that records it, so enforcing the baseline would refuse to boot for the rest of
+/// the era's life — and the financial recovery that reconciles the difference runs only after
+/// this point.
 ///
 /// This deliberately does NOT validate Start identity: that is owned by
 /// `PaperStateDb::seed_financial_start` and its authority counterpart, which run on BOTH paths and
-/// are idempotent on a match. Skipping this equality on recovery therefore drops no identity
+/// are idempotent on a match. Skipping this equality once traded therefore drops no identity
 /// protection, only the frozen-balance assumption.
 pub fn check_start_baseline_bankroll(
-    store: FinancialBootStore,
-    fresh_activation: bool,
+    store: &str,
+    traded: bool,
     observed: Option<Decimal>,
     starting_bankroll: Decimal,
-) -> Result<(), FinancialBootBankrollError> {
-    if !fresh_activation {
-        return Ok(());
-    }
-    if observed == Some(starting_bankroll) {
-        return Ok(());
-    }
-    Err(FinancialBootBankrollError::BaselineDiffers {
-        store,
-        observed,
-        expected: starting_bankroll,
-    })
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        traded || observed == Some(starting_bankroll),
+        "{store} bankroll {observed:?} differs from QualificationStarted baseline {starting_bankroll}"
+    );
+    Ok(())
 }
 
 pub const PAPER_LOG_SCHEMA_VERSION: u32 = 2;
@@ -3206,118 +3174,33 @@ mod anchor_replay_tests {
 
 #[cfg(test)]
 mod financial_boot_gate_tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
     use rust_decimal_macros::dec;
 
-    const BASELINE: Decimal = dec!(10000);
-
-    fn check(
-        store: FinancialBootStore,
-        fresh: bool,
-        observed: Option<Decimal>,
-    ) -> Result<(), FinancialBootBankrollError> {
-        check_start_baseline_bankroll(store, fresh, observed, BASELINE)
-    }
-
-    /// A fresh activation is the one state where the era really must carry the Start baseline.
+    /// The gate is a pure table: an untraded store must carry the Start baseline exactly; a store
+    /// that has applied a fill is past the point where the baseline can hold. WHICH store counts as
+    /// untraded is decided in `main` from each store's own progress marker, and that wiring is
+    /// proven through the real binary (`scenario_source_log_boot::post_start_boot_*`).
     #[test]
-    fn a_fresh_activation_requires_the_start_baseline_in_both_stores() {
-        for store in [FinancialBootStore::Local, FinancialBootStore::Authoritative] {
-            assert!(check(store, true, Some(BASELINE)).is_ok(), "{store:?}");
-            // A balance that is merely close is still the wrong era to activate onto.
+    fn untraded_stores_require_the_start_baseline_and_traded_stores_do_not() {
+        let baseline = dec!(10000);
+        for store in ["local", "authoritative"] {
+            assert!(check_start_baseline_bankroll(store, false, Some(baseline), baseline).is_ok());
+            // Merely close is still the wrong era to activate onto.
             assert!(
-                check(store, true, Some(dec!(9999.99))).is_err(),
-                "{store:?}"
+                check_start_baseline_bankroll(store, false, Some(dec!(9999.99)), baseline).is_err()
             );
-            assert!(check(store, true, None).is_err(), "{store:?}");
+            assert!(check_start_baseline_bankroll(store, false, None, baseline).is_err());
+            assert!(
+                check_start_baseline_bankroll(store, true, Some(dec!(9987.66)), baseline).is_ok()
+            );
         }
-    }
-
-    /// #628 regression. Before the fresh/recovery split, these four assertions were the boot
-    /// failures `main` raised after the first fill — the service could not restart for the rest of
-    /// the era's life. A fill debits cash, so a recovering boot legitimately observes less than the
-    /// Start baseline in whichever store has projected it.
-    #[test]
-    fn recovery_accepts_a_bankroll_that_a_fill_already_moved() {
-        // Completed fill: both stores have debited.
-        assert!(check(FinancialBootStore::Local, false, Some(dec!(9987.66))).is_ok());
-        assert!(
-            check(
-                FinancialBootStore::Authoritative,
-                false,
-                Some(dec!(9987.66))
-            )
-            .is_ok()
-        );
-        // Authority applied the fill, the local projection has not caught up: the two stores
-        // disagree, and BOTH readings must still be admitted. Guarding this with the local fill
-        // count alone would have rejected the authoritative side here.
-        assert!(check(FinancialBootStore::Local, false, Some(BASELINE)).is_ok());
-        assert!(
-            check(
-                FinancialBootStore::Authoritative,
-                false,
-                Some(dec!(9987.66))
-            )
-            .is_ok()
-        );
-    }
-
-    /// The gate is about the balance only. Dropping it on recovery must not be read as dropping
-    /// Start identity, which `seed_financial_start` owns and enforces on both paths.
-    #[test]
-    fn recovery_drops_the_balance_assertion_and_nothing_else() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
-        db.init_bankroll(BASELINE).unwrap();
-
-        let start = AppendReceipt {
-            sequence: EventSeq(7),
-            this_hash: blake3::hash(b"start"),
-        };
-        assert!(db.financial_start().unwrap().is_none(), "fixture is fresh");
-        db.seed_financial_start(start).unwrap();
-        assert_eq!(db.financial_start().unwrap(), Some(start));
-
-        // Re-seeding the SAME Start is idempotent, which is what every recovering boot does.
-        db.seed_financial_start(start).unwrap();
-
-        // A DIFFERENT Start is still refused, on the very path where the balance check no longer
-        // runs — so recovery has not become a hole.
-        let impostor = AppendReceipt {
-            sequence: EventSeq(7),
-            this_hash: blake3::hash(b"impostor"),
-        };
-        assert!(db.seed_financial_start(impostor).is_err());
-    }
-
-    /// The predicate is each store's own financial progress, NOT the presence of a Start.
-    /// Initial activation also carries a Start, and a service that seeds Start and then crashes
-    /// BEFORE any fill leaves a still-pristine era — which must keep the baseline protection.
-    #[test]
-    fn a_seeded_start_without_a_fill_is_still_a_fresh_era() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
-        db.init_bankroll(BASELINE).unwrap();
-        db.seed_financial_start(AppendReceipt {
-            sequence: EventSeq(7),
-            this_hash: blake3::hash(b"start"),
-        })
-        .unwrap();
-
-        // Start is recorded, but nothing has traded: the era is pristine and a wrong balance here
-        // must still refuse. A Start-presence predicate would have waved this through.
-        assert_eq!(db.fills_count().unwrap(), 0);
-        assert_eq!(db.financial_last_prepared_seq().unwrap(), None);
-        assert!(
-            check(
-                FinancialBootStore::Local,
-                db.fills_count().unwrap() == 0,
-                Some(dec!(1))
-            )
-            .is_err()
+        let refusal = check_start_baseline_bankroll("local", false, Some(dec!(1)), baseline)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            refusal.as_deref(),
+            Some("local bankroll Some(1) differs from QualificationStarted baseline 10000")
         );
     }
 }
