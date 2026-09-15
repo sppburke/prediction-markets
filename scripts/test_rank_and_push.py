@@ -870,6 +870,87 @@ class RankAndPushScenario(unittest.TestCase):
             self.assertEqual(manifest["universe"]["backfill_partial_wallets"], ["0xabc"])
 
     def test_v2_cycle_manifest_uses_only_completed_generations_and_stamps_versions(self):
+        db = self.root / "data" / "wallet_cache.db"
+        db.unlink()
+        with sqlite3.connect(db) as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 2;
+                CREATE TABLE wallets (
+                    wallet_hex TEXT PRIMARY KEY, is_active INTEGER NOT NULL,
+                    is_infra INTEGER NOT NULL
+                );
+                CREATE VIEW active_tradeable_wallets AS
+                    SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+                CREATE TABLE activity_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, cursors_json TEXT,
+                    completed_at_unix INTEGER, reference_sha256 TEXT,
+                    wallet_count INTEGER, receipt_set_digest TEXT,
+                    aggregate_digest TEXT, source_row_count INTEGER
+                );
+                CREATE TABLE activity_groups_v2 (
+                    wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
+                    coverage_generation INTEGER
+                );
+                CREATE TABLE clob_payout_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, terminal_kind TEXT,
+                    completed_at_unix INTEGER, manifest_json TEXT,
+                    terminal_page_sha256 TEXT
+                );
+                CREATE TABLE clob_payout_evidence_v2 (
+                    coverage_generation INTEGER, fetched_at_unix INTEGER
+                );
+                CREATE TABLE cache_v2_migration_state (
+                    singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
+                    ranker_projection_digest TEXT, ranker_classifier_version INTEGER
+                );
+                INSERT INTO wallets VALUES ('0xabc', 1, 0);
+                INSERT INTO activity_coverage_manifests_v2 VALUES
+                    (1, '{"0xabc":10}', 20, 'aa', 1, 'bb', 'cc', 2);
+                INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
+                INSERT INTO activity_groups_v2 VALUES ('0xignored', 99, 'TRADE', 2);
+                INSERT INTO activity_groups_v2 VALUES ('0xabc', 98, 'REDEEM', 1);
+                INSERT INTO clob_payout_coverage_manifests_v2 VALUES
+                    (3, 'end_cursor', 30, '{}', 'dd');
+                INSERT INTO clob_payout_evidence_v2 VALUES (3, 29);
+                INSERT INTO clob_payout_evidence_v2 VALUES (2, 97);
+                INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 1);
+                """
+            )
+
+        # Direct test of the snapshot owner: an installed schema-two cache now runs
+        # the candidate lane in the wrapper, so the decoy rows are checked here.
+        sys.path.insert(0, str(self.root / "scripts"))
+        try:
+            import importlib
+            rank_cycle_manifest = importlib.import_module("rank_cycle_manifest")
+        finally:
+            sys.path.pop(0)
+        manifest = rank_cycle_manifest.snapshot(
+            db, "2026-09-15",
+            {"activity_schema": 2, "activity_parser": 2, "clob_resolution_schema": 2,
+             "clob_resolution_parser": 2, "cache_schema": 2, "configuration": 1},
+            {"top_n": "200"},
+        )
+        self.assertEqual(manifest["universe"]["backfill_partial_wallets"], [])
+        self.assertEqual(manifest["source_watermark"]["activity"]["generation"], 1)
+        self.assertEqual(manifest["source_watermark"]["activity"]["count"], 2)
+        self.assertEqual(manifest["source_watermark"]["activity"]["newest_source_unix"], 10)
+        self.assertEqual(manifest["source_watermark"]["activity"]["receipt_set_digest"], "bb")
+        self.assertEqual(
+            manifest["source_watermark"]["activity"]["ranker_projection"]["digest"], "ee"
+        )
+        self.assertEqual(manifest["source_watermark"]["resolution"]["generation"], 3)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["count"], 1)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["newest_fetch_unix"], 29)
+        self.assertEqual(
+            manifest["source_watermark"]["resolution"]["terminal_page_sha256"], "dd"
+        )
+        self.assertEqual(manifest["versions"]["activity_parser"], 2)
+        self.assertEqual(manifest["versions"]["clob_resolution_schema"], 2)
+        self.assertEqual(manifest["versions"]["ranker"], 1)
+
+    def test_installed_schema_two_cache_runs_the_candidate_lane_and_captures_its_generation(self):
         """An installed schema-two cache runs the private-candidate lane; the
         accepted capture reads only the newly completed generation of the
         installed file and stamps the pipeline versions."""
@@ -1444,7 +1525,9 @@ class RankAndPushScenario(unittest.TestCase):
             "    print(json.dumps({'generation': generation}))\n"
             "elif sub == 'cache-populate-payout-v2':\n"
             "    with sqlite3.connect(db) as c:\n"
-            "        generation = int(c.execute('SELECT COALESCE(MAX(generation), 0) + 1 FROM clob_payout_coverage_manifests_v2').fetchone()[0])\n"
+            "        active = c.execute('SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1').fetchone()\n"
+            "        generation = int(active[0]) if active else int(c.execute('SELECT COALESCE(MAX(generation), 0) + 1 FROM clob_payout_coverage_manifests_v2').fetchone()[0])\n"
+            "        c.execute('DELETE FROM clob_payout_walk_state_v2')\n"
             "        c.execute('INSERT INTO clob_payout_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?)', (generation, 'end_cursor', now, '{}', 'dd'))\n"
             "        c.execute('DELETE FROM clob_payout_evidence_v2'); c.execute('INSERT INTO clob_payout_evidence_v2 VALUES (?, ?)', (generation, now))\n"
             "    print(json.dumps({'generation': generation}))\n"
@@ -1520,7 +1603,60 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
         self.assertEqual(self._bootstrap_ops(), ops_before, "unchanged day restaged or recollected")
-        print("PASS: initial schema-two cutover lane completes one supervised cycle and then skips")
+
+        # A changed installed watermark starts a complete second cycle from the
+        # installed schema-two result with no opt-in: generation 2, a new
+        # candidate beside the same physical file, a second publication.
+        (self.root / ".env").write_text(
+            "SUPABASE_URL=http://127.0.0.1:9\nSUPABASE_SECRET_KEY=test-secret\n"
+        )
+        with sqlite3.connect(fixed) as connection:
+            connection.execute("INSERT INTO activity_groups_v2 VALUES ('0xabc', 99, 'TRADE', 1)")
+        third = self._run()
+        self.assertEqual(third.returncode, 0, third.stderr + third.stdout)
+        self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", third.stdout)
+        later_ops = self._bootstrap_ops()[len(ops_before):]
+        self.assertEqual(
+            later_ops,
+            ["cache-stage-v2", "winner-discovery", "activate-next", "cache-populate-activity-v2",
+             "cache-populate-payout-v2", "cache-finalize-v2", "prices-history",
+             "cache-finalize-v2", "cache-activate"],
+        )
+        self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
+        cycles = sorted((self.root / "data/eval-results").glob("cron-*"))
+        self.assertEqual(len(cycles), 2)
+        self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 2)
+        self.assertEqual(list((self.root / "phys").glob("wallet_cache.*.side.db")), [])
+        accepted = json.loads((cycles[-1] / "accepted_cycle_manifest.json").read_text())
+        self.assertEqual(accepted["source_watermark"]["activity"]["generation"], 2)
+        self.assertEqual(len((self._log("push.log") or "").splitlines()), 8)
+        print("PASS: initial schema-two cutover lane completes, skips unchanged, then runs a second full cycle")
+
+    def test_explicit_resume_pending_in_the_candidate_lane_captures_from_the_physical_fixed_path(self):
+        """The request binds the physical fixed path; explicit recovery activates
+        it, captures the accepted watermark from that path (not the default
+        repository name), and the next zero-argument run skips."""
+        fixed = self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+        first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        pending = self.root / "data/eval-results/rank_and_push.pending"
+        self.assertTrue(pending.is_file())
+        out = Path(pending.read_text().strip()).parent
+        request = json.loads((self.root / out / "ranking_publish_request.json").read_text())
+        self.assertEqual(request["cache_activation"]["fixed_path"], str(fixed))
+        ops_before = self._bootstrap_ops()
+        resumed = self._run("--resume-pending")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+        self.assertEqual(self._bootstrap_ops(), ops_before + ["cache-activate"])
+        self.assertIn(f"capture --db {fixed}", self._log("python_invocations.log"))
+        accepted = json.loads((self.root / out / "accepted_cycle_manifest.json").read_text())
+        self.assertEqual(accepted["source_watermark"]["activity"]["generation"], 2)
+        self.assertFalse(pending.exists())
+        skipped = self._run()
+        self.assertEqual(skipped.returncode, 0, skipped.stderr + skipped.stdout)
+        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", skipped.stdout)
+        print("PASS: explicit candidate-lane recovery captures from the request's fixed path")
 
     def test_recurring_lane_advances_generation_and_reuses_a_completed_payout_walk(self):
         """PASS: an installed schema-two cache selects the lane without the opt-in,
@@ -1528,10 +1664,15 @@ class RankAndPushScenario(unittest.TestCase):
         reuses the same names, resumes the same generation, skips the completed
         payout walk and publishes. FAIL: a migration, a new payout walk, another
         candidate, or a changed generation on retry."""
-        self._install_candidate_layout(schema=2)
+        fixed = self._install_candidate_layout(schema=2)
         self._install_candidate_stub()
+        # The installed cache carries an interrupted payout walk: the prior fixes
+        # the cycle's payout target to that generation, not to newest+1.
+        with sqlite3.connect(fixed) as connection:
+            connection.execute("INSERT INTO clob_payout_walk_state_v2 VALUES (1, 4)")
         first = self._run(exit_env={"STUB_EXIT_cache_finalize_v2": "75"})
         self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        self.assertIn("[targets] activity generation 2; payout generation 4 (complete=0)", first.stdout)
         cycle = self.root / "data/eval-results/rank_and_push.cycle"
         self.assertTrue(cycle.is_file())
         out = Path(cycle.read_text().strip()).name
@@ -1557,7 +1698,8 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 1)
         accepted = json.loads((self.root / "data/eval-results" / out / "accepted_cycle_manifest.json").read_text())
         self.assertEqual(accepted["source_watermark"]["activity"]["generation"], 2)
-        self.assertIn("[payout] generation 2 already complete on the candidate; reused", second.stdout)
+        self.assertEqual(accepted["source_watermark"]["resolution"]["generation"], 4)
+        self.assertIn("[payout] generation 4 already complete on the candidate; reused", second.stdout)
         print("PASS: recurring lane resumes its own candidate and reuses the completed payout walk")
 
     def test_lane_is_frozen_with_the_cycle_across_opt_in_changes(self):
@@ -1610,7 +1752,7 @@ class RankAndPushScenario(unittest.TestCase):
             "PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n"
         )
         first = self._run()
-        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        self.assertEqual(first.returncode, 2, first.stderr + first.stdout)
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", first.stdout)
         pending = self.root / "data/eval-results/rank_and_push.pending"
         self.assertTrue(pending.is_file())
@@ -1621,6 +1763,20 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse((self.root / out / "accepted_cycle_manifest.json").exists())
         ops_before = self._bootstrap_ops()
 
+        # While the value stays `prepare`, neither recovery entry may activate.
+        for args in ((), ("--resume-pending",)):
+            held = self._run(*args)
+            self.assertEqual(held.returncode, 2, held.stderr + held.stdout)
+            self.assertIn("holds the prepared request", held.stderr)
+            self.assertEqual(self._bootstrap_ops(), ops_before)
+            self.assertTrue(pending.is_file())
+        with sqlite3.connect(fixed) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+
+        (self.root / ".env").write_text(
+            "SUPABASE_URL=http://127.0.0.1:9\nSUPABASE_SECRET_KEY=test-secret\n"
+            "PE_RANK_SCHEMA_TWO_CUTOVER=1\n"
+        )
         recovered = self._run()
         self.assertEqual(recovered.returncode, 0, recovered.stderr + recovered.stdout)
         self.assertIn("RANK_AND_PUSH_AUTO_RESUME_PENDING=", recovered.stdout)

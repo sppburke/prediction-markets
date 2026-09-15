@@ -200,16 +200,17 @@ type FinalizedProjectionState = (String, Option<i64>, Option<String>, Option<i64
 
 /// Versioned identity of one fresh activity collection recorded in the
 /// candidate's migration-state singleton (#588). `digest` binds the other
-/// fields and is the `reference_sha256` every receipt, manifest and projection
-/// row of that generation carries.
+/// fields and is the `reference_sha256` of that generation's receipts and
+/// activity manifest; projection rows bind it indirectly through their
+/// activity generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FreshCollectionIdentity {
-    pub version: u32,
-    pub generation: u64,
-    pub fixed_end_unix: i64,
-    pub wallets: Vec<String>,
-    pub digest: String,
+struct FreshCollectionIdentity {
+    version: u32,
+    generation: u64,
+    fixed_end_unix: i64,
+    wallets: Vec<String>,
+    digest: String,
 }
 
 impl FreshCollectionIdentity {
@@ -570,13 +571,16 @@ fn begin_or_resume_fresh_collection(
         }
         // Starting a generation clears the candidate's retained activity, so an
         // unfinished collection can only be resumed: its frozen universe is
-        // otherwise no longer derivable from this copy.
-        let completed: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM activity_coverage_manifests_v2 WHERE generation = ?1)",
-            params![to_i64(record.generation, "fresh activity generation")?],
-            |row| row.get(0),
+        // otherwise no longer derivable from this copy. Only a manifest that
+        // proves the recorded identity counts as complete.
+        let completed = completed_activity_manifest(
+            &transaction,
+            record.generation,
+            &record.digest,
+            record.fixed_end_unix,
+            &record.wallets,
         )?;
-        if !completed {
+        if completed.is_none() {
             return invalid(format!(
                 "fresh activity generation {} is incomplete; resume it instead of starting {generation}",
                 record.generation
@@ -786,10 +790,10 @@ async fn collect_activity_v2(
     )
 }
 
-// A source read that exhausted the fetcher's own retries on a transient or
-// rate-limited response is the supervised temporary failure (exit 75), the
-// same classification `clob.rs`/`events.rs` use; every completed wallet keeps
-// its durable receipt, so the retry fetches only the remainder.
+// A source read that exhausted the fetcher's transient retries, or that the
+// venue rate-limited, is the supervised temporary failure (exit 75), the same
+// classification `clob.rs`/`events.rs` use; every completed wallet keeps its
+// durable receipt, so the retry fetches only the remainder.
 fn activity_read_failure(wallet_hex: &str, error: ActivityReadError) -> BootstrapError {
     match error {
         ActivityReadError::Fetch {
@@ -2066,10 +2070,16 @@ pub fn stage_cache_cycle_v2(
     let _lock = crate::lock::CacheMutationLock::acquire(fixed_path)?;
     require_regular_file(fixed_path, "current fixed cache")?;
     require_same_device(fixed_path, prior_path, side_path)?;
+    // The copies delete and rename their `.pending` names, so those must be
+    // independent of every role as well.
+    let prior_pending = pending_path_for(prior_path);
+    let side_pending = pending_path_for(side_path);
     require_distinct_files(&[
         ("current fixed cache", fixed_path),
         ("immutable prior cache", prior_path),
         ("private candidate cache", side_path),
+        ("immutable prior staging file", &prior_pending),
+        ("private candidate staging file", &side_pending),
     ])?;
     if side_path.exists() {
         require_regular_file(side_path, "private candidate cache")?;
@@ -2081,7 +2091,16 @@ pub fn stage_cache_cycle_v2(
             ));
         }
         require_regular_file(prior_path, "immutable prior cache")?;
-        return stage_report(fixed_path, prior_path, side_path, None, true);
+        let report = stage_report(fixed_path, prior_path, side_path, None, true)?;
+        // A restart between adoption and the manifest write must not leave the
+        // initial seal without its authentic input.
+        if let Some(path) = build_manifest_path
+            && report.prior_schema != CACHE_SCHEMA_VERSION_V2
+            && !path.exists()
+        {
+            write_build_manifest(prior_path, &sha256_file(prior_path)?, path)?;
+        }
+        return Ok(report);
     }
     let prior_sha256 = if prior_path.exists() {
         require_regular_file(prior_path, "immutable prior cache")?;
@@ -2095,49 +2114,64 @@ pub fn stage_cache_cycle_v2(
         copy_file_atomic_verified(fixed_path, prior_path, Some(&fixed_sha256))?;
         fixed_sha256
     };
-    copy_file_atomic_verified(prior_path, side_path, Some(&prior_sha256))?;
-    let report = stage_report(fixed_path, prior_path, side_path, Some(prior_sha256), false)?;
     // An initial schema-one candidate is sealed by `cache-migrate-v2` against
-    // this authentic hash-bound build manifest; the candidate and the prior are
-    // byte-identical here, so the verified prior hash is the backup hash.
+    // this authentic hash-bound build manifest; the candidate is a byte copy
+    // of the verified prior, so the prior hash is the backup hash. Written
+    // before the candidate is adopted so an interrupted cycle resumes with it.
     if let Some(path) = build_manifest_path
-        && report.prior_schema != CACHE_SCHEMA_VERSION_V2
+        && verified_user_version(prior_path)? != CACHE_SCHEMA_VERSION_V2
         && !path.exists()
     {
-        let prior = open_existing_ro(prior_path)?;
-        let newest_trade: Option<i64> =
-            prior.query_row("SELECT MAX(timestamp_unix) FROM trades", [], |row| {
-                row.get(0)
-            })?;
-        let newest_resolution: Option<i64> = prior.query_row(
-            "SELECT MAX(fetched_at_unix) FROM market_resolutions",
+        write_build_manifest(prior_path, &prior_sha256, path)?;
+    }
+    copy_file_atomic_verified(prior_path, side_path, Some(&prior_sha256))?;
+    stage_report(fixed_path, prior_path, side_path, Some(prior_sha256), false)
+}
+
+fn write_build_manifest(
+    prior_path: &Path,
+    prior_sha256: &str,
+    path: &Path,
+) -> Result<(), BootstrapError> {
+    let prior = open_existing_ro(prior_path)?;
+    let newest_trade: Option<i64> =
+        prior.query_row("SELECT MAX(timestamp_unix) FROM trades", [], |row| {
+            row.get(0)
+        })?;
+    let newest_resolution: Option<i64> = prior.query_row(
+        "SELECT MAX(fetched_at_unix) FROM market_resolutions",
+        [],
+        |row| row.get(0),
+    )?;
+    let clob_cursor: Option<String> = prior
+        .query_row(
+            "SELECT value FROM source_cursor WHERE key = 'clob_closed'",
             [],
             |row| row.get(0),
-        )?;
-        let clob_cursor: Option<String> = prior
-            .query_row(
-                "SELECT value FROM source_cursor WHERE key = 'clob_closed'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        prior.close().map_err(|(_, error)| error)?;
-        atomic_write_json(
-            path,
-            &CacheV2BuildManifest {
-                manifest_version: CACHE_BUILD_MANIFEST_VERSION,
-                backup_sha256: report.prior_sha256.clone().unwrap_or_default(),
-                source_bounds: serde_json::json!({
-                    "newest_trade_unix": newest_trade,
-                    "newest_resolution_fetch_unix": newest_resolution,
-                }),
-                cursors: serde_json::json!({ "clob_closed": clob_cursor }),
-                hashes: BTreeMap::new(),
-                sealed_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
-            },
-        )?;
-    }
-    Ok(report)
+        )
+        .optional()?;
+    prior.close().map_err(|(_, error)| error)?;
+    atomic_write_json(
+        path,
+        &CacheV2BuildManifest {
+            manifest_version: CACHE_BUILD_MANIFEST_VERSION,
+            backup_sha256: prior_sha256.to_owned(),
+            source_bounds: serde_json::json!({
+                "newest_trade_unix": newest_trade,
+                "newest_resolution_fetch_unix": newest_resolution,
+            }),
+            cursors: serde_json::json!({ "clob_closed": clob_cursor }),
+            hashes: BTreeMap::new(),
+            sealed_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+        },
+    )
+}
+
+fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
+    let connection = open_existing_ro(path)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(version)
 }
 
 /// The staged roles must be independent files: the same path, a hard link or a
@@ -2195,9 +2229,7 @@ fn stage_report(
     prior_sha256: Option<String>,
     resumed: bool,
 ) -> Result<CacheStageReport, BootstrapError> {
-    let prior = open_existing_ro(prior_path)?;
-    let prior_schema: i64 = prior.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    prior.close().map_err(|(_, error)| error)?;
+    let prior_schema = verified_user_version(prior_path)?;
     Ok(CacheStageReport {
         fixed_path: std::fs::canonicalize(fixed_path)?,
         prior_path: std::fs::canonicalize(prior_path)?,
@@ -3066,6 +3098,10 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), Bootstra
     sync_parent(path)
 }
 
+fn pending_path_for(target: &Path) -> PathBuf {
+    sidecar_path(target, ".pending")
+}
+
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
     value.push(suffix);
@@ -3145,9 +3181,7 @@ fn copy_file_atomic_verified(
     target: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<(), BootstrapError> {
-    let mut pending = target.as_os_str().to_owned();
-    pending.push(".pending");
-    let pending = PathBuf::from(pending);
+    let pending = pending_path_for(target);
     match std::fs::remove_file(&pending) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

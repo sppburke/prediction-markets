@@ -571,13 +571,14 @@ hash covers the installed bytes:
 PE_PYTHON="$PE_PYTHON" bash scripts/rank_and_push.sh \
   --db "$CACHE_V2_SIDE" --engine duck \
   --cache-stage-record "$CACHE_STAGE_RECORD" \
-  --fixed-db data/wallet_cache.db \
+  --fixed-db "$FIXED_PHYSICAL" \
   --prior-cache-backup "$CACHE_PRIOR_BACKUP" \
   --skip-discovery --skip-backfill
 ```
 
-The exact publication request carries the side path, fixed path, generic prior-backup path, and
-stage hash inside its `publish_key`. If the process stops after preparation, the existing pending
+`FIXED_PHYSICAL` is the regular file behind `data/wallet_cache.db` (`readlink -f`); activation and
+restore refuse a symbolic link. The exact publication request carries the side path, fixed path,
+generic prior-backup path, and stage hash inside its `publish_key`. If the process stops after preparation, the existing pending
 pointer resumes idempotent activation before publication; no additional pointer is used. Before
 either first activation or resumed activation, the publisher validates the complete request and
 returns the sole activation tuple consumed by the wrapper. A content-hash mismatch therefore fails
@@ -596,7 +597,7 @@ hash and schema. Preserve the displaced cache for audit:
 
 ```bash
 pe-bootstrap cache-restore-prior \
-  --fixed-db data/wallet_cache.db \
+  --fixed-db "$FIXED_PHYSICAL" \
   --backup "$CACHE_PRIOR_BACKUP" \
   --displaced-backup "$DISPLACED_CACHE_BACKUP" \
   --prior-sha256 "$PRIOR_CACHE_SHA256" \
@@ -631,8 +632,8 @@ and every retained history, without a frozen reference:
 pe-bootstrap cache-stage-v2 --db "$FIXED_PHYSICAL" --prior "$PRIOR" --side "$SIDE" \
   --manifest "$CACHE_BUILD_MANIFEST"
 pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   # initial only
-pe-bootstrap winner-discovery --defer-activation           # PE_BOOTSTRAP_CACHE_PATH=$SIDE
-pe-bootstrap activate-next --batch-id "$BATCH" --audit-csv "$AUDIT"
+pe-bootstrap winner-discovery --db "$SIDE" --defer-activation
+pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
 pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # unless generation T is complete
 pe-bootstrap cache-finalize-v2 --db "$SIDE" --stage-record "$CACHE_STAGE_RECORD"
@@ -648,8 +649,9 @@ candidate knows, and an unfinished generation can only be resumed. A retry with 
 `N` keeps the recorded end and wallet list and fetches only wallets without a valid
 receipt; a completed generation returns its manifest without any source call. Fresh reads
 request each wallet's full history (`start=1` on the wire; an omitted `start` returns only
-the venue's recent window). A `Transient`/`RateLimited` read that exhausts the fetcher's
-retries exits `rank_and_push_tempfail_exit` (75) so the supervisor resumes the collection.
+the venue's recent window). A read that exhausts the fetcher's transient retries or is
+rate-limited by the venue exits `rank_and_push_tempfail_exit` (75) so the supervisor resumes the
+collection.
 Finalization, activation and the installed-cache validator accept the fresh identity without
 a frozen-payload row; caches finalized under the frozen flow keep their authentic legacy
 identity, including caches that physically lack the new column.
@@ -689,35 +691,44 @@ Fixed, prior, candidate and displaced files must be independent regular files on
 filesystem; staging refuses the same path, a hard link or a symbolic link among them. A
 completed prior is never rewritten and a candidate without its prior is refused. The
 existing locked prior-hash comparison at activation refuses a fixed cache changed after the
-prior was captured; resume with the recorded candidate and prior, or start a new cycle.
+prior was captured; resume with the recorded candidate and prior, or, only while no request
+has been prepared, abandon the cycle as described under recovery states and start a new one.
 
 **Initial cutover and acceptance.** Complete any outstanding schema-one cycle and its
 publication first. Create the two aliases, check free space for two additional copies of
 the fixed file on that filesystem, then set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and run
-one zero-argument cycle (under the supervisor or by hand while it is paused with
-`scripts/deploy/forge_pause.sh`). It stages, seals, collects the full union, walks payout,
+one zero-argument cycle, either under the supervisor or by hand while it is paused with
+`scripts/deploy/forge_pause.sh`. It stages, seals, collects the full union, walks payout,
 finalizes, ranks and prepares the exact request; the publisher's unchanged freshness checks
 decide acceptance. On acceptance the wrapper prints `RANK_AND_PUSH_PREPARED_ONLY=<request>`
-and exits 75 with the pending pointer retained and the installed cache untouched. Record the
-measurement from the cycle artifacts: the wallet union (`wallet_count` in the activity
-manifest of the candidate's `activity_coverage_manifests_v2`, also in
-`candidate_cycle_manifest.json`), the candidate size, elapsed time from the cycle log, and
-the source times the publisher accepted. Then set the value to `1`; the pending-publication
-recovery activates and publishes exactly that request. If the publisher refuses (stale
-source times, incomplete coverage), the cycle stops with the installed cache untouched and
-the candidate, prior and log preserved; do not relabel times, narrow membership or relax
-freshness. Require the next real scheduled refresh and publication (installed schema two
-selects the lane automatically) before closing the classifier-two handoff.
+and exits 2 with the pending pointer retained and the installed cache untouched; under the
+supervisor that non-75 exit stops the loop deliberately. While the value stays `prepare`,
+neither recovery entry (automatic zero-argument or `--resume-pending`) activates: both print
+the same line and exit 2 with the pointer retained. Record the measurement from the cycle
+artifacts: the wallet union (`wallet_count` in the activity manifest of the candidate's
+`activity_coverage_manifests_v2`, also in `candidate_cycle_manifest.json`), the candidate
+size, elapsed time from the cycle log, and the source times the publisher accepted. Then set
+the value to `1` and start the supervisor (or run the zero-argument command once): the
+pending-publication recovery activates and publishes exactly that request. If the publisher
+refuses (stale source times, incomplete coverage), the cycle stops with the installed cache
+untouched and the candidate, prior and log preserved; do not relabel times, narrow
+membership or relax freshness. Require the next real scheduled refresh and publication
+(installed schema two selects the lane automatically) before closing the classifier-two
+handoff.
 
-**Recovery states.** Before a prepared request exists, an abandoned cycle is stopped by
-writing `stop`, removing `rank_and_push.cycle`, and deleting only that cycle's candidate;
-the fixed cache was never modified and the prior may be kept as evidence. Once a request is
-prepared, never delete it: the pending pointer resumes activation and publication. After
-activation but before the publication is consumed, `cache-restore-prior` with the cycle's
-prior and displaced names restores the exact prior bytes. After consumption, roll forward.
-Forge's boot card is failing (#637); the caches, repository and evaluation results live on
-the SSDs, but confirm the host before any cutover and keep the prior until the publication
-is confirmed.
+**Recovery states.** Before a prepared request exists, abandon a cycle only after
+`scripts/deploy/forge_pause.sh pause` reports the loop inactive with no cycle descendant and
+no held lock; then confirm `rank_and_push.pending` is absent and the cycle directory holds no
+`ranking_publish_request.json`, remove `rank_and_push.cycle`, and delete only that cycle's
+candidate. The fixed cache was never modified and the prior may be kept as evidence. Once a
+request is prepared, never delete it or start another cycle: the pending pointer resumes
+activation and publication. After activation but before the publication is consumed,
+`cache-restore-prior` with the cycle's prior and displaced names restores the exact prior
+bytes; the restore renames the prior file onto the fixed path, so the prior name is consumed
+and the supervisor must stay paused until the recovery is resolved. After consumption, roll
+forward. Forge's boot card is failing (#637); the caches, repository and evaluation results
+live on the SSDs, but confirm the host before any cutover and keep the prior until the
+publication is confirmed.
 
 ### Continuous Forge supervisor
 

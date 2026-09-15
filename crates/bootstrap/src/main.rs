@@ -34,7 +34,8 @@ async fn main() {
     //        cache is durable, re-run to retry failed items.
     //   75 = temporary failure (tempfail): a bounded retryable operation
     //        exhausted its in-process retries; the production loop supervisor
-    //        retries the cycle. Currently emitted by `events` and `resolutions`.
+    //        retries the cycle. Emitted by `events`, `resolutions`, and
+    //        `cache-populate-activity-v2` (transient or rate-limited reads).
 
     // ── Subcommands that take [--strict] [<toml-path>] ──────────────────────
     let known_sub = matches!(
@@ -118,7 +119,7 @@ async fn main() {
         let mut held_run_lock_pid_arg: Option<u32> = None;
         let mut fixed_end_arg: Option<i64> = None;
         let mut generation_arg: Option<u64> = None;
-        let mut fresh_generation_arg: Option<u64> = None;
+        let mut fresh_generation_arg: Option<Result<u64, String>> = None;
         let mut prior_arg: Option<std::path::PathBuf> = None;
         let mut side_arg: Option<std::path::PathBuf> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -277,9 +278,9 @@ async fn main() {
             } else if a == "--fresh-generation" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
-                fresh_generation_arg = rest[i].parse().ok();
+                fresh_generation_arg = Some(rest[i].parse().map_err(|_| rest[i].to_owned()));
             } else if let Some(v) = a.strip_prefix("--fresh-generation=") {
-                fresh_generation_arg = v.parse().ok();
+                fresh_generation_arg = Some(v.parse().map_err(|_| v.to_owned()));
             } else if a == "--prior" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -375,6 +376,12 @@ async fn main() {
                                         .to_owned(),
                                 });
                             }
+                            let generation =
+                                generation.map_err(|value| BootstrapError::Invalid {
+                                    message: format!(
+                                        "--fresh-generation requires an integer, got {value:?}"
+                                    ),
+                                })?;
                             let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                                 &bootstrap_config.cache_path,
                             )?;

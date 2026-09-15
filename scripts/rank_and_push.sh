@@ -988,6 +988,11 @@ activate_bound_cache() {
   # The request's fixed path is the installed cache the accepted watermark
   # must be captured from on every entry, including recovery.
   ACCEPTED_DB="${binding[1]}"
+  if [[ "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" == "prepare" ]]; then
+    echo "RANK_AND_PUSH_PREPARED_ONLY=$request_path"
+    echo "FATAL: PE_RANK_SCHEMA_TWO_CUTOVER=prepare holds the prepared request at the acceptance boundary; set it to 1 to activate and publish" >&2
+    return 2
+  fi
   local -a lock_handoff=(
     --held-run-lock-fd 8
     --held-run-lock-pid "$$"
@@ -1014,11 +1019,13 @@ if [[ "$CUTOVER_MODE" == "1" && "$RESUME_PENDING" != "1" ]]; then
   if [[ "$push_rc" -eq 0 && "$FRESH_LANE" == "1" && "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" == "prepare" ]]; then
     # Acceptance boundary (#588 §6.3): the full candidate has reached exact
     # request preparation within the publisher's unchanged freshness checks.
-    # Stop here with the pending request retained; the operator records the
-    # measurement, then the ordinary pending-publication recovery activates
-    # and publishes exactly this request.
+    # Stop here with the pending request retained. Exit 2 stops the supervisor
+    # (non-75) instead of retrying into activation; recovery refuses to
+    # activate until the operator records the measurement and sets the value
+    # to 1, after which the ordinary pending-publication recovery activates and
+    # publishes exactly this request.
     echo "RANK_AND_PUSH_PREPARED_ONLY=$PUBLISH_REQUEST_FILE"
-    exit 75
+    exit 2
   fi
   if [[ "$push_rc" -eq 0 ]]; then
     activate_bound_cache "$PUBLISH_REQUEST_FILE"
