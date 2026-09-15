@@ -3,8 +3,9 @@ use pe_bootstrap::{
     cache::WalletCache,
     cache_migration::{
         CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
-        activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2, populate_activity_v2,
-        restore_prior_cache, verify_frozen_payload_v1,
+        activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2,
+        populate_activity_fresh_v2, populate_activity_v2, restore_prior_cache,
+        stage_cache_cycle_v2, verify_frozen_payload_v1,
     },
     config, coverage,
     error::BootstrapError,
@@ -63,6 +64,7 @@ async fn main() {
                 | "cache-finalize-v2"
                 | "cache-activate"
                 | "cache-restore-prior"
+                | "cache-stage-v2"
                 | "pipeline-versions"
         )
     );
@@ -116,6 +118,9 @@ async fn main() {
         let mut held_run_lock_pid_arg: Option<u32> = None;
         let mut fixed_end_arg: Option<i64> = None;
         let mut generation_arg: Option<u64> = None;
+        let mut fresh_generation_arg: Option<u64> = None;
+        let mut prior_arg: Option<std::path::PathBuf> = None;
+        let mut side_arg: Option<std::path::PathBuf> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -269,6 +274,24 @@ async fn main() {
                 generation_arg = rest[i].parse().ok();
             } else if let Some(v) = a.strip_prefix("--generation=") {
                 generation_arg = v.parse().ok();
+            } else if a == "--fresh-generation" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                fresh_generation_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--fresh-generation=") {
+                fresh_generation_arg = v.parse().ok();
+            } else if a == "--prior" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                prior_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--prior=") {
+                prior_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--side" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                side_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--side=") {
+                side_arg = Some(std::path::PathBuf::from(v));
             } else if a == "--stage" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -305,6 +328,7 @@ async fn main() {
                 | "cache-finalize-v2"
                 | "cache-activate"
                 | "cache-restore-prior"
+                | "cache-stage-v2"
         ) {
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             let result = match sub {
@@ -334,6 +358,37 @@ async fn main() {
                     }),
                 "cache-populate-activity-v2" => {
                     async {
+                        let fetcher = pe_source_polymarket_public::ReqwestFetcher::new(
+                            reqwest::Client::new(),
+                        );
+                        // Fresh mode (#588): no frozen reference; a newly started
+                        // generation is bounded by the same settled read end the
+                        // legacy poller uses, and a recorded generation keeps its end.
+                        if let Some(generation) = fresh_generation_arg {
+                            if frozen_payload_arg.is_some()
+                                || fixed_end_arg.is_some()
+                                || generation_arg.is_some()
+                            {
+                                return Err(BootstrapError::Invalid {
+                                    message: "--fresh-generation cannot be combined with \
+                                              --frozen-payload, --fixed-end, or --generation"
+                                        .to_owned(),
+                                });
+                            }
+                            let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                                &bootstrap_config.cache_path,
+                            )?;
+                            return populate_activity_fresh_v2(
+                                &bootstrap_config.cache_path,
+                                &fetcher,
+                                &bootstrap_config.polymarket_base_url,
+                                generation,
+                                now - pe_bootstrap::polymarket::ACTIVITY_SETTLE_LAG_SECS,
+                                now,
+                            )
+                            .await
+                            .and_then(json_report);
+                        }
                         let (fixed_end, generation) = fixed_end_arg.zip(generation_arg).ok_or_else(
                             || BootstrapError::Invalid {
                                 message: "cache-populate-activity-v2 requires integer --fixed-end and --generation"
@@ -349,9 +404,6 @@ async fn main() {
                         let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                             &bootstrap_config.cache_path,
                         )?;
-                        let fetcher = pe_source_polymarket_public::ReqwestFetcher::new(
-                            reqwest::Client::new(),
-                        );
                         populate_activity_v2(
                             &bootstrap_config.cache_path,
                             &fetcher,
@@ -366,6 +418,20 @@ async fn main() {
                     }
                     .await
                 }
+                "cache-stage-v2" => prior_arg
+                    .zip(side_arg)
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "cache-stage-v2 requires --db, --prior, and --side".to_owned(),
+                    })
+                    .and_then(|(prior, side)| {
+                        stage_cache_cycle_v2(
+                            &bootstrap_config.cache_path,
+                            &prior,
+                            &side,
+                            manifest_arg.as_deref(),
+                        )
+                        .and_then(json_report)
+                    }),
                 "cache-populate-payout-v2" => {
                     async {
                         let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
