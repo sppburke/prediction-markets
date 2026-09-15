@@ -2728,6 +2728,17 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert!(!staged.resumed);
     assert_eq!(staged.prior_schema, 1);
     assert!(!interrupted.exists());
+    // Checked before any test connection reopens a role: a later read-write
+    // close would tidy sidecars that staging itself left behind.
+    for role in [&prior, &side] {
+        for suffix in ["db-wal", "db-shm"] {
+            assert!(
+                !role.with_extension(suffix).exists(),
+                "staging left a sidecar beside {}",
+                role.display()
+            );
+        }
+    }
     let fixed_sha256 = sha256_file(&fixed).unwrap();
     assert_eq!(staged.prior_sha256.as_deref(), Some(fixed_sha256.as_str()));
     assert_eq!(staged.side_sha256.as_deref(), Some(fixed_sha256.as_str()));
@@ -2746,15 +2757,6 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert_eq!(build.source_bounds["newest_trade_unix"], FRESH_END - 10);
     assert_eq!(build.cursors["clob_closed"], "");
     assert_eq!(staged.side_schema, 1);
-    for role in [&prior, &side] {
-        for suffix in ["db-wal", "db-shm"] {
-            assert!(
-                !role.with_extension(suffix).exists(),
-                "staging left a sidecar beside {}",
-                role.display()
-            );
-        }
-    }
     // A manifest lost before the seal is recreated from the immutable prior
     // and still seals the candidate.
     std::fs::remove_file(&manifest).unwrap();
@@ -2889,6 +2891,33 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert!(!nested.resumed);
     assert!(nested_manifest.is_file());
     assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
+    // `..` after a directory that does not exist yet steps back over it, so a
+    // manifest spelled through one still compares by identity: a spelling that
+    // lands on a role is refused and an ordinary target is written.
+    let manifest_on_role = dir.path().join("missing-a/../cron-8.side.db");
+    let dotted_role = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-8.prior.db"),
+        &dir.path().join("cron-8.side.db"),
+        Some(&manifest_on_role),
+    )
+    .unwrap_err();
+    assert!(
+        dotted_role.to_string().contains("not an independent file"),
+        "{dotted_role}"
+    );
+    assert!(!dir.path().join("cron-8.prior.db").exists());
+    let dotted_manifest = dir.path().join("missing-b/../dotted/build.json");
+    let dotted = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-9.prior.db"),
+        &dir.path().join("cron-9.side.db"),
+        Some(&dotted_manifest),
+    )
+    .unwrap();
+    assert!(!dotted.resumed);
+    assert!(dir.path().join("dotted/build.json").is_file());
+    assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
 }
 
 #[test]
@@ -2918,7 +2947,36 @@ fn cycle_staging_honors_a_seal_committed_only_to_the_write_ahead_log() {
         side.with_extension("db-wal").metadata().unwrap().len() > 0,
         "the committed write-ahead log must be left intact"
     );
+    // A connection that stays open across a resume keeps its shared-memory
+    // index and truncated log: staging never unlinks sidecars itself, so the
+    // held connection still commits and its write is visible afterwards.
+    sealing
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert_eq!(side.with_extension("db-wal").metadata().unwrap().len(), 0);
+    let held = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert_eq!(held.side_schema, 2);
+    assert!(side.with_extension("db-shm").exists());
+    let changed = sealing
+        .execute(
+            "UPDATE source_cursor SET value = 'live' WHERE key = 'clob_closed'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
     drop(sealing);
+    let value: String = Connection::open(&side)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM source_cursor WHERE key = 'clob_closed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(value, "live");
+    for suffix in ["db-wal", "db-shm"] {
+        assert!(!side.with_extension(suffix).exists());
+    }
 }
 
 #[tokio::test]

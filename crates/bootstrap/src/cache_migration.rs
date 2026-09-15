@@ -2140,7 +2140,10 @@ fn write_build_manifest(
     prior_sha256: &str,
     path: &Path,
 ) -> Result<(), BootstrapError> {
-    let prior = open_existing_ro(prior_path)?;
+    // A read-write connection that only reads: SQLite checkpoints and removes
+    // its own sidecars on close, under its own locks, when it is the last
+    // connection to the file.
+    let prior = open_existing_rw(prior_path)?;
     let newest_trade: Option<i64> =
         prior.query_row("SELECT MAX(timestamp_unix) FROM trades", [], |row| {
             row.get(0)
@@ -2158,7 +2161,6 @@ fn write_build_manifest(
         )
         .optional()?;
     prior.close().map_err(|(_, error)| error)?;
-    remove_idle_sidecars(prior_path)?;
     atomic_write_json(
         path,
         &CacheV2BuildManifest {
@@ -2191,26 +2193,14 @@ fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
 }
 
 /// Read the candidate's `user_version` through SQLite so a seal committed to
-/// the write-ahead log but not yet checkpointed is honored, then remove the
-/// idle sidecars this read created beside a closed candidate.
+/// the write-ahead log but not yet checkpointed is honored. The read-write
+/// connection only reads; SQLite removes the sidecars it created when this is
+/// the last connection to close and leaves them to any connection still open.
 fn candidate_user_version(path: &Path) -> Result<i64, BootstrapError> {
-    let connection = open_existing_ro(path)?;
+    let connection = open_existing_rw(path)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     connection.close().map_err(|(_, error)| error)?;
-    remove_idle_sidecars(path)?;
     Ok(version)
-}
-
-/// Remove an empty write-ahead log and, when no committed frames remain, the
-/// shared-memory index a closed read left behind. A non-empty log is durable
-/// state and is left intact together with its index.
-fn remove_idle_sidecars(path: &Path) -> Result<(), BootstrapError> {
-    let wal = sidecar_path(path, "-wal");
-    let wal_is_nonempty = wal.is_file() && std::fs::metadata(&wal)?.len() != 0;
-    if wal_is_nonempty {
-        return Ok(());
-    }
-    remove_sidecars(path)
 }
 
 /// The staged roles must be independent files: the same path, a hard link or a
@@ -2238,36 +2228,34 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
     Ok(())
 }
 
-/// Canonical form of a path that may not exist yet: its nearest existing
-/// ancestor is canonicalized and the remaining components are appended, so a
-/// manifest in a directory the writer will create still compares by identity.
+/// Canonical form of a path that may not exist yet. Each component that
+/// exists is resolved through the file system so a link compares by its
+/// target; a component that does not exist cannot be a link, so its spelling
+/// is kept and a following `..` steps back over it. A manifest in a directory
+/// the writer will create therefore still compares by identity.
 fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let mut existing = absolute.as_path();
-    let mut remainder = Vec::new();
-    loop {
-        if existing.exists() {
-            break;
-        }
-        let name = existing
-            .file_name()
-            .ok_or_else(|| BootstrapError::Invalid {
-                message: format!("{} has no existing ancestor", path.display()),
-            })?;
-        remainder.push(name.to_owned());
-        existing = existing.parent().ok_or_else(|| BootstrapError::Invalid {
-            message: format!("{} has no existing ancestor", path.display()),
-        })?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        let next = match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => resolved
+                .parent()
+                .unwrap_or(resolved.as_path())
+                .to_path_buf(),
+            other => resolved.join(other.as_os_str()),
+        };
+        resolved = if next.exists() {
+            std::fs::canonicalize(&next)?
+        } else {
+            next
+        };
     }
-    let mut canonical = std::fs::canonicalize(existing)?;
-    for name in remainder.into_iter().rev() {
-        canonical.push(name);
-    }
-    Ok(canonical)
+    Ok(resolved)
 }
 
 #[cfg(unix)]
