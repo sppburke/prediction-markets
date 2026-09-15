@@ -33,7 +33,9 @@ use crate::error::BootstrapError;
 use crate::infra_probe::{InfraProbe, ProbeClassification};
 
 const TRADE_FETCH_LIMIT: u32 = 500;
-const ACTIVITY_SETTLE_LAG_SECS: i64 = 120;
+/// Settled read bound shared by the legacy poller and the fresh cache
+/// collection (#588): the venue may still be indexing the newest seconds.
+pub const ACTIVITY_SETTLE_LAG_SECS: i64 = 120;
 const FORWARD_WINDOW_TARGET_ROWS: i64 = 2_000;
 const FORWARD_WINDOW_MAX_SECS: i64 = 31_536_000;
 const FORWARD_WINDOW_FIRST_SECS: i64 = 1;
