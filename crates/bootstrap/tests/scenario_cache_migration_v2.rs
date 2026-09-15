@@ -3048,6 +3048,23 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     );
     assert!(!dir.path().join("cron-13.prior.db").exists());
     assert!(!dir.path().join("build.json").exists());
+    // The candidate's and the fixed cache's SQLite sidecar names are roles:
+    // a prior named like the candidate's shared-memory index would be
+    // truncated when staging reads the candidate.
+    let sidecar_named_prior = dir.path().join("cron-14.side.db-shm");
+    let sidecar_role = stage_cache_cycle_v2(
+        &fixed,
+        &sidecar_named_prior,
+        &dir.path().join("cron-14.side.db"),
+        Some(&dir.path().join("build.json")),
+    )
+    .unwrap_err();
+    assert!(
+        sidecar_role.to_string().contains("not an independent file"),
+        "{sidecar_role}"
+    );
+    assert!(!sidecar_named_prior.exists());
+    assert!(!dir.path().join("cron-14.side.db").exists());
     assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
         !entry
             .unwrap()

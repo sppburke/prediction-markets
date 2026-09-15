@@ -2076,6 +2076,18 @@ pub fn stage_cache_cycle_v2(
     // independent of every role as well.
     let prior_pending = pending_path_for(prior_path);
     let side_pending = pending_path_for(side_path);
+    // SQLite creates or truncates the fixed cache's and the candidate's
+    // write-ahead and shared-memory sidecars when staging opens them, so
+    // those names are roles as well.
+    let sidecars: Vec<(&str, PathBuf)> = [
+        ("current fixed cache sidecar", fixed_path),
+        ("private candidate sidecar", side_path),
+    ]
+    .into_iter()
+    .flat_map(|(label, path)| {
+        ["-wal", "-shm"].map(move |suffix| (label, sidecar_path(path, suffix)))
+    })
+    .collect();
     let mut roles = vec![
         ("current fixed cache", fixed_path),
         ("immutable prior cache", prior_path),
@@ -2083,6 +2095,11 @@ pub fn stage_cache_cycle_v2(
         ("immutable prior staging file", prior_pending.as_path()),
         ("private candidate staging file", side_pending.as_path()),
     ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(label, path)| (*label, path.as_path())),
+    );
     // The manifest is checked and written under one spelling: its resolved
     // identity, whose parent directory exists. The writer's temporary file
     // beside it is a role too.
