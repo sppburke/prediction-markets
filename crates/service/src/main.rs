@@ -530,14 +530,24 @@ async fn main() -> Result<()> {
     paper_state
         .init_bankroll(starting_bankroll)
         .context("initialise paper-state bankroll")?;
+    // #628: the Start-baseline gate (`check_start_baseline_bankroll` documents why it binds only
+    // while a store is untraded). The progress marker is per-store on purpose: the authority can
+    // apply a fill before the local projection catches up, so one shared predicate would wrongly
+    // refuse one side or excuse the other. It is deliberately NOT "has a Start been recorded" —
+    // initial activation also carries a Start, and a service that seeds Start then crashes before
+    // any fill leaves a pristine era that must keep this protection.
     if financial_start.is_some() {
-        anyhow::ensure!(
+        pe_service::paper_recovery::check_start_baseline_bankroll(
+            "local",
+            paper_state
+                .fills_count()
+                .context("read the local financial fill count")?
+                > 0,
             paper_state
                 .bankroll()
-                .context("read Start-bound local bankroll")?
-                == Some(starting_bankroll),
-            "local bankroll differs from QualificationStarted before authority mutation"
-        );
+                .context("read Start-bound local bankroll")?,
+            starting_bankroll,
+        )?;
     }
     // #511: LEGACY-ONLY blind frame replay. In authoritative mode the boot frame-walk
     // below owns local application — every unresolved frame is decided by the authority
@@ -576,16 +586,18 @@ async fn main() -> Result<()> {
             &cfg.supabase_secret_key,
         );
         if let Some(start) = financial_start {
-            let authoritative_bankroll = client
-                .fetch_bankroll()
+            // #628: one observation, so the balance and the progress marker cannot straddle a
+            // concurrent fill and make a legitimate first fill look like a corrupt balance.
+            let authoritative = client
+                .fetch_bankroll_progress()
                 .await
                 .context("read Start-bound authoritative bankroll")?;
-            anyhow::ensure!(
-                authoritative_bankroll == Some(starting_bankroll),
-                "authoritative bankroll {:?} differs from QualificationStarted baseline {}",
-                authoritative_bankroll,
-                starting_bankroll
-            );
+            pe_service::paper_recovery::check_start_baseline_bankroll(
+                "authoritative",
+                authoritative.is_some_and(|(_, last_prepared_seq)| last_prepared_seq.is_some()),
+                authoritative.map(|(bankroll, _)| bankroll),
+                starting_bankroll,
+            )?;
             paper_state
                 .seed_financial_start(start)
                 .context("seed local financial Start")?;

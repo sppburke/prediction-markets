@@ -35,24 +35,14 @@ type SettledEntry = (Decimal, Vec<Decimal>, i64);
 use std::sync::Mutex;
 
 use pe_core_types::{
-    BasisPoints, CollateralAmount, ContractQty, KellyFraction, PolymarketConditionId,
-    PolymarketTokenId, Probability, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, StrategyId,
+    CollateralAmount, ContractQty, PolymarketConditionId, ReceivedAt, ShareAmount, SourceId,
+    SourceTimestamp, StrategyId,
 };
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
-use pe_execution_core::{
-    AdmissionReceipts, BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit,
-    LadderAskAudit, LadderPlanAudit, LiveAdmissionArtifactAudit, LiveMarketEvidenceAudit,
-    MarketSelection, ObservationEvidence, RiskAudit, RiskDecisionAudit, SizingAudit,
-    SizingModeAudit,
-};
 use pe_paper_state::{FillRecord, PaperStateDb};
-use pe_resolver_card::{
-    VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
-};
-use pe_risk_engine::RiskSnapshot;
 use pe_service::paper_recovery::{
     CanonicalFillResult, CanonicalResolutionResult, ExpectedAuthority, FinancialPayload,
     FinancialResult, PaperFillOperationIdentity, PaperLogFrame, PaperLogRecord,
@@ -66,7 +56,6 @@ use pe_service::supabase_state::{
     resolve_event_frames, supabase_authoritative_boot,
 };
 use pe_venue_core::OrderIntent;
-use pe_venue_polymarket::CompactFeeSchedule;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
@@ -579,13 +568,6 @@ async fn ac_settled_refusal_is_terminal_and_walk_advances() {
     println!("PASS: AC-SETTLED-WALK — refused frame disposed terminally, no resurrection");
 }
 
-fn active_receipt(sequence: u64, byte: u8) -> AppendReceipt {
-    AppendReceipt {
-        sequence: EventSeq(sequence),
-        this_hash: blake3::Hash::from_bytes([byte; 32]),
-    }
-}
-
 fn empty_tail() -> TailBinding {
     TailBinding {
         physical_tail: 5,
@@ -612,118 +594,6 @@ fn active_start_record() -> PaperLogRecord {
         parser_version: 1,
         financial_semantic_version: 1,
     }))
-}
-
-fn active_economic(
-    source_receipt: AppendReceipt,
-    financial_prefix: AppendReceipt,
-) -> EconomicPrepared {
-    let price = Price::new(dec!(0.5)).unwrap();
-    let shares = ShareAmount::from_whole(2).unwrap();
-    let principal = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
-    EconomicPrepared {
-        version: ECONOMIC_PREPARED_VERSION,
-        market: MarketSelection {
-            condition_id: PolymarketConditionId("condition".to_owned()),
-            outcome_index: 0,
-            token_id: PolymarketTokenId("token-0".to_owned()),
-            side: Side::Buy,
-            market_id: "condition".to_owned(),
-        },
-        admission: LiveAdmissionArtifactAudit {
-            market: LiveMarketEvidenceAudit {
-                condition_id: PolymarketConditionId("condition".to_owned()),
-                ordered_outcome_token_ids: [
-                    PolymarketTokenId("token-0".to_owned()),
-                    PolymarketTokenId("token-1".to_owned()),
-                ],
-                neg_risk: false,
-                minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
-                minimum_order_size: shares,
-                observed_at_unix: 1_800_000_000,
-                schema_version: 1,
-                parser_version: 1,
-                freshness_window_secs: 60,
-            },
-            settlement: VenueSettlementRecord {
-                schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
-                condition_id: PolymarketConditionId("condition".to_owned()),
-                status: VenueResolutionStatus::Unresolved,
-                raw_evidence_hash: "settlement".to_owned(),
-                source_timestamp_unix: Some(1_800_000_000),
-                observed_at_unix: 1_800_000_000,
-                parser_version: 1,
-                freshness_window_secs: 60,
-            },
-            fee_schedule: CompactFeeSchedule::Zero,
-            scheduled_end_unix: Some(1_800_003_600),
-            receipts: AdmissionReceipts {
-                gamma: active_receipt(1, 1),
-                clob_long: active_receipt(2, 2),
-                clob_compact: active_receipt(3, 3),
-            },
-        },
-        ladder: LadderPlanAudit {
-            used_asks: vec![LadderAskAudit { price, shares }],
-            best_ask: price,
-            limit_price: price,
-            minimum_shares: shares,
-            principal,
-        },
-        book_receipt: active_receipt(4, 4),
-        observation: Some(ObservationEvidence {
-            source_receipt,
-            complete_bound_receipt: source_receipt,
-            observed_unix_ms: 1_700_000_000_000,
-            provenance: "scenario_rest".to_owned(),
-        }),
-        sizing: SizingAudit {
-            mode: SizingModeAudit::Kelly {
-                fraction: KellyFraction::new(dec!(0.25)).unwrap(),
-                probability: Probability::new(dec!(0.6)).unwrap(),
-            },
-            budget: principal,
-            principal,
-            minimum_shares: shares,
-            expected_shares: shares,
-            expected_vwap: price,
-            all_in_price: price,
-            slippage_rate: Decimal::ZERO,
-        },
-        fee: FeeAudit {
-            schedule: CompactFeeSchedule::Zero,
-            expected_fee: CollateralAmount::ZERO,
-            reserve: CollateralAmount::ZERO,
-        },
-        risk: RiskAudit {
-            financial_prefix,
-            snapshot: RiskSnapshot {
-                leader_exposure_bps: BasisPoints::ZERO,
-                market_exposure_bps: BasisPoints::ZERO,
-                family_exposure_bps: BasisPoints::ZERO,
-                total_copy_exposure_bps: BasisPoints::ZERO,
-                intraday_pnl_bps: BasisPoints::ZERO,
-                rolling_7d_pnl_bps: BasisPoints::ZERO,
-                absolute_pnl_bps: BasisPoints::ZERO,
-                copy_latency_kill_switch_active: false,
-                proposed_trade_bps: BasisPoints(1_000),
-                per_trade_cap_bps: 1_000,
-                concentration_caps: None,
-            },
-            decision: RiskDecisionAudit::Approved,
-            price_receipts: Vec::new(),
-            evaluated_at_unix_ms: 1_800_000_000_000,
-        },
-        balance: BalanceAudit {
-            cash_before: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
-            worst_case_debit: principal,
-            price_impact_cap_bps: 100,
-            chase_ceiling: price,
-            band_floor: Price::ZERO,
-            band_ceiling_exclusive: Price::ONE,
-        },
-        applied_configuration_hash: "config".to_owned(),
-    }
 }
 
 fn append_active_record(writer: &mut Writer, record: &PaperLogRecord) -> AppendReceipt {
@@ -820,7 +690,7 @@ async fn active_fill_crash_matrix_converges_once() {
         );
         let payload = FinancialPayload::Fill {
             operation: operation.clone(),
-            economic: active_economic(source_receipt, start),
+            economic: support::economic_prepared(source_receipt, start),
         };
         let prepared_receipt = append_active_record(
             &mut writer,
@@ -1023,7 +893,7 @@ fn assert_authority_conflict<T>(result: Result<T, SupabaseStateError>, field: &s
 /// FAIL: a changed retry is reported existing/applied or changes the authority mutation count.
 #[tokio::test]
 async fn prepared_authority_changed_field_conflict_matrix() {
-    let start = active_receipt(10, 10);
+    let start = support::hashed_receipt(10, 10);
     let authority = FakeSupabaseState::prepared(dec!(10), start);
     let expected = ExpectedAuthority {
         qualification_start_receipt: start,
@@ -1034,9 +904,13 @@ async fn prepared_authority_changed_field_conflict_matrix() {
         source_trade_id: SourceTradeId("g2:authority-fill".to_owned()),
         observed_at_bucket: 1_800_000_000,
     };
-    let economic = active_economic(active_receipt(5, 5), start);
-    let request =
-        PreparedFillRequest::from_prepared(expected, active_receipt(11, 11), &operation, &economic);
+    let economic = support::economic_prepared(support::hashed_receipt(5, 5), start);
+    let request = PreparedFillRequest::from_prepared(
+        expected,
+        support::hashed_receipt(11, 11),
+        &operation,
+        &economic,
+    );
     authority.commit_prepared_fill(&request).await.unwrap();
     assert_eq!(authority.prepared_mutations(), 1);
     assert_eq!(
@@ -1090,13 +964,13 @@ async fn prepared_authority_changed_field_conflict_matrix() {
     changed_fill!("era", |value: &mut PreparedFillRequest| value
         .expected_authority
         .qualification_start_receipt =
-        active_receipt(10, 99));
+        support::hashed_receipt(10, 99));
     changed_fill!("prior_sequence", |value: &mut PreparedFillRequest| value
         .expected_authority
         .prior_completed_prepared_sequence =
         Some(EventSeq(9)));
     changed_fill!("prepared_sequence", |value: &mut PreparedFillRequest| {
-        value.prepared_receipt = active_receipt(12, 12)
+        value.prepared_receipt = support::hashed_receipt(12, 12)
     });
     for (field, changed) in fill_retries {
         assert_authority_conflict(authority.commit_prepared_fill(&changed).await, field);
@@ -1107,7 +981,7 @@ async fn prepared_authority_changed_field_conflict_matrix() {
             qualification_start_receipt: start,
             prior_completed_prepared_sequence: Some(EventSeq(11)),
         },
-        prepared_receipt: active_receipt(12, 12),
+        prepared_receipt: support::hashed_receipt(12, 12),
         condition: PolymarketConditionId("condition".to_owned()),
         payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
         settled_at_unix: 1_800_000_100,
@@ -1136,13 +1010,13 @@ async fn prepared_authority_changed_field_conflict_matrix() {
     changed.settled_at_unix += 1;
     resolution_retries.push(("settled_at_unix", changed));
     let mut changed = resolution.clone();
-    changed.expected_authority.qualification_start_receipt = active_receipt(10, 99);
+    changed.expected_authority.qualification_start_receipt = support::hashed_receipt(10, 99);
     resolution_retries.push(("era", changed));
     let mut changed = resolution.clone();
     changed.expected_authority.prior_completed_prepared_sequence = None;
     resolution_retries.push(("prior_sequence", changed));
     let mut changed = resolution.clone();
-    changed.prepared_receipt = active_receipt(13, 13);
+    changed.prepared_receipt = support::hashed_receipt(13, 13);
     resolution_retries.push(("prepared_sequence", changed));
     for (field, changed) in resolution_retries {
         assert_authority_conflict(authority.apply_prepared_resolution(&changed).await, field);
@@ -1206,7 +1080,7 @@ async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
                 qualification_start_receipt: start,
                 prior_completed_prepared_sequence: None,
             };
-            let economic = active_economic(source_receipt, start);
+            let economic = support::economic_prepared(source_receipt, start);
             let prepared = append_active_record(
                 &mut writer,
                 &PaperLogRecord::FinancialPrepared {

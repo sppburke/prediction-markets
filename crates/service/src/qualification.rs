@@ -4963,14 +4963,30 @@ pub fn run_financial_era(
         }
         FinancialEraCommand::RollbackCheck => rollback_check_financial_era(&manifest, config),
         FinancialEraCommand::Preflight => {
-            // Exactly four gate groups, every one of them reading a local file: the manifest
-            // (already validated above), the staged target configuration, the exported Financial15
-            // rows, and `status.json`. No database, no log scan — so this stays a seconds-long
-            // answer even when it runs with the service already stopped.
+            // Five gate groups: the manifest (already validated above), the staged target
+            // configuration, the exported Financial15 rows, `status.json`, and the membership
+            // proof. Four read a local file; the fifth reads the paper state. No log scan, so this
+            // stays a short answer even when it runs with the service already stopped.
             validate_financial_target_config(config)?;
             let config_rows = read_financial_config_rows(financial_config_rows_path)?;
             let hot_config_hash = derive_hot_config_hash(&config_rows, config)?;
             let accounts = verify_live_status_posture(&config.status_path)?;
+            // #624: this is the gate that cost 100 minutes of downtime. `prepare` evaluates the
+            // membership proof roughly 95 minutes AFTER the stop, so a single member missing its
+            // `position_validations` row was discovered with production already down and the
+            // window unrecoverable. It is a local read, so it belongs here with the others.
+            //
+            // The opener is the one `prepare` itself uses: read-only, `query_only`, a 5s busy
+            // timeout, and it admits an unmigrated schema. That matters because the PRE-stop
+            // preflight runs while the live service still holds the database; WAL allows the
+            // concurrent reader.
+            //
+            // This shrinks the exposure rather than removing it: a stopped service commits no
+            // activity, so validations freeze at the stop, and the residual race between a passing
+            // preflight and `prepare` collapses from ~100 minutes to the seconds in between.
+            let state =
+                PaperStateDb::open_read_only_allowing_unmigrated(&manifest.paths.paper_state)?;
+            derive_membership_proofs_hash(&state, &manifest.membership)?;
             // Name what was proven. The driver records this, so a later reader can tell which gates
             // this observation covered and which ones only the post-stop preparation runs.
             Ok(serde_json::to_string(&serde_json::json!({
@@ -4979,6 +4995,7 @@ pub fn run_financial_era(
                     "financial_target_config",
                     "financial15_config_rows",
                     "live_status_posture",
+                    "membership_proof",
                 ],
                 "hot_config_hash": hot_config_hash,
                 "live_accounts": accounts.len(),
@@ -10646,7 +10663,38 @@ mod tests {
     /// Give the fixture the offline authority inputs `validate_financial_target_config` requires,
     /// and write the exported Financial15 rows the preflight reads.
     fn preflight_fixture(root: &Path) -> (FinancialEraManifest, ServiceConfig, PathBuf) {
-        let (manifest, mut config) = financial_era_live_source_fixture(root);
+        let (mut manifest, mut config) = financial_era_live_source_fixture(root);
+        // #628: one valid member, so the membership-proof gate has something to prove. Same rows
+        // as `initial_membership_proof_does_not_read_current_projection`.
+        let member = WalletAddress([42; 20]);
+        let at = manifest.start_unix;
+        let state = PaperStateDb::open(&manifest.paths.paper_state).unwrap();
+        state
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet: member,
+                complete: true,
+                proof_json: "{\"complete\":true}".to_owned(),
+                updated_at_unix: at,
+            })
+            .unwrap();
+        state.seed_cursors_if_absent(&[(member, at)]).unwrap();
+        state
+            .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                history_status: None,
+                wallet: member,
+                balances: Vec::new(),
+                activity_cutoff_unix: at,
+                anchored_at_unix: at,
+                ledger_hash_after: "ledger".to_owned(),
+                positions_proof_hash: "positions".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "g557".to_owned(),
+                proof_json: "{\"anchor\":1}".to_owned(),
+                recorded_at_unix: at,
+            }])
+            .unwrap();
+        drop(state);
+        manifest.membership = vec![member];
         config.supabase_authoritative = true;
         config.supabase_url = "https://example.invalid".to_owned();
         config.supabase_secret_key = "service-role".to_owned();
@@ -10670,7 +10718,7 @@ mod tests {
         )
     }
 
-    /// #618. The preflight must cover exactly the four gate groups that are valid against a running
+    /// #618, #628. The preflight must cover exactly the five gate groups that are valid against a running
     /// service, and NOT the journal, source-log or paper-state gates — those assert on a tail that
     /// is still moving while the service runs.
     ///
@@ -10678,21 +10726,23 @@ mod tests {
     /// an implementation that read the live journal but not the source log. Here every file the
     /// preflight is forbidden to touch is *deleted* while the manifest still names it.
     /// PASS: the preflight succeeds anyway.
-    /// FAIL: it touched something outside its four groups.
+    /// FAIL: it touched something outside its five groups.
     #[test]
-    fn preflight_ignores_every_file_outside_its_four_gate_groups() {
+    fn preflight_reads_the_paper_state_but_never_scans_a_log() {
         let temp = tempfile::tempdir().unwrap();
         let (manifest, config, _) = preflight_fixture(temp.path());
+        // #628: the preflight gained a fifth gate -- the membership proof -- so it now reads the
+        // paper state. What must STILL hold is that it scans no LOG: that is what keeps it a
+        // seconds-long answer, and what lets it run before the stop instead of 95 minutes after.
         for forbidden in [
             &manifest.paths.paper_log,
             &manifest.paths.source_log,
             &manifest.paths.live_journal,
-            &manifest.paths.paper_state,
         ] {
             fs::remove_file(forbidden).unwrap();
             assert!(!forbidden.exists());
         }
-        let report = run_preflight(temp.path(), &config).expect("preflight must not read those");
+        let report = run_preflight(temp.path(), &config).expect("preflight must not read the logs");
         let report: serde_json::Value = serde_json::from_str(&report).unwrap();
         assert_eq!(
             report["gates"],
@@ -10701,11 +10751,45 @@ mod tests {
                 "financial_target_config",
                 "financial15_config_rows",
                 "live_status_posture",
+                "membership_proof",
             ])
         );
         assert_eq!(report["live_accounts"], 1);
 
-        // ...and prepare, which does read them, refuses on the same fixture. Without this the test
+        // The gate must be load-bearing for the exact defect that cost attempt 16 its 100 minutes:
+        // a member whose current position validation is gone. Everything else about the fixture
+        // stays valid, so only the membership gate can refuse -- and it has to say so.
+        let member = manifest.membership[0];
+        let connection = rusqlite::Connection::open(&manifest.paths.paper_state).unwrap();
+        connection
+            .execute(
+                "DELETE FROM position_validations WHERE wallet_hex = ?1",
+                [member.to_string()],
+            )
+            .unwrap();
+        let refusal = run_preflight(temp.path(), &config)
+            .expect_err("a member without a validation row must refuse")
+            .to_string();
+        assert!(
+            refusal.contains(&format!(
+                "membership proof lacks a current position validation for {member}"
+            )),
+            "{refusal}"
+        );
+        // Restoring the row (the values the anchor install wrote) re-admits the fixture: the
+        // refusal was that row and nothing else.
+        connection
+            .execute(
+                "INSERT INTO position_validations VALUES (?1, 'ledger', 'positions', '[]', 'g557', \
+                 '{\"anchor\":1}', ?2)",
+                rusqlite::params![member.to_string(), manifest.start_unix],
+            )
+            .unwrap();
+        drop(connection);
+        run_preflight(temp.path(), &config).expect("the repaired row re-admits the fixture");
+
+        // ...and prepare, which reads the logs too, refuses on the same fixture -- with the paper
+        // state intact, so only the missing logs can be the cause. Without this the log deletions
         // above could pass simply because the files were never load-bearing.
         assert!(
             run_financial_era(
@@ -10715,7 +10799,7 @@ mod tests {
                 Some(&temp.path().join("rows.json")),
             )
             .is_err(),
-            "prepare must still depend on the files the preflight ignores"
+            "prepare must still depend on the logs the preflight ignores"
         );
     }
 
@@ -11606,6 +11690,23 @@ mod tests {
         assert_eq!(before, after);
 
         manifest.state = "guarded".to_owned();
+        // #626: Start recomputes the preparation and requires equality with the manifest's stored
+        // copy before emitting the event from it. That copy now reaches the manifest over stdin,
+        // because a 21.7 MB binding cannot be a single argv element -- so the check the transport
+        // relies on has to be shown to fire. It had no negative test. Assert it BEFORE the
+        // successful Start below: once a Start exists, retries take the recorded-receipt path
+        // instead of recomputing.
+        let mut tampered = manifest.clone();
+        let mut truncated = preparation.clone();
+        truncated.start.membership_proofs_hash.pop();
+        tampered.preparation = Some(truncated);
+        let refusal = start_financial_era(&tampered, &config, &config_rows)
+            .expect_err("Start must refuse a preparation that differs from its recomputed inputs");
+        assert!(
+            format!("{refusal}").contains("preparation differs from the verified manifest inputs"),
+            "wrong refusal: {refusal}"
+        );
+
         manifest.preparation = Some(preparation.clone());
         let first = start_financial_era(&manifest, &config, &config_rows).unwrap();
         let second = start_financial_era(&manifest, &config, &config_rows).unwrap();

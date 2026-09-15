@@ -36,6 +36,33 @@ use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pendi
 use crate::position_seeder::ledger_capture;
 use crate::supabase_sink::supabase_fill_from;
 
+/// #628: the Start-baseline bankroll gate applied at boot, for one store.
+///
+/// A FRESH financial activation and RECOVERY of an era that has already traded are different
+/// states, and only the first one can legitimately carry the Start baseline. While a store has
+/// applied no fill the era is still pristine there, and this equality is the real protection
+/// against activating onto the wrong balance. Once a fill lands it debits cash in the same
+/// transaction that records it, so enforcing the baseline would refuse to boot for the rest of
+/// the era's life — and the financial recovery that reconciles the difference runs only after
+/// this point.
+///
+/// This deliberately does NOT validate Start identity: that is owned by
+/// `PaperStateDb::seed_financial_start` and its authority counterpart, which run on BOTH paths and
+/// are idempotent on a match. Skipping this equality once traded therefore drops no identity
+/// protection, only the frozen-balance assumption.
+pub fn check_start_baseline_bankroll(
+    store: &str,
+    traded: bool,
+    observed: Option<Decimal>,
+    starting_bankroll: Decimal,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        traded || observed == Some(starting_bankroll),
+        "{store} bankroll {observed:?} differs from QualificationStarted baseline {starting_bankroll}"
+    );
+    Ok(())
+}
+
 pub const PAPER_LOG_SCHEMA_VERSION: u32 = 2;
 /// Current paper financial meaning. A changed value seals the active qualification before use.
 pub const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
@@ -3142,5 +3169,38 @@ mod anchor_replay_tests {
                 source_trade_id: actual
             }) if actual == source_trade_id
         ));
+    }
+}
+
+#[cfg(test)]
+mod financial_boot_gate_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// The gate is a pure table: an untraded store must carry the Start baseline exactly; a store
+    /// that has applied a fill is past the point where the baseline can hold. WHICH store counts as
+    /// untraded is decided in `main` from each store's own progress marker, and that wiring is
+    /// proven through the real binary (`scenario_source_log_boot::post_start_boot_*`).
+    #[test]
+    fn untraded_stores_require_the_start_baseline_and_traded_stores_do_not() {
+        let baseline = dec!(10000);
+        for store in ["local", "authoritative"] {
+            assert!(check_start_baseline_bankroll(store, false, Some(baseline), baseline).is_ok());
+            // Merely close is still the wrong era to activate onto.
+            assert!(
+                check_start_baseline_bankroll(store, false, Some(dec!(9999.99)), baseline).is_err()
+            );
+            assert!(check_start_baseline_bankroll(store, false, None, baseline).is_err());
+            assert!(
+                check_start_baseline_bankroll(store, true, Some(dec!(9987.66)), baseline).is_ok()
+            );
+        }
+        let refusal = check_start_baseline_bankroll("local", false, Some(dec!(1)), baseline)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            refusal.as_deref(),
+            Some("local bankroll Some(1) differs from QualificationStarted baseline 10000")
+        );
     }
 }

@@ -252,13 +252,34 @@ root=sys.argv[1]; path=os.path.join(root,"prediction-markets/gen/g557/status.jso
 value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
 "tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,"uptime_secs":1,
 "mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,"oldest_anchor_age_secs":0,
-"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":100,
 "source_health":{"poll_error_streak":0,"copy_admission_blocked":False,"ws_sink_poisoned":False,"poll_last_round_age_secs":0},
 "runtime_config":{"applied_hash":"b"*64,"rejected":None},
-"watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
+"watchlist_projection":{"applied":{"token":"2026-09-14T18:36:09.442332+00:00","count":1,"time":"now"},"last_error":None},
 "supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
 "accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,"requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
 json.dump(value,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT"
+    # #628: a financial era that has TRADED is the normal post-Start state, not an anomaly. These
+    # markers let a scenario present one. Amounts follow the plan: baseline 10000, BUY 2 @ 0.50
+    # (principal 1, fee 0.01) -> 9998.99, settlement credit 2 -> 10000.99.
+    if [[ -f "$state/status-traded" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]; v=json.load(open(path))
+v["fills_total"]=1; v["settled_total"]=1; v["open_positions"]=0; v["bankroll"]="10000.99"
+json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
+    if [[ -f "$state/status-producer-down" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]; v=json.load(open(path))
+v["tasks"][0]["state"]="failed"
+json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
+    if [[ -f "$state/status-wrong-bankroll" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]; v=json.load(open(path))
+v["fills_total"]=0; v["bankroll"]="9999"
+json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
     ;;
   *) echo "unexpected systemctl command: $*" >&2; exit 97 ;;
 esac
@@ -286,6 +307,13 @@ if [[ -z "$file" && -z "$sql" ]]; then stdin=$(dd bs=4096 2>/dev/null || true); 
 if [[ "$stdin" == *rolbypassrls* ]]; then
   count=0; [[ ! -f "$state/legacy-contract-count" ]] || count=$(<"$state/legacy-contract-count")
   echo $((count + 1)) > "$state/legacy-contract-count"
+fi
+# #628: count the Financial15 rows export the same way. It is the only remote call between the stop
+# and the post-stop preflight, so a test can assert that preflight reuses the pre-stop export rather
+# than blocking the local refusal behind `psql` again.
+if [[ "$sql" == *"json_agg(json_build_object('key',key,'value',value,'value_type',value_type)"* ]]; then
+  count=0; [[ ! -f "$state/rows-export-count" ]] || count=$(<"$state/rows-export-count")
+  echo $((count + 1)) > "$state/rows-export-count"
 fi
 if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ $(<"$state/service.active") == false ]] || exit 98
@@ -342,10 +370,35 @@ elif [[ "$sql" == *information_schema.columns* ]]; then
 elif [[ "$sql" == *paper_fills_archive* ]]; then
   echo '0 0 0 1 0'
 elif [[ "$sql" == *seed_financial_start* ]]; then
-  echo '{"outcome":"applied","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
-  echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
+  # #628: `authority-has-traded` makes the authority report a legitimately PROGRESSED era -- the
+  # exact state a resumed activation meets after the service started and filled. `seed_financial_start`
+  # is idempotent for a matching Start, so it still answers `existing`; only the read-back moves.
+  if [[ -f "$state/authority-has-traded" ]]; then
+    echo '{"outcome":"existing","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    echo '{"bankroll":"9998.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":42}'
+  elif [[ -f "$state/authority-start-impostor" ]]; then
+    # A DIFFERENT Start on a progressed era: identity must still be refused on the resume path.
+    echo '{"outcome":"existing","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    echo '{"bankroll":"9998.99","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","last_prepared_seq":42}'
+  else
+    echo '{"outcome":"applied","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
+  fi
 elif [[ "$sql" == *"'start_seq'"* ]]; then
-  echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  # #628: the authority observation for a traded era, and for a still-fresh era whose cash is wrong.
+  if [[ -f "$state/remote-traded" ]]; then
+    echo '{"paper_fills":1,"bankroll_count":1,"bankroll":"10000.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-wrong-start" ]]; then
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-wrong-membership" ]]; then
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000999"]}'
+  elif [[ -f "$state/remote-wrong-batch" ]]; then
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":999,"membership":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-wrong-bankroll" ]]; then
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"9999","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  else
+  echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  fi
 elif [[ "$sql" == *json_build_object* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"paper_bankroll":1,"fill_market_snapshots":0}'
 fi
@@ -523,10 +576,10 @@ root=sys.argv[1]; path=os.path.join(root,"prediction-markets/gen/g557/status.jso
 value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
 "tasks":[{"name":name,"state":"running","class":"critical"} for name in ("activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server")],"status_error":None,"uptime_secs":1,
 "mode":"paper","authoritative":True,"bankroll":"10000","open_positions":0,"fills_total":0,"settled_total":0,"oldest_anchor_age_secs":0,
-"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":1,
+"last_event_seq":0,"watchlist_size":1,"watchlist_target_size":100,
 "source_health":{"poll_error_streak":0,"copy_admission_blocked":False,"ws_sink_poisoned":False,"poll_last_round_age_secs":0},
 "runtime_config":{"applied_hash":"b"*64,"rejected":None},
-"watchlist_projection":{"applied":{"token":"batch:545","count":1,"time":"now"},"last_error":None},
+"watchlist_projection":{"applied":{"token":"2026-09-14T18:36:09.442332+00:00","count":1,"time":"now"},"last_error":None},
 "supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
 "accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,"requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
 json.dump(value,open(path,"w"))' "$root"
@@ -647,14 +700,18 @@ binding = json.dumps({"version": 1, "proof_hash": "c" * 64,
                      separators=(",", ":"))
 zero = "0" * 64
 prefix = {"physical_tail": 1, "last_sequence": None, "last_hash": zero}
-print(json.dumps({"start": {"starting_bankroll": 10000000000,
+preparation = json.dumps({"start": {"starting_bankroll": 10000000000,
     "paper_prefix": prefix, "source_prefix": prefix, "live_prefix": prefix,
     "artifact_blake3": "a" * 64, "static_config_hash": "b" * 64, "hot_config_hash": "b" * 64,
     "generation": "g557", "activation_id": "act-545", "ranking_batch_id": 545,
     "membership": members, "membership_proofs_hash": binding,
     "schema_version": 3, "parser_version": 1, "financial_semantic_version": 1},
-    "expected_receipt": {"sequence": 1, "this_hash": "c" * 64}}, separators=(",", ":")))' \
-        $(cat "$seam_marker")
+    "expected_receipt": {"sequence": 1, "this_hash": "c" * 64}}, separators=(",", ":"))
+# Keep a copy of the exact bytes emitted, so the scenario can compare what the driver RECORDED
+# against them rather than against a size threshold a partial payload could still clear.
+with open(sys.argv[3], "w") as emitted: emitted.write(preparation)
+print(preparation)' \
+        $(cat "$seam_marker") "$seam_marker.emitted"
       exit 0
     fi
     cat <<'JSON'
@@ -673,6 +730,17 @@ for table in ("fills","positions","settled_markets","fill_market_snapshots"): db
 db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"10000\")")
 db.execute("delete from meta"); db.execute("insert into meta values(\"financial_start_seq\",\"1\")")
 db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,))
+# #628 markers, same amounts as the status fixture.
+if os.path.exists(sys.argv[2]+"/sqlite-traded"):
+    for t in ("fills","positions","settled_markets","fill_market_snapshots"):
+        db.execute("insert into "+t+" values(\"traded\")")
+    db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"10000.99\")")
+    db.execute("insert into meta values(\"financial_last_prepared_seq\",\"3\")")
+if os.path.exists(sys.argv[2]+"/sqlite-wrong-start"):
+    db.execute("delete from meta where key=\"financial_start_hash\"")
+    db.execute("insert into meta values(\"financial_start_hash\",?)",("d"*64,))
+if os.path.exists(sys.argv[2]+"/sqlite-wrong-bankroll"):
+    db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"9999\")")
 if wal_crash:
     db.execute("drop index durable_value")
     db.execute("alter table durable add column reset_only text")
@@ -2001,69 +2069,115 @@ raise SystemExit(0 if not v.get("service_stop_intent") and not v.get("stop_invok
   fail "a pre-stop preflight refusal recorded a stop boundary"
 echo "PASS: FE-PREFLIGHT-65"
 
-# Scenario FE-SEAM-68 — the real preparation shape cannot cross the driver's own plumbing (#626).
+# Scenario FE-SEAM-68 — a production-shaped preparation crosses the driver plumbing AND converges
+#       (#626, #628).
 # Preconditions: the prepare shim emits the PRODUCTION shape — a serialized MembershipProofBinding
-#       carrying each member's proof documents — instead of the miniature fixture the other
-#       scenarios use. Sizes come from the measured live generation (mean validation proof
-#       341,056 B); the live 26-member binding was 21,711,795 B against a 131,072-byte
-#       MAX_ARG_STRLEN.
-# PASS (today): the driver cannot record the preparation, because it passes the whole payload as a
-#       single argv element at activate_financial_era.sh:945. This scenario PINS that failure. It is
-#       the canary for the seam no test covered: the shell suite stubs the Rust side and the AC10
-#       rehearsal never drives this script, so nothing ever fed real output to the real driver.
-# FAIL: the driver silently accepts a production-shaped preparation — meaning either the transport
-#       was fixed (then flip this scenario to assert convergence AND make the production shape the
-#       default above) or the shim stopped emitting the real shape.
-# Scope: this pins transport only. #625 (the bare-64-hex regex at :1081) and #627 (the batch:<id>
-# projection token at :1101) sit further along the same path and need their own coverage once the
-# payload can reach them.
+#       carrying each member proof document — instead of the miniature fixture the other scenarios
+#       use. Sizes come from the measured live generation (mean validation proof 341,056 B); the
+#       live 26-member binding was 21,711,795 B against a 131,072-byte MAX_ARG_STRLEN.
+# PASS: the run reaches `verified`, and the preparation the manifest carries is EXACTLY the one the
+#       generator emitted. Before the stdin transport the whole payload went as one argv element
+#       and failed E2BIG at activate_financial_era.sh:945 — immediately after the ~95-minute
+#       post-stop prepare had succeeded, with production already stopped and rollback forbidden.
+#       Before the membership-proof regex was deleted, the recorded preparation was then refused
+#       for not being a 64-hex digest, which a "was it recorded" check could not see.
+# FAIL: the run stops short of `verified`, dies with "Argument list too long", or the recorded
+#       preparation differs from the emitted one (a truncating or re-encoding transport — a whole
+#       missing member proof still clears any plausible size threshold).
 root=$TEST_TMP/seam-production-shaped-preparation
 setup_fixture "$root"
 driver_args "$root"
-set +e
 printf '3 341056\n' > "$root/test-state/production-shaped-preparation"
+set +e
 output=$(drive_to_verified "$root" 2>&1)
-status=$?
+converged=$?
 set -e
-[[ $status -ne 0 ]] ||
-  fail "a production-shaped preparation converged; the transport limit or the shim shape changed"
-state=$(python3 -c 'import json,sys
-try: print(json.load(open(sys.argv[1]))["state"])
-except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
-[[ "$state" != verified ]] ||
-  fail "driver reached verified with a production-shaped preparation: seam closed, update this test"
-# Not merely "it failed": assert it failed for the TRANSPORT reason. Verified in isolation — the
-# exact transform at activate_financial_era.sh:945 on a 2,048,811-byte preparation returns rc=126
-# with "Argument list too long". Without this the scenario would also pass on a malformed payload,
-# which is precisely the vacuous-fixture trap that hid this defect in the first place.
-recorded=$(python3 -c 'import json,sys
-try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
-except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
-[[ "$recorded" == "no" ]] ||
-  fail "preparation recorded ($recorded) despite exceeding the argv limit: transport may be fixed"
-# Require the TRANSPORT diagnostic exactly. `read-only financial-era preparation failed` is the
-# driver's generic response to any unsuccessful prepare (activate_financial_era.sh:944) and fires
-# BEFORE the argv transform at :945, so accepting it would let a crashed generator — which emits no
-# payload at all — keep this canary green. That is the precise vacuous pass this file exists to
-# prevent, and the first version of this scenario had it.
-[[ "$output" == *'Argument list too long'* ]] ||
-  fail "production-shaped preparation did not fail at the argv transport, so this scenario proves \
-nothing. Driver output was: $output"
+[[ "$output" != *'Argument list too long'* ]] ||
+  fail "a production-shaped preparation still hit the argv limit; the transport regressed: $output"
+[[ "$converged" == 0 ]] ||
+  fail "a production-shaped preparation did not reach verified: $output"
+emitted=$root/test-state/production-shaped-preparation.emitted
+python3 -c 'import json,sys
+recorded=json.load(open(sys.argv[1]))["preparation"]
+emitted=json.load(open(sys.argv[2]))
+raise SystemExit(0 if recorded == emitted else 1)' "$root/pe-financial-era.json" "$emitted" ||
+  fail "the recorded preparation differs from the one the generator emitted"
+carried=$(wc -c < "$emitted")
 
-# Control: the SAME generator at a size UNDER the limit must produce a preparation the driver
-# records. Without this, a generator that emits nothing would satisfy every assertion above.
+# Control: the SAME generator at a size UNDER the old limit must also converge, so the oversized
+# case is evidence about SIZE rather than about the generator working at all.
 control=$TEST_TMP/seam-undersized-control
 setup_fixture "$control"
 driver_args "$control"
 printf '1 1024\n' > "$control/test-state/production-shaped-preparation"
-drive_to_verified "$control" >/dev/null 2>&1 || true
-control_recorded=$(python3 -c 'import json,sys
-try: print("yes" if json.load(open(sys.argv[1])).get("preparation") is not None else "no")
-except FileNotFoundError: print("absent")' "$control/pe-financial-era.json")
-[[ "$control_recorded" == "yes" ]] ||
-  fail "the seam generator cannot produce a recordable preparation even under the argv limit \
-(got $control_recorded), so the oversized case proves nothing about SIZE"
-echo "PASS: FE-SEAM-68 (pinned: oversized stops at state=$state unrecorded via argv; undersized records)"
+drive_to_verified "$control" >/dev/null 2>&1 ||
+  fail "the seam generator cannot converge even when small, so the oversized case proves nothing \
+about SIZE"
+echo "PASS: FE-SEAM-68 (production-shaped preparation verified, $carried bytes carried via stdin)"
+
+# Scenario FE-VERIFY-70 — a financial era that has TRADED reaches `verified` (#628, #627).
+# Preconditions: all three observations report a post-fill, post-settlement era -- status
+#   fills_total=1/settled_total=1/bankroll 10000.99, SQLite with all four tables populated, an
+#   advanced financial version and moved cash, and the authority reporting the same.
+# PASS: the driver converges to `verified`. This is the state the whole rewrite exists to permit:
+#   verification runs with producers ALREADY RUNNING, so demanding zero fills left exactly one
+#   passing instant and the first fill closed it forever.
+# FAIL: any of the three blocks still demands a frozen world.
+root=$TEST_TMP/verify-traded-era
+setup_fixture "$root"
+driver_args "$root"
+: > "$root/test-state/status-traded"
+: > "$root/test-state/sqlite-traded"
+: > "$root/test-state/remote-traded"
+set +e
+output=$(drive_to_verified "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 0 ]] ||
+  fail "a traded financial era did not reach verified: $output"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+  "$root/pe-financial-era.json") == verified ]] ||
+  fail "traded era did not durably record verified"
+echo "PASS: FE-VERIFY-70"
+
+# Scenario FE-VERIFY-71 — while nothing has traded, the balance is still pinned, in every store.
+# Preconditions: an UNTRADED era (fills zero everywhere) whose cash is wrong in exactly one store.
+# PASS: each store refuses with its own diagnostic. The #628 relaxation made the bankroll assertion
+#   conditional on that store having no fill; if a condition were inverted, every positive scenario
+#   above would still pass and nothing would notice. These are the controls that see it.
+# FAIL: a wrong balance on a pristine era converges.
+# Each row is one injected defect and the ONE diagnostic that must name it. Requiring the exact
+# message stops an unrelated refusal upstream from satisfying a control -- the trap that let a whole
+# verification block go untested. Rows cover every assertion inside the blocks #628 edited; the
+# readiness checks sit in a block this change never touched, so they get no control here.
+for case in \
+  "status-wrong-bankroll|status bankroll differs from the fresh baseline" \
+  "sqlite-wrong-bankroll|local bankroll differs" \
+  "remote-wrong-bankroll|remote bankroll differs" \
+  "sqlite-wrong-start|local Start identity differs" \
+  "remote-wrong-start|remote Start/version differs" \
+  "remote-wrong-membership|remote membership differs" \
+  "remote-wrong-batch|remote ranking batch differs" \
+  "status-producer-down|the producer/critical owner set is not running"; do
+  marker=${case%%|*}; want=${case#*|}; store=$marker
+  root=$TEST_TMP/verify-refuses-$store
+  setup_fixture "$root"
+  driver_args "$root"
+  : > "$root/test-state/$marker"
+  set +e
+  output=$(drive_to_verified "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] ||
+    fail "$store: the driver accepted an era carrying an injected defect"
+  [[ "$output" == *"$want"* ]] ||
+    fail "$store refused for the wrong reason (wanted '$want'): $output"
+  [[ $(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["state"])
+except FileNotFoundError: print("absent")' "$root/pe-financial-era.json") != verified ]] ||
+    fail "$store reached verified despite an injected defect"
+done
+echo "PASS: FE-VERIFY-71"
 
 # Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
 # Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
@@ -2085,6 +2199,11 @@ set -e
   fail "the pre-stop observation should have passed on a clean status"
 [[ $(<"$root/test-state/preflight-count") == 2 ]] ||
   fail "expected a pre-stop and a post-stop observation"
+# #628: the post-stop preflight must answer from the rows the pre-stop one already exported. A second
+# export here is a remote `psql` call with no deadline, sitting exactly where the immediate local
+# refusal is supposed to happen.
+[[ $(<"$root/test-state/rows-export-count") == 1 ]] ||
+  fail "the post-stop preflight re-exported the configuration rows it already had ($(<"$root/test-state/rows-export-count") exports)"
 [[ $(<"$root/test-state/stop-count") == 1 ]] ||
   fail "the service should have been stopped exactly once"
 compgen -G "$root/prediction-markets/financial-era-*-paper-state.db" > /dev/null &&
@@ -2103,12 +2222,13 @@ if v.get("backup"): raise SystemExit("a backup receipt was recorded")' \
   fail "the post-stop refusal left the wrong manifest state"
 echo "PASS: FE-PREFLIGHT-66"
 
-# Scenario FE-PREFLIGHT-67 — a stopped re-entry must not need a surviving rows export (#618).
-# Preconditions: the service is already inactive at entry, so neither preflight call applies. The
-#   rows export lives in a per-invocation temp dir that the EXIT trap removes, so an unconditional
-#   post-stop re-check would refuse this otherwise valid retry and leave production down.
-# PASS: the run converges with no preflight attempted at all.
-# FAIL: the driver demands evidence this invocation had no reason to produce.
+# Scenario FE-PREFLIGHT-67 — an already-stopped entry is gated exactly like a forward one (#628).
+# Preconditions: the service is already inactive at entry, so the pre-stop arm never runs. Under
+#   #618 this invocation performed NO preflight at all and walked into the backup ungated; the rows
+#   export was the only reason, and it is idempotent, so it is recreated instead.
+# PASS: the run converges having performed exactly ONE preflight — the post-stop one — before the
+#   backup, and without stopping a service that was already inactive.
+# FAIL: no preflight (the #618 hole), or a stop of an already-inert service.
 root=$TEST_TMP/preflight-inactive-entry
 setup_fixture "$root"
 echo false > "$root/test-state/service.active"
@@ -2119,8 +2239,10 @@ status=$?
 set -e
 [[ $status -eq 0 ]] ||
   fail "an initially inactive entry did not converge: $output"
-[[ ! -e "$root/test-state/preflight-count" ]] ||
-  fail "a preflight ran for an entry that never had a running service to ask"
+[[ $(<"$root/test-state/preflight-count") == 1 ]] ||
+  fail "an already-stopped entry must carry exactly one current preflight before the backup"
+[[ ! -e "$root/test-state/stop-count" ]] ||
+  fail "the driver stopped a service that was already inert"
 echo "PASS: FE-PREFLIGHT-67"
 
 # Scenario REHEARSAL-REVIEWED-BYTES-07
@@ -3071,6 +3193,57 @@ run_driver "$root" >/dev/null
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
   fail "Start recovery did not durably roll forward to started"
 
+# Scenario FE-SERVICE-START-69 — a resumed activation accepts an era that has already traded (#628).
+# Preconditions: complete Start, service started, then an interruption before `started` is recorded.
+#   Before the retry the AUTHORITY reports a progressed era: `last_prepared_seq` set and cash moved.
+# PASS: the retry rolls forward to `started`, proving Start identity without re-proving pristineness,
+#       and without repeating the archive or starting the service a second time.
+# FAIL: the driver refuses ("authority Start read-back differs"), stranding an activation whose
+#       service is running normally, with rollback already forbidden by the complete Start.
+root=$TEST_TMP/post-service-start-traded
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after before-manifest-started >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -eq 86 && $(<"$root/test-state/service.active") == true ]] ||
+  fail "traded-resume fixture did not reach the post-service-start seam"
+archive_before=$(<"$root/test-state/archive-count")
+start_before=$(<"$root/test-state/start-count")
+
+# The service is up and has traded: the authority has advanced past the pristine baseline.
+touch "$root/test-state/authority-has-traded"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 0 ]] ||
+  fail "a resumed activation refused an era that legitimately traded: $output"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$root/pe-financial-era.json") == started ]] ||
+  fail "traded resume did not durably roll forward to started"
+[[ $(<"$root/test-state/archive-count") -eq "$archive_before" ]] ||
+  fail "traded resume repeated the remote archive"
+[[ $(<"$root/test-state/start-count") -eq "$start_before" ]] ||
+  fail "traded resume started the service a second time"
+
+# Control: identity is still proven on the resume path. A progressed era carrying a DIFFERENT Start
+# must still refuse, otherwise accepting progress would have become a hole.
+root=$TEST_TMP/post-service-start-traded-impostor
+setup_fixture "$root"
+driver_args "$root"
+set +e
+run_driver "$root" --simulate-crash-after before-manifest-started >/dev/null 2>&1
+set -e
+touch "$root/test-state/authority-start-impostor"
+set +e
+output=$(run_driver "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'authority Start read-back differs'* ]] ||
+  fail "a resumed activation accepted a different authority Start: $output"
+echo "PASS: FE-SERVICE-START-69"
+
 root=$TEST_TMP/post-service-start-empty-membership
 setup_fixture "$root"
 driver_args "$root"
@@ -3660,4 +3833,4 @@ cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
-echo "PASS: 68 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 71 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"

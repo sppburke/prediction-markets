@@ -698,7 +698,6 @@ if manifest.get("generation_legacy_history") != json.loads(sys.argv[3]): raise S
    "$static_config_hash" == "$(manifest_get static_config_hash)" &&
    "$ranking_batch_id" == "$(manifest_get ranking_batch_id)" ]] ||
   die "financial-era evidence identity changed"
-ranking_identity="batch:$ranking_batch_id"
 python3 -c 'import decimal,json,sys
 manifest,members,bankroll=sys.argv[1:]
 value=json.load(open(manifest,encoding="utf-8"))
@@ -876,7 +875,6 @@ case "$state" in
       # `verify_legacy_service_contract` is read-only (it queries the database, not the service) and
       # still runs after the stop; this is an early warning, not a replacement. Both it and the rows
       # export are `psql` calls, and both are free here because nothing is stopped yet.
-      preflight_ran=false
       if [[ "$current_active" == true ]]; then
         verify_legacy_service_contract
         export_financial_config_rows
@@ -885,7 +883,6 @@ case "$state" in
           --financial-config-rows="$financial_config_rows_file") ||
           die "financial-era preflight refused before the stop; production was not touched"
         printf 'financial-era preflight pre-stop: %s\n' "$preflight_report"
-        preflight_ran=true
       fi
       if ! manifest_flag service_stop_intent; then
         was_active=$current_active
@@ -898,22 +895,27 @@ case "$state" in
       fi
       [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service did not become inert"
       manifest_patch_boundary service-stopped "{\"stop_invoked\":true,\"service_was_active\":$was_active}"
-      # #618: the service wrote `status.json` once more on its way down, and that write can poison
-      # the very flag the pre-stop preflight just approved. Re-ask the same local gates NOW — before
-      # `verify_legacy_service_contract`'s remote psql (which has no deadline), before the backup,
-      # and before the ~34-minute integrity check — so a shutdown-caused refusal costs seconds
-      # instead of an hour. Guarded on the pre-stop preflight having run in THIS invocation: the
-      # rows export lives in a per-invocation temp dir that the EXIT trap removes, so an
-      # unconditional call would refuse a perfectly valid stopped re-entry for want of a file.
-      if [[ "$preflight_ran" == true ]]; then
-        preflight_report=$(run_target_offline --financial-era=preflight \
-          --activation-manifest="$MANIFEST" \
-          --financial-config-rows="$financial_config_rows_file") ||
-          die "financial-era preflight refused immediately after the stop; no backup was started"
-        printf 'financial-era preflight post-stop: %s\n' "$preflight_report"
-      fi
     fi
     [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert"
+    # #618: the service wrote `status.json` once more on its way down, and that write can poison the
+    # very flag the pre-stop preflight just approved. Re-ask the same local gates NOW — before
+    # `verify_legacy_service_contract`s remote psql (which has no deadline), before the backup, and
+    # before the ~34-minute integrity check — so a shutdown-caused refusal costs seconds, not an hour.
+    #
+    # #628: this is now UNCONDITIONAL, and deliberately sits outside the stop block. `stop_invoked`
+    # is recorded durably before this point, so a crash-and-retry skips that whole block and used to
+    # walk straight into the backup with no current preflight at all — discovering a membership
+    # proof invalidated during shutdown only after the expensive work. The rows export was the only
+    # reason for the old guard. It is also the only REMOTE call on this path, and `psql` has no
+    # deadline: a forward invocation reuses the export its pre-stop preflight already made, so the
+    # local refusal cannot be blocked behind the authority; only a stopped re-entry (crash-and-retry,
+    # or an already-inactive service) has no export yet and makes one now.
+    [[ -s "$financial_config_rows_file" ]] || export_financial_config_rows
+    preflight_report=$(run_target_offline --financial-era=preflight \
+      --activation-manifest="$MANIFEST" \
+      --financial-config-rows="$financial_config_rows_file") ||
+      die "financial-era preflight refused immediately after the stop; no backup was started"
+    printf 'financial-era preflight post-stop: %s\n' "$preflight_report"
     verify_legacy_service_contract
     manifest_patch_boundary legacy-contract-verified '{"legacy_contract_verified":true}'
     backup_path="$SERVICE_ROOT/financial-era-$activation_id-paper-state.db"
@@ -942,7 +944,11 @@ print(json.dumps({"backup":{"path":backup,"sha256":sha},"guarded_paper_state_sha
         --activation-manifest="$MANIFEST" \
         --financial-config-rows="$financial_config_rows_file") ||
         die "read-only financial-era preparation failed"
-      manifest_patch_boundary preparation "$(python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.argv[1])},sort_keys=True,separators=(",",":")))' "$preparation")"
+      # #626: the preparation reaches python on stdin. It carries the full membership-proof binding
+      # (21,711,795 bytes for the live 26-wallet membership) and as a single argv element that is
+      # E2BIG -- which is where activation died, immediately after the ~95-minute post-stop prepare
+      # had already succeeded and with the service already stopped.
+      manifest_patch_boundary preparation "$(printf '%s' "$preparation" | python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.stdin.read())},sort_keys=True,separators=(",",":")))')"
     fi
     manifest_advance guarded "$patch"
     state=guarded
@@ -1000,6 +1006,20 @@ if [[ "$state" == guarded ]]; then
     psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql"
     manifest_patch_boundary live-schema-installed '{"live_schema_installed":true}'
   fi
+  # #628: initial authority seeding and RESUME are different states. The pristine assertions below
+  # -- `last_prepared_seq` null and the untouched fresh bankroll -- are exactly right the FIRST
+  # time, because nothing has traded yet. But the service is started further down, and a crash
+  # after that (`--simulate-crash-after before-manifest-started`, or any real interruption) leaves
+  # a `guarded` manifest whose retry now meets an era that has legitimately traded. `seed_financial_start`
+  # itself copes -- it returns `existing` for a matching Start and never resets progress
+  # (scripts/supabase_paper_state_schema.sql) -- so the DRIVER's pristine read-back is the only
+  # thing refusing, and it refuses forever: the activation can never roll forward even though the
+  # correct service is running normally. On resume, re-prove Start IDENTITY and accept the progress.
+  if manifest_flag authority_start_seeded; then
+    authority_start_mode=resume
+  else
+    authority_start_mode=initial
+  fi
   authority_start=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select seed_financial_start($start_seq,'$start_hash');
      select json_build_object('bankroll',(select bankroll_str from paper_bankroll where id=0),
@@ -1012,11 +1032,14 @@ lines=[line for line in sys.argv[1].splitlines() if line]
 if len(lines) != 2: raise SystemExit("authority Start proof must contain seed and read-back rows")
 seed,row=map(json.loads,lines)
 if seed.get("outcome") not in {"applied","existing"}: raise SystemExit("authority Start seed conflicted")
-sequence=int(sys.argv[2]); digest=sys.argv[3]
+sequence=int(sys.argv[2]); digest=sys.argv[3]; mode=sys.argv[5]
 if seed.get("start_seq") != sequence or seed.get("start_hash") != digest: raise SystemExit("seed result identity differs")
-if row.get("start_seq") != sequence or row.get("start_hash") != digest or row.get("last_prepared_seq") is not None: raise SystemExit("authority Start read-back differs")
-if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise SystemExit("authority bankroll read-back differs")' \
-    "$authority_start" "$start_seq" "$start_hash" "$fresh_bankroll" ||
+# Identity is proven on BOTH paths: a different Start is still refused after a resume.
+if row.get("start_seq") != sequence or row.get("start_hash") != digest: raise SystemExit("authority Start read-back differs")
+if mode == "initial":
+    if row.get("last_prepared_seq") is not None: raise SystemExit("authority Start read-back differs")
+    if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise SystemExit("authority bankroll read-back differs")' \
+    "$authority_start" "$start_seq" "$start_hash" "$fresh_bankroll" "$authority_start_mode" ||
     die "authority Start seed/read-back proof failed"
   manifest_patch_boundary authority-start-seeded \
     "$(python3 -c 'import json,sys; print(json.dumps({"authority_start_seeded":True,"authority_start_proof":[json.loads(line) for line in sys.argv[1].splitlines() if line]},sort_keys=True,separators=(",",":")))' "$authority_start")"
@@ -1078,27 +1101,35 @@ if [[ "$state" == started ]]; then
   [[ -f "$generation/status.json" ]] || die "fresh status proof is not available yet"
   hot_config_hash=$(manifest_get preparation.start.hot_config_hash)
   [[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "prepared hot-config identity is invalid"
-  membership_proofs_hash=$(manifest_get preparation.start.membership_proofs_hash)
-  [[ "$membership_proofs_hash" =~ ^[0-9a-f]{64}$ ]] ||
-    die "prepared membership-proofs identity is invalid"
   verify_guarded_log_prefixes || die "paper/source/live prefixes do not extend their guarded identities"
   python3 -c 'import decimal,json,os,sys
-path,started,revision,hot,bankroll,membership_count,ranking_identity=sys.argv[1:]
+path,started,revision,hot,bankroll,membership_count=sys.argv[1:]
 started=int(started); membership_count=int(membership_count)
 value=json.load(open(path,encoding="utf-8"))
 if os.stat(path).st_mtime < started: raise SystemExit("status predates financial-era start")
 if value.get("revision") != revision: raise SystemExit("status revision differs from the reviewed target")
 if value.get("status_error") is not None: raise SystemExit("status carries a financial sampling error")
 if value.get("mode") != "paper" or value.get("authoritative") is not True: raise SystemExit("status is not authoritative paper mode")
-if decimal.Decimal(str(value.get("bankroll"))) != decimal.Decimal(bankroll): raise SystemExit("status bankroll differs from the fresh baseline")
-if any(value.get(key) != 0 for key in ("open_positions","fills_total","settled_total")): raise SystemExit("status financial state is not freshly reset")
+# #628: the era is verified for IDENTITY and CONTINUITY, not stasis. `verified` is reached with the
+# producer set already running (below), so demanding zero fills made the only passing window
+# "producers up, no fill yet" -- and `fills_total` is a monotone COUNT(*), so the first fill closed
+# it permanently. The balance is still pinned while nothing has traded, which is the case where it
+# means something. Status reads cash BEFORE the fill count, so a crossing fill yields baseline cash
+# with count 1 (permitted) and never debited cash with count 0.
+if value.get("fills_total") == 0 and decimal.Decimal(str(value.get("bankroll"))) != decimal.Decimal(bankroll): raise SystemExit("status bankroll differs from the fresh baseline")
 runtime=value.get("runtime_config") or {}
 if runtime.get("applied_hash") != hot or runtime.get("rejected") is not None: raise SystemExit("status hot configuration identity differs")
-if value.get("watchlist_size") != membership_count or value.get("watchlist_target_size") != membership_count: raise SystemExit("status membership count differs")
+# `watchlist_target_size` is the configured CAP, documented to differ from the live size whenever
+# the ranking bench cannot fill every slot (status_writer.rs). Comparing a config knob with a
+# membership census could never pass: production runs cap 100 against a 26-28 wallet membership.
+if value.get("watchlist_size") != membership_count: raise SystemExit("status membership count differs")
 if membership_count and not isinstance(value.get("oldest_anchor_age_secs"),int): raise SystemExit("status does not prove installed membership anchors")
 projection=value.get("watchlist_projection") or {}
 applied=projection.get("applied") or {}
-if applied.get("token") != ranking_identity or applied.get("count") != membership_count or projection.get("pending") is not None or projection.get("last_error") is not None: raise SystemExit("status membership projection is not exact")
+# The projection token is a timestamptz (the refresh RPC returns `new_token`), never "batch:<id>",
+# so comparing it with the ranking identity could never pass. Ranking identity is proven instead by
+# the remote batch comparison further down, against the authority ranking_batch_id.
+if applied.get("count") != membership_count or projection.get("pending") is not None or projection.get("last_error") is not None: raise SystemExit("status membership projection is not exact")
 tasks=value.get("tasks") or []
 required={"activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server"}
 running={row.get("name") for row in tasks if row.get("state") == "running"}
@@ -1121,8 +1152,7 @@ for account in accounts:
         raise SystemExit("a live account is not off and unarmed")
 if None in identities or len(identities) != len(set(identities)): raise SystemExit("live account inventory is not uniquely identified")' \
     "$generation/status.json" "$(manifest_get started_unix)" "$target_revision" \
-    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" \
-    "$ranking_identity" ||
+    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" ||
     die "first fresh health proof is incomplete"
   readiness_url=$(installed_readiness_url) || die "installed readiness endpoint is invalid"
   financial_readiness_response=$(mktemp)
@@ -1142,39 +1172,48 @@ if not isinstance(value,dict) or value.get("ready") is not True or value.get("is
   python3 -c 'import decimal,json,sqlite3,sys
 path,start_seq,start_hash,bankroll=sys.argv[1:]
 db=sqlite3.connect("file:"+path+"?mode=ro",uri=True)
+db.execute("BEGIN")
 def meta(key):
     row=db.execute("select value from meta where key=?",(key,)).fetchone()
     if row is None: return None
     value=row[0]
     return value.decode() if isinstance(value,bytes) else str(value)
 if meta("financial_start_seq") != start_seq or meta("financial_start_hash") != start_hash: raise SystemExit("local Start identity differs")
-if meta("financial_last_prepared_seq") is not None: raise SystemExit("local financial version is not fresh")
-for table in ("fills","positions","settled_markets","fill_market_snapshots"):
-    if db.execute("select count(*) from "+table).fetchone()[0] != 0: raise SystemExit("local financial table is not empty: "+table)
+# #628: identity, fill count and cash must come from ONE snapshot. Python sqlite3 opens no
+# transaction for SELECTs, so these were three independent reads and a fill landing between them
+# shows count 0 with already-debited cash -- refusing a legitimate first fill. SQLite takes the
+# snapshot at the first ACCESS after BEGIN, so every read below shares it.
+fills=db.execute("select count(*) from fills").fetchone()[0]
 rows=db.execute("select bankroll_str from bankroll").fetchall()
-if len(rows) != 1 or decimal.Decimal(rows[0][0]) != decimal.Decimal(bankroll): raise SystemExit("local bankroll differs")' \
+if len(rows) != 1: raise SystemExit("local bankroll differs")
+# Emptiness and a null financial version are properties of an era that has not traded yet, not of a
+# correctly activated one: a real fill inserts its row and advances the version in the same
+# transaction that debits cash, and settlement retains both. Only the balance is still pinned, and
+# only while nothing has traded in THIS store.
+if fills == 0 and decimal.Decimal(rows[0][0]) != decimal.Decimal(bankroll): raise SystemExit("local bankroll differs")' \
     "$paper_state" "$(manifest_get start_receipt.sequence)" "$(manifest_get start_receipt.this_hash)" "$fresh_bankroll" ||
     die "local financial reset/Start proof is incomplete"
   remote_verified=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select json_build_object(
        'paper_fills',(select count(*) from paper_fills),
-       'settled_markets',(select count(*) from settled_markets),
-       'paper_positions',(select count(*) from paper_positions),
-       'fill_market_snapshots',(select count(*) from fill_market_snapshots),
        'bankroll_count',(select count(*) from paper_bankroll),
        'bankroll',(select bankroll_str from paper_bankroll where id=0),
        'start_seq',(select start_seq from paper_bankroll where id=0),
        'start_hash',(select start_hash from paper_bankroll where id=0),
-       'last_prepared_seq',(select last_prepared_seq from paper_bankroll where id=0),
        'ranking_batch_id',(select max(batch_id) from ranking_batches),
        'membership',coalesce((select json_agg(wallet_hex order by wallet_hex) from service_watchlist),'[]'::json)
      )::text;") || die "read remote verified-state proof"
   python3 -c 'import decimal,json,sys
 actual=json.loads(sys.argv[1]); manifest=json.load(open(sys.argv[2],encoding="utf-8"))
-if any(actual[key] != 0 for key in ("paper_fills","settled_markets","paper_positions","fill_market_snapshots")): raise SystemExit("remote financial tables are not empty")
-if actual["bankroll_count"] != 1 or decimal.Decimal(actual["bankroll"]) != decimal.Decimal(sys.argv[3]): raise SystemExit("remote bankroll differs")
+# #628: same identity-and-continuity rule as the local block. The authority observation is already
+# built by ONE SQL statement, so its counts and cash cannot straddle a fill. Emptiness and a null
+# version describe an era that has not traded; they are dropped. The balance stays pinned only
+# while the AUTHORITY itself has applied no fill -- it can apply one before the local projection
+# catches up, so this must use the remote count, not the local one.
+if actual["bankroll_count"] != 1: raise SystemExit("remote bankroll differs")
+if actual["paper_fills"] == 0 and decimal.Decimal(actual["bankroll"]) != decimal.Decimal(sys.argv[3]): raise SystemExit("remote bankroll differs")
 receipt=manifest["start_receipt"]
-if actual["start_seq"] != receipt["sequence"] or actual["start_hash"] != receipt["this_hash"] or actual["last_prepared_seq"] is not None: raise SystemExit("remote Start/version differs")
+if actual["start_seq"] != receipt["sequence"] or actual["start_hash"] != receipt["this_hash"]: raise SystemExit("remote Start/version differs")
 if actual["ranking_batch_id"] != manifest["ranking_batch_id"]: raise SystemExit("remote ranking batch differs")
 if sorted(actual["membership"]) != sorted(manifest["membership"]): raise SystemExit("remote membership differs")' \
     "$remote_verified" "$MANIFEST" "$fresh_bankroll" || die "remote financial/ranking/membership proof is incomplete"
