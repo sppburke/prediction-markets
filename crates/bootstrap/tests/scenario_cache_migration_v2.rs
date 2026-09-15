@@ -2766,6 +2766,43 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     assert_eq!(rebuilt.backup_sha256, build.backup_sha256);
     assert_eq!(rebuilt.source_bounds, build.source_bounds);
+    // A stale but valid write-ahead log beside the immutable prior (never
+    // produced by staging) is ignored: the manifest is rebuilt from the main
+    // file's bytes, the prior is not checkpointed and no index is created.
+    let scratch = dir.path().join("scratch.db");
+    std::fs::copy(&prior, &scratch).unwrap();
+    let mut stale = WalletCache::open(&scratch).unwrap();
+    stale
+        .raw_conn_for_test()
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .unwrap();
+    stale.conn_for_test_insert_trade(WALLET, "0xstale", FRESH_END + 100);
+    std::fs::copy(
+        scratch.with_extension("db-wal"),
+        prior.with_extension("db-wal"),
+    )
+    .unwrap();
+    drop(stale);
+    // The copied log is one SQLite honors for these exact main bytes: an
+    // ordinary read-write open of an identical copy sees the extra trade.
+    let probe = dir.path().join("probe.db");
+    std::fs::copy(&prior, &probe).unwrap();
+    std::fs::copy(
+        prior.with_extension("db-wal"),
+        probe.with_extension("db-wal"),
+    )
+    .unwrap();
+    assert_eq!(count(&probe, "SELECT COUNT(*) FROM trades"), 2);
+    std::fs::remove_file(&manifest).unwrap();
+    let ignoring = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(ignoring.resumed);
+    assert_eq!(ignoring.prior_schema, 1);
+    let from_main: CacheV2BuildManifest =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(from_main.source_bounds["newest_trade_unix"], FRESH_END - 10);
+    assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
+    assert!(!prior.with_extension("db-shm").exists());
+    std::fs::remove_file(prior.with_extension("db-wal")).unwrap();
     let migrated = migrate_cache_v2(&side, &manifest).unwrap();
     assert!(!migrated.resumed);
     assert_eq!(migrated.legacy_trade_count, 1);
@@ -2917,6 +2954,31 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     .unwrap();
     assert!(!dotted.resumed);
     assert!(dir.path().join("dotted/build.json").is_file());
+    assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
+    // A link without a target is refused before anything is created: creating
+    // the manifest's missing directory would give this one a target (the cache
+    // directory itself) and the manifest write would land on the fixed cache.
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink("missing-c/..", &link).unwrap();
+    let manifest_through_link = dir
+        .path()
+        .join("missing-c/../link")
+        .join(fixed.file_name().unwrap());
+    let broken = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-10.prior.db"),
+        &dir.path().join("cron-10.side.db"),
+        Some(&manifest_through_link),
+    )
+    .unwrap_err();
+    assert!(
+        broken
+            .to_string()
+            .contains("symbolic link without a target"),
+        "{broken}"
+    );
+    assert!(!dir.path().join("missing-c").exists());
+    assert!(!dir.path().join("cron-10.prior.db").exists());
     assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
 }
 

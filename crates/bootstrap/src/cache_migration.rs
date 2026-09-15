@@ -2140,10 +2140,7 @@ fn write_build_manifest(
     prior_sha256: &str,
     path: &Path,
 ) -> Result<(), BootstrapError> {
-    // A read-write connection that only reads: SQLite checkpoints and removes
-    // its own sidecars on close, under its own locks, when it is the last
-    // connection to the file.
-    let prior = open_existing_rw(prior_path)?;
+    let prior = open_immutable(prior_path)?;
     let newest_trade: Option<i64> =
         prior.query_row("SELECT MAX(timestamp_unix) FROM trades", [], |row| {
             row.get(0)
@@ -2177,19 +2174,37 @@ fn write_build_manifest(
     )
 }
 
-/// Read `user_version` from the main file header (bytes 60..64, big-endian in
-/// the SQLite file format) so the immutable prior is inspected without SQLite
-/// creating write-ahead or shared-memory sidecars beside it. The prior is a
-/// checkpointed and closed main, where the header is authoritative.
-fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
-    use std::io::Read as _;
-    let mut header = [0_u8; 100];
-    File::open(path)?.read_exact(&mut header)?;
-    if !header.starts_with(b"SQLite format 3\0") {
-        return invalid(format!("{} is not a SQLite database", path.display()));
+/// Open a checkpointed and closed main for reading exactly as its bytes are.
+/// SQLite's immutable mode takes no locks, creates no write-ahead or
+/// shared-memory sidecar beside the file and ignores any it finds, so the
+/// immutable prior is inspected without being touched.
+fn open_immutable(path: &Path) -> Result<Connection, BootstrapError> {
+    let text = path.to_str().ok_or_else(|| BootstrapError::Invalid {
+        message: format!("{} is not a UTF-8 path", path.display()),
+    })?;
+    let mut uri = String::from("file:");
+    for character in text.chars() {
+        match character {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3F"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
     }
-    let version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
-    Ok(i64::from(version))
+    uri.push_str("?immutable=1");
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(BootstrapError::from)
+}
+
+/// The immutable prior's `user_version`, read without touching the file.
+fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
+    let connection = open_immutable(path)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(version)
 }
 
 /// Read the candidate's `user_version` through SQLite so a seal committed to
@@ -2231,8 +2246,9 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
 /// Canonical form of a path that may not exist yet. Each component that
 /// exists is resolved through the file system so a link compares by its
 /// target; a component that does not exist cannot be a link, so its spelling
-/// is kept and a following `..` steps back over it. A manifest in a directory
-/// the writer will create therefore still compares by identity.
+/// is kept and a following `..` steps back over it; a link without a target
+/// is refused because a directory created later could give it one. A manifest
+/// in a directory the writer will create therefore still compares by identity.
 fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -2249,10 +2265,18 @@ fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
                 .to_path_buf(),
             other => resolved.join(other.as_os_str()),
         };
-        resolved = if next.exists() {
-            std::fs::canonicalize(&next)?
-        } else {
-            next
+        resolved = match std::fs::metadata(&next) {
+            Ok(_) => std::fs::canonicalize(&next)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&next).is_ok() {
+                    return invalid(format!(
+                        "{} is a symbolic link without a target",
+                        next.display()
+                    ));
+                }
+                next
+            }
+            Err(error) => return Err(error.into()),
         };
     }
     Ok(resolved)
