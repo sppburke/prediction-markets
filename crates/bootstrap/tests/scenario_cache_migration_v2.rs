@@ -3009,20 +3009,45 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         "{dangling}"
     );
     assert!(!dir.path().join("cron-11.prior.db").exists());
-    // The manifest is written under its resolved identity, so a spelling that
-    // differs only in form (a trailing `/.`) lands on the same file and leaves
-    // no temporary file behind.
-    let spelled =
-        std::path::PathBuf::from(format!("{}/.", dir.path().join("spelled.json").display()));
-    let normalized = stage_cache_cycle_v2(
+    // A spelling that names a directory (a trailing `/` or `/.`) is refused:
+    // the manifest is read again under the same spelling by the migration,
+    // which cannot open it that way once a file exists there.
+    for spelling in ["spelled.json/.", "spelled.json/"] {
+        let spelled = std::path::PathBuf::from(format!("{}/{spelling}", dir.path().display()));
+        let refused = stage_cache_cycle_v2(
+            &fixed,
+            &dir.path().join("cron-12.prior.db"),
+            &dir.path().join("cron-12.side.db"),
+            Some(&spelled),
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("names a directory, not a file"),
+            "{spelling}: {refused}"
+        );
+        assert!(!dir.path().join("spelled.json").exists());
+        assert!(!dir.path().join("cron-12.prior.db").exists());
+    }
+    // The writer's temporary file beside the manifest is a role as well: a
+    // candidate named like it would receive the manifest bytes first.
+    let temp_named_side = dir
+        .path()
+        .join(format!(".build.json.{}.tmp", std::process::id()));
+    let temp_role = stage_cache_cycle_v2(
         &fixed,
-        &dir.path().join("cron-12.prior.db"),
-        &dir.path().join("cron-12.side.db"),
-        Some(&spelled),
+        &dir.path().join("cron-13.prior.db"),
+        &temp_named_side,
+        Some(&dir.path().join("build.json")),
     )
-    .unwrap();
-    assert!(!normalized.resumed);
-    assert!(dir.path().join("spelled.json").is_file());
+    .unwrap_err();
+    assert!(
+        temp_role.to_string().contains("not an independent file"),
+        "{temp_role}"
+    );
+    assert!(!dir.path().join("cron-13.prior.db").exists());
+    assert!(!dir.path().join("build.json").exists());
     assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
         !entry
             .unwrap()

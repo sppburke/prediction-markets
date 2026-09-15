@@ -2083,15 +2083,20 @@ pub fn stage_cache_cycle_v2(
         ("immutable prior staging file", prior_pending.as_path()),
         ("private candidate staging file", side_pending.as_path()),
     ];
-    if let Some(path) = build_manifest_path {
-        roles.push(("cache build manifest", path));
-    }
-    require_distinct_files(&roles)?;
     // The manifest is checked and written under one spelling: its resolved
-    // identity, whose parent directory exists.
+    // identity, whose parent directory exists. The writer's temporary file
+    // beside it is a role too.
     let build_manifest_path = build_manifest_path
         .map(canonical_intended_path)
         .transpose()?;
+    let build_manifest_temp = build_manifest_path.as_deref().map(atomic_write_temp_path);
+    if let Some(path) = build_manifest_path.as_deref() {
+        roles.push(("cache build manifest", path));
+    }
+    if let Some(path) = build_manifest_temp.as_deref() {
+        roles.push(("cache build manifest staging file", path));
+    }
+    require_distinct_files(&roles)?;
     if side_path.exists() {
         require_regular_file(side_path, "private candidate cache")?;
         if !prior_path.exists() {
@@ -2258,6 +2263,10 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
 /// Staging never creates directories, so a spelling that would put a
 /// directory or a file at a cache role is refused before anything is written.
 fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
+    let spelled = path.as_os_str().as_encoded_bytes();
+    if spelled.ends_with(b"/") || spelled.ends_with(b"/.") {
+        return invalid(format!("{} names a directory, not a file", path.display()));
+    }
     let name = path.file_name().ok_or_else(|| BootstrapError::Invalid {
         message: format!("{} has no file name", path.display()),
     })?;
@@ -2277,13 +2286,14 @@ fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // A link without a target is not an absent file: a copy made
             // later could give it one and turn it into an alias.
-            if std::fs::symlink_metadata(&intended).is_ok() {
-                return invalid(format!(
+            match std::fs::symlink_metadata(&intended) {
+                Ok(_) => invalid(format!(
                     "{} is a symbolic link without a target",
                     path.display()
-                ));
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(intended),
+                Err(error) => Err(error.into()),
             }
-            Ok(intended)
         }
         Err(error) => Err(error.into()),
     }
@@ -3157,19 +3167,28 @@ fn sync_parent(path: &Path) -> Result<(), BootstrapError> {
     Ok(())
 }
 
+/// The temporary file [`atomic_write_json`] renames onto `path`.
+fn atomic_write_temp_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("stage"),
+        std::process::id()
+    ))
+}
+
 fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), BootstrapError> {
     let parent = path
         .parent()
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("stage"),
-        std::process::id()
-    ));
+    let temp = atomic_write_temp_path(path);
     let rendered = serde_json::to_vec_pretty(value)?;
     let mut file = OpenOptions::new()
         .create_new(true)
