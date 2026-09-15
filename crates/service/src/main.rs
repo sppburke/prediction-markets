@@ -530,20 +530,12 @@ async fn main() -> Result<()> {
     paper_state
         .init_bankroll(starting_bankroll)
         .context("initialise paper-state bankroll")?;
-    // #628: a FRESH financial activation is not the same thing as RECOVERY of an era that has
-    // already traded. While a store has applied no fill, the era is still pristine there and this
-    // equality is the real protection against activating onto the wrong balance. Once a fill lands,
-    // it debits cash in the SAME transaction that records it (`PaperStateDb::apply_financial_fill`),
-    // so demanding the Start baseline would refuse to boot for the rest of the era's life — and the
-    // financial recovery that reconciles the difference runs only further below.
-    //
-    // The freshness marker is per-store on purpose: the authority can apply a fill before the local
-    // projection catches up, so a single shared predicate would wrongly refuse one side or excuse
-    // the other. It is deliberately NOT "has a Start been recorded" — initial activation also
-    // carries a Start, and a service that seeds Start then crashes before any fill leaves a
-    // pristine era that must keep this protection. Start identity is unaffected and is still
-    // validated on BOTH paths by `seed_financial_start`, which is idempotent on a match and fails
-    // otherwise.
+    // #628: the Start-baseline gate (`check_start_baseline_bankroll` documents why it binds only
+    // while a store is untraded). The progress marker is per-store on purpose: the authority can
+    // apply a fill before the local projection catches up, so one shared predicate would wrongly
+    // refuse one side or excuse the other. It is deliberately NOT "has a Start been recorded" —
+    // initial activation also carries a Start, and a service that seeds Start then crashes before
+    // any fill leaves a pristine era that must keep this protection.
     if financial_start.is_some() {
         pe_service::paper_recovery::check_start_baseline_bankroll(
             "local",

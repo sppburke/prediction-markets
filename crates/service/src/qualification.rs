@@ -10718,7 +10718,7 @@ mod tests {
         )
     }
 
-    /// #618. The preflight must cover exactly the four gate groups that are valid against a running
+    /// #618, #628. The preflight must cover exactly the five gate groups that are valid against a running
     /// service, and NOT the journal, source-log or paper-state gates — those assert on a tail that
     /// is still moving while the service runs.
     ///
@@ -10726,7 +10726,7 @@ mod tests {
     /// an implementation that read the live journal but not the source log. Here every file the
     /// preflight is forbidden to touch is *deleted* while the manifest still names it.
     /// PASS: the preflight succeeds anyway.
-    /// FAIL: it touched something outside its four groups.
+    /// FAIL: it touched something outside its five groups.
     #[test]
     fn preflight_reads_the_paper_state_but_never_scans_a_log() {
         let temp = tempfile::tempdir().unwrap();
