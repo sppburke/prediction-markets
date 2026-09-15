@@ -2179,6 +2179,45 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json") != ver
 done
 echo "PASS: FE-VERIFY-71"
 
+# Scenario FE-VERIFY-72 — an installed bind on the unspecified address is probed on loopback (#545).
+# Preconditions: the adopted target environment binds `0.0.0.0:18080`, the production shape
+#   (`PE_BIND=0.0.0.0:8080`), which every earlier proof of this step sidestepped: the rehearsal
+#   overrides the bind to loopback and this fixture wrote `127.0.0.1` outright.
+# PASS: the driver converges to `verified`. The curl shim answers ONLY
+#   `http://127.0.0.1:18080/health/ready` (exit 96 for any other URL), so convergence proves the
+#   readiness URL was derived on loopback with the installed port.
+# FAIL: `installed_readiness_url` refuses the unspecified address ("installed readiness endpoint is
+#   invalid"), which is exactly what the pre-fix driver did.
+# Control: a SPECIFIC non-loopback address is still refused, so only the unspecified address is admitted.
+for case in "0.0.0.0|verified" "10.0.0.5|refused"; do
+  bind=${case%%|*}; want=${case#*|}
+  root=$TEST_TMP/verify-bind-$bind
+  setup_fixture "$root"
+  sed -i "s|^PE_BIND=127.0.0.1:18080$|PE_BIND=$bind:18080|" "$root/target/service.env"
+  grep -q "^PE_BIND=$bind:18080$" "$root/target/service.env" || fail "fixture did not rebind the target environment"
+  # The fixture's rehearsal evidence hashes the target environment; re-record it so the driver binds
+  # THIS env instead of refusing it as environment_identity_mismatch.
+  write_rehearsal_evidence "$root"
+  driver_args "$root"
+  set +e
+  output=$(drive_to_verified "$root" 2>&1)
+  status=$?
+  set -e
+  state=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["state"])
+except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
+  if [[ "$want" == verified ]]; then
+    [[ $status -eq 0 && "$state" == verified ]] ||
+      fail "an installed bind on $bind did not reach verified (state $state): $output"
+  else
+    [[ $status -ne 0 && "$state" != verified ]] ||
+      fail "an installed bind on $bind was admitted (state $state)"
+    [[ "$output" == *"installed readiness endpoint is invalid"* ]] ||
+      fail "an installed bind on $bind was refused for the wrong reason: $output"
+  fi
+done
+echo "PASS: FE-VERIFY-72"
+
 # Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
 # Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
 #   it; the shutdown write then records `stale: true` — the #545 attempt-15 shape.
@@ -3833,4 +3872,4 @@ cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
-echo "PASS: 71 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 72 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"

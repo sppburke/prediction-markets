@@ -365,6 +365,9 @@ else:
 if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
     raise SystemExit("invalid installed bind port")
 address=ipaddress.ip_address(host)
+# An installed bind on the unspecified address (production: PE_BIND=0.0.0.0:8080) listens on every local
+# address, loopback included, so the readiness probe targets loopback on the same port.
+if address.is_unspecified: address=ipaddress.ip_address("::1" if address.version == 6 else "127.0.0.1")
 if not address.is_loopback: raise SystemExit("installed readiness bind is not loopback")
 url_host=f"[{address}]" if address.version == 6 else str(address)
 print(f"http://{url_host}:{port}/health/ready")' "$installed_bind"
