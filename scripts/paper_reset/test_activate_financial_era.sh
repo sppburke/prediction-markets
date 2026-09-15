@@ -308,6 +308,13 @@ if [[ "$stdin" == *rolbypassrls* ]]; then
   count=0; [[ ! -f "$state/legacy-contract-count" ]] || count=$(<"$state/legacy-contract-count")
   echo $((count + 1)) > "$state/legacy-contract-count"
 fi
+# #628: count the Financial15 rows export the same way. It is the only remote call between the stop
+# and the post-stop preflight, so a test can assert that preflight reuses the pre-stop export rather
+# than blocking the local refusal behind `psql` again.
+if [[ "$sql" == *"json_agg(json_build_object('key',key,'value',value,'value_type',value_type)"* ]]; then
+  count=0; [[ ! -f "$state/rows-export-count" ]] || count=$(<"$state/rows-export-count")
+  echo $((count + 1)) > "$state/rows-export-count"
+fi
 if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ $(<"$state/service.active") == false ]] || exit 98
   count=0; [[ ! -f "$state/archive-count" ]] || count=$(<"$state/archive-count")
@@ -2192,6 +2199,11 @@ set -e
   fail "the pre-stop observation should have passed on a clean status"
 [[ $(<"$root/test-state/preflight-count") == 2 ]] ||
   fail "expected a pre-stop and a post-stop observation"
+# #628: the post-stop preflight must answer from the rows the pre-stop one already exported. A second
+# export here is a remote `psql` call with no deadline, sitting exactly where the immediate local
+# refusal is supposed to happen.
+[[ $(<"$root/test-state/rows-export-count") == 1 ]] ||
+  fail "the post-stop preflight re-exported the configuration rows it already had ($(<"$root/test-state/rows-export-count") exports)"
 [[ $(<"$root/test-state/stop-count") == 1 ]] ||
   fail "the service should have been stopped exactly once"
 compgen -G "$root/prediction-markets/financial-era-*-paper-state.db" > /dev/null &&

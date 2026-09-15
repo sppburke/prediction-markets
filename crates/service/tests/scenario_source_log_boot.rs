@@ -22,8 +22,8 @@ use pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID;
 use pe_service::paper_migration::{PaperMigrationBoot, PaperMigrationPaths};
 use pe_service::paper_recovery::{
     CanonicalFillResult, ExpectedAuthority, FinancialPayload, FinancialResult,
-    PaperFillOperationIdentity, PaperLogRecord, QualificationStarted, TailBinding, paper_era,
-    replay_membership, scan_paper_log,
+    PaperFillOperationIdentity, PaperLogFrame, PaperLogRecord, QualificationStarted, TailBinding,
+    paper_era, replay_membership, scan_paper_log,
 };
 use pe_service::risk_inputs::SourceReceiptIndex;
 use pe_service::source_log_boot::{SourceLogBoot, SourceLogBootHooks};
@@ -1228,12 +1228,19 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
 /// frozen-baseline message. Exercising the helper with literal booleans could not catch a `main`
 /// that ignored the markers, so these cases boot the binary itself with `--exit-after-anchors`,
 /// which runs past both guards, the Start seed and the frame reconciliation before exiting.
+///
+/// The two successful cases share ONE genuine Prepared fill, laid down exactly as the runtime
+/// leaves it before the authority answers (the causal source frame, then the Prepared frame —
+/// `orchestrator.rs` synchronizes Prepared BEFORE calling the authority). They differ only in how
+/// far past that point the crash happened, so the admitted "authority ahead" state is not merely
+/// tolerated: the boot has to recover it.
 enum PostStartBootCase {
-    /// The authority applied a fill; the local projection has not caught up. Both stores must be
-    /// admitted: the local one still carries the baseline, the authority no longer does.
+    /// Crashed after the authority applied the fill and before the local projection: the store
+    /// still carries the baseline, the authority no longer does. Both must be admitted, and the
+    /// boot must then recover the fill locally and append its Final.
     AuthorityAheadLocalUntouched,
-    /// Both stores carry the fill: one local fill row plus the Prepared frame's Final, and the
-    /// authority reports the same progress.
+    /// Crashed after the local projection and the Final append: both stores carry the fill, and
+    /// the boot has nothing left to reconcile.
     BothTraded,
     /// An untraded local store reset onto the wrong balance is still the fresh-activation
     /// refusal, before the authority is consulted.
@@ -1252,6 +1259,8 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
         requests: Arc<Mutex<Vec<Uri>>>,
         bankroll: serde_json::Value,
         start: AppendReceipt,
+        /// The `commit_fill_v2` answer for the Prepared fixture, when one exists.
+        commit: Option<serde_json::Value>,
     }
     async fn respond(State(authority): State<Authority>, uri: Uri) -> Json<serde_json::Value> {
         use serde_json::json;
@@ -1302,6 +1311,10 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
                 "start_seq": authority.start.sequence.0,
                 "start_hash": authority.start.this_hash.to_hex().to_string(),
             }),
+            "/rest/v1/rpc/commit_fill_v2" => authority
+                .commit
+                .clone()
+                .expect("commit_fill_v2 is reachable only through the Prepared fixture"),
             _ => panic!("unexpected post-Start boot request {uri}"),
         })
     }
@@ -1338,13 +1351,12 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
             CollateralAmount::from_decimal_exact(local_reset).unwrap(),
         )
         .unwrap();
-    let mut authority_progress = serde_json::json!({"bankroll_str": "9", "last_prepared_seq": 2});
+    let mut authority_progress =
+        serde_json::json!({"bankroll_str": "9", "last_prepared_seq": null});
+    let mut commit = None;
     let mut expected_cash = local_reset;
-    match case {
-        PostStartBootCase::BothTraded => {
-            // One completed fill, exactly as the runtime leaves it: Prepared and Final frames in
-            // the paper log, the fill row and the debited cash in the local store, and the
-            // authority reporting the same progress.
+    let prepared = match case {
+        PostStartBootCase::AuthorityAheadLocalUntouched | PostStartBootCase::BothTraded => {
             let source_receipt = append(
                 &paths.source_log,
                 activity_envelope("0xboot-fill", NOW_UNIX + 1),
@@ -1371,56 +1383,83 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
             );
             let request =
                 PreparedFillRequest::from_prepared(expected, prepared, &operation, &economic);
-            paper
-                .apply_financial_fill(
-                    start,
-                    None,
-                    prepared.sequence,
-                    source_receipt,
-                    NOW_UNIX,
-                    &FillRecord {
-                        idempotency_key: request.idempotency_key.clone(),
-                        market_id: MarketId(VenueMarketId(request.market_id.clone())),
-                        outcome_id: OutcomeId(request.outcome_id),
-                        side: request.side,
-                        quantity: request.quantity,
-                        fill_price: request.fill_price,
-                        principal: request.principal,
-                        fee: request.fee,
-                    },
-                    dec!(9),
-                )
-                .unwrap();
-            append_paper_record(
-                &paths.paper_log,
-                &PaperLogRecord::FinancialFinal {
-                    prepared_receipt: prepared,
-                    result: FinancialResult::Fill {
-                        canonical: CanonicalFillResult {
-                            outcome: "applied".to_owned(),
-                            bankroll: dec!(9),
-                            applied_prepared_seq: prepared.sequence,
+            // The authority has applied it either way: cash 9, progress at this Prepared.
+            authority_progress = serde_json::json!({
+                "bankroll_str": "9",
+                "last_prepared_seq": prepared.sequence.0,
+            });
+            expected_cash = dec!(9);
+            // Its idempotent `commit_fill_v2` answer, byte-for-byte what the reconciler validates
+            // against the Prepared it recomputes.
+            commit = Some(serde_json::json!({
+                "outcome": "existing",
+                "bankroll": "9",
+                "applied_prepared_seq": prepared.sequence.0,
+                "row": {
+                    "idempotency_key": request.idempotency_key,
+                    "leader_wallet": request.leader_wallet.to_string(),
+                    "source_trade_id": request.source_trade_id.0,
+                    "market_id": request.market_id,
+                    "outcome_id": request.outcome_id,
+                    "side": "buy",
+                    "quantity": request.quantity.to_decimal().to_string(),
+                    "fill_price": request.fill_price.0.to_string(),
+                    "principal": request.principal.to_decimal().to_string(),
+                    "fee": request.fee.to_decimal().to_string(),
+                    "entry_unix": request.entry_unix,
+                    "prepared_seq": prepared.sequence.0,
+                },
+            }));
+            if matches!(case, PostStartBootCase::BothTraded) {
+                // Exactly what `apply_financial_result` stores: the fill row, the debited cash and
+                // the causal time read back from the source receipt's envelope (NOW_UNIX + 1).
+                paper
+                    .apply_financial_fill(
+                        start,
+                        None,
+                        prepared.sequence,
+                        source_receipt,
+                        NOW_UNIX + 1,
+                        &FillRecord {
+                            idempotency_key: request.idempotency_key.clone(),
+                            market_id: MarketId(VenueMarketId(request.market_id.clone())),
+                            outcome_id: OutcomeId(request.outcome_id),
+                            side: request.side,
                             quantity: request.quantity,
+                            fill_price: request.fill_price,
                             principal: request.principal,
                             fee: request.fee,
-                            fill_price: request.fill_price,
+                        },
+                        dec!(9),
+                    )
+                    .unwrap();
+                append_paper_record(
+                    &paths.paper_log,
+                    &PaperLogRecord::FinancialFinal {
+                        prepared_receipt: prepared,
+                        result: FinancialResult::Fill {
+                            canonical: CanonicalFillResult {
+                                outcome: "applied".to_owned(),
+                                bankroll: dec!(9),
+                                applied_prepared_seq: prepared.sequence,
+                                quantity: request.quantity,
+                                principal: request.principal,
+                                fee: request.fee,
+                                fill_price: request.fill_price,
+                            },
                         },
                     },
-                },
-            );
-            assert_eq!(paper.fills_count().unwrap(), 1);
-            assert_eq!(paper.bankroll().unwrap(), Some(dec!(9)));
-            expected_cash = dec!(9);
-            authority_progress =
-                serde_json::json!({"bankroll_str": "9", "last_prepared_seq": prepared.sequence.0});
+                );
+                assert_eq!(paper.fills_count().unwrap(), 1);
+                assert_eq!(paper.bankroll().unwrap(), Some(dec!(9)));
+            } else {
+                assert_eq!(paper.fills_count().unwrap(), 0);
+                assert_eq!(paper.bankroll().unwrap(), Some(dec!(10)));
+            }
+            Some(prepared)
         }
-        PostStartBootCase::AuthorityWrongBaseline => {
-            authority_progress =
-                serde_json::json!({"bankroll_str": "9", "last_prepared_seq": null});
-        }
-        PostStartBootCase::AuthorityAheadLocalUntouched | PostStartBootCase::LocalWrongBaseline => {
-        }
-    }
+        PostStartBootCase::LocalWrongBaseline | PostStartBootCase::AuthorityWrongBaseline => None,
+    };
     drop(paper);
 
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1428,6 +1467,7 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
         requests: requests.clone(),
         bankroll: authority_progress,
         start,
+        commit,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1473,13 +1513,38 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
     let seeded = hit
         .iter()
         .any(|path| path == "/rest/v1/rpc/seed_financial_start");
+    let committed = hit.iter().any(|path| path == "/rest/v1/rpc/commit_fill_v2");
+    let finals_for = |prepared: AppendReceipt| {
+        paper_era(scan_paper_log(&paths.paper_log).unwrap())
+            .frames
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    &frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialFinal { prepared_receipt, .. })
+                        if *prepared_receipt == prepared
+                )
+            })
+            .count()
+    };
     match case {
         PostStartBootCase::AuthorityAheadLocalUntouched | PostStartBootCase::BothTraded => {
             assert!(output.status.success(), "{stderr}");
             assert!(seeded, "the boot must reach the Start seed: {hit:?}");
+            let prepared = prepared.unwrap();
+            // Authority-ahead: the boot must have asked the authority for the Prepared it found
+            // unmatched, applied the answer locally and appended the Final. Both-traded: nothing
+            // was left to ask, and the one Final is still the one the fixture wrote.
+            let recovered = matches!(case, PostStartBootCase::AuthorityAheadLocalUntouched);
+            assert_eq!(committed, recovered, "{hit:?}");
+            assert_eq!(finals_for(prepared), 1);
             let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
             assert_eq!(paper.financial_start().unwrap(), Some(start));
-            // The boot reconciled nothing: the cash is exactly what the fixture left.
+            assert_eq!(paper.fills_count().unwrap(), 1);
+            assert_eq!(
+                paper.financial_last_prepared_seq().unwrap(),
+                Some(prepared.sequence)
+            );
             assert_eq!(paper.bankroll().unwrap(), Some(expected_cash));
         }
         PostStartBootCase::LocalWrongBaseline => {

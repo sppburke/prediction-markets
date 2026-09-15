@@ -568,13 +568,6 @@ async fn ac_settled_refusal_is_terminal_and_walk_advances() {
     println!("PASS: AC-SETTLED-WALK — refused frame disposed terminally, no resurrection");
 }
 
-fn active_receipt(sequence: u64, byte: u8) -> AppendReceipt {
-    AppendReceipt {
-        sequence: EventSeq(sequence),
-        this_hash: blake3::Hash::from_bytes([byte; 32]),
-    }
-}
-
 fn empty_tail() -> TailBinding {
     TailBinding {
         physical_tail: 5,
@@ -900,7 +893,7 @@ fn assert_authority_conflict<T>(result: Result<T, SupabaseStateError>, field: &s
 /// FAIL: a changed retry is reported existing/applied or changes the authority mutation count.
 #[tokio::test]
 async fn prepared_authority_changed_field_conflict_matrix() {
-    let start = active_receipt(10, 10);
+    let start = support::hashed_receipt(10, 10);
     let authority = FakeSupabaseState::prepared(dec!(10), start);
     let expected = ExpectedAuthority {
         qualification_start_receipt: start,
@@ -911,9 +904,13 @@ async fn prepared_authority_changed_field_conflict_matrix() {
         source_trade_id: SourceTradeId("g2:authority-fill".to_owned()),
         observed_at_bucket: 1_800_000_000,
     };
-    let economic = support::economic_prepared(active_receipt(5, 5), start);
-    let request =
-        PreparedFillRequest::from_prepared(expected, active_receipt(11, 11), &operation, &economic);
+    let economic = support::economic_prepared(support::hashed_receipt(5, 5), start);
+    let request = PreparedFillRequest::from_prepared(
+        expected,
+        support::hashed_receipt(11, 11),
+        &operation,
+        &economic,
+    );
     authority.commit_prepared_fill(&request).await.unwrap();
     assert_eq!(authority.prepared_mutations(), 1);
     assert_eq!(
@@ -967,13 +964,13 @@ async fn prepared_authority_changed_field_conflict_matrix() {
     changed_fill!("era", |value: &mut PreparedFillRequest| value
         .expected_authority
         .qualification_start_receipt =
-        active_receipt(10, 99));
+        support::hashed_receipt(10, 99));
     changed_fill!("prior_sequence", |value: &mut PreparedFillRequest| value
         .expected_authority
         .prior_completed_prepared_sequence =
         Some(EventSeq(9)));
     changed_fill!("prepared_sequence", |value: &mut PreparedFillRequest| {
-        value.prepared_receipt = active_receipt(12, 12)
+        value.prepared_receipt = support::hashed_receipt(12, 12)
     });
     for (field, changed) in fill_retries {
         assert_authority_conflict(authority.commit_prepared_fill(&changed).await, field);
@@ -984,7 +981,7 @@ async fn prepared_authority_changed_field_conflict_matrix() {
             qualification_start_receipt: start,
             prior_completed_prepared_sequence: Some(EventSeq(11)),
         },
-        prepared_receipt: active_receipt(12, 12),
+        prepared_receipt: support::hashed_receipt(12, 12),
         condition: PolymarketConditionId("condition".to_owned()),
         payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
         settled_at_unix: 1_800_000_100,
@@ -1013,13 +1010,13 @@ async fn prepared_authority_changed_field_conflict_matrix() {
     changed.settled_at_unix += 1;
     resolution_retries.push(("settled_at_unix", changed));
     let mut changed = resolution.clone();
-    changed.expected_authority.qualification_start_receipt = active_receipt(10, 99);
+    changed.expected_authority.qualification_start_receipt = support::hashed_receipt(10, 99);
     resolution_retries.push(("era", changed));
     let mut changed = resolution.clone();
     changed.expected_authority.prior_completed_prepared_sequence = None;
     resolution_retries.push(("prior_sequence", changed));
     let mut changed = resolution.clone();
-    changed.prepared_receipt = active_receipt(13, 13);
+    changed.prepared_receipt = support::hashed_receipt(13, 13);
     resolution_retries.push(("prepared_sequence", changed));
     for (field, changed) in resolution_retries {
         assert_authority_conflict(authority.apply_prepared_resolution(&changed).await, field);

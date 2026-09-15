@@ -906,9 +906,11 @@ case "$state" in
     # is recorded durably before this point, so a crash-and-retry skips that whole block and used to
     # walk straight into the backup with no current preflight at all — discovering a membership
     # proof invalidated during shutdown only after the expensive work. The rows export was the only
-    # reason for the old guard, and it is idempotent: recreate it here so a stopped re-entry is
-    # gated exactly like a forward one.
-    export_financial_config_rows
+    # reason for the old guard. It is also the only REMOTE call on this path, and `psql` has no
+    # deadline: a forward invocation reuses the export its pre-stop preflight already made, so the
+    # local refusal cannot be blocked behind the authority; only a stopped re-entry (crash-and-retry,
+    # or an already-inactive service) has no export yet and makes one now.
+    [[ -s "$financial_config_rows_file" ]] || export_financial_config_rows
     preflight_report=$(run_target_offline --financial-era=preflight \
       --activation-manifest="$MANIFEST" \
       --financial-config-rows="$financial_config_rows_file") ||
@@ -1036,9 +1038,7 @@ if seed.get("start_seq") != sequence or seed.get("start_hash") != digest: raise 
 if row.get("start_seq") != sequence or row.get("start_hash") != digest: raise SystemExit("authority Start read-back differs")
 if mode == "initial":
     if row.get("last_prepared_seq") is not None: raise SystemExit("authority Start read-back differs")
-    if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise SystemExit("authority bankroll read-back differs")
-elif mode != "resume":
-    raise SystemExit("unknown authority Start mode")' \
+    if decimal.Decimal(row.get("bankroll")) != decimal.Decimal(sys.argv[4]): raise SystemExit("authority bankroll read-back differs")' \
     "$authority_start" "$start_seq" "$start_hash" "$fresh_bankroll" "$authority_start_mode" ||
     die "authority Start seed/read-back proof failed"
   manifest_patch_boundary authority-start-seeded \
