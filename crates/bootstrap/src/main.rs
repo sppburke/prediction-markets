@@ -365,10 +365,17 @@ async fn main() {
                         // Fresh mode (#588): no frozen reference; a newly started
                         // generation is bounded by the same settled read end the
                         // legacy poller uses, and a recorded generation keeps its end.
-                        if let Some(generation) = fresh_generation_arg {
-                            if frozen_payload_arg.is_some()
-                                || fixed_end_arg.is_some()
-                                || generation_arg.is_some()
+                        // Mode selection reads the raw flags, so a bare or
+                        // malformed flag can never fall through to the other
+                        // collector.
+                        let flag_present = |name: &str| {
+                            rest.iter()
+                                .any(|a| *a == name || a.starts_with(&format!("{name}=")))
+                        };
+                        if flag_present("--fresh-generation") {
+                            if flag_present("--frozen-payload")
+                                || flag_present("--fixed-end")
+                                || flag_present("--generation")
                             {
                                 return Err(BootstrapError::Invalid {
                                     message: "--fresh-generation cannot be combined with \
@@ -376,12 +383,22 @@ async fn main() {
                                         .to_owned(),
                                 });
                             }
-                            let generation =
-                                generation.map_err(|value| BootstrapError::Invalid {
-                                    message: format!(
-                                        "--fresh-generation requires an integer, got {value:?}"
-                                    ),
-                                })?;
+                            let generation = match fresh_generation_arg {
+                                Some(Ok(generation)) => generation,
+                                Some(Err(value)) => {
+                                    return Err(BootstrapError::Invalid {
+                                        message: format!(
+                                            "--fresh-generation requires an integer, got {value:?}"
+                                        ),
+                                    });
+                                }
+                                None => {
+                                    return Err(BootstrapError::Invalid {
+                                        message: "--fresh-generation requires an integer value"
+                                            .to_owned(),
+                                    });
+                                }
+                            };
                             let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                                 &bootstrap_config.cache_path,
                             )?;

@@ -549,6 +549,32 @@ fn fresh_generation_cli_refuses_malformed_values_and_legacy_flag_mixes() {
             ],
             "cannot be combined",
         ),
+        (
+            vec![
+                "cache-populate-activity-v2",
+                "--fresh-generation",
+                "9",
+                "--generation=bad",
+            ],
+            "cannot be combined",
+        ),
+        (
+            vec!["cache-populate-activity-v2", "--fresh-generation"],
+            "requires an integer value",
+        ),
+        (
+            vec![
+                "cache-populate-activity-v2",
+                "--frozen-payload",
+                "reference.json",
+                "--generation",
+                "1",
+                "--fixed-end",
+                "1",
+                "--fresh-generation",
+            ],
+            "cannot be combined",
+        ),
     ] {
         let output = run_cli_with_env(dir.path(), &cache_path, &args, &[("RUST_LOG", "error")]);
         assert_eq!(output.status.code(), Some(1), "{args:?}");

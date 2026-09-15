@@ -631,7 +631,7 @@ and every retained history, without a frozen reference:
 # rename). A schema-one prior also gets its hash-bound build manifest for the initial seal.
 pe-bootstrap cache-stage-v2 --db "$FIXED_PHYSICAL" --prior "$PRIOR" --side "$SIDE" \
   --manifest "$CACHE_BUILD_MANIFEST"
-pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   # initial only
+pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   # unsealed candidate only
 pe-bootstrap winner-discovery --db "$SIDE" --defer-activation
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
@@ -708,7 +708,9 @@ the same line and exit 2 with the pointer retained. Record the measurement from 
 artifacts: the wallet union (`wallet_count` in the activity manifest of the candidate's
 `activity_coverage_manifests_v2`, also in `candidate_cycle_manifest.json`), the candidate
 size, elapsed time from the cycle log, and the source times the publisher accepted. Then set
-the value to `1` and start the supervisor (or run the zero-argument command once): the
+the value to `1` and either run the zero-argument command once by hand or, if the loop was
+paused, `scripts/deploy/forge_pause.sh restore` (it restores the recorded run flag and unit
+state; a plain unit start would exit on the `stop` flag the pause wrote): the
 pending-publication recovery activates and publishes exactly that request. If the publisher
 refuses (stale source times, incomplete coverage), the cycle stops with the installed cache
 untouched and the candidate, prior and log preserved; do not relabel times, narrow

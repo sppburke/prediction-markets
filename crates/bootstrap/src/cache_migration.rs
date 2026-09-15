@@ -288,6 +288,8 @@ pub struct CacheStageReport {
     pub prior_path: PathBuf,
     pub side_path: PathBuf,
     pub prior_schema: i64,
+    /// Differs from `prior_schema` only after the initial candidate was sealed.
+    pub side_schema: i64,
     pub prior_sha256: Option<String>,
     pub side_sha256: Option<String>,
     pub resumed: bool,
@@ -2074,13 +2076,17 @@ pub fn stage_cache_cycle_v2(
     // independent of every role as well.
     let prior_pending = pending_path_for(prior_path);
     let side_pending = pending_path_for(side_path);
-    require_distinct_files(&[
+    let mut roles = vec![
         ("current fixed cache", fixed_path),
         ("immutable prior cache", prior_path),
         ("private candidate cache", side_path),
-        ("immutable prior staging file", &prior_pending),
-        ("private candidate staging file", &side_pending),
-    ])?;
+        ("immutable prior staging file", prior_pending.as_path()),
+        ("private candidate staging file", side_pending.as_path()),
+    ];
+    if let Some(path) = build_manifest_path {
+        roles.push(("cache build manifest", path));
+    }
+    require_distinct_files(&roles)?;
     if side_path.exists() {
         require_regular_file(side_path, "private candidate cache")?;
         if !prior_path.exists() {
@@ -2092,10 +2098,11 @@ pub fn stage_cache_cycle_v2(
         }
         require_regular_file(prior_path, "immutable prior cache")?;
         let report = stage_report(fixed_path, prior_path, side_path, None, true)?;
-        // A restart between adoption and the manifest write must not leave the
-        // initial seal without its authentic input.
+        // An unsealed initial candidate whose manifest went missing gets it
+        // back from the immutable prior; a sealed candidate keeps its recorded
+        // input hash in `sealed_generation_manifests` and needs no file.
         if let Some(path) = build_manifest_path
-            && report.prior_schema != CACHE_SCHEMA_VERSION_V2
+            && report.side_schema != CACHE_SCHEMA_VERSION_V2
             && !path.exists()
         {
             write_build_manifest(prior_path, &sha256_file(prior_path)?, path)?;
@@ -2167,11 +2174,19 @@ fn write_build_manifest(
     )
 }
 
+/// Read `user_version` from the main file header (bytes 60..64, big-endian in
+/// the SQLite file format) so a staged role is inspected without SQLite
+/// creating write-ahead or shared-memory sidecars beside it. Every caller
+/// inspects a checkpointed and closed main, where the header is authoritative.
 fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
-    let connection = open_existing_ro(path)?;
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    connection.close().map_err(|(_, error)| error)?;
-    Ok(version)
+    use std::io::Read as _;
+    let mut header = [0_u8; 100];
+    File::open(path)?.read_exact(&mut header)?;
+    if !header.starts_with(b"SQLite format 3\0") {
+        return invalid(format!("{} is not a SQLite database", path.display()));
+    }
+    let version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    Ok(i64::from(version))
 }
 
 /// The staged roles must be independent files: the same path, a hard link or a
@@ -2230,11 +2245,13 @@ fn stage_report(
     resumed: bool,
 ) -> Result<CacheStageReport, BootstrapError> {
     let prior_schema = verified_user_version(prior_path)?;
+    let side_schema = verified_user_version(side_path)?;
     Ok(CacheStageReport {
         fixed_path: std::fs::canonicalize(fixed_path)?,
         prior_path: std::fs::canonicalize(prior_path)?,
         side_path: std::fs::canonicalize(side_path)?,
         prior_schema,
+        side_schema,
         side_sha256: prior_sha256.clone(),
         prior_sha256,
         resumed,

@@ -1925,29 +1925,38 @@ fn activity_url(wallet: &str, end: i64) -> String {
     )
 }
 
-// The original wallet trades one market twice (an old entry and a recent
-// re-entry); every other wallet trades a distinct market per epoch.
+// Every wallet other than the original trades one distinct market per epoch.
 fn market_for(wallet: &str, epoch: i64) -> String {
-    if wallet == WALLET {
-        "0xsame".to_owned()
-    } else {
-        format!("market-{epoch}")
-    }
+    format!("market-{}-{epoch}", &wallet[2..6])
 }
 
+// The original wallet always returns one scripted history on one market: an
+// old entry, a complete exit, and a recent re-entry. Full history makes the
+// recent buy a re-entry; the venue's default window would show it as a first
+// entry. Its `epochs` are ignored.
 fn activity_rows(wallet: &str, epochs: &[i64], revised: bool) -> Vec<u8> {
-    let rows = epochs
-        .iter()
-        .map(|epoch| {
-            serde_json::json!({
-                "proxyWallet": wallet, "type": "TRADE", "conditionId": market_for(wallet, *epoch),
-                "asset": "123", "outcome": "Yes", "side": "BUY",
-                "size": if revised { "2" } else { "1" },
-                "usdcSize": if revised { "1" } else { "0.5" }, "price": "0.5",
-                "timestamp": epoch, "transactionHash": format!("trade-{epoch}"), "outcomeIndex": "0",
-            })
+    let size = if revised { "2" } else { "1" };
+    let usdc = if revised { "1" } else { "0.5" };
+    let row = |market: String, side: &str, epoch: i64| {
+        serde_json::json!({
+            "proxyWallet": wallet, "type": "TRADE", "conditionId": market,
+            "asset": "123", "outcome": "Yes", "side": side, "size": size,
+            "usdcSize": usdc, "price": "0.5", "timestamp": epoch,
+            "transactionHash": format!("trade-{epoch}"), "outcomeIndex": "0",
         })
-        .collect::<Vec<_>>();
+    };
+    let rows = if wallet == WALLET {
+        vec![
+            row("0xsame".to_owned(), "BUY", FRESH_END - 1),
+            row("0xsame".to_owned(), "SELL", FRESH_END - 151),
+            row("0xsame".to_owned(), "BUY", FRESH_END - 201),
+        ]
+    } else {
+        epochs
+            .iter()
+            .map(|epoch| row(market_for(wallet, *epoch), "BUY", *epoch))
+            .collect()
+    };
     serde_json::to_vec(&rows).unwrap()
 }
 
@@ -2043,14 +2052,16 @@ async fn finalize_fresh_initial(dir: &TempDir, side: &std::path::Path) -> String
     .cache_sha256
 }
 
-/// Resolved payout evidence for every market the fresh fixtures trade, so the
-/// classifier projects real first entries.
+/// Resolved payout evidence for the shared market and the wallets C and D, so
+/// the classifier projects real first entries while the inactive retained
+/// wallet B keeps zero projected entries (retention is not projection).
 async fn install_fresh_payouts(side: &std::path::Path) {
     let markets = [
         "0xsame".to_owned(),
-        format!("market-{}", FRESH_END - 1),
-        format!("market-{}", FRESH_END - 101),
-        format!("market-{}", FRESH_END + 50),
+        market_for(WALLET_C, FRESH_END - 1),
+        market_for(WALLET_C, FRESH_END - 101),
+        market_for(WALLET_D, FRESH_END - 1),
+        market_for(WALLET_D, FRESH_END - 101),
     ]
     .map(|market| {
         serde_json::json!({
@@ -2130,14 +2141,15 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
         )
         .unwrap();
     assert_eq!(Value::String(bound), record["digest"]);
-    assert_eq!(generation_rows(&side, 1), 8);
-    // Full history makes the old trade the only first entry on the shared
-    // market; the recent re-entry is not projected. Every other wallet's two
-    // distinct markets are first entries, all certified as classifier two.
-    let mut expected = vec![(WALLET.to_owned(), "0xsame".to_owned(), FRESH_END - 101)];
-    for wallet in [WALLET_B, WALLET_C, WALLET_D] {
+    assert_eq!(generation_rows(&side, 1), 9);
+    // Full history makes the old buy the only first entry on the shared market:
+    // the recent buy after a complete exit is a re-entry and is not projected.
+    // C and D project both of their markets; the inactive retained wallet B has
+    // no payout evidence and therefore no projected entry at all.
+    let mut expected = vec![(WALLET.to_owned(), "0xsame".to_owned(), FRESH_END - 201)];
+    for wallet in [WALLET_C, WALLET_D] {
         for epoch in [FRESH_END - 101, FRESH_END - 1] {
-            expected.push((wallet.to_owned(), format!("market-{epoch}"), epoch));
+            expected.push((wallet.to_owned(), market_for(wallet, epoch), epoch));
         }
     }
     expected.sort();
@@ -2147,7 +2159,7 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
             &side,
             "SELECT COUNT(*) FROM ranker_entries_v2 WHERE classifier_version = 2"
         ),
-        7
+        5
     );
 
     // A completed generation is returned without any source call, and an older
@@ -2339,7 +2351,7 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
         1
     );
     assert_eq!(sha256_file(&prior).unwrap(), prior_sha256);
-    assert_eq!(generation_rows(&prior, 1), 8);
+    assert_eq!(generation_rows(&prior, 1), 9);
 
     // An unfinished generation can only be resumed.
     let skipped = populate_activity_fresh_v2(
@@ -2381,20 +2393,24 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     );
     assert_eq!(manifest.generation, 2);
     assert_eq!(manifest.wallet_count, 5);
-    assert_eq!(generation_rows(&side, 2), 9);
+    assert_eq!(generation_rows(&side, 2), 10);
     assert_eq!(
         count(
             &side,
             "SELECT COUNT(*) FROM activity_groups_v2 WHERE share_amount_str = '2'"
         ),
-        8,
+        9,
         "revised historical rows are accepted in the private generation"
     );
     // Retained histories stay in the union independently of ranker membership:
-    // the re-entry wallet's only projected entry is its old trade and the
-    // flagged wallet keeps its projection, yet both are collected because of
-    // their retained rows, not their projection rows.
+    // the inactive wallet B has retained rows but no projected entry in the
+    // prior, and it was collected anyway.
     let prior_projection = projected_entries(&prior);
+    assert!(
+        !prior_projection
+            .iter()
+            .any(|(wallet, _, _)| wallet == WALLET_B)
+    );
     assert_eq!(
         prior_projection
             .iter()
@@ -2489,6 +2505,7 @@ async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tamper
         [activity_url(WALLET, FRESH_END + 100)]
     );
     assert_eq!(generation_rows(&side, 7), 0);
+    assert_eq!(generation_rows(&side, 8), 3);
     assert_eq!(
         count(
             &side,
@@ -2528,7 +2545,7 @@ async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tamper
     assert_eq!(fresh_record(&side)["generation"], 8);
     assert_eq!(
         generation_rows(&side, 8),
-        2,
+        3,
         "no clearing on a refused start"
     );
     let connection = Connection::open(&side).unwrap();
@@ -2654,19 +2671,15 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         "the WAL-only committed row must reach the immutable prior"
     );
     // The staged build manifest is the authentic hash-bound input the initial
-    // migration seals against; it is written once.
-    let manifest_bytes = std::fs::read(&manifest).unwrap();
-    let build: CacheV2BuildManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    // migration seals against; it is written before the candidate is adopted.
+    let build: CacheV2BuildManifest =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     assert_eq!(build.backup_sha256, fixed_sha256);
     assert_eq!(build.source_bounds["newest_trade_unix"], FRESH_END - 10);
     assert_eq!(build.cursors["clob_closed"], "");
-    let migrated = migrate_cache_v2(&side, &manifest).unwrap();
-    assert!(!migrated.resumed);
-    assert_eq!(migrated.legacy_trade_count, 1);
-    assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
-
-    // A restart that lost the manifest after adopting the candidate recreates
-    // it from the immutable prior with the same hash and bounds.
+    assert_eq!(staged.side_schema, 1);
+    // A manifest lost before the seal is recreated from the immutable prior
+    // and still seals the candidate.
     std::fs::remove_file(&manifest).unwrap();
     let recovered = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
     assert!(recovered.resumed);
@@ -2674,7 +2687,18 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     assert_eq!(rebuilt.backup_sha256, build.backup_sha256);
     assert_eq!(rebuilt.source_bounds, build.source_bounds);
-    let manifest_bytes = std::fs::read(&manifest).unwrap();
+    let migrated = migrate_cache_v2(&side, &manifest).unwrap();
+    assert!(!migrated.resumed);
+    assert_eq!(migrated.legacy_trade_count, 1);
+    assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
+    // Once sealed, the candidate records the manifest hash itself: a resume
+    // reports the sealed schema and does not fabricate a manifest that the
+    // seal could no longer verify.
+    std::fs::remove_file(&manifest).unwrap();
+    let sealed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(sealed.resumed);
+    assert_eq!(sealed.side_schema, 2);
+    assert!(!manifest.exists());
 
     // A retry returns the cycle's own candidate untouched and never rewrites
     // the completed prior.
@@ -2690,7 +2714,7 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert_eq!(resumed.prior_sha256, None);
     assert_eq!(sha256_file(&side).unwrap(), mutated);
     assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
-    assert_eq!(std::fs::read(&manifest).unwrap(), manifest_bytes);
+    assert!(!manifest.exists());
 
     // A candidate without its prior is not a resumable cycle.
     std::fs::remove_file(&prior).unwrap();
@@ -2755,6 +2779,23 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         "the fixed cache must survive a refused staging"
     );
     assert!(!colliding_prior.exists() && !colliding_side.exists());
+    // The build manifest is written before the copies, so it must not be a
+    // role or a staging name either.
+    let manifest_as_pending = dir.path().join("cron-6.side.db.pending");
+    let manifest_role = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-6.prior.db"),
+        &dir.path().join("cron-6.side.db"),
+        Some(&manifest_as_pending),
+    )
+    .unwrap_err();
+    assert!(
+        manifest_role
+            .to_string()
+            .contains("not an independent file"),
+        "{manifest_role}"
+    );
+    assert!(!dir.path().join("cron-6.prior.db").exists());
     assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
 }
 

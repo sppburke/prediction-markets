@@ -743,13 +743,13 @@ refresh_candidate_v2() {
   local build_manifest="$OUT_DIR/cache_build_manifest.json"
   run_refresh_stage "cache-stage" stage_candidate_cache "$prior" "$side" "$build_manifest" "$stage_json"
   export PE_BOOTSTRAP_CACHE_PATH="$side"
-  local prior_schema
-  prior_schema="$("$PYTHON_BIN" -c 'import json, sys
-print(int(json.load(open(sys.argv[1], encoding="utf-8"))["prior_schema"]))' "$stage_json")"
-  if [[ "$prior_schema" != "2" ]]; then
+  local side_schema
+  side_schema="$("$PYTHON_BIN" -c 'import json, sys
+print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$stage_json")"
+  if [[ "$side_schema" != "2" ]]; then
     # Initial schema-one candidate: seal it once against the hash-bound build
-    # manifest that staging wrote from the verified prior bytes; the resumed
-    # migration compares the same manifest bytes.
+    # manifest that staging wrote from the verified prior bytes. A sealed
+    # candidate records that manifest's hash itself and is not migrated again.
     run_refresh_stage "cache-migrate" "$PE_BOOTSTRAP_BIN" cache-migrate-v2 --db "$side" \
       --manifest "$build_manifest" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
