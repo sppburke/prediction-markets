@@ -2158,6 +2158,7 @@ fn write_build_manifest(
         )
         .optional()?;
     prior.close().map_err(|(_, error)| error)?;
+    remove_idle_sidecars(prior_path)?;
     atomic_write_json(
         path,
         &CacheV2BuildManifest {
@@ -2175,9 +2176,9 @@ fn write_build_manifest(
 }
 
 /// Read `user_version` from the main file header (bytes 60..64, big-endian in
-/// the SQLite file format) so a staged role is inspected without SQLite
-/// creating write-ahead or shared-memory sidecars beside it. Every caller
-/// inspects a checkpointed and closed main, where the header is authoritative.
+/// the SQLite file format) so the immutable prior is inspected without SQLite
+/// creating write-ahead or shared-memory sidecars beside it. The prior is a
+/// checkpointed and closed main, where the header is authoritative.
 fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
     use std::io::Read as _;
     let mut header = [0_u8; 100];
@@ -2189,25 +2190,40 @@ fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
     Ok(i64::from(version))
 }
 
+/// Read the candidate's `user_version` through SQLite so a seal committed to
+/// the write-ahead log but not yet checkpointed is honored, then remove the
+/// idle sidecars this read created beside a closed candidate.
+fn candidate_user_version(path: &Path) -> Result<i64, BootstrapError> {
+    let connection = open_existing_ro(path)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    connection.close().map_err(|(_, error)| error)?;
+    remove_idle_sidecars(path)?;
+    Ok(version)
+}
+
+/// Remove an empty write-ahead log and, when no committed frames remain, the
+/// shared-memory index a closed read left behind. A non-empty log is durable
+/// state and is left intact together with its index.
+fn remove_idle_sidecars(path: &Path) -> Result<(), BootstrapError> {
+    let wal = sidecar_path(path, "-wal");
+    let wal_is_nonempty = wal.is_file() && std::fs::metadata(&wal)?.len() != 0;
+    if wal_is_nonempty {
+        return Ok(());
+    }
+    remove_sidecars(path)
+}
+
 /// The staged roles must be independent files: the same path, a hard link or a
 /// symbolic link would let candidate writes reach the prior or the fixed cache.
 fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError> {
     let mut identities: Vec<(PathBuf, Option<(u64, u64)>)> = Vec::new();
     for (label, path) in roles {
-        let canonical = match std::fs::canonicalize(path) {
-            Ok(canonical) => canonical,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let parent = path
-                    .parent()
-                    .filter(|value| !value.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."));
-                let name = path.file_name().ok_or_else(|| BootstrapError::Invalid {
-                    message: format!("{label} has no file name: {}", path.display()),
-                })?;
-                std::fs::canonicalize(parent)?.join(name)
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let canonical = canonical_intended_path(path).map_err(|error| match error {
+            BootstrapError::Invalid { message } => BootstrapError::Invalid {
+                message: format!("{label}: {message}"),
+            },
+            other => other,
+        })?;
         let inode = file_identity(path)?;
         for (other_path, other_inode) in &identities {
             if *other_path == canonical || (inode.is_some() && inode == *other_inode) {
@@ -2220,6 +2236,38 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
         identities.push((canonical, inode));
     }
     Ok(())
+}
+
+/// Canonical form of a path that may not exist yet: its nearest existing
+/// ancestor is canonicalized and the remaining components are appended, so a
+/// manifest in a directory the writer will create still compares by identity.
+fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = absolute.as_path();
+    let mut remainder = Vec::new();
+    loop {
+        if existing.exists() {
+            break;
+        }
+        let name = existing
+            .file_name()
+            .ok_or_else(|| BootstrapError::Invalid {
+                message: format!("{} has no existing ancestor", path.display()),
+            })?;
+        remainder.push(name.to_owned());
+        existing = existing.parent().ok_or_else(|| BootstrapError::Invalid {
+            message: format!("{} has no existing ancestor", path.display()),
+        })?;
+    }
+    let mut canonical = std::fs::canonicalize(existing)?;
+    for name in remainder.into_iter().rev() {
+        canonical.push(name);
+    }
+    Ok(canonical)
 }
 
 #[cfg(unix)]
@@ -2245,7 +2293,7 @@ fn stage_report(
     resumed: bool,
 ) -> Result<CacheStageReport, BootstrapError> {
     let prior_schema = verified_user_version(prior_path)?;
-    let side_schema = verified_user_version(side_path)?;
+    let side_schema = candidate_user_version(side_path)?;
     Ok(CacheStageReport {
         fixed_path: std::fs::canonicalize(fixed_path)?,
         prior_path: std::fs::canonicalize(prior_path)?,

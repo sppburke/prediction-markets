@@ -26,7 +26,10 @@ use pe_bootstrap::cache_migration::{
 };
 use pe_bootstrap::clob::ClobFetcher;
 use pe_bootstrap::pile::SRC_TRADES;
-use pe_core_types::{ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, WalletAddress};
+use pe_core_types::{
+    LeaderAction, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId, SourceTimestamp,
+    WalletAddress,
+};
 use pe_position_ledger::{
     EntryClassification, LedgerMutation, PositionLedger, SecondVerdict,
     classify_complete_second_legacy,
@@ -2161,6 +2164,71 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
         ),
         5
     );
+    // The same fixture through the real ledger and classifier: the old buy is
+    // an admitted entry, the sell is an exit that empties the position, and the
+    // recent buy is an entry (not an add-on) refused as not-first-entry.
+    let wallet = WalletAddress::from_hex(WALLET).unwrap();
+    let observed = time::OffsetDateTime::from_unix_timestamp(FRESH_END + 1).unwrap();
+    let mut aggregates = parse_activity_response(
+        &activity_rows(WALLET, &[], false),
+        wallet,
+        &ActivityParseContext {
+            source_id: SourceId("polymarket-data-api".to_owned()),
+            observed_at: SourceTimestamp(observed),
+            received_at: ReceivedAt(observed),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap();
+    aggregates.sort_by_key(|aggregate| aggregate.source_time.0);
+    let mut ledger = PositionLedger::new();
+    let mut history = std::collections::BTreeSet::<String>::new();
+    let mut classified = Vec::new();
+    for aggregate in &aggregates {
+        let mutation = LedgerMutation::from_activity(aggregate).unwrap();
+        let SecondVerdict::OrderIndependent { decisions, .. } =
+            pe_position_ledger::classify_complete_historical_second(
+                &ledger,
+                wallet,
+                std::slice::from_ref(&mutation),
+                ReconstructionQuality::new(100).unwrap(),
+                &|market| history.contains(&market.to_string()),
+            )
+            .unwrap()
+        else {
+            panic!("scripted history is order independent");
+        };
+        assert_eq!(decisions.len(), 1);
+        classified.push((decisions[0].action, decisions[0].entry));
+        ledger
+            .apply_all_or_none(std::slice::from_ref(&mutation))
+            .unwrap();
+        for key in mutation.touched_keys() {
+            history.insert(key.market().to_string());
+        }
+        if decisions[0].action == LeaderAction::Exit {
+            assert!(
+                ledger.position(&wallet).is_some_and(|snapshot| {
+                    snapshot.positions.values().all(|state| {
+                        state.long_contracts == ShareAmount::ZERO
+                            && state.short_contracts == ShareAmount::ZERO
+                    })
+                }),
+                "the exit must leave no inventory: {:?}",
+                ledger.position(&wallet)
+            );
+        }
+    }
+    assert_eq!(
+        classified,
+        vec![
+            (LeaderAction::Entry, EntryClassification::Admitted),
+            (LeaderAction::Exit, EntryClassification::NotBuy),
+            (LeaderAction::Entry, EntryClassification::NotFirstEntry),
+        ]
+    );
 
     // A completed generation is returned without any source call, and an older
     // or equal generation cannot be started.
@@ -2678,6 +2746,15 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert_eq!(build.source_bounds["newest_trade_unix"], FRESH_END - 10);
     assert_eq!(build.cursors["clob_closed"], "");
     assert_eq!(staged.side_schema, 1);
+    for role in [&prior, &side] {
+        for suffix in ["db-wal", "db-shm"] {
+            assert!(
+                !role.with_extension(suffix).exists(),
+                "staging left a sidecar beside {}",
+                role.display()
+            );
+        }
+    }
     // A manifest lost before the seal is recreated from the immutable prior
     // and still seals the candidate.
     std::fs::remove_file(&manifest).unwrap();
@@ -2699,6 +2776,9 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert!(sealed.resumed);
     assert_eq!(sealed.side_schema, 2);
     assert!(!manifest.exists());
+    for suffix in ["db-wal", "db-shm"] {
+        assert!(!prior.with_extension(suffix).exists());
+    }
 
     // A retry returns the cycle's own candidate untouched and never rewrites
     // the completed prior.
@@ -2796,7 +2876,49 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         "{manifest_role}"
     );
     assert!(!dir.path().join("cron-6.prior.db").exists());
+    // A manifest in a directory that does not exist yet is an ordinary target:
+    // the writer creates the directory.
+    let nested_manifest = dir.path().join("new-dir/nested/build.json");
+    let nested = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-7.prior.db"),
+        &dir.path().join("cron-7.side.db"),
+        Some(&nested_manifest),
+    )
+    .unwrap();
+    assert!(!nested.resumed);
+    assert!(nested_manifest.is_file());
     assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
+}
+
+#[test]
+fn cycle_staging_honors_a_seal_committed_only_to_the_write_ahead_log() {
+    use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    let prior = dir.path().join("wallet_cache.cron-1.prior.db");
+    let side = dir.path().join("wallet_cache.cron-1.side.db");
+    let manifest = dir.path().join("cache_build_manifest.json");
+    drop(seed_v1(&fixed, FRESH_END - 10));
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert_eq!(staged.side_schema, 1);
+    // A seal whose `user_version` commit sits in the write-ahead log while the
+    // main header still says one (interrupted before its checkpoint) must be
+    // seen as sealed: no manifest is fabricated for it.
+    let sealing = Connection::open(&side).unwrap();
+    sealing
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA user_version = 2;")
+        .unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(resumed.resumed);
+    assert_eq!(resumed.side_schema, 2);
+    assert!(!manifest.exists());
+    assert!(
+        side.with_extension("db-wal").metadata().unwrap().len() > 0,
+        "the committed write-ahead log must be left intact"
+    );
+    drop(sealing);
 }
 
 #[tokio::test]
