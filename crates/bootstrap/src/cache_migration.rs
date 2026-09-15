@@ -2069,23 +2069,22 @@ pub fn stage_cache_cycle_v2(
     side_path: &Path,
     build_manifest_path: Option<&Path>,
 ) -> Result<CacheStageReport, BootstrapError> {
-    let _lock = crate::lock::CacheMutationLock::acquire(fixed_path)?;
     require_regular_file(fixed_path, "current fixed cache")?;
     require_same_device(fixed_path, prior_path, side_path)?;
     // The copies delete and rename their `.pending` names, so those must be
     // independent of every role as well.
     let prior_pending = pending_path_for(prior_path);
     let side_pending = pending_path_for(side_path);
-    // SQLite creates or truncates the fixed cache's and the candidate's
-    // write-ahead and shared-memory sidecars when staging opens them, so
-    // those names are roles as well.
+    // SQLite creates, truncates or deletes the fixed cache's and the
+    // candidate's write-ahead, shared-memory and rollback-journal sidecars
+    // when staging opens them, so those names are roles as well.
     let sidecars: Vec<(&str, PathBuf)> = [
         ("current fixed cache sidecar", fixed_path),
         ("private candidate sidecar", side_path),
     ]
     .into_iter()
     .flat_map(|(label, path)| {
-        ["-wal", "-shm"].map(move |suffix| (label, sidecar_path(path, suffix)))
+        ["-wal", "-shm", "-journal"].map(move |suffix| (label, sidecar_path(path, suffix)))
     })
     .collect();
     let mut roles = vec![
@@ -2100,6 +2099,10 @@ pub fn stage_cache_cycle_v2(
             .iter()
             .map(|(label, path)| (*label, path.as_path())),
     );
+    // Taking the cache lock creates and rewrites the lock file, so the roles
+    // are validated before the lock is taken.
+    let lock_path = crate::lock::lock_path_for(fixed_path);
+    roles.push(("cache mutation lock", lock_path.as_path()));
     // The manifest is checked and written under one spelling: its resolved
     // identity, whose parent directory exists. The writer's temporary file
     // beside it is a role too.
@@ -2114,6 +2117,7 @@ pub fn stage_cache_cycle_v2(
         roles.push(("cache build manifest staging file", path));
     }
     require_distinct_files(&roles)?;
+    let _lock = crate::lock::CacheMutationLock::acquire(fixed_path)?;
     if side_path.exists() {
         require_regular_file(side_path, "private candidate cache")?;
         if !prior_path.exists() {

@@ -3065,6 +3065,22 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     );
     assert!(!sidecar_named_prior.exists());
     assert!(!dir.path().join("cron-14.side.db").exists());
+    // A rollback journal SQLite finds beside a database it opens is played
+    // back and deleted, so that name is a role too.
+    let journal_named_prior = dir.path().join("cron-15.side.db-journal");
+    let journal_role = stage_cache_cycle_v2(
+        &fixed,
+        &journal_named_prior,
+        &dir.path().join("cron-15.side.db"),
+        Some(&dir.path().join("build.json")),
+    )
+    .unwrap_err();
+    assert!(
+        journal_role.to_string().contains("not an independent file"),
+        "{journal_role}"
+    );
+    assert!(!journal_named_prior.exists());
+    assert!(!dir.path().join("cron-15.side.db").exists());
     assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -3073,6 +3089,26 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
             .ends_with(".tmp")
     }));
     assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
+}
+
+#[test]
+fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
+    use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    drop(seed_v1(&fixed, FRESH_END - 10));
+    let lock = pe_bootstrap::lock::lock_path_for(&fixed);
+    let before = std::fs::read(&lock).ok();
+    // Taking the lock creates and rewrites the lock file, so a role named
+    // like it is refused before the lock is taken.
+    let refused =
+        stage_cache_cycle_v2(&fixed, &lock, &dir.path().join("cron-1.side.db"), None).unwrap_err();
+    assert!(
+        refused.to_string().contains("not an independent file"),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read(&lock).ok(), before);
+    assert!(!dir.path().join("cron-1.side.db").exists());
 }
 
 #[test]
