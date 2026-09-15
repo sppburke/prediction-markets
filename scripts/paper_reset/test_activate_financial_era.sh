@@ -280,6 +280,12 @@ path=sys.argv[1]; v=json.load(open(path))
 v["fills_total"]=0; v["bankroll"]="9999"
 json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
     fi
+    if [[ -f "$state/status-live-empty" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]; v=json.load(open(path))
+v["watchlist_size"]=0; v["watchlist_projection"]["applied"]["count"]=0; v["oldest_anchor_age_secs"]=None
+json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
     ;;
   *) echo "unexpected systemctl command: $*" >&2; exit 97 ;;
 esac
@@ -385,19 +391,27 @@ elif [[ "$sql" == *seed_financial_start* ]]; then
     echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
   fi
 elif [[ "$sql" == *"'start_seq'"* ]]; then
+  # The shim cannot run SQL, so it pins the shape of the verified-state statement: the lifecycle
+  # table, the demote event and the Start-bound time window (#545: knockouts are audited continuity).
+  started=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["started_unix"])' "$PE_ACTIVATION_TEST_ROOT/pe-financial-era.json")
+  [[ "$sql" == *"from wallet_lifecycle_events where event='demote' and ts >= to_timestamp($started))"* ]] || exit 96
   # #628: the authority observation for a traded era, and for a still-fresh era whose cash is wrong.
-  if [[ -f "$state/remote-traded" ]]; then
-    echo '{"paper_fills":1,"bankroll_count":1,"bankroll":"10000.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  if [[ -f "$state/remote-demoted-member" ]]; then
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":[],"demoted_since_start":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-extra-member" ]]; then
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000999"],"demoted_since_start":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-traded" ]]; then
+    echo '{"paper_fills":1,"bankroll_count":1,"bankroll":"10000.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"],"demoted_since_start":[]}'
   elif [[ -f "$state/remote-wrong-start" ]]; then
-    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"],"demoted_since_start":[]}'
   elif [[ -f "$state/remote-wrong-membership" ]]; then
-    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000999"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":[],"demoted_since_start":[]}'
   elif [[ -f "$state/remote-wrong-batch" ]]; then
-    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":999,"membership":["0x0000000000000000000000000000000000000545"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":999,"membership":["0x0000000000000000000000000000000000000545"],"demoted_since_start":[]}'
   elif [[ -f "$state/remote-wrong-bankroll" ]]; then
-    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"9999","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+    echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"9999","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"],"demoted_since_start":[]}'
   else
-  echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  echo '{"paper_fills":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"],"demoted_since_start":[]}'
   fi
 elif [[ "$sql" == *json_build_object* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"paper_bankroll":1,"fill_market_snapshots":0}'
@@ -2218,6 +2232,46 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
 done
 echo "PASS: FE-VERIFY-72"
 
+# Scenario FE-VERIFY-73 — membership is continuity, not stasis (#545 attempt 17). The service's own
+# #350 knockout evicted a prepared member 3.5 h after Start, audited in wallet_lifecycle_events, and
+# the frozen equality refused a healthy era for good.
+# Preconditions: the authority reports the prepared member gone and audited as `demote` after
+#   started_unix; the status agrees (live size 0, projection 0).
+# PASS: the driver converges to `verified`.
+# FAIL: the equality is still frozen ("status membership count differs").
+root=$TEST_TMP/verify-demoted-member
+setup_fixture "$root"
+driver_args "$root"
+: > "$root/test-state/status-live-empty"
+: > "$root/test-state/remote-demoted-member"
+set +e
+output=$(drive_to_verified "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 0 ]] || fail "an audited knockout did not reach verified: $output"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+  "$root/pe-financial-era.json") == verified ]] ||
+  fail "audited knockout did not durably record verified"
+# Controls: one defect per row and the ONE diagnostic that must name it. An UNAUDITED absence stays
+# covered by FE-VERIFY-71's remote-wrong-membership row ("remote membership differs").
+for case in \
+  "remote-demoted-member|status membership count differs from the authority" \
+  "status-live-empty|status membership count differs from the authority" \
+  "remote-extra-member|remote membership admits a wallet outside the prepared membership"; do
+  marker=${case%%|*}; want=${case#*|}
+  root=$TEST_TMP/verify-membership-$marker
+  setup_fixture "$root"
+  driver_args "$root"
+  : > "$root/test-state/$marker"
+  set +e
+  output=$(drive_to_verified "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "$marker: the driver accepted a membership defect"
+  [[ "$output" == *"$want"* ]] || fail "$marker refused for the wrong reason (wanted '$want'): $output"
+done
+echo "PASS: FE-VERIFY-73"
+
 # Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
 # Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
 #   it; the shutdown write then records `stale: true` — the #545 attempt-15 shape.
@@ -3872,4 +3926,4 @@ cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
-echo "PASS: 72 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 73 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"

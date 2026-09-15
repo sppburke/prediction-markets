@@ -1105,7 +1105,7 @@ if [[ "$state" == started ]]; then
   hot_config_hash=$(manifest_get preparation.start.hot_config_hash)
   [[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "prepared hot-config identity is invalid"
   verify_guarded_log_prefixes || die "paper/source/live prefixes do not extend their guarded identities"
-  python3 -c 'import decimal,json,os,sys
+  status_watchlist_size=$(python3 -c 'import decimal,json,os,sys
 path,started,revision,hot,bankroll,membership_count=sys.argv[1:]
 started=int(started); membership_count=int(membership_count)
 value=json.load(open(path,encoding="utf-8"))
@@ -1125,14 +1125,19 @@ if runtime.get("applied_hash") != hot or runtime.get("rejected") is not None: ra
 # `watchlist_target_size` is the configured CAP, documented to differ from the live size whenever
 # the ranking bench cannot fill every slot (status_writer.rs). Comparing a config knob with a
 # membership census could never pass: production runs cap 100 against a 26-28 wallet membership.
-if value.get("watchlist_size") != membership_count: raise SystemExit("status membership count differs")
-if membership_count and not isinstance(value.get("oldest_anchor_age_secs"),int): raise SystemExit("status does not prove installed membership anchors")
+# The live size is BOUNDED by the prepared membership, not equal to it: the #350 knockout run by
+# the service itself evicts members at any tick and audits each one in wallet_lifecycle_events, which is
+# continuity, not drift (attempt 17 lost a member 3.5 h after Start). The remote proof explains
+# every absence; the size is printed so both proofs compare against this ONE status read.
+size=value.get("watchlist_size")
+if not isinstance(size,int) or size > membership_count: raise SystemExit("status membership count exceeds the prepared membership")
+if size and not isinstance(value.get("oldest_anchor_age_secs"),int): raise SystemExit("status does not prove installed membership anchors")
 projection=value.get("watchlist_projection") or {}
 applied=projection.get("applied") or {}
 # The projection token is a timestamptz (the refresh RPC returns `new_token`), never "batch:<id>",
 # so comparing it with the ranking identity could never pass. Ranking identity is proven instead by
 # the remote batch comparison further down, against the authority ranking_batch_id.
-if applied.get("count") != membership_count or projection.get("pending") is not None or projection.get("last_error") is not None: raise SystemExit("status membership projection is not exact")
+if applied.get("count") != size or projection.get("pending") is not None or projection.get("last_error") is not None: raise SystemExit("status membership projection is not exact")
 tasks=value.get("tasks") or []
 required={"activity_ingest","public_activity_poll","orchestrator","resolution_poller","watchlist_refresh","status_writer","http_server"}
 running={row.get("name") for row in tasks if row.get("state") == "running"}
@@ -1153,10 +1158,12 @@ for account in accounts:
     identities.append(account.get("account_id"))
     if account.get("requested_live_mode") != "off" or account.get("effective_live_mode") != "off" or account.get("armed") is not False:
         raise SystemExit("a live account is not off and unarmed")
-if None in identities or len(identities) != len(set(identities)): raise SystemExit("live account inventory is not uniquely identified")' \
+if None in identities or len(identities) != len(set(identities)): raise SystemExit("live account inventory is not uniquely identified")
+print(size)' \
     "$generation/status.json" "$(manifest_get started_unix)" "$target_revision" \
-    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" ||
+    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")") ||
     die "first fresh health proof is incomplete"
+  [[ "$status_watchlist_size" =~ ^[0-9]+$ ]] || die "first fresh health proof is incomplete"
   readiness_url=$(installed_readiness_url) || die "installed readiness endpoint is invalid"
   financial_readiness_response=$(mktemp)
   readiness_env=("PATH=$PATH" "LANG=${LANG:-C.UTF-8}")
@@ -1196,6 +1203,8 @@ if len(rows) != 1: raise SystemExit("local bankroll differs")
 if fills == 0 and decimal.Decimal(rows[0][0]) != decimal.Decimal(bankroll): raise SystemExit("local bankroll differs")' \
     "$paper_state" "$(manifest_get start_receipt.sequence)" "$(manifest_get start_receipt.this_hash)" "$fresh_bankroll" ||
     die "local financial reset/Start proof is incomplete"
+  started_unix=$(manifest_get started_unix)
+  [[ "$started_unix" =~ ^[0-9]+$ ]] || die "manifest started_unix is invalid"
   remote_verified=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
     "select json_build_object(
        'paper_fills',(select count(*) from paper_fills),
@@ -1204,7 +1213,8 @@ if fills == 0 and decimal.Decimal(rows[0][0]) != decimal.Decimal(bankroll): rais
        'start_seq',(select start_seq from paper_bankroll where id=0),
        'start_hash',(select start_hash from paper_bankroll where id=0),
        'ranking_batch_id',(select max(batch_id) from ranking_batches),
-       'membership',coalesce((select json_agg(wallet_hex order by wallet_hex) from service_watchlist),'[]'::json)
+       'membership',coalesce((select json_agg(wallet_hex order by wallet_hex) from service_watchlist),'[]'::json),
+       'demoted_since_start',coalesce((select json_agg(lower(wallet_hex)) from wallet_lifecycle_events where event='demote' and ts >= to_timestamp(${started_unix})),'[]'::json)
      )::text;") || die "read remote verified-state proof"
   python3 -c 'import decimal,json,sys
 actual=json.loads(sys.argv[1]); manifest=json.load(open(sys.argv[2],encoding="utf-8"))
@@ -1218,8 +1228,14 @@ if actual["paper_fills"] == 0 and decimal.Decimal(actual["bankroll"]) != decimal
 receipt=manifest["start_receipt"]
 if actual["start_seq"] != receipt["sequence"] or actual["start_hash"] != receipt["this_hash"]: raise SystemExit("remote Start/version differs")
 if actual["ranking_batch_id"] != manifest["ranking_batch_id"]: raise SystemExit("remote ranking batch differs")
-if sorted(actual["membership"]) != sorted(manifest["membership"]): raise SystemExit("remote membership differs")' \
-    "$remote_verified" "$MANIFEST" "$fresh_bankroll" || die "remote financial/ranking/membership proof is incomplete"
+# Membership is continuity, not stasis: the service knocks members out on its own schedule (#350)
+# and audits each one. The live set must stay inside the prepared membership, every absence must
+# be an audited demotion after Start, and the authority must agree with the status read above.
+live=set(actual["membership"]); prepared=set(manifest["membership"])
+if not live <= prepared: raise SystemExit("remote membership admits a wallet outside the prepared membership")
+if not (prepared - live) <= set(actual["demoted_since_start"]): raise SystemExit("remote membership differs")
+if len(live) != int(sys.argv[4]): raise SystemExit("status membership count differs from the authority")' \
+    "$remote_verified" "$MANIFEST" "$fresh_bankroll" "$status_watchlist_size" || die "remote financial/ranking/membership proof is incomplete"
   manifest_advance verified \
     "$(python3 -c 'import json,sys
 print(json.dumps({"verified_state_assertions":True,"verified_start_reset":True,"verified_source_replay_continuity":True,"verified_ranking_membership":True,"verified_producers_projection":True,"verified_accounts_off_unarmed":True,"verified_readiness_sha256":sys.argv[1]},sort_keys=True,separators=(",",":")))' "$verified_readiness_sha256")"
