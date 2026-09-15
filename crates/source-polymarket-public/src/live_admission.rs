@@ -210,10 +210,13 @@ fn validate_state(gamma: &GammaMarket, clob: &ClobMarket) -> Result<(), LiveMark
     if gamma.enable_order_book != Some(true) || clob.enable_order_book != Some(true) {
         return Err(LiveMarketError::OrderBookDisabled);
     }
+    // The long CLOB market is the delay authority. Gamma's `secondsDelay` is nullable and usually
+    // absent (Gamma OpenAPI; docs/15-SOURCES.md 2026-09-15), so it may only corroborate: a
+    // positive delay on either side, or no CLOB delay at all, fails closed.
     match (gamma.seconds_delay, clob.seconds_delay) {
-        (Some(0), Some(0)) => Ok(()),
-        (Some(_), Some(_)) => Err(LiveMarketError::NonzeroDelay),
-        _ => Err(LiveMarketError::MissingDelay),
+        (None | Some(0), Some(0)) => Ok(()),
+        (_, None) => Err(LiveMarketError::MissingDelay),
+        _ => Err(LiveMarketError::NonzeroDelay),
     }
 }
 
@@ -388,6 +391,34 @@ mod tests {
             validate(&gamma(false), &clob),
             Err(LiveMarketError::NonzeroDelay)
         );
+    }
+
+    #[test]
+    fn clob_delay_is_the_authority_and_gamma_delay_is_optional() {
+        for (gamma_delay, clob_delay, expected) in [
+            (None, Some(0), Ok(())),
+            (None, Some(1), Err(LiveMarketError::NonzeroDelay)),
+            (Some(0), None, Err(LiveMarketError::MissingDelay)),
+            (Some(1), Some(0), Err(LiveMarketError::NonzeroDelay)),
+        ] {
+            let mut gamma = gamma(false);
+            let mut clob = clob(false);
+            if let Some(delay) = gamma_delay {
+                gamma[0]["secondsDelay"] = json!(delay);
+            } else {
+                gamma[0].as_object_mut().unwrap().remove("secondsDelay");
+            }
+            if let Some(delay) = clob_delay {
+                clob["seconds_delay"] = json!(delay);
+            } else {
+                clob.as_object_mut().unwrap().remove("seconds_delay");
+            }
+            assert_eq!(
+                validate(&gamma, &clob).map(|_| ()),
+                expected,
+                "gamma {gamma_delay:?} clob {clob_delay:?}"
+            );
+        }
     }
 
     #[test]

@@ -161,7 +161,7 @@
 | https://docs.polymarket.com/v2-migration | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/overview | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/orders/create | 2026-08-11 | 2026-10-10 |
-| https://docs.polymarket.com/trading/fees | 2026-09-05 | 2026-11-04 |
+| https://docs.polymarket.com/trading/fees | 2026-09-15 | 2026-11-14 |
 | https://docs.polymarket.com/builders/fees | 2026-09-05 | 2026-11-04 |
 | https://docs.polymarket.com/trading/deposit-wallets | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/wallets-auth | 2026-08-11 | 2026-10-10 |
@@ -188,7 +188,7 @@
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
 | https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-18 | 2026-09-16 |
-| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-09-05 | 2026-11-04 |
+| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-09-15 | 2026-11-14 |
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
@@ -274,6 +274,21 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-09-15: Re-verified the Polymarket market-admission wire for issue #638 against the official
+  Gamma and CLOB OpenAPI documents (`/api-spec/gamma-openapi.yaml`, `/api-spec/clob-openapi.yaml`)
+  and live responses. Gamma `secondsDelay` is a nullable integer and was absent on 47 of the top 80
+  markets by 24 h volume (present values 0 and 1); the long CLOB market always reported
+  `seconds_delay`, so it is the delay authority and Gamma may only corroborate. The compact
+  `/clob-markets/{condition_id}` `mbf`/`tbf` fields are documented as the maker/taker "base fee in
+  basis points" and were `1000` on every fee-bearing market sampled across categories, while `fd`
+  ("fee curve parameters": `r`, `e`, `to`) carried the documented per-category taker rate (`0.05`
+  weather/sports/economics, `0.04` politics) with `e = 1` and `to = true`; a fee-free geopolitics
+  market omitted `mbf`, `tbf`, and `fd` (Gamma `feesEnabled = false`); `/fee-rate` returned
+  `{"base_fee": 1000}` for a `0.05` market; the fees page states "Makers are never charged fees."
+  The vendored SDK documents both base fees as legacy V1 values unused in V2 settlement. Runtime
+  consequence: `fd`, when present, is the whole fee schedule and the base-fee lexemes are not
+  classified; without `fd` the absent-or-zero base-fee rule is unchanged.
 
 - 2026-09-05: Re-verified the corrected Winner-Follow fee and live-finality contracts for #545.
   Compact CLOB `fd` is the sole runtime fee authority: accepted economics are taker-only,

@@ -350,6 +350,11 @@ impl Harness {
         gamma[0]["conditionId"] = condition.clone().into();
         gamma[0]["clobTokenIds"] = json!([token, other]).to_string().into();
         gamma[0]["outcomePrices"] = "[\"0.50\",\"0.50\"]".into();
+        // Wire shape observed 2026-09-15 (#638): Gamma omits `secondsDelay`, and fee-bearing
+        // markets report legacy base fees of 1000 bps in every payload beside the compact fee curve.
+        gamma[0].as_object_mut().unwrap().remove("secondsDelay");
+        gamma[0]["makerBaseFee"] = 1000.into();
+        gamma[0]["takerBaseFee"] = 1000.into();
         self.prices
             .markets
             .lock()
@@ -361,6 +366,8 @@ impl Harness {
         long["condition_id"] = condition.clone().into();
         long["tokens"][0]["token_id"] = token.clone().into();
         long["tokens"][1]["token_id"] = other.clone().into();
+        long["maker_base_fee"] = 1000.into();
+        long["taker_base_fee"] = 1000.into();
         let mut compact: Value = serde_json::from_slice(include_bytes!(
             "fixtures/golden_stream_v1/clob_compact.json"
         ))
@@ -368,6 +375,8 @@ impl Harness {
         compact["c"] = condition.clone().into();
         compact["t"][0]["t"] = token.clone().into();
         compact["t"][1]["t"] = other.into();
+        compact["mbf"] = 1000.into();
+        compact["tbf"] = 1000.into();
         let mut book: Value =
             serde_json::from_slice(include_bytes!("fixtures/golden_stream_v1/book.json")).unwrap();
         book["market"] = condition.clone().into();

@@ -24,15 +24,14 @@ pub enum FeeScheduleError {
     Exponent,
     #[error("fee rate is not exactly representable")]
     Unrepresentable,
-    #[error("compact fee fields contradict each other")]
-    Contradictory,
     #[error("compact base fees are unknown or nonzero without a schedule")]
     UnknownBase,
     #[error("compact fee field is malformed")]
     Malformed,
 }
 
-/// Parse the compact wire's exact `fd` / `mbf` / `tbf` lexemes.
+/// Parse the compact wire's fee schedule: the `fd` fee curve when present, otherwise the
+/// `mbf` / `tbf` base-fee lexemes.
 ///
 /// This deliberately reads the raw JSON lexemes before the shared SDK DTO is deserialized by the
 /// market parser. Financial decimals therefore never traverse `f64`, and absent fields remain
@@ -40,23 +39,25 @@ pub enum FeeScheduleError {
 pub fn parse_compact_fee_schedule(bytes: &[u8]) -> Result<CompactFeeSchedule, FeeScheduleError> {
     let fields: BTreeMap<String, Box<RawValue>> =
         serde_json::from_slice(bytes).map_err(|_| FeeScheduleError::Malformed)?;
-    let maker_base = optional_base_fee(&fields, "mbf")?;
-    if maker_base.is_some_and(|value| value != Decimal::ZERO) {
-        return Err(FeeScheduleError::MakerFee);
-    }
-    let taker_base = optional_base_fee(&fields, "tbf")?;
     let Some(details) = fields.get("fd") else {
+        // Without a fee curve the base fees are the only fee evidence: absent or explicitly zero
+        // on both sides proves a zero-fee market; anything else is unknown and fails closed.
+        let maker_base = optional_base_fee(&fields, "mbf")?;
+        if maker_base.is_some_and(|value| value != Decimal::ZERO) {
+            return Err(FeeScheduleError::MakerFee);
+        }
+        let taker_base = optional_base_fee(&fields, "tbf")?;
         return if taker_base.is_none_or(|value| value == Decimal::ZERO) {
             Ok(CompactFeeSchedule::Zero)
         } else {
             Err(FeeScheduleError::UnknownBase)
         };
     };
+    // `fd` is the venue's fee curve and the sole fee authority (docs/15-SOURCES.md 2026-09-15).
+    // Fee-bearing markets report the legacy base fees as 1000 bps on both sides regardless of the
+    // curve, so `mbf` / `tbf` carry no schedule information once `fd` is present.
     if details.get().trim() == "null" {
         return Err(FeeScheduleError::Malformed);
-    }
-    if taker_base.is_some_and(|value| value != Decimal::ZERO) {
-        return Err(FeeScheduleError::Contradictory);
     }
 
     let detail_fields: BTreeMap<String, Box<RawValue>> =
@@ -363,18 +364,24 @@ mod tests {
                 CompactFeeSchedule::Zero
             );
         }
-        for fields in [
-            json!({"fd": {"r": 0, "e": 1, "to": true}}),
-            json!({"fd": {"r": 0.0025, "e": 1, "to": true}}),
-            json!({"fd": {"r": 0.0025, "e": 1, "to": true}, "mbf": 0, "tbf": 0}),
+        for (fields, expected_rate) in [
+            (json!({"fd": {"r": 0, "e": 1, "to": true}}), Decimal::ZERO),
+            (
+                json!({"fd": {"r": 0.0025, "e": 1, "to": true}}),
+                dec!(0.0025),
+            ),
+            (
+                json!({"fd": {"r": 0.0025, "e": 1, "to": true}, "mbf": 0, "tbf": 0}),
+                dec!(0.0025),
+            ),
+            // Live shape recorded 2026-09-15: legacy base fees of 1000 bps beside the curve.
+            (
+                json!({"fd": {"r": 0.05, "e": 1, "to": true}, "mbf": 1000, "tbf": 1000}),
+                dec!(0.05),
+            ),
         ] {
-            let expected_rate = fields
-                .get("fd")
-                .and_then(|details| details.get("r"))
-                .and_then(Value::as_i64)
-                .map_or(dec!(0.0025), Decimal::from);
             assert_eq!(
-                parse_compact_fee_schedule(&compact(fields.clone())).unwrap(),
+                parse_compact_fee_schedule(&compact(fields)).unwrap(),
                 CompactFeeSchedule::Taker {
                     rate: expected_rate
                 }
@@ -407,10 +414,6 @@ mod tests {
             (
                 json!({"fd": {"r": 1, "e": 1, "to": true}}),
                 FeeScheduleError::Unrepresentable,
-            ),
-            (
-                json!({"fd": {"r": 0.0025, "e": 1, "to": true}, "tbf": 1}),
-                FeeScheduleError::Contradictory,
             ),
             (
                 json!({"fd": {"r": 0.0025, "rate": 0.003, "e": 1, "to": true}}),
