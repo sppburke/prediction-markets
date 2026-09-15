@@ -614,6 +614,111 @@ authority refuses restoration; recover by rolling forward through the existing p
 path. There is no operator assertion flag. Schema one retains `auto | duck | sqlite`; schema two
 requires the verified DuckDB snapshot and refuses SQLite.
 
+### Fresh private-candidate cycles and the scheduled schema-two lane (#588)
+
+The frozen-payload flow above seals one historical snapshot; it cannot collect a later
+generation because the frozen reference is bound to one generation and end, the wallet
+list is fixed to the sealed schema-one history, and activity insertion moves matching rows
+between generations inside one database. Recurring classifier-two publication therefore
+builds every cycle in a **private candidate** copied from an **immutable prior** of the fixed
+cache and collects fresh complete activity for the union of current acquisition candidates
+and every retained history, without a frozen reference:
+
+```bash
+# Under the cache lock: checkpoint + integrity-check the fixed main, copy it to the
+# immutable prior, copy the prior to the candidate (each copy hash-verified before its
+# rename). A schema-one prior also gets its hash-bound build manifest for the initial seal.
+pe-bootstrap cache-stage-v2 --db "$FIXED_PHYSICAL" --prior "$PRIOR" --side "$SIDE" \
+  --manifest "$CACHE_BUILD_MANIFEST"
+pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   # initial only
+pe-bootstrap winner-discovery --defer-activation           # PE_BOOTSTRAP_CACHE_PATH=$SIDE
+pe-bootstrap activate-next --batch-id "$BATCH" --audit-csv "$AUDIT"
+pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
+pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # unless generation T is complete
+pe-bootstrap cache-finalize-v2 --db "$SIDE" --stage-record "$CACHE_STAGE_RECORD"
+```
+
+`--fresh-generation N` records one versioned collection identity in the candidate
+(`fresh_collection_json`, `_GLOSSARY.md`): the requested generation, its fixed end
+(`now − ACTIVITY_SETTLE_LAG_SECS` at start), the sorted wallet union and its digest, which
+is the `reference_sha256` of every receipt and manifest of that generation. Starting a
+generation atomically invalidates finalization and clears only the candidate's superseded
+projection, activity rows, receipts and manifests; `N` must exceed every generation the
+candidate knows, and an unfinished generation can only be resumed. A retry with the same
+`N` keeps the recorded end and wallet list and fetches only wallets without a valid
+receipt; a completed generation returns its manifest without any source call. Fresh reads
+request each wallet's full history (`start=1` on the wire; an omitted `start` returns only
+the venue's recent window). A `Transient`/`RateLimited` read that exhausts the fetcher's
+retries exits `rank_and_push_tempfail_exit` (75) so the supervisor resumes the collection.
+Finalization, activation and the installed-cache validator accept the fresh identity without
+a frozen-payload row; caches finalized under the frozen flow keep their authentic legacy
+identity, including caches that physically lack the new column.
+
+The zero-argument `rank_and_push.sh` production cycle enters this lane automatically when
+the installed cache is schema two, and for the one-time initial cutover when `.env` sets
+`PE_RANK_SCHEMA_TWO_CUTOVER` (`_GLOSSARY.md`). The lane is frozen in the cycle's
+`cycle_configuration.json` (`cache_lane`), so a resumed cycle keeps its lane even if the
+opt-in changes and an outstanding legacy cycle completes under its original contract. In
+the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolutions` read
+retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
+Parquet export, pass one, targeted `prices-history`, second finalization, candidate
+recapture into `candidate_cycle_manifest.json` (bound into pass two; `cycle_manifest.json`
+keeps the cycle's initial installed-cache watermark), `--prepare-only`, `cache-activate` and
+the exact `--resume-request`. Both targets are fixed by the immutable prior and reused on
+retry: `N` is the prior's newest activity generation plus one (1 for a schema-one prior);
+the payout target is the prior's active walk if one exists, else its newest coverage
+generation plus one, and a walk already completed on the candidate is reused rather than
+restarted. After every successful publication — the fresh path, the automatic pending
+resume and explicit `--resume-pending` — the accepted watermark is captured from the
+request's installed fixed path before the pointers clear, so the next unchanged same-day
+invocation skips before staging.
+
+**Physical layout.** The candidate lane uses the regular physical fixed file
+(`readlink -f data/wallet_cache.db`) and derives per-cycle names beside it from the
+durable cycle directory: `wallet_cache.<cron-UTC>.side.db`, `.prior.db`, and the
+`.displaced.db` name used only by `cache-restore-prior`. The Rust lock owners derive the
+cache lock and the loop/run lock directory from that physical path, so the physical
+directory must carry two aliases to the repository inodes, checked before any mutation:
+
+| Alias | Target |
+|---|---|
+| `<physical dir>/eval-results` | `<repo>/data/eval-results` |
+| `<physical dir>/wallet_cache.db.lock` | `<repo>/data/wallet_cache.db.lock` |
+
+Fixed, prior, candidate and displaced files must be independent regular files on one
+filesystem; staging refuses the same path, a hard link or a symbolic link among them. A
+completed prior is never rewritten and a candidate without its prior is refused. The
+existing locked prior-hash comparison at activation refuses a fixed cache changed after the
+prior was captured; resume with the recorded candidate and prior, or start a new cycle.
+
+**Initial cutover and acceptance.** Complete any outstanding schema-one cycle and its
+publication first. Create the two aliases, check free space for two additional copies of
+the fixed file on that filesystem, then set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and run
+one zero-argument cycle (under the supervisor or by hand while it is paused with
+`scripts/deploy/forge_pause.sh`). It stages, seals, collects the full union, walks payout,
+finalizes, ranks and prepares the exact request; the publisher's unchanged freshness checks
+decide acceptance. On acceptance the wrapper prints `RANK_AND_PUSH_PREPARED_ONLY=<request>`
+and exits 75 with the pending pointer retained and the installed cache untouched. Record the
+measurement from the cycle artifacts: the wallet union (`wallet_count` in the activity
+manifest of the candidate's `activity_coverage_manifests_v2`, also in
+`candidate_cycle_manifest.json`), the candidate size, elapsed time from the cycle log, and
+the source times the publisher accepted. Then set the value to `1`; the pending-publication
+recovery activates and publishes exactly that request. If the publisher refuses (stale
+source times, incomplete coverage), the cycle stops with the installed cache untouched and
+the candidate, prior and log preserved; do not relabel times, narrow membership or relax
+freshness. Require the next real scheduled refresh and publication (installed schema two
+selects the lane automatically) before closing the classifier-two handoff.
+
+**Recovery states.** Before a prepared request exists, an abandoned cycle is stopped by
+writing `stop`, removing `rank_and_push.cycle`, and deleting only that cycle's candidate;
+the fixed cache was never modified and the prior may be kept as evidence. Once a request is
+prepared, never delete it: the pending pointer resumes activation and publication. After
+activation but before the publication is consumed, `cache-restore-prior` with the cycle's
+prior and displaced names restores the exact prior bytes. After consumption, roll forward.
+Forge's boot card is failing (#637); the caches, repository and evaluation results live on
+the SSDs, but confirm the host before any cutover and keep the prior until the publication
+is confirmed.
+
 ### Continuous Forge supervisor
 
 Production repetition is file-governed and runs the complete one-shot command
