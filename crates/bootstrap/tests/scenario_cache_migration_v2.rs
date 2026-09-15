@@ -2915,23 +2915,38 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         "{manifest_role}"
     );
     assert!(!dir.path().join("cron-6.prior.db").exists());
-    // A manifest in a directory that does not exist yet is an ordinary target:
-    // the writer creates the directory.
-    let nested_manifest = dir.path().join("new-dir/nested/build.json");
-    let nested = stage_cache_cycle_v2(
-        &fixed,
-        &dir.path().join("cron-7.prior.db"),
-        &dir.path().join("cron-7.side.db"),
-        Some(&nested_manifest),
-    )
-    .unwrap();
-    assert!(!nested.resumed);
-    assert!(nested_manifest.is_file());
-    assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
-    // `..` after a directory that does not exist yet steps back over it, so a
-    // manifest spelled through one still compares by identity: a spelling that
-    // lands on a role is refused and an ordinary target is written.
-    let manifest_on_role = dir.path().join("missing-a/../cron-8.side.db");
+    // Staging never creates directories: a manifest whose directory does not
+    // exist yet is refused before any copy, whether spelled directly, through
+    // `..`, or through a directory that would have to appear at a role.
+    for spelling in [
+        "new-dir/nested/build.json",
+        "missing-b/../build.json",
+        "cron-7.side.db/../build.json",
+        "cron-7.side.db/build.json",
+    ] {
+        let manifest = dir.path().join(spelling);
+        let refused = stage_cache_cycle_v2(
+            &fixed,
+            &dir.path().join("cron-7.prior.db"),
+            &dir.path().join("cron-7.side.db"),
+            Some(&manifest),
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("parent directory is not available"),
+            "{spelling}: {refused}"
+        );
+        assert!(!dir.path().join("cron-7.prior.db").exists(), "{spelling}");
+        assert!(!dir.path().join("cron-7.side.db").exists(), "{spelling}");
+    }
+    assert!(!dir.path().join("new-dir").exists());
+    assert!(!dir.path().join("missing-b").exists());
+    // `..` through an existing directory resolves through the file system, so
+    // a manifest spelled that way onto a role is a collision.
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let manifest_on_role = dir.path().join("sub/../cron-8.side.db");
     let dotted_role = stage_cache_cycle_v2(
         &fixed,
         &dir.path().join("cron-8.prior.db"),
@@ -2944,26 +2959,11 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
         "{dotted_role}"
     );
     assert!(!dir.path().join("cron-8.prior.db").exists());
-    let dotted_manifest = dir.path().join("missing-b/../dotted/build.json");
-    let dotted = stage_cache_cycle_v2(
-        &fixed,
-        &dir.path().join("cron-9.prior.db"),
-        &dir.path().join("cron-9.side.db"),
-        Some(&dotted_manifest),
-    )
-    .unwrap();
-    assert!(!dotted.resumed);
-    assert!(dir.path().join("dotted/build.json").is_file());
-    assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
-    // A link without a target is refused before anything is created: creating
-    // the manifest's missing directory would give this one a target (the cache
-    // directory itself) and the manifest write would land on the fixed cache.
+    // A link without a target is not an existing directory either, so nothing
+    // is created that could later give it one.
     let link = dir.path().join("link");
     std::os::unix::fs::symlink("missing-c/..", &link).unwrap();
-    let manifest_through_link = dir
-        .path()
-        .join("missing-c/../link")
-        .join(fixed.file_name().unwrap());
+    let manifest_through_link = link.join(fixed.file_name().unwrap());
     let broken = stage_cache_cycle_v2(
         &fixed,
         &dir.path().join("cron-10.prior.db"),
@@ -2974,7 +2974,7 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert!(
         broken
             .to_string()
-            .contains("symbolic link without a target"),
+            .contains("parent directory is not available"),
         "{broken}"
     );
     assert!(!dir.path().join("missing-c").exists());

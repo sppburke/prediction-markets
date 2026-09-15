@@ -2179,7 +2179,10 @@ fn write_build_manifest(
 /// shared-memory sidecar beside the file and ignores any it finds, so the
 /// immutable prior is inspected without being touched.
 fn open_immutable(path: &Path) -> Result<Connection, BootstrapError> {
-    let text = path.to_str().ok_or_else(|| BootstrapError::Invalid {
+    // SQLite's URI rules want a canonical absolute path: repeated separators
+    // (a leading `//` would read as a URI authority) and links resolved.
+    let canonical = std::fs::canonicalize(path)?;
+    let text = canonical.to_str().ok_or_else(|| BootstrapError::Invalid {
         message: format!("{} is not a UTF-8 path", path.display()),
     })?;
     let mut uri = String::from("file:");
@@ -2243,43 +2246,31 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
     Ok(())
 }
 
-/// Canonical form of a path that may not exist yet. Each component that
-/// exists is resolved through the file system so a link compares by its
-/// target; a component that does not exist cannot be a link, so its spelling
-/// is kept and a following `..` steps back over it; a link without a target
-/// is refused because a directory created later could give it one. A manifest
-/// in a directory the writer will create therefore still compares by identity.
+/// Identity of a staged path: its parent directory resolved through the file
+/// system, joined with its file name, itself resolved when it already exists
+/// so a linked alias of a role collides. The parent must already exist.
+/// Staging never creates directories, so a spelling that would put a
+/// directory or a file at a cache role is refused before anything is written.
 fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut resolved = PathBuf::new();
-    for component in absolute.components() {
-        let next = match component {
-            std::path::Component::CurDir => continue,
-            std::path::Component::ParentDir => resolved
-                .parent()
-                .unwrap_or(resolved.as_path())
-                .to_path_buf(),
-            other => resolved.join(other.as_os_str()),
-        };
-        resolved = match std::fs::metadata(&next) {
-            Ok(_) => std::fs::canonicalize(&next)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if std::fs::symlink_metadata(&next).is_ok() {
-                    return invalid(format!(
-                        "{} is a symbolic link without a target",
-                        next.display()
-                    ));
-                }
-                next
-            }
-            Err(error) => return Err(error.into()),
-        };
+    let name = path.file_name().ok_or_else(|| BootstrapError::Invalid {
+        message: format!("{} has no file name", path.display()),
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|error| BootstrapError::Invalid {
+        message: format!(
+            "{}: parent directory is not available: {error}",
+            path.display()
+        ),
+    })?;
+    let intended = parent.join(name);
+    match std::fs::canonicalize(&intended) {
+        Ok(existing) => Ok(existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(intended),
+        Err(error) => Err(error.into()),
     }
-    Ok(resolved)
 }
 
 #[cfg(unix)]
