@@ -259,6 +259,27 @@ value={"revision":"1"*40,"applied_config_hash":"static","updated_at":datetime.da
 "supabase_rpc_calls":0,"live":{"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"fetched_at_unix":None,"stale":False,
 "accounts":[{"account_id":"live-a","is_primary":True,"enabled":False,"requested_live_mode":"off","effective_live_mode":"off","armed":False}]}}
 json.dump(value,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT"
+    # #628: a financial era that has TRADED is the normal post-Start state, not an anomaly. These
+    # markers let a scenario present one. Amounts follow the plan: baseline 10000, BUY 2 @ 0.50
+    # (principal 1, fee 0.01) -> 9998.99, settlement credit 2 -> 10000.99.
+    if [[ -f "$state/status-traded" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]; v=json.load(open(path))
+v["fills_total"]=1; v["settled_total"]=1; v["open_positions"]=0; v["bankroll"]="10000.99"
+json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
+    if [[ -f "$state/status-producer-down" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]; v=json.load(open(path))
+v["tasks"][0]["state"]="failed"
+json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
+    if [[ -f "$state/status-wrong-bankroll" ]]; then
+      python3 -c 'import json,sys
+path=sys.argv[1]; v=json.load(open(path))
+v["fills_total"]=0; v["bankroll"]="9999"
+json.dump(v,open(path,"w"))' "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/status.json"
+    fi
     ;;
   *) echo "unexpected systemctl command: $*" >&2; exit 97 ;;
 esac
@@ -357,7 +378,20 @@ elif [[ "$sql" == *seed_financial_start* ]]; then
     echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
   fi
 elif [[ "$sql" == *"'start_seq'"* ]]; then
+  # #628: the authority observation for a traded era, and for a still-fresh era whose cash is wrong.
+  if [[ -f "$state/remote-traded" ]]; then
+    echo '{"paper_fills":1,"settled_markets":1,"paper_positions":1,"fill_market_snapshots":1,"bankroll_count":1,"bankroll":"10000.99","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":3,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-wrong-start" ]]; then
+    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":9,"start_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-wrong-membership" ]]; then
+    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000999"]}'
+  elif [[ -f "$state/remote-wrong-batch" ]]; then
+    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":999,"membership":["0x0000000000000000000000000000000000000545"]}'
+  elif [[ -f "$state/remote-wrong-bankroll" ]]; then
+    echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"9999","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  else
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"fill_market_snapshots":0,"bankroll_count":1,"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null,"ranking_batch_id":545,"membership":["0x0000000000000000000000000000000000000545"]}'
+  fi
 elif [[ "$sql" == *json_build_object* ]]; then
   echo '{"paper_fills":0,"settled_markets":0,"paper_positions":0,"paper_bankroll":1,"fill_market_snapshots":0}'
 fi
@@ -685,6 +719,17 @@ for table in ("fills","positions","settled_markets","fill_market_snapshots"): db
 db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"10000\")")
 db.execute("delete from meta"); db.execute("insert into meta values(\"financial_start_seq\",\"1\")")
 db.execute("insert into meta values(\"financial_start_hash\",?)",("c"*64,))
+# #628 markers, same amounts as the status fixture.
+if os.path.exists(sys.argv[2]+"/sqlite-traded"):
+    for t in ("fills","positions","settled_markets","fill_market_snapshots"):
+        db.execute("insert into "+t+" values(\"traded\")")
+    db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"10000.99\")")
+    db.execute("insert into meta values(\"financial_last_prepared_seq\",\"3\")")
+if os.path.exists(sys.argv[2]+"/sqlite-wrong-start"):
+    db.execute("delete from meta where key=\"financial_start_hash\"")
+    db.execute("insert into meta values(\"financial_start_hash\",?)",("d"*64,))
+if os.path.exists(sys.argv[2]+"/sqlite-wrong-bankroll"):
+    db.execute("delete from bankroll"); db.execute("insert into bankroll values(0,\"9999\")")
 if wal_crash:
     db.execute("drop index durable_value")
     db.execute("alter table durable add column reset_only text")
@@ -2062,6 +2107,70 @@ except FileNotFoundError: print("absent")' "$control/pe-financial-era.json")
   fail "the seam generator cannot produce a recordable preparation even when small (got \
 $control_recorded), so the oversized case proves nothing about SIZE"
 echo "PASS: FE-SEAM-68 (production-shaped preparation recorded, $carried bytes carried via stdin)"
+
+# Scenario FE-VERIFY-70 — a financial era that has TRADED reaches `verified` (#628, #627).
+# Preconditions: all three observations report a post-fill, post-settlement era -- status
+#   fills_total=1/settled_total=1/bankroll 10000.99, SQLite with all four tables populated, an
+#   advanced financial version and moved cash, and the authority reporting the same.
+# PASS: the driver converges to `verified`. This is the state the whole rewrite exists to permit:
+#   verification runs with producers ALREADY RUNNING, so demanding zero fills left exactly one
+#   passing instant and the first fill closed it forever.
+# FAIL: any of the three blocks still demands a frozen world.
+root=$TEST_TMP/verify-traded-era
+setup_fixture "$root"
+driver_args "$root"
+: > "$root/test-state/status-traded"
+: > "$root/test-state/sqlite-traded"
+: > "$root/test-state/remote-traded"
+set +e
+output=$(drive_to_verified "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 0 ]] ||
+  fail "a traded financial era did not reach verified: $output"
+[[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' \
+  "$root/pe-financial-era.json") == verified ]] ||
+  fail "traded era did not durably record verified"
+echo "PASS: FE-VERIFY-70"
+
+# Scenario FE-VERIFY-71 — while nothing has traded, the balance is still pinned, in every store.
+# Preconditions: an UNTRADED era (fills zero everywhere) whose cash is wrong in exactly one store.
+# PASS: each store refuses with its own diagnostic. The #628 relaxation made the bankroll assertion
+#   conditional on that store having no fill; if a condition were inverted, every positive scenario
+#   above would still pass and nothing would notice. These are the controls that see it.
+# FAIL: a wrong balance on a pristine era converges.
+# Each row is one injected defect and the ONE diagnostic that must name it. Requiring the exact
+# message stops an unrelated refusal upstream from satisfying a control -- the trap that let a whole
+# verification block go untested. Rows cover every assertion inside the blocks #628 edited; the
+# readiness checks sit in a block this change never touched, so they get no control here.
+for case in \
+  "status-wrong-bankroll|status bankroll differs from the fresh baseline" \
+  "sqlite-wrong-bankroll|local bankroll differs" \
+  "remote-wrong-bankroll|remote bankroll differs" \
+  "sqlite-wrong-start|local Start identity differs" \
+  "remote-wrong-start|remote Start/version differs" \
+  "remote-wrong-membership|remote membership differs" \
+  "remote-wrong-batch|remote ranking batch differs" \
+  "status-producer-down|the producer/critical owner set is not running"; do
+  marker=${case%%|*}; want=${case#*|}; store=$marker
+  root=$TEST_TMP/verify-refuses-$store
+  setup_fixture "$root"
+  driver_args "$root"
+  : > "$root/test-state/$marker"
+  set +e
+  output=$(drive_to_verified "$root" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] ||
+    fail "$store: the driver accepted an era carrying an injected defect"
+  [[ "$output" == *"$want"* ]] ||
+    fail "$store refused for the wrong reason (wanted '$want'): $output"
+  [[ $(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["state"])
+except FileNotFoundError: print("absent")' "$root/pe-financial-era.json") != verified ]] ||
+    fail "$store reached verified despite an injected defect"
+done
+echo "PASS: FE-VERIFY-71"
 
 # Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
 # Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
@@ -3712,4 +3821,4 @@ cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 
-echo "PASS: 69 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+echo "PASS: 71 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"

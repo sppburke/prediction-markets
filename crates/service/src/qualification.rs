@@ -11635,6 +11635,23 @@ mod tests {
         assert_eq!(before, after);
 
         manifest.state = "guarded".to_owned();
+        // #626: Start recomputes the preparation and requires equality with the manifest's stored
+        // copy before emitting the event from it. That copy now reaches the manifest over stdin,
+        // because a 21.7 MB binding cannot be a single argv element -- so the check the transport
+        // relies on has to be shown to fire. It had no negative test. Assert it BEFORE the
+        // successful Start below: once a Start exists, retries take the recorded-receipt path
+        // instead of recomputing.
+        let mut tampered = manifest.clone();
+        let mut truncated = preparation.clone();
+        truncated.start.membership_proofs_hash.pop();
+        tampered.preparation = Some(truncated);
+        let refusal = start_financial_era(&tampered, &config, &config_rows)
+            .expect_err("Start must refuse a preparation that differs from its recomputed inputs");
+        assert!(
+            format!("{refusal}").contains("preparation differs from the verified manifest inputs"),
+            "wrong refusal: {refusal}"
+        );
+
         manifest.preparation = Some(preparation.clone());
         let first = start_financial_era(&manifest, &config, &config_rows).unwrap();
         let second = start_financial_era(&manifest, &config, &config_rows).unwrap();
