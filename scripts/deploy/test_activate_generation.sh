@@ -50,13 +50,9 @@ mapfile -d '' -t parsed < <(
 # The seam that refused the #545 activation: the process environment came from the unit's own
 # evaluator, the proof's expectation from the parser, and a whole-value reference must compare equal.
 proof_root="$TEST_TMP/ownership-proof"
-mkdir -p "$proof_root/proc/4242" "$proof_root/service/smoke-test"
-printf '%s\n' binary > "$proof_root/service/pe-service"
-printf '%s\n' 'bind = "127.0.0.1:1"' > "$proof_root/service/smoke-test/service.toml"
+mkdir -p "$proof_root/proc/4242" "$proof_root/service"
 printf '%s\n' 'PE_A=value' 'PE_B=${PE_A}' > "$proof_root/service/.env"
 printf '%s\0' "$proof_root/service/pe-service" smoke-test/service.toml > "$proof_root/proc/4242/cmdline"
-ln -s "$proof_root/service" "$proof_root/proc/4242/cwd"
-ln -s "$proof_root/service/pe-service" "$proof_root/proc/4242/exe"
 {
   env -i /bin/bash --noprofile --norc -c 'set -a; . "$1"; set +a; env -0' _ "$proof_root/service/.env"
   printf '%s\0' CREDENTIALS_DIRECTORY=/run/credentials/pe-service.service "HOME=$proof_root" \
