@@ -3109,6 +3109,53 @@ fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
     );
     assert_eq!(std::fs::read(&lock).ok(), before);
     assert!(!dir.path().join("cron-1.side.db").exists());
+
+    // The documented alias layout links the physical lock name to the
+    // repository's lock file before that file exists: the link's target is
+    // the reserved name, staging proceeds and taking the lock creates it.
+    let phys = dir.path().join("phys");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&phys).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let physical = phys.join("wallet_cache.db");
+    drop(seed_v1(&physical, FRESH_END - 10));
+    let _ = std::fs::remove_file(phys.join("wallet_cache.db.lock"));
+    let repo_lock = data.join("wallet_cache.db.lock");
+    std::os::unix::fs::symlink(&repo_lock, phys.join("wallet_cache.db.lock")).unwrap();
+    assert!(!repo_lock.exists());
+    let staged = stage_cache_cycle_v2(
+        &physical,
+        &phys.join("cron-2.prior.db"),
+        &phys.join("cron-2.side.db"),
+        None,
+    )
+    .unwrap();
+    assert!(!staged.resumed);
+    assert!(repo_lock.is_file());
+
+    // A lock link whose target is another name of the fixed cache is refused
+    // by identity: taking the lock would rewrite the fixed cache.
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let victim = other.join("wallet_cache.db");
+    drop(seed_v1(&victim, FRESH_END - 10));
+    let _ = std::fs::remove_file(other.join("wallet_cache.db.lock"));
+    let victim_sha256 = sha256_file(&victim).unwrap();
+    std::fs::hard_link(&victim, other.join("alias.db")).unwrap();
+    std::os::unix::fs::symlink("alias.db", other.join("wallet_cache.db.lock")).unwrap();
+    let aliased = stage_cache_cycle_v2(
+        &victim,
+        &other.join("cron-3.prior.db"),
+        &other.join("cron-3.side.db"),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        aliased.to_string().contains("not an independent file"),
+        "{aliased}"
+    );
+    assert_eq!(sha256_file(&victim).unwrap(), victim_sha256);
+    assert!(!other.join("cron-3.prior.db").exists());
 }
 
 #[test]

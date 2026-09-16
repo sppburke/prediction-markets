@@ -2101,8 +2101,8 @@ pub fn stage_cache_cycle_v2(
     );
     // Taking the cache lock creates and rewrites the lock file, so the roles
     // are validated before the lock is taken.
-    let lock_path = crate::lock::lock_path_for(fixed_path);
-    roles.push(("cache mutation lock", lock_path.as_path()));
+    let lock_target = lock_target_path(fixed_path)?;
+    roles.push(("cache mutation lock", lock_target.as_path()));
     // The manifest is checked and written under one spelling: its resolved
     // identity, whose parent directory exists. The writer's temporary file
     // beside it is a role too.
@@ -2277,6 +2277,32 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
     Ok(())
 }
 
+/// The file the cache lock will create or rewrite: the lock name with links
+/// followed, including a link whose target does not exist yet (the documented
+/// alias layout links the physical lock name to the repository's lock file
+/// before either exists).
+fn lock_target_path(fixed_path: &Path) -> Result<PathBuf, BootstrapError> {
+    let mut path = crate::lock::lock_path_for(fixed_path);
+    for _ in 0..16 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(parent) if !target.is_absolute() => parent.join(target),
+                    _ => target,
+                };
+            }
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    invalid(format!(
+        "cache lock for {} resolves through too many links",
+        fixed_path.display()
+    ))
+}
+
 /// Identity of a staged path: its parent directory resolved through the file
 /// system, joined with its file name, itself resolved when it already exists
 /// so a linked alias of a role collides; a link without a target is refused.
@@ -2321,9 +2347,10 @@ fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
 }
 
 #[cfg(unix)]
+/// Device and inode of the file a spelling opens, links followed.
 fn file_identity(path: &Path) -> Result<Option<(u64, u64)>, BootstrapError> {
     use std::os::unix::fs::MetadataExt as _;
-    match std::fs::symlink_metadata(path) {
+    match std::fs::metadata(path) {
         Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -2809,14 +2836,21 @@ fn checkpoint_truncate(connection: &Connection) -> Result<(), BootstrapError> {
 }
 
 fn open_existing_rw(path: &Path) -> Result<Connection, BootstrapError> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    // A canonical absolute path is never read as a SQLite URI (`file:` names).
+    let connection = Connection::open_with_flags(
+        std::fs::canonicalize(path)?,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
     connection.busy_timeout(Duration::from_secs(5))?;
     Ok(connection)
 }
 
 fn open_existing_ro(path: &Path) -> Result<Connection, BootstrapError> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(BootstrapError::from)
+    Connection::open_with_flags(
+        std::fs::canonicalize(path)?,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(BootstrapError::from)
 }
 
 fn require_schema(connection: &Connection, expected: i64) -> Result<(), BootstrapError> {
