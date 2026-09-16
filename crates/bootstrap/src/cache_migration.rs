@@ -2285,7 +2285,14 @@ fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError>
 /// alias layout links the physical lock name to the repository's lock file
 /// before either exists).
 fn lock_target_path(fixed_path: &Path) -> Result<PathBuf, BootstrapError> {
-    let mut path = crate::lock::lock_path_for(fixed_path);
+    link_target_path(crate::lock::lock_path_for(fixed_path))
+}
+
+/// A path with symbolic links followed one by one, including a final link
+/// whose target does not exist yet: the file that creating or rewriting the
+/// path would actually touch.
+fn link_target_path(mut path: PathBuf) -> Result<PathBuf, BootstrapError> {
+    let spelled = path.clone();
     for _ in 0..16 {
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -2301,8 +2308,8 @@ fn lock_target_path(fixed_path: &Path) -> Result<PathBuf, BootstrapError> {
         }
     }
     invalid(format!(
-        "cache lock for {} resolves through too many links",
-        fixed_path.display()
+        "{} resolves through too many links",
+        spelled.display()
     ))
 }
 
@@ -2530,6 +2537,53 @@ pub async fn restore_prior_cache(
     pending_pointer_path: &Path,
     publication_probe: &dyn PublicationConsumptionProbe,
 ) -> Result<(), BootstrapError> {
+    // Taking the lock stack creates and rewrites three lock files, the
+    // displaced copy and its sidecars are written through `.pending` names
+    // and the fixed cache's sidecars are removed, so none of those names may
+    // be another role; checked before any lock is taken.
+    let displaced_pending = pending_path_for(displaced_cache_backup_path);
+    let sidecars: Vec<(&str, PathBuf)> = [
+        ("corrected fixed cache sidecar", fixed_path),
+        (
+            "displaced-cache backup sidecar",
+            displaced_cache_backup_path,
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(label, path)| {
+        ["-wal", "-shm", "-journal"].map(move |suffix| (label, sidecar_path(path, suffix)))
+    })
+    .collect();
+    let sidecar_pendings = ["-wal", "-shm"]
+        .map(|suffix| pending_path_for(&sidecar_path(displaced_cache_backup_path, suffix)));
+    let [loop_lock, run_lock] = crate::lock::forge_named_lock_paths(fixed_path);
+    let lock_targets = [
+        link_target_path(loop_lock)?,
+        link_target_path(run_lock)?,
+        lock_target_path(fixed_path)?,
+    ];
+    let mut roles = vec![
+        ("corrected fixed cache", fixed_path),
+        ("prior cache restore main", prior_cache_backup_path),
+        ("displaced-cache backup", displaced_cache_backup_path),
+        ("displaced-cache staging file", displaced_pending.as_path()),
+    ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(label, path)| (*label, path.as_path())),
+    );
+    roles.extend(
+        sidecar_pendings
+            .iter()
+            .map(|path| ("displaced-cache sidecar staging file", path.as_path())),
+    );
+    roles.extend(
+        lock_targets
+            .iter()
+            .map(|path| ("Forge lock file", path.as_path())),
+    );
+    require_distinct_files(&roles)?;
     let _locks = ForgeActivationLocks::acquire(fixed_path)?;
     let request = verified_pending_publication(
         publication_request_path,
@@ -2558,34 +2612,6 @@ pub async fn restore_prior_cache(
         prior_cache_backup_path,
         displaced_cache_backup_path,
     )?;
-    // The displaced copy and its staging name, the sidecars copied beside it
-    // and the fixed cache's own sidecars are written or removed below, so
-    // none of them may be another role.
-    let displaced_pending = pending_path_for(displaced_cache_backup_path);
-    let sidecars: Vec<(&str, PathBuf)> = [
-        ("corrected fixed cache sidecar", fixed_path),
-        (
-            "displaced-cache backup sidecar",
-            displaced_cache_backup_path,
-        ),
-    ]
-    .into_iter()
-    .flat_map(|(label, path)| {
-        ["-wal", "-shm", "-journal"].map(move |suffix| (label, sidecar_path(path, suffix)))
-    })
-    .collect();
-    let mut roles = vec![
-        ("corrected fixed cache", fixed_path),
-        ("prior cache restore main", prior_cache_backup_path),
-        ("displaced-cache backup", displaced_cache_backup_path),
-        ("displaced-cache staging file", displaced_pending.as_path()),
-    ];
-    roles.extend(
-        sidecars
-            .iter()
-            .map(|(label, path)| (*label, path.as_path())),
-    );
-    require_distinct_files(&roles)?;
     if fixed_path.is_file() {
         let current = open_existing_rw(fixed_path)?;
         checkpoint_truncate(&current)?;
@@ -2895,8 +2921,10 @@ fn require_schema(connection: &Connection, expected: i64) -> Result<(), Bootstra
     }
 }
 
+/// Schema of a checkpointed, hash-bound main, read in immutable mode so the
+/// check creates no sidecar beside it.
 fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
-    let connection = open_existing_ro(path)?;
+    let connection = open_immutable(path)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 | CACHE_SCHEMA_VERSION_V1 => {}

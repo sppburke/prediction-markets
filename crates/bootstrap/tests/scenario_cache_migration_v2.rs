@@ -626,6 +626,35 @@ urllib.request.urlopen = urlopen
     assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
     assert!(!dir.path().join("saved").exists());
     std::fs::rename(&saved_pending, &prior_v2).unwrap();
+    // The lock stack rewrites its lock files and the displaced copy's sidecars
+    // are written through their own `.pending` names, so those names are
+    // refused before any lock is taken and the prior stays intact.
+    let lock_named = pe_bootstrap::lock::lock_path_for(&fixed);
+    let _ = std::fs::remove_file(&lock_named);
+    let wal_pending = dir.path().join("saved-wal.pending");
+    for colliding_prior in [&lock_named, &wal_pending] {
+        std::fs::rename(&prior_v2, colliding_prior).unwrap();
+        let refused = restore_prior_cache(
+            &fixed,
+            colliding_prior,
+            &dir.path().join("saved"),
+            &v2_binding,
+            &v2_request,
+            &v2_pending,
+            &FixedPublicationProbe(false),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("not an independent file"),
+            "{}: {refused}",
+            colliding_prior.display()
+        );
+        assert_eq!(sha256_file(colliding_prior).unwrap(), v2_binding.sha256);
+        assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+        assert!(!dir.path().join("saved").exists());
+        std::fs::rename(colliding_prior, &prior_v2).unwrap();
+    }
     let displaced_next = dir.path().join("wallet_cache.displaced.next.v2.db");
     restore_prior_cache(
         &fixed,
