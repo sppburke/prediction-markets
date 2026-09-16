@@ -146,7 +146,7 @@ fn activity_url(wallet: WalletAddress) -> String {
     PolymarketEndpoint::UserPositionActivityPage {
         user: wallet.to_string(),
         end: NOW,
-        start: None,
+        start: Some(1),
         offset: 0,
     }
     .url(BASE)

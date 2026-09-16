@@ -347,7 +347,14 @@ durable and unseen groups, or a revision of an already-durable group, still fenc
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
 activity cutoff, has an installed anchor no older than `ANCHOR_REFRESH_SECS`, and has
 `reanchor_required = false`. Any failed condition walks the wallet through `validate_direct`.
-`position_validation_current` is not a reuse prerequisite. When a required `validate_direct` walk
+The durable `position_anchors` proof selected by coverage must also retain all three full-history
+activity walks: each walk includes its original page-zero request with exclusive start zero and
+that walk's fixed end. Split pages keep their narrower bounds. Missing or older proof shapes,
+including omitted-start walks, require validation even when an old completion flag is true.
+`position_validation_current` is not a reuse prerequisite: ordinary activity can delete that
+temporary projection without deleting the durable anchor. Only reused wallets and wallets accepted
+by direct validation can enter the boot universe; a deferred walk cannot reuse an old complete flag.
+When a required `validate_direct` walk
 encounters a `TRADE` row with a price outside the unit range (issue #594; observed 2026-09-11), the
 wallet is left out of the accepted set like a transient read failure (unvalidated for runtime
 admission; a wallet reused on a fresh anchor is not re-read at boot), and a live wallet's periodic
@@ -416,6 +423,18 @@ Campaign financial limits and eligibility are canonical in
 Copies only a leader's first-ever BUY entry into a market that resolves within the configured horizon. Version-two `wallet_market_history_v2`, `entry_gate_results`, and `wallet_history_status_v2` rows in paper-state are the sole runtime history owner; `CopyEntryGate` is rebuilt from them before producers. Missing or incomplete reconciled history blocks membership publication. The captured legacy history file is a one-time migration input selected by boot-owned `legacy_wallet_history_path`: its source hash and import result are durable; it must stay present and unchanged until the migration reaches phase `installed`, after which file edits are inert. It is not a runtime sidecar. SELLs remain non-consuming.
 
 “History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
+
+Every causal bracket requests full attributable history through exclusive `Some(0)` (wire
+`start=1`) for each of its three independently bounded activity walks. During catch-up, verified
+prior purchases for unfenced wallets consume all missing markets through the existing bucket
+transaction and history projection, including while reanchoring is required and when a group was
+already stored without history. Fenced wallets retain the existing conservative recording of newly
+seen verified purchases and receive no stored-group repair. Stored dispositions, effects and proof
+bytes remain unchanged; historical balances are not applied again and no copy continuation is
+created. Newly recovered history counts as activity for the bracket's bounded retry. Running
+history changes only after the transaction succeeds.
+Existing complete records and historical membership proof snapshots remain intact; the corrected
+durable anchor proves current full-history coverage (#641).
 
 For validator-backed runtime admission, a successful full-history bracket carries
 `WalletHistoryStatusRecord` through `AnchorInstall.history_status` into the accepted anchor

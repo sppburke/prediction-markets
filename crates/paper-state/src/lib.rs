@@ -1787,6 +1787,22 @@ impl PaperStateDb {
         Ok(anchored_at_unix.map(|anchored| now_unix.saturating_sub(anchored).max(0)))
     }
 
+    /// Read only the proof of the durable anchor selected by wallet coverage.
+    pub fn position_anchor_proof(
+        &self,
+        wallet: &WalletAddress,
+        anchor_seq: i64,
+    ) -> Result<Option<String>, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT proof_json FROM position_anchors WHERE wallet_hex = ?1 AND anchor_seq = ?2",
+                params![wallet.to_string(), anchor_seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PaperStateError::from)
+    }
+
     /// All position anchors for one wallet in append order.
     pub fn position_anchors(
         &self,
@@ -6033,6 +6049,54 @@ mod tests {
             db.oldest_anchor_age(&[first, second], 350).unwrap(),
             Some(130),
             "age uses each wallet's latest anchor"
+        );
+    }
+
+    #[test]
+    fn selected_anchor_proof_survives_validation_removal_and_reopen() {
+        let (_dir, db) = db();
+        let first = wallet();
+        let second = other_wallet();
+        db.seed_cursors_if_absent(&[(first, 10), (second, 20)])
+            .unwrap();
+        for (wallet, cutoff, proof) in [
+            (first, 100, "{\"old\":true}"),
+            (second, 100, "{\"other\":true}"),
+            (first, 200, "{\"corrected\":true}"),
+        ] {
+            let mut install = anchor_install(wallet, Vec::new(), cutoff, cutoff, "ledger");
+            install.proof_json = proof.to_owned();
+            db.install_anchors(&[install]).unwrap();
+        }
+        db.lock()
+            .execute("DELETE FROM position_validations", [])
+            .unwrap();
+        let path = db.lock().path().unwrap().to_owned();
+        drop(db);
+        let db = PaperStateDb::open(std::path::Path::new(&path)).unwrap();
+        assert!(db.position_validation(&first).unwrap().is_none());
+        assert_eq!(
+            db.position_anchor_proof(&first, 0).unwrap().as_deref(),
+            Some("{\"old\":true}")
+        );
+        assert_eq!(
+            db.position_anchor_proof(
+                &first,
+                db.wallet_coverage(&first).unwrap().anchor_seq.unwrap()
+            )
+            .unwrap()
+            .as_deref(),
+            Some("{\"corrected\":true}")
+        );
+        assert_eq!(
+            db.position_anchor_proof(&second, 0).unwrap().as_deref(),
+            Some("{\"other\":true}")
+        );
+        assert_eq!(db.position_anchor_proof(&second, 1).unwrap(), None);
+        assert_eq!(
+            db.position_anchor_proof(&WalletAddress([3; 20]), 0)
+                .unwrap(),
+            None
         );
     }
 

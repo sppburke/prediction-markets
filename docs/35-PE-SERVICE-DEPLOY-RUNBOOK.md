@@ -723,6 +723,28 @@ its read ends in a stale or no-copy disposition, and boot authenticates it). Pre
 source records, recorded effects, fences, financial records, and publication artifacts. See the
 [canonical continuation and commitment contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
+**#641 full-history admission repair.** Deploy the request-bound change, bucket history repair,
+and boot anchor proof check together. After verified financial activation, use the private
+state-copy and open-continuation validation procedure above, then the single required restart.
+This repair does not create a new financial activation, state generation, table, event, config
+key or migration marker.
+
+Before accepting rollout, verify the running revision and record which old omitted-start anchors
+were revalidated or excluded. Inspect the selected durable `position_anchors` proof for all three
+original page-zero activity requests: exclusive start zero, wire `start=1`, and each walk's fixed
+end. An old complete flag alone cannot justify reuse; failed or deferred boot validation leaves
+that wallet excluded. Record activity and metadata request counts, actual validation duration,
+total boot duration, and accepted and deferred wallet counts. Every revalidated old anchor performs
+at least seven source requests (three activity walks and two position reads over both partitions)
+before pagination. Full reads can take longer; retain the existing request/retry bounds without
+a new timeout or fallback.
+
+For recovery, preserve all state and use a compatible binary containing both the history repair
+and boot-proof check. An older binary can decode the unchanged formats but resumes the defective
+admission rules, so it is not an accepted recovery target. Do not reset state, clear fences,
+recopy historical trades or perform another first financial activation. Existing completion
+records and historical membership proof snapshots remain unchanged.
+
 Required release evidence for the first-activation/ordinary-update distinction:
 
 | Failure/recovery test | Required result |
