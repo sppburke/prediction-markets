@@ -2103,6 +2103,9 @@ pub fn stage_cache_cycle_v2(
     // are validated before the lock is taken.
     let lock_target = lock_target_path(fixed_path)?;
     roles.push(("cache mutation lock", lock_target.as_path()));
+    // The commands that follow staging take the candidate's own lock.
+    let side_lock_target = lock_target_path(side_path)?;
+    roles.push(("private candidate lock", side_lock_target.as_path()));
     // The manifest is checked and written under one spelling: its resolved
     // identity, whose parent directory exists. The writer's temporary file
     // beside it is a role too.
@@ -2555,6 +2558,34 @@ pub async fn restore_prior_cache(
         prior_cache_backup_path,
         displaced_cache_backup_path,
     )?;
+    // The displaced copy and its staging name, the sidecars copied beside it
+    // and the fixed cache's own sidecars are written or removed below, so
+    // none of them may be another role.
+    let displaced_pending = pending_path_for(displaced_cache_backup_path);
+    let sidecars: Vec<(&str, PathBuf)> = [
+        ("corrected fixed cache sidecar", fixed_path),
+        (
+            "displaced-cache backup sidecar",
+            displaced_cache_backup_path,
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(label, path)| {
+        ["-wal", "-shm", "-journal"].map(move |suffix| (label, sidecar_path(path, suffix)))
+    })
+    .collect();
+    let mut roles = vec![
+        ("corrected fixed cache", fixed_path),
+        ("prior cache restore main", prior_cache_backup_path),
+        ("displaced-cache backup", displaced_cache_backup_path),
+        ("displaced-cache staging file", displaced_pending.as_path()),
+    ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(label, path)| (*label, path.as_path())),
+    );
+    require_distinct_files(&roles)?;
     if fixed_path.is_file() {
         let current = open_existing_rw(fixed_path)?;
         checkpoint_truncate(&current)?;

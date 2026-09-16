@@ -600,6 +600,32 @@ urllib.request.urlopen = urlopen
     .unwrap_err();
     assert!(unavailable.to_string().contains("authority unavailable"));
     assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+    // Restore writes the displaced copy through its `.pending` name and
+    // removes the fixed cache's sidecars, so those names may not be roles: a
+    // prior named like the displaced copy's staging file is refused intact.
+    let saved_pending = dir.path().join("saved.pending");
+    std::fs::rename(&prior_v2, &saved_pending).unwrap();
+    let (colliding_request, colliding_pending) =
+        write_pending_publication(&dir, "v2c", &consumed_side, &fixed, &fixed, &saved_pending);
+    let colliding = restore_prior_cache(
+        &fixed,
+        &saved_pending,
+        &dir.path().join("saved"),
+        &v2_binding,
+        &colliding_request,
+        &colliding_pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        colliding.to_string().contains("not an independent file"),
+        "{colliding}"
+    );
+    assert_eq!(sha256_file(&saved_pending).unwrap(), v2_binding.sha256);
+    assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+    assert!(!dir.path().join("saved").exists());
+    std::fs::rename(&saved_pending, &prior_v2).unwrap();
     let displaced_next = dir.path().join("wallet_cache.displaced.next.v2.db");
     restore_prior_cache(
         &fixed,
@@ -3109,6 +3135,17 @@ fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
     );
     assert_eq!(std::fs::read(&lock).ok(), before);
     assert!(!dir.path().join("cron-1.side.db").exists());
+    // The commands after staging take the candidate's own lock, so a prior
+    // named like it is refused as well.
+    let side = dir.path().join("cron-1.side.db");
+    let side_lock = pe_bootstrap::lock::lock_path_for(&side);
+    let refused_side = stage_cache_cycle_v2(&fixed, &side_lock, &side, None).unwrap_err();
+    assert!(
+        refused_side.to_string().contains("not an independent file"),
+        "{refused_side}"
+    );
+    assert!(!side_lock.exists());
+    assert!(!side.exists());
 
     // The documented alias layout links the physical lock name to the
     // repository's lock file before that file exists: the link's target is
